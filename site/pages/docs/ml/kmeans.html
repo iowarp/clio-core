@@ -60,6 +60,6 @@ std::vector<float> FitKMeansReference(const float *data, u64 n_rows, u32 dims,
 <p><code>FitKMeans</code> runs over a paged <code>Dataset</code> and needs the runtime. <code>FitKMeansPlain</code> runs the same kernel over a plain device copy of the data and needs a device but no runtime. <code>FitKMeansReference</code> is the CPU oracle with the same summation order.</p>
 
 <h2>ChiMod</h2>
-<p>Module <code>ml_kmeans</code>, library <code>clio_ml_kmeans_chimod</code>, client <code>clio_ml::chimod::KMeansClient</code>. Compute params are <code>KMeansParams(k, iters, threads, init_centroids)</code>. See <a href="/docs/ml/index.html#running-as-chimods">running as ChiMods</a>.</p>
+<p>Module <code>ml_kmeans</code>, library <code>clio_ml_kmeans_chimod</code>, client <code>clio_ml::chimod::KMeansClient</code>. Compute params are <code>KMeansParams(k, iters, threads, init_centroids)</code>. See <a href="/docs/ml/usage.html#running-as-chimods">running as ChiMods</a>.</p>
 
 <p>Related: <a href="/docs/ml/bkm.html">bisecting k-means</a>, <a href="/docs/ml/gmm.html">Gaussian mixture</a>, fuzzy c-means.</p>

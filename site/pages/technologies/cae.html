@@ -34,11 +34,11 @@ transfers:
 <p>The engine and its summarizer speak the Context Transfer Engine's own interface, so they can sit in the write path. The summarizer sends matching blobs to a language model and stores the reply beside the data as an ordinary blob; the indexer makes both keyword-searchable. Imported data is findable by what it says without a separate pass.</p>
 
 <h2>Pages for paged consumers</h2>
-<p>Memory expansion and clio-ml address data as page 0, page 1, and so on. The engine can serve numbered pages assembled from named blobs, and with an empty blob prefix an imported file's blobs are the pager's pages. That is how <a href="/docs/ml/index.html">clio-ml trains on an assimilated CSV or Parquet table</a> without first loading it into memory.</p>
+<p>Memory expansion and clio-ml address data as page 0, page 1, and so on. The engine can serve numbered pages assembled from named blobs, and with an empty blob prefix an imported file's blobs are the pager's pages. That is how <a href="/docs/ml/usage.html">clio-ml trains on an assimilated CSV or Parquet table</a> without first loading it into memory.</p>
 
 <h2>Where to go next</h2>
 <ul>
-  <li><a href="/docs/cae.html">Context Assimilation Engine docs</a>: assimilators, OMNI files, ingest on fault and pagify.</li>
+  <li><a href="/docs/cae/usage.html">Context Assimilation Engine docs</a>: assimilators, OMNI files, ingest on fault and pagify.</li>
   <li><a href="/modules/cae-core.html">CAE core</a> and <a href="/modules/summarizer.html">summarizer</a> module reference.</li>
   <li><a href="/technologies/cee.html">Context Exploration Engine</a>: find and read what was imported.</li>
 </ul>

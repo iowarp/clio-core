@@ -36,11 +36,11 @@ data = ctx.context_retrieve("run42.*", ".*", max_results=5,
 <p>The engine stores nothing of its own. Files written through a Context FS mount, objects put through the Context Transfer Engine and data imported by the assimilation engine are all tags and blobs, so they are all queryable the moment they are written. <code>context_bundle</code> imports new sources through the assimilation engine in the same call style.</p>
 
 <h2>Composed for search</h2>
-<p>What the engine can find depends on the stack you compose: keep the indexer in the chain so every writer is indexed, add the summarizer for content labels, and give retrieval a fast tier. The defaults already do the first; the <a href="/docs/cee.html#composing-storage-for-search">docs</a> show the rest.</p>
+<p>What the engine can find depends on the stack you compose: keep the indexer in the chain so every writer is indexed, add the summarizer for content labels, and give retrieval a fast tier. The defaults already do the first; the <a href="/docs/cee/usage.html#composing-storage-for-search">docs</a> show the rest.</p>
 
 <h2>Where to go next</h2>
 <ul>
-  <li><a href="/docs/cee.html">Context Exploration Engine docs</a>: API, query modes, MCP server and limits.</li>
+  <li><a href="/docs/cee/usage.html">Context Exploration Engine docs</a>: API, query modes, MCP server and limits.</li>
   <li><a href="/tutorials/python-semantic-query.html">Query files from Python</a>.</li>
   <li><a href="/technologies/cae.html">Context Assimilation Engine</a>: bring data in to explore.</li>
 </ul>

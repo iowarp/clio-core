@@ -12,20 +12,21 @@ facts: Written for | Scientists, HPC users and developers ; Works on | Linux, ma
 
 <h2>What you can do with it</h2>
 <div class="card-list">
-  <a href="/docs/basic-usage.html"><span class="feature-index">01</span><h3>Mount a filesystem</h3><p>Start the runtime, mount a directory, copy data in, and unmount. Takes about five minutes.</p></a>
+  <a href="/docs/context-fs/quickstart.html"><span class="feature-index">01</span><h3>Mount a filesystem</h3><p>Start the runtime, mount a directory, copy data in, and unmount. Takes about five minutes.</p></a>
   <a href="/tutorials/compose.html"><span class="feature-index">02</span><h3>Compose storage tiers</h3><p>Combine RAM, NVMe, SSD and disk in one store with a short YAML file.</p></a>
   <a href="/tutorials/python-semantic-query.html"><span class="feature-index">03</span><h3>Search from Python</h3><p>Find files by keyword relevance or name pattern, and read them back.</p></a>
   <a href="/tutorials/dashboard.html"><span class="feature-index">04</span><h3>Watch the runtime</h3><p>See nodes, workers and storage tiers live in the built-in web dashboard.</p></a>
 </div>
 
 <h2>The documentation, by technology</h2>
+<p>Each technology has its own documentation: what it is, how to install it, how to use it and its API.</p>
 <div class="card-list">
-  <a href="/docs/context-fs.html"><span class="feature-index">01</span><h3>Context FS</h3><p>Start the runtime, mount the filesystem, the default composition, and where to go for advanced ones.</p></a>
-  <a href="/docs/cae.html"><span class="feature-index">02</span><h3>Context Assimilation Engine</h3><p>Bring files, HDF5, web and cloud data into the stack, and describe content as it is written.</p></a>
-  <a href="/docs/cee.html"><span class="feature-index">03</span><h3>Context Exploration Engine</h3><p>Bundle, query and retrieve data by name, keywords or time, and compose storage for search.</p></a>
-  <a href="/docs/cte.html"><span class="feature-index">04</span><h3>Context Transfer Engine</h3><p>Tags, blobs and scores: the data model and the C++ and Python APIs.</p></a>
-  <a href="/docs/runtime.html"><span class="feature-index">05</span><h3>Context Runtime</h3><p>Build a ChiMod: modules, tasks, pools and pool queries.</p></a>
-  <a href="/docs/memory-expansion.html"><span class="feature-index">06</span><h3>Memory expansion</h3><p>CPU and GPU vectors larger than memory: API, configuration and examples.</p></a>
+  <a href="/docs/context-fs/index.html"><span class="feature-index">01</span><h3>Context FS</h3><p>Start the runtime, mount the filesystem, the default composition, and where to go for advanced ones.</p></a>
+  <a href="/docs/cae/index.html"><span class="feature-index">02</span><h3>Context Assimilation Engine</h3><p>Bring files, HDF5, web and cloud data into the stack, and describe content as it is written.</p></a>
+  <a href="/docs/cee/index.html"><span class="feature-index">03</span><h3>Context Exploration Engine</h3><p>Bundle, query and retrieve data by name, keywords or time, and compose storage for search.</p></a>
+  <a href="/docs/cte/index.html"><span class="feature-index">04</span><h3>Context Transfer Engine</h3><p>Tags, blobs and scores: the data model and the C++ and Python APIs.</p></a>
+  <a href="/docs/runtime/index.html"><span class="feature-index">05</span><h3>Context Runtime</h3><p>Build a ChiMod: modules, tasks, pools and pool queries.</p></a>
+  <a href="/docs/memory-expansion/index.html"><span class="feature-index">06</span><h3>Memory expansion</h3><p>CPU and GPU vectors larger than memory: API, configuration and examples.</p></a>
   <a href="/docs/ml/index.html"><span class="feature-index">07</span><h3>Machine learning</h3><p>Compose storage and memory for clio-ml, and the API of each algorithm.</p></a>
 </div>
 <p>The <a href="/docs/concepts.html">core concepts</a> page explains tags, blobs, scores and pools in more depth. The <a href="/design/index.html">design</a> section covers the internals.</p>
@@ -33,6 +34,6 @@ facts: Written for | Scientists, HPC users and developers ; Works on | Linux, ma
 <h2>Where to start</h2>
 <ol class="steps">
   <li><h3>Install</h3><p><code>pip install iowarp-core</code> works on most workstations. See <a href="/docs/installation.html">Installation</a> for conda, Docker, Spack and source builds.</p></li>
-  <li><h3>Mount and copy a file</h3><p>Follow <a href="/docs/basic-usage.html">Basic usage</a> end to end.</p></li>
+  <li><h3>Mount and copy a file</h3><p>Follow <a href="/docs/context-fs/quickstart.html">Basic usage</a> end to end.</p></li>
   <li><h3>Shape your storage</h3><p>Use <a href="/tutorials/compose.html">Compose local tiers</a> when the defaults no longer fit.</p></li>
 </ol>

@@ -1,0 +1,237 @@
+<!--
+title: API reference
+heading: Context Runtime <em>reference.</em>
+description: The clio_run command and its subcommands, client initialisation, PoolQuery routing modes, the task and coroutine macros, the container callbacks, the CMake functions for ChiMods, the configuration file sections and the runtime environment variables.
+eyebrow: Docs · Context Runtime
+lede: Everything an operator types and everything a module author calls, with the defaults as they are in the source. The filesystem daemon that attaches to this runtime, clio_cte_fuse, is documented with Context FS.
+facts: Command | clio_run ; Headers | clio_runtime/clio_runtime.h, pool_query.h, container.h, task.h ; Config | ~/.clio/clio.yaml
+-->
+<h2>clio_run</h2>
+<pre data-label="usage">
+clio_run &lt;command&gt; [options]
+</pre>
+<ul>
+  <li><code>start</code>: start the runtime in the foreground, recover every piece of persistent state it finds, and compose the pools in the configuration.</li>
+  <li><code>stop</code>: stop the local runtime.</li>
+  <li><code>status</code>: report whether the local runtime answers.</li>
+  <li><code>compose &lt;start|stop|rm|list&gt;</code>: manage pools from a compose file.</li>
+  <li><code>config export --path &lt;file&gt;</code>: write the node's effective configuration to a file.</li>
+  <li><code>monitor</code>: print worker statistics.</li>
+  <li><code>migrate</code>: move a container to a different node.</li>
+  <li><code>refresh</code>: regenerate ChiMod method files for module development.</li>
+</ul>
+<p>The nested forms <code>clio_run runtime start|stop|status</code> and <code>clio_run repo refresh</code> still work. <code>clio_run restart</code> was removed: <code>start</code> always recovers state, and <code>start --fresh</code> discards it.</p>
+<h3>start</h3>
+<pre data-label="usage">
+clio_run start [--fresh] [--induct] [--ephemeral] [--disk &lt;path&gt;]
+               [--viz | --no-viz] [--viz-port &lt;port&gt;] [--viz-bind &lt;addr&gt;]
+</pre>
+<ul>
+  <li><code>--fresh</code>: discard this node's persistent state (pools, metadata logs, allocator logs, data) and start empty.</li>
+  <li><code>--induct</code>: register this node with all existing cluster nodes.</li>
+  <li><code>--ephemeral</code>: skip the configured compose and start with only the admin pool (sets <code>CLIO_EPHEMERAL=1</code>).</li>
+  <li><code>--disk &lt;path&gt;</code>: storage root for this run, created if missing (sets <code>CLIO_STORAGE_ROOT</code>; default <code>~/.clio</code>).</li>
+  <li><code>--viz</code>, <code>--no-viz</code>: serve or skip the dashboard. A daemon serves it by default; an embedded runtime does not.</li>
+  <li><code>--viz-port &lt;port&gt;</code> (default 8080; 0 picks a free port) and <code>--viz-bind &lt;addr&gt;</code> (default 127.0.0.1). Naming either turns the dashboard on.</li>
+</ul>
+<h3>stop</h3>
+<pre data-label="usage">
+clio_run stop [--force] [--grace-period &lt;ms&gt;]
+</pre>
+<ul>
+  <li><code>--grace-period &lt;ms&gt;</code>: drain budget for in-flight work (default 5000; 0 means the default). A graceful stop also moves RAM-tier data to disk within this budget.</li>
+  <li><code>--force</code>: immediate, ungraceful stop.</li>
+</ul>
+<p>If the runtime does not answer, <code>stop</code> on Linux and macOS finds its process, escalates from SIGTERM to SIGKILL, and sweeps leftover shared-memory and socket files. On Windows that escalation is not available and <code>stop</code> reports the failure.</p>
+<h3>status</h3>
+<p>Probes the local runtime with a heartbeat and exits with a code that scripts can test:</p>
+<ul>
+  <li><code>0</code>: <code>RUNNING</code>, with the process id when it can be found.</li>
+  <li><code>1</code>: <code>STOPPED (clean)</code>: no runtime and no stale artifacts.</li>
+  <li><code>2</code>: <code>STOPPED (stale artifacts)</code>: no responsive runtime, but leftover segments or sockets exist. They are listed on stdout.</li>
+</ul>
+<p>The probe waits up to 2 s unless <code>CLIO_WAIT_SERVER</code> is set.</p>
+<h3 id="compose">compose</h3>
+<pre data-label="usage">
+clio_run compose start &lt;config.yaml&gt;
+clio_run compose stop  &lt;config.yaml&gt;
+clio_run compose rm    &lt;config.yaml&gt;
+clio_run compose list  [--restartable]
+</pre>
+<ul>
+  <li><code>start</code>: create the pools in the file's <code>compose:</code> list, in order, through the admin pool. Pools with <code>restart: true</code> are recorded in each node's pool log and recreated by the next <code>clio_run start</code>.</li>
+  <li><code>stop</code>: destroy the listed pools but keep them in the pool log, so they are still restartable.</li>
+  <li><code>rm</code>: destroy the listed pools and drop them from the pool log. The compose file itself is kept.</li>
+  <li><code>list</code>: list the active containers in the local runtime. <code>--restartable</code> lists the pool-log entries instead, read from <code>&lt;conf_dir&gt;/wal</code> without contacting the runtime.</li>
+</ul>
+<p>The old forms <code>compose &lt;file&gt;</code> and <code>compose --unregister &lt;file&gt;</code> still work with a deprecation warning.</p>
+<h3 id="compose-file">Compose file entries</h3>
+<p>A compose file is any YAML file with a <code>compose:</code> list; the runtime's own configuration is one. The runtime reads these keys of each entry and hands everything else to the module as a YAML string:</p>
+<ul>
+  <li><code>mod_name</code>: the module's <code>chimod_lib_name</code>, such as <code>clio_bdev</code> or <code>clio_cte_core</code>.</li>
+  <li><code>pool_name</code>: the pool's name. For block devices it is also the device path (<code>ram::name</code> or a file path).</li>
+  <li><code>pool_query</code>: routing of the create task. One of <code>local</code>, <code>broadcast</code>, <code>dynamic</code>, <code>direct_id:N</code>, <code>direct_hash:N</code>, <code>range:OFFSET:COUNT</code>, <code>physical:NODE</code>, <code>many_to_one:HASH[:KEY[:NS]]</code>.</li>
+  <li><code>pool_id</code>: <code>"major.minor"</code> as a string.</li>
+  <li><code>restart</code>: <code>true</code> records the pool for recreation on the next start.</li>
+</ul>
+<pre data-label="yaml · tiers.yaml">
+compose:
+  - mod_name: clio_bdev
+    pool_name: "ram::scratch"
+    pool_query: local
+    pool_id: "320.0"
+    bdev_type: ram
+    capacity: "256MB"
+    restart: true
+</pre>
+<p>Module keys are documented with each module: the <a href="/modules/index.html">module reference</a> for storage and chain modules, and the <a href="/docs/context-fs/api.html">Context FS reference</a> for the filesystem and stream modules.</p>
+
+<h2>Client initialisation</h2>
+<pre data-label="c++ · clio_runtime/clio_runtime.h">
+namespace clio::run {
+enum class RuntimeMode { kClient, kServer, kRuntime = kServer };
+
+bool CLIO_INIT(RuntimeMode mode, bool default_with_runtime = false,
+               bool is_restart = false);
+void CLIO_RUNTIME_FINALIZE();
+}
+</pre>
+<ul>
+  <li><code>mode</code>: <code>kClient</code> for a program; <code>kServer</code> (alias <code>kRuntime</code>) for a process that is the runtime, which fails if one is already running on the port.</li>
+  <li><code>default_with_runtime</code>: used when <code>CLIO_WITH_RUNTIME</code> is unset. In client mode "with runtime" means try to be the runtime and attach if the port is already bound, so several processes launched together elect one host. <code>false</code> only attaches.</li>
+  <li><code>is_restart</code>: <code>true</code> recovers the node's persistent state (a plain <code>clio_run start</code>); <code>false</code> discards it.</li>
+  <li>Returns <code>false</code> when no runtime could be started or reached within <code>CLIO_WAIT_SERVER</code>.</li>
+</ul>
+<p>Call <code>CLIO_RUNTIME_FINALIZE()</code> before the process exits; it closes the sockets and joins the background threads the client started.</p>
+
+<h2>PoolQuery</h2>
+<p>Factories in <code>clio_runtime/pool_query.h</code>. <code>net_timeout</code> is the per-task network timeout in seconds; <code>-1</code> uses the runtime default.</p>
+<ul>
+  <li><code>PoolQuery::Local(u32 parallelism = 32)</code>: the container on this node. The default for creates.</li>
+  <li><code>PoolQuery::Dynamic(float net_timeout = -1)</code>: the module's own routing decides per task. The CTE routes each blob to its owner this way.</li>
+  <li><code>PoolQuery::Broadcast(float net_timeout = -1)</code>: every container runs the task; each copy's outputs are merged into the original with <code>AggregateOut</code>.</li>
+  <li><code>PoolQuery::DirectId(ContainerId container_id, float net_timeout = -1)</code>: one container by id.</li>
+  <li><code>PoolQuery::DirectHash(u32 hash, float net_timeout = -1)</code>: one container chosen by hashing a key you supply.</li>
+  <li><code>PoolQuery::Range(u32 offset, u32 count, float net_timeout = -1)</code>: a contiguous range of containers.</li>
+  <li><code>PoolQuery::Physical(u32 node_id, float net_timeout = -1)</code>: the container on a specific node.</li>
+  <li><code>PoolQuery::ManyToOne(u32 container_hash, u64 batch_key = 0, u64 batch_for_ns = 10000)</code>: tasks with the same pool, method, hash and key that arrive within the window are folded into one task with <code>AggregateIn</code>, run once, and the result is sent back to every submitter. The neighbourhood width is <code>networking.neighborhood_size</code>.</li>
+  <li><code>PoolQuery::AllToOne(u32 container_hash, u64 batch_key = 0)</code>: like <code>ManyToOne</code>, but the folded task runs once a task from every container in the pool has arrived. A barrier or reduction.</li>
+  <li><code>PoolQuery::Null()</code>: no routing.</li>
+  <li><code>PoolQuery::FromString(const std::string&amp;)</code>: parses the <code>pool_query</code> strings of a compose entry.</li>
+</ul>
+<p>Setters on any query: <code>SetNetTimeout(float seconds)</code>; <code>SetTtl(float seconds)</code>, a hard cap on how long the origin waits for a cross-node task (negative for none); <code>SetParallelism(u32)</code>, threads used when a GPU submits the task.</p>
+
+<h2>Tasks and handlers</h2>
+<h3>Task fields</h3>
+<p>A task derives from <code>clio::run::Task</code> and is constructed with <code>(TaskId, PoolId, PoolQuery, method)</code>. The base class carries <code>task_id_</code>, <code>pool_id_</code>, <code>pool_query_</code>, <code>method_</code>, <code>task_flags_</code> and <code>return_code_</code>. Field annotations <code>IN</code>, <code>OUT</code> and <code>INOUT</code> document direction; <code>SerializeIn</code> and <code>SerializeOut</code> decide what travels, and both must call the base version first. Strings use <code>clio::run::priv::string</code> with <code>CLIO_PRIV_ALLOC</code>.</p>
+<h3>Coroutine macros</h3>
+<p>From <code>clio_runtime/task.h</code>. They expand to C++20 coroutine keywords by default and to Boost fiber calls when <code>CLIO_CORE_ENABLE_BOOST_COROUTINES</code> is on, so handler code is the same for both.</p>
+<ul>
+  <li><code>CLIO_TASK_BODY_BEGIN</code> / <code>CLIO_TASK_BODY_END</code>: bracket a handler body.</li>
+  <li><code>CLIO_CO_AWAIT(expr)</code>: suspend until a future or nested handler completes. Never hold a plain lock across it.</li>
+  <li><code>CLIO_CO_RETURN</code>: finish the handler.</li>
+  <li><code>CLIO_TASK_CC(ContainerClass)</code>: at the end of the runtime source file, defines the entry points the module manager loads.</li>
+</ul>
+<p>Coroutine-aware locks: <code>clio::run::CoMutex</code> (<code>clio_runtime/comutex.h</code>) and <code>clio::run::CoRwLock</code> (<code>clio_runtime/corwlock.h</code>) with the guards <code>ScopedCoMutex</code>, <code>ScopedCoRwReadLock</code> and <code>ScopedCoRwWriteLock</code>.</p>
+<h3>Container callbacks</h3>
+<p>Virtual methods of <code>clio::run::Container</code> (<code>clio_runtime/container.h</code>) a module may override:</p>
+<ul>
+  <li><code>void Init(const PoolId&amp;, const std::string&amp; pool_name, u32 container_id = 0)</code>: first-time initialisation.</li>
+  <li><code>TaskResume Run(u32 method, shared_ptr&lt;Task&gt;)</code>: dispatch by method id.</li>
+  <li><code>void Restart(const PoolId&amp;, const std::string&amp;, u32 container_id = 0)</code>: warm start on the same node. Default calls <code>Init</code>.</li>
+  <li><code>u32 ScheduleRecover()</code>: which node should recover this container; default <code>-1</code> lets the admin choose.</li>
+  <li><code>void Recover(const PoolId&amp;, const std::string&amp;, u32 container_id = 0)</code>: rebuild on another node after a node loss. Default calls <code>Init</code>.</li>
+  <li><code>void Expand(const Host&amp; new_host)</code>: a node joined. Default no-op.</li>
+  <li><code>void Migrate(u32 dest_node_id)</code>: move state to another node. Default no-op.</li>
+  <li><code>u64 GetWorkRemaining() const</code>: pending work, used when draining.</li>
+</ul>
+<p>The admin module also provides <code>AsyncHeartbeat</code>, <code>AsyncCompose(PoolConfig)</code>, <code>AsyncDestroyPool(PoolQuery, PoolId, flags)</code> and <code>AsyncListContainers(PoolQuery)</code> on <code>clio::run::admin::Client</code>, which the <code>clio_run</code> subcommands use.</p>
+
+<h2>CMake functions</h2>
+<p>Provided by <code>ClioCoreCommon.cmake</code>, loaded by <code>find_package(clio-core CONFIG)</code>. Both read <code>clio_mod.yaml</code> in the current source directory and search upward for <code>clio_repo.yaml</code>.</p>
+<pre data-label="cmake">
+add_clio_module_client(
+  [LIB_NAME &lt;name&gt;]
+  SOURCES &lt;files&gt;...
+  [COMPILE_DEFINITIONS ...] [LINK_LIBRARIES ...] [LINK_DIRECTORIES ...]
+  [INCLUDE_LIBRARIES ...] [INCLUDE_DIRECTORIES ...])
+
+add_clio_module_runtime(&lt;same arguments&gt;)
+</pre>
+<ul>
+  <li>Targets are <code>&lt;LIB_NAME&gt;_client</code> and <code>&lt;LIB_NAME&gt;_runtime</code>, or <code>&lt;package&gt;_&lt;module&gt;_client</code> and <code>_runtime</code> without <code>LIB_NAME</code>. The output file name follows the target, so <code>LIB_NAME</code> must equal the module's <code>chimod_lib_name</code>.</li>
+  <li>Aliases <code>&lt;namespace&gt;::&lt;module&gt;_client</code> and <code>_runtime</code> are created for the YAML namespace.</li>
+  <li>Both link <code>clio::run::cxx</code>; the runtime library also links the client and defines <code>CLIO_RUNTIME=1</code>. Modules other than admin and bdev automatically link the admin and bdev clients when those targets exist.</li>
+  <li>Headers under <code>include/</code> are installed; <code>WINDOWS_EXPORT_ALL_SYMBOLS</code> is set so module DLLs link without annotations.</li>
+</ul>
+<p>Exported targets after <code>find_package</code>: <code>clio::run::cxx</code>, <code>clio::run::admin_client</code>, <code>clio::run::admin_runtime</code>, <code>clio::run::bdev_client</code>, <code>clio::run::bdev_runtime</code>, and when built, <code>clio::cte::core_client</code>, <code>clio::cte::core_runtime</code>, <code>clio::cae::core_client</code>, <code>clio::cae::core_runtime</code>.</p>
+
+<h2>Configuration file</h2>
+<p>The runtime reads the first file that exists: <code>$CLIO_SERVER_CONF</code>, <code>~/.clio/clio.yaml</code>, <code>~/.clio/clio_run.yaml</code>. Sizes accept <code>B</code>, <code>KB</code>, <code>MB</code>, <code>GB</code>, <code>TB</code>. <code>${CLIO_STORAGE_ROOT}</code> and other variables expand in paths. The installed <code>clio_default.yaml</code> documents every key in comments; the defaults below are its values.</p>
+<h3>networking</h3>
+<ul>
+  <li><code>port</code> (9413): base RPC port. The runtime binds <code>port</code>, <code>port+1</code> and <code>port+3</code> and refuses to start if any is taken.</li>
+  <li><code>neighborhood_size</code> (32): width of a <code>ManyToOne</code> neighbourhood.</li>
+  <li><code>hostfile</code> (unset): one <code>host</code> or <code>host:port</code> per line for a cluster.</li>
+  <li><code>wait_for_restart</code> (30) and <code>wait_for_restart_poll_period</code> (1): seconds to wait for peers at startup and between retries.</li>
+</ul>
+<h3>runtime</h3>
+<ul>
+  <li><code>num_threads</code> (4): worker threads.</li>
+  <li><code>queue_depth</code> (1024): task queue depth per worker.</li>
+  <li><code>local_sched</code> (<code>"default"</code>): local scheduler.</li>
+  <li><code>first_busy_wait</code> (10000): microseconds to busy-wait before sleeping.</li>
+  <li><code>client_reap_grace_s</code> (30): seconds a dead, idle client's shared memory is kept before reclaim; 0 defers to the next start.</li>
+  <li><code>task_progress_interval_ms</code> (5000): how long a cross-node task may sit quietly before its node is probed; 0 disables.</li>
+  <li><code>learning_rate</code> (0.2): learning rate of the task cost model.</li>
+  <li><code>conf_dir</code> (per-user runtime directory): where learned models and the pool log live.</li>
+  <li><code>ipc_namespace</code> (<code>""</code>): extra suffix for shared-memory segment names, to run two runtimes with the same user and port.</li>
+</ul>
+<h3>viz</h3>
+<ul>
+  <li><code>enabled</code>: serve the dashboard. Unset, a daemon serves it and an embedded runtime does not.</li>
+  <li><code>port</code> (8080; 0 picks a free port), <code>bind</code> (<code>"127.0.0.1"</code>), <code>max_threads</code> (16).</li>
+</ul>
+<h3>swim</h3>
+<ul>
+  <li><code>enabled</code> (<code>false</code>): gossip failure detection and container recovery.</li>
+  <li><code>direct_probe_timeout_sec</code> (300.0), <code>indirect_probe_timeout_sec</code> (150.0), <code>suspicion_timeout_sec</code> (3600.0).</li>
+</ul>
+<h3>compose</h3>
+<p>The list of pools to create at startup, in order; see <a href="#compose-file">compose file entries</a>. Only <code>clio_bdev</code> is strictly required.</p>
+
+<h2 id="environment-variables">Environment variables</h2>
+<p>Environment values win over the configuration file and are re-applied after every reload.</p>
+<h3>Locating and reaching the runtime</h3>
+<ul>
+  <li><code>CLIO_SERVER_CONF</code>: path of the configuration file.</li>
+  <li><code>CLIO_STORAGE_ROOT</code> (<code>~/.clio</code>): directory for on-disk state; expanded as <code>${CLIO_STORAGE_ROOT}</code> in the file.</li>
+  <li><code>CLIO_PORT</code> (9413): overrides <code>networking.port</code>.</li>
+  <li><code>CLIO_SERVER_ADDR</code>: address clients use to reach the runtime.</li>
+  <li><code>CLIO_BIND_ADDR</code>: address the runtime binds its TCP sockets to. On Windows set both this and <code>CLIO_SERVER_ADDR</code> to <code>127.0.0.1</code>.</li>
+  <li><code>CLIO_IPC_MODE</code>: <code>SHM</code>, <code>IPC</code> or <code>TCP</code>. Unset, the client picks shared memory for a runtime on the same machine, otherwise a Unix socket, otherwise TCP.</li>
+  <li><code>CLIO_WITH_RUNTIME</code>: <code>0</code> attaches to a running runtime only; <code>1</code> makes sure one is available. Unset, the program's <code>default_with_runtime</code> applies.</li>
+  <li><code>CLIO_WAIT_SERVER</code>: seconds a client waits for the runtime. <code>status</code> uses 2, <code>stop</code> 5, the FUSE mount 600.</li>
+  <li><code>CLIO_IPC_NAMESPACE</code>: overrides <code>runtime.ipc_namespace</code>.</li>
+  <li><code>CLIO_NUM_THREADS</code>: overrides <code>runtime.num_threads</code>.</li>
+  <li><code>CLIO_EPHEMERAL=1</code>: what <code>--ephemeral</code> sets.</li>
+  <li><code>CLIO_REPO_PATH</code>: directories searched for module libraries, <code>:</code>-separated (<code>;</code> on Windows).</li>
+</ul>
+<h3>Failure detection</h3>
+<ul>
+  <li><code>CLIO_TASK_PROGRESS_INTERVAL_MS</code> (5000): overrides <code>runtime.task_progress_interval_ms</code>.</li>
+  <li><code>CLIO_PROBE_SILENCE_S</code> (30): a peer silent this long is declared dead and the tasks waiting on it fail.</li>
+  <li><code>CLIO_NET_RETRY_TIMEOUT_S</code> (30): how long a send to an unreachable peer is retried before its task fails.</li>
+  <li><code>CLIO_NET_DEAD_FAIL_FAST</code> (0): <code>1</code> fails a task addressed to a peer already declared dead at once.</li>
+</ul>
+<h3>Dashboard</h3>
+<ul>
+  <li><code>CLIO_VIZ_ENABLE</code> (1/0), <code>CLIO_VIZ_PORT</code>, <code>CLIO_VIZ_BIND</code>, <code>CLIO_VIZ_MAX_THREADS</code>: override the <code>viz</code> section.</li>
+  <li><code>CLIO_VIZ_PATH</code>: <code>:</code>-separated directories to serve dashboard assets from instead of those next to the loaded module libraries.</li>
+</ul>
+<h3>Logging and debugging</h3>
+<ul>
+  <li><code>CTP_LOG_LEVEL</code> (<code>info</code>): <code>debug</code>, <code>info</code>, <code>success</code>, <code>warning</code>, <code>error</code>, <code>fatal</code>.</li>
+  <li><code>CTP_LOG_OUT</code>: log file path; unset logs to the console.</li>
+  <li><code>CLIO_ALLOW_PTRACE=1</code>: allow a debugger to attach on hosts with restricted ptrace scope.</li>
+</ul>

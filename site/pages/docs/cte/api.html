@@ -1,0 +1,218 @@
+<!--
+title: API reference
+heading: Context Transfer Engine <em>API reference.</em>
+description: Reference for the Context Transfer Engine: the C++ Tag and Client classes with real signatures and defaults, the Python clio_cte_core_ext module, the environment variables the client reads, and the clio_cte_core compose YAML keys for storage tiers, placement, targets and the organizer.
+eyebrow: Docs · Context Transfer Engine
+lede: Signatures below are taken from <code>context-transfer-engine/core/include/clio_cte/core/core_client.h</code>, the Python bindings in <code>context-transfer-engine/wrapper/python/core_bindings.cc</code>, and the parser in <code>context-transfer-engine/core/src/core_config.cc</code>. Types are abbreviated: <code>Future</code> is <code>clio::run::Future</code>, <code>PoolQuery</code> is <code>clio::run::PoolQuery</code>, <code>u32</code> and <code>u64</code> are <code>clio::run::u32</code> and <code>clio::run::u64</code>.
+facts: Namespace | clio::cte::core ; Header | clio_cte/core/core_client.h ; Python | clio_cte_core_ext ; Module name | clio_cte_core
+-->
+<h2 id="init">Initialization</h2>
+<pre data-label="cpp">
+bool clio::run::CLIO_INIT(clio::run::RuntimeMode mode, bool default_with_runtime = false, bool is_restart = false);
+bool clio::cte::core::CLIO_CTE_CLIENT_INIT(const std::string &amp;config_path = "",
+                                          const PoolQuery &amp;pool_query = PoolQuery::Dynamic());
+#define CLIO_CTE_CLIENT  /* clio::cte::core::Client * bound by CLIO_CTE_CLIENT_INIT */
+</pre>
+<ul>
+  <li><code>RuntimeMode</code> is <code>kClient</code>, <code>kServer</code> or <code>kRuntime</code>.</li>
+  <li><code>CLIO_CTE_CLIENT_INIT</code> binds the shared client to pool 512.0 (<code>kCtePoolId</code>), or to the pool named by the <code>CLIO_CTE_POOL</code> environment variable as <code>major.minor</code>. A malformed value is logged and ignored.</li>
+  <li><code>Client()</code> uses the default pool; <code>Client(const PoolId &amp;)</code> addresses any pool that speaks the core interface.</li>
+</ul>
+
+<h2 id="tag">C++: Tag</h2>
+<p>A thin wrapper over the shared client for one tag. The blocking put from a private buffer defaults the score to 1.0. The asynchronous and shared-memory forms default to -1.0, which keeps the blob's existing score.</p>
+<pre data-label="cpp">
+class Tag {
+ public:
+  explicit Tag(const std::string &amp;tag_name);   // GetOrCreateTag
+  explicit Tag(const TagId &amp;tag_id);           // wrap an existing id, no RPC
+
+  void PutBlob(const std::string &amp;blob_name, const char *data, size_t data_size,
+               size_t off = 0, float score = 1.0f, const Context &amp;context = Context());
+  void PutBlob(const std::string &amp;blob_name, const ctp::ipc::ShmPtr&lt;&gt; &amp;data, size_t data_size,
+               size_t off = 0, float score = -1.0f, const Context &amp;context = Context());
+  Future&lt;PutBlobTask&gt; AsyncPutBlob(const std::string &amp;blob_name, const char *data, size_t data_size,
+               size_t off = 0, float score = -1.0f, const Context &amp;context = Context());
+  Future&lt;PutBlobTask&gt; AsyncPutBlob(const std::string &amp;blob_name, const ctp::ipc::ShmPtr&lt;&gt; &amp;data,
+               size_t data_size, size_t off = 0, float score = -1.0f, const Context &amp;context = Context());
+
+  void GetBlob(const std::string &amp;blob_name, char *data, size_t data_size, size_t off = 0);
+  void GetBlob(const std::string &amp;blob_name, ctp::ipc::ShmPtr&lt;&gt; data, size_t data_size, size_t off = 0);
+  Future&lt;GetBlobTask&gt; AsyncGetBlob(const std::string &amp;blob_name, char *data, size_t data_size, size_t off = 0);
+
+  float GetBlobScore(const std::string &amp;blob_name);
+  u64 GetBlobSize(const std::string &amp;blob_name);
+  std::vector&lt;std::string&gt; GetContainedBlobs();
+  void ReorganizeBlob(const std::string &amp;blob_name, float new_score);
+  const TagId &amp;GetTagId() const;
+};
+</pre>
+<ul>
+  <li>The blocking <code>PutBlob(const char *)</code> throws on a non-zero return code. The private-buffer forms need no shared-memory management; the <code>ShmPtr</code> forms take a buffer from <code>CLIO_IPC-&gt;AllocateBuffer</code> that the caller keeps alive until the task completes.</li>
+  <li>A private-buffer <code>AsyncGetBlob</code> served from the shared-memory cache returns an empty future: <code>Wait()</code> returns at once and the future must not be dereferenced. Otherwise <code>GetReturnCode()</code> is 0 on success after <code>Wait()</code>.</li>
+</ul>
+
+<h2 id="client">C++: Client</h2>
+<p>Every verb is asynchronous. Results live on the task after <code>Wait()</code>: <code>return_code_</code> or <code>GetReturnCode()</code> is 0 on success; <code>tag_id_</code> for GetOrCreateTag; <code>size_</code> for GetBlobSize; <code>results_</code> for TagQuery, SemanticSearch and TemporalSearch; parallel <code>tag_names_</code> and <code>blob_names_</code> for BlobQuery; <code>blob_names_</code> for GetContainedBlobs; <code>entries_</code> for PollTelemetryLog; <code>target_names_</code> for ListTargets.</p>
+<h3>Tags</h3>
+<pre data-label="cpp">
+Future&lt;GetOrCreateTagTask&lt;CreateParams&gt;&gt; AsyncGetOrCreateTag(const std::string &amp;tag_name,
+    const TagId &amp;tag_id = TagId::GetNull(), const PoolQuery &amp;pool_query = PoolQuery::Dynamic());
+Future&lt;GetOrCreateTagTask&lt;CreateParams&gt;&gt; AsyncGetOrCreateTag(const std::string &amp;tag_name,
+    const clio::run::PoolId &amp;fault_pool_id, const std::string &amp;fault_pool_name, const std::string &amp;fault_params,
+    const TagId &amp;tag_id = TagId::GetNull(), const PoolQuery &amp;pool_query = PoolQuery::Dynamic());
+Future&lt;DelTagTask&gt;    AsyncDelTag(const TagId &amp;tag_id, const PoolQuery &amp;pool_query = PoolQuery::Dynamic());
+Future&lt;DelTagTask&gt;    AsyncDelTag(const std::string &amp;tag_name, const PoolQuery &amp;pool_query = PoolQuery::Dynamic(),
+    bool posix_unlink = false);
+Future&lt;RenameTagTask&gt; AsyncRenameTag(const std::string &amp;old_name, const std::string &amp;new_name,
+    const TagId &amp;tag_id = TagId::GetNull(), const PoolQuery &amp;pool_query = PoolQuery::Broadcast());
+Future&lt;SyncTagTask&gt;   AsyncSyncTag(const TagId &amp;tag_id, const PoolQuery &amp;pool_query = PoolQuery::Broadcast(),
+    int min_persistence = -1);
+Future&lt;GetContainedBlobsTask&gt; AsyncGetContainedBlobs(const TagId &amp;tag_id,
+    const PoolQuery &amp;pool_query = PoolQuery::Dynamic());
+</pre>
+<p>The second <code>AsyncGetOrCreateTag</code> registers another pool as the tag's fault handler: a get of a blob the tag does not hold is dispatched to that pool with <code>fault_params</code> in the context. The Context Assimilation Engine and the paged vectors' <code>Copy</code> use it.</p>
+<h3>Blobs</h3>
+<pre data-label="cpp">
+Future&lt;PutBlobTask&gt; AsyncPutBlob(const TagId &amp;tag_id, const std::string &amp;blob_name,
+    u64 offset, u64 size, const char *priv_data, float score = -1.0f,
+    const Context &amp;context = Context(), u32 flags = 0, const PoolQuery &amp;pool_query = PoolQuery::Dynamic());
+Future&lt;PutBlobTask&gt; AsyncPutBlob(const TagId &amp;tag_id, const std::string &amp;blob_name,
+    u64 offset, u64 size, ctp::ipc::ShmPtr&lt;&gt; blob_data, float score = -1.0f,
+    const Context &amp;context = Context(), u32 flags = 0, const PoolQuery &amp;pool_query = PoolQuery::Dynamic());
+int AsyncPutBlobDefer(const TagId &amp;tag_id, const std::string &amp;blob_name, u64 offset, u64 size,
+    const char *priv_data, float score = -1.0f, const Context &amp;context = Context(), u32 flags = 0,
+    const PoolQuery &amp;pool_query = PoolQuery::Dynamic(), u64 max_inflight_bytes = 0);
+static u64 AwaitPutsUntilSpace(u64 max_inflight_bytes, u64 max_inflight_count = std::numeric_limits&lt;u64&gt;::max());
+static u64 DeferErrorCount();
+
+Future&lt;GetBlobTask&gt; AsyncGetBlob(const TagId &amp;tag_id, const std::string &amp;blob_name,
+    u64 offset, u64 size, u32 flags, char *priv_data,
+    const PoolQuery &amp;pool_query = PoolQuery::Dynamic(), const Context &amp;context = Context());
+Future&lt;GetBlobTask&gt; AsyncGetBlob(const TagId &amp;tag_id, const std::string &amp;blob_name,
+    u64 offset, u64 size, u32 flags, ctp::ipc::ShmPtr&lt;&gt; blob_data,
+    const PoolQuery &amp;pool_query = PoolQuery::Dynamic(), const Context &amp;context = Context());
+Future&lt;GetBlobTask&gt; AsyncGetBlobDefer(const TagId &amp;tag_id, const std::string &amp;blob_name,
+    u64 offset, u64 size, char *priv_data, u32 flags = 0,
+    const PoolQuery &amp;pool_query = PoolQuery::Dynamic(), const Context &amp;context = Context());
+
+Future&lt;DelBlobTask&gt;        AsyncDelBlob(const TagId &amp;tag_id, const std::string &amp;blob_name,
+    const PoolQuery &amp;pool_query = PoolQuery::Dynamic(), u32 del_flags = 0);
+Future&lt;TruncateBlobTask&gt;   AsyncTruncateBlob(const TagId &amp;tag_id, const std::string &amp;blob_name, u64 new_size,
+    const PoolQuery &amp;pool_query = PoolQuery::Dynamic());
+Future&lt;GetBlobSizeTask&gt;    AsyncGetBlobSize(const TagId &amp;tag_id, const std::string &amp;blob_name,
+    const PoolQuery &amp;pool_query = PoolQuery::Dynamic(), int replica = 0);
+Future&lt;GetBlobScoreTask&gt;   AsyncGetBlobScore(const TagId &amp;tag_id, const std::string &amp;blob_name,
+    const PoolQuery &amp;pool_query = PoolQuery::Dynamic());
+Future&lt;ReorganizeBlobTask&gt; AsyncReorganizeBlob(const TagId &amp;tag_id, const std::string &amp;blob_name, float new_score,
+    const PoolQuery &amp;pool_query = PoolQuery::Dynamic(), int replica = 0);
+Future&lt;EvictTask&gt;          AsyncEvict(float min_tier_score, u64 bytes,
+    const PoolQuery &amp;pool_query = PoolQuery::Broadcast(), u32 droppable_only = 0);
+</pre>
+<p><code>Context</code> flags: <code>kNoFault</code> suppresses fault-handler dispatch for one operation; <code>kPutIfAbsent</code> fails with <code>kPutExistsRc</code> when the blob exists; <code>kPutIfVersion</code> applies the put only at the expected content version and fails with a version-mismatch code otherwise. A deferred put returns 0 when submitted. The private-buffer <code>AsyncGetBlob</code> has three paths: a copy out of the shared-memory cache with no task (the future is empty), a direct read when the caller is inside the runtime, and client staging.</p>
+<h3>Queries and telemetry</h3>
+<pre data-label="cpp">
+Future&lt;TagQueryTask&gt;       AsyncTagQuery(const std::string &amp;tag_regex, u32 max_tags = 0,
+    const PoolQuery &amp;pool_query = PoolQuery::Broadcast());
+Future&lt;BlobQueryTask&gt;      AsyncBlobQuery(const std::string &amp;tag_regex, const std::string &amp;blob_regex,
+    u32 max_blobs = 0, const PoolQuery &amp;pool_query = PoolQuery::Broadcast());
+Future&lt;SemanticSearchTask&gt; AsyncSemanticSearch(const std::string &amp;tag_regex, const std::string &amp;blob_regex,
+    const std::string &amp;query_text, u32 k = 10, const PoolQuery &amp;pool_query = PoolQuery::Broadcast());
+Future&lt;TemporalSearchTask&gt; AsyncTemporalSearch(const std::string &amp;tag_regex, const std::string &amp;blob_regex,
+    Timestamp time_begin = 0, Timestamp time_end = 0, u32 max_entries = 0,
+    const PoolQuery &amp;pool_query = PoolQuery::Broadcast());
+Future&lt;PollTelemetryLogTask&gt; AsyncPollTelemetryLog(std::uint64_t minimum_logical_time,
+    const PoolQuery &amp;pool_query = PoolQuery::Dynamic());
+Future&lt;ListTargetsTask&gt;    AsyncListTargets(const PoolQuery &amp;pool_query = PoolQuery::Dynamic());
+</pre>
+<p>Patterns are matched against the whole name with <code>std::regex_match</code>. <code>SemanticSearchResult</code> has <code>tag_id_</code>, <code>blob_name_</code> and <code>score_</code>; <code>TemporalSearchResult</code> has <code>tag_id_</code>, <code>blob_name_</code> and <code>last_modified_</code>. <code>Timestamp</code> is a <code>u64</code> of nanoseconds on <code>std::chrono::steady_clock</code> (see the note on the <a href="/docs/cte/usage.html">usage page</a>). SemanticSearch is answered by the indexer module, so the client must be bound to it.</p>
+<h3>Pool queries</h3>
+<ul>
+  <li><code>PoolQuery::Dynamic()</code>: route to the owner of the tag or blob. The default for data operations.</li>
+  <li><code>PoolQuery::Broadcast()</code>: every container answers and the runtime merges. The default for queries, RenameTag, SyncTag and Evict.</li>
+  <li><code>PoolQuery::Local()</code>: only this node.</li>
+</ul>
+
+<h2 id="python">Python: clio_cte_core_ext</h2>
+<p>The module binds the same client. Payloads are <code>bytes</code>, every blocking call releases the GIL, and asynchronous calls return a <code>Future</code>. The <a href="/docs/cte/python.html">Python module reference</a> lists every call with its arguments, defaults and return value. In short:</p>
+<ul>
+  <li><strong>Setup:</strong> <code>clio_init(mode, default_with_runtime=False, is_restart=False)</code>, <code>initialize_cte(config_path, pool_query)</code>, <code>get_cte_client()</code>.</li>
+  <li><strong>Tag:</strong> <code>Tag(tag_name)</code> or <code>Tag(tag_id)</code>; <code>PutBlob(blob_name, data, off=0)</code>, <code>GetBlob(blob_name, data_size, off=0)</code>, <code>GetBlobScore</code>, <code>GetBlobSize</code>, <code>GetContainedBlobs</code>, <code>ReorganizeBlob(blob_name, new_score)</code>, <code>GetTagId</code>.</li>
+  <li><strong>Client, blocking:</strong> <code>TagQuery</code>, <code>BlobQuery</code>, <code>SemanticSearch</code>, <code>TemporalSearch</code>, <code>ReorganizeBlob</code>, <code>DelBlob</code>, <code>PollTelemetryLog</code>, <code>RegisterTarget</code>.</li>
+  <li><strong>Client, asynchronous:</strong> <code>AsyncGetOrCreateTag</code>, <code>AsyncPutBlob</code>, <code>AsyncPutBlobIfAbsent</code>, <code>AsyncPutBlobIfVersion</code>, <code>AsyncGetBlob</code>, <code>AsyncGetBlobVersioned</code>, <code>AsyncGetBlobDefer</code>, <code>AsyncPutBlobDefer</code> (returns an <code>int</code>), <code>AwaitPutsUntilSpace</code>, <code>DeferErrorCount</code>, <code>AsyncGetBlobSize</code>, <code>AsyncGetContainedBlobs</code>, <code>AsyncDelBlob</code>, <code>AsyncReorganizeBlob</code>, <code>AsyncTagQuery</code>, <code>AsyncBlobQuery</code>, <code>AsyncSemanticSearch</code>, <code>AsyncTemporalSearch</code>, <code>AsyncPollTelemetryLog</code>, <code>AsyncRegisterTarget</code>, <code>AsyncGetCapacity</code>, <code>AsyncListTargets</code>, <code>AsyncStatTargets</code>, <code>AsyncGetTargetInfo</code>.</li>
+  <li><strong>Types:</strong> <code>UniqueId</code> (the tag id), <code>PoolQuery</code>, <code>Future</code>, <code>SemanticSearchResult</code>, <code>TemporalSearchResult</code>, <code>CteTelemetry</code>, <code>CapacityInfo</code>, <code>TargetInfo</code>, and the enums <code>RuntimeMode</code>, <code>BdevType</code> (<code>kFile</code>, <code>kRam</code>) and <code>CteOp</code>.</li>
+</ul>
+
+<h2 id="env">Environment variables</h2>
+<ul>
+  <li><code>CLIO_CTE_POOL</code>: pool the shared CTE client binds to, as <code>major.minor</code>. Default 512.0.</li>
+  <li><code>CLIO_WITH_RUNTIME</code>: <code>0</code> attaches to a running runtime, <code>1</code> starts one in the process. Overrides the <code>default_with_runtime</code> argument of <code>CLIO_INIT</code> and <code>clio_init</code>.</li>
+  <li><code>CLIO_SERVER_CONF</code>: path of the runtime configuration file. Unset means <code>~/.clio/clio.yaml</code>, then built-in defaults.</li>
+  <li><code>CLIO_WAIT_SERVER</code>: seconds a client waits for the runtime to answer before <code>clio_init</code> gives up. Default 30.</li>
+  <li><code>CLIO_BIND_ADDR</code>, <code>CLIO_SERVER_ADDR</code>: the address the runtime binds and the address clients connect to. On Windows set both to <code>127.0.0.1</code>.</li>
+</ul>
+
+<h2 id="yaml">Compose YAML: clio_cte_core</h2>
+<p>The CTE is one entry in the runtime's <code>compose</code> list. Sizes accept suffixes <code>k</code> to <code>p</code> (powers of 1024). This is the default file's entry with comments removed; the <a href="/modules/cte-core.html">module page</a> adds the behavior behind each key.</p>
+<pre data-label="yaml">
+compose:
+  - mod_name: clio_cte_core
+    pool_name: cte_main
+    pool_query: local
+    pool_id: "512.0"
+    storage:
+      - path: "ram::cte_ram_tier1"
+        bdev_type: "ram"
+        capacity_limit: "0g"
+        score: 1.0
+      - path: "${CLIO_STORAGE_ROOT}/cte_disk_tier.dat"
+        bdev_type: "file"
+        capacity_limit: "10GB"
+        score: 0.2
+        persistence_level: "temporary"
+    performance:
+      metadata_log_path: "${CLIO_STORAGE_ROOT}/cte_metadata_log"
+      transaction_log_capacity: "32MB"
+    dpe:
+      dpe_type: "max_bw"
+    targets:
+      neighborhood: 1
+      default_target_timeout_ms: 30000
+      poll_period_ms: 5000
+</pre>
+<h3>storage (list)</h3>
+<ul>
+  <li><code>path</code>: <code>ram::&lt;name&gt;</code> for memory tiers, a file path for file tiers, a URL for <code>s3</code> and <code>gcs</code>. Required unless binding to an existing pool.</li>
+  <li><code>bdev_type</code>: <code>file</code>, <code>ram</code>, <code>hbm</code>, <code>pinned</code>, <code>noop</code>, <code>s3</code> or <code>gcs</code>.</li>
+  <li><code>capacity_limit</code>: size string. <code>0</code> is valid only for <code>ram</code> and means 80% of system DRAM. A file tier grows lazily up to this cap.</li>
+  <li><code>score</code>: 0.0 to 1.0. Absent means automatic scoring from measured bandwidth.</li>
+  <li><code>persistence_level</code>: <code>volatile</code> (default), <code>temporary</code> or <code>long_term</code>. Only a tier above volatile can hold the durable copy a flush or SyncTag asks for.</li>
+  <li><code>growth_unit</code>: lazy-growth step of a file tier, default 1 GB.</li>
+  <li><code>existing_pool_id</code>, <code>existing_pool_module</code>: bind an already composed pool, such as <code>clio_safe_bdev</code>, as a tier instead of creating a block device. The module name is for logging only.</li>
+</ul>
+<h3>performance</h3>
+<ul>
+  <li><code>metadata_log_path</code>: directory for the metadata write-ahead log and snapshots. Empty disables metadata durability.</li>
+  <li><code>transaction_log_capacity</code>: WAL capacity, default 32 MB.</li>
+  <li><code>flush_metadata_period_ms</code> (5000), <code>flush_data_period_ms</code> (10000), <code>flush_data_min_persistence</code> (1).</li>
+  <li><code>fsync_mode</code>: <code>durable</code> (default) or <code>deferred</code>.</li>
+  <li><code>stat_targets_period_ms</code> (1000, valid 10 to 60000), <code>max_concurrent_operations</code> (64).</li>
+</ul>
+<h3>targets</h3>
+<ul>
+  <li><code>neighborhood</code>: nodes, in ring order, a container registers persistent targets from. Built-in default 4; the shipped file sets 1.</li>
+  <li><code>default_target_timeout_ms</code> (30000), <code>poll_period_ms</code> (5000).</li>
+  <li><code>failover_to_successor</code> (false): route a dead owner's blobs to the first live successor.</li>
+</ul>
+<h3>dpe and organizer</h3>
+<ul>
+  <li><code>dpe.dpe_type</code>: <code>max_bw</code> (default), <code>round_robin</code> or <code>random</code>.</li>
+  <li><code>organizer</code>: <code>none</code> (default), <code>frecency</code>, <code>grayscott</code>, <code>cyclic</code>, <code>scatter</code> or <code>hotset</code>. <code>organizer_tasks</code> (1) and <code>organizer_period_ms</code> (5000) size and pace the periodic rescoring.</li>
+</ul>
+
+<h2>Where to go next</h2>
+<ul>
+  <li><a href="/docs/cte/python.html">Python module reference</a>: every <code>clio_cte_core_ext</code> call.</li>
+  <li><a href="/docs/cte/usage.html">Usage</a>: the same calls in task order with examples.</li>
+  <li><a href="/modules/cte-core.html">CTE core module</a> and <a href="/design/cte-core.html">CTE design</a>: behavior and internals.</li>
+</ul>

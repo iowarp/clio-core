@@ -1,0 +1,52 @@
+<!--
+title: Overview
+heading: The Context <em>Assimilation Engine.</em>
+description: What the Context Assimilation Engine (CAE) is, the problem it solves, its transfer and assimilator model, how it relates to the other CLIO Core technologies, and where to read next.
+eyebrow: Docs · Context Assimilation Engine
+lede: The Context Assimilation Engine (CAE) brings data from outside the stack into the Context Transfer Engine, and can describe it on the way in. It is a runtime module that runs one assimilator per source scheme, a command-line tool that submits YAML lists of transfers, and an optional summarizer that labels data as it is written.
+facts: Module | clio_cae_core, pool 400.0 ; Tool | clio_cae <omni.yaml> ; Interposer | clio_cae_summarizer, pool 401.0 ; Source | context-assimilation-engine/
+-->
+<h2>What it is</h2>
+<p>Everything in CLIO Core stores data as tags holding blobs in the <a href="/docs/cte/index.html">Context Transfer Engine</a> (CTE). The CAE is the part that turns something else into tags and blobs: a file on disk, a dataset in an HDF5 file, an object in a bucket, a URL, or a string inside a program. Once imported, that data is tiered, replicated, searched and mounted like anything written through the normal client.</p>
+<p>The CAE has three parts:</p>
+<ul>
+  <li><strong>The core module</strong>, <code>clio_cae_core</code>. A pool in the runtime that receives a list of transfers, picks an assimilator for each source and writes the result into a destination tag. The default configuration composes it at pool 400.0.</li>
+  <li><strong>The <code>clio_cae</code> tool.</strong> Reads an OMNI file, a YAML list of transfers, and submits it to the core module as one task.</li>
+  <li><strong>The summarizer</strong>, <code>clio_cae_summarizer</code>. An optional interposer that forwards every CTE operation and, after a matching put, asks a language model to label the blob and stores the reply beside it.</li>
+</ul>
+
+<h2>The problem it solves</h2>
+<p>Scientific data arrives in many containers and from many places. Applications that read it through the CTE want one addressing scheme, tag and blob, and want the data where the CTE can place and index it. The CAE is the single entry point for that: one YAML format for every source, one task that does the copying inside the runtime, and one set of rules for naming the resulting blobs. It also solves two second-order problems:</p>
+<ul>
+  <li><strong>Ingest cost.</strong> A transfer can be registered without copying anything. The CAE then ingests a blob the first time something reads it. See <a href="/docs/cae/on-demand.html">On-demand ingest and pagify</a>.</li>
+  <li><strong>Meaning.</strong> Data that passes through the summarizer gets a model-written label stored as a sibling blob, and data that passes through the indexer becomes keyword-searchable. See <a href="/docs/cae/usage.html#describing-content-in-the-i-o-path">Describing content in the I/O path</a>.</li>
+</ul>
+
+<h2>Key concepts</h2>
+<ul>
+  <li><strong>Transfer.</strong> One source, one destination and a format. In YAML it is one entry under <code>transfers</code>. In C++ and Python it is an <code>AssimilationCtx</code>. Transfers in a list run in order, each finishing before the next starts.</li>
+  <li><strong>Source URL.</strong> The part of <code>src</code> before <code>://</code> or <code>::</code> is the scheme and selects the assimilator: <code>file::</code>, <code>string::</code>, <code>hdf5::</code>, <code>http://</code>, <code>https://</code>, <code>s3://</code>, <code>gs://</code> or <code>gcs://</code>, and <code>globus://</code>.</li>
+  <li><strong>Destination.</strong> <code>dst</code> is <code>iowarp::&lt;tag name&gt;</code>. The binary and string assimilators write into that tag. The HDF5 assimilator writes one tag per dataset, named <code>&lt;tag name&gt;/&lt;dataset path&gt;</code>.</li>
+  <li><strong>Blob naming.</strong> A file becomes blobs <code>chunk_0</code>, <code>chunk_1</code>, and so on, 1 MiB each by default. A <code>string::name</code> source becomes one blob called <code>name</code>.</li>
+  <li><strong>Assimilator.</strong> A C++ class implementing <code>BaseAssimilator</code>. Reads one kind of source and puts blobs through the CTE client. Shipped assimilators are listed on the <a href="/docs/cae/usage.html#sources-and-formats">usage page</a>; new ones are described on the <a href="/docs/cae/extend.html">extending page</a>.</li>
+  <li><strong>Interposer.</strong> A module that speaks the CTE core's task interface and forwards to the pool named by its <code>next_pool_id</code>. The summarizer is one. The CAE core also forwards <code>GetOrCreateTag</code>, <code>PutBlob</code>, <code>GetBlob</code> and <code>SemanticSearch</code>, so a CTE client can be pointed at it.</li>
+</ul>
+
+<h2>How it relates to the other technologies</h2>
+<ul>
+  <li><a href="/docs/runtime/index.html">Context Runtime</a> hosts the CAE core and the summarizer as pools, runs their task coroutines, and loads their configuration from the <code>compose</code> list.</li>
+  <li><a href="/docs/cte/index.html">Context Transfer Engine</a> is where everything lands. The CAE core writes through its <code>next_pool_id</code>, by default the top of the interposition chain at 563.0, so imports pass the cache, the indexer and replication before reaching the core.</li>
+  <li><a href="/docs/cee/index.html">Context Exploration Engine</a> calls the CAE for its <code>context_bundle</code> operation and the CTE for query and retrieve. If you want to import from Python, that is the API to use.</li>
+  <li><a href="/docs/context-fs/index.html">Context FS</a> does not use the CAE. Files written through a mount are already tags and blobs. The default configuration composes the CAE beside the filesystem chain, not inside it.</li>
+  <li><a href="/docs/ml/index.html">Machine learning</a> uses the CAE to map a staged float32 file onto a dataset's tag, one blob per page, so a model can train on a file without loading it.</li>
+  <li><a href="/docs/memory-expansion/index.html">Memory expansion</a> uses the same CTE fault mechanism the CAE uses for on-demand ingest, with its own fault handler rather than an assimilator.</li>
+</ul>
+
+<h2>Where to go next</h2>
+<ul>
+  <li><a href="/docs/cae/install.html">Install</a>: which packages include the CAE and the CMake options for HDF5, S3, Google Cloud Storage and Globus.</li>
+  <li><a href="/docs/cae/usage.html">Usage</a>: writing OMNI files, running <code>clio_cae</code>, importing from the cloud, and labeling data in the I/O path.</li>
+  <li><a href="/docs/cae/api.html">API reference</a>: the OMNI schema, the tool, <code>AssimilationCtx</code>, the C++ client, compose keys and environment variables.</li>
+  <li><a href="/docs/cae/extend.html">Writing an assimilator</a>: the <code>BaseAssimilator</code> interface and the factory.</li>
+  <li><a href="/docs/cae/on-demand.html">On-demand ingest and pagify</a>: ingest on fault and numbered pages over named blobs.</li>
+</ul>

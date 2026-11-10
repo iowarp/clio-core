@@ -13,7 +13,7 @@ facts: Storage | Context FS, Context Transfer Engine ; Context | Assimilation an
     <li>Files spread across the tiers you compose (RAM, NVMe, erasure-coded arrays, Amazon S3 or Google Cloud buckets) by score, with distributed metadata and no metadata server.</li>
     <li>Every file is also tags and blobs in the Context Transfer Engine, so search, assimilation and the other technologies use it without a copy.</li>
 </ul>
-<p><a href="/technologies/context-fs.html">Context FS overview</a> · <a href="/docs/context-fs.html">Docs</a></p>
+<p><a href="/technologies/context-fs.html">Context FS overview</a> · <a href="/docs/context-fs/usage.html">Docs</a></p>
 
 <h2>Context Assimilation Engine</h2>
 <p class="eyebrow">Context</p>
@@ -23,7 +23,7 @@ facts: Storage | Context FS, Context Transfer Engine ; Context | Assimilation an
     <li>Describes data in the I/O path: the summarizer labels it and the indexer makes it searchable as it lands.</li>
     <li>Serves imported data as numbered pages, so memory expansion and clio-ml can work on it directly.</li>
 </ul>
-<p><a href="/technologies/cae.html">Context Assimilation Engine overview</a> · <a href="/docs/cae.html">Docs</a></p>
+<p><a href="/technologies/cae.html">Context Assimilation Engine overview</a> · <a href="/docs/cae/usage.html">Docs</a></p>
 
 <h2>Context Exploration Engine</h2>
 <p class="eyebrow">Context</p>
@@ -33,7 +33,7 @@ facts: Storage | Context FS, Context Transfer Engine ; Context | Assimilation an
     <li>Sees everything written through Context FS, the Context Transfer Engine or the assimilation engine, with no import step.</li>
     <li>Returns matches packed into one size-bounded buffer, ready for an analysis or a model.</li>
 </ul>
-<p><a href="/technologies/cee.html">Context Exploration Engine overview</a> · <a href="/docs/cee.html">Docs</a></p>
+<p><a href="/technologies/cee.html">Context Exploration Engine overview</a> · <a href="/docs/cee/usage.html">Docs</a></p>
 
 <h2>Context Transfer Engine</h2>
 <p class="eyebrow">Storage</p>
@@ -43,7 +43,7 @@ facts: Storage | Context FS, Context Transfer Engine ; Context | Assimilation an
     <li>Regex, keyword and time-window queries, and a shared-memory path for clients on the same node.</li>
     <li>The substrate every other technology writes to.</li>
 </ul>
-<p><a href="/technologies/context-transfer-engine.html">Context Transfer Engine overview</a> · <a href="/docs/cte.html">Docs</a></p>
+<p><a href="/technologies/context-transfer-engine.html">Context Transfer Engine overview</a> · <a href="/docs/cte/usage.html">Docs</a></p>
 
 <h2>Context Runtime</h2>
 <p class="eyebrow">Runtime</p>
@@ -52,7 +52,7 @@ facts: Storage | Context FS, Context Transfer Engine ; Context | Assimilation an
     <li>One abstraction for moving data over shared memory, sockets, TCP and storage tiers.</li>
     <li>Recompose the stack, add nodes and recover from failures while it runs.</li>
 </ul>
-<p><a href="/technologies/context-runtime.html">Context Runtime overview</a> · <a href="/docs/runtime.html">Docs</a></p>
+<p><a href="/technologies/context-runtime.html">Context Runtime overview</a> · <a href="/docs/runtime/usage.html">Docs</a></p>
 
 <h2>Memory expansion</h2>
 <p class="eyebrow">Memory</p>
@@ -61,7 +61,7 @@ facts: Storage | Context FS, Context Transfer Engine ; Context | Assimilation an
     <li>Pages spill to DRAM and storage tiers; placement, coherence and persistence are handled for you.</li>
     <li>Measured within 0.88-1.19x of MPI, oneCCL and Intel SHMEM on up to 64 Aurora nodes.</li>
 </ul>
-<p><a href="/technologies/memory-expansion.html">Memory expansion overview</a> · <a href="/docs/memory-expansion.html">Docs</a></p>
+<p><a href="/technologies/memory-expansion.html">Memory expansion overview</a> · <a href="/docs/memory-expansion/usage.html">Docs</a></p>
 
 <h2>Machine learning</h2>
 <p class="eyebrow">Compute</p>
@@ -70,7 +70,7 @@ facts: Storage | Context FS, Context Transfer Engine ; Context | Assimilation an
     <li>Trains out of core: data larger than GPU memory streams from the tiers you compose.</li>
     <li>Measured 8-59x faster per iteration than Spark MLlib.</li>
 </ul>
-<p><a href="/technologies/machine-learning.html">Machine learning overview</a> · <a href="/docs/ml/index.html">Docs</a></p>
+<p><a href="/technologies/machine-learning.html">Machine learning overview</a> · <a href="/docs/ml/usage.html">Docs</a></p>
 
 <h2>How the numbers on these pages were measured</h2>
 <p>Every figure on the technology pages comes from a benchmark in the repository, with its hardware and its caveats. Where a comparison favors another system, the page says so. Most runs are single runs on one machine or a small allocation; treat them as measured examples, not guarantees for your hardware. Each page links the source document so you can rerun it.</p>

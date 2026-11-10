@@ -60,29 +60,43 @@ SITE_SUMMARY = (
     "written lets you search files from Python by BM25 keyword relevance or name pattern. It is "
     "written in C++ with Python bindings and installs with pip, conda, Docker, Spack or from source.")
 
-def _ml_algorithm_pages():
-    """Every docs/ml/<algo>.html page, labelled by its title."""
-    out = []
-    for f in sorted((Path(__file__).parent / "pages" / "docs" / "ml").glob("*.html")):
-        if f.name == "index.html":
-            continue
-        m = re.search(r"^title:\s*(.+)$", f.read_text(encoding="utf-8"), re.M)
-        out.append((f"docs/ml/{f.name}", m.group(1).strip() if m else f.stem))
-    return out
+def _title_of(f: Path) -> str:
+    m = re.search(r"^title:\s*(.+)$", f.read_text(encoding="utf-8"), re.M)
+    return m.group(1).strip() if m else f.stem
 
 
-ML_ALGOS = _ml_algorithm_pages()
+# Every technology has its own docs section, docs/<tech>/, with its own
+# sidebar. These pages come first, in this order, when they exist.
+DOC_CORE_PAGES = [("index.html", "Overview"), ("install.html", "Install"),
+                  ("quickstart.html", "Quickstart"), ("usage.html", "Usage"),
+                  ("api.html", "API reference")]
+
+
+def _tech_docs_nav(tech_dir: str, label: str) -> list:
+    """Sidebar groups for docs/<tech_dir>/: the core pages, then the rest
+    (titled "Algorithms" for machine learning, else "More")."""
+    d = Path(__file__).parent / "pages" / "docs" / tech_dir
+    if not d.is_dir():
+        return []
+    core = [(f"docs/{tech_dir}/{n}", l) for n, l in DOC_CORE_PAGES if (d / n).exists()]
+    names = {n for n, _ in DOC_CORE_PAGES}
+    rest = [(f"docs/{tech_dir}/{f.name}", _title_of(f))
+            for f in sorted(d.glob("*.html")) if f.name not in names]
+    groups = [(label, core)]
+    if rest:
+        groups.append(("Algorithms" if tech_dir == "ml" else "More", rest))
+    return groups
 
 # Section navigation: (group title, [(page path, label), ...]).
 # Each technology: (technology page, docs page, label). Drives the
 # Technologies and Docs dropdowns, so both list the same systems.
 TECHNOLOGIES = [
-    ("technologies/context-fs.html", "docs/context-fs.html", "Context FS"),
-    ("technologies/cae.html", "docs/cae.html", "Context Assimilation Engine"),
-    ("technologies/cee.html", "docs/cee.html", "Context Exploration Engine"),
-    ("technologies/context-transfer-engine.html", "docs/cte.html", "Context Transfer Engine"),
-    ("technologies/context-runtime.html", "docs/runtime.html", "Context Runtime"),
-    ("technologies/memory-expansion.html", "docs/memory-expansion.html", "Memory expansion"),
+    ("technologies/context-fs.html", "docs/context-fs/index.html", "Context FS"),
+    ("technologies/cae.html", "docs/cae/index.html", "Context Assimilation Engine"),
+    ("technologies/cee.html", "docs/cee/index.html", "Context Exploration Engine"),
+    ("technologies/context-transfer-engine.html", "docs/cte/index.html", "Context Transfer Engine"),
+    ("technologies/context-runtime.html", "docs/runtime/index.html", "Context Runtime"),
+    ("technologies/memory-expansion.html", "docs/memory-expansion/index.html", "Memory expansion"),
     ("technologies/machine-learning.html", "docs/ml/index.html", "Machine learning"),
 ]
 
@@ -94,33 +108,10 @@ NAV = {
     "docs": [
         ("Start here", [
             ("docs/index.html", "Introduction"),
-            ("docs/installation.html", "Installation"),
-            ("docs/basic-usage.html", "Basic usage"),
+            ("docs/installation.html", "Install CLIO Core"),
             ("docs/concepts.html", "Core concepts"),
-            ("docs/cli.html", "CLI and environment"),
         ]),
-        ("Context FS", [
-            ("docs/context-fs.html", "Start and compose"),
-        ]),
-        ("Context Assimilation Engine", [
-            ("docs/cae.html", "Assimilate data"),
-        ]),
-        ("Context Exploration Engine", [
-            ("docs/cee.html", "Explore and search"),
-        ]),
-        ("Context Transfer Engine", [
-            ("docs/cte.html", "Data model and API"),
-            ("docs/python-api.html", "Python API"),
-        ]),
-        ("Context Runtime", [
-            ("docs/runtime.html", "Build a ChiMod"),
-        ]),
-        ("Memory expansion", [
-            ("docs/memory-expansion.html", "CPU and GPU vectors"),
-        ]),
-        ("Machine learning", [
-            ("docs/ml/index.html", "Overview"),
-        ] + ML_ALGOS),
+        ("Technologies", [(dp, lb) for _, dp, lb in TECHNOLOGIES]),
     ],
     "tutorials": [
         ("Overview", [
@@ -199,6 +190,15 @@ REDIRECTS = {
     "install/index.html": "docs/installation.html",
     "tutorials/fuse-adapters.html": "tutorials/fuse-linux.html",
     "technologies/kv-store.html": "technologies/context-transfer-engine.html",
+    "docs/context-fs.html": "docs/context-fs/usage.html",
+    "docs/basic-usage.html": "docs/context-fs/quickstart.html",
+    "docs/cli.html": "docs/context-fs/cli.html",
+    "docs/cae.html": "docs/cae/usage.html",
+    "docs/cee.html": "docs/cee/usage.html",
+    "docs/cte.html": "docs/cte/usage.html",
+    "docs/python-api.html": "docs/cte/python.html",
+    "docs/runtime.html": "docs/runtime/usage.html",
+    "docs/memory-expansion.html": "docs/memory-expansion/usage.html",
 }
 
 ICON_GITHUB = ('<svg class="filled" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8'
@@ -401,6 +401,10 @@ def add_heading_ids(body: str) -> tuple[str, list[tuple[int, str, str]]]:
     return body, toc
 
 
+for _tp, _dp, _lb in TECHNOLOGIES:
+    _dir = _dp.split("/")[1]
+    NAV[f"docs/{_dir}"] = _tech_docs_nav(_dir, _lb)
+
 # Primary entries that open a dropdown of their section's pages.
 DROPDOWNS = {"technologies", "docs"}
 
@@ -495,6 +499,15 @@ def footer_html() -> str:
 </footer>"""
 
 
+def nav_key(page: str) -> str:
+    """Return the sidebar key of a page: docs/<tech> inside a technology's
+    docs section, else its section."""
+    parts = page.split("/")
+    if len(parts) > 2 and parts[0] == "docs" and f"docs/{parts[1]}" in NAV:
+        return f"docs/{parts[1]}"
+    return section_of(page)
+
+
 def section_of(page: str) -> str:
     """Return the section key of a page (``overview`` for top-level pages)."""
     return page.split("/")[0] if "/" in page else "overview"
@@ -578,7 +591,8 @@ def side_nav_html(section: str, page: str) -> str:
             f'<li><a href="/{href}"{" aria-current=\"page\"" if href == page else ""}>{label}</a></li>'
             for href, label in items)
         groups.append(f"<h2>{title}</h2><ul>{lis}</ul>")
-    label = section.capitalize()
+    label = section.capitalize() if "/" not in section else \
+        next((lb for _, dp, lb in TECHNOLOGIES if dp.startswith(section + "/")), section)
     return (f'<nav class="side-nav" aria-label="{label}"><details open><summary>{label} menu</summary>'
             f'<div>{"".join(groups)}</div></details></nav>')
 
@@ -658,8 +672,9 @@ def render_page(src: Path, out_root: Path) -> str:
     meta, body = parse_page(src)
     section = section_of(page)
     body = wrap_tables(render_code_blocks(body))
-    if section in NAV and meta.get("layout") != "landing":
-        main = render_guide(meta, body, section, page)
+    navk = nav_key(page)
+    if navk in NAV and meta.get("layout") != "landing":
+        main = render_guide(meta, body, navk, page)
     else:
         main = body
     doc = (head_html(meta, page) +
@@ -720,8 +735,9 @@ def page_order(pages: list[str]) -> list[str]:
     """
     ordered = [p for p in ["index.html"] if p in pages]
     for _, _, key in PRIMARY:
-        ordered += [href for _, items in NAV.get(key, []) for href, _ in items
-                    if href in pages and href not in ordered]
+        for nk in [key] + [k for k in NAV if k.startswith(key + "/")]:
+            ordered += [href for _, items in NAV.get(nk, []) for href, _ in items
+                        if href in pages and href not in ordered]
     return ordered + sorted(p for p in pages if p not in ordered)
 
 

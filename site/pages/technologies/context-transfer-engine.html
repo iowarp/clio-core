@@ -35,7 +35,7 @@ size = tag.GetBlobSize("params")
 print(tag.GetBlob("params", size, 0))        # get bytes back
 print(tag.GetContainedBlobs())               # list keys in the tag
 </pre>
-<p>The same operations exist in C++ (<code>clio::cte::core::Tag::PutBlob</code>, <code>GetBlob</code>), with asynchronous variants such as <code>AsyncPutBlob</code>, and on the client for whole-store queries (<code>TagQuery</code>, <code>BlobQuery</code>, <code>SemanticSearch</code>). The <a href="/docs/python-api.html">Python API reference</a> lists them all.</p>
+<p>The same operations exist in C++ (<code>clio::cte::core::Tag::PutBlob</code>, <code>GetBlob</code>), with asynchronous variants such as <code>AsyncPutBlob</code>, and on the client for whole-store queries (<code>TagQuery</code>, <code>BlobQuery</code>, <code>SemanticSearch</code>). The <a href="/docs/cte/python.html">Python API reference</a> lists them all.</p>
 
 <h2>Performance against Redis, RocksDB and DynamoDB</h2>
 <p>The repository's YCSB binding (<code>context-transfer-engine/benchmark/ycsb</code>) runs the standard workloads against CLIO Core and three other stores. Throughput in operations per second, higher is better:</p>

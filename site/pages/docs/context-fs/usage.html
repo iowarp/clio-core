@@ -1,18 +1,20 @@
 <!--
-title: Context FS
+title: Usage
 heading: Run <em>Context FS.</em>
-description: Start the CLIO Core runtime, mount Context FS with clio_cte_fuse on Linux, macOS and Windows, read the default compose chain, change the storage tiers, and find the advanced compose guides.
+description: Mount Context FS with clio_cte_fuse on Linux, macOS and Windows, read the default compose chain, change the storage tiers, tune the mount for one node or many, and find the advanced compose guides.
 eyebrow: Docs · Context FS
-lede: Context FS is the filesystem module composed over the Context Transfer Engine, plus the clio_cte_fuse daemon that mounts it. Starting it is two commands: start the runtime, then mount. This page covers both on each operating system, explains what the default configuration composes, and shows where to change the tiers.
-facts: Runtime | clio_run start ; Mount | clio_cte_fuse <mountpoint> -f ; Config | ~/.clio/clio.yaml or CLIO_SERVER_CONF ; Filesystem pool | 560.0
+lede: Starting Context FS is two commands: start the runtime, then mount. This page covers both on each operating system, explains what the default configuration composes, shows where to change the tiers, and lists the mount settings that matter on one node and on several.
+facts: Runtime | clio_run start ; Mount | clio_cte_fuse &lt;mountpoint&gt; -f ; Config | ~/.clio/clio.yaml or CLIO_SERVER_CONF ; Filesystem pool | 560.0
 -->
 <h2>How it starts</h2>
-<p>Two processes are involved. The runtime, started with <code>clio_run start</code>, reads the configuration file and composes the pools in its <code>compose</code> list: block devices, the CTE core, the interposition chain, and the filesystem module. The FUSE daemon, <code>clio_cte_fuse</code>, is a client of that runtime. It creates or binds the filesystem pool itself, so no extra compose step is needed before mounting.</p>
+<p>Two processes are involved. The runtime, started with <code>clio_run start</code>, reads the configuration file and composes the pools in its <code>compose</code> list: block devices, the CTE core, the interposition chain, the stream pool and the filesystem module. The FUSE daemon, <code>clio_cte_fuse</code>, is a client of that runtime. It creates or binds the filesystem pool itself, so no extra compose step is needed before mounting. The <code>clio_run</code> command is documented in the <a href="/docs/runtime/api.html">Context Runtime API reference</a>.</p>
 <p>Always mount with <code>CLIO_WITH_RUNTIME=0</code>. Without it the daemon starts a private runtime in its own process, and Python clients, <code>clio_cae</code> and other mounts will not see the same files.</p>
 
-<h2>Linux</h2>
+<h2>Mount on each platform</h2>
+<div class="tabs" data-platform data-label="Platform">
+  <section class="tab-panel" data-tab="Linux"><p class="tab-title">Linux</p>
 <pre data-label="shell">
-$ clio_run start &
+$ clio_run start &amp;
 $ mkdir -p ~/clio-mnt
 $ CLIO_WITH_RUNTIME=0 clio_cte_fuse ~/clio-mnt -f
 </pre>
@@ -21,50 +23,35 @@ $ CLIO_WITH_RUNTIME=0 clio_cte_fuse ~/clio-mnt -f
 $ fusermount3 -u ~/clio-mnt
 $ clio_run stop
 </pre>
-<p>Installing the FUSE packages and running in containers is covered in <a href="/tutorials/fuse-linux.html">FUSE on Linux</a>.</p>
-
-<h2>macOS</h2>
-<p>The pip wheel does not include the macOS adapter, so build it once against macFUSE as described in <a href="/tutorials/fuse-macos.html">FUSE on macOS</a>. Then:</p>
+<p>Installing the FUSE packages and running in containers is covered in <a href="/tutorials/fuse-linux.html">FUSE on Linux</a>.</p></section>
+  <section class="tab-panel" data-tab="macOS"><p class="tab-title">macOS</p>
+<p>The pip wheel does not include the macOS adapter, so build it once against macFUSE as described in <a href="/docs/context-fs/install.html">Install</a>. Then:</p>
 <pre data-label="shell">
-$ clio_run start &
+$ clio_run start &amp;
 $ mkdir -p ~/clio-mnt
 $ CLIO_WITH_RUNTIME=0 clio_cte_fuse ~/clio-mnt -f
 </pre>
-<p>On macOS 15.4 and newer with macFUSE 5.1 or later, <code>-o backend=fskit</code> selects FSKit and avoids the kernel extension; the mountpoint must then be under <code>/Volumes</code>. Unmount with <code>umount ~/clio-mnt</code>, or <code>diskutil unmount force</code> if a process still holds it open.</p>
-
-<h2>Windows</h2>
+<p>On macOS 15.4 and newer with macFUSE 5.1 or later, <code>-o backend=fskit</code> selects FSKit and avoids the kernel extension; the mountpoint must then be under <code>/Volumes</code>. Unmount with <code>umount ~/clio-mnt</code>, or <code>diskutil unmount force</code> if a process still holds it open. See <a href="/tutorials/fuse-macos.html">FUSE on macOS</a>.</p></section>
+  <section class="tab-panel" data-tab="Windows"><p class="tab-title">Windows</p>
 <p>Windows uses WinFsp, and the mountpoint is a drive letter or an empty folder path whose parent exists. Use two PowerShell windows. In the first:</p>
 <pre data-label="powershell">
-PS> clio_run start
+PS&gt;$env:CLIO_BIND_ADDR = "127.0.0.1"
+PS&gt;$env:CLIO_SERVER_ADDR = "127.0.0.1"
+PS&gt;clio_run start
 </pre>
 <p>In the second:</p>
 <pre data-label="powershell">
-PS> $env:CLIO_WITH_RUNTIME = "0"
-PS> clio_cte_fuse Z: -f
+PS&gt;$env:CLIO_WITH_RUNTIME = "0"
+PS&gt;$env:CLIO_SERVER_ADDR = "127.0.0.1"
+PS&gt;clio_cte_fuse Z: -f
 </pre>
 <p>To unmount, stop the daemon, then the runtime:</p>
 <pre data-label="powershell">
-PS> Stop-Process -Name clio_cte_fuse -Force
-PS> clio_run stop
+PS&gt;Stop-Process -Name clio_cte_fuse -Force
+PS&gt;clio_run stop
 </pre>
-<p>The default configuration binds the dashboard to 127.0.0.1, and networking examples on Windows should do the same. Installing WinFsp, the Microsoft Defender note and the <code>-o uid=-1,gid=-1</code> option for git are in <a href="/tutorials/fuse-windows.html">FUSE on Windows</a>.</p>
-
-<h2>Environment variables that matter here</h2>
-<dl class="notes">
-  <dt>CLIO_SERVER_CONF</dt>
-  <dd>Path of the runtime configuration file. When unset, the runtime looks for <code>~/.clio/clio.yaml</code>, then <code>~/.clio/clio_run.yaml</code>. The installed <code>clio_default.yaml</code> documents every key in comments and is the file this page quotes from.</dd>
-  <dt>CLIO_STORAGE_ROOT</dt>
-  <dd>Directory for on-disk runtime state: the CTE disk tier, the metadata and indexer logs, and the filesystem's namespace log. Defaults to <code>~/.clio</code>. <code>clio_run start --disk &lt;path&gt;</code> sets it for one run. Paths written out explicitly in a custom config are used as written.</dd>
-  <dt>CLIO_WITH_RUNTIME</dt>
-  <dd><code>0</code> attaches the daemon (or any client) to the running runtime. The default of <code>1</code> starts a runtime in-process.</dd>
-  <dt>CLIO_PORT</dt>
-  <dd>Base RPC port, default 9413. The runtime binds the base port, port+1 and port+3, and refuses to start if any is taken.</dd>
-  <dt>CLIO_FUSE_ATTR_CACHE_S, CLIO_FUSE_WRITEBACK</dt>
-  <dd>Kernel attribute-cache lifetime (1.0 s on one node, 0 on several) and writeback caching (off). Set the first to <code>0</code> when several processes on one node must see each other's metadata at once; turn on the second only for a single writer.</dd>
-  <dt>CTP_LOG_LEVEL, CTP_LOG_OUT</dt>
-  <dd>Log verbosity (<code>debug</code>, <code>info</code>, <code>success</code>, <code>warning</code>, <code>error</code>, <code>fatal</code>) and an optional log file path.</dd>
-</dl>
-<p>The full list, including the dashboard variables, is on the <a href="/docs/cli.html">CLI and environment</a> page.</p>
+<p>The default configuration binds the dashboard to 127.0.0.1, and networking examples on Windows should do the same. Installing WinFsp, the Microsoft Defender note and the <code>-o uid=-1,gid=-1</code> option for git are in <a href="/tutorials/fuse-windows.html">FUSE on Windows</a>.</p></section>
+</div>
 
 <h2>What the default compose creates</h2>
 <p>The default configuration composes one chain of pools. Each entry's <code>next_pool_id</code> names the pool below it, and every entry must come after the entry it points to. Read from the top, a file operation travels like this:</p>
@@ -77,7 +64,7 @@ PS> clio_run stop
   <li><strong>clio_cte_core, pool 512.0.</strong> The storage engine every client resolves to. Its <code>storage</code> list defines two tiers: a RAM tier (<code>ram::cte_ram_tier1</code>, score 1.0, capacity <code>0g</code> meaning 80% of DRAM) and a file tier at <code>${CLIO_STORAGE_ROOT}/cte_disk_tier.dat</code> (score 0.2, 10 GB cap, <code>persistence_level: temporary</code>). The metadata write-ahead log at <code>${CLIO_STORAGE_ROOT}/cte_metadata_log</code> is what lets data survive a restart.</li>
   <li><strong>clio_bdev, pool 301.0.</strong> The RAM block device that provides the shared-memory allocator other modules use. The only strictly required entry.</li>
 </ul>
-<p>The default also composes <code>clio_cae_core</code> at 400.0, the Context Assimilation Engine entry point, pointed at the chain top so imported data is indexed. It is not part of the file path; see <a href="/docs/cae.html">the CAE page</a>. The compressor (562.0) and the summarizer (401.0) are present in the file but commented out.</p>
+<p>The default also composes <code>clio_cae_core</code> at 400.0, the Context Assimilation Engine entry point, pointed at the chain top so imported data is indexed. It is not part of the file path; see <a href="/docs/cae/index.html">the CAE documentation</a>. The compressor (562.0) and the summarizer (401.0) are present in the file but commented out.</p>
 <div class="callout">
   <span class="callout-title">Why the chain is ordered this way</span>
   <p>The indexer sits above the compressor so its read-backs see uncompressed bytes. The cache sits on top so that the zero-copy shared-memory read path stays available even for blobs that are compressed or replicated below. <a href="/design/chain.html">The interposition chain</a> explains the design.</p>
@@ -111,8 +98,8 @@ PS> clio_run stop
 <pre data-label="shell">
 $ clio_run stop
 $ export CLIO_SERVER_CONF=~/clio-tiers.yaml
-$ clio_run start &
-$ CLIO_WITH_RUNTIME=0 clio_cte_fuse ~/clio-mnt -f &
+$ clio_run start &amp;
+$ CLIO_WITH_RUNTIME=0 clio_cte_fuse ~/clio-mnt -f &amp;
 </pre>
 <p>Three rules when editing:</p>
 <ul>
@@ -122,6 +109,25 @@ $ CLIO_WITH_RUNTIME=0 clio_cte_fuse ~/clio-mnt -f &
 </ul>
 <p>A tier can also be registered while the runtime runs, from the dashboard's pool page or its REST route; such tiers last until the next restart. <a href="/tutorials/compose.html">Compose local tiers</a> walks through all of this with a four-tier example.</p>
 
+<h2>Keeping the namespace across restarts</h2>
+<p>Three logs decide what survives <code>clio_run stop</code> and the next <code>clio_run start</code>:</p>
+<ul>
+  <li><code>metadata_log_path</code> on the <code>clio_cte_core</code> entry: which blobs exist and where their bytes are.</li>
+  <li><code>metadata_log_path</code> on the <code>clio_cte_filesystem</code> entry: the directory table blocks this node is home for. Unset, directory blocks are stored as CTE blobs instead, with one blob write per change.</li>
+  <li><code>log_path</code> on the <code>clio_cte_stream</code> entry: file sizes and pending appends. Unset, file sizes do not survive a stop.</li>
+</ul>
+<p>The filesystem journal is node-local. A node that never returns takes its directory blocks with it. <code>clio_run start --fresh</code> discards all three logs on that node.</p>
+
+<h2>One node or many</h2>
+<p>The daemon reads the runtime's <code>networking.hostfile</code>. With more than one line it switches to multi-node defaults; <code>CLIO_FUSE_MULTINODE=0</code> or <code>1</code> overrides the decision.</p>
+<ul class="checks">
+  <li><strong>Attribute cache.</strong> One node: the kernel caches attributes for 1 s. Several nodes: 0 s, so a reader sees a size another node just extended. <code>CLIO_FUSE_ATTR_CACHE_S</code> sets it; use <code>0</code> on one node when several processes must see each other's metadata at once.</li>
+  <li><strong>Appends.</strong> One node: the kernel's cached size supplies the <code>O_APPEND</code> offset. Several nodes: appends are staged and merged at the file's stream home. <code>CLIO_FUSE_APPEND=kernel|reserve|deferred</code> chooses explicitly.</li>
+  <li><strong>Writeback caching</strong> is off everywhere. <code>CLIO_FUSE_WRITEBACK=1</code> turns it on; it is only safe with a single writer that fsyncs.</li>
+  <li><strong>Batched creates and asynchronous close</strong> are on for a single node and off on several.</li>
+</ul>
+<p>Every variable, with its default, is in the <a href="/docs/context-fs/api.html#environment-variables">API reference</a>. For a filesystem deployment that should fail fast while a node is down, the runtime's <code>CLIO_NET_DEAD_FAIL_FAST=1</code> makes operations on names the dead node owns return <code>EIO</code> at once instead of stalling.</p>
+
 <h2>Advanced compose configurations</h2>
 <ul>
   <li><a href="/tutorials/compose.html">Compose local tiers</a>: RAM, NVMe, SSD and disk layouts, placement policies, and adding a tier at runtime.</li>
@@ -129,5 +135,4 @@ $ CLIO_WITH_RUNTIME=0 clio_cte_fuse ~/clio-mnt -f &
   <li><a href="/tutorials/cloud-storage.html">Amazon S3 and Google Cloud</a>: a bucket as the capacity tier, and importing existing objects.</li>
   <li><a href="/modules/index.html">Module reference</a>: every compose key of every module, including <a href="/modules/safe-bdev.html">safe-bdev</a> erasure-coded arrays and <a href="/modules/replication.html">replication</a> factors above one.</li>
   <li><a href="/design/filesystem.html">Filesystem design</a>: how paths, inodes and pages map onto tags and blobs, and how the namespace log works.</li>
-  <li>The mount tutorials: <a href="/tutorials/fuse-linux.html">Linux</a>, <a href="/tutorials/fuse-macos.html">macOS</a> and <a href="/tutorials/fuse-windows.html">Windows</a>.</li>
 </ul>

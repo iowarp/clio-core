@@ -56,5 +56,5 @@ facts: Unit of code | Module (ChiMod), run as a pool ; Unit of work | Task, run 
   <li><strong>Clients</strong> detect a lost runtime with a heartbeat, wait for it or fail over to another node, reconnect and resend. The runtime, in turn, survives clients that die.</li>
   <li><strong>Data</strong> survives node loss through the replication module, not through the runtime alone. A gossip detector exists but is off by default, because at large scale wide collectives starved its probes.</li>
 </ul>
-<p><a href="/design/runtime.html">Runtime design</a> covers each mechanism and its tradeoffs, and <a href="/docs/runtime.html">the Context Runtime docs</a> show how to build a module.</p>
+<p><a href="/design/runtime.html">Runtime design</a> covers each mechanism and its tradeoffs, and <a href="/docs/runtime/usage.html">the Context Runtime docs</a> show how to build a module.</p>
 
