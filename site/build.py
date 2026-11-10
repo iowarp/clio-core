@@ -395,7 +395,21 @@ def add_heading_ids(body: str) -> tuple[str, list[tuple[int, str, str]]]:
 
 
 # Primary entries that open a dropdown of their section's pages.
-DROPDOWNS = {"technologies"}
+DROPDOWNS = {"technologies", "docs"}
+
+# Dropdowns that list fixed entries instead of every page in the section.
+# Docs links one page per technology.
+DROPDOWN_ITEMS = {
+    "docs": [
+        ("docs/context-fs.html", "Context FS"),
+        ("docs/cae.html", "Context Assimilation Engine"),
+        ("docs/cee.html", "Context Exploration Engine"),
+        ("docs/cte.html", "Context Transfer Engine"),
+        ("docs/runtime.html", "Context Runtime"),
+        ("docs/memory-expansion.html", "Memory expansion"),
+        ("docs/ml/index.html", "Machine learning"),
+    ],
+}
 
 
 def header_html(section: str, page: str = "") -> str:
@@ -411,7 +425,7 @@ def header_html(section: str, page: str = "") -> str:
         if key not in DROPDOWNS:
             parts.append(f'<a href="/{href}"{current}>{label}</a>')
             continue
-        items = [item for _, group in NAV[key] for item in group]
+        items = DROPDOWN_ITEMS.get(key) or [item for _, group in NAV[key] for item in group]
         lis = "".join(
             f'<li><a href="/{h}"{" aria-current=\"page\"" if h == page else ""}>{l}</a></li>'
             for h, l in items)
