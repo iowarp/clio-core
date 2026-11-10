@@ -13,6 +13,7 @@
 #include <clio_runtime/bdev/transports/fs_bdev_transport.h>
 #include <clio_ctp/introspect/system_info.h>
 #include <clio_ctp/io/io_error.h>
+#include <clio_ctp/util/config_parse.h>
 #include <clio_ctp/util/msan.h>
 #include <clio_runtime/clio_runtime.h>
 #include <clio_runtime/manager.h>
@@ -189,6 +190,39 @@ int SyncFileData(const std::string &file_path) {
 #endif
 }
 
+/**
+ * Striping requested through the environment, read once at Init:
+ * CLIO_BDEV_STRIPE_FILES=<N> (default 1, clamped to [1, 64]) and
+ * CLIO_BDEV_STRIPE_UNIT=<size> (default 1 MiB). A unit that is not a multiple
+ * of the direct-I/O alignment (or 4 KiB) falls back to the default with a
+ * warning, so every stripe boundary stays O_DIRECT-aligned.
+ * @return the stripe layout for this device (num_files == 1 when unset)
+ */
+StripeLayout LoadStripeLayout() {
+  constexpr clio::run::u64 kDefaultUnit = clio::run::u64(1) << 20;
+  StripeLayout layout;
+  layout.unit = kDefaultUnit;
+  if (const char *n = std::getenv("CLIO_BDEV_STRIPE_FILES")) {
+    const long parsed = std::strtol(n, nullptr, 10);
+    layout.num_files =
+        static_cast<clio::run::u32>(std::clamp<long>(parsed, 1, 64));
+  }
+  if (const char *u = std::getenv("CLIO_BDEV_STRIPE_UNIT")) {
+    const clio::run::u64 want = ctp::ConfigParse::ParseSize(u);
+    const clio::run::u64 align =
+        std::max<clio::run::u64>(4096, ctp::DirectIoAlign());
+    if (want > 0 && want % align == 0) {
+      layout.unit = want;
+    } else {
+      HLOG(kWarning,
+           "CLIO_BDEV_STRIPE_UNIT={} is not a positive multiple of {} bytes; "
+           "using {} bytes",
+           u, align, kDefaultUnit);
+    }
+  }
+  return layout;
+}
+
 // Steady-clock time in nanoseconds, used to age the host free-space sample.
 clio::run::u64 SteadyNowNs() {
   return static_cast<clio::run::u64>(
@@ -198,15 +232,19 @@ clio::run::u64 SteadyNowNs() {
 
 }  // namespace
 
-bool WorkerIOContext::Init(const std::string &file_path, clio::run::u32 io_depth,
-                           clio::run::u32 worker_id) {
+bool WorkerIOContext::Init(const std::vector<std::string> &paths,
+                           clio::run::u32 io_depth, clio::run::u32 worker_id) {
   if (is_initialized_) return true;
 
-  async_io_ = OpenBackingFile(io_depth, file_path);
-  if (!async_io_) {
-    HLOG(kError, "Worker {} failed to open file {} ({})", worker_id,
-         file_path, std::strerror(errno));
-    return false;
+  for (const std::string &path : paths) {
+    auto io = OpenBackingFile(io_depth, path);
+    if (!io) {
+      HLOG(kError, "Worker {} failed to open file {} ({})", worker_id, path,
+           std::strerror(errno));
+      Cleanup();  // release the files that did open
+      return false;
+    }
+    async_ios_.push_back(std::move(io));
   }
 
   is_initialized_ = true;
@@ -214,13 +252,11 @@ bool WorkerIOContext::Init(const std::string &file_path, clio::run::u32 io_depth
 }
 
 void WorkerIOContext::Cleanup() {
-  if (is_initialized_) {
-    if (async_io_) {
-      async_io_->Close();
-      async_io_.reset();
-    }
-    is_initialized_ = false;
+  for (auto &io : async_ios_) {
+    if (io) io->Close();
   }
+  async_ios_.clear();
+  is_initialized_ = false;
 }
 
 bool FsBdevTransport::Init(const CreateParams& params,
@@ -232,29 +268,15 @@ bool FsBdevTransport::Init(const CreateParams& params,
   fail_marker_checked_ns_.store(0, std::memory_order_relaxed);
   fail_marker_present_.store(false, std::memory_order_relaxed);
 
-  auto setup_io = OpenBackingFile(io_depth_, file_path_, /*create=*/true);
-  if (!setup_io) {
-    // errno from the last open attempt. Without it this message says only
-    // "it did not work", and a permission problem on a leftover file is
-    // indistinguishable from a missing io_uring or a full disk -- which is
-    // exactly the ambiguity that made a stale scratch file look like a broken
-    // driver.
-    HLOG(kError, "Failed to open bdev file: {} ({})", file_path_,
-         strerror(errno));
-    return false;
+  stripe_ = LoadStripeLayout();
+  if (stripe_.IsStriped()) {
+    HLOG(kInfo, "bdev {}: striped over {} files ({}.s0 .. .s{}), stripe unit {} bytes",
+         file_path_, stripe_.num_files, file_path_, stripe_.num_files - 1,
+         stripe_.unit);
   }
-  // #1210: remember which file this is; later by-path opens check it.
-  file_id_valid_ = ctp::SystemInfo::GetFileIdentity(file_path_, &file_id_);
 
-  // int64_t, not off_t: MSVC off_t is a 32-bit long, which wraps any
-  // backing file of 2 GiB or more (#1059).
-  int64_t current_size = setup_io->GetFileSize();
-  if (current_size < 0) {
-    HLOG(kError, "Failed to get file size for: {}", file_path_);
-    setup_io->Close();
-    return false;
-  }
-  clio::run::u64 existing = static_cast<clio::run::u64>(current_size);
+  clio::run::u64 existing = 0;
+  if (!OpenBackingFiles(&existing)) return false;
 
   // Device capacity (what the allocator hands out): the configured size when
   // one is given, else the existing file's size, else a 1GB default.
@@ -292,17 +314,11 @@ bool FsBdevTransport::Init(const CreateParams& params,
     if (growth_unit_ > 0 && growth_unit_ < initial) {
       initial = growth_unit_;
     }
-    if (!setup_io->Truncate(static_cast<size_t>(initial))) {
-      HLOG(kError, "Failed to truncate file");
-      setup_io->Close();
-      return false;
-    }
-    const int rrc = ReserveFileSpace(file_path_, 0, initial);
-    if (rrc != 0) {
-      HLOG(kError, "Cannot reserve {} bytes for bdev file {} ({})", initial,
-           file_path_, std::strerror(rrc));
-      setup_io->Truncate(0);
-      setup_io->Close();
+    // GrowBackingFile truncates and reserves; on failure it leaves the file
+    // at size 0 (its undo), so a failed fresh start holds no data.
+    if (!GrowBackingFile(0, initial)) {
+      HLOG(kError, "Cannot reserve {} bytes for bdev file {}", initial,
+           file_path_);
       return false;
     }
     file_backed_bytes_.store(initial, std::memory_order_relaxed);
@@ -313,8 +329,6 @@ bool FsBdevTransport::Init(const CreateParams& params,
     file_backed_bytes_.store(existing < file_size ? existing : file_size,
                              std::memory_order_relaxed);
   }
-
-  setup_io->Close();
 
   if (!InitializeWorkerIOContexts()) {
     // A worker that cannot open the file fails every I/O it is handed: refuse
@@ -330,6 +344,225 @@ bool FsBdevTransport::Init(const CreateParams& params,
   allocator_.Init(num_workers, file_size, params.alignment_);
 
   return OpenAllocLog(params);
+}
+
+std::vector<std::string> FsBdevTransport::BackingPaths() const {
+  if (!stripe_.IsStriped()) return {file_path_};
+  std::vector<std::string> paths;
+  paths.reserve(stripe_.num_files);
+  for (clio::run::u32 i = 0; i < stripe_.num_files; ++i) {
+    paths.push_back(file_path_ + ".s" + std::to_string(i));
+  }
+  return paths;
+}
+
+bool FsBdevTransport::OpenBackingFiles(clio::run::u64 *existing) {
+  const std::vector<std::string> paths = BackingPaths();
+  file_ids_.clear();
+  file_ids_.resize(paths.size());
+  file_id_valid_ = true;
+  int64_t min_size = -1;
+  for (size_t i = 0; i < paths.size(); ++i) {
+    // errno from the last open attempt. Without it this message says only
+    // "it did not work", and a permission problem on a leftover file is
+    // indistinguishable from a missing io_uring or a full disk -- which is
+    // exactly the ambiguity that made a stale scratch file look like a broken
+    // driver.
+    auto io = OpenBackingFile(io_depth_, paths[i], /*create=*/true);
+    if (!io) {
+      HLOG(kError, "Failed to open bdev file: {} ({})", paths[i],
+           strerror(errno));
+      return false;
+    }
+    // #1210: remember which file this is; later by-path opens check it.
+    const bool id_ok =
+        ctp::SystemInfo::GetFileIdentity(paths[i], &file_ids_[i]);
+    file_id_valid_ = file_id_valid_ && id_ok;
+    // int64_t, not off_t: MSVC off_t is a 32-bit long, which wraps any
+    // backing file of 2 GiB or more (#1059).
+    const int64_t size = io->GetFileSize();
+    io->Close();
+    if (size < 0) {
+      HLOG(kError, "Failed to get file size for: {}", paths[i]);
+      return false;
+    }
+    if (min_size < 0 || size < min_size) min_size = size;
+  }
+  const auto smallest = static_cast<clio::run::u64>(min_size);
+  // Striped: the prefix every file fully covers (a file torn by a crash can
+  // only shrink the claim, never make a hole the allocator would address).
+  *existing = stripe_.IsStriped() ? stripe_.LogicalPrefixFromFileSize(smallest)
+                                  : smallest;
+  return true;
+}
+
+bool FsBdevTransport::GrowStripedFiles(clio::run::u64 target) {
+  if (!BackingFileIntact("grow")) return false;
+  const clio::run::u64 per_file = stripe_.PerFileBytes(target);
+  std::vector<std::pair<std::string, clio::run::u64>> grown;
+  for (const std::string &path : BackingPaths()) {
+    clio::run::u64 prev = 0;
+    if (!ExtendStripeFile(path, per_file, &prev)) {
+      UndoStripeGrowth(grown);
+      return false;
+    }
+    if (prev < per_file) grown.emplace_back(path, prev);
+  }
+  return true;
+}
+
+bool FsBdevTransport::ExtendStripeFile(const std::string &path,
+                                       clio::run::u64 to,
+                                       clio::run::u64 *prev) {
+  auto io = OpenBackingFile(io_depth_, path);
+  if (!io) {
+    HLOG(kError, "EnsureFileBacked: failed to open {} to grow it", path);
+    return false;
+  }
+  const int64_t cur_signed = io->GetFileSize();
+  if (cur_signed < 0) {
+    io->Close();
+    return false;
+  }
+  const auto cur = static_cast<clio::run::u64>(cur_signed);
+  *prev = cur;
+  if (to <= cur) {
+    io->Close();
+    return true;  // already long enough (another growth or a torn run)
+  }
+  bool ok = io->Truncate(static_cast<size_t>(to));
+  if (ok) {
+    const int rrc = ReserveFileSpace(path, cur, to);
+    if (rrc != 0) {
+      HLOG(kWarning, "EnsureFileBacked: no disk space to grow {} to {} "
+           "bytes ({})", path, to, std::strerror(rrc));
+      io->Truncate(static_cast<size_t>(cur));
+      ok = false;
+    }
+  }
+  io->Close();
+  return ok;
+}
+
+void FsBdevTransport::UndoStripeGrowth(
+    const std::vector<std::pair<std::string, clio::run::u64>> &grown) {
+  for (const auto &[path, size] : grown) {
+    auto io = OpenBackingFile(io_depth_, path);
+    if (io) {
+      io->Truncate(static_cast<size_t>(size));
+      io->Close();
+    }
+  }
+}
+
+int FsBdevTransport::SyncBackingFiles() {
+  for (const std::string &path : BackingPaths()) {
+    const int rc = SyncFileData(path);
+    if (rc != 0) return rc;
+  }
+  return 0;
+}
+
+clio::run::u64 FsBdevTransport::NextWriteSegment(clio::run::u64 fo,
+                                                 clio::run::u64 left,
+                                                 const StripeLayout &stripe) {
+  // Up to three writes per block: an unaligned head and tail through the
+  // page cache, and the DirectAlign()-aligned body between them bounced to
+  // the O_DIRECT fd (see WantsBounce). A FUSE write from an unaligned user
+  // buffer arrives as ~1 MiB + a few bytes, so without the split no byte
+  // of it could go direct.
+  const clio::run::u64 align = DirectAlign();
+  const clio::run::u64 head =
+      std::min<clio::run::u64>(left, (align - fo % align) % align);
+  const clio::run::u64 body = ((left - head) / align) * align;
+  clio::run::u64 seg = left;
+  if (body >= kBounceMin) {
+    seg = head != 0 ? head : body;
+  }
+  // A segment never crosses a stripe boundary, so it maps to one file.
+  return std::min(seg, stripe.BytesToBoundary(fo));
+}
+
+FsBdevTransport::AlignedBuf FsBdevTransport::PrepareWriteSegment(
+    char *src, clio::run::u64 seg, clio::run::u64 file_off, void **out_data) {
+  *out_data = src;
+  AlignedBuf bounce;
+  if (WantsBounce(src, static_cast<size_t>(seg), file_off)) {
+    bounce = TakeBounce(static_cast<size_t>(seg));
+    std::memcpy(bounce.get(), src, static_cast<size_t>(seg));
+    *out_data = bounce.get();
+  }
+  return bounce;
+}
+
+void FsBdevTransport::LogWriteFailure(int error_code,
+                                      clio::run::u64 logical_off,
+                                      clio::run::u64 seg, size_t file_index) {
+  static std::atomic<clio::run::u64> write_errs{0};
+  const clio::run::u64 ne = write_errs.fetch_add(1) + 1;
+  if (ne <= 20 || (ne & (ne - 1)) == 0) {
+    HLOG(kError,
+         "file bdev write failed: errno {} ({}) offset {} size {} file {} "
+         "(#{} so far)",
+         error_code, std::strerror(error_code), logical_off, seg, file_index,
+         ne);
+  }
+}
+
+ctp::IoToken FsBdevTransport::SubmitReadSegment(ctp::AsyncIO *aio, char *dst,
+                                                clio::run::u64 seg,
+                                                clio::run::u64 file_off,
+                                                AlignedBuf &rbounce) {
+  // issue #1343: reads bounce like writes. Task buffers in shared memory
+  // are not DirectAlign()-aligned, so an aligned read was still sent to the
+  // buffered fd: served (and polluted) by the page cache, never the device.
+  void *read_dst = dst;
+  if (WantsBounce(dst, static_cast<size_t>(seg), file_off)) {
+    rbounce = TakeBounce(static_cast<size_t>(seg));
+    read_dst = rbounce.get();
+  }
+  ctp::IoToken token = aio->Read(read_dst, static_cast<size_t>(seg),
+                                 static_cast<int64_t>(file_off));
+  if (token == ctp::kInvalidIoToken && rbounce) {
+    GiveBounce(std::move(rbounce), static_cast<size_t>(seg));
+  }
+  return token;
+}
+
+void FsBdevTransport::FinishBouncedRead(AlignedBuf &rbounce, char *dst,
+                                        clio::run::u64 seg,
+                                        const ctp::IoResult &result) {
+  if (!rbounce) return;  // read went straight into the caller's buffer
+  if (result.error_code == 0 && result.bytes_transferred > 0) {
+    std::memcpy(dst, rbounce.get(),
+                std::min(static_cast<size_t>(result.bytes_transferred),
+                         static_cast<size_t>(seg)));
+  }
+  GiveBounce(std::move(rbounce), static_cast<size_t>(seg));
+}
+
+clio::run::u64 FsBdevTransport::ZeroFillUnbacked(char *dst,
+                                                 clio::run::u64 got,
+                                                 clio::run::u64 seg,
+                                                 clio::run::u64 logical_off,
+                                                 bool in_capacity) {
+  if (got >= seg || !in_capacity) return got;
+  // Inside the device but past the backed end of the (lazily grown) file:
+  // never written, so it reads as zeros -- the same answer the file would
+  // give had it been truncated to full capacity up front. A caller that
+  // writes at fixed offsets without going through this allocator (a
+  // safe_bdev member) otherwise saw a short read of a partly written
+  // chunk and took it for a failing disk.
+  std::memset(dst + got, 0, seg - got);
+  static std::atomic<clio::run::u64> zero_fills{0};
+  const clio::run::u64 nz = zero_fills.fetch_add(1) + 1;
+  if (nz <= 20 || (nz & (nz - 1)) == 0) {
+    // Which reads land past the backed end of a file (#1124 diagnosis).
+    HLOG(kDebug, "bdev ReadBlocks: zero-fill #{} on {}: off {} len {} "
+         "got {} backed {}", nz, file_path_, logical_off, seg, got,
+         file_backed_bytes_.load());
+  }
+  return seg;
 }
 
 bool FsBdevTransport::OpenAllocLog(const CreateParams& params) {
@@ -432,7 +665,7 @@ bool FsBdevTransport::Sync() {
   gc_running_ = true;
   const clio::run::u64 covers = gc_next_;  // everyone registered so far
   lk.unlock();
-  const int err = SyncFileData(file_path_);
+  const int err = SyncBackingFiles();
   if (err == 0) FlushAllocLog();
   lk.lock();
   gc_running_ = false;
@@ -571,6 +804,7 @@ void FsBdevTransport::FinishAllocate(bool backed_ok, int worker_id,
 
 bool FsBdevTransport::GrowBackingFile(clio::run::u64 backed,
                                       clio::run::u64 target) {
+  if (stripe_.IsStriped()) return GrowStripedFiles(target);
   if (!BackingFileIntact("grow")) return false;
   auto io = OpenBackingFile(io_depth_, file_path_);
   if (!io) {
@@ -726,14 +960,19 @@ void FsBdevTransport::FreeBlocks(int worker_id, const std::vector<Block>& blocks
 
 bool FsBdevTransport::BackingFileIntact(const char *what) const {
   if (!file_id_valid_) return true;  // nothing recorded to compare with
-  ctp::SystemInfo::FileIdentity now;
-  if (ctp::SystemInfo::GetFileIdentity(file_path_, &now) && now == file_id_) {
-    return true;
+  const std::vector<std::string> paths = BackingPaths();
+  for (size_t i = 0; i < paths.size() && i < file_ids_.size(); ++i) {
+    ctp::SystemInfo::FileIdentity now;
+    if (ctp::SystemInfo::GetFileIdentity(paths[i], &now) &&
+        now == file_ids_[i]) {
+      continue;
+    }
+    HLOG(kError, "bdev {}: cannot {}: the backing file {} was deleted or "
+         "replaced while the device was in use; refusing rather than using a "
+         "different file", file_path_, what, paths[i]);
+    return false;
   }
-  HLOG(kError, "bdev {}: cannot {}: the backing file was deleted or "
-       "replaced while the device was in use; refusing rather than using a "
-       "different file", file_path_, what);
-  return false;
+  return true;
 }
 
 bool FsBdevTransport::InitializeWorkerIOContexts() {
@@ -759,8 +998,9 @@ bool FsBdevTransport::InitializeWorkerIOContexts() {
   io_contexts_.resize(reserved);
   bool success = true;
   if (!BackingFileIntact("open worker I/O contexts")) return false;
+  const std::vector<std::string> paths = BackingPaths();
   for (size_t i = 0; i < num_workers; ++i) {
-    if (!io_contexts_[i].Init(file_path_, io_depth_, static_cast<clio::run::u32>(i))) {
+    if (!io_contexts_[i].Init(paths, io_depth_, static_cast<clio::run::u32>(i))) {
       success = false;
     }
   }
@@ -780,7 +1020,8 @@ WorkerIOContext *FsBdevTransport::GetWorkerIOContext(size_t worker_id) {
   WorkerIOContext *ctx = &io_contexts_[worker_id];
   if (!ctx->is_initialized_) {
     if (!BackingFileIntact("open a worker I/O context") ||
-        !ctx->Init(file_path_, io_depth_, static_cast<clio::run::u32>(worker_id))) {
+        !ctx->Init(BackingPaths(), io_depth_,
+                   static_cast<clio::run::u32>(worker_id))) {
       return nullptr;
     }
   }
@@ -852,41 +1093,29 @@ clio::run::TaskResume FsBdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask> 
                            ? static_cast<void *>(staging.data() + data_offset)
                            : static_cast<void *>(data_ptr.ptr_ + data_offset);
 
-    if (io_ctx == nullptr || !io_ctx->is_initialized_ || !io_ctx->async_io_) {
+    if (io_ctx == nullptr || !io_ctx->is_initialized_ || io_ctx->async_ios_.empty()) {
       HLOG(kError, "WriteToFile called with invalid I/O context");
       task->return_code_ = 1;
       task->bytes_written_ = total_bytes_written;
       CLIO_CO_RETURN;
     }
 
-    // Up to three writes per block: an unaligned head and tail through the
-    // page cache, and the DirectAlign()-aligned body between them bounced to
-    // the O_DIRECT fd (see WantsBounce). A FUSE write from an unaligned user
-    // buffer arrives as ~1 MiB + a few bytes, so without the split no byte
-    // of it could go direct.
-    const clio::run::u64 align = DirectAlign();
+    // Each segment lies inside one stripe file (NextWriteSegment clamps at
+    // stripe boundaries), so it is one AIO write to that file's context.
     clio::run::u64 seg_done = 0;
     while (seg_done < block_write_size) {
       const clio::run::u64 fo = block.offset_ + seg_done;
-      const clio::run::u64 left = block_write_size - seg_done;
-      const clio::run::u64 head =
-          std::min<clio::run::u64>(left, (align - fo % align) % align);
-      const clio::run::u64 body = ((left - head) / align) * align;
-      clio::run::u64 seg = left;
-      if (body >= kBounceMin) {
-        seg = head != 0 ? head : body;
-      }
+      const clio::run::u64 seg =
+          NextWriteSegment(fo, block_write_size - seg_done, stripe_);
+      const StripeLocation loc = stripe_.Locate(fo);
       char *seg_src = static_cast<char *>(block_data) + seg_done;
       void *seg_data = seg_src;
-      AlignedBuf bounce;
-      if (WantsBounce(seg_src, static_cast<size_t>(seg), fo)) {
-        bounce = TakeBounce(static_cast<size_t>(seg));
-        std::memcpy(bounce.get(), seg_src, static_cast<size_t>(seg));
-        seg_data = bounce.get();
-      }
+      AlignedBuf bounce =
+          PrepareWriteSegment(seg_src, seg, loc.file_offset, &seg_data);
 
-      ctp::IoToken token = io_ctx->async_io_->Write(
-          seg_data, static_cast<size_t>(seg), static_cast<int64_t>(fo));
+      ctp::AsyncIO *aio = io_ctx->async_ios_[loc.file_index].get();
+      ctp::IoToken token = aio->Write(seg_data, static_cast<size_t>(seg),
+                                      static_cast<int64_t>(loc.file_offset));
       if (token == ctp::kInvalidIoToken) {
         task->return_code_ = 2;
         task->bytes_written_ = total_bytes_written + seg_done;
@@ -894,7 +1123,7 @@ clio::run::TaskResume FsBdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask> 
       }
 
       ctp::IoResult result;
-      while (!io_ctx->async_io_->IsComplete(token, result)) {
+      while (!aio->IsComplete(token, result)) {
         CLIO_CO_AWAIT(clio::run::yield(10.0));
       }
       if (bounce) {
@@ -902,15 +1131,7 @@ clio::run::TaskResume FsBdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask> 
       }
 
       if (result.error_code != 0) {
-        static std::atomic<clio::run::u64> write_errs{0};
-        const clio::run::u64 ne = write_errs.fetch_add(1) + 1;
-        if (ne <= 20 || (ne & (ne - 1)) == 0) {
-          HLOG(kError,
-               "file bdev write failed: errno {} ({}) offset {} size {} "
-               "(#{} so far)",
-               result.error_code, std::strerror(result.error_code), fo, seg,
-               ne);
-        }
+        LogWriteFailure(result.error_code, fo, seg, loc.file_index);
         task->return_code_ = 4;
         task->io_error_ =
             static_cast<clio::run::u32>(ctp::ClassifyErrno(result.error_code));
@@ -970,80 +1191,58 @@ clio::run::TaskResume FsBdevTransport::ReadBlocks(ctp::ipc::FullPtr<ReadTask> ta
                            ? static_cast<void *>(staging.data() + data_offset)
                            : static_cast<void *>(data_ptr.ptr_ + data_offset);
 
-    if (io_ctx == nullptr || !io_ctx->is_initialized_ || !io_ctx->async_io_) {
+    if (io_ctx == nullptr || !io_ctx->is_initialized_ || io_ctx->async_ios_.empty()) {
       task->return_code_ = 1;
       task->bytes_read_ = total_bytes_read;
       CLIO_CO_RETURN;
     }
 
-    // issue #1343: reads bounce like writes. Task buffers in shared memory
-    // are not DirectAlign()-aligned, so an aligned read was still sent to the
-    // buffered fd: served (and polluted) by the page cache, never the device.
-    AlignedBuf rbounce;
-    void *read_dst = block_data;
-    if (WantsBounce(block_data, static_cast<size_t>(block_read_size),
-                    block.offset_)) {
-      rbounce = TakeBounce(static_cast<size_t>(block_read_size));
-      read_dst = rbounce.get();
-    }
-    ctp::IoToken token = io_ctx->async_io_->Read(
-        read_dst, static_cast<size_t>(block_read_size),
-        static_cast<int64_t>(block.offset_));
-    if (token == ctp::kInvalidIoToken) {
-      if (rbounce) {
-        GiveBounce(std::move(rbounce), static_cast<size_t>(block_read_size));
+    // Reads split only at stripe boundaries; short reads are zero-filled per
+    // piece (ZeroFillUnbacked), which keeps the block-level answer unchanged.
+    const bool in_capacity =
+        block.offset_ + block_read_size <= allocator_.GetCapacity();
+    clio::run::u64 seg_read = 0;
+    while (seg_read < block_read_size) {
+      const clio::run::u64 fo = block.offset_ + seg_read;
+      const clio::run::u64 seg = std::min(block_read_size - seg_read,
+                                          stripe_.BytesToBoundary(fo));
+      const StripeLocation loc = stripe_.Locate(fo);
+      char *seg_dst = static_cast<char *>(block_data) + seg_read;
+
+      ctp::AsyncIO *aio = io_ctx->async_ios_[loc.file_index].get();
+      AlignedBuf rbounce;
+      ctp::IoToken token =
+          SubmitReadSegment(aio, seg_dst, seg, loc.file_offset, rbounce);
+      if (token == ctp::kInvalidIoToken) {
+        task->return_code_ = 2;
+        task->bytes_read_ = total_bytes_read + seg_read;
+        CLIO_CO_RETURN;
       }
-      task->return_code_ = 2;
-      task->bytes_read_ = total_bytes_read;
-      CLIO_CO_RETURN;
+
+      ctp::IoResult result;
+      while (!aio->IsComplete(token, result)) {
+        CLIO_CO_AWAIT(clio::run::yield(10.0));
+      }
+      FinishBouncedRead(rbounce, seg_dst, seg, result);
+
+      if (result.error_code != 0) {
+        task->return_code_ = 4;
+        task->io_error_ =
+            static_cast<clio::run::u32>(ctp::ClassifyErrno(result.error_code));
+        task->bytes_read_ = total_bytes_read + seg_read;
+        CLIO_CO_RETURN;
+      }
+
+      const clio::run::u64 got = ZeroFillUnbacked(
+          seg_dst,
+          std::min(static_cast<clio::run::u64>(result.bytes_transferred), seg),
+          seg, fo, in_capacity);
+      seg_read += got;
+      if (got < seg) break;  // past the backed end, outside the device
     }
 
-    ctp::IoResult result;
-    while (!io_ctx->async_io_->IsComplete(token, result)) {
-      CLIO_CO_AWAIT(clio::run::yield(10.0));
-    }
-    if (rbounce) {
-      if (result.error_code == 0 && result.bytes_transferred > 0) {
-        std::memcpy(block_data, rbounce.get(),
-                    std::min(static_cast<size_t>(result.bytes_transferred),
-                             static_cast<size_t>(block_read_size)));
-      }
-      GiveBounce(std::move(rbounce), static_cast<size_t>(block_read_size));
-    }
-
-    if (result.error_code != 0) {
-      task->return_code_ = 4;
-      task->io_error_ =
-          static_cast<clio::run::u32>(ctp::ClassifyErrno(result.error_code));
-      task->bytes_read_ = total_bytes_read;
-      CLIO_CO_RETURN;
-    }
-
-    clio::run::u64 actual_bytes = std::min(
-        static_cast<clio::run::u64>(result.bytes_transferred), block_read_size);
-    if (actual_bytes < block_read_size &&
-        block.offset_ + block_read_size <= allocator_.GetCapacity()) {
-      // Inside the device but past the backed end of the (lazily grown) file:
-      // never written, so it reads as zeros -- the same answer the file would
-      // give had it been truncated to full capacity up front. A caller that
-      // writes at fixed offsets without going through this allocator (a
-      // safe_bdev member) otherwise saw a short read of a partly written
-      // chunk and took it for a failing disk.
-      std::memset(static_cast<char *>(block_data) + actual_bytes, 0,
-                  block_read_size - actual_bytes);
-      static std::atomic<clio::run::u64> zero_fills{0};
-      const clio::run::u64 nz = zero_fills.fetch_add(1) + 1;
-      if (nz <= 20 || (nz & (nz - 1)) == 0) {
-        // Which reads land past the backed end of a file (#1124 diagnosis).
-        HLOG(kDebug, "bdev ReadBlocks: zero-fill #{} on {}: off {} len {} "
-             "got {} backed {}", nz, file_path_, block.offset_,
-             block_read_size, actual_bytes,
-             file_backed_bytes_.load());
-      }
-      actual_bytes = block_read_size;
-    }
-    total_bytes_read += actual_bytes;
-    data_offset += actual_bytes;
+    total_bytes_read += seg_read;
+    data_offset += seg_read;
   }
 
   if (data_on_device && total_bytes_read > 0) {

@@ -8,6 +8,7 @@
 
 #include <clio_runtime/bdev/transports/bdev_transport.h>
 #include <clio_runtime/bdev/transports/block_allocator.h>
+#include <clio_runtime/bdev/transports/fs_stripe_layout.h>
 #include <clio_runtime/bdev/bdev_alloc_log.h>
 #include <clio_ctp/io/async_io_factory.h>
 #include <clio_ctp/introspect/system_info.h>
@@ -26,13 +27,23 @@
 namespace clio::run::bdev {
 
 /**
- * Worker-local I/O context for filesystem backend
+ * Worker-local I/O context for filesystem backend. Holds one AsyncIO per
+ * backing file, in stripe order (exactly one when the device is not striped).
  */
 struct WorkerIOContext {
   bool is_initialized_{false};
-  std::unique_ptr<ctp::AsyncIO> async_io_;
+  std::vector<std::unique_ptr<ctp::AsyncIO>> async_ios_;
 
-  bool Init(const std::string &file_path, clio::run::u32 io_depth, clio::run::u32 worker_id);
+  /**
+   * Open every backing file of the device for this worker.
+   * @param paths backing files, in stripe order (index i = stripe file i)
+   * @param io_depth AsyncIO queue depth per file
+   * @param worker_id worker owning this context (for the error message)
+   * @return true when every file opened; on failure nothing stays open
+   */
+  bool Init(const std::vector<std::string> &paths, clio::run::u32 io_depth,
+            clio::run::u32 worker_id);
+  /** Close and release every file this context opened (idempotent). */
   void Cleanup();
 };
 
@@ -148,19 +159,151 @@ class FsBdevTransport : public BdevTransport {
   std::string file_path_;
   clio::run::u32 io_depth_;
 
-  // #1210: the identity of the file Init opened. Later code opens the file
-  // again BY PATH (worker contexts, growth, sync); if the path no longer
-  // names this file (deleted, replaced), those opens must fail loudly rather
-  // than create a new empty file or sync the wrong one.
-  ctp::SystemInfo::FileIdentity file_id_;
+  /** Striping of the logical block space over the backing files. The default
+   *  (one file) keeps the classic layout: data in `file_path_` itself. With
+   *  N > 1 the data lives in `file_path_ + ".s<i>"` (see BackingPaths). */
+  StripeLayout stripe_;
+
+  // #1210: the identities of the files Init opened, one per backing file
+  // (index = stripe file). Later code opens the files again BY PATH (worker
+  // contexts, growth, sync); if a path no longer names its file (deleted,
+  // replaced), those opens must fail loudly rather than create a new empty
+  // file or sync the wrong one.
+  std::vector<ctp::SystemInfo::FileIdentity> file_ids_;
   bool file_id_valid_ = false;
 
   /**
-   * Whether file_path_ still names the file Init opened.
-   * @param what the operation about to reopen it (for the error message)
-   * @return true when it does (or when no identity could be recorded)
+   * Paths of the backing files in stripe order: just `file_path_` when not
+   * striped, else `file_path_ + ".s<i>"` for i in [0, N).
+   * @return one path per backing file
+   */
+  std::vector<std::string> BackingPaths() const;
+
+  /**
+   * Whether every backing file still has the identity Init recorded.
+   * @param what the operation about to reopen them (for the error message)
+   * @return true when they do (or when no identity could be recorded)
    */
   bool BackingFileIntact(const char *what) const;
+
+  /**
+   * Create-or-open every backing file, record its identity, and measure the
+   * existing data. Closes each file again; growth reopens them.
+   * @param existing out: logical backed prefix already in the files (0 for a
+   *        fresh device; the largest fully-backed prefix when striped)
+   * @return false if a file cannot be opened or sized
+   */
+  bool OpenBackingFiles(clio::run::u64 *existing);
+
+  /**
+   * Extend the device's backing so a logical prefix of `target` bytes is
+   * backed. Striped: every stripe file is extended to PerFileBytes(target).
+   * @param target logical prefix to back, in bytes
+   * @return true on success; on failure every file grown here is restored
+   */
+  bool GrowStripedFiles(clio::run::u64 target);
+
+  /**
+   * Grow one stripe file to at least `to` bytes, reserving the new blocks.
+   * Never shrinks a file. On reserve failure the file is restored to its
+   * previous size.
+   * @param path file to grow
+   * @param to required size in bytes
+   * @param prev out: the file size before this call
+   * @return true when the file is at least `to` bytes long
+   */
+  bool ExtendStripeFile(const std::string &path, clio::run::u64 to,
+                        clio::run::u64 *prev);
+
+  /**
+   * Shrink stripe files back after a failed multi-file growth.
+   * @param grown (path, size before growth) for each file grown so far
+   */
+  void UndoStripeGrowth(
+      const std::vector<std::pair<std::string, clio::run::u64>> &grown);
+
+  /**
+   * Flush every backing file's data to media (fdatasync per stripe file).
+   * @return 0, or the errno of the first failing file
+   */
+  int SyncBackingFiles();
+
+  /**
+   * Size of the next write segment starting at logical offset `fo`: the
+   * O_DIRECT-aligned head or body split, clamped at a stripe boundary so the
+   * segment maps to one stripe file.
+   * @param fo logical offset of the segment start
+   * @param left bytes left in the block
+   * @param stripe striping of the device
+   * @return segment length in (0, left]
+   */
+  static clio::run::u64 NextWriteSegment(clio::run::u64 fo,
+                                         clio::run::u64 left,
+                                         const StripeLayout &stripe);
+
+  /**
+   * Source buffer for one write segment: the caller's memory, or a bounce
+   * copy when WantsBounce says the direct fd needs an aligned buffer.
+   * @param src caller's segment data
+   * @param seg segment length
+   * @param file_off file offset the segment is written at
+   * @param out_data out: the buffer to submit to AsyncIO::Write
+   * @return the bounce buffer that backs *out_data (empty when none is used)
+   */
+  AlignedBuf PrepareWriteSegment(char *src, clio::run::u64 seg,
+                                 clio::run::u64 file_off, void **out_data);
+
+  /**
+   * Log a failed write segment (rate-limited: first 20, then powers of two).
+   * @param error_code errno the AIO backend reported
+   * @param logical_off logical offset of the segment
+   * @param seg segment length
+   * @param file_index stripe file the segment was written to
+   */
+  void LogWriteFailure(int error_code, clio::run::u64 logical_off,
+                       clio::run::u64 seg, size_t file_index);
+
+  /**
+   * Submit one read segment, through a bounce buffer when the direct fd needs
+   * an aligned one (see WantsBounce).
+   * @param aio AsyncIO of the stripe file holding the segment
+   * @param dst caller's destination for the segment
+   * @param seg segment length
+   * @param file_off file offset of the segment
+   * @param rbounce out: the bounce buffer in use (empty when none); the
+   *        caller passes it to FinishBouncedRead after completion
+   * @return the AIO token, or ctp::kInvalidIoToken (bounce already recycled)
+   */
+  ctp::IoToken SubmitReadSegment(ctp::AsyncIO *aio, char *dst,
+                                 clio::run::u64 seg, clio::run::u64 file_off,
+                                 AlignedBuf &rbounce);
+
+  /**
+   * Finish a read segment: if it went through a bounce buffer, copy the bytes
+   * the device returned into the caller's buffer and recycle the bounce.
+   * Does nothing when `rbounce` is empty.
+   * @param rbounce bounce buffer (emptied by this call)
+   * @param dst caller's destination
+   * @param seg segment length
+   * @param result completed AIO result
+   */
+  void FinishBouncedRead(AlignedBuf &rbounce, char *dst, clio::run::u64 seg,
+                         const ctp::IoResult &result);
+
+  /**
+   * Zero-fill the unbacked tail of a short read inside the device capacity
+   * (never-written blocks read as zeros). Short reads outside the capacity
+   * are returned as they are.
+   * @param dst caller's destination for the segment
+   * @param got bytes the device returned
+   * @param seg segment length
+   * @param logical_off logical offset of the segment
+   * @param in_capacity whether the whole block lies inside the device capacity
+   * @return the number of valid bytes now at `dst` (seg after a fill)
+   */
+  clio::run::u64 ZeroFillUnbacked(char *dst, clio::run::u64 got,
+                                  clio::run::u64 seg,
+                                  clio::run::u64 logical_off, bool in_capacity);
 
   // #858: lazy backing-file growth. The file is truncated to at most one
   // growth unit at Init and extended in growth-unit steps as allocations

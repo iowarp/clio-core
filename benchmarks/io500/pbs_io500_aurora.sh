@@ -245,8 +245,8 @@ if [ "${BENCH:-io500}" = ior ]; then
     [ "${PROFILE:-0}" = 1 ] && bash "$HERE/sample_stacks.sh" "$OUT/prof_$ph" \
       "${PROFILE_DELAY:-1}" > /dev/null 2>&1 &
     mpiexec -n $(( NN * PPN )) -ppn "$PPN" --cpu-bind depth -d 4 --envall \
-      "$IOR" -g -k -e -o "$DATADIR/ior-easy/ior_file_easy" -C -Q 1 \
-      -t 2m -b "${EASY_MB}m" -F $fl -a POSIX > "ior-easy-$ph.txt" 2>&1
+      "$IOR" -g -G 271828 -k -e -o "$DATADIR/ior-easy/ior_file_easy" -C -Q 1 \
+      -t 2m -b "${EASY_MB}m" -F $fl -a POSIX ${IOR_EXTRA:-} > "ior-easy-$ph.txt" 2>&1
     rc=$?
     echo "IORCELL tag=${RUN_TAG:-none} nodes=$NN phase=$ph rc=$rc $(grep -E '^(write|read) ' "ior-easy-$ph.txt" | awk '{print "MiB/s=" $2, "open_s=" $7, "io_s=" $8, "close_s=" $9}')"
   done
