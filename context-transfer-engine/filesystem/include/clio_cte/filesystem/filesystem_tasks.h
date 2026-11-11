@@ -898,24 +898,29 @@ struct ReaddirTask : public clio::run::Task {
   IN clio::run::priv::string path_;
   OUT clio::run::priv::vector<clio::run::priv::string> entries_;
   OUT clio::run::priv::vector<clio::run::u64> inos_;  // packed TagId per entry (parallel)
+  /** kFsType* of each entry (parallel to entries_): the type stored in the
+   *  directory row, so a lister gets d_type without a stat per entry. */
+  OUT clio::run::priv::vector<clio::run::u32> types_;
   ReaddirTask()
       : clio::run::Task(), path_(CTP_MALLOC), entries_(CTP_MALLOC),
-        inos_(CTP_MALLOC) {}
+        inos_(CTP_MALLOC), types_(CTP_MALLOC) {}
   explicit ReaddirTask(const clio::run::TaskId &task_id, const clio::run::PoolId &pool_id,
                        const clio::run::PoolQuery &pool_query, const std::string &path)
       : clio::run::Task(task_id, pool_id, pool_query, Method::kReaddir),
-        path_(CTP_MALLOC, path), entries_(CTP_MALLOC), inos_(CTP_MALLOC) {}
+        path_(CTP_MALLOC, path), entries_(CTP_MALLOC), inos_(CTP_MALLOC),
+        types_(CTP_MALLOC) {}
   void Copy(const ctp::ipc::FullPtr<ReaddirTask>& o) {
     // Base fields first (pool id, method, query, flags): a forwarded copy
     // without them reached SendIn with a null pool and crashed the node.
     clio::run::Task::Copy(o.template Cast<clio::run::Task>());
     path_ = o->path_; entries_ = o->entries_; inos_ = o->inos_;
+    types_ = o->types_;
   }
   template <typename Ar> void SerializeIn(Ar &ar) {
     Task::SerializeIn(ar); ar(path_);
   }
   template <typename Ar> void SerializeOut(Ar &ar) {
-    Task::SerializeOut(ar); ar(entries_, inos_);
+    Task::SerializeOut(ar); ar(entries_, inos_, types_);
   }
 };
 

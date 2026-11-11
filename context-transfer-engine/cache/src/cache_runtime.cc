@@ -249,8 +249,12 @@ clio::run::TaskResume Runtime::PodMultiGetBlob(
 //   - a tag WRITE (creation, fault-handler registration, pinned id) goes to
 //     the owner, then GetOrCreateTag(name, handler, id) is applied to EVERY
 //     core container before the write returns;
-//   - a delete goes to the owner, then DelTag(id) is applied to every core
-//     container before it returns;
+//   - a delete BY NAME goes to the name's owner, then DelTag(id) is applied
+//     to every core container before it returns;
+//   - a delete BY ID is forwarded once, to this node's core container. It
+//     is not re-fanned to every container (that made a caller that deletes
+//     many ids by id N^2): the caller reaches the containers that hold the
+//     tag's blobs;
 //   - rename is already a core broadcast; lookups need no help.
 // Guarantee: once a tag write returns, every node resolves the tag (and its
 // fault handler) locally and correctly. While it runs, nodes may disagree.
@@ -313,7 +317,8 @@ clio::run::TaskResume Runtime::DelTag(
     clio::run::u32 rc = 0;
     TagId id = task->tag_id_;
     if (name.empty()) {
-      auto f = core->AsyncDelTag(id, clio::run::PoolQuery::Dynamic());
+      // By id: one forward to this node's core container, no re-fan.
+      auto f = core->AsyncDelTag(id, clio::run::PoolQuery::Local());
       CLIO_CO_AWAIT(f);
       rc = f->GetReturnCode();
       if (!f->tag_id_.IsNull()) id = f->tag_id_;
@@ -323,17 +328,18 @@ clio::run::TaskResume Runtime::DelTag(
       CLIO_CO_AWAIT(f);
       rc = f->GetReturnCode();
       if (!f->tag_id_.IsNull()) id = f->tag_id_;
-    }
-    task->tag_id_ = id;
-    if (rc == 0 && !id.IsNull() && CLIO_IPC->GetNumHosts() > 1) {
-      // Every other node's copy of the tag (name, handler, its local blobs).
-      const clio::run::u32 nc = NumCoreContainers();
-      for (clio::run::u32 c = 0; c < nc; ++c) {
-        auto d = core->AsyncDelTag(id, clio::run::PoolQuery::DirectId(
-                                           static_cast<clio::run::ContainerId>(c)));
-        CLIO_CO_AWAIT(d);  // rc 1 = that node had no copy: fine
+      if (rc == 0 && !id.IsNull() && CLIO_IPC->GetNumHosts() > 1) {
+        // By name: remove the copies GetOrCreateTag's write-through installed
+        // on every other container (name, handler, its local blobs).
+        const clio::run::u32 nc = NumCoreContainers();
+        for (clio::run::u32 c = 0; c < nc; ++c) {
+          auto d = core->AsyncDelTag(id, clio::run::PoolQuery::DirectId(
+                                             static_cast<clio::run::ContainerId>(c)));
+          CLIO_CO_AWAIT(d);  // rc 1 = that node had no copy: fine
+        }
       }
     }
+    task->tag_id_ = id;
     task->SetReturnCode(rc);
   }
   CLIO_CO_RETURN;

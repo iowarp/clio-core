@@ -1285,6 +1285,20 @@ bool Runtime::IsNodeLocalRefTag(const TagId &tag_id) {
   return p.compare(0, 6, "fault:") == 0;  // CAE ingest-on-fault tag
 }
 
+/**
+ * Resolve a Dynamic pool query for a CTE task into a concrete route.
+ *
+ * The rule: a Dynamic query is resolved by HASHING the task's key to its
+ * owner container, or LOCALLY when the operation is a per-container scan or
+ * answer. A Dynamic query is never resolved to Broadcast. A caller that wants
+ * the cluster-wide view passes PoolQuery::Broadcast() explicitly.
+ *
+ * Only called by the IPC manager for Dynamic queries; explicit routes pass
+ * through untouched.
+ *
+ * @param task the CTE task whose method_ selects the rule
+ * @return the concrete PoolQuery the task should be routed with
+ */
 clio::run::PoolQuery Runtime::ScheduleTask(const clio::run::shared_ptr<clio::run::Task> &task) {
   using namespace clio::cte::core;
   switch (task->method_) {
@@ -1313,6 +1327,26 @@ clio::run::PoolQuery Runtime::ScheduleTask(const clio::run::shared_ptr<clio::run
       clio::run::u32 hash_value = static_cast<clio::run::u32>(string_hasher(tag_name));
       return clio::run::PoolQuery::DirectHash(hash_value);
     }
+
+    // DelTag by NAME goes to the name's hash owner, with no local shortcut:
+    // the delete must reach the owner whether or not this container holds a
+    // copy. DelTag by ID removes this container's share of the tag (its
+    // TagInfo and the blobs it holds), so it runs locally.
+    case Method::kDelTag: {
+      auto typed = task.template Cast<DelTagTask>();
+      if (typed->tag_id_.IsNull() && !typed->tag_name_.str().empty()) {
+        std::hash<std::string> string_hasher;
+        clio::run::u32 hash_value =
+            static_cast<clio::run::u32>(string_hasher(typed->tag_name_.str()));
+        return clio::run::PoolQuery::DirectHash(hash_value);
+      }
+      return clio::run::PoolQuery::Local();
+    }
+
+    // Tag-name publication is a per-container table update; each filesystem
+    // container publishes the names it owns into its own node's CTE.
+    case Method::kUpdateTagNames:
+      return clio::run::PoolQuery::Local();
 
     // Blob operations: hash blob name to container -- except on a CAE
     // INGEST-ON-FAULT tag (fault_params "fault:..."): its source is readable
@@ -1384,8 +1418,9 @@ clio::run::PoolQuery Runtime::ScheduleTask(const clio::run::shared_ptr<clio::run
       return HashBlobToContainer(typed->tag_id_, typed->blob_name_.str());
     }
 
+    // Per-container scan: each container answers for the tags it holds.
     case Method::kTagQuery:
-      return clio::run::PoolQuery::Broadcast();
+      return clio::run::PoolQuery::Local();
     case Method::kTruncateBlob: {
       // Blob-keyed: it must reach the container that OWNS the blob. The
       // default (Local) silently truncated nothing on every other node.
@@ -1393,13 +1428,10 @@ clio::run::PoolQuery Runtime::ScheduleTask(const clio::run::shared_ptr<clio::run
       return HashBlobToContainer(typed->tag_id_, typed->blob_name_.str());
     }
 
-    // GetTagSize backs every stat: a broadcast that waited out the 30 s
-    // retry window for each DEAD node made every stat on every survivor
-    // take 30 s while one node was down. net_timeout 0 skips nodes already
-    // declared dead (live nodes are unaffected; the answer covers the
-    // containers that are reachable).
+    // GetTagSize answers for the blobs this container holds. A caller that
+    // wants the cluster-wide size passes Broadcast(0.0f) explicitly.
     case Method::kGetTagSize:
-      return clio::run::PoolQuery::Broadcast(0.0f);
+      return clio::run::PoolQuery::Local();
 
     // A tag's xattr section lives on the container its id hashes to.
     case Method::kTagXattr: {
@@ -1407,12 +1439,13 @@ clio::run::PoolQuery Runtime::ScheduleTask(const clio::run::shared_ptr<clio::run
       return TagXattrOwner(typed->tag_id_);
     }
 
-    // Broadcast operations
+    // Per-container scans and answers: each container reports its own share.
+    // A caller that wants the cluster-wide answer passes Broadcast explicitly.
     case Method::kGetContainedBlobs:
     case Method::kBlobQuery:
     case Method::kEvict:
     case Method::kReorganizeHint:
-      return clio::run::PoolQuery::Broadcast();
+      return clio::run::PoolQuery::Local();
 
     default:
       return task->pool_query_;

@@ -296,7 +296,7 @@ clio::run::u64 Tag::GetBlobSize(const std::string &blob_name) {
 
 std::vector<std::string> Tag::GetContainedBlobs() {
   auto *cte_client = CLIO_CTE_CLIENT;
-  auto task = cte_client->AsyncGetContainedBlobs(tag_id_);
+  auto task = cte_client->AsyncGetContainedBlobs(tag_id_, clio::run::PoolQuery::Broadcast());
   task.Wait();
 
   std::vector<std::string> blobs = task->blob_names_;

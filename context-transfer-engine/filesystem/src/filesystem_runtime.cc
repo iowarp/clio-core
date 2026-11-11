@@ -228,9 +228,11 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
       CLIO_CO_RETURN;
     }
   }
-  // Mirror the namespace into CTE tag names (async). The root first; on a
-  // restart this node missed broadcasts while down, so drop its published
-  // names, re-add the ones this container owns, and pull the rest from peers.
+  // Mirror the namespace into CTE tag names (async). The root first. On a
+  // restart this node's CTE still holds the names published before it went
+  // down, so drop them and re-add the ones this container owns. Names owned
+  // by other containers are published by those containers into their own
+  // nodes' CTE, so nothing is pulled from peers.
   PublishName(clio::cte::core::TagNameOp::kSetRoot, FsRootId(), "/");
   if (is_restart_) {
     std::string reset;
@@ -247,11 +249,6 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
     }
     auto u = cte_.AsyncUpdateTagNames(reset, clio::run::PoolQuery::Local());
     CLIO_CO_AWAIT(u);
-    const clio::run::u32 n = NumContainers();
-    for (clio::run::u32 c = 0; c < n; ++c) {
-      if (c != container_id_) catchup_missing_.insert(c);
-    }
-    catchup_pending_ = !catchup_missing_.empty();
   }
 
   // issue #817: shared-memory attribute mirror. Node-local derived state that
@@ -284,7 +281,7 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   // Never claim the root complete: after a restart it has children the
   // mirror has never seen.
   MirrorDir("/", FsRootId(), /*complete=*/false);
-  EnsurePurgeDrain();  // also broadcasts the queued tag names
+  EnsurePurgeDrain();  // also publishes the queued tag names
   fields->return_code_ = 0;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -854,7 +851,7 @@ clio::run::TaskResume Runtime::Close(clio::run::shared_ptr<CloseTask> &task) {
     if (fi->open_count_ > 0) fi->open_count_--;
     if (task->advance_size_ != 0) fi->dirty_ = true;
     if (fi->orphan_ && fi->open_count_ == 0) {
-      DropInodeLocked(fi);
+      DropInodeLocked(fi, /*size_trusted=*/true);
     } else if (fi->dirty_) {
       fi->dirty_ = false;
       LogInode(*fi);
@@ -1698,6 +1695,7 @@ clio::run::TaskResume Runtime::Readdir(clio::run::shared_ptr<ReaddirTask> &task)
   const std::string dir = FsNormPath(task->path_.str());
   task->entries_ = clio::run::priv::vector<clio::run::priv::string>(CTP_MALLOC);
   task->inos_ = clio::run::priv::vector<clio::run::u64>(CTP_MALLOC);
+  task->types_ = clio::run::priv::vector<clio::run::u32>(CTP_MALLOC);
   CLIO_FS_RESOLVE(dir, de, dpar, rc);
   (void)dpar;
   if (rc == 0 && de.type_ != kFsTypeDir) rc = ENOTDIR;
@@ -1706,10 +1704,12 @@ clio::run::TaskResume Runtime::Readdir(clio::run::shared_ptr<ReaddirTask> &task)
   if (rc == 0) CLIO_CO_AWAIT(CollectDir(de.id_, &listing, &newest, rc));
   task->entries_.reserve(listing.size());
   task->inos_.reserve(listing.size());
+  task->types_.reserve(listing.size());
   for (const auto &kv : listing) {
     task->entries_.push_back(
         clio::run::priv::string(CTP_MALLOC, FsJoin(dir, kv.first)));
     task->inos_.push_back(InoFromPacked(kv.second.id_));
+    task->types_.push_back(kv.second.type_);
   }
   task->return_code_ = rc;
   CLIO_CO_RETURN;

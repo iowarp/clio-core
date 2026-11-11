@@ -77,6 +77,13 @@ inline clio::run::u64 NowNs() { return clio::cte::core::GetWallTimeNs(); }
 constexpr double kCommitPollUs = 10.0;
 /** Wait between checks while another task loads the same block (us). */
 constexpr double kLoadPollUs = 20.0;
+/**
+ * Most directory entries one block-loading subtask covers when a directory
+ * scan fans out. A level of the split tree whose blocks could hold more than
+ * this many entries is loaded by concurrent subtasks, each covering at most
+ * this many (see Runtime::ScanBlocksPerTask).
+ */
+constexpr clio::run::u64 kScanTaskEntries = 8192;
 /** Version jump when a home loads a block from its blob: more changes
  *  than one incarnation of a home can make to one block. */
 constexpr clio::run::u64 kIncarnationStride = 1ull << 32;
@@ -1761,6 +1768,101 @@ clio::run::TaskResume Runtime::TableBlocks(clio::run::u64 dir,
   CLIO_TASK_BODY_END
 }
 
+size_t Runtime::ScanBlocksPerTask(clio::run::u32 split_entries) {
+  const size_t split = std::max<clio::run::u32>(split_entries, 1);
+  return std::max<size_t>(1, static_cast<size_t>(kScanTaskEntries) / split);
+}
+
+clio::run::TaskResume Runtime::CollectBlocks(
+    clio::run::u64 dir, std::vector<clio::run::u32> *out, int &rc) {
+  CLIO_TASK_BODY_BEGIN
+  rc = 0;
+  out->clear();
+  // A block's children are known only once it is loaded, so the tree is
+  // walked one level at a time. A level's blocks hold at most
+  // split_entries_ rows each: a level that could exceed kScanTaskEntries is
+  // loaded by subtasks first, and the walk below then finds every block cached.
+  std::vector<clio::run::u32> level{0};
+  std::unordered_set<clio::run::u32> seen;
+  std::string shape;  // index:born-depth of every block, for the error below
+  while (!level.empty()) {
+    if (static_cast<clio::run::u64>(level.size()) * split_entries_ >
+        kScanTaskEntries) {
+      CLIO_CO_AWAIT(LoadBlocksConcurrently(dir, level, rc));
+      if (rc != 0) CLIO_CO_RETURN;
+    }
+    std::vector<clio::run::u32> next;
+    for (clio::run::u32 k : level) {
+      if (!seen.insert(k).second) {
+        // Each block has exactly one parent in the split tree; reaching one
+        // twice means two blocks disagree about who owns which names.
+        HLOG(kError, "filesystem: directory {} has a corrupt split tree "
+             "(block {} reached twice): {}", dir, k, shape);
+        rc = EIO;
+        CLIO_CO_RETURN;
+      }
+      std::shared_ptr<TableBlockSlot> slot;
+      CLIO_CO_AWAIT(LoadBlock(dir, k, slot, rc));
+      if (rc != 0) CLIO_CO_RETURN;
+      out->push_back(k);
+      {
+        std::lock_guard<std::mutex> g(ns_mu_);
+        const InodeTableBlock &b = slot->blk_;
+        shape += std::to_string(b.index_) + ":" + std::to_string(b.born_) +
+                 "-" + std::to_string(b.depth_) + " ";
+        for (clio::run::u32 c : ChildBlocks(b)) next.push_back(c);
+      }
+      if (out->size() % 64 == 0) CLIO_CO_AWAIT(clio::run::yield(1.0));
+    }
+    level = std::move(next);
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::LoadBlocksConcurrently(
+    clio::run::u64 dir, const std::vector<clio::run::u32> &blocks, int &rc) {
+  CLIO_TASK_BODY_BEGIN
+  rc = 0;
+  const size_t per_task = ScanBlocksPerTask(split_entries_);
+  // Every subtask is sent before any reply is awaited, so they run on
+  // whichever workers are free.
+  std::vector<clio::run::Future<ShardOpTask>> inflight;
+  for (size_t i = 0; i < blocks.size(); i += per_task) {
+    const size_t end = std::min(blocks.size(), i + per_task);
+    FsReq req;
+    req.dir_id_ = dir;
+    req.str_ = EncIndices(std::vector<clio::run::u32>(
+        blocks.begin() + static_cast<std::ptrdiff_t>(i),
+        blocks.begin() + static_cast<std::ptrdiff_t>(end)));
+    inflight.push_back(SendShard(container_id_, kTableLoadBlocks, req));
+  }
+  for (auto &f : inflight) {
+    CLIO_CO_AWAIT(f);
+    FsResp resp;
+    const bool ok = ReadShardResp(f, &resp);
+    if (rc == 0) rc = ok ? static_cast<int>(resp.rc_) : EIO;
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::LoadBlockGroup(const FsReq &req, FsResp &resp) {
+  CLIO_TASK_BODY_BEGIN
+  resp.rc_ = 0;
+  for (clio::run::u32 k : DecIndices(req.str_)) {
+    std::shared_ptr<TableBlockSlot> slot;
+    int rc = 0;
+    CLIO_CO_AWAIT(LoadBlock(req.dir_id_, k, slot, rc));
+    if (rc != 0) {
+      resp.rc_ = static_cast<clio::run::u32>(rc);
+      break;
+    }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 clio::run::TaskResume Runtime::CollectDir(
     clio::run::u64 dir, std::vector<std::pair<std::string, InodeRow>> *out,
     clio::run::u64 *newest, int &rc) {
@@ -1776,7 +1878,7 @@ clio::run::TaskResume Runtime::CollectDir(
     out->clear();
     *newest = 0;
     std::vector<clio::run::u32> blocks;
-    CLIO_CO_AWAIT(TableBlocks(dir, &blocks, rc));
+    CLIO_CO_AWAIT(CollectBlocks(dir, &blocks, rc));
     if (rc != 0) CLIO_CO_RETURN;
     std::vector<std::shared_ptr<TableBlockSlot>> slots;
     for (clio::run::u32 k : blocks) {

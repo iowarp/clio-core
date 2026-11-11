@@ -2772,6 +2772,20 @@ int cte_fuse_readdir_flush_guard() {
   return 0;
 }
 
+/**
+ * File-type bits (S_IFMT) for a directory entry of the given filesystem type.
+ * @param fs_type kFsType* as stored in the directory row
+ * @return S_IFREG, S_IFDIR or S_IFLNK; 0 (DT_UNKNOWN) for anything else
+ */
+static mode_t DirentMode(clio::run::u32 fs_type) {
+  switch (fs_type) {
+    case clio::cte::filesystem::kFsTypeFile: return S_IFREG;
+    case clio::cte::filesystem::kFsTypeDir: return S_IFDIR;
+    case clio::cte::filesystem::kFsTypeSymlink: return S_IFLNK;
+    default: return 0;
+  }
+}
+
 int cte_fuse_readdir(const char *path, void *buf,
                             ClioFuseFillDirT filler, cte_off_t offset,
                             struct fuse_file_info *fi,
@@ -2860,12 +2874,15 @@ int cte_fuse_readdir(const char *path, void *buf,
     // as POSIX is concerned: listing it made `ls` show debris and let rm -r
     // trip over it.
     if (name.rfind(".fuse_hidden", 0) == 0) continue;
-    // Supply only d_ino (the child's tag-derived inode) so getdents agrees with
-    // a subsequent stat (generic/637). Leave st_mode = 0 (DT_UNKNOWN): the entry
-    // type is not reliably known here, so the kernel issues a getattr to resolve
-    // it — setting a wrong d_type would mislead `rm -rf`/`find`.
+    // Supply d_ino (the child's tag-derived inode) so getdents agrees with a
+    // subsequent stat (generic/637), and d_type from the type stored in the
+    // directory row (immutable for an inode). Without d_type a walker stats
+    // every entry just to tell files from directories: pfind did 128,000
+    // serial stats on one rank for one shared directory. An entry whose type
+    // the chimod did not report stays DT_UNKNOWN (st_mode = 0).
     cte_stat_t st;
     memset(&st, 0, sizeof(st));
+    st.st_mode = i < t->types_.size() ? DirentMode(t->types_[i]) : 0;
     st.st_ino = i < t->inos_.size() ? static_cast<ino_t>(t->inos_[i]) : 0;
     // d_ino = 0 means "deleted" to glibc's readdir(3), which silently DROPS
     // the entry — children whose ino lookup missed became invisible to ls

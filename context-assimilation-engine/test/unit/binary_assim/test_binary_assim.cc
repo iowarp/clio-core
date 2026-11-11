@@ -340,7 +340,7 @@ int main(int argc, char* argv[]) {
       HLOG(kSuccess, "Tag found in CTE: {} (ID: {})", kTestTagName, tag_id);
 
       // Get tag size to verify data was transferred
-      auto size_task = cte_client->AsyncGetTagSize(tag_id);
+      auto size_task = cte_client->AsyncGetTagSize(tag_id, clio::run::PoolQuery::Broadcast(0.0f));
       size_task.Wait();
       size_t tag_size = size_task->tag_size_;
       HLOG(kInfo, "Tag size in CTE: {} bytes", tag_size);
