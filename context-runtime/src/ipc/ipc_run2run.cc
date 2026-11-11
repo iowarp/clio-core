@@ -747,6 +747,27 @@ bool IpcManagerRun2Run::RecvInHandleOne(
     // issue #781: ClientMapTask removed. Deposit on the shared ingress lane (0);
     // the runtime maps to a worker via RuntimeMapTask.
     clio::run::u32 lane_id = 0;
+    // CLIO_NET_DIRECT (default on in this branch; =0 restores lane 0): place
+    // the task on its worker HERE, on the recv thread, instead of pushing it
+    // to the shared ingress lane 0. Lane 0 is drained only by worker 0, which
+    // also owns client SHM shard 0 and drains up to 256 client requests
+    // inline per pass, so with the hand-off done there (CLIO_NET_SPREAD) a
+    // remote task still waited ~2 ms (r_lane) under a 4-node 16x16 4 KB load
+    // once the send queues were emptied by dedicated send threads. Same
+    // least-loaded choice (RuntimeMapTask with no submitting worker); marked
+    // net-placed so the destination's RouteTask runs it without re-placing.
+    static const bool kNetDirect = [] {
+      const char *e = std::getenv("CLIO_NET_DIRECT");
+      return !(e != nullptr && e[0] == '0');
+    }();
+    if (kNetDirect && task_ptr->IsRemote()) {
+      clio::run::ContainerHold exec = task_ptr->ExecContainer().get();
+      if (exec) {
+        task_ptr->SetNetPlaced();
+        lane_id = ipc_manager->GetScheduler()->RuntimeMapTask(nullptr, future,
+                                                              exec);
+      }
+    }
     auto *worker_queues = ipc_manager->GetTaskQueue();
     if (worker_queues) {
       auto &dest_lane = worker_queues->GetLane(lane_id, 0);
