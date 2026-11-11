@@ -2438,6 +2438,24 @@ const std::string &IpcManager::GetCurrentHostname() const {
   return this_host_.ip_address;
 }
 
+namespace {
+// Peer (run2run) transport, experiment: CLIO_PEER_TRANSPORT=socket swaps the
+// peer listener(s) and peer connections from ZeroMQ to lightbeam's plain TCP
+// SocketTransport (one sendmsg per message, TCP_NODELAY, no I/O threads).
+// Measured on ares: a raw libzmq DEALER->ROUTER 64 B round trip is 253 us vs
+// 79 us for blocking TCP between the same two nodes.
+ctp::lbm::TransportType PeerTransportType() {
+  static const ctp::lbm::TransportType t = [] {
+    const char *e = std::getenv("CLIO_PEER_TRANSPORT");
+    if (e != nullptr && std::string(e) == "socket") {
+      return ctp::lbm::TransportType::kSocket;
+    }
+    return ctp::lbm::TransportType::kZeroMq;
+  }();
+  return t;
+}
+}  // namespace
+
 bool IpcManager::TryStartMainServer(const std::string &hostname) {
   ConfigManager *config = CLIO_CONFIG_MANAGER;
 
@@ -2454,7 +2472,7 @@ bool IpcManager::TryStartMainServer(const std::string &hostname) {
     for (int i = 0; i < NetTierSlots(); ++i) {
       u32 tport = port + kNetTierPortOffset + static_cast<u32>(i);
       ctp::lbm::TransportPtr t = ctp::lbm::TransportFactory::Get(
-          hostname, ctp::lbm::TransportType::kZeroMq,
+          hostname, PeerTransportType(),
           ctp::lbm::TransportMode::kServer, protocol, tport);
       if (!t) {
         HLOG(kError, "Failed to bind size-tier peer port {}:{}", hostname,
@@ -2471,7 +2489,7 @@ bool IpcManager::TryStartMainServer(const std::string &hostname) {
     }
 
     main_transport_ = ctp::lbm::TransportFactory::Get(
-        hostname, ctp::lbm::TransportType::kZeroMq,
+        hostname, PeerTransportType(),
         ctp::lbm::TransportMode::kServer, protocol, port);
 
     if (!main_transport_) {
@@ -2860,8 +2878,8 @@ ctp::lbm::Transport *IpcManager::GetOrCreateClient(const std::string &addr,
   ctp::lbm::TransportPtr transport;
   try {
     transport = ctp::lbm::TransportFactory::Get(
-        addr, ctp::lbm::TransportType::kZeroMq,
-        ctp::lbm::TransportMode::kClient, "tcp", port);
+        addr, PeerTransportType(), ctp::lbm::TransportMode::kClient, "tcp",
+        port);
   } catch (const std::exception &e) {
     HLOG(kError, "[ClientPool] Failed to dial {}: {}", key, e.what());
     return nullptr;
