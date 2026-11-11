@@ -99,6 +99,16 @@ if(HDF5_ENABLED)
   list(APPEND RUNTIME_LINK_LIBRARIES ${HDF5_LIBRARIES})
 endif()
 
+# http:// and https:// sources (curl child processes via posix_spawn; POSIX
+# only). Credentials come from ~/.clio/cae_http_auth.ini (http_auth.h).
+if(NOT WIN32)
+  message(STATUS "CAE HTTP(S) support: ENABLED")
+  add_compile_definitions(CAE_ENABLE_HTTP)
+  list(APPEND RUNTIME_SOURCES
+    src/factory/http_file_assimilator.cc
+    src/factory/http_fetch.cc)
+endif()
+
 # Conditionally add Globus assimilator if enabled
 if(GLOBUS_ENABLED)
   list(APPEND RUNTIME_SOURCES src/factory/globus_file_assimilator.cc)
@@ -190,10 +200,23 @@ if(CAE_ENABLE_S3)
   install(TARGETS cae_s3_tool DESTINATION bin)
 endif()
 
+# cae_http_tool: the http(s) download engine without a runtime -- fetch one URL
+# with the same config file and CAE_HTTP_* knobs the assimilator uses.
+if(NOT WIN32)
+  add_executable(cae_http_tool
+    src/factory/tools/http_tool_main.cc
+    src/factory/http_fetch.cc)
+  target_include_directories(cae_http_tool PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  find_package(Threads REQUIRED)
+  target_link_libraries(cae_http_tool PRIVATE Threads::Threads)
+  install(TARGETS cae_http_tool DESTINATION bin)
+endif()
+
 # OMNI parsing, split out of the clio_cae binary so the unit tests can link it
 # (a main()-only translation unit is not linkable from a test). Static: it has
 # exactly two consumers, the binary below and test_cae_omni_loader.
-add_library(cae_omni_loader STATIC src/omni_loader.cc)
+add_library(cae_omni_loader STATIC src/omni_loader.cc src/omni_run.cc)
 target_include_directories(cae_omni_loader
   PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>

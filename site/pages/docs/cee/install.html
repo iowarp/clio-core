@@ -1,0 +1,90 @@
+<!--
+title: Install
+heading: Install the <em>Context Exploration Engine.</em>
+description: Which CLIO Core packages include the Context Exploration Engine and its clio_cee Python module, the CMake options and nanobind requirement for source builds, what the MCP server needs, and how to check the install.
+eyebrow: Docs · Context Exploration Engine
+lede: The pip wheel is the easiest way to get CEE: it ships the C++ library and the clio_cee Python module. From source, CEE is on by default and the Python module needs CLIO_CORE_ENABLE_PYTHON, which fetches nanobind. The MCP server is a separate Python script with its own requirements.
+facts: pip | pip install iowarp-core, then import clio_cee ; CMake | CLIO_CORE_ENABLE_CEE=ON, CLIO_CORE_ENABLE_PYTHON=ON ; Binding | nanobind v2.9.2, fetched by CMake ; MCP | mcp>=1.2,<2 and pyyaml
+-->
+<h2>What each package includes</h2>
+<p>The general <a href="/docs/installation.html">installation page</a> covers every method. This page says what each one gives you for CEE.</p>
+<ul class="checks">
+  <li><strong>pip wheel</strong> (<code>pip install iowarp-core</code>). Built with <code>CLIO_CORE_ENABLE_CEE=ON</code> and <code>CLIO_CORE_ENABLE_PYTHON=ON</code>. The wheel contains <code>libclio_cee_api</code> and the <code>clio_cee</code> extension under <code>iowarp_core/ext</code>, and importing <code>iowarp_core</code> puts that directory on <code>sys.path</code>. <code>iowarp_core.cee_available()</code> reports whether the extension is present. Wheels exist for CPython 3.10 to 3.13 on Linux x86_64 and aarch64, Windows x64 and macOS on Apple Silicon.</li>
+  <li><strong>conda</strong> (<code>iowarp-core</code> on the <code>iowarp</code> channel, linux-64, Python 3.12). Includes CEE and the <code>clio_cee</code> module in the environment's site-packages.</li>
+  <li><strong>Docker</strong> (<code>iowarp/deploy-cpu</code>). Includes the CEE C++ library. The image is meant to run the runtime; use CEE from a client on the host or in another container.</li>
+  <li><strong>Spack</strong>. Variant <code>+cee</code> (default on); add <code>+python</code> for the module.</li>
+  <li><strong>.deb, .rpm, AppImage, Windows installer.</strong> Native binaries without Python bindings. The C++ library and headers come with the Linux packages. The Windows presets set <code>CLIO_CORE_ENABLE_CEE=OFF</code>, so the Windows installer does not include CEE; use the pip wheel on Windows.</li>
+  <li><strong>Source.</strong> Everything below.</li>
+</ul>
+
+<h2>Build options</h2>
+<div class="table-wrap"><table>
+  <thead><tr><th>Option</th><th>Default</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>CLIO_CORE_ENABLE_CEE</code></td><td>ON</td><td>Builds <code>context-exploration-engine/api</code>: the shared library <code>clio_cee_api</code>, its CMake package, and the tests.</td></tr>
+    <tr><td><code>CLIO_CORE_ENABLE_CAE</code></td><td>ON</td><td>Required. <code>clio_cee_api</code> links <code>clio_cae_core_client</code> and includes the CAE's <code>AssimilationCtx</code>.</td></tr>
+    <tr><td><code>CLIO_CORE_ENABLE_PYTHON</code></td><td>OFF</td><td>Builds the <code>clio_cee</code> module. The root build fetches nanobind v2.9.2 with <code>FetchContent</code> and finds Python with the <code>Interpreter</code> and <code>Development.Module</code> components. The module is installed to the detected site-packages directory (<code>PYTHON_SITE_PACKAGES</code>).</td></tr>
+  </tbody>
+</table></div>
+<p>If <code>CLIO_CORE_ENABLE_PYTHON</code> is on but the <code>nanobind_add_module</code> command is not available, the CEE build prints a warning and skips the module rather than failing. The same option also builds <code>clio_cte_core_ext</code>, the CTE Python module that the MCP server and the <a href="/tutorials/python-semantic-query.html">query-files-from-Python tutorial</a> use.</p>
+
+<h2>Build from source</h2>
+<pre data-label="shell">
+$ git clone --recurse-submodules https://github.com/iowarp/clio-core.git
+$ cd clio-core
+$ cmake --preset release -DCLIO_CORE_ENABLE_PYTHON=ON
+$ cmake --build build -j"$(nproc)"
+$ sudo cmake --install build
+</pre>
+<p>Look for these configure lines:</p>
+<pre data-label="text">
+Python bindings enabled - configuring nanobind
+Building CEE Python bindings - nanobind configured by root CMakeLists.txt
+CEE Python wrapper will be installed to: /path/to/site-packages
+    Context Exploration:        ON
+</pre>
+<p>Without installing, the module is in the build's <code>bin</code> directory; put that directory on <code>PYTHONPATH</code>. The MCP server also searches <code>CTE_PYTHON_PATH</code>.</p>
+
+<h2>Use the C++ library from CMake</h2>
+<p>The install exports the package <code>clio_cee_api</code> with the target <code>clio::cee::api</code>. Its config file finds <code>clio_run</code>, <code>clio_cte_core</code> and <code>clio_cae_core</code> for you.</p>
+<pre data-label="cmake">
+find_package(clio_cee_api REQUIRED)
+add_executable(app app.cc)
+target_link_libraries(app PRIVATE clio::cee::api)
+</pre>
+
+<h2>MCP server requirements</h2>
+<p>The server in <code>context-exploration-engine/iowarp-cei-mcp/server.py</code> needs:</p>
+<ul>
+  <li>Python 3.8 or newer, per its README.</li>
+  <li><code>mcp&gt;=1.2,&lt;2</code> and <code>pyyaml&gt;=6.0</code>, from its <code>requirements.txt</code>. The server imports <code>mcp.server.fastmcp</code>, which mcp 2.x renamed, so pin below 2.</li>
+  <li>The <code>clio_cte_core_ext</code> module on the search path: the build's <code>bin</code> directory, <code>CTE_PYTHON_PATH</code>, or <code>PYTHONPATH</code>. It is also in the pip wheel's <code>iowarp_core/ext</code>, which <code>import iowarp_core</code> adds to <code>sys.path</code>.</li>
+</ul>
+<pre data-label="shell">
+$ cd context-exploration-engine/iowarp-cei-mcp
+$ python3 -m venv venv &amp;&amp; source venv/bin/activate
+$ pip install -r requirements.txt
+$ export PYTHONPATH=/path/to/build/bin:$PYTHONPATH
+</pre>
+
+<h2>Check the install</h2>
+<p>Start the runtime, then run a round trip from Python. On Windows, set <code>CLIO_BIND_ADDR=127.0.0.1</code> and <code>CLIO_SERVER_ADDR=127.0.0.1</code> for both the runtime and the client.</p>
+<pre data-label="shell">
+$ clio_run start &amp;
+$ python -c "import iowarp_core; print(iowarp_core.cee_available())"
+</pre>
+<pre data-label="python">
+import os
+os.environ.setdefault("CLIO_CTE_POOL", "563.0")   # reach the indexer for keyword search
+import clio_cee as cee
+
+ctx = cee.ContextInterface()
+rc = ctx.context_bundle([cee.AssimilationCtx(
+    src='string::hello', dst='iowarp::cee_check', format='binary',
+    src_data="hello from the CEE")])
+assert rc == 0
+print(ctx.context_query("cee_check", ".*"))        # ['hello']
+print(ctx.context_retrieve("cee_check", "hello"))  # ['hello from the CEE']
+ctx.context_destroy(["cee_check"])
+</pre>
+<p>A bundle return of 1 with <code>Failed to initialize Clio client</code> in the log means no runtime was reachable. That failure is remembered for the life of the process, so start the runtime and run the script again.</p>

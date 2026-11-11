@@ -1,0 +1,64 @@
+<!--
+title: gbt
+heading: <em>gbt:</em> gradient-boosted regression trees.
+description: API reference for clio-ml's gradient-boosted regression trees: Python fit_gbt and predict, C++ FitGbt and GbtPredict, GbtOptions and the GbtModel layout.
+eyebrow: Docs · Machine learning
+lede: Gradient-boosted regression trees with squared loss, the equivalent of Spark MLlib's GBTRegressor. Each level of each tree is one paged pass: the kernel evaluates the prior ensemble per row from resident metadata, accumulates gradient sums per node, feature and bin, and the host picks the variance-reduction split.
+facts: Module | ml_gbt ; Header | clio_ml/gbt.h ; Rows | features, then target ; Limits | num_trees at most 64, max_depth at most 6
+-->
+<h2>What it does</h2>
+<p>Leaf value is <code>-sum g / count</code> and the prediction is <code>sum_t learning_rate * leaf_t(x)</code>. The same header and options drive the <a href="/docs/ml/gbtc.html">classifier</a> when <code>logistic</code> is true. Bit-reproducible across paging and block counts.</p>
+
+<h2>Rows</h2>
+<p><code>n_features</code> feature columns followed by the regression target. <code>clio_ml.COLUMNS["gbt"]</code> is 1.</p>
+
+<h2>Python</h2>
+<pre data-label="python">
+import numpy as np, clio_ml as cm
+rng = np.random.default_rng(1)
+X = rng.normal(size=(4096, 7)).astype(np.float32)
+y = X[:, 0] * X[:, 1] + 0.1 * rng.normal(size=4096)
+data = np.column_stack([X, y]).astype(np.float32)
+
+r = cm.fit_gbt(data, num_trees=3, max_depth=3, learning_rate=0.3)
+print(r.model.M, "trees of depth", r.model.depth)
+print(cm.predict("gbt", r, data[0, :7]))      # regression value
+</pre>
+<ul>
+  <li><code>fit_gbt(X, **options)</code>.</li>
+  <li>Options (<code>GbtOptions</code>): <code>num_trees</code> (20), <code>max_depth</code> (3), <code>num_bins</code> (32), <code>learning_rate</code> (0.3), <code>logistic</code> (False), <code>l2</code> (0.0), <code>min_hessian</code> (1.0; equals the minimum rows per child for regression), <code>threads</code> (256).</li>
+  <li>Result <code>GbtResult</code>: <code>model</code> and <code>stats</code>. <code>model</code> (<code>GbtModel</code>): <code>nf</code>, <code>B</code>, <code>depth</code>, <code>maxN</code> (slots per tree), <code>M</code> (trees), <code>lr</code>, <code>mn</code> and <code>inv</code> (binning), and <code>feat</code>, <code>split</code>, <code>leaf</code>, <code>value</code> (each <code>M*maxN</code>).</li>
+  <li><code>predict("gbt", r, x)</code> returns the raw regression value.</li>
+</ul>
+
+<h2>C++</h2>
+<pre data-label="cpp">
+struct GbtOptions {
+  u32 num_trees = 20;     // <= 64
+  u32 max_depth = 3;      // <= 6
+  u32 num_bins = 32;
+  float learning_rate = 0.3f;
+  bool logistic = false;  // true: binary log-loss classifier
+  float l2 = 0.0f;
+  float min_hessian = 1.0f;
+  u32 threads = 256;
+  ClusterExchange cluster;
+};
+struct GbtModel {
+  u32 nf = 0, B = 0, depth = 0, maxN = 0, M = 0;
+  float lr = 0.0f;
+  std::vector<float> mn, inv;
+  std::vector<float> feat, split, leaf, value;  // M*maxN each
+  std::vector<float> Flatten() const;
+};
+struct GbtResult { GbtModel model; VecStats stats; };
+GbtResult FitGbt(Dataset &ds, const GbtOptions &opt);
+GbtResult FitGbtPlain(const float *data, u64 n_rows, u32 nf, u64 elems_per_page,
+                      u32 nblocks, const GbtOptions &opt);
+GbtResult FitGbtReference(/* same arguments */);
+float GbtPredict(const GbtModel &m, const float *x);        // raw margin / value
+float GbtPredictProba(const GbtModel &m, const float *x);   // sigmoid of GbtPredict
+</pre>
+<p>The ChiMod is module <code>ml_gbt</code>.</p>
+
+<p>Related: <a href="/docs/ml/gbtc.html">gradient-boosted classifier</a>, <a href="/docs/ml/tree.html">decision tree</a>, <a href="/docs/ml/rf.html">random forest</a>.</p>

@@ -171,6 +171,38 @@ assimilation time (no secrets are placed in the OMNI file):
   gcloud ADC, or the GCE/GKE metadata server), and an optional endpoint via
   `GCS_ENDPOINT` (e.g. fake-gcs-server).
 
+**Transforming a source first (`run:`):**
+
+```yaml
+transfers:
+  - src: file::/data/A46_xx.csv
+    dst: iowarp::a46_parquet
+    format: binary
+    run: to_parquet.sh                  # called as: to_parquet.sh <src> <run_out>
+    run_out: ${SCRATCH}/a46.parquet     # the file the script writes; it is ingested
+```
+
+`clio_cae` runs each `run:` script before it submits anything. The scripts run
+in order, as the user running `clio_cae`, and never inside the runtime.
+
+- **Arguments:** the script gets two. The first is the local path for `file::`
+  and `hdf5::` sources, and the URL itself for any other scheme, so a script
+  can fetch remote data on its own. The second is `run_out`.
+- **Success:** the script must exit 0 and leave a regular file at `run_out`. An
+  existing `run_out` is deleted first, so a file from an earlier run can't count
+  as this run's output.
+- **What gets ingested:** the transfer then ingests `run_out`, as `hdf5::` when
+  `format` starts with `hdf5` and as `file::` otherwise. `range_off` and
+  `range_size` apply to that output. A later `depends_on` that named the old
+  `src` is updated to match.
+- **Failure:** if any step fails, no transfer is submitted.
+- **Paths:** `run` and `run_out` expand `${VAR}`. Relative paths resolve
+  against the OMNI file's directory.
+- **Visibility:** `run_out` must be readable by the runtime process, so on
+  several nodes put it on a shared file system.
+- **Windows:** the script runs through `cmd /C`, so `.bat` and `.cmd` files
+  work.
+
 **Key fields:**
 
 | Field | Description |
@@ -181,6 +213,9 @@ assimilation time (no secrets are placed in the OMNI file):
 | `range_off` / `range_size` | Byte range within source (0 = full file) |
 | `src_token` / `dst_token` | Auth tokens; environment variables are expanded |
 | `dataset_filter` | HDF5 dataset include/exclude glob patterns |
+| `run` / `run_out` | Script that turns `src` into `run_out` before ingest (see above) |
+
+A per-transfer key not in this table is logged as a warning and ignored.
 
 ## Linking from C++
 

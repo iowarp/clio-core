@@ -1,0 +1,46 @@
+<!--
+title: Overview
+heading: The Context <em>Exploration Engine.</em>
+description: What the Context Exploration Engine (CEE) is, the problem it solves, its bundle, query and retrieve model, how it builds on the Context Assimilation Engine and the Context Transfer Engine, and where to read next.
+eyebrow: Docs · Context Exploration Engine
+lede: The Context Exploration Engine (CEE) is a small API over the other two engines. It imports data through the Context Assimilation Engine, then finds and reads it back through the Context Transfer Engine by name, by keyword or by time. It exists so that a program, a notebook or an agent can work with stored data through five calls.
+facts: C++ | iowarp::ContextInterface in clio_cee/api/context_interface.h ; Python | import clio_cee ; Source | context-exploration-engine/api ; Needs | A running runtime
+-->
+<h2>What it is</h2>
+<p>CEE is one class, <code>iowarp::ContextInterface</code>, available in C++ and as the Python module <code>clio_cee</code>. It has five methods:</p>
+<ul>
+  <li><strong>bundle</strong> imports a list of sources into tags.</li>
+  <li><strong>query</strong> returns the names of blobs that match a regular expression, a keyword prompt, or a time range.</li>
+  <li><strong>retrieve</strong> runs the same query and returns the matching blobs' bytes packed into one buffer.</li>
+  <li><strong>destroy</strong> deletes tags.</li>
+  <li><strong>splice</strong> is declared but not implemented.</li>
+</ul>
+<p>The class stores nothing itself. Every call becomes a task on the Context Assimilation Engine or the Context Transfer Engine, so what CEE can find and how fast it can read is decided by how the runtime is composed.</p>
+
+<h2>The problem it solves</h2>
+<p>The CTE client is precise but verbose: tags, tag ids, blob ids, buffers in shared memory, async futures. The CAE client takes serialized context lists. A program that only wants to put some documents in, ask which ones talk about a subject, and read those back should not have to learn either. CEE is that shortcut. It is also the API the pip wheel exposes for Python users who do not build from source, and the shape an agent tool or a retrieval pipeline calls.</p>
+
+<h2>Key concepts</h2>
+<ul>
+  <li><strong>Context.</strong> In CEE's vocabulary a context is a CTE tag. <code>context_destroy</code> takes tag names. A bundle's <code>dst</code> is <code>iowarp::&lt;tag name&gt;</code>.</li>
+  <li><strong>AssimilationCtx.</strong> The transfer description shared with the CAE: source URL, destination, format, and optional range, tokens and inline payload. The Python binding exposes nine of its fields.</li>
+  <li><strong>Query modes.</strong> One method, three behaviors chosen by its arguments: temporal when a time bound is set, semantic when a prompt is given, regex otherwise. The order of precedence is temporal, then semantic, then regex.</li>
+  <li><strong>Patterns.</strong> <code>tag_re</code> and <code>blob_re</code> are full-string regular expressions. <code>.*</code> matches everything; <code>.*part.*</code> matches a substring.</li>
+  <li><strong>Packed buffer.</strong> Retrieve returns the bytes of every matched blob concatenated, with no framing. The caller must know the blob sizes or query names first.</li>
+</ul>
+
+<h2>How it relates to the other technologies</h2>
+<ul>
+  <li><a href="/docs/cae/index.html">Context Assimilation Engine</a>: <code>context_bundle</code> is a <code>ParseOmni</code> task on the CAE pool at 400.0. Everything the CAE can import, CEE can import, with the fields the binding exposes.</li>
+  <li><a href="/docs/cte/index.html">Context Transfer Engine</a>: query, retrieve and destroy are the CTE client's <code>BlobQuery</code>, <code>SemanticSearch</code>, <code>TemporalSearch</code>, <code>GetBlob</code> and <code>DelTag</code>. Keyword search is answered by the CTE indexer module, so the client must be bound to a pool that reaches it.</li>
+  <li><a href="/docs/runtime/index.html">Context Runtime</a>: CEE attaches to a running runtime as a client on first use. It does not start one.</li>
+  <li><a href="/docs/context-fs/index.html">Context FS</a>: files written through a mount are tags and blobs, so CEE can query and retrieve them without an import. Pages are named by number and there is a small attribute blob to exclude.</li>
+  <li><a href="/docs/ml/index.html">Machine learning</a>: clio-ml reads datasets from the same tags; CEE is a convenient way to stage and inspect them from Python.</li>
+</ul>
+
+<h2>Where to go next</h2>
+<ul>
+  <li><a href="/docs/cee/install.html">Install</a>: the pip wheel includes <code>clio_cee</code>; the CMake options and nanobind for source builds; what the MCP server needs.</li>
+  <li><a href="/docs/cee/usage.html">Usage</a>: connecting, bundling, the three query modes, retrieving, working with Context FS files, composing storage for search, and the MCP server.</li>
+  <li><a href="/docs/cee/api.html">API reference</a>: every method, argument and default in C++ and Python, <code>AssimilationCtx</code>, return formats, environment variables and the MCP tools.</li>
+</ul>

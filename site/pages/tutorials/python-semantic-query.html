@@ -122,7 +122,7 @@ print(ctx.context_query("climate_docs", ".*"))      # ['ice', 'co2'] in some ord
 print(ctx.context_retrieve("climate_docs", ".*"))   # the texts, packed into one string
 ctx.context_destroy(["climate_docs"])
 </pre>
-<p><code>context_query</code> returns blob names only, which is why the tutorial above uses <code>clio_cte_core_ext</code> for mounted files. The full signatures are in the <a href="/docs/python-api.html">Python API reference</a>.</p>
+<p><code>context_query</code> returns blob names only, which is why the tutorial above uses <code>clio_cte_core_ext</code> for mounted files. The full signatures are in the <a href="/docs/cte/python.html">Python API reference</a>.</p>
 
 <h3>Keyword search over imported data</h3>
 <p><code>context_query(..., prompt="sea ice")</code> ranks imported blobs by BM25. In the default configuration it returns nothing: the import engine (pool <code>400.0</code>) writes straight to the storage core, below the indexer, so imports are never indexed. To index them, send imports through the top of the chain. In <code>clio.yaml</code>, move the <code>clio_cae_core</code> entry below the <code>clio_cte_cache</code> entry (an entry must come after the pool it forwards to) and change its <code>next_pool_id</code>:</p>

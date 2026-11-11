@@ -40,6 +40,34 @@ if(Poco_FOUND)
   install(TARGETS clio_run_sigv4_test RUNTIME DESTINATION bin)
 endif()
 
+# GCS REST client round-trip tests. They talk to whatever GCS_ENDPOINT names --
+# in CI, fake-gcs-server running as a service container (.github/workflows/
+# ci-cloud-bdev.yml) -- and skip when it is unset, so plain ctest never reaches
+# the real storage.googleapis.com. Labelled `cloud` for selection.
+if(CLIO_ENABLE_GOOGLE_CLOUD)
+  add_executable(clio_run_gcs_rest_test test_gcs_rest.cc)
+  target_include_directories(clio_run_gcs_rest_test PRIVATE
+    ${CLIO_RUN_ROOT}/test              # simple_test.h
+    ${CLIO_RUN_ROOT}/modules/bdev/include
+  )
+  target_link_libraries(clio_run_gcs_rest_test
+    Poco::Net Poco::NetSSL Poco::Crypto Poco::Foundation
+    ctp::cxx                            # simple_test.h pulls in clio_ctp
+  )
+  set_target_properties(clio_run_gcs_rest_test PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  target_compile_definitions(clio_run_gcs_rest_test PRIVATE
+    CLIO_ENABLE_GOOGLE_CLOUD)
+  if(CLIO_CORE_ENABLE_TESTS)
+    add_test(NAME cr_bdev_gcs_rest COMMAND clio_run_gcs_rest_test
+             WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    set_tests_properties(cr_bdev_gcs_rest PROPERTIES TIMEOUT 120 LABELS "cloud")
+  endif()
+endif()
+
 # S3 REST client round-trip tests. Driven by s3_stub_server.py, which stands up
 # an in-memory S3 stand-in on an ephemeral port and verifies SigV4 itself, so
 # the test needs no AWS account, no network and no credentials. Gated on the

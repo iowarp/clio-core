@@ -1,0 +1,76 @@
+<!--
+title: Technologies
+heading: The technologies, <em>at a glance.</em>
+description: CLIO Core's technologies and what each one gives you: Context FS, the Context Assimilation, Exploration and Transfer Engines, the Context Runtime, memory expansion and machine learning.
+eyebrow: Technologies
+lede: CLIO Core is a composable I/O stack: one runtime, one store and a set of modules you compose in YAML. Each technology below is a way of using that stack, and they all share the same data, so a file written through the mount can be searched, paged into GPU memory or trained on without a copy.
+facts: Storage | Context FS, Context Transfer Engine ; Context | Assimilation and Exploration Engines ; Runtime | Context Runtime ; Compute | Memory expansion, machine learning
+-->
+<h2>Context FS</h2>
+<p class="eyebrow">Storage</p>
+<ul class="checks">
+    <li>Mount it like any other directory on Linux, macOS and Windows through FUSE. Applications run unchanged.</li>
+    <li>Files spread across the tiers you compose (RAM, NVMe, erasure-coded arrays, Amazon S3 or Google Cloud buckets) by score, with distributed metadata and no metadata server.</li>
+    <li>Every file is also tags and blobs in the Context Transfer Engine, so search, assimilation and the other technologies use it without a copy.</li>
+</ul>
+<p><a href="/technologies/context-fs.html">Context FS overview</a> · <a href="/docs/context-fs/usage.html">Docs</a></p>
+
+<h2>Context Assimilation Engine</h2>
+<p class="eyebrow">Context</p>
+<ul class="checks">
+    <li>Brings files, HDF5 datasets, web downloads, S3, Google Cloud and Globus data into the stack with one YAML file.</li>
+    <li>Ingests on fault: register a source and only the parts that are read are pulled in, when they are read.</li>
+    <li>Describes data in the I/O path: the summarizer labels it and the indexer makes it searchable as it lands.</li>
+    <li>Serves imported data as numbered pages, so memory expansion and clio-ml can work on it directly.</li>
+</ul>
+<p><a href="/technologies/cae.html">Context Assimilation Engine overview</a> · <a href="/docs/cae/usage.html">Docs</a></p>
+
+<h2>Context Exploration Engine</h2>
+<p class="eyebrow">Context</p>
+<ul class="checks">
+    <li>One small API in C++ and Python: bundle, query, retrieve and destroy.</li>
+    <li>Finds data by name pattern, by keyword relevance (BM25) or by time window, across every node at once.</li>
+    <li>Sees everything written through Context FS, the Context Transfer Engine or the assimilation engine, with no import step.</li>
+    <li>Returns matches packed into one size-bounded buffer, ready for an analysis or a model.</li>
+</ul>
+<p><a href="/technologies/cee.html">Context Exploration Engine overview</a> · <a href="/docs/cee/usage.html">Docs</a></p>
+
+<h2>Context Transfer Engine</h2>
+<p class="eyebrow">Storage</p>
+<ul class="checks">
+    <li>A key-value store for C++ and Python: tags hold blobs, with partial reads and writes by offset.</li>
+    <li>Each blob is placed on a tier by its score; changing the score moves it.</li>
+    <li>Regex, keyword and time-window queries, and a shared-memory path for clients on the same node.</li>
+    <li>The substrate every other technology writes to.</li>
+</ul>
+<p><a href="/technologies/context-transfer-engine.html">Context Transfer Engine overview</a> · <a href="/docs/cte/usage.html">Docs</a></p>
+
+<h2>Context Runtime</h2>
+<p class="eyebrow">Runtime</p>
+<ul class="checks">
+    <li>Hosts every module as a long-lived pool and runs work as tasks, rather than as a fixed set of MPI ranks.</li>
+    <li>One abstraction for moving data over shared memory, sockets, TCP and storage tiers.</li>
+    <li>Recompose the stack, add nodes and recover from failures while it runs.</li>
+</ul>
+<p><a href="/technologies/context-runtime.html">Context Runtime overview</a> · <a href="/docs/runtime/usage.html">Docs</a></p>
+
+<h2>Memory expansion</h2>
+<p class="eyebrow">Memory</p>
+<ul class="checks">
+    <li>Paged vectors for CPU and GPU code whose data is larger than device memory.</li>
+    <li>Pages spill to DRAM and storage tiers; placement, coherence and persistence are handled for you.</li>
+    <li>Measured within 0.88-1.19x of MPI, oneCCL and Intel SHMEM on up to 64 Aurora nodes.</li>
+</ul>
+<p><a href="/technologies/memory-expansion.html">Memory expansion overview</a> · <a href="/docs/memory-expansion/usage.html">Docs</a></p>
+
+<h2>Machine learning</h2>
+<p class="eyebrow">Compute</p>
+<ul class="checks">
+    <li>clio-ml: the Spark MLlib algorithm set, over 30 modules, on CPU, CUDA and SYCL.</li>
+    <li>Trains out of core: data larger than GPU memory streams from the tiers you compose.</li>
+    <li>Measured 8-59x faster per iteration than Spark MLlib.</li>
+</ul>
+<p><a href="/technologies/machine-learning.html">Machine learning overview</a> · <a href="/docs/ml/usage.html">Docs</a></p>
+
+<h2>How the numbers on these pages were measured</h2>
+<p>Every figure on the technology pages comes from a benchmark in the repository, with its hardware and its caveats. Where a comparison favors another system, the page says so. Most runs are single runs on one machine or a small allocation; treat them as measured examples, not guarantees for your hardware. Each page links the source document so you can rerun it.</p>

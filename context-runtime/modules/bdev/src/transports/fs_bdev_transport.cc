@@ -275,6 +275,16 @@ bool FsBdevTransport::Init(const CreateParams& params,
 }
 
 bool FsBdevTransport::OpenAllocLog(const CreateParams& params) {
+  if (params.SkipsAllocLog()) {
+    // Explicitly volatile: nothing recovers this bdev's allocations, so keep
+    // no WAL and no sync thread. Remove a default log a previous non-volatile
+    // run may have left, so a later run with persistence never replays it.
+    std::error_code ec;
+    std::filesystem::remove(file_path_ + ".alloc_log", ec);
+    HLOG(kDebug, "bdev {}: persistence_level volatile, allocator WAL off",
+         file_path_);
+    return true;
+  }
   // An explicit alloc_log always recovers. The default log recovers on every
   // recovering start (a plain `clio_run start`); after `start --fresh` no
   // metadata references the old bytes, so their allocations are garbage and
@@ -868,10 +878,23 @@ clio::run::TaskResume FsBdevTransport::ReadBlocks(ctp::ipc::FullPtr<ReadTask> ta
       CLIO_CO_RETURN;
     }
 
+    // issue #1343: reads bounce like writes. Task buffers in shared memory
+    // are not DirectAlign()-aligned, so an aligned read was still sent to the
+    // buffered fd: served (and polluted) by the page cache, never the device.
+    AlignedBuf rbounce;
+    void *read_dst = block_data;
+    if (WantsBounce(block_data, static_cast<size_t>(block_read_size),
+                    block.offset_)) {
+      rbounce = TakeBounce(static_cast<size_t>(block_read_size));
+      read_dst = rbounce.get();
+    }
     ctp::IoToken token = io_ctx->async_io_->Read(
-        block_data, static_cast<size_t>(block_read_size),
+        read_dst, static_cast<size_t>(block_read_size),
         static_cast<int64_t>(block.offset_));
     if (token == ctp::kInvalidIoToken) {
+      if (rbounce) {
+        GiveBounce(std::move(rbounce), static_cast<size_t>(block_read_size));
+      }
       task->return_code_ = 2;
       task->bytes_read_ = total_bytes_read;
       CLIO_CO_RETURN;
@@ -880,6 +903,14 @@ clio::run::TaskResume FsBdevTransport::ReadBlocks(ctp::ipc::FullPtr<ReadTask> ta
     ctp::IoResult result;
     while (!io_ctx->async_io_->IsComplete(token, result)) {
       CLIO_CO_AWAIT(clio::run::yield(10.0));
+    }
+    if (rbounce) {
+      if (result.error_code == 0 && result.bytes_transferred > 0) {
+        std::memcpy(block_data, rbounce.get(),
+                    std::min(static_cast<size_t>(result.bytes_transferred),
+                             static_cast<size_t>(block_read_size)));
+      }
+      GiveBounce(std::move(rbounce), static_cast<size_t>(block_read_size));
     }
 
     if (result.error_code != 0) {

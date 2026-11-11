@@ -1,0 +1,37 @@
+<!--
+title: Overview
+heading: Memory <em>expansion.</em>
+description: What memory expansion is in CLIO Core: paged vectors for CPU and GPU code whose pages live in the Context Transfer Engine, how pages map to blobs and tiers, lazy copy-on-write copies, and how it relates to the Context Assimilation Engine and clio-ml.
+eyebrow: Docs · Memory expansion
+lede: Memory expansion gives a program a vector larger than the memory it runs in. <code>cpu_vector</code> pages into host memory from any thread; <code>gpu_vector</code> pages into device memory from inside a kernel. Every page is a blob in the <a href="/docs/cte/index.html">Context Transfer Engine</a>, so a vector is bounded by the tiers you compose, not by DRAM or HBM.
+facts: Headers | clio_cte/cpu_vector/cpu_vector.h, clio_cte/gpu_vector/gpu_vector.h ; Namespaces | clio::cte::cpu_vector, clio::cte::gpu_vector ; Page p is | blob "p" in the vector's tag
+-->
+<h2>What it is</h2>
+<p>A paged vector is a CTE tag plus a page cache. The vector has a logical length in elements and a page size in bytes. Page <code>p</code> is the blob named <code>p</code> in decimal inside the tag, <code>page_bytes</code> long, written at blob score 0.5. In front of the tag sits a set-associative cache of page frames in host memory (<code>cpu_vector</code>) or device memory (<code>gpu_vector</code>). The program drives the cache explicitly: it fetches the element ranges it is about to touch, holds a page to read or write it, flushes the ranges it wrote, and unpins what it fetched.</p>
+<p>The problem it solves is the dataset that does not fit. Out-of-core code written by hand has to split data into chunks, move them in and out of memory, and keep track of which chunk is where. The vectors take that over, and because the pages are ordinary CTE blobs, a page that does not fit in the cache spills to DRAM, then to local storage, then to whatever slower tier the runtime composes. Placement, movement between tiers and persistence are the CTE's job.</p>
+
+<h2>Key concepts</h2>
+<ul>
+  <li><strong>Pages and blobs.</strong> A <code>cpu_vector</code> and a <code>gpu_vector</code> opened on the same tag with the same page size and element type see the same data. Any CTE client, including the <a href="/docs/cte/python.html">Python module</a>, can read a page as a blob.</li>
+  <li><strong>The cache.</strong> <code>nsets</code> sets of <code>set_size</code> frames. A page's home set is computed from its number. The cache holds at most <code>nsets * set_size</code> pages, and the page-sized memory behind the frames can be capped lower with <code>capacity_pages</code>.</li>
+  <li><strong>Four verbs.</strong> <strong>Fetch</strong> makes element ranges resident and pins their pages. <strong>HoldPage</strong> returns a view onto the part of a range that lies on one page; it never fetches. <strong>Flush</strong> writes ranges back to the CTE; there is no dirty bit, so an unflushed write is lost on eviction. <strong>UnpinRange</strong> releases the pins a fetch took. A page that is never unpinned can never be evicted.</li>
+  <li><strong>Generations.</strong> The first argument of Fetch and Flush is a generation number. 0 means an ordinary transfer. Otherwise a flush stamps the generation on the extents it wrote, and a fetch waits until the writer has published at least that generation. This is how several nodes or kernels share one vector without invalidation traffic.</li>
+  <li><strong>Tiers.</strong> Pages are written at score 0.5. With the default <code>max_bw</code> placement engine a tier scored above 0.5 is not chosen on its own; a prefetch hint or a rescore moves a page into it. The <a href="/design/placement.html">placement page</a> explains the rule.</li>
+  <li><strong>Lazy copies.</strong> <code>Copy(new_name)</code> makes a copy-on-write snapshot. It creates the copy's tag with the checkpoint module (pool 566.0, <code>clio_cte_checkpoint</code>) registered as the tag's fault handler and the source tag as the fault parameter. Nothing is duplicated until a page of the copy is touched; <code>Copy(new_name, true)</code> or <code>MaterializeAll()</code> forces every page to real bytes.</li>
+</ul>
+
+<h2>How it relates to the other technologies</h2>
+<ul>
+  <li>The <a href="/docs/cte/index.html">Context Transfer Engine</a> stores the pages, places them by score and serves fetches and flushes. The vector constructors take the CTE pool to use; <code>gpu_vector</code> also reads <code>CLIO_GV_STORAGE_POOL</code>, so pages can go through the cache module at 563.0 for node-local caching of remote pages.</li>
+  <li>The <a href="/docs/cae/index.html">Context Assimilation Engine</a> uses the same fault-handler mechanism as <code>Copy</code> to ingest a file on first access. With an empty <code>blob_prefix</code> it names the ingested blobs <code>0</code>, <code>1</code>, and so on, which are exactly the page names a vector faults on, so a vector can be opened over a file the CAE has not read yet.</li>
+  <li><a href="/docs/ml/index.html">Machine learning</a> stores every <code>Dataset</code> in a <code>gpu_vector</code> on CUDA and SYCL builds and a <code>cpu_vector</code> on the CPU build, and uses the CAE's ingest-on-fault to bring training tables in page by page.</li>
+  <li>The <a href="/docs/runtime/index.html">Context Runtime</a> completes the transfers. A kernel submits its fetches and flushes as tasks that the runtime's CPU workers execute; the <code>gpu</code> section of the runtime configuration sizes that queue.</li>
+</ul>
+
+<h2>Where to go next</h2>
+<ul>
+  <li><a href="/docs/memory-expansion/install.html">Install</a>: build options for CUDA and SYCL, the headers and CMake targets, and what the pip wheel contains.</li>
+  <li><a href="/docs/memory-expansion/usage.html">Usage</a>: a host-thread example with <code>cpu_vector</code> and a CUDA kernel with <code>gpu_vector</code>.</li>
+  <li><a href="/docs/memory-expansion/api.html">API reference</a>: both class templates, their constructors and methods, and the configuration keys and environment variables.</li>
+  <li><a href="/technologies/memory-expansion.html">Memory expansion technology page</a>: the measurements behind it.</li>
+</ul>

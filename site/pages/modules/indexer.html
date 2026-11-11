@@ -1,0 +1,278 @@
+<!--
+title: Indexer module
+heading: The <em>indexer</em> module
+description: The CTE indexer: a chain interposer that keeps a per-node keyword index of blob contents and serves BM25 semantic search without re-reading blobs.
+eyebrow: Modules · Context Transfer Engine
+lede: The indexer sits in the storage chain above the CTE core, watches every write that passes through it, and keeps a tokenized copy of each blob's text in memory. Keyword (BM25) searches are answered from that index, so a query never reads blob bytes.
+facts: Library | clio_cte_indexer ; Default pool | 564.0 ; Source | context-transfer-engine/indexer ; Module ids | kIndexSweep 100, kReindexScan 101
+-->
+<h2>What it does</h2>
+<p>The CTE core once implemented <code>SemanticSearch</code> by reading and
+tokenizing every candidate blob on each query. That work now lives in the
+indexer module, which maintains a <strong>forward index</strong>: for every
+indexed blob (a "document") it stores the tag id, the resolved tag name, the
+blob name, the per-term frequencies and the document length. A query
+filters the documents by two regular expressions, computes BM25 statistics
+over the matched set, and returns the top-k results. The core itself no
+longer accepts the search method, so a client that wants search must be
+pointed at the indexer or at a pool that forwards into it.</p>
+<p>Use the indexer when data written through the CTE is text-like (logs,
+notes, JSON, source, metadata documents) and you want to find blobs by the
+words they contain, from Python, from the CLI, or from the Context
+Exploration Engine. Binary data can be left out of the index with the scope
+regexes described below.</p>
+
+<h2>Where it sits</h2>
+<p>The indexer is an interposer: it speaks the core's task interface,
+handles a few verbs itself, and forwards everything else to
+<code>next_pool_id</code> unchanged. Its handlers are coroutines that run
+nested calls on the co-located core container rather than issuing new client
+requests, as described on the <a href="/design/chain.html">chain design
+page</a>.</p>
+<p>In the default chain shipped in
+<code>context-runtime/config/clio_default.yaml</code> the order is:</p>
+<pre data-label="yaml">
+cache(563.0) -> indexer(564.0) -> [compressor(562.0) ->] replication(561.0) -> core(512.0)
+</pre>
+<p>The indexer sits <em>above</em> the compressor so that when it has to
+read a blob back it sees logical, uncompressed bytes. It must be composed
+after the pool it forwards to and before the pools that forward into it
+(the <a href="/modules/cache.html">cache</a>, the filesystem module, the CAE
+core).</p>
+
+<h2>Composing it</h2>
+<p>Minimal composition, adapted from the indexer restart test and the default
+configuration:</p>
+<pre data-label="yaml">
+compose:
+  - mod_name: clio_cte_core
+    pool_name: cte_main
+    pool_query: local
+    pool_id: "512.0"
+    storage:
+      - path: "ram::cte_dram"
+        bdev_type: "ram"
+        capacity_limit: "512MB"
+        score: 1.0
+
+  - mod_name: clio_cte_indexer
+    pool_name: clio_cte_indexer
+    pool_query: local
+    pool_id: "564.0"
+    next_pool_id: "512.0"
+    index_log_path: "${CLIO_STORAGE_ROOT}/cte_indexer_index"
+    # index_sweep_period_ms: 100
+    # index_wal_compact_bytes: "8MB"
+    # tag_re: ".*"
+    # blob_re: ".*"
+</pre>
+<p>Clients then bind to the indexer pool instead of the bare core. In C++
+that means constructing a <code>clio::cte::core::Client</code> on pool
+564.0; for the Python bindings and other processes that use the shared
+client singleton, set <code>CLIO_CTE_POOL=564.0</code> (or the id of the
+chain top, usually the cache at 563.0) before initializing. Writes that
+bypass the indexer are not indexed until a backfill picks them up.</p>
+
+<h2>Operations</h2>
+<p>From <code>indexer/clio_mod.yaml</code>, the module intercepts these core
+verbs, with the same method ids as the core:</p>
+<ul>
+  <li><strong>PutBlob, MultiPutBlob, TruncateBlob.</strong> Forwarded down
+  first. On success the affected (tag, blob) key is marked dirty for
+  asynchronous re-indexing. Replica-addressed puts are not indexed, since
+  the primary write already was.</li>
+  <li><strong>DelBlob, DelTag.</strong> Forwarded down first; on success the
+  document, or every document of the tag, is removed from the index and from
+  the dirty set. Deleting a tag also forgets that the tag was seen, so a
+  recreated tag triggers a fresh backfill.</li>
+  <li><strong>RenameTag.</strong> Forwarded, then the cached tag name and
+  every affected document's tag name are rewritten.</li>
+  <li><strong>UpdateTagNames</strong> (filesystem create, rename, unlink):
+  forwarded, then the whole tag-name cache is dropped and documents
+  re-resolve their names before the next search.</li>
+  <li><strong>SemanticSearch</strong> terminates here and is answered from
+  the index.</li>
+</ul>
+<p>Two module-specific verbs are numbered above the core's id space:</p>
+<ul>
+  <li><strong>IndexSweep (100)</strong> is a periodic task the module
+  schedules for itself. It drains the dirty set and compacts the write-ahead
+  log when it has grown past the threshold.</li>
+  <li><strong>ReindexScan (101)</strong> is the on-demand backfill. The C++
+  client's <code>AsyncReindexScan(tag_regex, blob_regex, pool_query)</code>
+  enumerates this node's existing blobs that match both regexes (intersected
+  with the module's own scope), enqueues them, and reports
+  <code>blobs_enqueued_</code>. The default pool query is Broadcast, so every
+  node scans its own slice. There is no Python or CLI wrapper for this verb
+  at the time of writing.</li>
+</ul>
+
+<h2>How indexing works</h2>
+<ol class="steps">
+  <li><strong>Enqueue.</strong> A successful put, multi-put or truncate adds
+  its (tag, blob) key to a dirty map. Keys coalesce: ten overwrites of one
+  blob cost one re-tokenization. This is the only indexing cost on the put
+  acknowledgement path.</li>
+  <li><strong>First-insertion backfill.</strong> The first write a tag
+  receives after the indexer was composed also schedules a one-time scan of
+  that tag's pre-existing blobs (a local <code>BlobQuery</code> against the
+  pool below). Seen tags are remembered, and persisted, so this fires once
+  per tag.</li>
+  <li><strong>Drain.</strong> The periodic sweep, or a search, pops dirty
+  keys. For each one the module asks the core for the blob's current size,
+  resolves the tag name, checks the scope regexes, reads the blob's bytes
+  through a nested call on the local core container, and tokenizes them.
+  A blob whose size is zero or that cannot be read is dropped from the
+  index rather than kept as an empty document.</li>
+  <li><strong>Search barrier.</strong> Every <code>SemanticSearch</code>
+  drains the dirty set completely before evaluating the query, so a search
+  issued after an acknowledged write sees that write. The sweep only bounds
+  how stale the index can be between searches.</li>
+</ol>
+<p>Tokenization lowercases ASCII and splits on anything that is not an
+ASCII letter or digit, keeping runs of two or more characters. Bytes above
+0x7F are separators. Query text is tokenized the same way.</p>
+
+<h2>Keyword search</h2>
+<p>A search carries a tag regex, a blob-name regex, the query text and
+<code>k</code>. Both regexes use full-string matching
+(<code>std::regex_match</code>), so <code>"doc.*"</code> matches
+<code>doc7</code> but <code>"doc"</code> does not. The matched documents
+form the working set; document frequencies and the average document length
+are computed over that set only, so scores mean "rank within this filter".
+The implementation is Okapi BM25 with <code>k1 = 1.5</code> and
+<code>b = 0.75</code>. Results are sorted by descending score and cut to
+<code>k</code>; <code>k = 0</code> returns every matched document. An empty
+query returns matched documents with score 0. A malformed regex fails the
+task with return code 1.</p>
+<p>Each container holds the index for the blobs its node owns. A search sent
+with a Broadcast pool query runs on every container and the runtime merges
+the shards; a Local query searches only the submitting node's slice.</p>
+<h3>From Python</h3>
+<p>The Python binding exposes the core client's search method directly. The
+smoke test <code>context-transfer-engine/wrapper/python/test_cte_semantic_search.py</code>
+does the following:</p>
+<pre data-label="python">
+import os
+os.environ.setdefault("CLIO_CTE_POOL", "564.0")   # bind the client to the indexer
+import clio_cte_core_ext as cte
+
+tag = cte.Tag("semsearch_corpus")
+tag.PutBlob("doc0", b"Apollo 11 landed on the Moon ...", 0)
+
+client = cte.get_cte_client()
+results = client.SemanticSearch(
+    tag_regex=".*",
+    blob_regex="^doc[0-9]+$",
+    query_text="moon space telescope lunar exploration",
+    k=5,
+    pool_query=cte.PoolQuery.Local(),
+)
+for r in results:            # list[SemanticSearchResult], sorted by score
+    print(r.blob_name, r.score, r.tag_id.major_, r.tag_id.minor_)
+</pre>
+<p><code>k</code> defaults to 10 and <code>pool_query</code> to Broadcast.
+The same client also offers <code>BlobQuery(tag_regex, blob_regex,
+max_blobs, pool_query)</code>, which returns (tag name, blob name) pairs by
+name alone. Name queries are answered by the core's metadata, not by the
+indexer, and need no index. See the
+<a href="/docs/cte/python.html">Python API page</a> for the rest of the
+client.</p>
+
+<h2>Configuration</h2>
+<dl class="notes">
+  <dt><code>next_pool_id</code></dt>
+  <dd>The pool this indexer forwards to, as <code>"major.minor"</code>. Usually
+  the replication pool (561.0), or the compressor (562.0) when compression is
+  enabled. Unset falls back to the canonical core pool 512.0.</dd>
+  <dt><code>index_sweep_period_ms</code></dt>
+  <dd>Period of the background drain. Default 100. 0 disables the sweep;
+  the index is then updated only when a search runs, and the write-ahead
+  log is compacted only on clean shutdown.</dd>
+  <dt><code>tag_re</code>, <code>blob_re</code></dt>
+  <dd>Index scope. Only blobs whose full tag name matches
+  <code>tag_re</code> and whose blob name matches <code>blob_re</code> are
+  tokenized. Defaults are <code>".*"</code>. Out-of-scope content is never
+  read, uses no index memory and writes no log records. A regex that fails
+  to compile is logged and the scope is opened to everything.</dd>
+  <dt><code>index_log_path</code></dt>
+  <dd>When set, the module keeps a snapshot at this path and an append-only
+  log at <code>&lt;path&gt;.wal</code>, and a restart restores the index
+  from them. Environment variables in the path are expanded. Empty (the
+  default) keeps the index in memory only.</dd>
+  <dt><code>index_wal_compact_bytes</code></dt>
+  <dd>Log size that triggers a snapshot and log truncation, checked by the
+  sweep. Default 8 MiB; accepts size suffixes.</dd>
+</dl>
+<p>Setting <code>CLIO_INDEXER_PASSIVE=1</code> in the runtime's environment
+turns the module into a forward-only interposer: puts and deletes still
+flow through, but nothing is enqueued or indexed. It exists for triage and
+for measuring interposition cost separately from indexing cost.</p>
+
+<h2>Persistence and restart</h2>
+<ul>
+  <li>With <code>index_log_path</code> set, every index mutation (document
+  replaced, document deleted, tag deleted, tag renamed, tag first seen) is
+  appended to the log and flushed. On create, the module loads the snapshot,
+  replays the log last-wins, drops restored documents that fall outside the
+  current scope, writes a fresh snapshot and truncates the log.</li>
+  <li>The snapshot includes still-dirty keys and un-run tag backfills, so a
+  clean shutdown resumes exactly where it stopped. A restart never rescans
+  storage.</li>
+  <li>Crash window: content acknowledged after the last log record was
+  written may stay unindexed until the blob is rewritten or a
+  <code>ReindexScan</code> is issued. The index is derived state; the scan
+  repairs it.</li>
+  <li>Without a log path a restart comes up with an empty index. Each tag
+  is backfilled on its first write, and the rest can be pulled in with
+  <code>ReindexScan</code>.</li>
+</ul>
+<div class="callout">
+  <p>The header comment in <code>indexer/clio_mod.yaml</code> and the restart
+  test's compose file still describe the index as "rebuilt from storage" on
+  restart. The runtime code restores from the snapshot and log and does not
+  rescan; this page follows the code.</p>
+</div>
+
+<h2>Behaviors worth knowing</h2>
+<ul class="checks">
+  <li>Read-your-writes: a search after an acknowledged write includes it,
+  because the search drains the dirty set first. The cost is that a search
+  issued right after a large burst of writes pays for indexing them.</li>
+  <li>The index is in process memory and grows with the number of indexed
+  documents and distinct terms. Use <code>tag_re</code> and
+  <code>blob_re</code> to keep binary or bulk data out of it.</li>
+  <li>Every search iterates all documents in the container's index to apply
+  the regex filters; there is no inverted index. Tag-name matches are memoized
+  per tag within a query.</li>
+  <li>Partial writes and truncates are re-indexed by reading the blob's
+  current bytes back from the chain, so very large blobs with frequent small
+  updates cost a full read per drain.</li>
+  <li>Handlers that cannot allocate a read buffer leave the previous index
+  entry in place and log a warning.</li>
+</ul>
+
+<h2>Limits</h2>
+<ul>
+  <li>Tokenization is ASCII only; non-ASCII text is not indexed as words.</li>
+  <li>Scoring is exact-token BM25. There is no stemming, no embedding model
+  and no fuzzy matching; "semantic" in the method name refers to content
+  search as opposed to name search.</li>
+  <li>The persistence files are binary and versioned but not shared across
+  nodes; each container keeps its own.</li>
+  <li><code>ReindexScan</code> is reachable only from the C++ client.</li>
+</ul>
+
+<h2>Testing</h2>
+<ul>
+  <li><code>context-transfer-engine/test/integration/indexer_restart</code>:
+  writes documents through the indexer over a file-backed tier with
+  <code>index_log_path</code> set, restarts the runtime, and verifies searches
+  against the restored index. Built when the indexer client target exists.</li>
+  <li><code>context-transfer-engine/wrapper/python/test_cte_semantic_search.py</code>:
+  Python smoke test covering result type, descending order, the
+  <code>k</code> cap, the empty query and a non-matching blob regex.</li>
+  <li>The Context Assimilation Engine's summarizer test configurations
+  (<code>context-assimilation-engine/test/unit</code>) also compose an
+  indexer pool in their chains.</li>
+</ul>

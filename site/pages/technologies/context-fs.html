@@ -1,0 +1,218 @@
+<!--
+title: Context FS
+heading: Context FS: <em>a filesystem you compose.</em>
+description: Context FS is CLIO Core's distributed filesystem: FUSE on Linux, macOS and Windows, score-based tiering, expandable erasure-coded arrays and S3 or Google Cloud buckets as tiers.
+eyebrow: Technologies · Storage
+lede: Mount like any other directory on Windows, macOS and Linux via FUSE. Context FS presents the tiers you compose (RAM, NVMe, disk, erasure-coded arrays, cloud buckets) as one ordinary directory. Applications use it without changes; the stack underneath decides where each page lives.
+facts: Mount | FUSE 3 (libfuse, macFUSE, WinFsp) ; Metadata | Distributed, no metadata server ; Unit of data | 1 MiB page blobs ; Durability | ext4-style, durable on fsync
+-->
+<h2>Key takeaways</h2>
+<ul class="checks">
+  <li>Mount it like any other directory on Linux, macOS and Windows through FUSE. Applications run unchanged.</li>
+  <li>Files spread across the tiers you compose (RAM, NVMe, erasure-coded arrays, Amazon S3 or Google Cloud buckets) by score, with distributed metadata and no metadata server.</li>
+  <li>Every file is also tags and blobs in the Context Transfer Engine, so search, assimilation and the other technologies use it without a copy.</li>
+</ul>
+
+<ul class="headline-stats">
+  <li><strong>10 µs</strong><span>stat from the shared-memory mirror</span></li>
+  <li><strong>0</strong><span>metadata servers: inodes are homed by path</span></li>
+  <li><strong>3 OSes</strong><span>one FUSE daemon for Linux, macOS and Windows</span></li>
+  <li><strong>N + M</strong><span>drives in an erasure-coded array that grows in place</span></li>
+</ul>
+
+<h2>What it is</h2>
+<p>Context FS is a product of CLIO Core, not the whole of it. It is the filesystem adapter (<code>clio_cte_fuse</code>) plus the filesystem module, composed over the Context Transfer Engine. Directories, inodes and file data are all stored as CTE tags and blobs, so the filesystem inherits tiering, replication, durability and indexing from the engine, and has no central metadata server: each inode is homed on a node by its path.</p>
+
+<h2>FUSE on every desktop and cluster</h2>
+<pre data-label="Linux">
+$ clio_run start &
+$ mkdir -p ~/clio-mnt
+$ CLIO_WITH_RUNTIME=0 clio_cte_fuse ~/clio-mnt -f &
+$ cp -r ./results ~/clio-mnt/
+$ ls ~/clio-mnt/results
+</pre>
+<p>One daemon mounts on all three operating systems with each platform's native driver:</p>
+<ul class="checks">
+  <li><strong>Linux</strong>: libfuse3, included in the pip wheel.</li>
+  <li><strong>Windows</strong>: WinFsp (FUSE 3 compatibility layer), mounted as a drive letter, included in the pip wheel.</li>
+  <li><strong>macOS</strong>: macFUSE, or FSKit on macOS 15.4 and newer; build from source.</li>
+</ul>
+<p>Writes go straight through, so a file's size is exact as soon as <code>write()</code> returns. Attribute and negative-lookup caches last 1 s, and a shared-memory mirror answers <code>stat</code> without a round trip to the runtime. See the <a href="/tutorials/fuse-linux.html">Linux</a>, <a href="/tutorials/fuse-macos.html">macOS</a> and <a href="/tutorials/fuse-windows.html">Windows</a> tutorials.</p>
+
+<h2>Tiering</h2>
+<p>Each tier in the YAML gets a capacity and a score between 0 and 1. New data lands on the fastest tier with room; data you stop touching is demoted to slower, larger tiers, and a replica on a persistent tier keeps files across restarts.</p>
+<ol class="tier-stack" aria-label="Example tier stack">
+  <li><span class="tier-name">ram::hot</span><span class="tier-desc">DRAM, for the working set</span><span class="tier-type">score 1.0</span></li>
+  <li><span class="tier-name">/mnt/nvme</span><span class="tier-desc">Local NVMe, for staged data</span><span class="tier-type">score 0.9</span></li>
+  <li><span class="tier-name">safe_bdev</span><span class="tier-desc">Erasure-coded array of disks</span><span class="tier-type">score 0.4</span></li>
+  <li><span class="tier-name">s3:// · gs://</span><span class="tier-desc">A bucket as the capacity tier</span><span class="tier-type">score 0.1</span></li>
+</ol>
+<p><a href="/tutorials/compose.html">Compose local tiers</a> walks through a full configuration, and <a href="/design/placement.html">Placement and tiering</a> explains the policy.</p>
+
+<h2>Expandable RAID with safe_bdev</h2>
+<p><code>safe_bdev</code> is a block device made of other block devices. It protects data with Reed-Solomon erasure coding: for <em>N</em> drives that must survive <em>f</em> simultaneous failures it uses <em>k = N − f</em> data drives and <em>m = f</em> parity drives, so 8 drives surviving 2 failures is RS(6, 2) with 25% overhead. Unlike a classic RAID array, it grows in place:</p>
+<ul class="checks">
+  <li><strong>Add drives at runtime</strong> as data or parity members (<code>safe_bdev_add_bdev</code>). New blocks are allocated round-robin over the members that have room, so total data capacity is the sum of the members' capacities and an added drive's space is usable immediately, even when the array was already mostly full.</li>
+  <li><strong>Mixed sizes.</strong> Each member fills to its own capacity; stripes narrower than <em>k</em> are protected as mirrors until enough members have written into them.</li>
+  <li><strong>Replace and rebuild.</strong> Remove a failed member and name a replacement; the runtime rebuilds its shards while the filesystem stays mounted, and the dashboard shows recovery progress.</li>
+</ul>
+<p>The array is an ordinary tier, so Context FS on top of it needs no changes. The <code>cr_safe_bdev_integration_docker</code> test composes three data drives and one added parity drive under a mounted Context FS, removes a member, rebuilds it, and checks that the data still reads back.</p>
+
+<h2>Amazon S3 and Google Cloud as tiers</h2>
+<p>The block device module has S3 and Google Cloud Storage transports, so a bucket can be a tier like any disk. Give it the lowest score and only data the organizer demotes reaches it. Separately, the assimilation engine imports existing <code>s3://</code> and <code>gs://</code> objects, including anonymous reads of public buckets. The <a href="/tutorials/cloud-storage.html">cloud storage tutorial</a> covers both.</p>
+
+<h2>Performance</h2>
+<p>Metadata latency for one operation each, through the FUSE mount on Linux (from <a href="/design/filesystem.html">Filesystem and FUSE</a>):</p>
+<ul class="bars" aria-label="Metadata latency through the FUSE mount on Linux">
+  <li class="ours"><span>stat, shared-memory mirror</span><span class="bar"><i style="width:2%"></i></span><span class="val">~10 µs</span></li>
+  <li class="ours"><span>stat, filesystem module</span><span class="bar"><i style="width:5%"></i></span><span class="val">~31 µs</span></li>
+  <li class="ours"><span>readdir, 10 entries</span><span class="bar"><i style="width:43%"></i></span><span class="val">255 µs</span></li>
+  <li class="ours"><span>rename</span><span class="bar"><i style="width:96%"></i></span><span class="val">~570 µs</span></li>
+  <li class="ours"><span>readdir, 100 entries</span><span class="bar"><i style="width:100%"></i></span><span class="val">592 µs</span></li>
+</ul>
+<p>About 91% of each operation's wall time is kernel transit; the daemon itself spends about 9.6 µs of CPU time per operation.</p>
+
+<h3>Against OrangeFS on Ares: IO500</h3>
+<p>IO500 on 4 nodes of the Ares cluster, 32 MPI ranks (8 per node). Each node: two Xeon Silver 4114 (40 cores), 46 GB of memory, a Toshiba RD400 NVMe drive, a Seagate ST1000LM049 1 TB HDD, and 40 GbE. Every node is both a server and a client of the filesystem under test.</p>
+<ul class="checks">
+  <li><strong>Context FS</strong>: release build of <code>site-technologies</code> (c89f7f10f), 20% DRAM / 80% NVMe per node: a 3 GB DRAM tier, pre-faulted at start (<code>CLIO_PREFAULT=0</code>), over a 12 GB NVMe tier. No replication.</li>
+  <li><strong>OrangeFS 2.10</strong> (f4854f7): every node a metadata and data server, mounted through <code>pvfs2fuse</code>, with all storage on the NVMe drive or all on the HDD. <code>TroveMethod directio</code>, so OrangeFS reaches its device with O_DIRECT, as Context FS's file tier does.</li>
+  <li><strong>IO500</strong> (5c2237d) with a 60 s stonewall and data capped at about 27 GB, 2.3x the aggregate DRAM tier, so most data lands on NVMe. These are not valid IO500 list submissions, which need a 300 s stonewall. One run per system.</li>
+</ul>
+<div class="chart-grid">
+  <figure><figcaption>IO500 score (higher is better)</figcaption>
+<ul class="bars" aria-label="IO500 score (higher is better)">
+  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:100%"></i></span><span class="val">0.686</span></li>
+  <li><span>OrangeFS, NVMe</span><span class="bar"><i style="width:62%"></i></span><span class="val">0.426</span></li>
+  <li><span>OrangeFS, HDD</span><span class="bar"><i style="width:18%"></i></span><span class="val">0.123</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>ior-easy write, GiB/s</figcaption>
+<ul class="bars" aria-label="ior-easy write, GiB/s">
+  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:100%"></i></span><span class="val">0.77</span></li>
+  <li><span>OrangeFS, NVMe</span><span class="bar"><i style="width:49%"></i></span><span class="val">0.38</span></li>
+  <li><span>OrangeFS, HDD</span><span class="bar"><i style="width:10%"></i></span><span class="val">0.08</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>ior-easy read, GiB/s</figcaption>
+<ul class="bars" aria-label="ior-easy read, GiB/s">
+  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:100%"></i></span><span class="val">0.73</span></li>
+  <li><span>OrangeFS, NVMe</span><span class="bar"><i style="width:69%"></i></span><span class="val">0.51</span></li>
+  <li><span>OrangeFS, HDD</span><span class="bar"><i style="width:5%"></i></span><span class="val">0.04</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>ior-hard read, GiB/s</figcaption>
+<ul class="bars" aria-label="ior-hard read, GiB/s">
+  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:58%"></i></span><span class="val">0.12</span></li>
+  <li><span>OrangeFS, NVMe</span><span class="bar"><i style="width:100%"></i></span><span class="val">0.21</span></li>
+  <li><span>OrangeFS, HDD</span><span class="bar"><i style="width:4%"></i></span><span class="val">0.01</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>mdtest-easy stat, ops/s</figcaption>
+<ul class="bars" aria-label="mdtest-easy stat, ops/s">
+  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:100%"></i></span><span class="val">13,923</span></li>
+  <li><span>OrangeFS, NVMe</span><span class="bar"><i style="width:6%"></i></span><span class="val">803</span></li>
+  <li><span>OrangeFS, HDD</span><span class="bar"><i style="width:6%"></i></span><span class="val">805</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>mdtest-easy delete, ops/s</figcaption>
+<ul class="bars" aria-label="mdtest-easy delete, ops/s">
+  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:21%"></i></span><span class="val">143</span></li>
+  <li><span>OrangeFS, NVMe</span><span class="bar"><i style="width:99%"></i></span><span class="val">677</span></li>
+  <li><span>OrangeFS, HDD</span><span class="bar"><i style="width:100%"></i></span><span class="val">682</span></li>
+</ul>
+  </figure>
+</div>
+<p>Every phase (bandwidth in GiB/s, metadata in thousands of operations per second; higher is better):</p>
+<table>
+  <tr><th>Phase</th><th>Context FS</th><th>OrangeFS, NVMe</th><th>OrangeFS, HDD</th></tr>
+  <tr><td>ior-easy write</td><td><strong>0.773</strong></td><td>0.377</td><td>0.076</td></tr>
+  <tr><td>ior-easy read</td><td><strong>0.728</strong></td><td>0.505</td><td>0.037</td></tr>
+  <tr><td>ior-hard write</td><td><strong>0.225</strong></td><td>0.142</td><td>0.018</td></tr>
+  <tr><td>ior-hard read</td><td>0.123</td><td><strong>0.213</strong></td><td>0.008</td></tr>
+  <tr><td>mdtest-easy write</td><td><strong>2.588</strong></td><td>0.699</td><td>0.685</td></tr>
+  <tr><td>mdtest-easy stat</td><td><strong>13.923</strong></td><td>0.803</td><td>0.805</td></tr>
+  <tr><td>mdtest-easy delete</td><td>0.143</td><td>0.677</td><td><strong>0.682</strong></td></tr>
+  <tr><td>mdtest-hard write</td><td><strong>0.741</strong></td><td>0.566</td><td>0.295</td></tr>
+  <tr><td>mdtest-hard stat</td><td><strong>5.678</strong></td><td>0.807</td><td>0.815</td></tr>
+  <tr><td>mdtest-hard read</td><td><strong>3.257</strong></td><td>0.824</td><td>0.493</td></tr>
+  <tr><td>mdtest-hard delete</td><td>0.035</td><td>0.685</td><td><strong>0.687</strong></td></tr>
+  <tr><td>find</td><td><strong>4.042</strong></td><td>0.364</td><td>0.495</td></tr>
+  <tr><td>Bandwidth score, GiB/s</td><td><strong>0.353</strong></td><td>0.276</td><td>0.026</td></tr>
+  <tr><td>Metadata score, kIOPS</td><td><strong>1.333</strong></td><td>0.659</td><td>0.592</td></tr>
+  <tr><td>IO500 score</td><td><strong>0.686</strong></td><td>0.426</td><td>0.123</td></tr>
+</table>
+<p>Context FS scores 1.6x OrangeFS on NVMe and 5.6x OrangeFS on HDD. It leads on writes, file-per-process reads and every create, stat, read and find phase, by 7-17x on stat and 8x on find. It loses two phases. OrangeFS on NVMe reads the single shared ior-hard file faster (0.21 vs 0.12 GiB/s). Deletes are Context FS's weak point: it removes files at 35-143 per second against about 680 for OrangeFS, so each delete phase took about 22 minutes. At OrangeFS's delete rate, Context FS's metadata score would be 2.35 kIOPS instead of 1.33.</p>
+<p>Two things in this setup cost OrangeFS bandwidth. <code>directio</code> keeps the server page cache from standing in for the device, and <code>pvfs2fuse</code> uses the FUSE 2 API, which splits writes into pieces of at most 128 KiB, so a 2 MiB IOR transfer reaches the device as 16 synchronous writes. OrangeFS through its kernel module, or with its default buffered <code>alt-aio</code> method, would post higher bandwidth. <code>pvfs2fuse</code> also needed a four-line fix: when several nodes create the shared ior-hard file at once, the losers got <code>EEXIST</code> from an <code>open(O_CREAT)</code> without <code>O_EXCL</code>, which aborted IO500 on NVMe every time. The patched client opens the existing file instead, as POSIX requires.</p>
+<h3>Checkpointing a simulation through the tiers</h3>
+<p>From the Eternia paper's evaluation: Gray-Scott on 2 Aurora nodes, 8 steps, a checkpoint every 2 steps. Each checkpoint is a copy-on-write snapshot that CLIO Core drains down the tier stack in the background, in a layout the HDF5 VOL can read. It is compared with a conventional synchronous checkpoint, in which the simulation waits until the snapshot reaches persistent storage; in the Lustre-heavy composition that is a simulation writing its checkpoint to the parallel file system. Total runtime in seconds, lower is better.</p>
+<div class="chart-grid">
+  <figure><figcaption>DRAM only</figcaption>
+<ul class="bars" aria-label="DRAM only">
+  <li class="ours"><span>CLIO async snapshot</span><span class="bar"><i style="width:83%"></i></span><span class="val">34.4</span></li>
+  <li><span>Synchronous checkpoint</span><span class="bar"><i style="width:100%"></i></span><span class="val">41.6</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>Balanced (25% DRAM, 50% DAOS, 25% Lustre)</figcaption>
+<ul class="bars" aria-label="Balanced (25% DRAM, 50% DAOS, 25% Lustre)">
+  <li class="ours"><span>CLIO async snapshot</span><span class="bar"><i style="width:75%"></i></span><span class="val">95.5</span></li>
+  <li><span>Synchronous checkpoint</span><span class="bar"><i style="width:100%"></i></span><span class="val">127.9</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>Lustre-heavy (10% DRAM, 20% DAOS, 70% Lustre)</figcaption>
+<ul class="bars" aria-label="Lustre-heavy (10% DRAM, 20% DAOS, 70% Lustre)">
+  <li class="ours"><span>CLIO async snapshot</span><span class="bar"><i style="width:85%"></i></span><span class="val">100.1</span></li>
+  <li><span>Synchronous checkpoint</span><span class="bar"><i style="width:100%"></i></span><span class="val">117.2</span></li>
+</ul>
+  </figure>
+</div>
+<p class="bars-caption">The asynchronous snapshot is 15-25% faster in every composition. Persisting the grid four times still moves 25-62 s of data against 10-48 s of computation; the snapshot lets that traffic proceed in the background instead of blocking the run on the slowest tier. For a science application at larger scale, see the <a href="/technologies/memory-expansion.html">Gray-Scott comparison against DDN, Hermes and cuFile</a>.</p>
+<h3>Against ext4: cloning the Linux kernel</h3>
+<ul class="bars" aria-label="git clone of the Linux kernel, seconds">
+  <li><span>ext4</span><span class="bar"><i style="width:23%"></i></span><span class="val">39 s</span></li>
+  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:100%"></i></span><span class="val">171 s</span></li>
+</ul>
+<p class="bars-caption">Linux kernel <code>git clone</code>, one node, lower is better. A clone is tens of thousands of small-file creates and lookups; a local kernel filesystem has no FUSE crossing, and Context FS pays one per metadata operation.</p>
+
+<h3>Against NTFS on a Windows workstation</h3>
+<p>The same Python script (1 GiB written in 1 MiB writes and fsynced, read back, then 2,000 files of 4 KiB created, stat'ed and listed) on an NTFS directory and on a Context FS mount at <code>Z:</code>. Release build of <code>dev</code> (f88db54bf), default runtime configuration bound to 127.0.0.1, WinFsp 2.0. Ryzen 7 3800X, 32 GB RAM, WD Black SN850X NVMe. Bars are the mean of two runs.</p>
+<div class="chart-grid">
+  <figure><figcaption>Sequential write + fsync, MB/s (higher is better)</figcaption>
+<ul class="bars" aria-label="Sequential write + fsync, MB/s (higher is better)">
+  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:100%"></i></span><span class="val">3,093</span></li>
+  <li><span>NTFS</span><span class="bar"><i style="width:38%"></i></span><span class="val">1,170</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>Sequential read, MB/s (higher is better)</figcaption>
+<ul class="bars" aria-label="Sequential read, MB/s (higher is better)">
+  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:53%"></i></span><span class="val">1,160</span></li>
+  <li><span>NTFS</span><span class="bar"><i style="width:100%"></i></span><span class="val">2,200</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>4 KiB file creates per second (higher is better)</figcaption>
+<ul class="bars" aria-label="4 KiB file creates per second (higher is better)">
+  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:53%"></i></span><span class="val">1,344</span></li>
+  <li><span>NTFS</span><span class="bar"><i style="width:100%"></i></span><span class="val">2,529</span></li>
+</ul>
+  </figure>
+  <figure><figcaption><code>stat</code> latency, µs (lower is better)</figcaption>
+<ul class="bars" aria-label="<code>stat</code> latency, µs (lower is better)">
+  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:100%"></i></span><span class="val">259</span></li>
+  <li><span>NTFS</span><span class="bar"><i style="width:5%"></i></span><span class="val">12</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>List 2,000 entries, ms (lower is better)</figcaption>
+<ul class="bars" aria-label="List 2,000 entries, ms (lower is better)">
+  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:100%"></i></span><span class="val">8.2</span></li>
+  <li><span>NTFS</span><span class="bar"><i style="width:15%"></i></span><span class="val">1.25</span></li>
+</ul>
+  </figure>
+</div>
+<p class="bars-caption">Bars are the mean of two runs; the two runs were within 1,081-1,258 vs 2,347-3,838 MB/s for writes and 2,122-2,278 vs 965-1,354 MB/s for reads (NTFS vs Context FS).</p>
+<p>Read the write result carefully: in this run the runtime registered a single storage target, the DRAM tier, so Context FS writes landed in memory and were not on disk when fsync returned, which NTFS guarantees. With a persistent disk tier active, writes also pay for the replica. Reads, file creation and metadata cross the WinFsp kernel boundary on every call, which is where NTFS leads. Defender real-time scanning was on for both. Single machine, two runs each.</p>
+
+<h2>Where to go next</h2>
+<ul>
+  <li><a href="/docs/context-fs/quickstart.html">Mount your first filesystem</a></li>
+  <li><a href="/design/filesystem.html">Filesystem and FUSE design</a> and <a href="/design/durability.html">durability and recovery</a></li>
+</ul>

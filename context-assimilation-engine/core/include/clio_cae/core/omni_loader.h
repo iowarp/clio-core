@@ -41,6 +41,7 @@
 #define CLIO_CAE_CORE_OMNI_LOADER_H_
 
 #include <clio_cae/core/factory/assimilation_ctx.h>
+#include <clio_cae/core/omni_run.h>
 
 #include <string>
 #include <vector>
@@ -53,8 +54,18 @@ namespace clio::cae::core {
  * Throws std::runtime_error when the file cannot be read, when `transfers` is
  * missing or is not a sequence, or when an entry omits src/dst/format. The
  * message names the offending transfer by its 1-based position.
+ *
+ * A transfer may carry a `run:` script and its `run_out:` output file (see
+ * omni_run.h). Both are env-expanded, and relative paths resolve against the
+ * OMNI file's directory. The parsed steps go to *runs; the caller executes
+ * them with ExecuteRunSteps before submitting the contexts. When runs is null
+ * a transfer with `run:` throws, so a caller that does not execute run steps
+ * can never ingest the untransformed source by accident.
+ *
+ * Keys the loader does not know are logged as warnings, not ignored silently.
  */
-std::vector<AssimilationCtx> LoadOmni(const std::string& omni_path);
+std::vector<AssimilationCtx> LoadOmni(const std::string& omni_path,
+                                      std::vector<RunStep>* runs = nullptr);
 
 }  // namespace clio::cae::core
 

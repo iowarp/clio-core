@@ -1,0 +1,54 @@
+<!--
+title: pca
+heading: <em>pca:</em> principal component analysis.
+description: API reference for clio-ml's PCA module: Python fit_pca, C++ FitPca, PcaOptions and the mean, components and explained_variance result fields.
+eyebrow: Docs · Machine learning
+lede: Principal component analysis, the equivalent of Spark MLlib's PCA. One paged pass accumulates the feature sums and the sum of outer products; the host forms the population covariance in double precision and diagonalises it with cyclic Jacobi.
+facts: Module | ml_pca ; Header | clio_ml/pca.h ; Rows | features only
+-->
+<h2>What it does</h2>
+<p>The pass is deterministic in block order, so the covariance and the components are reproducible across cache sizes. Components are sorted by decreasing variance and sign-normalised so that each component's largest-magnitude entry is positive. All <code>nf</code> components are returned; select the leading ones yourself.</p>
+
+<h2>Rows</h2>
+<p>Every column is a feature. <code>clio_ml.COLUMNS["pca"]</code> is 0.</p>
+
+<h2>Python</h2>
+<pre data-label="python">
+import numpy as np, clio_ml as cm
+X = np.random.default_rng(0).normal(size=(4096, 8)).astype(np.float32)
+
+r = cm.fit_pca(X)
+components = np.asarray(r.components).reshape(r.nf, r.nf)   # row k = k-th component
+top3 = components[:3]
+print(r.explained_variance[:3])
+projected = (X - np.asarray(r.mean)) @ top3.T
+</pre>
+<ul>
+  <li><code>fit_pca(X, **options)</code>.</li>
+  <li>Options (<code>PcaOptions</code>): <code>threads</code> (256).</li>
+  <li>Result <code>PcaResult</code>: <code>nf</code>, <code>mean</code> (nf), <code>components</code> (nf*nf, row k is the k-th component), <code>explained_variance</code> (nf, descending), <code>stats</code>.</li>
+  <li>No one-row predictor; project rows with NumPy as above.</li>
+</ul>
+
+<h2>C++</h2>
+<pre data-label="cpp">
+struct PcaOptions {
+  u32 threads = 256;
+  ClusterExchange cluster;  // global_rows used as n when active
+};
+struct PcaResult {
+  u32 nf = 0;
+  std::vector<float> mean;                // nf
+  std::vector<float> components;          // nf*nf
+  std::vector<float> explained_variance;  // nf, descending
+  VecStats stats;
+  std::vector<float> Flatten() const;
+};
+PcaResult FitPca(Dataset &ds, const PcaOptions &opt);
+PcaResult FitPcaPlain(const float *data, u64 n_rows, u32 nf, u64 elems_per_page,
+                      u32 nblocks, const PcaOptions &opt);
+PcaResult FitPcaReference(/* same arguments */);
+</pre>
+<p>The ChiMod is module <code>ml_pca</code>.</p>
+
+<p>Related: <a href="/docs/ml/kmeans.html">k-means</a>, <a href="/docs/ml/als.html">ALS</a>.</p>

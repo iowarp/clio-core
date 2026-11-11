@@ -1,0 +1,63 @@
+<!--
+title: fm
+heading: <em>fm:</em> factorization machine regression.
+description: API reference for clio-ml's factorization machine regression module: Python fit_fm and predict, C++ FitFm and FmPredict, FmOptions and the parameter layout.
+eyebrow: Docs · Machine learning
+lede: Factorization machine regression, the equivalent of Spark MLlib's FMRegressor: linear terms plus pairwise feature interactions through rank-<code>factor_size</code> factors, squared loss, full-batch Adam. One paged pass per step.
+facts: Module | ml_fm ; Header | clio_ml/fm.h ; Rows | features, then target
+-->
+<h2>What it does</h2>
+<p>Per-parameter gradients are summed in fixed row order and Adam runs on the host, so the model is bit-reproducible across paging, block counts and cluster nodes.</p>
+
+<h2>Rows</h2>
+<p><code>n_features</code> feature columns followed by the regression target. <code>clio_ml.COLUMNS["fm"]</code> is 1.</p>
+
+<h2>Python</h2>
+<pre data-label="python">
+import numpy as np, clio_ml as cm
+rng = np.random.default_rng(1)
+X = rng.normal(size=(4096, 7)).astype(np.float32)
+y = X[:, 0] * X[:, 1] + 0.5 * X[:, 2]
+data = np.column_stack([X, y]).astype(np.float32)
+
+r = cm.fit_fm(data, factor_size=4, iters=20, learning_rate=0.05)
+print(r.loss_history[-1])
+print(cm.predict("fm", r, data[0, :7]))      # predicted value
+</pre>
+<ul>
+  <li><code>fit_fm(X, **options)</code>.</li>
+  <li>Options (<code>FmOptions</code>): <code>factor_size</code> (4), <code>iters</code> (300), <code>learning_rate</code> (0.05, Adam), <code>init_std</code> (0.1), <code>seed</code> (1), <code>threads</code> (256).</li>
+  <li>Result <code>FmResult</code>: <code>model</code> (<code>FmModel</code> with <code>nf</code>, <code>k</code> and <code>params</code> laid out as <code>[w0 | w (nf) | V (nf*k)]</code>), <code>loss_history</code> (mean <code>0.5 * r^2</code> before each step), <code>stats</code>.</li>
+  <li><code>predict("fm", r, x)</code> returns the predicted value.</li>
+</ul>
+
+<h2>C++</h2>
+<pre data-label="cpp">
+struct FmOptions {
+  u32 factor_size = 4;
+  u32 iters = 300;
+  float learning_rate = 0.05f;  // Adam
+  float init_std = 0.1f;
+  u32 seed = 1;
+  u32 threads = 256;
+  ClusterExchange cluster;
+};
+struct FmModel {
+  u32 nf = 0, k = 0;
+  std::vector<float> params;  // [w0 | w (nf) | V (nf*k)]
+  std::vector<float> Flatten() const;
+};
+struct FmResult {
+  FmModel model;
+  std::vector<double> loss_history;
+  VecStats stats;
+};
+FmResult FitFm(Dataset &ds, const FmOptions &opt);
+FmResult FitFmPlain(const float *data, u64 n_rows, u32 nf, u64 elems_per_page,
+                    u32 nblocks, const FmOptions &opt);
+FmResult FitFmReference(/* same arguments */);
+float FmPredict(const FmModel &m, const float *x);
+</pre>
+<p>The ChiMod is module <code>ml_fm</code>.</p>
+
+<p>Related: <a href="/docs/ml/als.html">ALS</a>, <a href="/docs/ml/linreg.html">linear regression</a>.</p>

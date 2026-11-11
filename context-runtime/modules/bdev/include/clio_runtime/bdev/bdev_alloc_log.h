@@ -253,10 +253,19 @@ class AllocatorLog {
   bool SyncAppended() {
 #ifndef _WIN32
     int fd = -1;
+    clio::run::u64 target = 0;
     {
       std::lock_guard<std::mutex> lock(mu_);
       AppendLocked();
       if (!enabled_ || file_ == nullptr) return true;
+      // Nothing appended since the last COMPLETED sync: skip the fdatasync.
+      // The sync thread calls this every 50 ms; syncing an idle log anyway
+      // forced an XFS log commit + drive cache flush 20x/s, which stalled the
+      // data writes behind it (plain bdev 1 MiB writes ~350 MB/s on an NVMe
+      // that does ~1.1 GB/s). Sequence numbers, not a flag: a caller must not
+      // return while another thread's fdatasync of its records is in flight.
+      target = append_seq_;
+      if (durable_seq_ >= target) return true;
       const int cur = ::fileno(file_);
       if (cur >= 0) fd = ::dup(cur);
       unsynced_ = false;
@@ -271,6 +280,10 @@ class AllocatorLog {
     const bool ok = ::fsync(fd) == 0;
 #endif
     ::close(fd);
+    if (ok) {
+      std::lock_guard<std::mutex> lock(mu_);
+      if (durable_seq_ < target) durable_seq_ = target;
+    }
     return ok;
 #else
     Flush();
@@ -430,6 +443,8 @@ class AllocatorLog {
   bool enabled_ = false;
   std::FILE *file_ = nullptr;  /**< Append handle, open while enabled */
   bool unsynced_ = false;      /**< Appended since the last fsync */
+  clio::run::u64 append_seq_ = 0;   /**< Bumped by every AppendLocked write */
+  clio::run::u64 durable_seq_ = 0;  /**< append_seq_ covered by a completed sync */
   clio::run::u64 records_on_disk_ = 0;
   std::mutex mu_;
 
@@ -455,6 +470,7 @@ class AllocatorLog {
     records_on_disk_ += buffer_.size();
     buffer_.clear();
     unsynced_ = true;
+    ++append_seq_;
   }
 
   /** Close the append handle if open. */

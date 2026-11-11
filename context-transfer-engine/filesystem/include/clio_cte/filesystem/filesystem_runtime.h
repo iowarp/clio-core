@@ -447,6 +447,11 @@ class Runtime : public clio::run::Container {
   std::atomic<clio::run::u64> seen_held_dead_seq_{0};
   /** Drop every clean home block (reload on next use); see above. */
   void DropHomeBlocksAfterFailover();
+  /** issue #1322: until this steady-ms deadline (set by a rejoin notice) a
+   *  home that loads its own block also asks its stand-in for a newer copy.
+   *  Outside it there is no stand-in to ask: on a full-cluster restart every
+   *  node would wait on a neighbour that is itself still loading. */
+  std::atomic<clio::run::u64> standin_until_ms_{0};
   /** Blocks being loaded here (a push that arrives meanwhile is kept),
    *  each with the step its loader is on -- named in a slow waiter's
    *  warning, so a load that never returns says where it is stuck. */
@@ -480,6 +485,10 @@ class Runtime : public clio::run::Container {
   /** Durable images replayed from the journal and not loaded yet (a home
    *  block moves to blocks_ on first use). Guarded by ns_mu_. */
   std::unordered_map<TableBlockKey, std::string, TableBlockKeyHash> journaled_;
+  /** issue #1322: image + time of a block this container served as stand-in
+   *  home, kept after the real home returns so it can fetch the newest copy. */
+  std::unordered_map<TableBlockKey, std::pair<std::string, clio::run::u64>,
+                     TableBlockKeyHash> handback_;
   /** Steady ms of the journal's last periodic fsync. */
   clio::run::u64 dir_log_synced_ms_ = 0;
 
@@ -615,6 +624,17 @@ class Runtime : public clio::run::Container {
    */
   clio::run::TaskResume ReadBlockCte(clio::run::u64 dir, clio::run::u32 k,
                                      InodeTableBlock *out, int &rc);
+  /**
+   * issue #1322: read a block straight from the container that stood in for
+   * this (returning) home: the first live successor. Its copy is newer than
+   * this node's journal until replication hands it back.
+   * @param out receives the block when rc == 0
+   * @param rc 0 when the stand-in holds a decodable copy, else nonzero
+   */
+  /** issue #1322: answer kTableStandInFetch from the home slot or journal. */
+  int ServeStandInFetch(const FsReq &req, FsResp &resp);
+  clio::run::TaskResume ReadBlockStandIn(clio::run::u64 dir, clio::run::u32 k,
+                                         InodeTableBlock *out, int &rc);
   /**
    * Store a block image in its CTE blob, padded to a power of two, on a
    * non-volatile tier when one accepts it (else RAM). With the directory
@@ -1432,6 +1452,7 @@ enum FsShardOp : clio::run::u32 {
   kShardPurgeLocal = 18,    ///< drop this container's pages of a batch of ids
   kShardRepublish = 19,     ///< send this container's names to node req.a_
   kShardInodePush = 20,     ///< apply an inode home's attribute push
+  kTableStandInFetch = 21,  ///< send the block this container served as a stand-in (#1322)
 };
 
 /** Insert flags (FsReq::flags_ of kTableInsert). */

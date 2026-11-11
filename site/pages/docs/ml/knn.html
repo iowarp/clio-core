@@ -1,0 +1,59 @@
+<!--
+title: knn
+heading: <em>knn:</em> k-nearest-neighbour classification.
+description: API reference for clio-ml's k-nearest-neighbour module: Python fit_knn with queries, C++ KnnClassify, KnnOptions and the labels, neighbors and dist2 result fields.
+eyebrow: Docs · Machine learning
+lede: Classifies a resident set of query rows against a paged, labelled training set in one pass. Each block keeps a private top-k per query ordered by squared distance and then global row index; the host merges them and takes a majority vote, with ties going to the smallest label.
+facts: Module | ml_knn ; Header | clio_ml/knn.h ; Rows | features, then class label ; Limit | fewer than 2^24 training rows
+-->
+<h2>What it does</h2>
+<p>Unlike the other modules this one has no training step: the paged pass is the prediction. The queries are passed in as a flat array and stay resident on the device. Training rows must number fewer than 2^24.</p>
+
+<h2>Rows</h2>
+<p><code>n_features</code> feature columns followed by the class label. Queries have <code>n_features</code> columns and no label. <code>clio_ml.COLUMNS["knn"]</code> is 1.</p>
+
+<h2>Python</h2>
+<pre data-label="python">
+import numpy as np, clio_ml as cm
+rng = np.random.default_rng(1)
+X = rng.normal(size=(4096, 7)).astype(np.float32)
+y = (X[:, 0] + X[:, 1] > 0).astype(np.float32)
+data = np.column_stack([X, y]).astype(np.float32)
+
+r = cm.fit_knn(data, queries=X[:5], k=5)
+print(r.labels)                                   # 5 predicted labels
+print(np.asarray(r.neighbors).reshape(5, r.k))    # global row indices, nearest first
+print(np.asarray(r.dist2).reshape(5, r.k))        # squared distances
+</pre>
+<ul>
+  <li><code>fit_knn(X, queries=..., **options)</code>. <code>queries</code> is required (a 2-D array of feature rows) and raises <code>ValueError</code> when missing.</li>
+  <li>Options (<code>KnnOptions</code>): <code>k</code> (5), <code>threads</code> (256), <code>row_base</code> (0; the global index of this node's first row on a cluster).</li>
+  <li>Result <code>KnnResult</code>: <code>k</code>, <code>labels</code> (Q), <code>neighbors</code> (Q*k global row indices, nearest first), <code>dist2</code> (Q*k squared distances), <code>stats</code>.</li>
+  <li><code>predict</code> does not apply; the labels are in the result.</li>
+</ul>
+
+<h2>C++</h2>
+<pre data-label="cpp">
+struct KnnOptions {
+  u32 k = 5;
+  u32 threads = 256;
+  u64 row_base = 0;
+  ClusterExchange cluster;
+};
+struct KnnResult {
+  u32 k = 0;
+  std::vector<u32> labels;     // Q
+  std::vector<u32> neighbors;  // Q*k
+  std::vector<float> dist2;    // Q*k
+  VecStats stats;
+  std::vector<float> Flatten() const;
+};
+KnnResult KnnClassify(Dataset &ds, const std::vector<float> &queries, const KnnOptions &opt);
+KnnResult KnnClassifyPlain(const float *data, u64 n_rows, u32 nf, u64 elems_per_page,
+                           u32 nblocks, const std::vector<float> &queries,
+                           const KnnOptions &opt);
+KnnResult KnnClassifyReference(/* same arguments */);
+</pre>
+<p>The ChiMod is module <code>ml_knn</code>.</p>
+
+<p>Related: <a href="/docs/ml/nb.html">naive Bayes</a>, <a href="/docs/ml/kmeans.html">k-means</a>.</p>

@@ -3,12 +3,13 @@
 
 Reads page sources from ``site/pages`` and writes a complete, relocatable
 static site (relative links only, so it works under a GitHub Pages project
-path such as ``/clio-core/`` and straight from disk).
+path such as ``/clio-core/``), plus ``sitemap.xml``, ``robots.txt`` and
+``llms.txt``. Every page gets a canonical URL on ``SITE_URL`` and JSON-LD.
 
 Each page source starts with a metadata comment::
 
     <!--
-    title: Composing the context filesystem
+    title: Composing local storage tiers
     description: One sentence for search engines and social cards.
     eyebrow: Tutorial
     lede: The answer, shown under the title.
@@ -29,33 +30,89 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import datetime
 import html
 import http.server
 import functools
+import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 from pathlib import Path
+from xml.sax.saxutils import escape as xml_escape
 
 SITE = Path(__file__).resolve().parent
 PAGES = SITE / "pages"
 ASSETS = SITE / "assets"
 REPO_URL = "https://github.com/iowarp/clio-core"
+# Public origin used for canonical URLs, the sitemap, robots.txt and llms.txt.
+SITE_URL = os.environ.get("SITE_URL", "https://core.iowarp.ai").rstrip("/")
+SITE_NAME = "CLIO Core"
+SITE_SUMMARY = (
+    "CLIO Core is an open-source (BSD 3-Clause) context filesystem for scientific data, "
+    "developed by the Gnosis Research Center at Illinois Institute of Technology as part of "
+    "the IOWarp project. It turns the RAM, NVMe, SSDs and disks in your machines into one tiered "
+    "store and mounts it as an ordinary directory through FUSE on Linux, macOS and Windows, so "
+    "applications read and write files without changes. Recently used data stays in fast tiers "
+    "while colder data moves down, a persistent copy survives restarts, and an index of what was "
+    "written lets you search files from Python by BM25 keyword relevance or name pattern. It is "
+    "written in C++ with Python bindings and installs with pip, conda, Docker, Spack or from source.")
+
+def _title_of(f: Path) -> str:
+    m = re.search(r"^title:\s*(.+)$", f.read_text(encoding="utf-8"), re.M)
+    return m.group(1).strip() if m else f.stem
+
+
+# Every technology has its own docs section, docs/<tech>/, with its own
+# sidebar. These pages come first, in this order, when they exist.
+DOC_CORE_PAGES = [("index.html", "Overview"), ("install.html", "Install"),
+                  ("quickstart.html", "Quickstart"), ("usage.html", "Usage"),
+                  ("performance.html", "Performance and tuning"),
+                  ("api.html", "API reference")]
+
+
+def _tech_docs_nav(tech_dir: str, label: str) -> list:
+    """Sidebar groups for docs/<tech_dir>/: the core pages, then the rest
+    (titled "Algorithms" for machine learning, else "More")."""
+    d = Path(__file__).parent / "pages" / "docs" / tech_dir
+    if not d.is_dir():
+        return []
+    core = [(f"docs/{tech_dir}/{n}", l) for n, l in DOC_CORE_PAGES if (d / n).exists()]
+    names = {n for n, _ in DOC_CORE_PAGES}
+    rest = [(f"docs/{tech_dir}/{f.name}", _title_of(f))
+            for f in sorted(d.glob("*.html")) if f.name not in names]
+    groups = [(label, core)]
+    if rest:
+        groups.append(("Algorithms" if tech_dir == "ml" else "More", rest))
+    return groups
 
 # Section navigation: (group title, [(page path, label), ...]).
+# Each technology: (technology page, docs page, label). Drives the
+# Technologies and Docs dropdowns, so both list the same systems.
+TECHNOLOGIES = [
+    ("technologies/context-fs.html", "docs/context-fs/index.html", "Context FS"),
+    ("technologies/cae.html", "docs/cae/index.html", "Context Assimilation Engine"),
+    ("technologies/cee.html", "docs/cee/index.html", "Context Exploration Engine"),
+    ("technologies/context-transfer-engine.html", "docs/cte/index.html", "Context Transfer Engine"),
+    ("technologies/context-runtime.html", "docs/runtime/index.html", "Context Runtime"),
+    ("technologies/memory-expansion.html", "docs/memory-expansion/index.html", "Memory expansion"),
+    ("technologies/machine-learning.html", "docs/ml/index.html", "Machine learning"),
+]
+
 NAV = {
+    "technologies": [
+        ("Technologies", [("technologies/index.html", "Overview")]
+         + [(tp, lb) for tp, _, lb in TECHNOLOGIES]),
+    ],
     "docs": [
         ("Start here", [
             ("docs/index.html", "Introduction"),
-            ("docs/installation.html", "Installation"),
-            ("docs/basic-usage.html", "Basic usage"),
-        ]),
-        ("Reference", [
+            ("docs/installation.html", "Install CLIO Core"),
             ("docs/concepts.html", "Core concepts"),
-            ("docs/cli.html", "CLI and environment"),
-            ("docs/python-api.html", "Python API"),
         ]),
+        ("Technologies", [(dp, lb) for _, dp, lb in TECHNOLOGIES]),
     ],
     "tutorials": [
         ("Overview", [
@@ -83,6 +140,26 @@ NAV = {
             ("develop/extend-storage.html", "Extend the storage system"),
         ]),
     ],
+    "modules": [
+        ("Modules", [
+            ("modules/index.html", "Module reference"),
+        ]),
+        ("Storage", [
+            ("modules/bdev.html", "Block devices (bdev)"),
+            ("modules/safe-bdev.html", "Erasure-coded arrays (safe_bdev)"),
+            ("modules/cte-core.html", "CTE core"),
+        ]),
+        ("Data path", [
+            ("modules/cache.html", "Cache"),
+            ("modules/replication.html", "Replication"),
+            ("modules/compressor.html", "Compressor"),
+        ]),
+        ("Context", [
+            ("modules/indexer.html", "Indexer"),
+            ("modules/cae-core.html", "CAE core (assimilation)"),
+            ("modules/summarizer.html", "Summarizer"),
+        ]),
+    ],
     "design": [
         ("Design", [
             ("design/index.html", "Overview and principles"),
@@ -99,8 +176,10 @@ NAV = {
 
 PRIMARY = [
     ("index.html", "Overview", "overview"),
+    ("technologies/index.html", "Technologies", "technologies"),
     ("docs/index.html", "Docs", "docs"),
     ("tutorials/index.html", "Tutorials", "tutorials"),
+    ("modules/index.html", "Modules", "modules"),
     ("develop/index.html", "Develop", "develop"),
     ("design/index.html", "Design", "design"),
 ]
@@ -111,6 +190,16 @@ REDIRECTS = {
     "tutorials.html": "tutorials/index.html",
     "install/index.html": "docs/installation.html",
     "tutorials/fuse-adapters.html": "tutorials/fuse-linux.html",
+    "technologies/kv-store.html": "technologies/context-transfer-engine.html",
+    "docs/context-fs.html": "docs/context-fs/usage.html",
+    "docs/basic-usage.html": "docs/context-fs/quickstart.html",
+    "docs/cli.html": "docs/context-fs/cli.html",
+    "docs/cae.html": "docs/cae/usage.html",
+    "docs/cee.html": "docs/cee/usage.html",
+    "docs/cte.html": "docs/cte/usage.html",
+    "docs/python-api.html": "docs/cte/python.html",
+    "docs/runtime.html": "docs/runtime/usage.html",
+    "docs/memory-expansion.html": "docs/memory-expansion/usage.html",
 }
 
 ICON_GITHUB = ('<svg class="filled" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8'
@@ -165,8 +254,32 @@ def rel_prefix(page: str) -> str:
     return "../" * page.count("/")
 
 
+def canonical_path(page: str) -> str:
+    """Return the preferred URL path for a page, with directory indexes as ``dir/``.
+
+    Args:
+        page: Output path relative to the site root, e.g. ``docs/index.html``.
+
+    Returns:
+        Root-absolute path such as ``/``, ``/docs/`` or ``/docs/cli.html``.
+    """
+    if page == "index.html":
+        return "/"
+    if page.endswith("/index.html"):
+        return "/" + page[:-len("index.html")]
+    return "/" + page
+
+
+def canonical_url(page: str) -> str:
+    """Return the absolute canonical URL of a page on ``SITE_URL``."""
+    return SITE_URL + canonical_path(page)
+
+
 def relativize(body: str, page: str) -> str:
     """Rewrite root-absolute ``href``/``src`` values to page-relative ones.
+
+    Links to a directory index (``/docs/index.html``) become directory links
+    (``../docs/``) so internal links agree with the canonical URLs.
 
     Args:
         body: HTML to rewrite.
@@ -175,12 +288,19 @@ def relativize(body: str, page: str) -> str:
     prefix = rel_prefix(page)
 
     def fix(m: re.Match) -> str:
-        target = m.group(2)
-        if target == "":
-            target = "index.html"
-        return f'{m.group(1)}="{prefix}{target}'
+        path, sep, rest = _split_suffix(m.group(2))
+        if path == "index.html" or path.endswith("/index.html"):
+            path = path[:-len("index.html")]
+        link = prefix + path
+        return f'{m.group(1)}="{link or "./"}{sep}{rest}'
 
     return re.sub(r'(?<=\s)(href|src|poster)="/(?!/)([^"]*)', fix, body)
+
+
+def _split_suffix(target: str) -> tuple[str, str, str]:
+    """Split a URL into (path, first ``?``/``#`` separator, remainder)."""
+    m = re.match(r"([^?#]*)([?#]?)(.*)", target)
+    return m.group(1), m.group(2), m.group(3)
 
 
 def slugify(text: str) -> str:
@@ -282,11 +402,45 @@ def add_heading_ids(body: str) -> tuple[str, list[tuple[int, str, str]]]:
     return body, toc
 
 
-def header_html(section: str) -> str:
-    """Render the sticky site header with primary navigation."""
-    links = "".join(
-        f'<a href="/{href}"{" aria-current=\"page\"" if key == section else ""}>{label}</a>'
-        for href, label, key in PRIMARY)
+for _tp, _dp, _lb in TECHNOLOGIES:
+    _dir = _dp.split("/")[1]
+    NAV[f"docs/{_dir}"] = _tech_docs_nav(_dir, _lb)
+
+# Primary entries that open a dropdown of their section's pages.
+DROPDOWNS = {"technologies", "docs"}
+
+# Dropdowns that list fixed entries instead of every page in the section.
+# Docs links one page per technology.
+DROPDOWN_ITEMS = {
+    "technologies": [(tp, lb) for tp, _, lb in TECHNOLOGIES],
+    "docs": [(dp, lb) for _, dp, lb in TECHNOLOGIES],
+}
+
+
+def header_html(section: str, page: str = "") -> str:
+    """Render the sticky site header with primary navigation.
+
+    Args:
+        section: Section key of the current page, highlighted in the nav.
+        page: Output path of the current page, highlighted in dropdowns.
+    """
+    parts = []
+    for href, label, key in PRIMARY:
+        current = " aria-current=\"page\"" if key == section else ""
+        if key not in DROPDOWNS:
+            parts.append(f'<a href="/{href}"{current}>{label}</a>')
+            continue
+        items = DROPDOWN_ITEMS.get(key) or [item for _, group in NAV[key] for item in group]
+        lis = "".join(
+            f'<li><a href="/{h}"{" aria-current=\"page\"" if h == page else ""}>{l}</a></li>'
+            for h, l in items)
+        parts.append(
+            f'<div class="nav-drop"><a href="/{href}"{current}>{label}</a>'
+            f'<button class="nav-drop-toggle" type="button" aria-expanded="false" '
+            f'aria-controls="drop-{key}" aria-label="{label} menu">'
+            f'<svg viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5l3 3 3-3"/></svg></button>'
+            f'<ul class="nav-drop-menu" id="drop-{key}">{lis}</ul></div>')
+    links = "".join(parts)
     return f"""<header class="site-header">
   <div class="header-inner">
     <a class="brand" href="/index.html" aria-label="CLIO Core home">
@@ -310,8 +464,15 @@ def footer_html() -> str:
   <div class="footer-inner">
     <div class="footer-brand">
       <a class="brand" href="/index.html"><img class="mark-dark" src="/assets/brand/clio-core-mark.svg" width="30" height="30" alt=""><img class="mark-light" src="/assets/brand/clio-core-mark-light.svg" width="30" height="30" alt=""><span class="brand-name">CLIO <em>Core</em></span></a>
-      <p>Tiered storage for scientific data, mounted as an ordinary filesystem and searchable from Python. Part of the Clio ecosystem.</p>
+      <p>A composable I/O stack for data-intensive pipelines: storage, memory and compute modules you assemble from YAML. Part of the Clio ecosystem.</p>
     </div>
+    <div><h2>Technologies</h2><ul>
+      <li><a href="/technologies/index.html">Context Runtime</a></li>
+      <li><a href="/technologies/context-fs.html">Context FS</a></li>
+      <li><a href="/technologies/context-transfer-engine.html">Context Transfer Engine</a></li>
+      <li><a href="/technologies/memory-expansion.html">Memory expansion</a></li>
+      <li><a href="/technologies/machine-learning.html">Machine learning</a></li>
+    </ul></div>
     <div><h2>Docs</h2><ul>
       <li><a href="/docs/installation.html">Installation</a></li>
       <li><a href="/docs/basic-usage.html">Basic usage</a></li>
@@ -339,11 +500,69 @@ def footer_html() -> str:
 </footer>"""
 
 
+def nav_key(page: str) -> str:
+    """Return the sidebar key of a page: docs/<tech> inside a technology's
+    docs section, else its section."""
+    parts = page.split("/")
+    if len(parts) > 2 and parts[0] == "docs" and f"docs/{parts[1]}" in NAV:
+        return f"docs/{parts[1]}"
+    return section_of(page)
+
+
+def section_of(page: str) -> str:
+    """Return the section key of a page (``overview`` for top-level pages)."""
+    return page.split("/")[0] if "/" in page else "overview"
+
+
+def json_ld(meta: dict, page: str) -> dict:
+    """Build the schema.org structured data for a page.
+
+    The home page gets WebSite and SoftwareSourceCode; every other page gets a
+    BreadcrumbList of Home > section > page.
+
+    Args:
+        meta: Page metadata from its source comment.
+        page: Output path relative to the site root.
+
+    Returns:
+        A JSON-LD document as a dict.
+    """
+    if page == "index.html":
+        return {"@context": "https://schema.org", "@graph": [
+            {"@type": "WebSite", "@id": f"{SITE_URL}/#website", "url": f"{SITE_URL}/",
+             "name": SITE_NAME, "description": meta.get("description", ""), "inLanguage": "en"},
+            {"@type": "SoftwareSourceCode", "@id": f"{SITE_URL}/#software", "name": SITE_NAME,
+             "description": meta.get("description", ""), "url": f"{SITE_URL}/",
+             "codeRepository": REPO_URL, "license": "https://opensource.org/licenses/BSD-3-Clause",
+             "programmingLanguage": ["C++", "Python"],
+             "author": {"@type": "Organization", "name": "Gnosis Research Center, Illinois Institute of Technology",
+                        "url": "https://grc.iit.edu"}},
+        ]}
+    crumbs = [(SITE_NAME, canonical_url("index.html"))]
+    section = section_of(page)
+    index = f"{section}/index.html"
+    label = next((lbl for href, lbl, key in PRIMARY if key == section), None)
+    if label and (PAGES / index).exists():
+        crumbs.append((label, canonical_url(index)))
+    if page != index:
+        crumbs.append((html.unescape(meta.get("title", page)), canonical_url(page)))
+    return {"@context": "https://schema.org", "@type": "BreadcrumbList", "itemListElement": [
+        {"@type": "ListItem", "position": i, "name": name, "item": url}
+        for i, (name, url) in enumerate(crumbs, 1)]}
+
+
+def json_ld_html(meta: dict, page: str) -> str:
+    """Render the JSON-LD block, escaped so it cannot close its script tag."""
+    data = json.dumps(json_ld(meta, page), ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
+    return f'<script type="application/ld+json">{data}</script>'
+
+
 def head_html(meta: dict, page: str) -> str:
     """Render the document head."""
     title = meta.get("title", "CLIO Core")
     full = title if page == "index.html" else f"{title} · CLIO Core"
     desc = html.escape(meta.get("description", ""), quote=True)
+    canonical = html.escape(canonical_url(page), quote=True)
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -351,13 +570,16 @@ def head_html(meta: dict, page: str) -> str:
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{html.escape(full)}</title>
 <meta name="description" content="{desc}">
+<link rel="canonical" href="{canonical}">
 <meta property="og:title" content="{html.escape(full, quote=True)}">
 <meta property="og:description" content="{desc}">
+<meta property="og:url" content="{canonical}">
 <meta name="theme-color" content="#000000">
 <link rel="icon" href="/assets/brand/clio-core-mark.svg" type="image/svg+xml">
 <link rel="preload" href="/assets/fonts/plex-sans.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="preload" href="/assets/fonts/news-normal-500.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="/assets/css/site.css">
+{json_ld_html(meta, page)}
 {THEME_BOOT}
 </head>"""
 
@@ -370,7 +592,8 @@ def side_nav_html(section: str, page: str) -> str:
             f'<li><a href="/{href}"{" aria-current=\"page\"" if href == page else ""}>{label}</a></li>'
             for href, label in items)
         groups.append(f"<h2>{title}</h2><ul>{lis}</ul>")
-    label = section.capitalize()
+    label = section.capitalize() if "/" not in section else \
+        next((lb for _, dp, lb in TECHNOLOGIES if dp.startswith(section + "/")), section)
     return (f'<nav class="side-nav" aria-label="{label}"><details open><summary>{label} menu</summary>'
             f'<div>{"".join(groups)}</div></details></nav>')
 
@@ -448,15 +671,16 @@ def render_page(src: Path, out_root: Path) -> str:
     """
     page = src.relative_to(PAGES).as_posix()
     meta, body = parse_page(src)
-    section = page.split("/")[0] if "/" in page else "overview"
+    section = section_of(page)
     body = wrap_tables(render_code_blocks(body))
-    if section in NAV and meta.get("layout") != "landing":
-        main = render_guide(meta, body, section, page)
+    navk = nav_key(page)
+    if navk in NAV and meta.get("layout") != "landing":
+        main = render_guide(meta, body, navk, page)
     else:
         main = body
     doc = (head_html(meta, page) +
            f'\n<body class="{section}">\n<a class="skip" href="#content">Skip to content</a>\n' +
-           header_html(section) + f'\n<main id="content">\n{main}\n</main>\n' + footer_html() +
+           header_html(section, page) + f'\n<main id="content">\n{main}\n</main>\n' + footer_html() +
            '\n<script src="/assets/js/site.js" defer></script>\n</body>\n</html>\n')
     out = out_root / page
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -465,14 +689,18 @@ def render_page(src: Path, out_root: Path) -> str:
 
 
 def write_redirect(out_root: Path, old: str, new: str) -> None:
-    """Write a small HTML redirect so an old URL keeps working."""
-    target = rel_prefix(old) + new
+    """Write a small HTML redirect so an old URL keeps working.
+
+    The redirect's canonical is the absolute canonical URL of the new page.
+    """
+    target = (rel_prefix(old) + canonical_path(new)[1:]) or "./"
+    canonical = canonical_url(new)
     out = out_root / old
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(
         f'<!doctype html><meta charset="utf-8"><title>Moved</title>'
         f'<meta http-equiv="refresh" content="0; url={target}">'
-        f'<link rel="canonical" href="{target}"><p>This page moved to <a href="{target}">{new}</a>.</p>\n',
+        f'<link rel="canonical" href="{canonical}"><p>This page moved to <a href="{target}">{new}</a>.</p>\n',
         encoding="utf-8")
 
 
@@ -491,12 +719,111 @@ def check_links(out_root: Path) -> list[str]:
                     broken.append(f"{f.relative_to(out_root)} -> #{frag}")
                 continue
             dest = (f.parent / path.split("?")[0]).resolve()
+            if dest.is_dir():
+                dest = dest / "index.html"
             if not dest.exists():
                 broken.append(f"{f.relative_to(out_root)} -> {target}")
             elif frag and dest.suffix == ".html":
                 if f'id="{frag}"' not in dest.read_text(encoding="utf-8"):
                     broken.append(f"{f.relative_to(out_root)} -> {target}")
     return broken
+
+
+def page_order(pages: list[str]) -> list[str]:
+    """Order pages as the site presents them: home, then each section's nav order.
+
+    Pages missing from ``NAV`` follow, sorted by path, so none is ever dropped.
+    """
+    ordered = [p for p in ["index.html"] if p in pages]
+    for _, _, key in PRIMARY:
+        for nk in [key] + [k for k in NAV if k.startswith(key + "/")]:
+            ordered += [href for _, items in NAV.get(nk, []) for href, _ in items
+                        if href in pages and href not in ordered]
+    return ordered + sorted(p for p in pages if p not in ordered)
+
+
+def git_lastmod() -> dict[str, str]:
+    """Map page paths to the ISO 8601 date of the last commit that touched them.
+
+    Pages with uncommitted changes are left out so the caller falls back to
+    the file's modification time. Returns an empty dict outside a git checkout.
+    """
+    def git(*args: str) -> str:
+        return subprocess.run(["git", "-C", str(PAGES), *args], capture_output=True, text=True,
+                              check=True).stdout
+    try:
+        log = git("log", "--format=%x00%cI", "--name-only", "--relative", "--", ".")
+        dirty = (git("diff", "--name-only", "--relative", "HEAD", "--", ".") +
+                 git("ls-files", "--others", "--exclude-standard", "--", "."))
+    except (OSError, subprocess.CalledProcessError):
+        return {}
+    dates: dict[str, str] = {}
+    date = ""
+    for line in log.splitlines():
+        if line.startswith("\0"):
+            date = line[1:]
+        elif line and date:
+            dates.setdefault(line, date)
+    for line in dirty.splitlines():
+        dates.pop(line, None)
+    return dates
+
+
+def page_lastmod(page: str, dates: dict[str, str]) -> str:
+    """Return a page's last-modified date: from git, else from the source mtime."""
+    if page in dates:
+        return dates[page]
+    mtime = (PAGES / page).stat().st_mtime
+    return datetime.datetime.fromtimestamp(mtime, datetime.timezone.utc).isoformat(timespec="seconds")
+
+
+def write_sitemap(out_root: Path, pages: list[str]) -> None:
+    """Write ``sitemap.xml`` listing every page by canonical URL with ``lastmod``."""
+    dates = git_lastmod()
+    urls = "".join(
+        f"  <url>\n    <loc>{xml_escape(canonical_url(p))}</loc>\n"
+        f"    <lastmod>{page_lastmod(p, dates)}</lastmod>\n  </url>\n"
+        for p in page_order(pages))
+    (out_root / "sitemap.xml").write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+        f"{urls}</urlset>\n", encoding="utf-8")
+
+
+def write_robots(out_root: Path) -> None:
+    """Write ``robots.txt`` allowing all crawlers and pointing at the sitemap."""
+    (out_root / "robots.txt").write_text(
+        f"User-agent: *\nAllow: /\nSitemap: {SITE_URL}/sitemap.xml\n", encoding="utf-8")
+
+
+def write_llms_txt(out_root: Path, metas: dict[str, dict]) -> None:
+    """Write ``llms.txt``: a summary, then each section's pages with one-line descriptions.
+
+    Args:
+        out_root: Output directory.
+        metas: Page path -> page metadata, for every rendered page.
+    """
+    titles = {"docs": "Install and use", "tutorials": "Tutorials", "develop": "Develop", "design": "Design"}
+    lines = [f"# {SITE_NAME}", "", f"> {SITE_SUMMARY}", ""]
+    listed: set[str] = {"index.html"}
+    for key, heading in titles.items():
+        pages = [p for p in page_order(list(metas)) if section_of(p) == key]
+        if not pages:
+            continue
+        lines += [f"## {heading}", ""]
+        for p in pages:
+            meta = metas[p]
+            title = html.unescape(re.sub(r"<[^>]+>", "", meta.get("title", p)))
+            desc = html.unescape(meta.get("description", ""))
+            lines.append(f"- [{title}]({canonical_url(p)}): {desc}")
+            listed.add(p)
+        lines.append("")
+    rest = [p for p in page_order(list(metas)) if p not in listed]
+    lines += ["## Optional", ""]
+    lines += [f"- [{html.unescape(metas[p].get('title', p))}]({canonical_url(p)}): "
+              f"{html.unescape(metas[p].get('description', ''))}" for p in rest]
+    lines += [f"- [Source code on GitHub]({REPO_URL}): C++ and Python sources, issues and releases.", ""]
+    (out_root / "llms.txt").write_text("\n".join(lines), encoding="utf-8")
 
 
 def build(out_root: Path) -> int:
@@ -512,9 +839,13 @@ def build(out_root: Path) -> int:
     pages = [render_page(src, out_root) for src in sorted(PAGES.rglob("*.html"))]
     for old, new in REDIRECTS.items():
         write_redirect(out_root, old, new)
+    write_sitemap(out_root, pages)
+    write_robots(out_root)
+    write_llms_txt(out_root, {p: parse_page(PAGES / p)[0] for p in pages})
     (out_root / ".nojekyll").write_text("", encoding="utf-8")
     broken = check_links(out_root)
-    print(f"Built {len(pages)} pages and {len(REDIRECTS)} redirects into {out_root}")
+    print(f"Built {len(pages)} pages, {len(REDIRECTS)} redirects, sitemap.xml, robots.txt "
+          f"and llms.txt into {out_root}")
     for b in broken:
         print(f"  broken link: {b}", file=sys.stderr)
     return 1 if broken else 0

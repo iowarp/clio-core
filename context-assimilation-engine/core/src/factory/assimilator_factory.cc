@@ -33,6 +33,9 @@
 
 #include <clio_cae/core/factory/assimilator_factory.h>
 #include <clio_cae/core/factory/binary_file_assimilator.h>
+#ifdef CAE_ENABLE_HTTP
+#include <clio_cae/core/factory/http_file_assimilator.h>
+#endif
 #include <clio_cae/core/factory/string_data_assimilator.h>
 #ifdef CLIO_CAE_ENABLE_HDF5
 #include <clio_cae/core/factory/hdf5_file_assimilator.h>
@@ -86,6 +89,18 @@ std::unique_ptr<BaseAssimilator> AssimilatorFactory::Get(
          "protocol");
     // For file protocol, return a BinaryFileAssimilator
     return std::make_unique<BinaryFileAssimilator>(cte_client_);
+  } else if (protocol == "http" || protocol == "https") {
+    HLOG(kDebug,
+         "AssimilatorFactory: Creating HttpFileAssimilator for '{}' protocol",
+         protocol);
+#ifdef CAE_ENABLE_HTTP
+    // Plain web downloads (curl children; credentials from
+    // ~/.clio/cae_http_auth.ini). Globus web URLs were caught above.
+    return std::make_unique<HttpFileAssimilator>(cte_client_);
+#else
+    HLOG(kError, "AssimilatorFactory: http(s) sources need a POSIX build");
+    return nullptr;
+#endif
   } else if (protocol == "string") {
     HLOG(kDebug,
          "AssimilatorFactory: Creating StringDataAssimilator for 'string' "

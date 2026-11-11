@@ -1,0 +1,298 @@
+<!--
+title: Block device (bdev)
+heading: The block-device module (<em>bdev</em>)
+description: Reference for clio_bdev, the module behind every CLIO storage tier: its RAM, pinned, HBM, file, S3 and GCS transports, the block allocator, capacity reporting, and how a CTE tier maps to a bdev pool.
+eyebrow: Modules · Storage
+lede: A bdev pool is a flat byte space with a block allocator in front of it. It knows nothing about blobs or files; it hands out extents, moves bytes into and out of them, frees them, and reports how much room is left. Every storage tier the CTE places data on is one of these pools, and the erasure-coded safe-bdev is built from several of them.
+facts: Library | clio_bdev ; Source | context-runtime/modules/bdev ; Transports | ram, pinned, hbm, file, s3, gcs, noop ; Tests | cr_all_bdev_tests and siblings
+-->
+<h2>What it does</h2>
+<p>The module exposes a small task interface. Each operation is a task routed to
+one container of the pool; on a single node the container is the local one.</p>
+<ul>
+  <li><strong>AllocateBlocks</strong> takes a byte count and returns a list of
+  blocks, each an offset, a size and a size class. One request may come back
+  as several extents.</li>
+  <li><strong>Write</strong> and <strong>Read</strong> take a block list and a
+  buffer. Writes report bytes written and an I/O error category; reads report
+  bytes read.</li>
+  <li><strong>FreeBlocks</strong> returns blocks to the allocator.</li>
+  <li><strong>GetStats</strong> returns the configured performance figures,
+  the configured capacity, the remaining allocatable bytes and a predicted
+  device lifetime in days (999999 means healthy).</li>
+  <li><strong>Sync</strong> makes written data and allocator state durable. It
+  runs fdatasync on a file device and is a no-op on memory devices.</li>
+  <li><strong>SetLifespan</strong> overrides the lifetime figure, which the
+  CTE's placement filter reads. <strong>FlushAllocLog</strong> flushes and
+  compacts the allocator log. <strong>Update</strong> publishes GPU memory
+  pointers for the hbm and pinned types. <strong>Monitor</strong> answers
+  dashboard queries.</li>
+</ul>
+<p>The pool keeps no per-object metadata. Recording which blocks belong to
+which blob is the CTE's job; see <a href="/design/cte-core.html">the CTE
+core</a>. When the caller is in the same process as the runtime, the client
+runs allocate, free, read and write inline instead of sending a task.</p>
+
+<h2>Where it sits</h2>
+<p>A bdev pool is a leaf. It calls nothing below it, and it is called by the
+<a href="/modules/cte-core.html">CTE core</a> (one bdev per storage tier), by
+<a href="/modules/safe-bdev.html">safe-bdev</a> (one bdev per array member),
+and by tests and benchmarks directly. In a compose file it must appear before
+any pool that refers to it. The <a href="/design/runtime.html#bdev">runtime
+design page</a> covers the allocator and file-tier internals in more
+depth.</p>
+
+<h2>Composing a bdev directly</h2>
+<p>The pool name doubles as the device location: a file path for the file
+type, a bucket (with optional prefix) for s3 and gcs, and an arbitrary unique
+name for memory types. The default configuration composes one RAM device this
+way:</p>
+<pre data-label="yaml">
+compose:
+  - mod_name: clio_bdev
+    pool_name: "ram::chi_default_bdev"
+    pool_query: local
+    pool_id: "301.0"
+    bdev_type: ram          # file, ram, hbm, pinned, noop, s3, gcs
+    capacity: "0g"          # 0 on a ram device = 80% of system DRAM
+
+  - mod_name: clio_bdev
+    pool_name: "/mnt/nvme/chi_bdev"
+    pool_query: local
+    pool_id: "302.0"
+    bdev_type: file
+    capacity: "100GB"
+    alloc_log: "/mnt/nvme/chi_bdev.alloc_log"
+</pre>
+<h3>Configuration keys</h3>
+<dl class="notes">
+  <dt>bdev_type</dt>
+  <dd>One of <code>file</code> (default), <code>ram</code>, <code>hbm</code>,
+  <code>pinned</code>, <code>noop</code>, <code>s3</code>, <code>gcs</code>.
+  Setting the type also sets default performance figures ordered so that hbm
+  outranks ram, which outranks pinned, which outranks everything else.</dd>
+  <dt>capacity</dt>
+  <dd>A size string such as <code>2GB</code>. Default 0. For a RAM device 0
+  means 80% of physical DRAM; for s3 and gcs 0 means 1 TiB of address space;
+  for a file device it is the maximum the backing file may grow to.</dd>
+  <dt>alloc</dt>
+  <dd>Page commit policy for ram and pinned devices: <code>auto</code>
+  (default, commit everything at creation when a capacity was given),
+  <code>eager</code>, or <code>lazy</code>. An unknown value falls back to
+  auto with a warning.</dd>
+  <dt>io_depth</dt>
+  <dd>Asynchronous I/O queue depth per worker for file devices. Default
+  32.</dd>
+  <dt>alignment</dt>
+  <dd>Allocation granularity in bytes. Default 4096. Memory devices lower a
+  default or zero value to 512 because sub-4 KiB blobs otherwise pin a full
+  4 KiB block.</dd>
+  <dt>growth_unit</dt>
+  <dd>File devices only. How far the backing file grows, and reserves disk,
+  at a time. Default <code>1GB</code>.</dd>
+  <dt>populate_unit</dt>
+  <dd>RAM devices only. How many bytes of the shared mapping are pre-faulted
+  when an allocation crosses the populated watermark. Default
+  <code>64MB</code>; 0 disables population.</dd>
+  <dt>alloc_log</dt>
+  <dd>Path of the allocator write-ahead log. A file device logs to
+  <code>&lt;pool_name&gt;.alloc_log</code> when this is unset; setting it moves
+  the log and makes even <code>clio_run start --fresh</code> recover from
+  it.</dd>
+  <dt>persistence_level</dt>
+  <dd><code>volatile</code>, <code>temporary</code> or <code>long_term</code>.
+  Only an explicit <code>volatile</code> disables the allocator log on a file
+  device.</dd>
+  <dt>perf_metrics</dt>
+  <dd>A map of <code>read_bandwidth_mbps</code>,
+  <code>write_bandwidth_mbps</code>, <code>read_latency_us</code>,
+  <code>write_latency_us</code> and <code>iops</code>. These override the
+  type defaults and are what the placement engine ranks tiers by; they are not
+  measured.</dd>
+</dl>
+
+<h2>How a CTE tier becomes a bdev</h2>
+<p>You rarely compose a bdev by hand. Each entry under the CTE's
+<code>storage</code> list creates one bdev pool per node in the target
+neighborhood. The keys are the same ideas under slightly different names:</p>
+<pre data-label="yaml">
+  - mod_name: clio_cte_core
+    pool_name: clio_cte_core
+    pool_id: "512.0"
+    storage:
+      - path: "ram::cte_ram_tier1"      # memory tiers use ram::<name>
+        bdev_type: "ram"
+        capacity_limit: "0g"
+        score: 1.0
+      - path: "${CLIO_STORAGE_ROOT}/cte_disk_tier.dat"
+        bdev_type: "file"
+        capacity_limit: "10GB"
+        growth_unit: "1GB"
+        score: 0.2
+        persistence_level: "temporary"
+</pre>
+<ul>
+  <li><code>path</code> becomes the bdev pool name, with
+  <code>_node&lt;N&gt;</code> appended for the node the target is registered
+  on. For an S3 or GCS tier that suffix lands on the key prefix, so use a
+  <code>bucket/prefix</code> path rather than a bare bucket.</li>
+  <li><code>capacity_limit</code> maps to the bdev's <code>capacity</code>.
+  A RAM tier with 0 gets the same 80% of DRAM default.</li>
+  <li><code>growth_unit</code> and <code>persistence_level</code> pass through
+  unchanged. <code>score</code> belongs to the CTE's placement engine, not to
+  the bdev.</li>
+  <li>Memory tiers register on their own node only; file and object-store
+  tiers span the configured neighborhood.</li>
+  <li>A storage entry with <code>existing_pool_id</code> and
+  <code>existing_pool_module</code> attaches to a pool composed earlier (for
+  example a safe-bdev) instead of creating a bdev.</li>
+</ul>
+
+<h2>Transports</h2>
+<p>The runtime picks a transport from the type at pool creation. All of them
+share the same allocator and the same task interface.</p>
+<h3>ram</h3>
+<p>Host memory mapped as one sparse shared-memory segment, named from the
+runtime's process ID and the pool ID so client processes can attach it and
+read blob payloads without a round trip. Pages are faulted in one
+<code>populate_unit</code> at a time as allocations advance, so committed
+memory tracks the allocation high-water mark rather than the declared
+capacity. The environment variable <code>CLIO_PREFAULT</code> pre-faults a
+prefix at creation instead (<code>0</code> for the whole mapping, or a size
+string). Contents are lost on restart.</p>
+<h3>pinned and hbm</h3>
+<p><code>pinned</code> allocates page-locked host memory through the GPU API
+so device transfers can run asynchronously; it is not shared-memory backed.
+<code>hbm</code> allocates one device buffer covering the whole capacity. GPU
+copies are enqueued on a stream and the worker yields until they finish. In a
+GPU-enabled build a failed device allocation for hbm is fatal; it does not
+fall back to host memory. In a build without GPU support both types are
+ordinary host memory and hbm logs a warning saying so. Both are
+volatile.</p>
+<h3>file</h3>
+<p>A backing file driven by per-worker asynchronous I/O contexts. The
+backend is chosen at build time in the order NIXL, io_uring, libaio, then the
+platform default (POSIX AIO, or I/O completion ports on Windows). If the
+preferred backend cannot open the file at run time, for example io_uring
+under a container seccomp profile, the transport falls back to POSIX AIO.
+Behaviors worth knowing:</p>
+<ul>
+  <li>The file starts at one growth unit and is extended on demand. Where the
+  filesystem supports it, each step reserves real blocks so a full disk
+  fails at allocation time. A failed growth is remembered for two seconds so
+  requests past that point fail fast.</li>
+  <li>Remaining capacity is the allocator's free space capped by what the host
+  filesystem can still give the file, sampled at most once a second.</li>
+  <li>Writes of at least 64 KiB whose offset and length are aligned are
+  bounced through an aligned buffer so they can reach the direct-I/O file
+  descriptor.</li>
+  <li>The transport records the identity of the file it opened. If the path
+  later names a different file, reopen attempts fail instead of silently
+  creating an empty file.</li>
+  <li>Allocations and frees are appended to the allocator log before blocks
+  are handed out or reused. The log is flushed on every call and fsynced
+  every 50 ms by a thread owned by the transport. On restart the live extents
+  are replayed so no live byte is handed out twice.</li>
+  <li>A test-only fault marker, <code>&lt;file&gt;.fail</code>, makes every
+  read, write and sync fail with a device fault while it exists.</li>
+</ul>
+<h3>s3</h3>
+<p>Compiled in when <code>CLIO_ENABLE_AMAZON_DRIVE</code> is defined. Each
+block is one object named <code>[prefix/]block_&lt;offset&gt;</code>; a
+never-written block reads back as zeros when the GET returns 404. The pool
+name is parsed as <code>bucket</code>, <code>bucket/prefix</code> or
+<code>s3://bucket/prefix</code>. Requests are signed with AWS Signature
+Version 4 by a header-only REST client over Poco; no AWS SDK is linked. One
+keep-alive connection is kept per worker. The bucket is created if it does
+not exist and <code>S3_ALLOW_BUCKET_CREATE</code> is <code>1</code>.
+Configuration comes from the environment of the process that starts the
+runtime:</p>
+<ul>
+  <li><code>AWS_ACCESS_KEY_ID</code> and <code>AWS_SECRET_ACCESS_KEY</code>
+  are required; pool creation fails without them.
+  <code>AWS_SESSION_TOKEN</code> is optional.</li>
+  <li><code>AWS_DEFAULT_REGION</code>, default <code>us-east-1</code>.</li>
+  <li><code>S3_ENDPOINT</code> overrides the endpoint and switches to
+  path-style addressing, which is how MinIO and the test stub are reached.
+  Unset means real AWS with the bucket in the hostname.</li>
+</ul>
+<h3>gcs</h3>
+<p>Compiled in when <code>CLIO_ENABLE_GOOGLE_CLOUD</code> is defined. Same
+object layout and zero-fill convention as s3, with the pool name parsed as
+<code>bucket</code>, <code>bucket/prefix</code> or
+<code>gcs://bucket/prefix</code>. Authentication is an OAuth2 bearer token; a
+fresh HTTPS session is opened per call.</p>
+<ul>
+  <li><code>GCS_ACCESS_TOKEN</code> is required, typically the output of
+  <code>gcloud auth print-access-token</code>. The service-account JWT flow is
+  not implemented.</li>
+  <li><code>GCS_ENDPOINT</code>, default
+  <code>https://storage.googleapis.com</code>.</li>
+  <li><code>GCS_PROJECT_ID</code>, used only when creating the bucket;
+  default <code>clio-prototype</code>.</li>
+</ul>
+<h3>noop</h3>
+<p>No transport is created. Allocate, free, write and read return success
+without touching any storage. It exists to measure the runtime's own
+overhead.</p>
+<div class="callout">
+  <p>There is no cross-node transport inside the module. A remote device is
+  reached by routing the task to the pool's container on that node, which the
+  CTE does through target registration and safe-bdev does with its
+  <code>distributed</code> option.</p>
+</div>
+
+<h2>The allocator</h2>
+<p>Every transport uses the same allocator: a bump pointer over the capacity
+plus segregated free lists from 512 B to 1 MB, one set per worker, with
+stealing between workers. Blocks are returned with a size class so frees go
+back to the right list. When the heap is exhausted a large request is
+assembled from several free blocks, so a single allocation can return more
+than one extent and callers must handle block lists. Nothing is compacted or
+coalesced, so long churn fragments free space into blocks of 1 MB or less.
+File devices run the blocking part of growth off the runtime worker so a
+multi-second reservation does not stall other tasks.</p>
+
+<h2>Capacity and health</h2>
+<p>GetStats reports the configured capacity, not the physical device under
+it. Remaining space is the allocator's view, further capped on file devices
+by host free space. Several file devices on one disk each see the whole free
+space, so the figure is an upper bound. The lifetime figure defaults to
+healthy and can be set with SetLifespan; a Monitor query can also fetch a
+prediction from the optional failure-prediction service under
+<code>hw_failure_monitor/</code>, which is outside the normal data path.</p>
+
+<h2>Limits</h2>
+<ul>
+  <li>Allocator state for s3 and gcs devices is held in memory only; their
+  objects persist but the allocator restarts from zero after a restart.</li>
+  <li>Within one task, blocks are written one at a time. Concurrency comes
+  from many tasks in flight.</li>
+  <li>An hbm or pinned device in a build without GPU support is host
+  memory.</li>
+  <li>The GCS transport opens a new connection per request; the S3 transport
+  reuses one per worker.</li>
+</ul>
+
+<h2>How it is tested</h2>
+<p>Tests live in <code>context-runtime/modules/bdev/test</code>.</p>
+<ul>
+  <li><code>cr_all_bdev_tests</code> runs <code>test_bdev_chimod.cc</code>:
+  creation, 4 KiB allocation, lazy file growth, the volatile log skip, a
+  deleted backing file, host-disk capping, near-full-disk growth, RAM and
+  pinned I/O, bounds checks, parallel I/O, allocator-log recovery and
+  compaction, and the coalescing allocator cases.</li>
+  <li><code>cr_bdev_explicit_backend_shm</code>, <code>_tcp</code> and
+  <code>_ipc</code> run the file device over each client transport, and
+  <code>cr_bdev_force_net</code> routes every task through the network path
+  on loopback.</li>
+  <li><code>cr_bdev_sigv4</code> checks the signer against known-answer
+  vectors generated by <code>gen_sigv4_vectors.py</code>.
+  <code>cr_bdev_s3_rest</code> and <code>cr_bdev_s3_rest_resume</code> drive
+  the REST client against <code>s3_stub_server.py</code>, an in-memory S3
+  stand-in that verifies signatures, so no credentials or network are
+  needed.</li>
+  <li><code>cr_bdev_prediction_integration</code> (Linux only) starts the
+  Python model server and runs one prediction round trip; it skips when the
+  Python dependencies or models are absent.</li>
+</ul>

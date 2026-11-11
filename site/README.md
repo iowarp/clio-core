@@ -1,6 +1,9 @@
 # CLIO Core website
 
-The public website for CLIO Core: **Overview**, **Docs** (installation, basic
+The public website for CLIO Core, a composable I/O stack for data-intensive
+pipelines: **Overview**, **Technologies** (the composable stack and its
+products: Context FS, key-value store, memory expansion, machine learning,
+each with measured results against alternative systems), **Docs** (installation, basic
 usage, concepts, CLI, Python API), **Tutorials** (composing the context
 filesystem from RAM/NVMe/SSD/disk and S3/GCS, FUSE on Linux/macOS/Windows, the
 dashboard, Python semantic query, AI agents over MCP) and **Design** (how the
@@ -25,7 +28,28 @@ python3 site/build.py --serve    # build, then serve on http://127.0.0.1:8000/
 `.github/workflows/pages.yml` runs the same build on pull requests and deploys
 `main` to GitHub Pages. Enable it once under Settings → Pages → Source:
 "GitHub Actions". All links are relative, so the site works at
-`https://iowarp.github.io/clio-core/`, on a custom domain, or from disk.
+`https://iowarp.github.io/clio-core/` or on a custom domain. Links to section
+indexes are written as directories (`../docs/`), so browse it through
+`--serve` rather than from disk.
+
+## Search engines and LLMs
+
+The public origin is `SITE_URL` in `build.py` (`https://core.iowarp.ai`,
+override with the `SITE_URL` environment variable). From it the build adds:
+
+- a `<link rel="canonical">` and `og:url` on every page. Directory indexes use
+  the trailing-slash form (`/docs/`, never `/docs/index.html`), matching the
+  internal links; redirect stubs point at their new page.
+- JSON-LD: `WebSite` and `SoftwareSourceCode` on the home page, a
+  `BreadcrumbList` (Home › section › page) everywhere else.
+- `sitemap.xml` with every page, in nav order. `<lastmod>` is the date of the
+  last commit that touched the page source (the file's mtime if it has
+  uncommitted changes), which is why the workflow checks out full history.
+- `robots.txt` allowing all crawlers and naming the sitemap.
+- `llms.txt`: `SITE_SUMMARY` from `build.py`, then each section's pages with
+  their `description`.
+
+New pages need nothing extra: add them to `NAV` and they appear in all of these.
 
 ## Layout
 
@@ -34,6 +58,7 @@ site/
   build.py              Wraps pages in the shared layout, writes _site/, checks links
   pages/                Page sources (one HTML fragment per page)
     index.html          Overview (landing layout)
+    technologies/       The stack, Context FS, key-value store, memory expansion, machine learning
     docs/               Introduction, installation, basic usage, concepts, CLI, Python API
     tutorials/          Compose, cloud storage, FUSE x3, dashboard, Python query, AI agents
     design/             Runtime, CTE, placement, durability, chain, filesystem, adapters
@@ -64,7 +89,10 @@ $ sudo apt install fuse3
 ```
 
 - Add the page to `NAV` in `build.py` so it appears in the sidebar and in the
-  previous/next links.
+  previous/next links. Sections listed in `DROPDOWNS` (Technologies) also get
+  a header dropdown built from their `NAV` entries.
+- Every performance figure on a Technologies page must come from a benchmark
+  document in the repository; state its hardware and caveats next to it.
 - Write internal links root-relative (`href="/docs/cli.html"`). The build
   rewrites them relative to each page.
 - `<pre data-label="...">` blocks hold raw text. The build escapes them, adds
