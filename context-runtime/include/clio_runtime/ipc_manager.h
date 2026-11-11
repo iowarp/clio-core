@@ -1286,6 +1286,21 @@ class IpcManager {
                                          const char *lane = "");
 
   /**
+   * Dedicated network send threads (experiment, CLIO_NET_SEND_THREADS=N).
+   * Every cross-node request (SendIn) and reply (SendOut) used to be sent by
+   * ONE worker (the admin Send periodic on net_send_worker_), so a node's
+   * whole outbound path serialized there; under a 4-node 16x16 load tasks
+   * waited 0.4-1.6 ms on its queues, and a 1 MB request blocked small
+   * replies for ~0.5 s on the socket transport. With N > 0, N extra threads
+   * also drain the net queues. Each uses its own peer connections (the
+   * thread's slot is appended to the GetOrCreateClient key), because neither
+   * ZeroMQ sockets nor plain-socket writes may be shared across threads.
+   */
+  static int NetSendThreads();
+  /** Mark the calling thread as send slot `slot` (-1 = shared connections). */
+  static void SetSendSlot(int slot);
+
+  /**
    * Get or create a dial-back connection for returning a response to a client.
    *
    * Dial-back connections live in their own LRU-bounded table, separate from
@@ -1872,6 +1887,7 @@ class IpcManager {
 
   // Network queue for send operations (one lane, two priorities)
   ctp::ipc::FullPtr<NetQueue> net_queue_;
+  std::mutex net_pop_mu_;  // net_queue_ lanes are single-consumer rings
 
   /**
    * Spill-over for net_queue_ when a priority's ring is full.

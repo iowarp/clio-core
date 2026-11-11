@@ -562,6 +562,7 @@ class IpcManagerRun2Run {
   // -------------------------------------------------------------------------
   std::atomic<bool> recv_shutdown_{false};
   std::thread peer_recv_thread_;
+  std::vector<std::thread> send_threads_;  // CLIO_NET_SEND_THREADS
   std::vector<std::thread> tier_recv_threads_;  // size-tier listeners
   std::thread client_recv_thread_;
 

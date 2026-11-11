@@ -1967,6 +1967,48 @@ void IpcManagerRun2Run::StartRecvThreads() {
     HLOG(kInfo, "[PeerRecvThread] shutting down");
   });
 
+  // Dedicated network send threads (CLIO_NET_SEND_THREADS, see
+  // IpcManager::NetSendThreads). Replies first: they are small and complete
+  // a waiting origin; then requests. Bounded batches per priority so neither
+  // starves. Idle: spin ~200 us, then 20 us naps (the admin Send periodic
+  // still drains the same queues, so a napping thread delays nothing).
+  for (int slot = 0; slot < clio::run::IpcManager::NetSendThreads(); ++slot) {
+    send_threads_.emplace_back([this, slot]() {
+      ctp::SystemInfo::SetCurrentThreadName("chi-net-send");
+      clio::run::IpcManager::SetSendSlot(slot);
+      auto *ipc = CLIO_IPC;
+      using P = clio::run::NetQueuePriority;
+      const P order[] = {P::kSendOutLatency, P::kSendOutIO, P::kSendInLatency,
+                         P::kSendInIO};
+      auto idle_since = std::chrono::steady_clock::now();
+      while (!recv_shutdown_.load(std::memory_order_acquire)) {
+        bool did = false;
+        for (P p : order) {
+          for (int k = 0; k < 32; ++k) {
+            clio::run::Future<clio::run::Task> fut;
+            if (!ipc->TryPopNetTask(p, fut)) break;
+            auto t = fut.GetTaskPtr();
+            if (t.IsNull()) continue;
+            if (p == P::kSendOutLatency || p == P::kSendOutIO) {
+              SendOut(t);
+            } else {
+              SendIn(t);
+            }
+            did = true;
+          }
+        }
+        if (did) {
+          idle_since = std::chrono::steady_clock::now();
+        } else if (std::chrono::steady_clock::now() - idle_since <
+                   std::chrono::microseconds(200)) {
+          std::this_thread::yield();
+        } else {
+          CTP_THREAD_MODEL->SleepForUs(20);
+        }
+      }
+    });
+  }
+
   // Dedicated single client recv thread: drains TCP (port 9416) and IPC
   // (unix socket) client transports via IpcCpu2CpuZmq::RecvIn.
   client_recv_thread_ = std::thread([this]() {
@@ -2020,6 +2062,10 @@ void IpcManagerRun2Run::StartRecvThreads() {
 
 void IpcManagerRun2Run::StopRecvThreads() {
   recv_shutdown_.store(true, std::memory_order_release);
+  for (auto &t : send_threads_) {
+    if (t.joinable()) t.join();
+  }
+  send_threads_.clear();
   if (peer_recv_thread_.joinable()) peer_recv_thread_.join();
   for (auto &t : tier_recv_threads_) {
     if (t.joinable()) t.join();

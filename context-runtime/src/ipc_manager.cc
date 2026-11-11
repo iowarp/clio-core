@@ -2847,6 +2847,20 @@ void IpcManager::FreeBuffer(FullPtr<char> buffer_ptr) {
 #endif  // CTP_IS_HOST
 }
 
+namespace {
+thread_local int tls_send_slot = -1;
+}  // namespace
+
+int IpcManager::NetSendThreads() {
+  static const int n = [] {
+    const char *e = std::getenv("CLIO_NET_SEND_THREADS");
+    return e != nullptr ? std::max(0, std::atoi(e)) : 0;
+  }();
+  return n;
+}
+
+void IpcManager::SetSendSlot(int slot) { tls_send_slot = slot; }
+
 ctp::lbm::Transport *IpcManager::GetOrCreateClient(const std::string &addr,
                                                     int port,
                                                     const char *lane) {
@@ -2857,6 +2871,9 @@ ctp::lbm::Transport *IpcManager::GetOrCreateClient(const std::string &addr,
   if (lane != nullptr && *lane != '\0') {
     key += "#";
     key += lane;
+  }
+  if (tls_send_slot >= 0) {
+    key += "#s" + std::to_string(tls_send_slot);
   }
 
   // Lock the pool for thread-safe access
@@ -3188,6 +3205,10 @@ bool IpcManager::TryPopNetTask(NetQueuePriority priority,
   u32 priority_idx = static_cast<u32>(priority);
   auto &lane = net_queue_->GetLane(0, priority_idx);
 
+  // With dedicated send threads the ring has several consumers; the pop is
+  // cheap, the send that follows runs unlocked.
+  std::unique_lock<std::mutex> pop_lk(net_pop_mu_, std::defer_lock);
+  if (NetSendThreads() > 0) pop_lk.lock();
   bool popped = lane.Pop(future);
   if (!popped &&
       net_overflow_size_[priority_idx].load(std::memory_order_relaxed) != 0) {
