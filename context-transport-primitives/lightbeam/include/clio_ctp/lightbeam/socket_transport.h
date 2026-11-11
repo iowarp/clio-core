@@ -227,6 +227,15 @@ class SocketTransport : public Transport {
     return 0;
   }
 
+  /**
+   * Block up to timeout_ms until the client socket is readable (data, EOF or
+   * error). Server mode returns 0 at once: it waits through its EventManager.
+   */
+  int PollRecv(int timeout_ms) {
+    if (!IsClient() || fd_ == sock::kInvalidSocket) return 0;
+    return sock::PollRead(fd_, timeout_ms);
+  }
+
   /** Unified Recv: accept, iterate events, recv metadata + bulks */
   template <typename MetaT>
   ClientInfo Recv(MetaT& meta, const LbmContext& ctx = LbmContext()) {
