@@ -222,6 +222,14 @@ class PoolManager {
   DynamicContainer GetRealOrStaticContainer(PoolId pool_id) const;
 
   /**
+   * The real container this node hosts for a pool, with no fallback to the
+   * static container (which carries only the task-stat model).
+   * @param pool_id Pool identifier
+   * @return DynamicContainer handle (invalid if this node hosts none)
+   */
+  DynamicContainer GetLocalContainer(PoolId pool_id) const;
+
+  /**
    * Check if pool exists on this node
    * @param pool_id Pool identifier
    * @return true if pool exists locally, false otherwise

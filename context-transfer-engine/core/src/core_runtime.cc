@@ -9825,6 +9825,26 @@ clio::run::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, clio::run::u64 of
     CLIO_CO_RETURN;
   }
 
+  // CLIO_PUT_PROF: split ExtendBlob into its lock sections and the allocator
+  // call ([pext] snap/copy/alloc/debit/fin, us, wait+hold each), printed at
+  // scope exit. The put-level [pimp] ext_us showed 0.6-1.3 ms per new 4 KB
+  // blob under 4-node 16x16 load; this says which section owns it.
+  struct PextProf {
+    bool on;
+    long long snap = 0, copy = 0, alloc = 0, debit = 0, fin = 0;
+    ~PextProf() {
+      if (on) {
+        fprintf(stderr, "[pext] snap=%lld copy=%lld alloc=%lld debit=%lld fin=%lld\n",
+                snap, copy, alloc, debit, fin);
+      }
+    }
+  } pext{getenv("CLIO_PUT_PROF") != nullptr};
+  const auto pext_now = [] { return std::chrono::steady_clock::now(); };
+  const auto pext_us = [](std::chrono::steady_clock::time_point a,
+                          std::chrono::steady_clock::time_point b) {
+    return (long long)std::chrono::duration_cast<std::chrono::microseconds>(b - a)
+        .count();
+  };
   clio::run::u64 additional_size = required_size - current_blob_size;
   // A failed extension must leave the blob exactly as it found it: blocks
   // placed but never written, or spare capacity counted into the size, would
@@ -9902,7 +9922,7 @@ clio::run::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, clio::run::u64 of
       }
     }
   };
-  snapshot_targets();
+  { const auto t0 = pext_now(); snapshot_targets(); pext.snap += pext_us(t0, pext_now()); }
   // STARTUP RACE. This container is reachable before its Create has run
   // (PoolManager registers it first), and Create then awaits one broadcast
   // bdev create per target, which takes longer the more nodes there are.
@@ -10036,6 +10056,7 @@ clio::run::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, clio::run::u64 of
     // Copy target info under lock (can't hold lock across co_await)
     TargetInfo target_info_copy;
     bool found = false;
+    const auto pext_c0 = pext_now();
     {
       clio::run::ScopedCoRwReadLock read_lock(target_lock_);
       TargetInfo *target_info = registered_targets_.find(selected_target_id);
@@ -10072,8 +10093,11 @@ clio::run::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, clio::run::u64 of
                                   target_info_copy.remaining_space_);
     std::vector<clio::run::bdev::Block> out_blocks;
     bool alloc_success = false;
+    const auto pext_a0 = pext_now();
+    pext.copy += pext_us(pext_c0, pext_a0);
     CLIO_CO_AWAIT(AllocateFromTarget(target_info_copy, req, out_blocks,
                                 alloc_success));
+    pext.alloc += pext_us(pext_a0, pext_now());
     if (!alloc_success || out_blocks.empty()) {
       // NAMED, NOT SWALLOWED. This `continue` used to be the only trace a
       // tier going out of space left anywhere: no log, no counter, nothing
@@ -10115,6 +10139,7 @@ clio::run::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, clio::run::u64 of
 
     // Debit the CANONICAL target's remaining_space_ by the physical bytes taken
     // (mirror of FreeAllBlobBlocks' capacity_ credit).
+    const auto pext_d0 = pext_now();
     {
       clio::run::ScopedCoRwReadLock read_lock(target_lock_);
       TargetInfo *ti = registered_targets_.find(selected_target_id);
@@ -10129,6 +10154,7 @@ clio::run::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, clio::run::u64 of
             .fetch_add(1, std::memory_order_relaxed);
       }
     }
+    pext.debit += pext_us(pext_d0, pext_now());
   }
 
   // Error condition: if we've exhausted all targets but still have remaining
@@ -11059,12 +11085,34 @@ clio::run::TaskResume Runtime::AllocateFromTarget(
   // directly via Container::InlineOp — same per-worker-id sharding contract
   // the task path already exercises. Remote/non-local targets and containers
   // that decline (or ENOSPC) fall through to the task path unchanged.
-  if (target_info.target_query_.IsLocalMode()) {
+  //
+  // Multi-node runtimes register every storage target as
+  // DirectHash(target_node), never Local, so this fast path used to be skipped
+  // on every multi-node put: each new blob's allocation became a task round
+  // trip that cost 0.3-2 ms under a 4-node 16x16 4 KB load (CLIO_PUT_PROF
+  // [pext] alloc). A DirectHash target that names THIS node, whose real bdev
+  // container lives here, is just as local. CLIO_INLINE_ALLOC_DIRECT=0
+  // restores the Local-only rule.
+  static const bool kInlineDirect = [] {
+    const char *e = std::getenv("CLIO_INLINE_ALLOC_DIRECT");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  const bool target_is_here =
+      target_info.target_query_.IsLocalMode() ||
+      (kInlineDirect &&
+       TargetIsNodeLocal(target_info.target_query_,
+                         target_info.bdev_client_.pool_id_));
+  if (target_is_here) {
     // The REAL bdev container: InlineOp reaches into the live block allocator,
     // which only the container that ran Create owns. The pool's static
     // container carries the task-stat model and nothing else (issue #956).
-    auto inline_dc = CLIO_POOL_MANAGER->GetRealOrStaticContainer(
-        target_info.bdev_client_.pool_id_);
+    // A DirectHash target must not fall back to the static container.
+    auto inline_dc =
+        target_info.target_query_.IsLocalMode()
+            ? CLIO_POOL_MANAGER->GetRealOrStaticContainer(
+                  target_info.bdev_client_.pool_id_)
+            : CLIO_POOL_MANAGER->GetLocalContainer(
+                  target_info.bdev_client_.pool_id_);
     auto inline_c = inline_dc.get();  // ContainerHold keeps the container pinned
     if (inline_c) {
       clio::run::u64 inline_size = size;
