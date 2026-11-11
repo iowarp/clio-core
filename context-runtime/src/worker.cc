@@ -1099,7 +1099,14 @@ u32 Worker::DrainMyShard() {
   // ingested task, a larger quantum amortizes the drain loop; fairness to the
   // lane is preserved because each ingested task still runs to completion (or
   // routes away) before the next pop.
-  constexpr u32 kShardDrainBudget = 256;
+  // CLIO_SHARD_DRAIN_BUDGET overrides (experiment): a worker runs up to this
+  // many client requests inline per pass before it looks at its lane, which
+  // is where peer tasks wait (r_lane ~1.5 ms at 4-node 16x16 4 KB).
+  static const u32 kShardDrainBudget = [] {
+    const char *e = std::getenv("CLIO_SHARD_DRAIN_BUDGET");
+    const long v = e != nullptr ? std::atol(e) : 0;
+    return v > 0 ? static_cast<u32>(v) : 256u;
+  }();
   TaskLane *my_lane = assigned_lane_.load(std::memory_order_acquire);
   if (!BatchingEnabled()) {
     u32 n = 0;

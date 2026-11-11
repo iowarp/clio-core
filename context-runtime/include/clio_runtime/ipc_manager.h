@@ -1299,6 +1299,8 @@ class IpcManager {
   static int NetSendThreads();
   /** Mark the calling thread as send slot `slot` (-1 = shared connections). */
   static void SetSendSlot(int slot);
+  /** Number of inbound client SHM shards (worker w < this drains shard w). */
+  u32 GetShmInShards() const { return shm_in_shards_; }
 
   /**
    * Get or create a dial-back connection for returning a response to a client.
