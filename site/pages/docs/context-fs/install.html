@@ -1,0 +1,72 @@
+<!--
+title: Install
+heading: Install <em>Context FS.</em>
+description: Which CLIO Core installs include the clio_cte_fuse daemon, the FUSE driver each platform needs, the CMake option for source builds, and a check that the mount works.
+eyebrow: Docs · Context FS
+lede: The filesystem module ships in every CLIO Core install. The mount daemon, clio_cte_fuse, needs a FUSE driver from the operating system and is included only in some packages. This page lists which, and what to install beside them.
+facts: pip | Linux and Windows wheels include clio_cte_fuse ; macOS | build from source ; CMake option | CLIO_CTE_ENABLE_FUSE_ADAPTER
+-->
+<h2>What each install method gives you</h2>
+<p>The general install page, <a href="/docs/installation.html">Installation</a>, covers every method. For Context FS the question is whether <code>clio_cte_fuse</code> is in the package.</p>
+<ul class="checks">
+  <li><strong>pip</strong> (<code>pip install iowarp-core</code>): the Linux and Windows wheels build the FUSE adapter; the macOS wheel does not. The <code>clio_cte_fuse</code> console script exists on every platform, but on macOS the binary behind it is absent.</li>
+  <li><strong>conda</strong> (<code>iowarp</code> channel): built from the <code>release</code> preset, which does not enable the adapter. Build the recipe yourself with a FUSE preset to get it.</li>
+  <li><strong>Spack</strong>: <code>spack install iowarp +fuse</code>. The <code>fuse</code> variant is off by default, depends on <code>libfuse@3:</code>, and requires the CTE (<code>+cte</code>, the default).</li>
+  <li><strong>Release packages</strong> (<code>.deb</code>, <code>.rpm</code>, AppImage, Windows ZIP and installer): include the FUSE adapter.</li>
+  <li><strong>Docker</strong> (<code>iowarp/deploy-cpu</code>): runs the runtime; mounting inside a container needs <code>/dev/fuse</code> passed through. See <a href="/tutorials/fuse-linux.html">FUSE on Linux</a>.</li>
+  <li><strong>Source</strong>: configure with <code>-DCLIO_CTE_ENABLE_FUSE_ADAPTER=ON</code>, or use a preset that sets it.</li>
+</ul>
+
+<h2>Platform prerequisites</h2>
+<div class="tabs" data-platform data-label="Platform">
+  <section class="tab-panel" data-tab="Linux"><p class="tab-title">Linux</p>
+<p>The daemon links the system <code>libfuse3.so.3</code>, which the wheel does not bundle. Install the FUSE 3 packages:</p>
+<pre data-label="shell">
+$ sudo apt install fuse3 libfuse3-3        # Debian, Ubuntu
+$ sudo dnf install fuse3 fuse3-libs        # Fedora
+</pre>
+<p><code>-o allow_other</code> needs <code>user_allow_other</code> in <code>/etc/fuse.conf</code>. Mounting from inside Apptainer with <code>--fusemount</code> needs a daemon built against libfuse 3.14 headers; the manylinux wheels are built against 3.10 and support only the normal mount path.</p></section>
+  <section class="tab-panel" data-tab="macOS"><p class="tab-title">macOS</p>
+<pre data-label="shell">
+$ brew install --cask macfuse
+$ git clone --recurse-submodules https://github.com/iowarp/clio-core.git
+$ cd clio-core
+$ ./CI/ci-deps.sh --only-deps release
+$ conda activate iowarp
+$ cmake --preset release-mac-fuse -DCLIO_CORE_ENABLE_CONDA=ON
+$ cmake --build build-mac-fuse -j"$(sysctl -n hw.ncpu)"
+</pre>
+<p>macFUSE needs a one-time approval in System Settings. <a href="/tutorials/fuse-macos.html">FUSE on macOS</a> covers that, the FSKit backend on macOS 15.4 and later, and unmounting.</p></section>
+  <section class="tab-panel" data-tab="Windows"><p class="tab-title">Windows</p>
+<p>Install <a href="https://winfsp.dev/rel/">WinFsp</a>. The pip console script adds <code>%ProgramFiles(x86)%\WinFsp\bin</code> to <code>PATH</code> itself and refuses to start if that folder is missing. To build from source you also need WinFsp's developer files (install the MSI with <code>ADDLOCAL=ALL</code>), then:</p>
+<pre data-label="powershell">
+PS&gt;cmake --preset windows-release -DCLIO_CTE_ENABLE_FUSE_ADAPTER=ON
+PS&gt;cmake --build build --config Release
+</pre>
+<p>Dependencies come from vcpkg; set <code>VCPKG_ROOT</code> first. <a href="/tutorials/fuse-windows.html">FUSE on Windows</a> has the Defender note and the <code>-o uid=-1,gid=-1</code> option for git.</p></section>
+</div>
+
+<h2>Source presets and options</h2>
+<ul>
+  <li><code>release-fuse</code>: Linux CPU build with the adapter, into <code>build</code>.</li>
+  <li><code>release-mac-fuse</code>: macFUSE build, into <code>build-mac-fuse</code>.</li>
+  <li><code>release-adapter</code>: MPI, HDF5 VOL, ADIOS2 and FUSE adapters together.</li>
+  <li><code>CLIO_CTE_ENABLE_FUSE_ADAPTER</code> (default <code>OFF</code>): the option the presets set. When the FUSE library is missing, the build skips the adapter with a warning instead of failing, so check the configure output.</li>
+  <li><code>CLIO_CORE_ENABLE_CTE</code> (default <code>ON</code>): the filesystem module is part of the CTE and needs it.</li>
+</ul>
+<p>Install with <code>cmake --install build --prefix &lt;prefix&gt;</code> and put <code>&lt;prefix&gt;/bin</code> on <code>PATH</code>.</p>
+
+<h2>Check that it works</h2>
+<p>Start the runtime, mount, write a file through the mount, and unmount. On Linux:</p>
+<pre data-label="shell">
+$ clio_run start &amp;
+$ mkdir -p ~/clio-mnt
+$ CLIO_WITH_RUNTIME=0 clio_cte_fuse ~/clio-mnt -f &amp;
+$ echo hello &gt; ~/clio-mnt/hello.txt
+$ cat ~/clio-mnt/hello.txt
+hello
+$ fusermount3 -u ~/clio-mnt
+$ clio_run stop
+</pre>
+<p>On Windows mount a drive letter (<code>clio_cte_fuse Z: -f</code>) in a second PowerShell window with <code>$env:CLIO_WITH_RUNTIME = "0"</code>, and stop the daemon with <code>Stop-Process -Name clio_cte_fuse</code>. If <code>clio_cte_fuse</code> reports that its binary was not found, your install does not include the adapter; use one of the methods above that does.</p>
+<p>Next: <a href="/docs/context-fs/quickstart.html">Quickstart</a>.</p>

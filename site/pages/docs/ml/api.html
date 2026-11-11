@@ -1,0 +1,158 @@
+<!--
+title: API reference
+heading: clio-ml <em>API reference.</em>
+description: The clio_ml Python package (init, finalize, dataset, assimilate, attach, stage_table, has_cae, predict, COLUMNS, the fit_ functions, Dataset), the C++ Dataset class and AssimilateFloat32File, and the environment variables clio-ml reads.
+eyebrow: Docs · Machine learning
+lede: The Python package is a thin layer over the nanobind extension <code>clio_ml._clio_ml_native</code>. Per-algorithm options, results and predictors are generated from the C++ headers, so their names match the C++ API field for field. Each algorithm page lists its own options and result fields.
+facts: Package | clio_ml ; Native module | clio_ml.native ; C++ headers | clio_ml/dataset.h, clio_ml/assimilate.h
+-->
+<h2>Python package: clio_ml</h2>
+<h3>Module attributes</h3>
+<ul>
+  <li><code>clio_ml.backend</code>: <code>"cpu"</code>, <code>"cuda"</code> or <code>"sycl"</code>, whichever the extension was built for.</li>
+  <li><code>clio_ml.has_cae</code>: <code>True</code> when the build links the Context Assimilation Engine client, so <code>assimilate</code> works.</li>
+  <li><code>clio_ml.COLUMNS</code>: dict from algorithm name to the number of trailing non-feature columns a row has. 0 when every column is data (kmeans, pca, lda, fim, seq), 1 for one label column, 2 for aft (time, event). <code>None</code> for als, pic, w2v and iso, whose rows are fixed records and take no column argument.</li>
+  <li><code>clio_ml.native</code>: the extension module. It exposes every <code>Fit*</code>, <code>Fit*Plain</code>, <code>Fit*Reference</code>, <code>Mine*</code> and <code>*Predict</code> function, every <code>Options</code>, <code>Model</code> and <code>Result</code> class, <code>VecStats</code>, <code>GlmKind</code>, <code>Dataset</code> and <code>cae_assimilate</code>.</li>
+  <li><code>clio_ml.GlmKind</code>: enum with <code>linear</code>, <code>logistic</code> and <code>svm</code>.</li>
+</ul>
+
+<h3>Runtime</h3>
+<ul>
+  <li><code>init()</code>: starts the in-process runtime in client mode (<code>CLIO_INIT(RuntimeMode::kClient, true)</code>) and the Context Transfer Engine client. Raises <code>RuntimeError</code> if either fails. Required by <code>Dataset</code>, <code>dataset</code>, <code>attach</code>, <code>assimilate</code> and every paged fit. The in-memory fits do not need it.</li>
+  <li><code>finalize()</code>: stops the runtime (<code>CLIO_RUNTIME_FINALIZE()</code>).</li>
+</ul>
+
+<h3>Datasets</h3>
+<ul>
+  <li><code>dataset(X, tag=None, page_bytes=16384, nblocks=4, cache_pages=None, gpu_ids=(0,))</code>: a paged <code>Dataset</code> holding <code>X</code>. <code>X</code> is converted to a C-contiguous float32 2-D array; anything else raises <code>ValueError</code>. The page size is rounded down to whole rows, the block count to at most one block per page, and <code>set_size</code> is <code>cache_pages</code> (all pages when <code>None</code>) divided across the blocks. The tag defaults to <code>clio_ml_py_&lt;n&gt;</code>. Ends with <code>Dataset.preload(X)</code>.</li>
+  <li><code>attach(tag, n_rows, n_cols, page_bytes=16384, nblocks=4, cache_pages=None, gpu_ids=(0,))</code>: a <code>Dataset</code> over pages that already exist under <code>tag</code>, or that the CAE will fault in, with no preload. <code>n_rows</code>, <code>n_cols</code> and <code>page_bytes</code> must match the geometry the pages were written with.</li>
+  <li><code>assimilate(src, columns, tag=None, cache_pages=None, stage_dir=None, on_fault=True, fill_value=None, page_bytes=16384, nblocks=4, gpu_ids=(0,))</code>: stages <code>columns</code> of the CSV or Parquet file <code>src</code> with <code>stage_table</code>, builds a <code>Dataset</code> with <code>attach</code>, and maps the staging file onto its tag through the CAE. Returns <code>(dataset, info)</code> where <code>info</code> is a dict with <code>tag</code>, <code>n_rows</code>, <code>n_cols</code>, <code>n_pages</code>, <code>staged_path</code> and <code>on_fault</code>. The tag defaults to <code>clio_ml_&lt;file stem&gt;_&lt;pid&gt;_&lt;n&gt;</code>. The staging file is <code>&lt;tag&gt;.f32</code> in <code>stage_dir</code>, else <code>$CLIO_ML_STAGE_DIR</code>, else the source file's directory. Raises <code>RuntimeError</code> when <code>has_cae</code> is false.</li>
+  <li><code>stage_table(src, columns, out_path, page_bytes, fill_value=None, batch_rows=65536)</code>: writes <code>columns</code> of <code>src</code> as a page-aligned, row-major float32 file with whole rows per page and a zero-padded last page. Returns <code>(n_rows, n_cols, page_bytes, n_pages)</code>, where <code>page_bytes</code> is the row-aligned size actually used. Needs no runtime. A Parquet source needs <code>pyarrow</code>. Empty <code>columns</code> or a file with no rows raise <code>ValueError</code>, an unknown column <code>KeyError</code>, a non-numeric column <code>TypeError</code>, and missing values <code>ValueError</code> unless <code>fill_value</code> is given.</li>
+</ul>
+
+<h3>Dataset class</h3>
+<p><code>Dataset(tag, gpu_ids, page_bytes, nblocks, set_size, n_samples, n_features)</code> binds the C++ constructor below. Read-only properties: <code>num_rows</code>, <code>num_features</code>, <code>num_pages</code>, <code>elems_per_page</code>, <code>num_blocks</code>, <code>page_bytes</code>. Method <code>preload(x)</code> writes a C-contiguous float32 array of exactly <code>num_rows * num_features</code> elements into the paged store; a different size raises <code>ValueError</code>.</p>
+
+<h3>Fitting</h3>
+<p><code>fit_&lt;name&gt;(X, **options)</code> exists for every name in <code>COLUMNS</code>. <code>X</code> is a 2-D array (in memory, no runtime) or a <code>Dataset</code> (paged). Options are keyword arguments; each is set on a fresh instance of the algorithm's native options class, so the defaults are the C++ defaults. An unknown name raises <code>TypeError</code>. A dict value fills a nested options object field by field, for example <code>fit_rf(X, num_trees=4, tree={"max_depth": 3})</code>. The mapping from name to native stem and options class:</p>
+<pre data-label="name → native stem, options class, trailing columns">
+kmeans  KMeans               KMeansOptions               0
+linreg  Glm (GlmKind.linear) GlmOptions                  1
+logreg  Glm (GlmKind.logistic) GlmOptions                1
+svm     Glm (GlmKind.svm)    GlmOptions                  1
+nb      NaiveBayes           NaiveBayesOptions           1
+pca     Pca                  PcaOptions                  0
+knn     KnnClassify          KnnOptions                  1
+tree    DecisionTree         DecisionTreeOptions         1
+rf      RandomForest         RandomForestOptions         1
+gbt     Gbt                  GbtOptions                  1
+gbtc    Gbt (logistic=True)  GbtOptions                  1
+als     Als                  AlsOptions                  fixed records
+gmm     Gmm                  GmmOptions                  1
+mlp     Mlp                  MlpOptions                  1
+bkm     BisectingKMeans      BisectingKMeansOptions      1
+fm      Fm                   FmOptions                   1
+pglm    PoissonGlm           PoissonGlmOptions           1
+lda     Lda                  LdaOptions                  0
+fim     FrequentItemsets     FrequentItemsetOptions      0   (Mine*)
+aft     Aft                  AftOptions                  2
+pic     Pic                  PicOptions                  fixed records
+w2v     Word2Vec             Word2VecOptions             fixed records
+enet    ElasticNet           ElasticNetOptions           1
+iso     Isotonic             IsotonicOptions             fixed records
+seq     SequentialPatterns   SequentialPatternOptions    0   (Mine*)
+mlr     MultinomialLogistic  MultinomialLogisticOptions  1
+</pre>
+<ul>
+  <li>For a <code>Dataset</code>, <code>fit_&lt;name&gt;</code> calls the native <code>Fit&lt;Stem&gt;(ds, ..., options)</code> (<code>Mine&lt;Stem&gt;</code> for fim and seq, <code>KnnClassify</code> for knn). For an array it calls <code>Fit&lt;Stem&gt;Plain(X.ravel(), n_rows, n_features, elems_per_page, nblocks, ..., options)</code> with a 16 KiB page holding whole rows and at most four blocks; the <code>n_features</code> argument is omitted for the fixed-record algorithms.</li>
+  <li>Extra arguments: <code>fit_kmeans(..., init_centroids=)</code> and <code>fit_gmm(..., init_means=)</code> default to the first <code>k</code> rows of an array (<code>k</code> defaults to 8 for kmeans and 2 for gmm when not given) and are required for a <code>Dataset</code>. <code>fit_knn(..., queries=)</code> is always required.</li>
+  <li>Results are the native <code>*Result</code> objects. Paged results carry <code>stats</code>, a <code>VecStats</code> with <code>faults</code>, <code>puts</code>, <code>evicts</code>, <code>get_errors</code> and <code>put_errors</code>.</li>
+</ul>
+
+<h3>Prediction</h3>
+<p><code>predict(name, result, x)</code> evaluates one feature row with a fitted result. <code>x</code> is converted to a contiguous float32 array (a float for iso). The dispatch:</p>
+<ul>
+  <li>linreg, logreg, svm: <code>GlmPredict(kind, result.weights, x)</code>.</li>
+  <li>pglm: <code>PoissonGlmPredict(result.coef, x)</code>.</li>
+  <li>iso: <code>IsotonicPredict(result.model, float(x))</code>.</li>
+  <li>nb, tree, rf, gbt, gbtc, gmm, mlp, bkm, fm: the algorithm's <code>*Predict(result.model, x)</code>.</li>
+  <li>mlr: <code>MultinomialLogisticPredict(result, x)</code>; aft: <code>AftPredictMedian(result, x)</code>.</li>
+  <li>Any other name raises <code>ValueError</code>.</li>
+</ul>
+
+<h3>Environment variables</h3>
+<ul>
+  <li><code>CLIO_ML_DLL_PATH</code> (Windows only): directories, separated by <code>;</code>, added with <code>os.add_dll_directory</code> before the extension is imported.</li>
+  <li><code>CLIO_ML_STAGE_DIR</code>: default directory for <code>assimilate</code> staging files when <code>stage_dir</code> is not given.</li>
+  <li><code>CLIO_SERVER_CONF</code>, <code>CLIO_BIND_ADDR</code>, <code>CLIO_SERVER_ADDR</code>: read by the runtime that <code>init()</code> starts. See the <a href="/docs/runtime/index.html">Context Runtime</a> docs. On Windows set both addresses to <code>127.0.0.1</code>.</li>
+</ul>
+
+<h2>C++</h2>
+<h3>clio_ml/dataset.h</h3>
+<pre data-label="cpp">
+namespace clio_ml {
+using u32 = clio::run::u32;
+using u64 = clio::run::u64;
+
+class Dataset {
+ public:
+  Dataset(const std::string &amp;tag_name, const std::vector&lt;int&gt; &amp;gpu_ids,
+          u64 page_bytes, u32 nblocks, u32 set_size, u64 n_samples,
+          u32 n_features,
+          clio::run::PoolId storage_pool_id = clio::run::PoolId::GetNull(),
+          u32 nsets = 0);   // GPU cache sets; 0 = one per block
+
+  u64 NumRows() const;
+  u32 NumFeatures() const;
+  u64 RowsPerPage() const;
+  u64 PageBytes() const;
+  u64 ElemsPerPage() const;
+  u64 NumElems() const;      // n_samples * n_features
+  u64 NumPages() const;
+  u32 NumBlocks() const;     // drivers must launch exactly this many blocks
+  u64 RowOffset(u64 r) const;
+
+  PagedVec &amp;Vec();           // cpu_vector::Vector&lt;float&gt; or gpu_vector::Vector&lt;float&gt;
+  clio::cte::gpu_vector::DeviceVector&lt;float&gt; GetDevice(int gpu_id);  // GPU builds only
+};
+}
+</pre>
+<ul>
+  <li>The constructor throws <code>std::invalid_argument</code> unless <code>page_bytes / sizeof(float)</code> is a positive multiple of <code>n_features</code>. Rows are never padded to a page boundary.</li>
+  <li>On the CPU backend (<code>CLIO_ML_CPU=1</code>) <code>gpu_ids</code> and <code>nsets</code> are ignored and the vector is a <code>cpu_vector</code> with the same geometry.</li>
+  <li><code>PagedVec</code> and <code>VecStats</code> (<code>PagedVec::Stats</code>) come from <code>clio_ml/backend.h</code>, which selects the vector namespace from <code>CLIO_ML_CPU</code>.</li>
+  <li>Load data with <code>ds.Vec().Preload(ptr, count)</code>, or with the assimilate path below.</li>
+</ul>
+
+<h3>clio_ml/assimilate.h</h3>
+<pre data-label="cpp">
+namespace clio_ml {
+inline bool HasCae();   // true when built with CLIO_ML_CAE
+
+inline void AssimilateFloat32File(const std::string &amp;tag,
+                                  const std::string &amp;path,
+                                  std::uint64_t num_pages,
+                                  std::uint64_t page_bytes,
+                                  bool on_fault);
+}
+</pre>
+<ul>
+  <li><code>tag</code> is the dataset's tag name without the <code>iowarp::</code> prefix; <code>path</code> is the local staged float32 file; <code>num_pages</code> and <code>page_bytes</code> are <code>Dataset::NumPages()</code> and <code>Dataset::PageBytes()</code>.</li>
+  <li>It submits one CAE <code>AssimilationCtx</code> with <code>src = "file::" + path</code>, <code>dst = "iowarp::" + tag</code>, <code>format = "binary"</code>, <code>range_size = num_pages * page_bytes</code>, <code>chunk_size = page_bytes</code> and an empty <code>blob_prefix</code>, so blob <code>i</code> holds file bytes <code>[i*page, (i+1)*page)</code>, named like the pager's pages.</li>
+  <li><code>on_fault = true</code> copies nothing up front and makes the CAE the tag's fault handler; the file is read for the life of the tag. <code>false</code> ingests every page now.</li>
+  <li>Throws <code>std::runtime_error</code> when the build has no CAE or the ingest task fails.</li>
+  <li>Construct the <code>Dataset</code> first (it creates the tag) and do not preload it.</li>
+</ul>
+
+<h3>Build-time macros</h3>
+<ul>
+  <li><code>CLIO_ML_CPU</code>: 1 on the CPU backend, 0 on CUDA and SYCL.</li>
+  <li><code>CLIO_ML_CAE</code>: 1 when the Python extension links the CAE client; defaults to 0.</li>
+  <li><code>CTP_ENABLE_SYCL</code>: set on the SYCL backend; the extension reports <code>backend = "sycl"</code> when it is defined and <code>CLIO_ML_CPU</code> is 0.</li>
+</ul>
+
+<h2>Where to go next</h2>
+<ul>
+  <li>Per-algorithm options, result fields and C++ signatures: the algorithm pages listed on the <a href="/docs/ml/index.html">overview</a>.</li>
+  <li><a href="/docs/ml/usage.html">Usage</a>: worked examples for each path.</li>
+</ul>

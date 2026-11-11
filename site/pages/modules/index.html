@@ -1,0 +1,71 @@
+<!--
+title: Module reference
+heading: The modules <em>you compose.</em>
+description: Reference for CLIO Core's most developed modules (ChiMods): block devices, erasure-coded arrays, the CTE core, cache, replication, compressor, indexer, assimilation and summarizer.
+eyebrow: Modules
+lede: Every CLIO Core product is a stack of modules. Each module runs as a pool inside the runtime, and you choose which pools exist, and in what order data flows through them, in the compose section of one YAML file.
+facts: Module type | ChiMod (runtime pool) ; Composed in | compose: section of the runtime YAML ; Chained by | next_pool_id ; Default chain | cae, cache, indexer, replication, CTE core
+-->
+<h2>How modules fit together</h2>
+<p>A module (a <em>ChiMod</em>) is a unit of code that the runtime hosts as a <strong>pool</strong>. A pool has a name, a numeric <code>pool_id</code>, and containers on the nodes it spans, and it executes its operations as tasks in the runtime's worker threads. Clients and other modules address a pool by its id.</p>
+<p>The data-path modules form an <strong>interposition chain</strong>. Each one is configured with a <code>next_pool_id</code>: it handles the operations it cares about (the cache serves reads it holds, the indexer records what is written, replication fans writes out to copies) and forwards everything else to the pool below. The CTE core sits at the bottom of the chain and places data on block devices. Because each interposer forwards what it does not handle, you can remove one from the chain, or insert another, without changing the modules around it. <a href="/design/chain.html">The interposition chain</a> covers the mechanism.</p>
+
+<h2>The default composition</h2>
+<p>The runtime's default configuration (<code>context-runtime/config/clio_default.yaml</code>) composes this stack, top to bottom. Requests enter at the top and travel down:</p>
+<ol class="tier-stack wide" aria-label="Default module chain">
+  <li><span class="tier-name">clio_cae_core</span><span class="tier-desc">Assimilation: imports external data into the store</span><span class="tier-type">400.0</span></li>
+  <li><span class="tier-name">clio_cte_cache</span><span class="tier-desc">Keeps hot copies on fast tiers; the chain top for writes and reads</span><span class="tier-type">563.0</span></li>
+  <li><span class="tier-name">clio_cte_indexer</span><span class="tier-desc">Indexes what is written for keyword and name search</span><span class="tier-type">564.0</span></li>
+  <li><span class="tier-name">clio_cte_replication</span><span class="tier-desc">Writes durable copies to persistent tiers</span><span class="tier-type">561.0</span></li>
+  <li><span class="tier-name">clio_cte_core</span><span class="tier-desc">Tags, blobs, scores and placement across targets</span><span class="tier-type">512.0</span></li>
+  <li><span class="tier-name">clio_bdev</span><span class="tier-desc">Block devices: RAM, files, cloud buckets</span><span class="tier-type">301.0</span></li>
+</ol>
+<p>The filesystem (<code>clio_cte_filesystem</code>) and the stream module (<code>clio_cte_stream</code>) also enter the data path at the cache. The compressor, when composed, sits between the indexer and replication. A trimmed version of the default YAML:</p>
+<pre data-label="yaml">
+compose:
+  - mod_name: clio_bdev
+    pool_name: "ram::chi_default_bdev"
+    pool_query: local
+    pool_id: "301.0"
+    bdev_type: ram
+  - mod_name: clio_cte_core
+    pool_name: cte_main
+    pool_query: local
+    pool_id: "512.0"
+    storage:
+      - path: "ram::cte_ram_tier1"
+        bdev_type: "ram"
+        score: 1.0
+      - path: "${CLIO_STORAGE_ROOT}/cte_disk_tier.dat"
+        bdev_type: "file"
+        capacity_limit: "10GB"
+        score: 0.2
+  - mod_name: clio_cte_replication
+    pool_name: clio_cte_replication
+    pool_query: local
+    pool_id: "561.0"
+    next_pool_id: "512.0"
+  - mod_name: clio_cte_indexer
+    pool_name: clio_cte_indexer
+    pool_query: local
+    pool_id: "564.0"
+    next_pool_id: "561.0"
+  - mod_name: clio_cte_cache
+    pool_name: clio_cte_cache
+    pool_query: local
+    pool_id: "563.0"
+    next_pool_id: "564.0"
+</pre>
+
+<h2>Module pages</h2>
+<div class="product-grid">
+  <a href="/modules/bdev.html"><span class="feature-index">Storage</span><h3>Block devices</h3><p>The bottom of every stack: RAM, files, asynchronous I/O and Amazon S3 or Google Cloud Storage buckets.</p></a>
+  <a href="/modules/safe-bdev.html"><span class="feature-index">Storage</span><h3>safe_bdev</h3><p>An erasure-coded block device built from other block devices, which grows in place and rebuilds failed members.</p></a>
+  <a href="/modules/cte-core.html"><span class="feature-index">Storage</span><h3>CTE core</h3><p>Tags, blobs and scores: the tiered key-value engine every other module sits on.</p></a>
+  <a href="/modules/cache.html"><span class="feature-index">Data path</span><h3>Cache</h3><p>Hot copies on fast tiers, kept consistent with the store below.</p></a>
+  <a href="/modules/replication.html"><span class="feature-index">Data path</span><h3>Replication</h3><p>Durable copies on persistent tiers, and recovery from them.</p></a>
+  <a href="/modules/compressor.html"><span class="feature-index">Data path</span><h3>Compressor</h3><p>Compresses blobs on the way down, with the codec chosen per workload.</p></a>
+  <a href="/modules/indexer.html"><span class="feature-index">Context</span><h3>Indexer</h3><p>Keyword (BM25) and name search over everything written.</p></a>
+  <a href="/modules/cae-core.html"><span class="feature-index">Context</span><h3>CAE core</h3><p>Imports files, HDF5 and cloud objects into the store.</p></a>
+  <a href="/modules/summarizer.html"><span class="feature-index">Context</span><h3>Summarizer</h3><p>Produces summaries of assimilated data for search and agents.</p></a>
+</div>

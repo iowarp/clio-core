@@ -1,0 +1,64 @@
+<!--
+title: bkm
+heading: <em>bkm:</em> bisecting k-means.
+description: API reference for clio-ml's bisecting k-means module (divisive hierarchical clustering): Python fit_bkm and predict, C++ FitBisectingKMeans and BisectingKMeansPredict, BisectingKMeansOptions and the heap-ordered model.
+eyebrow: Docs · Machine learning
+lede: Divisive hierarchical clustering, the equivalent of Spark MLlib's BisectingKMeans. The tree grows one level at a time: every leaf with at least <code>min_cluster_size</code> points is split by 2-means started from the parent centre plus and minus a deterministic perturbation.
+facts: Module | ml_bkm ; Header | clio_ml/bisecting_kmeans.h ; Rows | features, then one ignored column ; Limits | max_depth at most 6
+-->
+<h2>What it does</h2>
+<p>Each 2-means iteration is one paged pass for all splitting leaves together: rows are routed down the existing tree inside the kernel. The result has up to <code>2^max_depth</code> leaves and is bit-reproducible across paging, block counts and cluster nodes.</p>
+
+<h2>Rows</h2>
+<p><code>n_features</code> feature columns followed by one ignored column. <code>clio_ml.COLUMNS["bkm"]</code> is 1.</p>
+
+<h2>Python</h2>
+<pre data-label="python">
+import numpy as np, clio_ml as cm
+rng = np.random.default_rng(1)
+X = rng.normal(size=(4096, 7)).astype(np.float32)
+data = np.column_stack([X, np.zeros(4096)]).astype(np.float32)
+
+r = cm.fit_bkm(data, max_depth=2, inner_iters=10)
+m = r.model
+leaves = [i for i, s in enumerate(m.status) if s == 2]
+print(len(leaves), "leaves;", np.asarray(m.centers).reshape(m.maxN, m.nf)[leaves])
+print(cm.predict("bkm", r, data[0, :7]))     # leaf node id (heap index)
+</pre>
+<ul>
+  <li><code>fit_bkm(X, **options)</code>.</li>
+  <li>Options (<code>BisectingKMeansOptions</code>): <code>max_depth</code> (2), <code>inner_iters</code> (10), <code>min_cluster_size</code> (2), <code>perturb</code> (0.1), <code>seed</code> (1), <code>threads</code> (256).</li>
+  <li>Result <code>BisectingKMeansResult</code>: <code>model</code> and <code>stats</code>. <code>model</code> (<code>BisectingKMeansModel</code>): <code>nf</code>, <code>maxN</code> (heap slots), <code>centers</code> (maxN*nf in heap order), <code>status</code> (0 absent, 2 leaf, 3 split), <code>counts</code> (points per node).</li>
+  <li><code>predict("bkm", r, x)</code> returns the leaf node's heap index, not a dense cluster number.</li>
+</ul>
+
+<h2>C++</h2>
+<pre data-label="cpp">
+struct BisectingKMeansOptions {
+  u32 max_depth = 2;          // leaves <= 2^max_depth; <= 6
+  u32 inner_iters = 10;
+  u32 min_cluster_size = 2;
+  float perturb = 0.1f;
+  u32 seed = 1;
+  u32 threads = 256;
+  ClusterExchange cluster;
+};
+struct BisectingKMeansModel {
+  u32 nf = 0, maxN = 0;
+  std::vector<float> centers;  // maxN*nf, heap order
+  std::vector<int> status;     // 0 absent, 2 leaf, 3 split
+  std::vector<float> counts;
+  std::vector<float> Flatten() const;
+  u32 NumLeaves() const;
+};
+struct BisectingKMeansResult { BisectingKMeansModel model; VecStats stats; };
+BisectingKMeansResult FitBisectingKMeans(Dataset &ds, const BisectingKMeansOptions &opt);
+BisectingKMeansResult FitBisectingKMeansPlain(const float *data, u64 n_rows, u32 nf,
+                                              u64 elems_per_page, u32 nblocks,
+                                              const BisectingKMeansOptions &opt);
+BisectingKMeansResult FitBisectingKMeansReference(/* same arguments */);
+u32 BisectingKMeansPredict(const BisectingKMeansModel &m, const float *x);  // leaf node id
+</pre>
+<p>The ChiMod is module <code>ml_bkm</code>.</p>
+
+<p>Related: <a href="/docs/ml/kmeans.html">k-means</a>, <a href="/docs/ml/gmm.html">Gaussian mixture</a>, mean shift.</p>

@@ -1,0 +1,201 @@
+<!--
+title: Usage
+heading: Using the <em>Context Exploration Engine.</em>
+description: How to use the Context Exploration Engine from Python and C++: connecting to the runtime, bundling sources, the regex, keyword and temporal query modes, retrieving packed data, working with Context FS files, composing the runtime for search, and running the MCP server.
+eyebrow: Docs · Context Exploration Engine
+lede: This page is task-oriented. It starts with the two environment variables that matter, then walks through import, query, retrieve and delete in Python, with the C++ equivalents, and ends with the storage composition that search depends on. Exact signatures and defaults are on the API reference page.
+facts: Python | import clio_cee ; C++ | iowarp::ContextInterface ; Search pool | CLIO_CTE_POOL=563.0 or 564.0 ; Needs | A running runtime
+-->
+<h2>Connecting to the runtime</h2>
+<p>Constructing a <code>ContextInterface</code> does nothing. The first method call initializes the runtime client, then the CAE client, which initializes the CTE client. If the runtime is not running the call logs an error and returns a failure value: 1 for bundle and destroy, an empty list for query and retrieve. A failed initialization is remembered for the life of the process, so start the runtime before the first call.</p>
+<p>Two environment variables matter, and both are read when the client initializes, so set them before the first call. In Python, set them before the import to be safe.</p>
+<ul>
+  <li><code>CLIO_CTE_POOL</code> selects the CTE pool the client talks to, as <code>major.minor</code>. Keyword search is answered by the indexer module, so set it to <code>564.0</code> (the indexer) or <code>563.0</code> (the chain top, which forwards to the indexer). Without it the client binds to the bare core at 512.0 and semantic queries return nothing. Regex and temporal queries work either way.</li>
+  <li><code>CLIO_WITH_RUNTIME</code> is not needed. CEE initializes the client with the attach-only default. Setting it to <code>1</code> makes the process try to start a runtime itself and attach to the existing one if the port is taken.</li>
+</ul>
+<pre data-label="python">
+import os
+os.environ["CLIO_CTE_POOL"] = "563.0"
+
+import clio_cee as cee
+ctx = cee.ContextInterface()
+</pre>
+<p>On Windows, run the runtime and the client with <code>CLIO_BIND_ADDR=127.0.0.1</code> and <code>CLIO_SERVER_ADDR=127.0.0.1</code>. If the runtime reads a non-default configuration, point <code>CLIO_SERVER_CONF</code> at the same file in the client's environment.</p>
+
+<h2>Import data with a bundle</h2>
+<p><code>context_bundle</code> takes a list of <code>AssimilationCtx</code> and submits them as one <code>ParseOmni</code> task to the CAE pool at 400.0. It returns 0 on success or the task's result code; an empty list returns 0 with a warning. Transfers run in order inside the runtime.</p>
+<pre data-label="python">
+rc = ctx.context_bundle([
+    cee.AssimilationCtx(src="string::ice", dst="iowarp::climate_docs", format="binary",
+                        src_data="Arctic sea ice extent fell to a record low."),
+    cee.AssimilationCtx(src="string::co2", dst="iowarp::climate_docs", format="binary",
+                        src_data="Atmospheric CO2 passed 420 ppm."),
+    cee.AssimilationCtx(src="file::/data/run42/field.bin", dst="iowarp::run42",
+                        format="binary"),
+])
+assert rc == 0
+</pre>
+<ul>
+  <li>A <code>string::name</code> source stores <code>src_data</code> verbatim as one blob called <code>name</code>. Pass it through the constructor's <code>src_data</code> argument or set the attribute.</li>
+  <li>A <code>file::/path</code> source becomes blobs <code>chunk_0</code>, <code>chunk_1</code>, and so on, 1 MiB each. The path must be readable by the runtime process.</li>
+  <li><code>hdf5::</code>, <code>http(s)://</code>, <code>s3://</code>, <code>gs://</code> and <code>globus://</code> sources work when the runtime was built with their support. The binding does not expose the HDF5 dataset filters.</li>
+  <li><code>range_off</code> and <code>range_size</code> select a byte range; <code>src_token</code> is the HTTP bearer token or Globus token.</li>
+</ul>
+<p>The <a href="/docs/cae/usage.html">CAE usage page</a> describes every source scheme and the result codes a bundle can return.</p>
+
+<h2>Find blobs with a query</h2>
+<p><code>context_query(tag_re, blob_re, max_results=0, prompt="", time_begin=0, time_end=0)</code> returns a list of blob names. Both patterns are full-string regular expressions, so write <code>.*part.*</code> for a substring. The arguments pick one of three modes, checked in this order:</p>
+<ol class="steps">
+  <li><strong>Temporal.</strong> If <code>time_begin</code> or <code>time_end</code> is non-zero, the call is a CTE <code>TemporalSearch</code>: blobs whose last-modified time lies in the inclusive range, sorted ascending by time. 0 for either bound means no bound. <code>max_results</code> caps the list; 0 means unlimited.</li>
+  <li><strong>Semantic.</strong> Otherwise, if <code>prompt</code> is non-empty, the call is a CTE <code>SemanticSearch</code>: BM25 keyword scoring of the prompt against the contents of every indexed blob that matches both patterns, best first. <code>max_results</code> is the top-k; 0 falls back to 10.</li>
+  <li><strong>Regex.</strong> Otherwise the call is a CTE <code>BlobQuery</code> and returns every blob whose tag and blob names match. 0 means unlimited.</li>
+</ol>
+<pre data-label="python">
+ctx.context_query("climate_docs", ".*")                                   # ['ice', 'co2'] in some order
+ctx.context_query("climate_docs", ".*", max_results=1, prompt="sea ice")  # ['ice']
+ctx.context_query("run42", "chunk_.*", time_begin=t0)                     # chunks modified at or after t0
+</pre>
+<div class="callout warn">
+  <span class="callout-title">Temporal bounds are not wall-clock time yet</span>
+  <p>The docstrings say epoch nanoseconds, but the <a href="/docs/cte/python.html">CTE Python page</a> documents that <code>last_modified</code> currently comes from a steady clock. Use temporal mode to order blobs within one run of the runtime, not to filter by calendar time.</p>
+</div>
+<p>Keyword search is exact-token BM25 over the text the indexer saw. There is no embedding model. Binary blobs match nothing useful; scope them out with the indexer's <code>tag_re</code> and <code>blob_re</code> keys, described under <a href="#composing-storage-for-search">composing storage</a>.</p>
+
+<h2>Read data with retrieve</h2>
+<p><code>context_retrieve</code> resolves blobs with the same three modes, then reads their bytes. The result is a list with one <code>str</code> holding every retrieved blob, or an empty list when nothing matched or nothing could be read.</p>
+<pre data-label="python">
+packed = ctx.context_retrieve("climate_docs", "ice")                  # ['Arctic sea ice extent fell to a record low.']
+packed = ctx.context_retrieve("run42", "chunk_.*", max_context_size=64 * 1024 * 1024)
+best   = ctx.context_retrieve("climate_docs", ".*", max_results=3, prompt="carbon dioxide")
+</pre>
+<ul>
+  <li>The buffer is the blobs' bytes concatenated in the order the query returned them. There are no headers, lengths or separators. To split it, query the names first and read sizes with the CTE client, or give each blob a fixed size.</li>
+  <li><code>max_results</code> defaults to 1024 here, not 0. The same 0 rules apply as for query.</li>
+  <li><code>max_context_size</code>, default 256 MiB, is allocated up front as one shared-memory buffer. Retrieval stops at the first blob that would not fit; blobs already copied are returned. Size it to what you will read.</li>
+  <li>Blobs are fetched <code>batch_size</code> at a time (default 32) with <code>AsyncGetBlob</code>. Within a batch the tag lookup and size lookup are sequential.</li>
+  <li>A blob of size 0 is skipped. A <code>GetBlob</code> that fails logs a warning but its reserved bytes stay in the buffer.</li>
+  <li>Each blob's tag is resolved with <code>GetOrCreateTag</code>, so a tag name that no longer exists is created empty as a side effect.</li>
+  <li>nanobind returns the buffer as <code>str</code>. Bytes that are not valid UTF-8 may not survive the conversion; for binary data read through the CTE client instead.</li>
+</ul>
+
+<h2>Delete contexts</h2>
+<p><code>context_destroy(["climate_docs", "run42"])</code> calls CTE <code>DelTag</code> for each name and waits. It returns 0 when every delete succeeded and 1 if any failed; an empty list returns 0. Deleting a tag deletes its blobs and, when the indexer is in the chain, its index entries. <code>context_splice</code> is declared but not implemented: it logs a warning and returns 1 without touching the runtime.</p>
+
+<h2>The same calls in C++</h2>
+<pre data-label="cpp">
+#include &lt;clio_cee/api/context_interface.h&gt;
+
+iowarp::ContextInterface ctx;
+
+clio::cae::core::AssimilationCtx item;
+item.src = "file::/data/run42/output.bin";
+item.dst = "iowarp::run42";
+item.format = "binary";
+if (ctx.ContextBundle({item}) != 0) { /* runtime not reachable or import failed */ }
+
+auto names  = ctx.ContextQuery("run42", ".*");                            // regex listing
+auto ranked = ctx.ContextQuery("run42", ".*", 5, "temperature gradient");  // BM25, top 5
+auto packed = ctx.ContextRetrieve("run42", ".*", 1024, 64 * 1024 * 1024);  // one std::string
+ctx.ContextDestroy({"run42"});
+</pre>
+<p>Link with <code>find_package(clio_cee_api REQUIRED)</code> and <code>target_link_libraries(app PRIVATE clio::cee::api)</code>. In C++ the context has fields the Python binding lacks, including <code>include_patterns</code>, <code>exclude_patterns</code>, <code>on_fault</code>, <code>chunk_size</code> and <code>blob_prefix</code>.</p>
+
+<h2>How CEE sees Context FS</h2>
+<p><a href="/docs/context-fs/index.html">Context FS</a> stores files as CTE tags and blobs, so anything written through a mount is visible to CEE without an import step:</p>
+<ul>
+  <li>Each file is a tag named by its path inside the mount.</li>
+  <li>File data is split into 1 MiB pages, one blob per page, named by page index (<code>0</code>, <code>1</code>, ...). Each file also has a small attribute blob named <code>~i</code>.</li>
+  <li>The filesystem pool (560.0) writes through the chain top at 563.0, so pages pass the indexer and are keyword-searchable when they are text.</li>
+</ul>
+<p>So <code>ctx.context_query(".*notes/.*", "[0-9]+", prompt="sea ice")</code> ranks the pages of files under <code>notes/</code>. The blob pattern <code>[0-9]+</code> keeps the <code>~i</code> blob out. The limitation is that <code>context_query</code> returns blob names only, which for files are page numbers with no file name attached. When the file name matters use <code>clio_cte_core_ext</code> directly: its <code>BlobQuery</code> returns (tag name, blob name) pairs and its search results carry the tag id. The <a href="/tutorials/python-semantic-query.html">query files from Python</a> tutorial shows that path. <code>context_retrieve</code> does work on files and returns the matched pages concatenated.</p>
+
+<h2>Composing storage for search</h2>
+<p>CEE has no configuration of its own. What it can find and how fast it can read depends on the chain composed in the runtime's YAML. The default <code>context-runtime/config/clio_default.yaml</code> already composes a working layout; the points below are what to keep when writing your own.</p>
+<ul class="checks">
+  <li><strong>Keep the indexer in the chain</strong>, and route every writer through it. The default order is cache (563.0) to indexer (564.0) to replication (561.0) to core (512.0), with the optional compressor (562.0) between indexer and replication. The CAE core (400.0), the filesystem (560.0) and the stream pool (565.0) all set <code>next_pool_id: "563.0"</code>, so imports and files are indexed. A writer pointed at 512.0 bypasses the index. Scope the index with the indexer's <code>tag_re</code> and <code>blob_re</code> keys so binary data is not tokenized, and set <code>index_log_path</code> so the index survives a restart.</li>
+  <li><strong>Add the summarizer for content labels.</strong> <code>clio_cae_summarizer</code> at 401.0 runs a prompt over each put that matches a rule and stores the reply as a sibling blob <code>&lt;blob&gt;_label</code> in the same tag. Give it <code>next_pool_id: "563.0"</code> so the label passes through the indexer, then point the CAE core's <code>next_pool_id</code> at <code>"401.0"</code>. A BM25 prompt then matches the model's description as well as the raw text, and <code>blob_re=".*_label"</code> restricts a query to labels. The <a href="/docs/cae/usage.html#describing-content-in-the-i-o-path">CAE usage page</a> has the full block.</li>
+  <li><strong>Give retrieval a fast tier.</strong> <code>context_retrieve</code> is a <code>GetBlob</code> per blob. Blobs land on the highest-scoring tier with room, and the cache at the chain top keeps a node-local copy of blobs read from other nodes. Promote a working set with the CTE client's <code>ReorganizeBlob</code> before a large retrieve.</li>
+  <li><strong>Bound the result.</strong> <code>max_context_size</code> is allocated in shared memory in full, so size it to what you will read rather than leaving the 256 MiB default for small queries.</li>
+</ul>
+<p>Excerpt of a chain that satisfies all of the above; the core, replication and cache entries are as in the default file:</p>
+<pre data-label="yaml">
+compose:
+  - mod_name: clio_cte_core
+    pool_name: cte_main
+    pool_query: local
+    pool_id: "512.0"
+    # storage tiers as in the default file
+
+  - mod_name: clio_cte_replication
+    pool_name: clio_cte_replication
+    pool_query: local
+    pool_id: "561.0"
+    next_pool_id: "512.0"
+
+  - mod_name: clio_cte_indexer
+    pool_name: clio_cte_indexer
+    pool_query: local
+    pool_id: "564.0"
+    next_pool_id: "561.0"
+    index_log_path: "${CLIO_STORAGE_ROOT}/cte_indexer_index"
+    tag_re: ".*"
+    blob_re: ".*"
+
+  - mod_name: clio_cte_cache
+    pool_name: clio_cte_cache
+    pool_query: local
+    pool_id: "563.0"
+    next_pool_id: "564.0"
+
+  - mod_name: clio_cae_summarizer
+    pool_name: clio_cae_summarizer
+    pool_query: local
+    pool_id: "401.0"
+    next_pool_id: "563.0"
+    label_endpoint: "http://127.0.0.1:11434"
+    label_prompts:
+      summarize: "Summarize the following text in one short sentence."
+    label_matches:
+      - tag_re: ".*"
+        blob_re: ".*"
+        model: "gemma3:1b"
+        prompt: "summarize"
+
+  - mod_name: clio_cae_core
+    pool_name: cae_main
+    pool_query: local
+    pool_id: "400.0"
+    next_pool_id: "401.0"
+</pre>
+<p>Each entry must come after the pool its <code>next_pool_id</code> names. Clients then set <code>CLIO_CTE_POOL=563.0</code> or <code>564.0</code>. Module pages document each key: <a href="/modules/indexer.html">indexer</a>, <a href="/modules/cache.html">cache</a>, <a href="/modules/summarizer.html">summarizer</a>, <a href="/modules/cte-core.html">CTE core</a>.</p>
+
+<h2>Run the MCP server</h2>
+<p><code>context-exploration-engine/iowarp-cei-mcp/server.py</code> is a Model Context Protocol server built on FastMCP. Despite the directory name it wraps the CTE Python module <code>clio_cte_core_ext</code>, not <code>clio_cee</code>, and the runtime client runs inside the server process. It searches for the module in the build's <code>bin</code> directory, <code>CTE_PYTHON_PATH</code> and <code>PYTHONPATH</code>. Install its requirements as on the <a href="/docs/cee/install.html#mcp-server-requirements">install page</a>, then register it with a client:</p>
+<pre data-label="json · claude_desktop_config.json">
+{
+  "mcpServers": {
+    "iowarp-cte": {
+      "command": "python3",
+      "args": ["/full/path/to/context-exploration-engine/iowarp-cei-mcp/server.py"],
+      "env": {
+        "PYTHONPATH": "/path/to/build/bin",
+        "CLIO_SERVER_CONF": "/path/to/clio.yaml"
+      }
+    }
+  }
+}
+</pre>
+<p>Call <code>initialize_cte_runtime</code> first. With <code>CLIO_SERVER_CONF</code> set, it uses that configuration; without it, it writes a one-tier file-backed configuration under the temp directory on a free port between 9129 and 9199 and sets <code>CLIO_SERVER_CONF</code> to it. In both cases it calls <code>clio_init(RuntimeMode.kClient, True)</code>, which tries to start a runtime in the server process and attaches to an existing one if the port is already bound, then <code>initialize_cte</code>, then registers a 512 MB file target at pool 700.0. The README warns that the query tools crash the server if called before initialization. Every tool returns a JSON string. The <a href="/docs/cee/api.html#mcp-tools">tool list</a> is on the API page. <code>test_mcp_tools.py</code> exercises every tool over stdio.</p>
+
+<h2>Limits</h2>
+<ul>
+  <li><code>context_splice</code> is unimplemented.</li>
+  <li><code>context_query</code> returns blob names without tag names; use <code>clio_cte_core_ext.Client.BlobQuery</code> when the tag matters.</li>
+  <li>The retrieve buffer has no framing and is returned as a Python <code>str</code>.</li>
+  <li>Keyword search is exact-token BM25 over ASCII text; there is no embedding model. See the <a href="/modules/indexer.html">indexer page</a>.</li>
+  <li>The Python <code>AssimilationCtx</code> exposes nine fields; dataset filters and on-demand ingest are C++ only.</li>
+  <li>The MCP server exposes CTE operations, not the <code>clio_cee</code> methods, and has no semantic or temporal search tool.</li>
+</ul>
+
+<h2>Tests</h2>
+<p><code>context-exploration-engine/api/test</code> holds Catch2 tests for bundle, query (including the three modes in <code>test_context_query_modes.cc</code>) and destroy, plus the Python tests <code>test_context_interface.py</code>, <code>test_context_interface_enhanced.py</code> and <code>test_context_retrieve_roundtrip.py</code>. All need a running runtime; the directory's <code>clio_config.yaml</code> is the configuration they use. <code>api/demo/demo.py</code> is a self-contained walk through bundle, query, retrieve and destroy on a 1 MB temporary file.</p>

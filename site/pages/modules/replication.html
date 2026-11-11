@@ -1,0 +1,295 @@
+<!--
+title: Replication module
+heading: Replication: <em>durable copies.</em>
+description: The CTE replication module: replication factor, on-node persistent replicas, remote copies on successor nodes, synchronous versus asynchronous write-through, failover and hand-back, configuration and limits.
+eyebrow: Modules · Transfer engine
+lede: The replication module is the reliability layer of the CTE interposition chain. It decides which blobs get copies and where, while the CTE core only stores and addresses them. Point an ordinary core client at this pool and plain puts and gets gain write-through copies and replica-served reads without any new API.
+facts: Library | clio_cte_replication ; Default pool | 561.0 ; Build option | CLIO_CTE_ENABLE_REPLICATION (ON) ; Source | context-transfer-engine/replication
+-->
+<h2>What it does</h2>
+<p>The CTE core can keep several independent block lists for one blob: a
+primary plus numbered replicas, each placed by the same placement engine
+and persistence rules as the primary. That is pure mechanism. The
+replication module owns the policy: how many copies exist, which tiers
+and nodes hold them, when they are written, and which copy serves a read
+when the primary is gone.</p>
+<p>Use it when data cached in a volatile RAM tier must survive a restart,
+a dead device or a dead node. With the default settings it adds nothing
+beyond the core's own fsync-based durability. Raising the replication
+factor or the on-node replica count buys availability at the cost of
+disk footprint and write latency.</p>
+
+<h2>Where it sits</h2>
+<p>The module is an interposer: it speaks the CTE core's own task
+interface and forwards to the pool named by <code>next_pool_id</code>,
+normally the core at 512.0. The canonical chain in the default
+configuration is cache, then indexer, then optionally the compressor,
+then replication, then the core. Replication sits directly above the
+core so that the copies it writes are the stored form, compressed or not,
+and so that everything above it sees one logical blob.</p>
+<ul>
+  <li><strong>Interposed verbs</strong>: PutBlob, MultiPutBlob, GetBlob,
+  GetBlobSize, DelBlob, TruncateBlob and SyncTag are handled here. Every
+  other core method is forwarded untouched.</li>
+  <li><strong>Own verbs</strong>: ReplicateBlob and FlushTag are numbered
+  above the core's method space and are reached through the
+  replication client, which inherits the full core client API.</li>
+  <li><strong>Called by</strong>: whatever is above it in the chain (cache,
+  indexer, compressor, the filesystem module) or a core client pointed at
+  the replication pool.</li>
+  <li><strong>Calls</strong>: the core pool for primaries and replicas, and
+  its own pool on other nodes for remote copies.</li>
+</ul>
+<p>A client selects the pool by its id. Setting <code>CLIO_CTE_POOL=561.0</code>
+before client initialization makes a plain core client talk to the
+replication pool instead of the core.</p>
+
+<h2>Composing it</h2>
+<p>This is the entry shipped in the default configuration. Each compose
+entry must come after the entry its <code>next_pool_id</code> names.</p>
+<pre data-label="yaml">
+compose:
+  - mod_name: clio_cte_core
+    pool_name: cte_core
+    pool_query: local
+    pool_id: "512.0"
+    storage:
+      - path: "ram::cte_ram_tier1"
+        bdev_type: ram
+        capacity_limit: 64MB
+        score: 1.0
+      - path: /mnt/nvme/clio/cte_disk.dat
+        bdev_type: file
+        capacity_limit: 64MB
+        score: 0.2
+    targets:
+      neighborhood: 1
+      # failover_to_successor: true
+
+  - mod_name: clio_cte_replication
+    pool_name: clio_cte_replication
+    pool_query: local
+    pool_id: "561.0"
+    next_pool_id: "512.0"
+    replication_factor: 1
+    cache_score: 1.0
+    replica_score: 0.2
+    # remote_copies: 1
+    # num_replicas: 1
+    # replicate_period_ms: 50
+    # handoff_log_path: "/var/lib/clio/cte_handoff_log"
+</pre>
+<p>Cross-node availability needs two keys in two places: the module's
+<code>replication_factor</code> (or <code>remote_copies</code>) creates the
+copies, and the core's <code>failover_to_successor</code> under
+<code>targets</code> routes operations on a dead owner's blobs to the node
+that holds them. Without the second key those operations fail until the
+owner returns.</p>
+
+<h2>Configuration</h2>
+<dl class="notes">
+  <dt>replication_factor</dt>
+  <dd>Total durable copies of every blob. Default 1: the blob's own copy,
+  made durable by fsync and the periodic data flush. N greater than 1 adds
+  N-1 copies on the next containers by hash, on other nodes. Values below
+  1 are raised to 1. Setting it also resets <code>remote_copies</code> to
+  N-1 and <code>num_replicas</code> to 0 unless those are given
+  explicitly.</dd>
+  <dt>remote_copies</dt>
+  <dd>Copies kept on successor containers. Default: replication_factor
+  minus 1. Written before a put returns.</dd>
+  <dt>num_replicas</dt>
+  <dd>Extra persistent copies on the owner's own node, pinned
+  (REPLICA_FIXED) and banned from volatile tiers (REPLICA_PERSISTENT).
+  Default 0. They protect against losing a device, not a node, and each
+  one adds a full copy to the disk footprint. The default configuration
+  advises leaving it 0 over a safe-bdev array.</dd>
+  <dt>replicate_period_ms</dt>
+  <dd>Period of the sweep that writes on-node replicas asynchronously.
+  Default 50. 0 makes the write-through synchronous. Only affects
+  <code>num_replicas</code>; remote copies are always written before the
+  ack.</dd>
+  <dt>cache_score</dt>
+  <dd>Score given to the primary when it is re-created from a replica
+  after a drop. Default 1.0, so the placement engine puts the fast copy
+  back on the fast tier.</dd>
+  <dt>replica_score</dt>
+  <dd>Score stamped on persistent replicas and remote copies. Default
+  0.2. It is also the organizer's drop threshold for the primary: when the
+  primary's score falls below the best persistent replica's, the primary
+  is dropped rather than migrated.</dd>
+  <dt>handoff_log_path</dt>
+  <dd>Base path of a per-container log of changes made on behalf of a
+  dead owner, suffixed with the container id. Default empty: in memory
+  only, so a restart of the stand-in before the owner returns loses the
+  hand-back list.</dd>
+</dl>
+<p>Configuration parsing is best-effort. A malformed value leaves the
+remaining keys at their defaults without an error.</p>
+
+<h2>Operations</h2>
+<h3>Interposed writes</h3>
+<ol class="steps">
+  <li>A put whose context already names a replica index passes straight
+  to the core. The caller is driving the mechanism directly.</li>
+  <li>The module hashes the blob to its owner container. If this
+  container is the owner, it first waits for any pending hand-back after
+  a restart, then takes the blob's write token.</li>
+  <li>If the write starts past the primary's current end but a replica
+  holds those earlier bytes, the replica is copied back into the primary
+  first. Otherwise the write would regrow the primary over the gap with
+  empty blocks that would shadow the intact replica and read as
+  zeros.</li>
+  <li>The primary is written first, verbatim. The RAM copy must never
+  serve stale bytes, so durability lagging behind is reported as an error
+  while a stale cache never is.</li>
+  <li>On-node replicas are either marked dirty for the sweep
+  (asynchronous, the default) or written one by one before the ack
+  (synchronous). Each replica put carries the fixed and persistent flags,
+  a minimum persistence level of at least 1 and the configured replica
+  score.</li>
+  <li>With remote copies, each written range is mirrored to the successor
+  containers' replication pools before the put returns.</li>
+</ol>
+<p>Batched puts from the deferred write pipeline go through the same
+write-through. Letting them bypass it would silently strip durability
+from every asynchronous caller.</p>
+
+<h3>Interposed reads</h3>
+<ol class="steps">
+  <li>After a restart, the first size probe or read of an owned blob
+  compares the primary with its remote copy and heals the primary if the
+  copy holds more. A copy is written through before the ack, while the
+  core's write-ahead log may not have reached disk before a kill.</li>
+  <li>If the primary covers the requested range, the read is forwarded
+  to the core. An I/O error on the primary with copies configured falls
+  through to the next step instead of failing.</li>
+  <li>Otherwise the first on-node replica that covers the range serves
+  the read, then the whole replica is copied back into the primary in
+  bounded chunks so later reads hit RAM again. An interrupted copy leaves
+  a valid prefix. This re-cache is best-effort and never fails the read
+  that triggered it.</li>
+  <li>If no local copy can serve, and the owner's device is down or a
+  restart dropped its RAM blocks, the read is served from the first live
+  successor's remote copy, and the primary is healed from it under the
+  write token.</li>
+</ol>
+<p>GetBlobSize reports the logical size, so a dropped primary answers with
+its best replica's size and size-then-read callers still reach the
+replica-serving read.</p>
+
+<h3>Explicit verbs</h3>
+<ul>
+  <li><strong>ReplicateBlob</strong> brings one replica of one blob up to
+  date with the primary, copying in chunks so a large blob never needs a
+  blob-sized bounce buffer. The context carries placement for the replica
+  blocks; a minimum persistence level is the usual reason to call it, so a
+  RAM-cached primary gains a persistent copy without being demoted.</li>
+  <li><strong>FlushTag</strong> runs ReplicateBlob for every blob in a tag
+  whose score is at least a threshold (0 means all), returning the number
+  of blobs and bytes copied.</li>
+  <li><strong>SyncTag</strong> (fsync from the filesystem layer) first
+  writes every pending replica of the tag on this container, then runs
+  the core's sync. When every replica is current the core is told so and
+  does not also move primaries that already have a durable replica.</li>
+  <li><strong>Monitor</strong> answers the query
+  <code>replicate_period_ms</code>, which the FUSE adapter reads once at
+  mount time to decide whether fsync needs an extra flush barrier.</li>
+</ul>
+<pre data-label="cpp">
+clio::cte::replication::Client repl(kReplicationPoolId, core_pool_id);
+clio::cte::core::Context ctx;
+ctx.min_persistence_level_ = 1;
+auto fut = repl.AsyncFlushTag(tag_id, /*replica=*/1, /*min_score=*/0.0f, ctx);
+fut.Wait();
+</pre>
+
+<h2>Failure and recovery</h2>
+<h3>Node loss with remote copies</h3>
+<p>When a blob's owner node is dead and the core's failover is on, its
+operations are routed to the first live successor. That container holds
+the remote copy and serves reads and writes against it. Every change it
+applies for the dead owner is recorded as a hand-off entry, and every
+node's cached copy of the blob is invalidated, because the stand-in does
+not know who holds copies. A record of a batched write that was forwarded
+to an owner that died mid-flight is resent up to ten times, one second
+apart, which gives the cluster time to mark the node dead and re-route to
+the successor.</p>
+<p>Even with a replication factor of 1 a stand-in records what it wrote.
+In that case it holds the only copy of data written during the outage,
+and the owner would return without it otherwise.</p>
+
+<h3>Hand-back when the owner returns</h3>
+<ul>
+  <li>A restarted owner's create asks every live peer to push back the
+  changes it made for it. It waits up to five seconds for the answers so
+  that composing the node never hangs on one peer, then returns and lets a
+  periodic sweep settle the rest.</li>
+  <li>Until the hand-back has completed, or two minutes have passed,
+  client writes to blobs this node owns wait. A write accepted earlier was
+  overwritten by the stand-in's older copy.</li>
+  <li>Each hand-off entry carries the wall time of the stand-in's change.
+  A push older than a write the owner has taken itself since returning
+  (a partition that healed without a restart) is dropped as stale.</li>
+  <li>A sweep every 500 ms pushes entries to owners that are alive again
+  and re-mirrors copies that missed a write because their holder was
+  down.</li>
+  <li>The hand-off log, when configured, is rewritten as a snapshot once
+  it passes 4 MiB.</li>
+</ul>
+
+<h3>Device loss and restarts without node loss</h3>
+<p>On-node replicas cover a primary whose blocks cannot be read or whose
+RAM tier was emptied by a restart. The read path above heals the primary
+from them. The organizer may also drop a cold primary deliberately once
+its score sinks below the replica score, and the next read restores
+it.</p>
+
+<h2>Consistency and concurrency</h2>
+<ul>
+  <li>One write token per blob serializes the refill of a dropped primary,
+  the primary put, the replica puts and a read's re-cache. Tokens for a
+  batch are taken all at once, so two batches with overlapping blobs
+  cannot deadlock.</li>
+  <li>Asynchronous write-through coalesces rapid overwrites: the pending
+  set is keyed by blob, and the sweep copies the primary's bytes as they
+  are when it runs. A put racing the sweep re-inserts the key and is
+  caught next period. SyncTag waits for any sweep that took entries out
+  of the set before declaring the tag current.</li>
+  <li>Explicit replica addressing in a context bypasses the module's
+  policy entirely, on both reads and writes.</li>
+</ul>
+
+<h2>Limits</h2>
+<ul>
+  <li>Remote copies go to the next containers by hash. Rack or
+  failure-domain aware placement does not exist.</li>
+  <li>Asynchronous mode acknowledges a put after the primary write. A
+  crash inside the sweep period loses the un-swept replica updates unless
+  fsync forced them. Remote copies are not affected: they are written
+  before the ack.</li>
+  <li>Node-level failover depends on the core's conservative failure
+  detector. Operations on a dead owner's blobs fail until the node is
+  marked dead, which takes about 30 seconds.</li>
+  <li>Without <code>handoff_log_path</code>, a stand-in that restarts
+  before the owner returns forgets what it must hand back.</li>
+  <li>Re-caching a primary from a replica and populating node-local copies
+  are best-effort. A failed chunk leaves a prefix or abandons the copy and
+  does not fail the read.</li>
+</ul>
+
+<h2>How it is tested</h2>
+<ul>
+  <li><code>context-transfer-engine/test/unit</code>: test_blob_replicas
+  (core replica mechanism plus the module's policy verbs),
+  test_interposer_stack (compressor over replication over core, drop and
+  heal end to end) and test_cache_stack (cache, compressor, replication,
+  core).</li>
+  <li><code>context-transfer-engine/test/integration/replication_persist</code>:
+  50 blobs written with a RAM primary and a disk replica, runtime
+  rebooted, disk replicas verified while the RAM primaries are gone. No
+  Docker needed.</li>
+  <li><code>context-transfer-engine/test/integration/coherence</code>: a
+  four-node Docker suite for cache coherence over replication, enabled
+  with the Docker CI option.</li>
+</ul>

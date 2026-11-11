@@ -1,0 +1,140 @@
+<!--
+title: Machine learning
+heading: Machine learning, <em>out of core.</em>
+description: clio-ml trains MLlib-equivalent models on GPU-paged data, so datasets larger than GPU memory train on one GPU tile per node. Measured against Spark MLlib, Intel oneDAL and Dask-ML on Aurora.
+eyebrow: Technologies · Compute
+lede: clio-ml is a library of classic machine-learning algorithms (the Spark MLlib set) written over CLIO Core's paged vectors. A dataset larger than GPU memory trains without hand-sizing anything; its pages stream from host memory, NVMe or DAOS through a GPU cache.
+facts: Algorithms | 30+ modules; 13 benchmarked below ; Backends | CPU, CUDA, SYCL ; Data | Any CTE tier, including DAOS ; Compared with | Spark MLlib, oneDAL, Dask-ML
+-->
+<h2>Key takeaways</h2>
+<ul class="checks">
+  <li>clio-ml: the Spark MLlib algorithm set, over 30 modules, on CPU, CUDA and SYCL.</li>
+  <li>Trains out of core: data larger than GPU memory streams from the tiers you compose.</li>
+  <li>Measured 8-59x faster per iteration than Spark MLlib.</li>
+</ul>
+
+<ul class="headline-stats">
+  <li><strong>8-59x</strong><span>faster per iteration than Spark MLlib, 1-16 nodes</span></li>
+  <li><strong>flat</strong><span>time per iteration from 1 to 16 nodes (weak scaling)</span></li>
+  <li><strong>9 of 10</strong><span>more algorithms faster than Spark, 1.1-32x</span></li>
+  <li><strong>4-6x</strong><span>less memory than Spark on 61 GB of data</span></li>
+</ul>
+
+<h2>What it is</h2>
+<p>clio-ml has more than thirty algorithm modules: the MLlib set (k-means, linear, logistic and multinomial regression, linear SVM, naive Bayes, PCA, decision trees, random forests, gradient-boosted trees, Gaussian mixtures, bisecting k-means, ALS, LDA, word2vec, k-nearest neighbors and more) plus neural models (MLP, CNN, LSTM, GNN) and a PyTorch integration. The thirteen benchmarked on this page are the classic algorithms. Each algorithm is a CLIO Core module built on three shared paged engines (k-means, generalized linear models, and a generic pass over the data) with CPU, CUDA and SYCL kernels. Training data lives in a <code>gpu_vector</code>: the GPU keeps a page cache of a size you choose, and the rest of the data stays on whatever tiers the runtime composes, from host RAM to a DAOS container.</p>
+
+<h2>Against Spark MLlib, oneDAL and Dask-ML</h2>
+<p>Setup: Aurora. clio-ml uses <strong>one Intel GPU tile per node</strong> (of 12). Spark 3.5.6 MLlib uses <strong>all CPU cores of the node</strong> (2x Sapphire Rapids, 208 hardware threads, 1 TB). All systems train on bit-identical generated rows, 10M rows per node, 10 iterations, median of 2 timed repetitions. Milliseconds per iteration, lower is better:</p>
+<div class="chart-grid">
+  <figure><figcaption>k-means, 1 node</figcaption>
+<ul class="bars" aria-label="k-means, 1 node">
+  <li class="ours"><span>clio-ml</span><span class="bar"><i style="width:12%"></i></span><span class="val">67.7</span></li>
+  <li><span>Spark MLlib</span><span class="bar"><i style="width:100%"></i></span><span class="val">558.6</span></li>
+  <li><span>oneDAL (1 tile)</span><span class="bar"><i style="width:41%"></i></span><span class="val">230.0</span></li>
+  <li><span>Dask-ML</span><span class="bar"><i style="width:71%"></i></span><span class="val">396.7</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>k-means, 16 nodes</figcaption>
+<ul class="bars" aria-label="k-means, 16 nodes">
+  <li class="ours"><span>clio-ml</span><span class="bar"><i style="width:4%"></i></span><span class="val">73.7</span></li>
+  <li><span>Spark MLlib</span><span class="bar"><i style="width:100%"></i></span><span class="val">2,031.0</span></li>
+  <li><span>oneDAL (1 tile)</span><span class="bar"><i style="width:12%"></i></span><span class="val">234.0</span></li>
+  <li><span>Dask-ML</span><span class="bar"><i style="width:76%"></i></span><span class="val">1,547.0</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>Linear regression, 1 node</figcaption>
+<ul class="bars" aria-label="Linear regression, 1 node">
+  <li class="ours"><span>clio-ml</span><span class="bar"><i style="width:4%"></i></span><span class="val">31.3</span></li>
+  <li><span>Spark MLlib</span><span class="bar"><i style="width:85%"></i></span><span class="val">683.5</span></li>
+  <li><span>Dask-ML</span><span class="bar"><i style="width:100%"></i></span><span class="val">801.4</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>Linear regression, 16 nodes</figcaption>
+<ul class="bars" aria-label="Linear regression, 16 nodes">
+  <li class="ours"><span>clio-ml</span><span class="bar"><i style="width:2%"></i></span><span class="val">35.2</span></li>
+  <li><span>Spark MLlib</span><span class="bar"><i style="width:100%"></i></span><span class="val">2,082.2</span></li>
+  <li><span>Dask-ML</span><span class="bar"><i style="width:22%"></i></span><span class="val">462.7</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>Logistic regression, 1 node</figcaption>
+<ul class="bars" aria-label="Logistic regression, 1 node">
+  <li class="ours"><span>clio-ml</span><span class="bar"><i style="width:5%"></i></span><span class="val">32.0</span></li>
+  <li><span>Spark MLlib</span><span class="bar"><i style="width:44%"></i></span><span class="val">278.0</span></li>
+  <li><span>oneDAL (1 tile)</span><span class="bar"><i style="width:27%"></i></span><span class="val">170.8</span></li>
+  <li><span>Dask-ML</span><span class="bar"><i style="width:100%"></i></span><span class="val">638.4</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>Logistic regression, 16 nodes</figcaption>
+<ul class="bars" aria-label="Logistic regression, 16 nodes">
+  <li class="ours"><span>clio-ml</span><span class="bar"><i style="width:3%"></i></span><span class="val">37.8</span></li>
+  <li><span>Spark MLlib</span><span class="bar"><i style="width:93%"></i></span><span class="val">1,153.3</span></li>
+  <li><span>oneDAL (1 tile)</span><span class="bar"><i style="width:20%"></i></span><span class="val">245.9</span></li>
+  <li><span>Dask-ML</span><span class="bar"><i style="width:100%"></i></span><span class="val">1,245.6</span></li>
+</ul>
+  </figure>
+</div>
+<p class="bars-caption">Milliseconds per iteration, lower is better. oneDAL solves linear regression in closed form, so it has no per-iteration time there. clio-ml's time stays flat from 1 to 16 nodes while Spark's grows 3.6x; tuning Spark's executor layout does not change that. 8-node results are in the benchmark notes.</p>
+
+<p>Speedup per iteration over Spark MLlib, higher is better:</p>
+<ul class="bars" aria-label="Speedup per iteration over Spark MLlib">
+  <li class="ours"><span>linreg, 16 nodes</span><span class="bar"><i style="width:100%"></i></span><span class="val">59.1x</span></li>
+  <li class="ours"><span>linreg, 8 nodes</span><span class="bar"><i style="width:66%"></i></span><span class="val">39.1x</span></li>
+  <li class="ours"><span>logreg, 16 nodes</span><span class="bar"><i style="width:52%"></i></span><span class="val">30.5x</span></li>
+  <li class="ours"><span>k-means, 16 nodes</span><span class="bar"><i style="width:47%"></i></span><span class="val">27.6x</span></li>
+  <li class="ours"><span>logreg, 1 node</span><span class="bar"><i style="width:15%"></i></span><span class="val">8.7x</span></li>
+  <li class="ours"><span>k-means, 1 node</span><span class="bar"><i style="width:14%"></i></span><span class="val">8.3x</span></li>
+</ul>
+<h3>Read these before quoting a speedup</h3>
+<ul>
+  <li><strong>An iteration is not the same progress everywhere.</strong> clio-ml's linear and logistic regression use batch gradient descent; MLlib uses L-BFGS. To the same linear model on one node, clio-ml takes 30 iterations in 0.94 s and Spark 6.8 s: 7.3x, not 21.8x.</li>
+  <li><strong>For logistic regression, the others reach a good model first.</strong> Spark (L-BFGS) and oneDAL (newton-cg) reach a lower log-loss in fewer iterations than clio-ml's current optimizer. A second-order solver for the binary GLMs is the open gap.</li>
+  <li><strong>oneDAL is the strongest baseline.</strong> Its k-means does the same work (identical final cost) at 3.2-3.4x clio-ml's time per iteration, and its closed-form linear regression beats clio-ml to the model.</li>
+  <li>clio-ml uses one of a node's twelve GPU tiles; Spark and Dask use the whole CPU side.</li>
+</ul>
+
+<h2>More algorithms, one node</h2>
+<p>Whole-fit times, 10M rows in memory, same data on both sides, against Spark MLlib. Where both systems report the same metric, accuracies agree to about three digits.</p>
+<ul class="bars" aria-label="clio-ml whole-fit speedup over Spark MLlib, one node">
+  <li class="ours"><span>Bisecting k-means</span><span class="bar"><i style="width:100%"></i></span><span class="val">31.7x</span></li>
+  <li class="ours"><span>Linear SVM</span><span class="bar"><i style="width:48%"></i></span><span class="val">15.1x</span></li>
+  <li class="ours"><span>Naive Bayes</span><span class="bar"><i style="width:39%"></i></span><span class="val">12.3x</span></li>
+  <li class="ours"><span>Multinomial logistic</span><span class="bar"><i style="width:11%"></i></span><span class="val">3.5x</span></li>
+  <li class="ours"><span>Gaussian mixture</span><span class="bar"><i style="width:10%"></i></span><span class="val">3.3x</span></li>
+  <li class="ours"><span>PCA</span><span class="bar"><i style="width:9%"></i></span><span class="val">2.8x</span></li>
+  <li class="ours"><span>MLP</span><span class="bar"><i style="width:8%"></i></span><span class="val">2.5x</span></li>
+  <li class="ours"><span>Gradient-boosted trees</span><span class="bar"><i style="width:6%"></i></span><span class="val">1.8x</span></li>
+  <li class="ours"><span>Decision tree</span><span class="bar"><i style="width:3%"></i></span><span class="val">1.1x</span></li>
+  <li class="ours"><span>Random forest</span><span class="bar"><i style="width:1%"></i></span><span class="val">0.2x</span></li>
+</ul>
+<p class="bars-caption">Whole-fit speedup over Spark MLlib, 10M rows on one node, higher is better (1.0x = Spark).</p>
+<figure class="figure"><img src="/assets/figures/clio-ml-algos-10m.png" alt="Bar chart of whole-fit time per algorithm for clio-ml, Spark MLlib and Dask-ML on 10M rows" loading="lazy"><figcaption>Fit time per algorithm, 10M rows, one Aurora node.</figcaption></figure>
+<p>Random forest is slower because clio-ml currently fits its trees one after another; Spark grows all trees together level by level.</p>
+
+<h2>Out of core: 61 GB on one node</h2>
+<p>500M rows (61 GB) on one node, with clio-ml's GPU cache capped well below the data size; evicted pages go to a host-DRAM tier. Spark and Dask hold the whole dataset in host memory.</p>
+<div class="chart-grid">
+  <figure><figcaption>k-means seconds per iteration, 500M rows (lower is better)</figcaption>
+<ul class="bars" aria-label="k-means seconds per iteration, 500M rows (lower is better)">
+  <li class="ours"><span>clio-ml, 4 GB cache</span><span class="bar"><i style="width:29%"></i></span><span class="val">5.05</span></li>
+  <li class="ours"><span>clio-ml from DAOS</span><span class="bar"><i style="width:33%"></i></span><span class="val">5.58</span></li>
+  <li><span>Dask-ML</span><span class="bar"><i style="width:41%"></i></span><span class="val">7.10</span></li>
+  <li><span>Spark MLlib</span><span class="bar"><i style="width:100%"></i></span><span class="val">17.13</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>Total memory for 61 GB of data, GB (lower is better)</figcaption>
+<ul class="bars" aria-label="Total memory">
+  <li class="ours"><span>clio-ml</span><span class="bar"><i style="width:21%"></i></span><span class="val">68.9</span></li>
+  <li><span>Dask-ML</span><span class="bar"><i style="width:60%"></i></span><span class="val">198.6</span></li>
+  <li><span>Spark MLlib</span><span class="bar"><i style="width:100%"></i></span><span class="val">332.6</span></li>
+</ul>
+  </figure>
+</div>
+<figure class="figure"><img src="/assets/figures/clio-ml-memory-vs-perf.png" alt="Total memory against seconds per iteration for clio-ml, Spark and Dask on 500M rows" loading="lazy"><figcaption>Memory used against time per iteration, 500M rows (61 GB) on one node. Lower left is better.</figcaption></figure>
+<p>clio-ml used 69-112 GB in total across cache sizes; Dask about 200 GB and Spark 333-455 GB for the same data. Dask's linear regression was ahead of clio-ml out of core (2.67 vs 4.34 s per iteration). These are single runs.</p>
+
+
+<h2>Where to go next</h2>
+<ul>
+  <li><a href="/technologies/memory-expansion.html">Memory expansion: the paged vectors underneath</a></li>
+  <li><a href="/technologies/context-transfer-engine.html">Context Transfer Engine</a></li>
+</ul>

@@ -1,0 +1,97 @@
+<!--
+title: Install
+heading: Install <em>memory expansion.</em>
+description: How to get the cpu_vector and gpu_vector paged vectors: the CMake options for CUDA, ROCm and SYCL builds, the clang requirement for gpu_vector, the headers and targets to link against, and what the pip wheel does and does not include.
+eyebrow: Docs · Memory expansion
+lede: <code>cpu_vector</code> is header-only and part of every CLIO Core build. <code>gpu_vector</code> is header-only too, but its device verbs are C++20 coroutines, so it is only built when the GPU toolchain can compile them. Both are C++; there is no Python binding of the vectors in the wheel.
+facts: cpu_vector | every build ; gpu_vector CUDA | CLIO_CORE_ENABLE_CUDA=ON CLIO_GPU_CLANG=ON ; gpu_vector SYCL | CLIO_CORE_ENABLE_SYCL=ON ; Headers | include/clio_cte/{cpu_vector,gpu_vector}/
+-->
+<h2>What each install contains</h2>
+<ul>
+  <li><strong>pip.</strong> <code>pip install iowarp-core</code> builds a CPU-only runtime with no C++ headers, so neither vector is usable from it. The GPU wheel variants (<code>iowarp-core-cuda12</code>, <code>iowarp-core-rocm6</code>, <code>iowarp-core-sycl</code>) install the same Python package with GPU support in the runtime; they ship no headers either, and the CUDA variant is compiled with nvcc, which does not build <code>gpu_vector</code>. For paged data from Python use <a href="/docs/ml/index.html">clio-ml</a>, whose datasets are paged vectors underneath.</li>
+  <li><strong>conda, Spack, packages.</strong> These install the C++ libraries and headers from a CPU build, so <code>cpu_vector</code> is available and <code>gpu_vector</code> is not.</li>
+  <li><strong>Source.</strong> Needed for <code>gpu_vector</code>. See below.</li>
+</ul>
+
+<h2>Build from source</h2>
+<p>Follow the <a href="/docs/installation.html">general install page</a> for the platform prerequisites, then configure with the GPU options. The adapter CMake file builds <code>gpu_vector</code> when one of these holds:</p>
+<ul>
+  <li><code>CLIO_CORE_ENABLE_CUDA=ON</code> together with <code>CLIO_GPU_CLANG=ON</code>. nvcc cannot compile device coroutines, so clang must be the CUDA compiler. Without the clang flag the configure step prints that <code>gpu_vector</code> is disabled and builds nothing for it.</li>
+  <li><code>CLIO_CORE_ENABLE_SYCL=ON</code> with the oneAPI compiler (<code>icpx -fsycl</code>). The SYCL device compiler is clang-based, so no extra flag is needed.</li>
+  <li><code>CLIO_CORE_ENABLE_ROCM=ON</code> on AMD (HIP platform not <code>nvidia</code>). The headers are reachable, but every test and benchmark under the adapter guards on CUDA or SYCL, so a ROCm build produces no <code>gpu_vector</code> workload yet.</li>
+</ul>
+<div class="tabs" data-label="GPU toolchain">
+  <section class="tab-panel" data-tab="CUDA (clang)"><p class="tab-title">CUDA with clang</p>
+<pre data-label="shell">
+$ git clone --recurse-submodules https://github.com/iowarp/clio-core.git
+$ cd clio-core
+$ cmake -S . -B build-gv -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCLIO_CORE_ENABLE_CUDA=ON -DCLIO_GPU_CLANG=ON \
+    -DCLIO_CORE_ENABLE_TESTS=ON
+$ cmake --build build-gv -j"$(nproc)"
+$ ctest --test-dir build-gv -L gpu_vector --output-on-failure
+</pre>
+  <p>The <code>cuda-release</code> preset in <code>CMakePresets.json</code> enables CUDA; add <code>-DCLIO_GPU_CLANG=ON</code> to it, or configure by hand as above. Tests are registered under the labels <code>cte</code>, <code>gpu</code> and <code>gpu_vector</code>.</p></section>
+  <section class="tab-panel" data-tab="SYCL"><p class="tab-title">SYCL (Intel GPUs)</p>
+<pre data-label="shell">
+$ cmake -S . -B build-sycl -G Ninja \
+    -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx \
+    -DCLIO_CORE_ENABLE_SYCL=ON -DCLIO_CORE_ENABLE_TESTS=ON
+$ cmake --build build-sycl -j"$(nproc)"
+</pre>
+  <p>The SYCL kernels for the vector live in <code>context-transfer-engine/adapter/gpu_vector/test/sycl</code>, in their own directory because SYCL kernel bodies are lambdas rather than <code>__global__</code> functions.</p></section>
+  <section class="tab-panel" data-tab="CPU only"><p class="tab-title">CPU only</p>
+<pre data-label="shell">
+$ cmake --preset release -DCLIO_CORE_ENABLE_TESTS=ON
+$ cmake --build build -j"$(nproc)"
+$ ctest --test-dir build -L cpu_vector --output-on-failure
+</pre>
+  <p><code>cpu_vector</code> is built in every configuration. Its test, <code>cte_cpu_vector</code>, starts a runtime in-process with a RAM tier.</p></section>
+</div>
+
+<h2>Headers and CMake targets</h2>
+<ul>
+  <li><code>cpu_vector</code>: header <code>clio_cte/cpu_vector/cpu_vector.h</code>, namespace <code>clio::cte::cpu_vector</code>, build-tree target <code>clio::cte::cpu_vector</code>.</li>
+  <li><code>gpu_vector</code>: header <code>clio_cte/gpu_vector/gpu_vector.h</code> (host side; it includes <code>device_vector.h</code> for the kernel side), namespace <code>clio::cte::gpu_vector</code>, build-tree target <code>clio::cte::gpu_vector</code>.</li>
+</ul>
+<p>Both targets are <code>INTERFACE</code> libraries that add the include directory and link <code>clio_cte_core_client</code> and <code>clio_cte_checkpoint_client</code>. They exist in the CLIO Core build tree, and the adapter's own tests and benchmarks link them. The install step copies the headers into <code>include/</code> but does not export the two interface targets, so a project built against an installed tree includes the headers and links the exported client targets itself:</p>
+<pre data-label="cmake">
+find_package(clio-core CONFIG REQUIRED)             # exports clio::cte::core_client
+add_executable(my_vector_app main.cc)
+target_link_libraries(my_vector_app clio::cte::core_client)
+# Vector::Copy needs the checkpoint client as well. Its module package is
+# installed next to clio_cte_core; it is not pulled in by the umbrella package.
+</pre>
+<p>A GPU program also links the runtime's GPU library and the vendor runtime. The adapter's CUDA tests link <code>clio_run_cxx</code>, <code>clio_run_cxx_gpu</code>, <code>clio_cte_core_client</code>, <code>clio_cte_core_runtime</code>, <code>clio::cte::gpu_vector</code> and <code>ctp::cuda_cxx</code>; the copy test adds <code>clio_cte_checkpoint_client</code> and <code>clio_cte_checkpoint_runtime</code>. Building inside the CLIO Core tree, with <code>add_subdirectory</code> or as an adapter, is the path the project itself exercises.</p>
+
+<h2>Runtime configuration</h2>
+<p>The runtime's compose must contain a <code>clio_cte_core</code> pool with at least one <code>storage</code> tier; without a tier the first writeback has nowhere to land and never completes. The default configuration qualifies. For GPU kernels, set <code>gpu.queue_depth</code> above the number of blocks that will have transfers in flight; the default is 16.</p>
+<pre data-label="yaml · clio.yaml">
+runtime:
+  num_threads: 4
+  queue_depth: 1024
+gpu:
+  queue_depth: 64
+compose:
+  - mod_name: clio_cte_core
+    pool_name: clio_cte
+    pool_query: local
+    pool_id: 512.0
+    storage:
+      - path: "ram::vector_dram"
+        bdev_type: "ram"
+        capacity_limit: "1GB"
+        score: 1.0
+    dpe:
+      dpe_type: "max_bw"
+</pre>
+
+<h2>Check the install</h2>
+<p>From a build tree with tests enabled, the two test labels above are the check. Without tests, compile the <code>cpu_vector</code> example on the <a href="/docs/memory-expansion/usage.html">usage page</a> and run it with <code>CLIO_SERVER_CONF</code> pointing at a file like the one above. It exits 0 when every element reads back.</p>
+
+<h2>Where to go next</h2>
+<ul>
+  <li><a href="/docs/memory-expansion/usage.html">Usage</a>: the host example and the CUDA kernel.</li>
+  <li><a href="/docs/memory-expansion/api.html">API reference</a>: constructors, verbs, host methods, configuration.</li>
+</ul>

@@ -1,0 +1,44 @@
+<!--
+title: svm
+heading: <em>svm:</em> linear support vector machine.
+description: API reference for clio-ml's linear SVM module (hinge loss on the GLM engine): Python fit_svm, C++ FitLinearSvm, GlmOptions and GlmResult.
+eyebrow: Docs · Machine learning
+lede: A linear support vector machine trained with hinge loss by full-batch gradient descent, in the style of Spark MLlib's LinearSVC but without regularisation. Labels are 0/1 in the data and mapped to -1/+1 inside the kernel.
+facts: Module | ml_svm ; Header | clio_ml/glm.h ; Rows | features, then 0/1 label
+-->
+<h2>What it does</h2>
+<p>The GLM engine with <code>GlmKind::kSvm</code>: one paged pass per iteration sums the hinge-loss subgradient, then one fixed-step update. No regularisation and no early stop. The recorded loss is the mean hinge loss before each update.</p>
+
+<h2>Rows</h2>
+<p><code>n_features</code> feature columns followed by a 0/1 label. <code>clio_ml.COLUMNS["svm"]</code> is 1.</p>
+
+<h2>Python</h2>
+<pre data-label="python">
+import numpy as np, clio_ml as cm
+rng = np.random.default_rng(1)
+X = rng.normal(size=(4096, 7)).astype(np.float32)
+y = (X[:, 0] + X[:, 1] > 0).astype(np.float32)
+data = np.column_stack([X, y]).astype(np.float32)
+
+r = cm.fit_svm(data, iters=20, learning_rate=0.1)
+margin = cm.predict("svm", r, data[0, :7])     # signed linear value
+print(r.weights, margin)
+</pre>
+<ul>
+  <li><code>fit_svm(X, **options)</code> calls the GLM engine with <code>GlmKind.svm</code>.</li>
+  <li>Options (<code>GlmOptions</code>): <code>iters</code> (100), <code>learning_rate</code> (0.1), <code>threads</code> (256).</li>
+  <li>Result <code>GlmResult</code>: <code>weights</code> (coefficients, then intercept), <code>loss_history</code>, <code>stats</code>.</li>
+  <li><code>predict("svm", r, x)</code> returns <code>GlmPredict(GlmKind.svm, ...)</code>, the linear value <code>w . x + b</code>; its sign is the class.</li>
+</ul>
+
+<h2>C++</h2>
+<pre data-label="cpp">
+GlmResult FitLinearSvm(Dataset &ds, const GlmOptions &opt);   // FitGlm(kSvm, ...)
+GlmResult FitGlm(GlmKind kind, Dataset &ds, const GlmOptions &opt);
+GlmResult FitGlmPlain(GlmKind kind, const float *data, u64 n_rows, u32 n_features,
+                      u64 elems_per_page, u32 nblocks, const GlmOptions &opt);
+float GlmPredict(GlmKind kind, const std::vector<float> &w, const float *x);
+</pre>
+<p><code>GlmOptions</code> and <code>GlmResult</code> are described on the <a href="/docs/ml/linreg.html">linear regression</a> page. The ChiMod is module <code>ml_svm</code>.</p>
+
+<p>Related: <a href="/docs/ml/logreg.html">logistic regression</a>, <a href="/docs/ml/mlr.html">multinomial logistic regression</a>.</p>

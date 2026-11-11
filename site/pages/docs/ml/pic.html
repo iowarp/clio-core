@@ -1,0 +1,35 @@
+<!--
+title: pic
+heading: <em>pic:</em> power iteration clustering.
+description: API reference for clio-ml's power iteration clustering module: Python fit_pic, C++ API, options, result fields and row layout.
+eyebrow: Docs · Machine learning
+lede: Graph clustering by power iteration, the equivalent of Spark MLlib's PowerIterationClustering with random initialisation.
+facts: Module | ml_pic ; Header | clio_ml/pic.h
+-->
+<h2>What it does</h2>
+<p>Graph clustering by power iteration, the equivalent of Spark MLlib's PowerIterationClustering with random initialisation. Each iteration computes v = D<sup>-1</sup>Wv over the paged edge list in one pass; k-means on the final vector assigns the clusters.</p>
+
+<h2>Rows</h2>
+<p>Directed edges <code>[src, dst, weight, pad]</code>; an undirected graph stores both directions. Vertex ids are below 2<sup>24</sup>.</p>
+
+<h2>Python</h2>
+<pre data-label="python">
+import numpy as np, clio_ml as cm
+r = cm.fit_pic(E, num_vertices=10000, k=4)     # E: rows of (src, dst, w, 0)
+print(r.assignment[:10])
+</pre>
+<ul>
+  <li><code>fit_pic(X, **options)</code> accepts an in-memory array or a paged <code>Dataset</code> from <code>cm.dataset(X)</code> or <code>cm.assimilate(...)</code>.</li>
+  <li>Options: <code>num_vertices</code> (required), <code>k</code> (2), <code>iters</code> (10), <code>seed</code> (1), <code>threads</code> (256).</li>
+  <li>Result <code>PicResult</code>: <code>embedding</code> (the final vector, one value per vertex), <code>assignment</code> (cluster per vertex), <code>stats</code>.</li>
+</ul>
+
+<h2>C++</h2>
+<pre data-label="cpp">
+PicResult FitPic(Dataset &amp;ds, const PicOptions &amp;opt);
+PicResult FitPicPlain(const float *edges, u64 n_edges, u64 elems_per_page,
+                      u32 nblocks, const PicOptions &amp;opt);
+</pre>
+<p>The paged call needs the runtime; the <code>Plain</code> call runs the same kernel over a plain copy of the data without one.</p>
+
+<p>Related: <a href="/docs/ml/kmeans.html">k-means</a>, <a href="/docs/ml/als.html">ALS</a>. Back to the <a href="/docs/ml/index.html">machine learning overview</a>.</p>

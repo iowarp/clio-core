@@ -1,0 +1,36 @@
+<!--
+title: iso
+heading: <em>iso:</em> isotonic regression.
+description: API reference for clio-ml's isotonic regression module: Python fit_iso, C++ API, options, result fields and row layout.
+eyebrow: Docs · Machine learning
+lede: A non-decreasing fit of y against x, the equivalent of Spark MLlib's IsotonicRegression.
+facts: Module | ml_iso ; Header | clio_ml/isotonic.h
+-->
+<h2>What it does</h2>
+<p>A non-decreasing fit of y against x, the equivalent of Spark MLlib's IsotonicRegression. The x range is split into bins, the bin sums are gathered in one paged pass, and the pool-adjacent-violators algorithm runs on the bins. Prediction interpolates linearly between boundaries and clamps outside them, as Spark does.</p>
+
+<h2>Rows</h2>
+<p>Fixed records of <code>(x, y)</code>; the fit takes no column count.</p>
+
+<h2>Python</h2>
+<pre data-label="python">
+import numpy as np, clio_ml as cm
+r = cm.fit_iso(XY, num_bins=1024, lo=0.0, hi=1.0)   # XY: rows of (x, y)
+y_hat = cm.predict("iso", r, 0.25)
+</pre>
+<ul>
+  <li><code>fit_iso(X, **options)</code> accepts an in-memory array or a paged <code>Dataset</code> from <code>cm.dataset(X)</code> or <code>cm.assimilate(...)</code>.</li>
+  <li>Options: <code>num_bins</code> (1024), <code>lo</code> (0.0) and <code>hi</code> (1.0), the feature range, <code>threads</code> (256).</li>
+  <li>Result <code>IsotonicResult</code>: <code>model.boundaries</code> (mean x of each non-empty bin, ascending), <code>model.predictions</code> (non-decreasing fitted values), <code>stats</code>.</li>
+</ul>
+
+<h2>C++</h2>
+<pre data-label="cpp">
+IsotonicResult FitIsotonic(Dataset &amp;ds, const IsotonicOptions &amp;opt);
+IsotonicResult FitIsotonicPlain(const float *data, u64 n_rows, u64 elems_per_page,
+                                u32 nblocks, const IsotonicOptions &amp;opt);
+float IsotonicPredict(const IsotonicModel &amp;m, float x);
+</pre>
+<p>The paged call needs the runtime; the <code>Plain</code> call runs the same kernel over a plain copy of the data without one.</p>
+
+<p>Related: <a href="/docs/ml/linreg.html">linear regression</a>. Back to the <a href="/docs/ml/index.html">machine learning overview</a>.</p>

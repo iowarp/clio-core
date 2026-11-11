@@ -1,0 +1,69 @@
+<!--
+title: On-demand ingest and pagify
+heading: On-demand ingest <em>and pagify.</em>
+description: How the Context Assimilation Engine registers a source without copying it and ingests each blob on first read (ingest on fault), the environment variables that bound its storage use, and how pagify serves numbered pages assembled from named blobs through a pagemap blob.
+eyebrow: Docs · Context Assimilation Engine
+lede: Two features of the CAE core change when and how data is read rather than what is read. Ingest on fault defers the copy until a blob is first touched. Pagify lets a consumer that thinks in page numbers read data stored as arbitrarily named blobs. Both are opt-in per transfer or per request.
+facts: Flag | AssimilationCtx::on_fault ; Registry tag | __cae_on_fault ; Page request | blob name page:<id> ; Map blob | pagemap
+-->
+<h2>Ingest on fault</h2>
+<p>A transfer context can be marked <code>on_fault</code>. It is not an OMNI key; programs that build an <code>AssimilationCtx</code> in C++ set it, and the Python binding does not expose it. <code>ParseOmni</code> then ingests nothing. Instead it:</p>
+<ol class="steps">
+  <li>Asks the source's assimilator for <code>BlobBytes(ctx)</code>. A 0 answer means the assimilator cannot ingest per blob, and the transfer fails with result code -20. Of the shipped assimilators only the binary file assimilator implements this.</li>
+  <li>Encodes the context and stores it under a key <code>fault:&lt;16 hex digits&gt;</code>, an FNV-1a hash of the encoding, both in memory and as a blob of that name in the registry tag <code>__cae_on_fault</code>, written with the <code>kNoFault</code> flag. The registry lets the CAE on any node serve the fault.</li>
+  <li>Registers the CAE pool as the destination tag's fault handler on every container of the pool it forwards to, using the CTE's <code>GetOrCreateTag</code> variant that takes a fault pool and fault parameters, with the key as the parameter.</li>
+</ol>
+<p>From then on, a <code>GetBlob</code> for a blob the tag does not hold is dispatched by the CTE to the CAE's <code>GetBlob</code> handler with the key in the task context. The handler:</p>
+<ol class="steps">
+  <li>Looks the key up in memory, or, when the registration was made on another node, loads and decodes the context from the registry tag.</li>
+  <li>Calls the assimilator's <code>ReadBlob</code> for exactly that blob on a separate I/O thread pool, because it is blocking source I/O. A short final blob is zero-filled to the blob size.</li>
+  <li>Stores the blob in the tag with a put flagged <code>kNoFault</code>, so the next read does not fault, then serves the read from the staged bytes. A size-0 request, which the CTE sends before a partial write, only stores.</li>
+</ol>
+<p>Blob size and naming come from the context: <code>chunk_size</code> bytes per blob, 0 meaning the assimilator's default of 1 MiB for files, and <code>blob_prefix</code> followed by the blob index. The default prefix is <code>chunk_</code>; an empty prefix names blobs <code>0</code>, <code>1</code>, and so on, which are the page names a gpu_vector pager faults on. The fields carried to other nodes are <code>src</code>, <code>dst</code>, <code>format</code>, <code>src_token</code>, <code>dst_token</code>, <code>s3_region</code>, <code>s3_profile</code>, <code>src_data</code>, <code>blob_prefix</code>, <code>range_off</code>, <code>range_size</code> and <code>chunk_size</code>.</p>
+<pre data-label="cpp">
+clio::cae::core::AssimilationCtx ctx("file::/data/run42/field.bin", "iowarp::run42_field", "binary");
+ctx.on_fault = true;
+ctx.chunk_size = 4 * 1024 * 1024;   // 4 MiB blobs
+ctx.blob_prefix = "";               // blobs "0", "1", ...
+auto f = cae.AsyncParseOmni({ctx});
+f.Wait();
+// Nothing copied yet. The first GetBlob of "7" reads bytes [28 MiB, 32 MiB) of the file.
+</pre>
+
+<h3>Storage policy</h3>
+<p>A fault-ingested blob can always be re-ingested, so it is not allowed to take the last of a tier. Three environment variables, read by the runtime, control this:</p>
+<ul>
+  <li><code>CLIO_CAE_FAULT_RESERVE_MB</code>, default 512. The handler keeps this many megabytes free across the node's targets and serves from the source without storing when a store would cross that line.</li>
+  <li><code>CLIO_CAE_FAULT_STORE</code>, default on. Set to <code>0</code> to never store, giving pure read-through: every read of the tag goes to the source.</li>
+  <li><code>CLIO_CAE_FAULT_STATS</code>. Set to <code>1</code> to log the handler's stage counters every 5 seconds.</li>
+</ul>
+<p>A store that fails because the tag cannot hold more drops the partial blob, serves from the source for the next 256 faults, then tries to store again. <code>CLIO_CAE_REF_IO_THREADS</code>, default 32, sizes the pool that performs the blocking reads.</p>
+
+<h3>The same mechanism elsewhere</h3>
+<p>The CTE fault hook is not specific to the CAE. The cpu_vector and gpu_vector adapters implement <code>Copy()</code> as a lazy copy-on-write checkpoint by registering their own module as the copy's fault handler with the source tag's name as the parameter. The HDF5 VOL connector binds its tag lazily on first access. The <a href="/docs/memory-expansion/index.html">memory expansion</a> documentation covers the vector side.</p>
+
+<h2>Pagify: numbered pages over named blobs</h2>
+<p>A paged consumer such as the gpu_vector addresses its data as page 0, page 1, page 2, and knows nothing about blob names. Pagify turns a page number into bytes. It is split into two headers:</p>
+<ul>
+  <li><strong><code>PageMap</code></strong> in <code>page_map.h</code> is pure arithmetic. It holds a page size and a sorted list of <code>PageExtent</code> entries, each saying which bytes of which blob land at which offset of the global page space. <code>ToPage(page_id)</code> returns the <code>PageSlice</code> list composing one page; <code>FromPage(blob, off, size)</code> returns the <code>PageRef</code> list of pages holding a byte range of one blob. <code>Build(page_size, extents)</code> sorts the extents and drops overlaps, first writer wins. Gaps are legal and read as zero.</li>
+  <li><strong><code>Pagify</code></strong> in <code>pagify.h</code> does the I/O over a map with injected callables: <code>ReadPage(page_id, dst, BlobReadFn)</code> and <code>WritePage(page_id, src, BlobWriteFn)</code>. The assembly is therefore testable without a runtime, and the same code serves the CAE pool or a direct client.</li>
+</ul>
+<p>The map travels with the data. <code>PageMap::Serialize()</code> produces a text block, and <code>PageMap::Parse()</code> reads it back, returning an empty map on malformed input:</p>
+<pre data-label="text · the pagemap blob">
+pagemap
+page_size=1048576
+total=2097152
+chunk_0 0 0 1048576
+chunk_1 0 1048576 1048576
+</pre>
+<p>Each extent line is <code>blob_name blob_off page_off size</code>. The text is stored as a plain blob named <code>pagemap</code> in the same tag as the data. The <code>BuildPageMap</code> hook on <code>BaseAssimilator</code> is where an assimilator would produce that map, but no shipped assimilator overrides it; today the program that ingests the data writes the <code>pagemap</code> blob itself, as the pagify test does.</p>
+
+<h3>Reading a page</h3>
+<p>The CAE core's <code>GetBlob</code> handler treats a blob name of the form <code>page:&lt;id&gt;</code> as a page request. It loads the tag's <code>pagemap</code> blob once per tag, zeroes the caller's buffer, and reads every slice of that page directly into its place. A page composed of several blobs, a blob covering only part of a page, and gaps covered by no extent all read correctly, with gaps as zero. A tag with no <code>pagemap</code> blob fails the page read with a warning. Any blob name without the prefix forwards unchanged, so pagify costs an unpaged deployment one string comparison and is opt-in per request.</p>
+<pre data-label="cpp">
+// A CTE client pointed at the CAE pool (CLIO_CTE_POOL=400.0, or the CAE client's passthrough).
+auto buf = CLIO_IPC-&gt;AllocateBuffer(page_size);
+auto g = cae.AsyncGetBlob(tag_id, "page:1", 0, page_size, 0, buf.shm_);
+g.Wait();   // buf holds page 1 assembled from its slices
+</pre>
+<p>The end-to-end test in <code>test/unit/test_cae_pagify.cc</code> writes four blobs and a map into a tag, then reads <code>page:0</code> and <code>page:1</code> through a CTE client pointed at the CAE pool: page 0 is assembled from three blobs, and page 1 holds 1000 bytes at offset 500 with zeros around them. <code>test_page_map.cc</code> and <code>test_pagify.cc</code> cover the arithmetic and the I/O without a runtime.</p>

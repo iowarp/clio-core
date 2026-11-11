@@ -1,0 +1,193 @@
+<!--
+title: Usage
+heading: Using the <em>Context Transfer Engine.</em>
+description: Task-oriented guide to the Context Transfer Engine in C++ and Python: connecting a client, putting and getting blobs, working with tags, querying by name, keyword and time, reorganizing blobs between tiers, and running operations asynchronously.
+eyebrow: Docs · Context Transfer Engine
+lede: This page shows how to do each common job with the CTE client, in C++ and in Python. The <a href="/docs/cte/api.html">API reference</a> has the full signatures; the <a href="/docs/cte/index.html">overview</a> explains tags, blobs, scores and tiers.
+facts: C++ | clio::cte::core::Tag, Client ; Python | clio_cte_core_ext ; Default pool | 512.0, or CLIO_CTE_POOL
+-->
+<h2>Connect a client</h2>
+<p>Every program first initializes the runtime client, then the CTE client. The CTE client binds to the core pool 512.0 by default. The environment variable <code>CLIO_CTE_POOL</code>, as <code>major.minor</code>, binds it to another pool that speaks the core interface, such as the indexer at 564.0 or the cache at 563.0. Set it before initialization.</p>
+<pre data-label="cpp">
+#include &lt;clio_runtime/clio_runtime.h&gt;
+#include &lt;clio_cte/core/core_client.h&gt;
+
+clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient);   // attach to a running clio_run
+clio::cte::core::CLIO_CTE_CLIENT_INIT();                  // bind the shared client
+auto *client = CLIO_CTE_CLIENT;                           // clio::cte::core::Client *
+</pre>
+<pre data-label="python">
+import os
+os.environ["CLIO_WITH_RUNTIME"] = "0"     # attach to a running clio_run
+os.environ["CLIO_CTE_POOL"] = "564.0"     # optional: the indexer, so SemanticSearch works
+
+import clio_cte_core_ext as cte
+cte.clio_init(cte.RuntimeMode.kClient, False)    # (mode, default_with_runtime=False, is_restart=False)
+cte.initialize_cte("", cte.PoolQuery.Dynamic())  # (config_path, pool_query)
+client = cte.get_cte_client()
+</pre>
+<p>To address a specific pool from C++ without the environment variable, construct <code>clio::cte::core::Client</code> with a <code>PoolId</code>. In Python, <code>cte.Client()</code> and <code>cte.Client(pool_id)</code> do the same.</p>
+
+<h2>Put and get a blob</h2>
+<p>The <code>Tag</code> wrapper is the simplest path. Its constructor runs GetOrCreateTag. The blocking <code>PutBlob</code> from a private buffer writes at offset 0 with score 1.0 unless told otherwise, and throws on a non-zero return code. <code>GetBlob</code> reads into a buffer you own.</p>
+<pre data-label="cpp">
+clio::cte::core::Tag tag("experiment/run1");
+std::string payload = "Arctic sea ice extent fell to a record low.";
+tag.PutBlob("note0", payload.data(), payload.size());          // off 0, score 1.0
+
+std::string out(tag.GetBlobSize("note0"), '\0');
+tag.GetBlob("note0", out.data(), out.size());
+
+tag.PutBlob("note0", "!", 1, /*off=*/payload.size());           // append one byte
+</pre>
+<pre data-label="python">
+tag = cte.Tag("experiment/run1")
+tag.PutBlob("note0", b"Arctic sea ice extent fell to a record low.", 0)
+data = tag.GetBlob("note0", tag.GetBlobSize("note0"), 0)      # bytes
+</pre>
+<p>Python <code>PutBlob</code> has no score argument; a blob written from Python lands at 1.0 and can be moved afterwards with <code>ReorganizeBlob</code>. <code>GetBlob</code> raises <code>RuntimeError</code> when the read fails. A range whose bytes lived only in RAM before a runtime restart fails with an I/O error rather than returning zeros.</p>
+
+<h2>Work with tags</h2>
+<pre data-label="cpp">
+auto *client = CLIO_CTE_CLIENT;
+const auto &amp;id = tag.GetTagId();
+
+std::vector&lt;std::string&gt; names = tag.GetContainedBlobs();
+
+auto rn = client-&gt;AsyncRenameTag("experiment/run1", "experiment/run1-final", id);
+rn.Wait();
+
+auto sync = client-&gt;AsyncSyncTag(id);        // flush to a persistent tier, like fsync
+sync.Wait();
+
+auto del = client-&gt;AsyncDelTag("experiment/run1-final");
+del.Wait();
+</pre>
+<pre data-label="python">
+names = tag.GetContainedBlobs()
+tid = tag.GetTagId()                                  # UniqueId with major_, minor_
+later = cte.Tag(tid)                                  # wrap an id, no RPC
+fut = client.AsyncGetOrCreateTag("experiment/run2")   # .result() -> UniqueId
+run2 = cte.Tag(fut.result())
+</pre>
+<p>The Python module exposes blob deletion (<code>DelBlob</code>) but not tag deletion, renaming or SyncTag.</p>
+
+<h2>Query by name</h2>
+<p><code>TagQuery</code> and <code>BlobQuery</code> match whole names with <code>std::regex_match</code>: <code>"doc.*"</code> matches <code>doc7</code>, <code>"doc"</code> does not, and <code>".*ice.*"</code> matches a substring. Both default to <code>PoolQuery::Broadcast()</code>, so every node answers for its own blobs and the results are merged. A <code>max</code> of 0 means no limit.</p>
+<pre data-label="cpp">
+auto tq = client-&gt;AsyncTagQuery("experiment/.*");
+tq.Wait();
+for (const auto &amp;name : tq-&gt;results_) { /* tag names */ }
+
+auto bq = client-&gt;AsyncBlobQuery("experiment/.*", "note.*");
+bq.Wait();
+for (size_t i = 0; i &lt; bq-&gt;blob_names_.size(); ++i) {
+  // bq-&gt;tag_names_[i], bq-&gt;blob_names_[i]
+}
+</pre>
+<pre data-label="python">
+tags = client.TagQuery("experiment/.*")                       # list[str]
+for tag_name, blob_name in client.BlobQuery("experiment/.*", "note.*"):
+    print(tag_name, blob_name)
+</pre>
+
+<h2>Search by keyword</h2>
+<p><code>SemanticSearch</code> is BM25 keyword search over blob contents. The core does not implement it; the indexer module at 564.0 does. The client must therefore be bound to the indexer or to a pool that forwards to it, through <code>CLIO_CTE_POOL=564.0</code> or a <code>Client</code> constructed on that pool. Results come back best first, with <code>score</code> 0 for a blob that matched the patterns but contains no query word. <code>k</code> defaults to 10; 0 means no cap.</p>
+<pre data-label="cpp">
+clio::cte::core::Client indexer(clio::run::PoolId(564, 0));
+auto hits = indexer.AsyncSemanticSearch("experiment/.*", ".*", "sea ice", 5);
+hits.Wait();
+for (const auto &amp;r : hits-&gt;results_) {
+  // r.tag_id_, r.blob_name_, r.score_
+}
+</pre>
+<pre data-label="python">
+for hit in client.SemanticSearch("experiment/.*", ".*", "sea ice", k=5):
+    print(hit.blob_name, hit.score)
+</pre>
+<p>For files in a Context FS mount, pass <code>"[0-9]+"</code> as the blob pattern to search the page blobs and skip each file's attribute blob.</p>
+
+<h2>Search by time</h2>
+<p><code>TemporalSearch</code> returns blobs whose last-modified timestamp lies in the inclusive range <code>[time_begin, time_end]</code>, sorted ascending; 0 for either bound means unbounded.</p>
+<pre data-label="python">
+for r in client.TemporalSearch("experiment/.*", ".*", time_begin=0, time_end=0, max_entries=20):
+    print(r.blob_name, r.last_modified)
+</pre>
+<div class="callout warn">
+  <span class="callout-title">The timestamp is not Unix time</span>
+  <p>The docstrings describe <code>last_modified</code> as epoch nanoseconds, but the core stamps it from <code>GetCurrentTimeNs()</code>, which reads <code>std::chrono::steady_clock</code>. A bound computed from <code>time.time()</code> matches nothing. Treat <code>last_modified</code> as an ordering key within one run of the runtime. This is a suspected bug in the source, documented here as it behaves.</p>
+</div>
+
+<h2>Move a blob between tiers</h2>
+<p>A blob's score decides its tier: 1.0 is the fastest, 0.0 the slowest. <code>ReorganizeBlob</code> gives the blob a new score and moves it to the tier that score selects. <code>Evict</code> frees the lowest-scored blobs off a tier, down to a minimum tier score and a byte count. With the default <code>organizer: none</code> these two calls are the only things that move data after a put.</p>
+<pre data-label="cpp">
+tag.ReorganizeBlob("note0", 0.2f);                 // demote
+float s = tag.GetBlobScore("note0");               // 0.2
+
+auto ev = client-&gt;AsyncEvict(/*min_tier_score=*/0.9f, /*bytes=*/64 &lt;&lt; 20);
+ev.Wait();
+</pre>
+<pre data-label="python">
+tag.ReorganizeBlob("note0", 0.0)                   # slowest tier
+ok = client.ReorganizeBlob(tag.GetTagId(), "note1", 1.0)   # True on success
+</pre>
+<p>Which tiers a score can reach depends on the tiers' own scores and the placement engine. The <a href="/design/placement.html">placement page</a> explains how <code>max_bw</code> chooses.</p>
+
+<h2>Run operations asynchronously</h2>
+<p>Every <code>Client</code> method is asynchronous and returns a <code>clio::run::Future</code> over the task. Submit several, then <code>Wait()</code> on each and read the task's fields. The <code>Tag</code> wrapper adds <code>AsyncPutBlob</code> and <code>AsyncGetBlob</code> from private buffers. The buffer must stay valid until <code>Wait()</code> returns.</p>
+<pre data-label="cpp">
+std::vector&lt;std::string&gt; bufs(4, std::string(4096, '\0'));
+std::vector&lt;clio::run::Future&lt;clio::cte::core::GetBlobTask&gt;&gt; futs;
+for (int i = 0; i &lt; 4; ++i) {
+  futs.push_back(tag.AsyncGetBlob("page" + std::to_string(i), bufs[i].data(), bufs[i].size()));
+}
+for (auto &amp;f : futs) f.Wait();   // served from the shared-memory cache: the future is empty, do not dereference it
+</pre>
+<p>In Python every <code>Async*</code> method returns a <code>Future</code> with <code>wait(max_sec=-1)</code>, <code>done()</code> and <code>result(max_sec=-1)</code>. The value of <code>result()</code> depends on the call: <code>bytes</code> for a get, a list for a query, a dict for the conditional puts, <code>None</code> for status-only operations.</p>
+<pre data-label="python">
+tid = tag.GetTagId()
+puts = [client.AsyncPutBlob(tid, f"page{i}", bytes(4096), 0) for i in range(4)]
+assert all(f.wait() == 0 for f in puts)
+
+gets = [client.AsyncGetBlob(tid, f"page{i}", 4096, 0) for i in range(4)]
+pages = [f.result() for f in gets]
+</pre>
+
+<h3>Deferred puts</h3>
+<p>A deferred put stages a copy of the data in shared memory and returns a submission code immediately, without a future. The put is tracked in a process-wide registry. When shared memory is exhausted the next submission waits for the oldest puts to finish; <code>max_inflight_bytes</code> adds an explicit ceiling. Drain with <code>AwaitPutsUntilSpace(0)</code> and check <code>DeferErrorCount()</code> for puts that failed after submission. <code>AsyncGetBlobDefer</code> completes any pending deferred put for the blob before reading it.</p>
+<pre data-label="python">
+for i in range(1000):
+    rc = client.AsyncPutBlobDefer(tid, f"rec{i}", record(i), 0, max_inflight_bytes=256 &lt;&lt; 20)
+    assert rc == 0
+client.AwaitPutsUntilSpace(0)
+assert client.DeferErrorCount() == 0
+</pre>
+
+<h3>Conditional puts</h3>
+<p>Two <code>Context</code> flags make a put conditional. <code>kPutIfAbsent</code> creates the blob only if it does not exist and fails with <code>kPutExistsRc</code> otherwise. <code>kPutIfVersion</code> applies the put only when the blob is still at the version the caller read, and fails with a version-mismatch code otherwise. Python exposes them as <code>AsyncPutBlobIfAbsent</code> and <code>AsyncPutBlobIfVersion</code>, whose <code>result()</code> is a dict with <code>code</code> and <code>version</code>, and <code>AsyncGetBlobVersioned</code> returns <code>code</code>, <code>version</code> and <code>data</code>. Conditional puts need a non-empty payload, and a put overwrites a range without truncating, so use fixed-size records.</p>
+
+<h2>Delete</h2>
+<pre data-label="cpp">
+auto del = client-&gt;AsyncDelBlob(tag.GetTagId(), "note0");
+del.Wait();
+int rc = del-&gt;return_code_;        // 0 on success
+</pre>
+<pre data-label="python">
+assert client.DelBlob(tag.GetTagId(), "note0")
+</pre>
+
+<h2>Inspect targets</h2>
+<p>From Python, <code>AsyncListTargets()</code> returns the registered target names on this node, <code>AsyncGetTargetInfo(name)</code> returns a <code>TargetInfo</code> with the target's score, remaining space and byte and operation counters, and <code>AsyncGetCapacity()</code> returns total and remaining bytes. All three default to <code>PoolQuery.Local()</code>; <code>Broadcast()</code> sums or concatenates across nodes. A failed query raises <code>RuntimeError</code> from <code>result()</code>.</p>
+<pre data-label="python">
+for name in client.AsyncListTargets().result():
+    info = client.AsyncGetTargetInfo(name).result()
+    print(name, info.target_score, info.remaining_space)
+</pre>
+
+<h2>Where to go next</h2>
+<ul>
+  <li><a href="/docs/cte/api.html">API reference</a>: every signature and default, and the compose YAML keys.</li>
+  <li><a href="/docs/cte/python.html">Python module reference</a>: each <code>clio_cte_core_ext</code> call with its return type.</li>
+  <li><a href="/modules/cte-core.html">CTE core module</a>: durability, capacity and startup behavior.</li>
+  <li><a href="/tutorials/python-semantic-query.html">Query files from Python</a>: keyword search over a mount.</li>
+</ul>

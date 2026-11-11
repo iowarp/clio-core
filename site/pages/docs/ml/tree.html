@@ -1,0 +1,64 @@
+<!--
+title: tree
+heading: <em>tree:</em> decision tree classifier.
+description: API reference for clio-ml's histogram-based decision tree classifier: Python fit_tree and predict, C++ FitDecisionTree and DecisionTreePredict, DecisionTreeOptions and the heap-ordered model.
+eyebrow: Docs · Machine learning
+lede: A histogram-based decision tree classifier with Gini impurity, the equivalent of Spark MLlib's DecisionTreeClassifier. One min/max pass fixes uniform bins per feature, then one paged pass per level accumulates class counts per node, feature and bin.
+facts: Module | ml_tree ; Header | clio_ml/decision_tree.h ; Rows | features, then class label ; Limits | max_depth at most 8
+-->
+<h2>What it does</h2>
+<p>The host picks each frontier node's best split by maximum Gini gain, breaking ties by lowest feature and then lowest bin. Counts are integers, so the tree is exact and identical across paging, block counts and nodes. The same header also defines the <a href="/docs/ml/rf.html">random forest</a>, which reuses <code>DecisionTreeOptions</code> with <code>seed</code> and <code>features_per_node</code> set.</p>
+
+<h2>Rows</h2>
+<p><code>n_features</code> feature columns followed by the class label in <code>0..num_classes-1</code>. <code>clio_ml.COLUMNS["tree"]</code> is 1.</p>
+
+<h2>Python</h2>
+<pre data-label="python">
+import numpy as np, clio_ml as cm
+rng = np.random.default_rng(1)
+X = rng.normal(size=(4096, 7)).astype(np.float32)
+y = ((X[:, 0] > 0) + (X[:, 1] > 0.25)).astype(np.float32)   # 3 classes
+data = np.column_stack([X, y]).astype(np.float32)
+
+r = cm.fit_tree(data, num_classes=3, max_depth=4, num_bins=32)
+print(r.model.depth, r.model.status[:7])      # 0 absent, 2 leaf, 3 split
+print(cm.predict("tree", r, data[0, :7]))     # predicted class
+</pre>
+<ul>
+  <li><code>fit_tree(X, **options)</code>.</li>
+  <li>Options (<code>DecisionTreeOptions</code>): <code>num_classes</code> (2), <code>max_depth</code> (4, at most 8), <code>num_bins</code> (32), <code>threads</code> (256), <code>seed</code> (0; non-zero turns on the Poisson(1) bootstrap used by random forests), <code>features_per_node</code> (0 = all features; otherwise a hashed subset per node), <code>row_base</code> (0).</li>
+  <li>Result <code>DecisionTreeResult</code>: <code>model</code> and <code>stats</code> (summed over passes). <code>model</code> (<code>DecisionTreeModel</code>) is a heap-ordered tree with <code>2^(max_depth+1)-1</code> slots: <code>nf</code>, <code>C</code>, <code>B</code> (bins), <code>depth</code>, <code>mn</code> and <code>inv</code> (binning, nf each), <code>status</code> (0 absent, 2 leaf, 3 split), <code>feat</code>, <code>split</code>, <code>cls</code> (majority class per node), <code>counts</code> (class counts per node).</li>
+  <li><code>predict("tree", r, x)</code> returns the class index.</li>
+</ul>
+
+<h2>C++</h2>
+<pre data-label="cpp">
+struct DecisionTreeOptions {
+  u32 num_classes = 2;
+  u32 max_depth = 4;          // <= 8
+  u32 num_bins = 32;
+  u32 threads = 256;
+  u32 seed = 0;               // != 0: Poisson(1) bootstrap rows
+  u32 features_per_node = 0;  // 0 = all
+  u64 row_base = 0;
+  ClusterExchange cluster;
+};
+struct DecisionTreeModel {
+  u32 nf = 0, C = 0, B = 0, depth = 0;
+  std::vector<float> mn, inv;
+  std::vector<int> status, feat, split;
+  std::vector<u32> cls;
+  std::vector<float> counts;
+  std::vector<float> Flatten() const;
+};
+struct DecisionTreeResult { DecisionTreeModel model; VecStats stats; };
+DecisionTreeResult FitDecisionTree(Dataset &ds, const DecisionTreeOptions &opt);
+DecisionTreeResult FitDecisionTreePlain(const float *data, u64 n_rows, u32 nf,
+                                        u64 elems_per_page, u32 nblocks,
+                                        const DecisionTreeOptions &opt);
+DecisionTreeResult FitDecisionTreeReference(/* same arguments */);
+u32 DecisionTreePredict(const DecisionTreeModel &m, const float *x);
+</pre>
+<p>The ChiMod is module <code>ml_tree</code>.</p>
+
+<p>Related: <a href="/docs/ml/rf.html">random forest</a>, <a href="/docs/ml/gbt.html">gradient-boosted trees</a>, <a href="/docs/ml/gbtc.html">gradient-boosted classifier</a>.</p>

@@ -1,0 +1,111 @@
+<!--
+title: Install
+heading: Install <em>clio-ml.</em>
+description: Build clio-ml inside a CLIO Core checkout with CLIO_CORE_ENABLE_CLIO_ML and CLIO_ML_PYTHON, choose the CPU, CUDA or SYCL backend, enable the assimilate path, and check the install.
+eyebrow: Docs · Machine learning
+lede: clio-ml is built from inside a CLIO Core configure. The <code>iowarp-core</code> wheel does not include it. A CPU-only <code>clio-ml</code> wheel exists for Python users; GPU backends and the assimilate path need a source build.
+facts: Core option | CLIO_CORE_ENABLE_CLIO_ML ; Python | CLIO_ML_PYTHON ; Backends | CPU, CUDA, SYCL ; Assimilate | CLIO_CORE_ENABLE_CAE=ON
+-->
+<h2>What you get from each method</h2>
+<ul>
+  <li><strong>pip install iowarp-core</strong> installs CLIO Core only. It does not contain clio-ml. See <a href="/docs/installation.html">the general install page</a> for that wheel.</li>
+  <li><strong>pip install clio-ml</strong> is the package the clio-ml repository's release workflow builds. It is the CPU backend over <code>cpu_vector</code>, built with the Context Assimilation Engine off, so <code>clio_ml.assimilate</code> is unavailable in it. It depends on <code>numpy</code> and needs Python 3.10 or newer.</li>
+  <li><strong>Source build</strong> gives every backend and the assimilate path. This is the method the rest of this page describes.</li>
+  <li><strong>conda, Docker, Spack:</strong> the CLIO Core recipes and images under <code>installers/</code> and <code>docker/</code> do not build clio-ml.</li>
+</ul>
+
+<h2>Prerequisites</h2>
+<ul>
+  <li>A CLIO Core checkout with clio-ml at <code>external/clio-ml</code>. The core CMake adds it as a subdirectory; clio-ml does not vendor the runtime.</li>
+  <li>CMake 3.20 or newer and a C++20 compiler.</li>
+  <li>For the CUDA backend, the CUDA toolchain the core build uses with <code>CLIO_CORE_ENABLE_CUDA=ON</code>. For SYCL, the oneAPI DPC++ compiler the core build uses with <code>CLIO_CORE_ENABLE_SYCL=ON</code>.</li>
+  <li>For the Python package, a Python interpreter with development headers. nanobind 2.9.2 is fetched at configure time.</li>
+  <li>For assimilating tables from Python: <code>pyarrow</code> for Parquet. CSV uses <code>pyarrow</code> when installed, then <code>pandas</code>, then the standard <code>csv</code> module.</li>
+</ul>
+
+<h2>Build as part of CLIO Core</h2>
+<p>Configure the core checkout with clio-ml enabled. The backend follows the core build: CUDA when <code>CLIO_CORE_ENABLE_CUDA</code> is on, SYCL when <code>CLIO_CORE_ENABLE_SYCL</code> is on without CUDA, and otherwise the CPU backend over <code>cpu_vector</code>.</p>
+<div class="tabs" data-label="Backend">
+  <section class="tab-panel" id="cpu" data-tab="CPU" data-note="No GPU toolchain."><p class="tab-title">CPU</p>
+<pre data-label="shell">
+$ cd clio-core
+$ cmake -S . -B build \
+    -DCLIO_CORE_ENABLE_CLIO_ML=ON \
+    -DCLIO_ML_PYTHON=ON
+$ cmake --build build
+</pre>
+  </section>
+  <section class="tab-panel" id="cuda" data-tab="CUDA" data-note="NVIDIA GPUs."><p class="tab-title">CUDA</p>
+<pre data-label="shell">
+$ cd clio-core
+$ cmake -S . -B build \
+    -DCLIO_CORE_ENABLE_CUDA=ON \
+    -DCLIO_CORE_ENABLE_CLIO_ML=ON \
+    -DCLIO_ML_PYTHON=ON
+$ cmake --build build
+</pre>
+  </section>
+  <section class="tab-panel" id="sycl" data-tab="SYCL" data-note="Intel GPUs through oneAPI."><p class="tab-title">SYCL</p>
+<pre data-label="shell">
+$ cd clio-core
+$ cmake -S . -B build \
+    -DCLIO_CORE_ENABLE_SYCL=ON \
+    -DCLIO_CORE_ENABLE_CLIO_ML=ON \
+    -DCLIO_ML_PYTHON=ON \
+    -DCLIO_ML_SYCL_AOT_DEVICE=pvc      # optional: ahead-of-time for one device
+$ cmake --build build
+</pre>
+  </section>
+</div>
+
+<h3>CMake options</h3>
+<ul>
+  <li><code>CLIO_CORE_ENABLE_CLIO_ML</code> (core, default OFF): adds <code>external/clio-ml</code> to the build. It forces <code>CLIO_ML_ENABLE_CUDA</code> to the value of <code>CLIO_CORE_ENABLE_CUDA</code>.</li>
+  <li><code>CLIO_ML_PYTHON</code> (default OFF): builds the <code>clio_ml</code> Python package with nanobind and stages it at <code>&lt;build&gt;/python/clio_ml</code>.</li>
+  <li><code>CLIO_ML_ENABLE_TESTS</code> (default ON): builds the per-algorithm unit tests and registers the <code>clio_ml_python</code> and <code>clio_ml_python_tables</code> ctests.</li>
+  <li><code>CLIO_ML_SYCL_AOT_DEVICE</code> (SYCL only, default empty): ahead-of-time compiles the kernels for one Intel device, for example <code>pvc</code>. Empty means JIT.</li>
+  <li><code>CLIO_CORE_ENABLE_CAE</code> (core, default ON): the Context Assimilation Engine. When its client target exists, the Python module is compiled with <code>CLIO_ML_CAE=1</code> and <code>clio_ml.assimilate</code> works. The configure log prints <code>clio-ml: Python assimilate() enabled (CAE client found)</code> or <code>clio-ml: CAE client not found; clio_ml.assimilate disabled</code>.</li>
+</ul>
+<div class="callout">
+  <span class="callout-title">Standalone configure</span>
+  <p>The clio-ml README shows a standalone <code>cmake -S . -B build -DCLIO_CORE_ROOT=/path/to/core</code> invocation with <code>CLIO_ML_ENABLE_CUDA</code> and <code>CLIO_ML_PYTHON</code>. The engine CMake file states that the algorithm libraries are in-tree only, because they use the core build's targets and helpers. Use the core option above for a working build.</p>
+</div>
+
+<h2>Build the Python wheel yourself</h2>
+<p><code>external/clio-ml/pyproject.toml</code> builds with scikit-build-core and points the CMake source directory two levels up, at the clio-core root. The wheel is therefore built from inside a clio-core checkout and installs only the <code>clio_ml_python</code> component. Its CMake defines turn on <code>CLIO_CORE_ENABLE_CLIO_ML</code> and <code>CLIO_ML_PYTHON</code> and turn off CUDA, ROCm, SYCL and the CAE, so a wheel built this way is CPU-only without assimilate. There is no source distribution.</p>
+
+<h2>Use the staged package</h2>
+<p>Put the staged directory on <code>PYTHONPATH</code>. On Windows, Python does not search <code>PATH</code> for an extension's DLL dependencies, so list the directories holding the runtime and backend DLLs in <code>CLIO_ML_DLL_PATH</code>, separated by <code>;</code>, before importing.</p>
+<div class="tabs" data-label="Platform">
+  <section class="tab-panel" id="linux" data-tab="Linux and macOS" data-note="PYTHONPATH only."><p class="tab-title">Linux and macOS</p>
+<pre data-label="shell">
+$ export PYTHONPATH=$PWD/build/python
+$ python -c "import clio_ml; print(clio_ml.backend, clio_ml.has_cae)"
+</pre>
+  </section>
+  <section class="tab-panel" id="windows" data-tab="Windows" data-note="Also CLIO_ML_DLL_PATH."><p class="tab-title">Windows</p>
+<pre data-label="powershell">
+&gt; $env:PYTHONPATH = "$PWD\build\python"
+&gt; $env:CLIO_ML_DLL_PATH = "$PWD\build\bin\Release;$PWD\build\bin;$PWD\vcpkg_installed\x64-windows\bin"
+&gt; $env:CLIO_BIND_ADDR = "127.0.0.1"
+&gt; python -c "import clio_ml; print(clio_ml.backend, clio_ml.has_cae)"
+</pre>
+  </section>
+</div>
+
+<h2>Check that it works</h2>
+<p>A fit on an in-memory array needs no runtime, so it is the quickest check of the extension:</p>
+<pre data-label="shell">
+$ python -c "import numpy as np, clio_ml as cm; X = np.random.default_rng(0).normal(size=(512, 8)).astype(np.float32); print(cm.fit_kmeans(X, k=4, iters=5).counts)"
+</pre>
+<p>To exercise the paged path and the runtime, run the registered ctests from the build directory. They set <code>PYTHONPATH</code>, <code>CLIO_BIND_ADDR=127.0.0.1</code> and <code>CLIO_ML_DLL_PATH</code> themselves. The tables test exits with status 1 and prints <code>SKIP assimilate</code> when the build has no CAE.</p>
+<pre data-label="shell">
+$ ctest --test-dir build -L clio_ml --output-on-failure
+</pre>
+
+<h2>Where to go next</h2>
+<ul>
+  <li><a href="/docs/ml/usage.html">Usage</a>: assimilate a table and train on it.</li>
+  <li><a href="/docs/ml/api.html">API reference</a>: the <code>clio_ml</code> package and the C++ headers.</li>
+  <li><a href="/docs/ml/index.html">Overview</a>: concepts and the algorithm list.</li>
+</ul>

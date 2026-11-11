@@ -1,0 +1,125 @@
+<!--
+title: API reference
+heading: Context FS <em>reference.</em>
+description: The POSIX operations Context FS supports and their limits, the clio_cte_fuse command and mount options, every CLIO_FUSE environment variable with its default, and the compose keys of the filesystem and stream modules.
+eyebrow: Docs · Context FS
+lede: The API of Context FS is the mount. This page lists what the daemon implements, what it refuses, how to invoke it, the environment variables that tune it, and the YAML keys of the two modules behind it. The runtime's own command, clio_run, is documented with the Context Runtime.
+facts: Daemon | clio_cte_fuse ; Modules | clio_cte_filesystem (560.0), clio_cte_stream (565.0) ; Page size | 1 MiB
+-->
+<h2>Mount semantics</h2>
+<p>The daemon is a high-level libfuse 3 filesystem. The kernel enforces permission bits (<code>default_permissions</code>) on Linux by default. Writes are sent to the runtime as they happen; a file's size is exact as soon as <code>write()</code> returns on the node that wrote it. <code>fsync</code> and <code>fsyncdir</code> return once the file's pages are on a tier at the configured persistence level and the namespace journal is synced, under the core's default <code>fsync_mode: "durable"</code>.</p>
+<h3>Supported operations</h3>
+<ul>
+  <li><strong>Files:</strong> <code>create</code>, <code>open</code>, <code>read</code>, <code>write</code>, <code>truncate</code>, <code>fallocate</code>, <code>flush</code>, <code>release</code>, <code>fsync</code>, <code>unlink</code>, <code>rename</code>, <code>link</code> (hard links).</li>
+  <li><strong>Directories:</strong> <code>mkdir</code>, <code>rmdir</code>, <code>readdir</code>, <code>fsyncdir</code>.</li>
+  <li><strong>Attributes:</strong> <code>getattr</code>, <code>chmod</code>, <code>chown</code>, <code>utimens</code>, <code>statfs</code>.</li>
+  <li><strong>Links:</strong> <code>symlink</code>, <code>readlink</code>.</li>
+  <li><strong>Extended attributes:</strong> <code>setxattr</code>, <code>getxattr</code>, <code>listxattr</code>, <code>removexattr</code>.</li>
+</ul>
+<h3>Limits</h3>
+<ul>
+  <li><code>fallocate</code> accepts only the default mode, <code>FALLOC_FL_KEEP_SIZE</code> and <code>FALLOC_FL_ZERO_RANGE</code>. Punch-hole, collapse and insert return <code>EOPNOTSUPP</code>. A negative offset or a length of zero returns <code>EINVAL</code>.</li>
+  <li><code>rename</code> honours <code>RENAME_NOREPLACE</code>. <code>RENAME_EXCHANGE</code> and <code>RENAME_WHITEOUT</code> return <code>EINVAL</code>.</li>
+  <li>A name longer than the limit returns <code>ENAMETOOLONG</code> from <code>create</code>, <code>mkdir</code>, <code>symlink</code>, <code>link</code> and <code>rename</code>.</li>
+  <li>Not implemented by the daemon: <code>mknod</code> (device nodes, FIFOs), <code>lock</code> and <code>flock</code>, <code>ioctl</code>, <code>copy_file_range</code>, <code>lseek</code> hole-seeking. The kernel's generic behaviour applies for those.</li>
+  <li>With <code>CLIO_FUSE_XATTR=0</code> every xattr call returns <code>ENOSYS</code>, which the kernel latches for the mount.</li>
+  <li>On macOS the xattr <code>position</code> argument must be 0; anything else returns <code>EINVAL</code>.</li>
+  <li><code>atime</code> follows <code>relatime</code> by default. <code>-o noatime</code>, <code>-o strictatime</code> and <code>-o relatime</code> are understood by the daemon and removed before libfuse sees them.</li>
+  <li>Case sensitivity is a property of the volume (<code>case_insensitive</code> below), fixed when it is created.</li>
+</ul>
+
+<h2>clio_cte_fuse</h2>
+<pre data-label="usage">
+clio_cte_fuse &lt;mountpoint&gt; [FUSE options]
+</pre>
+<p>The daemon attaches to the runtime, creates or binds the filesystem pool (<code>560.0</code>, <code>clio_cte_filesystem</code>), and serves the mount until it is unmounted. Every argument after the mountpoint goes to the FUSE library.</p>
+<ul>
+  <li><code>-f</code>: stay in the foreground. <code>-d</code>: trace every request. <code>-s</code>: single-threaded.</li>
+  <li><code>-o allow_other</code>: let other users open the mount (Linux needs <code>user_allow_other</code> in <code>/etc/fuse.conf</code>).</li>
+  <li><code>-o noatime</code>, <code>-o relatime</code>, <code>-o strictatime</code>: access-time policy; see <code>CLIO_FUSE_ATIME</code>.</li>
+  <li><code>-o backend=fskit</code> (macOS 15.4+, macFUSE 5.1+): use FSKit; the mountpoint must be under <code>/Volumes</code>.</li>
+  <li><code>-o uid=-1,gid=-1</code> (Windows): files belong to the mounting user, which git's ownership check needs.</li>
+  <li>Windows mountpoints are a drive letter (<code>Z:</code>) or an empty folder whose parent exists.</li>
+  <li>Apptainer <code>--fusemount</code>: when the last argument is <code>/dev/fd/N</code>, the daemon drives the pre-opened FUSE fd and reads the mountpoint from <code>CLIO_CTE_FUSE_MOUNTPOINT</code>. This needs a build against libfuse 3.14 headers and a 3.14 runtime library.</li>
+</ul>
+<p>Unmount with <code>fusermount3 -u</code> (Linux), <code>umount</code> (macOS) or by stopping the process (Windows).</p>
+
+<h2 id="environment-variables">Environment variables</h2>
+<p>The daemon reads these at startup. "Multi-node" means the runtime's hostfile has more than one line, or <code>CLIO_FUSE_MULTINODE=1</code>.</p>
+<h3>Connecting to the runtime</h3>
+<ul>
+  <li><code>CLIO_WITH_RUNTIME</code> (default <code>1</code>): <code>0</code> attaches to a running runtime. <code>1</code> starts a runtime inside the daemon if none is reachable. Use <code>0</code>.</li>
+  <li><code>CLIO_WAIT_SERVER</code> (default <code>600</code> for the mount): seconds to wait for the runtime to answer. The mount defaults higher than other clients so it outlasts a runtime's recovery after a reboot.</li>
+  <li><code>CLIO_SERVER_ADDR</code>, <code>CLIO_PORT</code>, <code>CLIO_IPC_MODE</code>, <code>CLIO_SERVER_CONF</code>: shared with every runtime client; see the <a href="/docs/runtime/api.html#environment-variables">runtime reference</a>.</li>
+</ul>
+<h3>Caching and coherence</h3>
+<ul>
+  <li><code>CLIO_FUSE_ATTR_CACHE_S</code> (default <code>1.0</code>; multi-node <code>0</code>): kernel attribute-cache lifetime in seconds.</li>
+  <li><code>CLIO_FUSE_ENTRY_CACHE_S</code> (default: same as the attribute lifetime; multi-node <code>1.0</code>): kernel name-to-inode cache lifetime.</li>
+  <li><code>CLIO_FUSE_WRITEBACK</code> (default off): <code>1</code> enables kernel writeback caching. Safe only for a single writer that fsyncs.</li>
+  <li><code>CLIO_FUSE_STATFS_TTL_MS</code> (default <code>1000</code>): how long a capacity answer serves <code>statfs</code>; <code>0</code> asks the store every call.</li>
+  <li><code>CLIO_FUSE_MULTINODE</code> (default: from the hostfile): <code>0</code> or <code>1</code> forces single- or multi-node behaviour.</li>
+</ul>
+<h3>Write path</h3>
+<ul>
+  <li><code>CLIO_FUSE_SIEVE</code> (default on): writes and reads go through the daemon's page buffer straight to the CTE. <code>0</code> sends every write and read as a filesystem-module task.</li>
+  <li><code>CLIO_FUSE_SIEVE_CREATE</code> (default on; single-node only): <code>create</code> returns without a round trip and new files are shipped in batches.</li>
+  <li><code>CLIO_FUSE_WRITE_INFLIGHT_MB</code> (default <code>256</code>): bytes of writes in flight per daemon before a write waits for the oldest. <code>0</code> removes the window.</li>
+  <li><code>CLIO_FUSE_DIRECT_WRONLY</code> (default on): a file opened write-only bypasses the kernel page cache. <code>0</code> disables.</li>
+  <li><code>CLIO_FUSE_APPEND</code> (default <code>kernel</code>; multi-node <code>deferred</code>): <code>kernel</code> uses the kernel's cached size, <code>reserve</code> reserves the end at the file's stream home, <code>deferred</code> stages the bytes for the stream home to merge.</li>
+  <li><code>CLIO_FUSE_ASYNC_FLUSH</code> (default on; single-node): <code>close(2)</code> publishes the file asynchronously. <code>0</code> waits.</li>
+  <li><code>CLIO_FUSE_ASYNC_CLOSE</code> (default on): the handle release is not awaited. <code>0</code> waits.</li>
+  <li><code>CLIO_FUSE_ASYNC_UTIMENS</code> (default off): <code>1</code> detaches time-stamp updates on a single node. Reorders against later operations, so <code>rsync -a</code> and <code>cp -a</code> need it off.</li>
+</ul>
+<h3>Attributes and permissions</h3>
+<ul>
+  <li><code>CLIO_FUSE_PERMISSIONS</code> (default on): <code>0</code> stops adding <code>-o default_permissions</code> on Linux. On macOS and Windows the option is not added.</li>
+  <li><code>CLIO_FUSE_ATIME</code> (default <code>relatime</code>): <code>0</code> or <code>noatime</code> never updates access time; <code>strict</code> updates it on every read. Set automatically from the <code>-o</code> atime options.</li>
+  <li><code>CLIO_FUSE_XATTR</code> (default on): <code>0</code> answers every xattr call with <code>ENOSYS</code>, which stops the kernel from sending them.</li>
+</ul>
+<h3>Diagnostics</h3>
+<ul>
+  <li><code>CLIO_ALLOW_PTRACE=1</code>: let a debugger attach to the daemon on hosts with restricted ptrace scope.</li>
+  <li><code>CTP_LOG_LEVEL</code> (<code>debug</code>, <code>info</code>, <code>success</code>, <code>warning</code>, <code>error</code>, <code>fatal</code>) and <code>CTP_LOG_OUT</code> (log file path): shared with the runtime.</li>
+</ul>
+
+<h2>Compose keys</h2>
+<p>Both modules are entries of the runtime's <code>compose:</code> list. The four keys every entry has (<code>mod_name</code>, <code>pool_name</code>, <code>pool_query</code>, <code>pool_id</code>) and <code>restart</code> are described in the <a href="/docs/runtime/api.html#compose-file">runtime reference</a>. The filesystem entry must come after the chain it points to, and the stream entry before the filesystem.</p>
+<h3>clio_cte_filesystem</h3>
+<pre data-label="yaml">
+  - mod_name: clio_cte_filesystem
+    pool_name: clio_cte_filesystem
+    pool_query: local
+    pool_id: "560.0"
+    next_pool_id: "563.0"
+    metadata_log_path: "${CLIO_STORAGE_ROOT}/cfs_namespace_log"
+    # dir_split_entries: 1024
+    # case_insensitive: false
+    # stream_pool_id: "565.0"
+</pre>
+<ul>
+  <li><code>next_pool_id</code>: the CTE pool that stores the tags and blobs. Point it at the chain top (<code>563.0</code>) to use the cache, indexer and replication, or at <code>512.0</code> to bypass them.</li>
+  <li><code>metadata_log_path</code> (default unset): node-local journal of the directory table blocks this node is home for. The container id is appended, and <code>~</code> and <code>${VARS}</code> expand. Unset, directory blocks are stored as CTE blobs.</li>
+  <li><code>dir_split_entries</code> (default <code>1024</code>): rows a directory block holds before it splits.</li>
+  <li><code>case_insensitive</code> (default <code>false</code>): compare names case-insensitively while keeping their spelling. Fixed when the volume is created; a runtime configured the other way refuses the volume.</li>
+  <li><code>stream_pool_id</code> (default <code>"565.0"</code>): the stream pool that owns file sizes and appends.</li>
+</ul>
+<h3>clio_cte_stream</h3>
+<pre data-label="yaml">
+  - mod_name: clio_cte_stream
+    pool_name: clio_cte_stream
+    pool_query: local
+    pool_id: "565.0"
+    next_pool_id: "563.0"
+    staging_pool_id: "561.0"
+    # log_path: "/mnt/nvme/$USER/clio/cte_stream_log"
+</pre>
+<ul>
+  <li><code>next_pool_id</code>: the data path for page writes, normally the chain top.</li>
+  <li><code>staging_pool_id</code> (default: <code>next_pool_id</code>): where staged appends are written. The default configuration uses the replication pool so they skip the cache.</li>
+  <li><code>log_path</code> (default unset): node-local log of the sizes and merge plans of the streams this node homes. Without it file sizes do not survive a stop and start.</li>
+</ul>
+<p>The CTE core keys that affect the mount (<code>storage</code> tiers, <code>metadata_log_path</code>, <code>fsync_mode</code>, <code>flush_data_period_ms</code>) are documented on the <a href="/modules/cte-core.html">CTE core module page</a>.</p>
+
+<h2>Reading mounted files from the CTE API</h2>
+<p>A file at <code>/notes/a.txt</code> on the mount is a tag named by that path in the pool the filesystem forwards to. Its bytes are blobs <code>"0"</code>, <code>"1"</code>, ... of 1 MiB each, and its attributes are the blob <code>~i</code>. The <a href="/docs/cte/api.html">CTE API reference</a> covers <code>TagQuery</code>, <code>GetBlob</code> and <code>SemanticSearch</code>; the <a href="/docs/context-fs/quickstart.html">quickstart</a> shows a search over mounted files from Python.</p>

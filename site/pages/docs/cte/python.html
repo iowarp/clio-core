@@ -1,0 +1,131 @@
+<!--
+title: Python module
+heading: The <em>clio_cte_core_ext</em> module.
+description: Call-by-call reference for the clio_cte_core_ext Python module: setup, the Tag class, the blocking and asynchronous Client methods, futures, deferred and conditional puts, and the supporting types.
+eyebrow: Docs · Context Transfer Engine
+lede: <code>clio_cte_core_ext</code> is the Python binding of the CTE client. It ships in the <code>iowarp-core</code> wheel and is built with nanobind from <code>context-transfer-engine/wrapper/python/core_bindings.cc</code>. Payloads are <code>bytes</code>. Every blocking call releases the GIL. The higher-level <code>clio_cee</code> module is documented in the <a href="/docs/cee/api.html">Context Exploration Engine reference</a>.
+facts: Installed by | pip install iowarp-core ; Attach with | CLIO_WITH_RUNTIME=0 ; Keyword search needs | CLIO_CTE_POOL=564.0
+-->
+<h2>Connecting</h2>
+<p>Set environment variables before the import; the client reads them once when it connects.</p>
+<pre data-label="python">
+import os
+os.environ["CLIO_WITH_RUNTIME"] = "0"    # attach to a running clio_run
+os.environ["CLIO_CTE_POOL"] = "564.0"    # only needed for SemanticSearch
+
+import clio_cte_core_ext as cte
+cte.clio_init(cte.RuntimeMode.kClient, False)
+cte.initialize_cte("", cte.PoolQuery.Dynamic())
+client = cte.get_cte_client()
+</pre>
+<ul>
+  <li><code>clio_init(mode, default_with_runtime=False, is_restart=False) -&gt; bool</code>. <code>CLIO_WITH_RUNTIME</code> overrides the second argument. Waits up to <code>CLIO_WAIT_SERVER</code> seconds (default 30) for the runtime.</li>
+  <li><code>initialize_cte(config_path, pool_query) -&gt; bool</code>. Both arguments are required; pass <code>""</code> and <code>PoolQuery.Dynamic()</code> for the defaults.</li>
+  <li><code>get_cte_client() -&gt; Client</code>: a copy of the shared client. <code>Client()</code> and <code>Client(pool_id)</code> construct one directly.</li>
+</ul>
+
+<h2>Tag</h2>
+<div class="table-wrap"><table>
+  <thead><tr><th>Call</th><th>Returns</th></tr></thead>
+  <tbody>
+    <tr><td><code>Tag(tag_name)</code></td><td>Opens the tag, creating it if needed (GetOrCreateTag). <code>Tag(tag_id)</code> wraps an existing id without an RPC.</td></tr>
+    <tr><td><code>.PutBlob(blob_name, data: bytes, off=0)</code></td><td><code>None</code>. Writes at offset <code>off</code>; a new blob lands at score 1.0. Raises on a non-zero return code.</td></tr>
+    <tr><td><code>.GetBlob(blob_name, data_size, off=0)</code></td><td><code>bytes</code> of length <code>data_size</code>. Raises <code>RuntimeError</code> on failure.</td></tr>
+    <tr><td><code>.GetBlobSize(blob_name)</code></td><td><code>int</code>, bytes</td></tr>
+    <tr><td><code>.GetBlobScore(blob_name)</code></td><td><code>float</code>, 0.0 to 1.0</td></tr>
+    <tr><td><code>.GetContainedBlobs()</code></td><td><code>list[str]</code></td></tr>
+    <tr><td><code>.ReorganizeBlob(blob_name, new_score)</code></td><td><code>None</code>. Moves the blob to the tier the score selects.</td></tr>
+    <tr><td><code>.GetTagId()</code></td><td><code>UniqueId</code></td></tr>
+  </tbody>
+</table></div>
+
+<h2>Client: blocking calls</h2>
+<div class="table-wrap"><table>
+  <thead><tr><th>Call</th><th>Returns</th></tr></thead>
+  <tbody>
+    <tr><td><code>TagQuery(tag_regex, max_tags=0, pool_query=PoolQuery.Broadcast())</code></td><td><code>list[str]</code> of tag names</td></tr>
+    <tr><td><code>BlobQuery(tag_regex, blob_regex, max_blobs=0, pool_query=Broadcast())</code></td><td><code>list[tuple[str, str]]</code> of <code>(tag_name, blob_name)</code></td></tr>
+    <tr><td><code>SemanticSearch(tag_regex, blob_regex, query_text, k=10, pool_query=Broadcast())</code></td><td><code>list[SemanticSearchResult]</code>, best first; <code>k=0</code> means no cap</td></tr>
+    <tr><td><code>TemporalSearch(tag_regex, blob_regex, time_begin=0, time_end=0, max_entries=0, pool_query=Broadcast())</code></td><td><code>list[TemporalSearchResult]</code>, ascending by <code>last_modified</code></td></tr>
+    <tr><td><code>ReorganizeBlob(tag_id, blob_name, new_score)</code></td><td><code>True</code> on success</td></tr>
+    <tr><td><code>DelBlob(tag_id, blob_name)</code></td><td><code>True</code> on success</td></tr>
+    <tr><td><code>PollTelemetryLog(minimum_logical_time)</code></td><td><code>list[CteTelemetry]</code></td></tr>
+    <tr><td><code>RegisterTarget(target_name, bdev_type, total_size)</code> or <code>RegisterTarget(target_name, bdev_type, total_size, target_query, bdev_id)</code></td><td><code>int</code>, 0 on success</td></tr>
+  </tbody>
+</table></div>
+<p>Patterns must match the whole name (<code>std::regex_match</code>), so use <code>.*part.*</code> for a substring. <code>SemanticSearch</code> ranks every blob matching both patterns, including blobs with no query word (score 0). For files in a mount, use <code>"[0-9]+"</code> as the blob pattern to search pages and skip each file's attribute blob.</p>
+<div class="callout warn">
+  <span class="callout-title">Time values are not Unix time</span>
+  <p><code>last_modified</code> comes from a steady clock, although the docstrings say epoch nanoseconds. A <code>time_begin</code> computed from <code>time.time()</code> matches nothing. Treat <code>last_modified</code> as an ordering key within one run of the runtime. This is a suspected bug in the source.</p>
+</div>
+
+<h2>Client: asynchronous calls</h2>
+<p>Each returns a <code>Future</code>. Submission runs without the GIL and may block while shared memory is allocated.</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Call</th><th><code>result()</code></th></tr></thead>
+  <tbody>
+    <tr><td><code>AsyncGetOrCreateTag(tag_name, pool_query=Dynamic())</code></td><td><code>UniqueId</code></td></tr>
+    <tr><td><code>AsyncPutBlob(tag_id, blob_name, data, off=0)</code></td><td><code>None</code>; <code>wait()</code> gives the return code</td></tr>
+    <tr><td><code>AsyncPutBlobIfAbsent(tag_id, blob_name, data, off=0)</code></td><td><code>{"code", "version"}</code>; a non-zero code means another writer won</td></tr>
+    <tr><td><code>AsyncPutBlobIfVersion(tag_id, blob_name, data, version, off=0)</code></td><td><code>{"code", "version"}</code>; absent counts as version 0</td></tr>
+    <tr><td><code>AsyncGetBlob(tag_id, blob_name, data_size, off=0)</code></td><td><code>bytes</code></td></tr>
+    <tr><td><code>AsyncGetBlobVersioned(tag_id, blob_name, data_size, off=0)</code></td><td><code>{"code", "version", "data"}</code>; <code>data</code> is <code>None</code> on failure</td></tr>
+    <tr><td><code>AsyncGetBlobDefer(tag_id, blob_name, data_size, off=0)</code></td><td><code>bytes</code>, after any pending deferred put to the blob completes</td></tr>
+    <tr><td><code>AsyncGetBlobSize(tag_id, blob_name, pool_query=Dynamic())</code></td><td><code>int</code></td></tr>
+    <tr><td><code>AsyncGetContainedBlobs(tag_id, pool_query=Broadcast())</code></td><td><code>list[str]</code></td></tr>
+    <tr><td><code>AsyncDelBlob(tag_id, blob_name)</code></td><td><code>None</code>; <code>wait()</code> gives the return code</td></tr>
+    <tr><td><code>AsyncReorganizeBlob(tag_id, blob_name, new_score)</code></td><td><code>None</code></td></tr>
+    <tr><td><code>AsyncTagQuery(tag_regex, max_tags=0, pool_query=Broadcast())</code></td><td><code>list[str]</code></td></tr>
+    <tr><td><code>AsyncBlobQuery(tag_regex, blob_regex, max_blobs=0, pool_query=Broadcast())</code></td><td><code>list[tuple[str, str]]</code></td></tr>
+    <tr><td><code>AsyncSemanticSearch(tag_regex, blob_regex, query_text, k=10, pool_query=Broadcast())</code></td><td><code>list[SemanticSearchResult]</code></td></tr>
+    <tr><td><code>AsyncTemporalSearch(tag_regex, blob_regex, time_begin=0, time_end=0, max_entries=0, pool_query=Broadcast())</code></td><td><code>list[TemporalSearchResult]</code></td></tr>
+    <tr><td><code>AsyncPollTelemetryLog(minimum_logical_time)</code></td><td><code>list[CteTelemetry]</code></td></tr>
+    <tr><td><code>AsyncRegisterTarget(target_name, bdev_type, total_size, target_query=Local(), bdev_id=UniqueId.GetNull(), pool_query=Dynamic(), attach_existing=0, growth_unit=1&lt;&lt;30)</code></td><td><code>None</code>; <code>wait()</code> gives the return code</td></tr>
+    <tr><td><code>AsyncGetCapacity(pool_query=Local())</code></td><td><code>CapacityInfo</code>; raises <code>RuntimeError</code> on a failed query</td></tr>
+    <tr><td><code>AsyncListTargets(pool_query=Local())</code></td><td><code>list[str]</code>; Broadcast appends names from replicas without deduplication</td></tr>
+    <tr><td><code>AsyncStatTargets(pool_query=Local())</code></td><td><code>None</code>; requests a one-shot statistics refresh</td></tr>
+    <tr><td><code>AsyncGetTargetInfo(target_name, pool_query=Local())</code></td><td><code>TargetInfo</code>; raises <code>RuntimeError</code> on a failed query or a missing target</td></tr>
+  </tbody>
+</table></div>
+<h3>Future</h3>
+<ul>
+  <li><code>wait(max_sec=-1)</code>: blocks until done; returns the return code, or <code>None</code> if <code>max_sec</code> (when positive) elapses first.</li>
+  <li><code>done()</code>: <code>True</code> when the task has completed.</li>
+  <li><code>result(max_sec=-1)</code>: blocks, then returns the value in the table above. Raises <code>TimeoutError</code> if <code>max_sec</code> elapses.</li>
+</ul>
+<h3>Deferred puts</h3>
+<ul>
+  <li><code>AsyncPutBlobDefer(tag_id, blob_name, data, off=0, max_inflight_bytes=0) -&gt; int</code>: stages a copy of <code>data</code> in shared memory and returns 0 when submitted. <code>data</code> is free to reuse as soon as the call returns. When shared memory is exhausted the call waits for the oldest puts; <code>max_inflight_bytes</code> adds an explicit ceiling (0 means none).</li>
+  <li><code>AwaitPutsUntilSpace(max_inflight_bytes) -&gt; int</code>: waits until at most that many payload bytes are in flight (0 drains all) and returns the bytes still in flight.</li>
+  <li><code>DeferErrorCount() -&gt; int</code>: deferred puts that completed with a non-zero return code. The count is sticky.</li>
+</ul>
+
+<h2>Supporting types</h2>
+<ul>
+  <li><code>UniqueId(major, minor)</code>: the tag id, with <code>major_</code>, <code>minor_</code>, <code>IsNull()</code>, <code>ToU64()</code> and the static <code>GetNull()</code>.</li>
+  <li><code>PoolQuery.Broadcast()</code>, <code>PoolQuery.Dynamic()</code>, <code>PoolQuery.Local(parallelism=32)</code>.</li>
+  <li><code>SemanticSearchResult</code>: <code>tag_id</code>, <code>blob_name</code>, <code>score</code>. <code>TemporalSearchResult</code>: <code>tag_id</code>, <code>blob_name</code>, <code>last_modified</code>.</li>
+  <li><code>CteTelemetry</code>: <code>op_</code> (a <code>CteOp</code>), <code>off_</code>, <code>size_</code>, <code>tag_id_</code>, <code>mod_time_</code>, <code>read_time_</code>, <code>logical_time_</code>.</li>
+  <li><code>CapacityInfo</code>: <code>total_capacity</code>, <code>remaining_capacity</code>. <code>TargetInfo</code>: <code>target_score</code>, <code>remaining_space</code>, <code>bytes_read</code>, <code>bytes_written</code>, <code>ops_read</code>, <code>ops_written</code>.</li>
+  <li>Enums: <code>RuntimeMode</code> (<code>kClient</code>, <code>kServer</code>, <code>kRuntime</code>), <code>BdevType</code> (<code>kFile</code>, <code>kRam</code>), <code>CteOp</code> (<code>kPutBlob</code>, <code>kGetBlob</code>, <code>kDelBlob</code>, <code>kGetOrCreateTag</code>, <code>kDelTag</code>, <code>kGetTagSize</code>).</li>
+</ul>
+
+<h2>Example</h2>
+<pre data-label="python">
+tag = cte.Tag("experiment/run1")
+tag.PutBlob("note0", b"Arctic sea ice extent fell to a record low.", 0)
+tag.PutBlob("note1", b"Atmospheric CO2 passed 420 ppm.", 0)
+
+for tag_name, blob_name in client.BlobQuery("experiment/.*", "note.*"):
+    print(tag_name, blob_name)
+
+for hit in client.SemanticSearch("experiment/.*", ".*", "sea ice", k=5):
+    print(hit.blob_name, hit.score)
+
+tag.ReorganizeBlob("note1", 0.0)
+
+futs = [client.AsyncGetBlob(tag.GetTagId(), n, tag.GetBlobSize(n), 0) for n in ("note0", "note1")]
+payloads = [f.result() for f in futs]
+
+client.DelBlob(tag.GetTagId(), "note0")
+</pre>

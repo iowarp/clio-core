@@ -1,0 +1,254 @@
+<!--
+title: API reference
+heading: Context Assimilation Engine <em>API reference.</em>
+description: Reference for the Context Assimilation Engine: the OMNI YAML schema, the clio_cae tool, the AssimilationCtx fields, the C++ client, the compose keys of the core and summarizer modules, the ParseOmni result codes, and every environment variable the engine reads.
+eyebrow: Docs · Context Assimilation Engine
+lede: Every key, field, signature and default on this page is taken from the source under context-assimilation-engine. Where a value has a default, it is stated. Where a feature needs a build option, the option is named.
+facts: OMNI parser | core/src/omni_loader.cc ; Context | factory/assimilation_ctx.h ; Client | clio_cae/core/core_client.h ; Compose keys | core_tasks.h, summarizer_tasks.h
+-->
+<h2>OMNI file schema</h2>
+<p>An OMNI file is YAML. The loader reads one top-level key, <code>transfers</code>, which must be a sequence. Any other top-level key is ignored. Each transfer is a map; <code>src</code>, <code>dst</code> and <code>format</code> are required, and a transfer that omits one fails the load with a message naming it by 1-based position. A per-transfer key not in the list below is logged as a warning and ignored.</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td><code>src</code></td><td>string</td><td>required</td><td>Source URL. The scheme selects the assimilator: <code>file::</code>, <code>string::</code>, <code>hdf5::</code>, <code>http://</code>, <code>https://</code>, <code>s3://</code>, <code>gs://</code>, <code>gcs://</code>, <code>globus://</code>.</td></tr>
+    <tr><td><code>dst</code></td><td>string</td><td>required</td><td>Destination, <code>iowarp::&lt;tag name&gt;</code>.</td></tr>
+    <tr><td><code>format</code></td><td>string</td><td>required</td><td><code>binary</code>, <code>hdf5</code>, <code>hdf5_vol</code> or <code>globus</code>. The HDF5 assimilator acts on <code>hdf5_vol</code>; the run-step logic treats any format starting with <code>hdf5</code> as HDF5.</td></tr>
+    <tr><td><code>depends_on</code></td><td>string</td><td><code>""</code></td><td>The exact <code>src</code> or <code>dst</code> of an earlier transfer. Checked before anything is scheduled; a dependency on a later transfer, on itself, or on nothing fails the file with result code -3.</td></tr>
+    <tr><td><code>range_off</code></td><td>integer</td><td>0</td><td>Byte offset into the source.</td></tr>
+    <tr><td><code>range_size</code></td><td>integer</td><td>0</td><td>Bytes to read from <code>range_off</code>. 0 means to the end.</td></tr>
+    <tr><td><code>src_token</code></td><td>string</td><td><code>""</code></td><td>Source credential. Environment-expanded. Sent as <code>Authorization: Bearer</code> for HTTP sources and used as the Globus access token.</td></tr>
+    <tr><td><code>dst_token</code></td><td>string</td><td><code>""</code></td><td>Destination credential. Environment-expanded. Carried in the context; no shipped assimilator reads it.</td></tr>
+    <tr><td><code>dataset_filter</code></td><td>map</td><td>none</td><td>Holds <code>include_patterns</code> and <code>exclude_patterns</code>, each a sequence of glob patterns (<code>*</code>, <code>?</code>, <code>[]</code>; <code>*</code> crosses <code>/</code>). Used by the HDF5 assimilator. Empty include means include all.</td></tr>
+    <tr><td><code>run</code></td><td>path</td><td>none</td><td>Script run by <code>clio_cae</code> before submission, as <code>script &lt;source&gt; &lt;run_out&gt;</code>. Environment-expanded; relative to the OMNI file's directory. Requires <code>run_out</code>.</td></tr>
+    <tr><td><code>run_out</code></td><td>path</td><td>none</td><td>The file the script writes; it replaces the source. Same expansion rules. Requires <code>run</code>.</td></tr>
+  </tbody>
+</table></div>
+<p>Fields of <code>AssimilationCtx</code> that have no OMNI key (<code>src_data</code>, <code>s3_region</code>, <code>s3_profile</code>, <code>on_fault</code>, <code>chunk_size</code>, <code>blob_prefix</code>) can only be set from code.</p>
+
+<h2>clio_cae tool</h2>
+<pre data-label="shell">
+$ clio_cae &lt;omni_file_path&gt;
+</pre>
+<p>One positional argument, the OMNI file. Any other argument count prints the usage and exits 1. <code>clio_cae_omni</code> is an installed alias. The tool:</p>
+<ol class="steps">
+  <li>Initializes a runtime client (<code>CLIO_INIT(kClient, false)</code>) and exits 1 if the runtime is unreachable.</li>
+  <li>Loads the file with <code>LoadOmni</code>, collecting <code>run</code> steps.</li>
+  <li>Executes the run steps in order with <code>ExecuteRunSteps</code>. On failure it exits 1 having submitted nothing.</li>
+  <li>Submits one <code>ParseOmni</code> task to pool 400.0 and waits.</li>
+  <li>Exits 1 if <code>result_code_</code> or the task framework code is non-zero, printing <code>error_message_</code>, or if the request was non-empty and <code>num_tasks_scheduled_</code> is 0. Otherwise prints the count and exits 0.</li>
+</ol>
+<p>Environment: the tool honors the runtime client variables (<code>CLIO_SERVER_CONF</code>, <code>CLIO_WITH_RUNTIME</code>, and on Windows <code>CLIO_SERVER_ADDR=127.0.0.1</code> with <code>CLIO_BIND_ADDR=127.0.0.1</code>). It reads no CAE-specific variables itself.</p>
+
+<h2>ParseOmni result codes</h2>
+<p>The <code>ParseOmniTask</code> outputs are <code>num_tasks_scheduled_</code> (u32), <code>result_code_</code> (u32, printed signed) and <code>error_message_</code>. Transfers are processed in order and the task stops at the first failure, so <code>num_tasks_scheduled_</code> is the count completed before it.</p>
+<ul>
+  <li><strong>0</strong>: every transfer ran.</li>
+  <li><strong>-1</strong>: the serialized context list could not be deserialized.</li>
+  <li><strong>-2</strong>: no assimilator for a source scheme, including a scheme whose support was not compiled in.</li>
+  <li><strong>-3</strong>: a <code>depends_on</code> that cannot be honored.</li>
+  <li><strong>-9</strong>: HDF5 include patterns matched no dataset.</li>
+  <li><strong>-20</strong>: an <code>on_fault</code> transfer whose assimilator cannot ingest per blob.</li>
+  <li><strong>Other non-zero</strong>: the assimilator's own error code, with <code>error_message_</code> set to <code>Assimilator failed</code>, or a CTE return code during <code>on_fault</code> setup with <code>on_fault assimilation setup failed</code>.</li>
+</ul>
+
+<h2>AssimilationCtx</h2>
+<p>Declared in <code>clio_cae/core/factory/assimilation_ctx.h</code>, namespace <code>clio::cae::core</code>. It is serialized into the <code>ParseOmni</code> task.</p>
+<pre data-label="cpp">
+struct AssimilationCtx {
+  std::string src;          // source URL
+  std::string dst;          // iowarp::&lt;tag&gt;
+  std::string format;       // binary, hdf5, hdf5_vol, globus
+  std::string depends_on;   // "" if none
+  size_t range_off;         // 0
+  size_t range_size;        // 0 = whole source
+  std::string src_token;
+  std::string dst_token;
+  std::string s3_region;    // -&gt; AWS_DEFAULT_REGION for the S3 helper; "" = inherit
+  std::string s3_profile;   // -&gt; AWS_PROFILE for the S3 helper; "" = inherit
+  std::string src_data;     // payload for string:: sources
+  bool on_fault = false;    // register as fault handler instead of ingesting now
+  size_t chunk_size = 0;    // bytes per blob; 0 = assimilator default (1 MiB for files)
+  std::string blob_prefix = "chunk_";   // "" names blobs "0", "1", ...
+  std::vector&lt;std::string&gt; include_patterns;
+  std::vector&lt;std::string&gt; exclude_patterns;
+
+  AssimilationCtx();
+  AssimilationCtx(const std::string&amp; src_url, const std::string&amp; dst_url,
+                  const std::string&amp; data_format, const std::string&amp; dependency = "",
+                  size_t offset = 0, size_t size = 0,
+                  const std::string&amp; source_token = "", const std::string&amp; dest_token = "");
+};
+
+// Returns "" when every depends_on names an earlier context, else a message.
+std::string CheckDependencies(const std::vector&lt;AssimilationCtx&gt;&amp; ctxs);
+</pre>
+<p>The Python binding of this struct, with two constructors and the first nine fields as attributes, is on the <a href="/docs/cee/api.html#assimilationctx">CEE API page</a>.</p>
+
+<h2>OMNI loader functions</h2>
+<p>Linked into <code>clio_cae</code> from the static library <code>cae_omni_loader</code>. Headers <code>clio_cae/core/omni_loader.h</code> and <code>clio_cae/core/omni_run.h</code>.</p>
+<pre data-label="cpp">
+namespace clio::cae::core {
+std::vector&lt;AssimilationCtx&gt; LoadOmni(const std::string&amp; omni_path,
+                                      std::vector&lt;RunStep&gt;* runs = nullptr);
+// Throws std::runtime_error on an unreadable file, a missing or non-sequence
+// `transfers`, a missing src/dst/format, or a `run` key when runs == nullptr.
+
+struct RunStep { size_t transfer = 0; std::string script; std::string out; };
+std::string RunSourceArg(const std::string&amp; src);     // path for file::/hdf5::, else the URL
+std::string RunOutputSrc(const std::string&amp; format, const std::string&amp; out);  // hdf5:: or file::
+int RunScript(const std::string&amp; script, const std::vector&lt;std::string&gt;&amp; args, std::string* err);
+std::string ExecuteRunSteps(const std::vector&lt;RunStep&gt;&amp; steps,
+                            std::vector&lt;AssimilationCtx&gt;* contexts);  // "" on success
+}
+</pre>
+
+<h2>C++ client</h2>
+<p>Header <code>clio_cae/core/core_client.h</code>, class <code>clio::cae::core::Client</code>, derived from <code>clio::run::ContainerClient</code>. The CAE pool id constant is <code>clio::cae::core::kCaePoolId</code>, which is 400.0. Link against <code>clio_cae_core_client</code>. Every method returns a <code>clio::run::Future&lt;Task&gt;</code>; call <code>Wait()</code> and read the task's output fields.</p>
+<pre data-label="cpp">
+namespace clio::cae::core {
+class Client : public clio::run::ContainerClient {
+ public:
+  Client() = default;
+  explicit Client(const clio::run::PoolId&amp; pool_id);
+
+  Future&lt;CreateTask&gt;  AsyncCreate(const PoolQuery&amp; pool_query, const std::string&amp; pool_name,
+                                  const PoolId&amp; custom_pool_id, const CreateParams&amp; params = CreateParams());
+  Future&lt;MonitorTask&gt; AsyncMonitor(const PoolQuery&amp; pool_query, const std::string&amp; query);
+
+  // Submit a list of transfers. Outputs: num_tasks_scheduled_, result_code_, error_message_.
+  Future&lt;ParseOmniTask&gt; AsyncParseOmni(const std::vector&lt;AssimilationCtx&gt;&amp; contexts);
+
+  // Write every blob of a tag to one file. format: "hdf5" or "binary".
+  // Outputs: result_code_, error_message_, bytes_exported_.
+  Future&lt;ExportDataTask&gt; AsyncExportData(const std::string&amp; tag_name, const std::string&amp; output_path,
+                                         const std::string&amp; format,
+                                         const PoolQuery&amp; pool_query = PoolQuery::Local());
+
+  // Read an HDF5 dataset (path == tag_name) from a file into a tag. format: "hdf5".
+  // Outputs: result_code_, error_message_, bytes_imported_.
+  Future&lt;ImportDataTask&gt; AsyncImportData(const std::string&amp; tag_name, const std::string&amp; input_path,
+                                         const std::string&amp; format,
+                                         const PoolQuery&amp; pool_query = PoolQuery::Local());
+
+  // One HDF5 dataset into tags under tag_prefix, routable to a node.
+  Future&lt;ProcessHdf5DatasetTask&gt; AsyncProcessHdf5Dataset(const PoolQuery&amp; pool_query,
+                                         const std::string&amp; file_path, const std::string&amp; dataset_path,
+                                         const std::string&amp; tag_prefix);
+
+  // CTE passthroughs: same arguments as clio::cte::core::Client, forwarded to next_pool_id.
+  Future&lt;PutBlobTask&gt;        AsyncPutBlob(const TagId&amp;, const std::string&amp; blob_name, u64 offset, u64 size,
+                                          ShmPtr&lt;&gt; blob_data, float score = -1.0f,
+                                          const Context&amp; = Context(), u32 flags = 0,
+                                          const PoolQuery&amp; = PoolQuery::Dynamic());
+  Future&lt;GetBlobTask&gt;        AsyncGetBlob(const TagId&amp;, const std::string&amp; blob_name, u64 offset, u64 size,
+                                          u32 flags, ShmPtr&lt;&gt; blob_data,
+                                          const PoolQuery&amp; = PoolQuery::Dynamic());
+  Future&lt;GetOrCreateTagTask&gt; AsyncGetOrCreateTag(const std::string&amp; tag_name,
+                                          const TagId&amp; = TagId::GetNull(),
+                                          const PoolQuery&amp; = PoolQuery::Dynamic());
+  Future&lt;SemanticSearchTask&gt; AsyncSemanticSearch(const std::string&amp; tag_regex, const std::string&amp; blob_regex,
+                                          const std::string&amp; query_text, u32 k = 10,
+                                          const PoolQuery&amp; = PoolQuery::Local());
+};
+}
+
+// Singleton. Initializes the CTE client first. Returns false on failure.
+bool CLIO_CAE_CLIENT_INIT(const std::string&amp; config_path = "",
+                          const clio::run::PoolQuery&amp; pool_query = clio::run::PoolQuery::Dynamic());
+#define CLIO_CAE_CLIENT  /* clio::cae::core::Client* */
+</pre>
+<pre data-label="cpp">
+#include &lt;clio_cae/core/core_client.h&gt;
+#include &lt;clio_cae/core/constants.h&gt;
+
+clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, false);
+CLIO_CAE_CLIENT_INIT();
+clio::cae::core::Client cae(clio::cae::core::kCaePoolId);
+
+clio::cae::core::AssimilationCtx item("file::/data/run42/field.bin", "iowarp::run42_field", "binary");
+auto f = cae.AsyncParseOmni({item});
+f.Wait();
+if (f-&gt;result_code_ != 0) { /* f-&gt;error_message_ */ }
+</pre>
+<p>The <code>ExportData</code>, <code>ImportData</code> and <code>ProcessHdf5Dataset</code> handlers return <code>result_code_</code> -1 with <code>HDF5 support not compiled in</code> when the build lacks <code>CLIO_CORE_ENABLE_HDF5</code>.</p>
+
+<h2>Compose keys: clio_cae_core</h2>
+<p>Module <code>clio_cae_core</code>, method ids in <code>core/clio_mod.yaml</code>. The <code>CreateParams</code> loader reads one key from the compose entry.</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Key</th><th>Default</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td><code>mod_name</code></td><td>required</td><td><code>clio_cae_core</code></td></tr>
+    <tr><td><code>pool_name</code></td><td>required</td><td>Any name; the default file uses <code>cae_main</code>.</td></tr>
+    <tr><td><code>pool_id</code></td><td>required</td><td><code>"400.0"</code>. Clients, <code>clio_cae</code> and the CEE connect to <code>kCaePoolId</code>, so use this value.</td></tr>
+    <tr><td><code>pool_query</code></td><td>required</td><td><code>local</code> in the default file.</td></tr>
+    <tr><td><code>next_pool_id</code></td><td>null</td><td><code>"major.minor"</code> of the pool the CAE writes through and forwards to. Null falls back to the CTE core, 512.0. The default file sets <code>"563.0"</code>.</td></tr>
+  </tbody>
+</table></div>
+<p>Methods the module handles: <code>kParseOmni</code> (10), <code>kProcessHdf5Dataset</code> (11), <code>kExportData</code> (12), <code>kImportData</code> (13), and the CTE passthroughs <code>kGetOrCreateTag</code> (14), <code>kPutBlob</code> (15), <code>kGetBlob</code> (16) and <code>kSemanticSearch</code> (35), whose ids equal the CTE core's.</p>
+
+<h2>Compose keys: clio_cae_summarizer</h2>
+<p>Module <code>clio_cae_summarizer</code>. It interposes <code>kPutBlob</code> (15) and forwards every other CTE core method to <code>next_pool_id</code>. With no rules it is a pure passthrough.</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Key</th><th>Default</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td><code>next_pool_id</code></td><td>null (CTE core)</td><td>Pool every operation is forwarded to.</td></tr>
+    <tr><td><code>label_endpoint</code></td><td><code>""</code></td><td>Base URL of the inference server.</td></tr>
+    <tr><td><code>label_api</code></td><td><code>ollama</code> when empty</td><td><code>ollama</code> posts to <code>{label_endpoint}/api/generate</code>; <code>openai</code> posts to <code>{label_endpoint}/chat/completions</code>. Any other value fails pool creation.</td></tr>
+    <tr><td><code>label_api_key_file</code></td><td><code>""</code></td><td><code>openai</code> only. File holding the bearer token. Wins over the env var. Re-read per request.</td></tr>
+    <tr><td><code>label_api_key_env</code></td><td><code>""</code></td><td><code>openai</code> only. Name of an environment variable holding the token. Neither set: no <code>Authorization</code> header.</td></tr>
+    <tr><td><code>label_prompts</code></td><td>empty map</td><td>Prompt name to template. The model input is <code>{prompt}\n\n{blob_text}</code>.</td></tr>
+    <tr><td><code>label_matches</code></td><td>empty list</td><td>Rules, in priority order; the first match wins. Each rule has the keys below.</td></tr>
+  </tbody>
+</table></div>
+<div class="table-wrap"><table>
+  <thead><tr><th>Rule key</th><th>Default</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td><code>tag_re</code></td><td><code>""</code></td><td>Regex searched (not full-matched) against the tag name.</td></tr>
+    <tr><td><code>blob_re</code></td><td><code>""</code></td><td>Regex searched against the blob name.</td></tr>
+    <tr><td><code>model</code></td><td><code>""</code></td><td>Model name sent to the endpoint.</td></tr>
+    <tr><td><code>prompt</code></td><td><code>""</code></td><td>Key into <code>label_prompts</code>.</td></tr>
+    <tr><td><code>context_length</code></td><td>4096</td><td>Token budget per request: Ollama <code>num_ctx</code>, and the chunking budget for both APIs. 0 or less disables chunking.</td></tr>
+    <tr><td><code>num_predict</code></td><td>0</td><td>Cap on response tokens (Ollama <code>num_predict</code>, OpenAI <code>max_tokens</code>). 0 means no cap.</td></tr>
+  </tbody>
+</table></div>
+<p>The label is stored as <code>{blob_name}_label</code> in the same tag with the same placement score. A payload larger than the budget is split into chunks of about 75% of <code>context_length</code> tokens at 3 bytes per token, minus the prompt template, and the chunk replies are concatenated.</p>
+
+<h2>Environment variables</h2>
+<p>Read by the runtime process unless noted. Values in parentheses are defaults.</p>
+<h3>Ingest on fault</h3>
+<ul>
+  <li><code>CLIO_CAE_FAULT_RESERVE_MB</code> (512): megabytes kept free across the node's targets. A fault-ingested blob that would cross that line is served from the source without being stored.</li>
+  <li><code>CLIO_CAE_FAULT_STORE</code> (1): set to <code>0</code> to never store fault-ingested blobs, giving pure read-through.</li>
+  <li><code>CLIO_CAE_FAULT_STATS</code> (unset): set to <code>1</code> to log the fault stage counters every 5 seconds.</li>
+  <li><code>CLIO_CAE_REF_IO_THREADS</code> (32): size of the thread pool that performs blocking source I/O for faults. 0 is treated as 1.</li>
+</ul>
+<h3>HTTP sources</h3>
+<ul>
+  <li><code>CAE_HTTP_AUTH_FILE</code> (<code>~/.clio/cae_http_auth.ini</code>): INI file of per-host or per-prefix sections with <code>query.*</code>, <code>header.*</code>, <code>bearer_token</code>, <code>user</code>, <code>password</code> and <code>client</code> (<code>curl</code> or <code>wget</code>). <code>${VAR}</code> in a value is expanded; an unset variable is an error. A file holding a secret must be mode 600.</li>
+  <li><code>CAE_HTTP_STREAMS</code> (8, 1 to 64): parallel ranged GETs.</li>
+  <li><code>CAE_HTTP_PART_MB</code> (64, 1 to 4096): bytes per ranged GET, in MiB.</li>
+  <li><code>CAE_HTTP_PART_RETRIES</code> (5, 0 to 100) and <code>CAE_HTTP_BACKOFF_MS</code> (1000, 0 to 60000): per-part retry policy.</li>
+  <li><code>CAE_HTTP_OVERWRITE</code> (0): set to 1 to overwrite an existing download.</li>
+  <li><code>CAE_HTTP_PROGRESS_S</code> (30, 0 to 3600): seconds between progress log lines.</li>
+  <li><code>CAE_HTTP_CURL</code>, <code>CAE_HTTP_WGET</code>: paths of the client programs.</li>
+  <li><code>CAE_HTTP_TOKEN</code>: read by the standalone <code>cae_http_tool</code> only, in place of <code>src_token</code>.</li>
+</ul>
+<h3>S3 sources</h3>
+<ul>
+  <li>Standard AWS variables: <code>AWS_ACCESS_KEY_ID</code>, <code>AWS_SECRET_ACCESS_KEY</code>, <code>AWS_SESSION_TOKEN</code>, <code>AWS_PROFILE</code>, <code>AWS_DEFAULT_REGION</code> (<code>us-east-1</code> in the helper), <code>S3_ENDPOINT</code> or <code>AWS_ENDPOINT_URL</code> for S3-compatible stores (path-style addressing), <code>AWS_NO_SIGN_REQUEST=1</code> to force anonymous requests.</li>
+  <li><code>CAE_S3_STREAMS</code> (up to 64): parallel GET streams.</li>
+  <li><code>CAE_S3_PART_MB</code> (up to 1024): part size in MiB.</li>
+  <li><code>CAE_S3_MAX_RESUMES</code> (1 to 1000), <code>CAE_S3_BACKOFF_MS</code> (0 to 30000), <code>CAE_S3_PART_RETRIES</code> (0 to 100): resume policy for a GET stream that ends short.</li>
+  <li><code>CAE_S3_TOOL</code>: read by the S3 read benchmark to locate <code>cae_s3_tool</code>.</li>
+</ul>
+<h3>Other sources</h3>
+<ul>
+  <li><code>GLOBUS_ACCESS_TOKEN</code>: Globus token when <code>src_token</code> is empty. <code>GLOBUS_HTTPS_ACCESS_TOKEN</code> is read for the HTTPS collection path.</li>
+  <li><code>GCS_ENDPOINT</code>: overrides the Google Cloud Storage endpoint.</li>
+</ul>
+<h3>Client side</h3>
+<ul>
+  <li><code>CLIO_CTE_POOL</code> (<code>major.minor</code>): binds the process's CTE client, which <code>CLIO_CAE_CLIENT_INIT</code> creates, to an interposing pool. Needed for semantic queries; see the <a href="/docs/cee/usage.html#connecting-to-the-runtime">CEE usage page</a>.</li>
+  <li><code>CLIO_WITH_RUNTIME</code>: <code>1</code> or <code>true</code> makes a client try to start a runtime in-process before attaching. <code>clio_cae</code> and the CEE default to attaching only.</li>
+</ul>
