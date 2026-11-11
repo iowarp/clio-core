@@ -88,7 +88,7 @@ constexpr double kEvBucketUs[EvChan::kBuckets - 1] = {
 // the copy waited on the device before starting, and how long it ran.
 // 19-30: rtt_remote split into per-stage spans on the node that runs each
 // stage -- see clio_runtime/evlat.h for the map.
-constexpr int kNumEvChan = 31;
+constexpr int kNumEvChan = 34;
 EvChan g_chan[kNumEvChan];
 const char *g_chan_name[kNumEvChan] = {"multi_total", "multi_await", "get_total",
                               "bdev_h2d",   "read_await",  "get_meta",
@@ -101,7 +101,8 @@ const char *g_chan_name[kNumEvChan] = {"multi_total", "multi_await", "get_total"
                               "o_netq", "o_send",
                               "r_read", "r_recvin", "r_lane", "r_exec",
                               "r_netq", "r_send", "r_resid",
-                              "o_read", "o_recvout", "peer_poll"};
+                              "o_read", "o_recvout", "peer_poll",
+                              "c_e2e", "o_res_loc", "o_res_rem"};
 
 // TSC rate. The report used to assume a 3 GHz TSC (2995 cycles/us); on a
 // 2.2 GHz part every printed microsecond was 27% short. Measured once at

@@ -62,7 +62,16 @@ enum Chan : int {
   kOriginRead = 28,
   kOriginRecvOut = 29,
   kPeerRecvPoll = 30,
-  kNumChan = 31,
+  // Client <-> runtime on one node (the part of a request no channel above
+  // covers): c_e2e is timed IN THE CLIENT (CLIO_EVLAT in its env), from
+  // registering the pending future at send to its receive thread demuxing the
+  // reply; o_res_loc / o_res_rem are timed in the runtime, from a worker
+  // popping the request off the client SHM shard to the response being
+  // copied into the client's ring, for requests served here vs sent to a peer.
+  kClientE2E = 31,
+  kOriginResLocal = 32,
+  kOriginResRemote = 33,
+  kNumChan = 34,
 };
 
 enum Busy : int { kBusyPeerRecv = 0, kBusyNetSend = 1, kNumBusy = 2 };

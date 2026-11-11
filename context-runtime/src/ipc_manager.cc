@@ -4719,6 +4719,8 @@ bool IpcManager::DrainShmResponses() {
       continue;
     }
     Task *task = it->second.task;
+    clio::run::evlat::Span(clio::run::evlat::kClientE2E, it->second.submit_cyc,
+                           clio::run::evlat::Now());
     // Park the archive; RecvOut moves it out and deserializes into the task.
     // Demuxing here (not just for our own net_key) is what lets one draining
     // waiter serve every waiter's response.

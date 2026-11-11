@@ -1040,6 +1040,8 @@ class RunContext {
   unsigned long long net_enq_cyc_ = 0;
   unsigned long long remote_arrive_cyc_ = 0;
   unsigned long long remote_start_cyc_ = 0;
+  /** CLIO_EVLAT: a worker popped this client request off its SHM shard. */
+  unsigned long long client_arrive_cyc_ = 0;
 
  private:
   std::atomic<bool> is_notified_; /**< Atomic flag to prevent duplicate event

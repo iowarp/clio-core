@@ -1998,6 +1998,7 @@ class IpcManager {
   // while the client's Future (which owns them) is alive.
   struct PendingClientFuture {
     Task *task = nullptr;  // waiter (task->fut_) + SetComplete()/SetNewData()
+    unsigned long long submit_cyc = 0;  // CLIO_EVLAT c_e2e start (0 = off)
   };
   // Pending futures (client-side, keyed by net_key)
   std::unordered_map<size_t, PendingClientFuture> pending_zmq_futures_;
