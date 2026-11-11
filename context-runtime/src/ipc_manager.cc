@@ -4724,6 +4724,7 @@ void IpcManager::EnqueueShmSend(const std::string &dest,
     std::lock_guard<std::mutex> lk(q->mtx);
     q->pending.push_back(std::move(future));
   }
+  shm_send_pending_.fetch_add(1, std::memory_order_release);
   // No wake needed: the workers drain these queues in their poll loop
   // (DrainShmSends), and the enqueuing worker itself will drain on its next
   // iteration; the 50ms max_sleep cap bounds the worst case if all workers park.
@@ -4745,6 +4746,13 @@ u32 IpcManager::DrainShmSends(ctp::lbm::Transport *transport, u32 budget) {
   // mutex, and conn->Send serialises per client ring via its own send_mu_, so
   // two workers transferring to the same client are safe. The client demuxes
   // responses by net_key, so cross-worker delivery order does not matter.
+  static const bool kFastEmpty = [] {
+    const char *e = std::getenv("CLIO_SHM_DRAIN_FAST");
+    return !(e != nullptr && (e[0] == '0' || e[0] == 'f' || e[0] == 'F'));
+  }();
+  if (kFastEmpty && shm_send_pending_.load(std::memory_order_acquire) == 0) {
+    return 0;
+  }
   u32 sent = 0;
   std::vector<ShmSendQueue *> queues;
   {
@@ -4761,6 +4769,7 @@ u32 IpcManager::DrainShmSends(ctp::lbm::Transport *transport, u32 budget) {
         fut = std::move(q->pending.front());
         q->pending.pop_front();
       }
+      shm_send_pending_.fetch_sub(1, std::memory_order_acq_rel);
       clio::run::shared_ptr<Task> task = fut.GetTaskPtr();
       if (!task.IsNull()) {
         IpcCpu2Cpu::SendOutTransfer(this, task, transport);
@@ -5039,10 +5048,21 @@ RouteResult IpcManager::RouteTask(Future<Task> &future, bool force_enqueue) {
     // is for nested subtasks, and the lane-0 drainer is not this task's
     // submitter -- its lane backlog is not even counted as its load.
     // CLIO_NET_SPREAD=0 restores the old behaviour (A/B).
-    static const bool kNetSpread = [] {
+    // CLIO_NET_SPREAD: 0 = off, 1 = always hand off, 2 (default) = hand off
+    // only when more peer tasks are queued behind this one on the ingress
+    // lane. Mode 1 cost 10-20% at 1 outstanding request (an extra lane push +
+    // wakeup per request); with an empty lane running it here is the fastest
+    // path and delays nothing.
+    static const int kSpreadMode = [] {
       const char *e = std::getenv("CLIO_NET_SPREAD");
-      return !(e != nullptr && (e[0] == '0' || e[0] == 'f' || e[0] == 'F'));
+      if (e == nullptr || *e == '\0') return 2;
+      if (e[0] == 'f' || e[0] == 'F') return 0;
+      return std::atoi(e);
     }();
+    const bool kNetSpread =
+        kSpreadMode == 1 ||
+        (kSpreadMode == 2 && task_ptr->Lane() != nullptr &&
+         task_ptr->Lane()->Size() > 0);
     Worker *cur = CLIO_CUR_WORKER;
     if (kNetSpread && exec && cur != nullptr && scheduler_ != nullptr &&
         !worker_queues_.IsNull() && task_ptr->IsRemote() &&

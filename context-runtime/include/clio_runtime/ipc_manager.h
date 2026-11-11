@@ -1822,6 +1822,12 @@ class IpcManager {
   std::unordered_map<std::string, std::unique_ptr<ShmSendQueue>>
       shm_send_queues_;
   std::mutex shm_send_queues_mutex_;   // guards the MAP (not the per-queue FIFOs)
+  // Futures queued across all ShmSendQueues. DrainShmSends runs on every
+  // worker loop pass; with the default inline send the queues are always
+  // empty, yet each pass took shm_send_queues_mutex_ -- ~20 workers contending
+  // on one mutex (1 in 6 gdb worker samples under a 4-node 16x16 load). This
+  // lets an empty drain return without touching any lock.
+  std::atomic<u64> shm_send_pending_{0};
   std::atomic<bool> shm_send_running_{false};  // #807: SHM-mode gate for flush
 
  public:
