@@ -2472,7 +2472,9 @@ bool IpcManager::TryStartMainServer(const std::string &hostname) {
     for (int i = 0; i < NetTierSlots(); ++i) {
       u32 tport = port + kNetTierPortOffset + static_cast<u32>(i);
       ctp::lbm::TransportPtr t = ctp::lbm::TransportFactory::Get(
-          hostname, PeerTransportType(),
+          hostname,
+          NetTierUsesZmq(i) ? ctp::lbm::TransportType::kZeroMq
+                            : PeerTransportType(),
           ctp::lbm::TransportMode::kServer, protocol, tport);
       if (!t) {
         HLOG(kError, "Failed to bind size-tier peer port {}:{}", hostname,
@@ -2558,6 +2560,16 @@ const NetTierCfg &GetNetTierCfg() {
 }  // namespace
 
 int IpcManager::NetTierSlots() { return GetNetTierCfg().slots; }
+
+bool IpcManager::NetTierUsesZmq(int slot) {
+  static const int zmq_from = [] {
+    const char *e = std::getenv("CLIO_NET_TIER_ZMQ_FROM");
+    return (e != nullptr && *e != '\0') ? std::atoi(e) : -1;
+  }();
+  const NetTierCfg &c = GetNetTierCfg();
+  if (zmq_from < 0 || slot < 0 || slot >= c.slots) return false;
+  return slot / c.lanes >= zmq_from;
+}
 
 int IpcManager::NetTierSlot(size_t bytes) {
   const NetTierCfg &c = GetNetTierCfg();
@@ -2894,9 +2906,14 @@ ctp::lbm::Transport *IpcManager::GetOrCreateClient(const std::string &addr,
   HLOG(kInfo, "[ClientPool] Creating new persistent connection to {}", key);
   ctp::lbm::TransportPtr transport;
   try {
+    ctp::lbm::TransportType ttype = PeerTransportType();
+    {
+      const int slot = port - static_cast<int>(CLIO_CONFIG_MANAGER->GetPort()) -
+                       static_cast<int>(kNetTierPortOffset);
+      if (NetTierUsesZmq(slot)) ttype = ctp::lbm::TransportType::kZeroMq;
+    }
     transport = ctp::lbm::TransportFactory::Get(
-        addr, PeerTransportType(), ctp::lbm::TransportMode::kClient, "tcp",
-        port);
+        addr, ttype, ctp::lbm::TransportMode::kClient, "tcp", port);
   } catch (const std::exception &e) {
     HLOG(kError, "[ClientPool] Failed to dial {}: {}", key, e.what());
     return nullptr;

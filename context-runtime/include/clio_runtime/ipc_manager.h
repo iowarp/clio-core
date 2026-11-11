@@ -1037,6 +1037,13 @@ class IpcManager {
   static int NetTierSlots();
   /** @return tier slot for a message of `bytes` payload bytes */
   static int NetTierSlot(size_t bytes);
+  /** CLIO_NET_TIER_ZMQ_FROM=k: tiers >= k (the larger messages) listen and
+   *  dial with ZeroMQ even when CLIO_PEER_TRANSPORT=socket. Plain sockets win
+   *  on small-message latency (4 KB 1x1 1.6x) but lose on loaded 1 MB
+   *  transfers (0.73-0.85x: one recv thread per port reads each message
+   *  synchronously, where ZeroMQ spreads it over its I/O threads).
+   *  @return true if tier slot `slot` uses ZeroMQ */
+  static bool NetTierUsesZmq(int slot);
   /** @return the tier listener transports (empty when tiers are off) */
   const std::vector<ctp::lbm::TransportPtr> &GetTierTransports() const {
     return tier_transports_;
