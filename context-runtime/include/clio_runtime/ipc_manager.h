@@ -1023,6 +1023,26 @@ class IpcManager {
   ctp::lbm::Transport *GetMainTransport() const;
 
   /**
+   * Size-tiered peer ports (experiment, CLIO_NET_TIERS / CLIO_NET_TIER_LANES).
+   * CLIO_NET_TIERS="16k,256k" splits peer messages into tiers by payload
+   * bytes (< 16k, < 256k, the rest); CLIO_NET_TIER_LANES=N gives each tier N
+   * ports, used round-robin. Tier slot i listens on base port +
+   * kNetTierPortOffset + i with its own ROUTER and recv thread, and peers
+   * send each message to the slot for its size, so small messages never
+   * queue behind bulk ones on one socket or one recv thread. Off (0 slots)
+   * when neither variable is set.
+   */
+  static constexpr u32 kNetTierPortOffset = 16;
+  /** @return number of tier slots (0 = tiers off) */
+  static int NetTierSlots();
+  /** @return tier slot for a message of `bytes` payload bytes */
+  static int NetTierSlot(size_t bytes);
+  /** @return the tier listener transports (empty when tiers are off) */
+  const std::vector<ctp::lbm::TransportPtr> &GetTierTransports() const {
+    return tier_transports_;
+  }
+
+  /**
    * Get this host identified during host identification
    * @return Const reference to this Host struct
    */
@@ -1884,6 +1904,7 @@ class IpcManager {
 
   // Main ZeroMQ transport (server mode) for distributed communication
   ctp::lbm::TransportPtr main_transport_;
+  std::vector<ctp::lbm::TransportPtr> tier_transports_;  // size-tier listeners
 
   // Callbacks run at the start of ClearTransports() to stop module-owned
   // threads that hold raw transport pointers. See RegisterTransportShutdownHook.

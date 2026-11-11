@@ -2448,6 +2448,28 @@ bool IpcManager::TryStartMainServer(const std::string &hostname) {
 
     HLOG(kDebug, "Attempting to start main server on {}:{}", hostname, port);
 
+    // Size-tier listeners first: the peer recv thread starts once
+    // main_transport_ is set and then reads tier_transports_ as final.
+    tier_transports_.clear();
+    for (int i = 0; i < NetTierSlots(); ++i) {
+      u32 tport = port + kNetTierPortOffset + static_cast<u32>(i);
+      ctp::lbm::TransportPtr t = ctp::lbm::TransportFactory::Get(
+          hostname, ctp::lbm::TransportType::kZeroMq,
+          ctp::lbm::TransportMode::kServer, protocol, tport);
+      if (!t) {
+        HLOG(kError, "Failed to bind size-tier peer port {}:{}", hostname,
+             tport);
+        tier_transports_.clear();
+        return false;
+      }
+      tier_transports_.push_back(std::move(t));
+    }
+    if (!tier_transports_.empty()) {
+      HLOG(kInfo, "Size-tier peer ports: {} slots on {}..{}",
+           tier_transports_.size(), port + kNetTierPortOffset,
+           port + kNetTierPortOffset + tier_transports_.size() - 1);
+    }
+
     main_transport_ = ctp::lbm::TransportFactory::Get(
         hostname, ctp::lbm::TransportType::kZeroMq,
         ctp::lbm::TransportMode::kServer, protocol, port);
@@ -2477,6 +2499,61 @@ bool IpcManager::TryStartMainServer(const std::string &hostname) {
 
 ctp::lbm::Transport *IpcManager::GetMainTransport() const {
   return main_transport_.get();
+}
+
+namespace {
+struct NetTierCfg {
+  std::vector<size_t> bounds;  // ascending upper bounds; tiers = bounds+1
+  int lanes = 1;
+  int slots = 0;
+};
+const NetTierCfg &GetNetTierCfg() {
+  static const NetTierCfg cfg = [] {
+    NetTierCfg c;
+    if (const char *e = std::getenv("CLIO_NET_TIERS")) {
+      std::string s(e);
+      size_t pos = 0;
+      while (pos < s.size()) {
+        size_t comma = s.find(',', pos);
+        std::string tok = s.substr(pos, comma == std::string::npos
+                                            ? std::string::npos
+                                            : comma - pos);
+        if (!tok.empty() && tok != "0") {
+          c.bounds.push_back(
+              static_cast<size_t>(ctp::ConfigParse::ParseSize(tok)));
+        }
+        if (comma == std::string::npos) break;
+        pos = comma + 1;
+      }
+      std::sort(c.bounds.begin(), c.bounds.end());
+    }
+    if (const char *e = std::getenv("CLIO_NET_TIER_LANES")) {
+      c.lanes = std::max(1, std::atoi(e));
+    }
+    if (!c.bounds.empty() || c.lanes > 1) {
+      c.slots = static_cast<int>(c.bounds.size() + 1) * c.lanes;
+    }
+    return c;
+  }();
+  return cfg;
+}
+}  // namespace
+
+int IpcManager::NetTierSlots() { return GetNetTierCfg().slots; }
+
+int IpcManager::NetTierSlot(size_t bytes) {
+  const NetTierCfg &c = GetNetTierCfg();
+  if (c.slots == 0) return -1;
+  size_t tier = 0;
+  while (tier < c.bounds.size() && bytes >= c.bounds[tier]) ++tier;
+  int lane = 0;
+  if (c.lanes > 1) {
+    // Senders are single threads (the net send worker), but keep it safe.
+    static std::atomic<u32> rr{0};
+    lane = static_cast<int>(rr.fetch_add(1, std::memory_order_relaxed) %
+                            static_cast<u32>(c.lanes));
+  }
+  return static_cast<int>(tier) * c.lanes + lane;
 }
 
 ctp::lbm::Transport *IpcManager::GetClientTransport(IpcMode mode) const {

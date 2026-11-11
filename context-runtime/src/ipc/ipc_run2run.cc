@@ -222,6 +222,21 @@ void IpcManagerRun2Run::SendInTransmitReplica(
   const uint64_t nt0 = nettrace::On() ? nettrace::NowNs() : 0;
   container->SaveTask(task_copy->method_, archive, task_copy);
   const uint64_t nt1 = nettrace::On() ? nettrace::NowNs() : 0;
+  // Size-tiered peer ports: send on the tier listener for this message's
+  // payload size (archive.send is complete once SaveTask returns; ZMQ Expose
+  // is a pass-through, so the archive built against the base DEALER is valid
+  // on any ZMQ DEALER).
+  if (clio::run::IpcManager::NetTierSlots() > 0) {
+    size_t bytes = 0;
+    for (const auto &b : archive.send) bytes += b.size;
+    int tport = port +
+                static_cast<int>(clio::run::IpcManager::kNetTierPortOffset) +
+                clio::run::IpcManager::NetTierSlot(bytes);
+    if (ctp::lbm::Transport *t =
+            ipc_manager->GetOrCreateClient(target_host->ip_address, tport)) {
+      lbm_transport = t;
+    }
+  }
 
   ctp::lbm::LbmContext ctx(ctp::lbm::LBM_SYNC);
   int rc = lbm_transport->Send(archive, ctx);
@@ -466,6 +481,7 @@ int IpcManagerRun2Run::SendOutTransmit(
       lbm_transport = fshm->response_transport_;
     }
   }
+  const bool used_fshm_transport = lbm_transport != nullptr;
   if (lbm_transport == nullptr) {
     // Responses ride a DEDICATED connection (lane "resp"), never the bulk
     // SendIn DEALER: a metadata-only ack queuing behind a 1 MiB task frame
@@ -490,6 +506,17 @@ int IpcManagerRun2Run::SendOutTransmit(
   const uint64_t nt0 = nettrace::On() ? nettrace::NowNs() : 0;
   container->SaveTask(origin_task->method_, archive, origin_task);
   const uint64_t nt1 = nettrace::On() ? nettrace::NowNs() : 0;
+  if (clio::run::IpcManager::NetTierSlots() > 0 && !used_fshm_transport) {
+    size_t bytes = 0;
+    for (const auto &b : archive.send) bytes += b.size;
+    int tport = port +
+                static_cast<int>(clio::run::IpcManager::kNetTierPortOffset) +
+                clio::run::IpcManager::NetTierSlot(bytes);
+    if (ctp::lbm::Transport *t = ipc_manager->GetOrCreateClient(
+            target_host->ip_address, tport, "resp")) {
+      lbm_transport = t;
+    }
+  }
 
   ctp::lbm::LbmContext ctx(ctp::lbm::LBM_SYNC);
   int rc = lbm_transport->Send(archive, ctx);
@@ -1839,24 +1866,10 @@ static constexpr int kZmqPollTimeoutMs = 1;
 void IpcManagerRun2Run::StartRecvThreads() {
   // Dedicated single peer recv thread: polls the main p2p transport
   // (port 9413 by default) and dispatches inbound task forwards/responses.
-  peer_recv_thread_ = std::thread([this]() {
-    ctp::SystemInfo::SetCurrentThreadName("chi-peer-recv");
-    auto *ipc_manager = CLIO_IPC;
-    ctp::lbm::Transport *lbm_transport = nullptr;
-    for (int spin = 0; spin < 1000 && !recv_shutdown_.load(); ++spin) {
-      lbm_transport = ipc_manager->GetMainTransport();
-      if (lbm_transport) break;
-      CTP_THREAD_MODEL->SleepForUs(1000);
-    }
-    if (!lbm_transport) {
-      HLOG(kError, "[PeerRecvThread] main transport never appeared");
-      return;
-    }
-    // Block on transport readability instead of spin-polling. main_transport_
-    // is a ZMQ transport, so we use its native zmq_poll (Transport::PollRecv)
-    // rather than an EventManager: ZMQ_FD can't be registered with
-    // WSAEventSelect on Windows. Each wake drains every pending message before
-    // blocking again.
+  // The drain/dispatch loop for one peer listener. Runs on the main
+  // listener's thread and, with size-tiered ports (CLIO_NET_TIERS), on one
+  // thread per tier listener.
+  auto peer_loop = [this](ctp::lbm::Transport *lbm_transport) {
     HLOG(kInfo, "[PeerRecvThread] started");
     while (!recv_shutdown_.load(std::memory_order_acquire)) {
       bool drained_any = false;
@@ -1924,6 +1937,33 @@ void IpcManagerRun2Run::StartRecvThreads() {
                                clio::run::evlat::Now());
       }
     }
+  };
+  peer_recv_thread_ = std::thread([this, peer_loop]() {
+    ctp::SystemInfo::SetCurrentThreadName("chi-peer-recv");
+    auto *ipc_manager = CLIO_IPC;
+    ctp::lbm::Transport *lbm_transport = nullptr;
+    for (int spin = 0; spin < 1000 && !recv_shutdown_.load(); ++spin) {
+      lbm_transport = ipc_manager->GetMainTransport();
+      if (lbm_transport) break;
+      CTP_THREAD_MODEL->SleepForUs(1000);
+    }
+    if (!lbm_transport) {
+      HLOG(kError, "[PeerRecvThread] main transport never appeared");
+      return;
+    }
+    // Block on transport readability instead of spin-polling. main_transport_
+    // is a ZMQ transport, so we use its native zmq_poll (Transport::PollRecv)
+    // rather than an EventManager: ZMQ_FD can't be registered with
+    // WSAEventSelect on Windows. Each wake drains every pending message before
+    // blocking again.
+    for (const auto &t : ipc_manager->GetTierTransports()) {
+      ctp::lbm::Transport *tt = t.get();
+      tier_recv_threads_.emplace_back([peer_loop, tt]() {
+        ctp::SystemInfo::SetCurrentThreadName("chi-peer-tier");
+        peer_loop(tt);
+      });
+    }
+    peer_loop(lbm_transport);
     HLOG(kInfo, "[PeerRecvThread] shutting down");
   });
 
@@ -1981,6 +2021,10 @@ void IpcManagerRun2Run::StartRecvThreads() {
 void IpcManagerRun2Run::StopRecvThreads() {
   recv_shutdown_.store(true, std::memory_order_release);
   if (peer_recv_thread_.joinable()) peer_recv_thread_.join();
+  for (auto &t : tier_recv_threads_) {
+    if (t.joinable()) t.join();
+  }
+  tier_recv_threads_.clear();
   if (client_recv_thread_.joinable()) client_recv_thread_.join();
   // Requests still held for a pool that never appeared: release their
   // transport-owned frames before the transports go away.
