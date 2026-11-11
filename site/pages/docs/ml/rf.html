@@ -1,0 +1,56 @@
+<!--
+title: rf
+heading: <em>rf:</em> random forest classifier.
+description: API reference for clio-ml's random forest classifier: Python fit_rf with nested tree options, C++ FitRandomForest and RandomForestPredict, RandomForestOptions and the model's list of trees.
+eyebrow: Docs · Machine learning
+lede: A random forest of histogram decision trees, the equivalent of Spark MLlib's RandomForestClassifier. Each tree sees a Poisson(1) bootstrap of the rows hashed from the global row index and tree number, and a hashed candidate feature subset per node. Prediction is a majority vote with ties going to the smallest class.
+facts: Module | ml_rf ; Header | clio_ml/decision_tree.h ; Rows | features, then class label
+-->
+<h2>What it does</h2>
+<p>Trees are fitted one after another with the <a href="/docs/ml/tree.html">decision tree</a> engine. Because the bootstrap and the feature subsets are hashed rather than sampled from a stream, the forest is the same for any paging, block count or node count.</p>
+
+<h2>Rows</h2>
+<p><code>n_features</code> feature columns followed by the class label. <code>clio_ml.COLUMNS["rf"]</code> is 1.</p>
+
+<h2>Python</h2>
+<pre data-label="python">
+import numpy as np, clio_ml as cm
+rng = np.random.default_rng(1)
+X = rng.normal(size=(4096, 7)).astype(np.float32)
+y = (X[:, 0] + X[:, 1] > 0).astype(np.float32)
+data = np.column_stack([X, y]).astype(np.float32)
+
+r = cm.fit_rf(data, num_trees=4, tree={"max_depth": 3, "num_classes": 2})
+print(len(r.model.trees))
+print(cm.predict("rf", r, data[0, :7]))
+</pre>
+<ul>
+  <li><code>fit_rf(X, **options)</code>. The nested tree options are passed as a dict under <code>tree</code>.</li>
+  <li>Options (<code>RandomForestOptions</code>): <code>num_trees</code> (8), <code>seed</code> (1), <code>features_per_node</code> (0 = ceil(sqrt(nf))), <code>tree</code> (a <code>DecisionTreeOptions</code>: <code>num_classes</code> 2, <code>max_depth</code> 4, <code>num_bins</code> 32, <code>threads</code> 256, <code>row_base</code> 0).</li>
+  <li>Result <code>RandomForestResult</code>: <code>model</code> (<code>RandomForestModel</code> with <code>trees</code>, a list of <code>DecisionTreeModel</code>) and <code>stats</code>.</li>
+  <li><code>predict("rf", r, x)</code> returns the voted class.</li>
+</ul>
+
+<h2>C++</h2>
+<pre data-label="cpp">
+struct RandomForestOptions {
+  u32 num_trees = 8;
+  u32 seed = 1;
+  u32 features_per_node = 0;  // 0 = ceil(sqrt(nf))
+  DecisionTreeOptions tree;   // depth, bins, classes, threads, row_base, cluster
+};
+struct RandomForestModel {
+  std::vector<DecisionTreeModel> trees;
+  std::vector<float> Flatten() const;
+};
+struct RandomForestResult { RandomForestModel model; VecStats stats; };
+RandomForestResult FitRandomForest(Dataset &ds, const RandomForestOptions &opt);
+RandomForestResult FitRandomForestPlain(const float *data, u64 n_rows, u32 nf,
+                                        u64 elems_per_page, u32 nblocks,
+                                        const RandomForestOptions &opt);
+RandomForestResult FitRandomForestReference(/* same arguments */);
+u32 RandomForestPredict(const RandomForestModel &m, const float *x);
+</pre>
+<p>The ChiMod is module <code>ml_rf</code>.</p>
+
+<p>Related: <a href="/docs/ml/tree.html">decision tree</a>, <a href="/docs/ml/gbtc.html">gradient-boosted classifier</a>.</p>

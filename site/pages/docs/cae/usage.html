@@ -1,0 +1,151 @@
+<!--
+title: Usage
+heading: Using the <em>Context Assimilation Engine.</em>
+description: How to import data with the Context Assimilation Engine: writing OMNI transfer files, running clio_cae, the supported sources and formats, preprocessing with run steps, cloud credentials, importing from code, and labeling data in the I/O path with the summarizer.
+eyebrow: Docs · Context Assimilation Engine
+lede: Most imports are an OMNI file and one command. This page walks through the file, the tool, each source scheme, and the two ways to describe data as it is written. Every key and default is listed on the API reference page.
+facts: Submit | clio_cae transfers.yaml ; From code | clio_cee.context_bundle or AsyncParseOmni ; Needs | A running runtime
+-->
+<h2>Import a file</h2>
+<p>An OMNI file is a YAML document with a <code>transfers</code> list. Each transfer names a source, a destination tag and a format. Write one, start the runtime, and submit it:</p>
+<pre data-label="yaml · transfers.yaml">
+name: import_results
+
+transfers:
+  - src: file::/data/run42/field.bin
+    dst: iowarp::run42_field
+    format: binary
+</pre>
+<pre data-label="shell">
+$ clio_run start &amp;
+$ clio_cae transfers.yaml
+</pre>
+<p>The file becomes the tag <code>run42_field</code> holding blobs <code>chunk_0</code>, <code>chunk_1</code>, and so on, 1 MiB each. Top-level keys other than <code>transfers</code>, such as <code>name</code>, are ignored. A per-transfer key the loader does not know is logged as a warning and ignored.</p>
+<p>The tool initializes a client of the running runtime, loads the file, executes any <code>run</code> steps locally, then submits the whole list as one <code>ParseOmni</code> task and waits. Transfers run in order inside the runtime, each finishing before the next starts. The tool exits 1 when:</p>
+<ul>
+  <li>the runtime is not running, or the OMNI file cannot be read or is missing <code>transfers</code>, <code>src</code>, <code>dst</code> or <code>format</code>;</li>
+  <li>a <code>run</code> step fails, in which case nothing is submitted;</li>
+  <li>the assimilation result code or the task framework code is non-zero, for example a <code>depends_on</code> that names a later transfer, or a source scheme that was not compiled in;</li>
+  <li>transfers were requested but zero were scheduled.</li>
+</ul>
+<p>Success means the transfers were processed by the CAE pool. Dataset-level problems inside an assimilator, such as a full tier (<code>PutBlob failed</code>), are logged by the runtime, not the tool. Confirm the blobs landed with <code>cte_search 'run42_field.*'</code>, or by listing the tag from the <a href="/docs/cte/python.html">CTE Python client</a>.</p>
+
+<h2>Sources and formats</h2>
+<p>The scheme of <code>src</code>, everything before <code>://</code> or <code>::</code>, selects the assimilator. The <code>format</code> key is required on every transfer; the values the code acts on are <code>binary</code>, <code>hdf5</code>, <code>hdf5_vol</code> and <code>globus</code>.</p>
+<ul class="checks">
+  <li><code>file::/path</code>. Reads a local file in chunks and stores blobs <code>chunk_0</code>, <code>chunk_1</code>, and so on. <code>range_off</code> and <code>range_size</code> select a byte range. The path must be visible to the runtime process, not only to the machine running <code>clio_cae</code>.</li>
+  <li><code>string::name</code>. Stores the bytes of <code>src_data</code> verbatim as one blob named <code>name</code>. OMNI files have no key for <code>src_data</code>, so this scheme is for programs that build contexts in code, such as <code>clio_cee</code>.</li>
+  <li><code>hdf5::/path.h5</code>. Discovers every dataset in the file. With <code>format: hdf5</code>, each dataset becomes its own tag named <code>&lt;dst tag&gt;/&lt;dataset path&gt;</code>, and large datasets are split into several blobs. <code>dataset_filter</code> selects datasets with include and exclude glob patterns. With <code>format: hdf5_vol</code> the file is staged in the layout the CTE's HDF5 VOL connector expects, so an application opening the file through the connector is served from the CTE from its first read. Needs <code>CLIO_CORE_ENABLE_HDF5=ON</code>.</li>
+  <li><code>http://</code> and <code>https://</code>. Downloads through a <code>curl</code> child process, with <code>src_token</code> as the bearer token when set. POSIX builds only. A URL under <code>https://app.globus.org</code> is handed to the Globus assimilator instead.</li>
+  <li><code>s3://bucket/key</code>. Amazon S3 or an S3-compatible store. Reads run in the runtime over Poco with SigV4 signing; the standalone <code>cae_s3_tool</code> helper links the AWS SDK and is used for seeding and benchmarks. Needs <code>CAE_ENABLE_S3=ON</code>.</li>
+  <li><code>gs://bucket/object</code> or <code>gcs://bucket/object</code>. Google Cloud Storage through Application Default Credentials. <code>GCS_ENDPOINT</code> overrides the endpoint. Needs <code>CAE_ENABLE_GCS=ON</code>.</li>
+  <li><code>globus://</code>. A Globus endpoint, with the access token from <code>src_token</code> or the <code>GLOBUS_ACCESS_TOKEN</code> environment variable. Needs <code>CAE_ENABLE_GLOBUS=ON</code>.</li>
+</ul>
+<p>A scheme whose support was not compiled in logs an error naming the CMake option to turn on, the factory returns no assimilator, and <code>ParseOmni</code> fails with result code -2.</p>
+
+<h2>Several transfers and dependencies</h2>
+<p>Transfers run in the order listed. <code>depends_on</code> names an earlier transfer by its exact <code>src</code> or <code>dst</code> URL. Because of the ordering it changes nothing at run time; it is a check. A dependency that names a later transfer, the transfer itself, or nothing in the list fails the whole file before anything is scheduled, with result code -3.</p>
+<pre data-label="yaml">
+transfers:
+  - src: file::/data/run42/mesh.bin
+    dst: iowarp::run42_mesh
+    format: binary
+  - src: file::/data/run42/field.bin
+    dst: iowarp::run42_field
+    format: binary
+    depends_on: iowarp::run42_mesh
+  - src: hdf5::/data/run42/diagnostics.h5
+    dst: iowarp::run42_diag
+    format: hdf5
+    dataset_filter:
+      include_patterns: ["/temperature/*"]
+      exclude_patterns: ["/temperature/raw*"]
+</pre>
+<p>Glob patterns support <code>*</code>, <code>?</code> and <code>[]</code>, and <code>*</code> crosses <code>/</code>. If the include patterns match no dataset the transfer fails with result code -9 and the tool prints the likely cause.</p>
+
+<h2>Preprocess a source with a run step</h2>
+<p>A transfer may carry <code>run</code> and <code>run_out</code>. The script runs in the <code>clio_cae</code> process, as the user running the tool, before anything is submitted. It never runs inside the runtime. It is called with two arguments: the source, which is the local path for <code>file::</code> and <code>hdf5::</code> sources and the URL unchanged for other schemes, and the output path. If it exits 0 and <code>run_out</code> exists as a regular file, the transfer ingests <code>run_out</code> instead of the original source: as <code>hdf5::</code> when the format starts with <code>hdf5</code>, as <code>file::</code> otherwise. Later <code>depends_on</code> entries that named the old source are rewritten. Any failure stops the whole ingest.</p>
+<pre data-label="yaml">
+transfers:
+  - src: file::/data/A46_xx.csv
+    dst: iowarp::a46_parquet
+    format: binary
+    run: ./to_parquet.sh           # called as: to_parquet.sh &lt;src&gt; &lt;run_out&gt;
+    run_out: /scratch/a46.parquet  # the file the script must write
+</pre>
+<p>Both paths are environment-expanded, and relative paths resolve against the OMNI file's directory. <code>run_out</code> without <code>run</code>, or the reverse, is an error.</p>
+
+<h2>Import from the cloud</h2>
+<p>Credentials are read by the process that performs the read. For <code>s3://</code> and <code>gs://</code> that is the runtime, so set the AWS or Google environment where <code>clio_run</code> starts. The exceptions are the two S3 hints the client can forward: a program that builds contexts in code can set <code>s3_region</code> and <code>s3_profile</code> on the context, and they become <code>AWS_DEFAULT_REGION</code> and <code>AWS_PROFILE</code> for the S3 helper. OMNI files have no key for them.</p>
+<pre data-label="yaml">
+transfers:
+  - src: s3://my-bucket/reference/baseline.bin
+    dst: iowarp::baseline
+    format: binary
+  - src: gs://my-bucket/reference/baseline-2.bin
+    dst: iowarp::baseline_2
+    format: binary
+  - src: https://data.example.org/run42.tar
+    dst: iowarp::run42_tar
+    format: binary
+    src_token: ${DATA_TOKEN}
+</pre>
+<p><code>src_token</code> and <code>dst_token</code> are environment-expanded when the file is loaded, so a token can stay out of the file. The <a href="/tutorials/cloud-storage.html">cloud storage tutorial</a> walks through S3 and Google Cloud imports end to end, and the <a href="/docs/cae/api.html#environment-variables">environment variable list</a> covers the S3 and HTTP tuning knobs.</p>
+
+<h2>Import from a program</h2>
+<p>The <a href="/docs/cee/usage.html">Context Exploration Engine</a> wraps the CAE for Python and C++: <code>context_bundle</code> takes a list of <code>AssimilationCtx</code> and submits one <code>ParseOmni</code> task on pool 400.0.</p>
+<pre data-label="python">
+import clio_cee as cee
+ctx = cee.ContextInterface()
+ctx.context_bundle([
+    cee.AssimilationCtx(src="file::/data/run42/field.bin", dst="iowarp::run42_field", format="binary"),
+    cee.AssimilationCtx(src="string::notes", dst="iowarp::run42_field", format="binary",
+                        src_data="field.bin is the final pressure field"),
+])
+</pre>
+<p>In C++ the CAE client is <code>clio::cae::core::Client</code>; the <a href="/docs/cae/api.html#c-client">API page</a> lists its methods. The C++ context has fields the Python binding does not expose, including <code>include_patterns</code>, <code>exclude_patterns</code>, <code>on_fault</code>, <code>chunk_size</code> and <code>blob_prefix</code>.</p>
+
+<h2>Export back to a file</h2>
+<p>The CAE core also has <code>ExportData</code> and <code>ImportData</code> tasks, reachable from the C++ client. <code>AsyncExportData(tag_name, output_path, format)</code> writes every blob of a tag to one file, with <code>format</code> <code>"hdf5"</code> or <code>"binary"</code>. <code>AsyncImportData(tag_name, input_path, "hdf5")</code> reads a dataset from an HDF5 file into a tag. Both HDF5 directions need <code>CLIO_CORE_ENABLE_HDF5=ON</code>; without it the task returns -1 with the message <code>HDF5 support not compiled in</code>. There is no command-line front end for them.</p>
+
+<h2>Describing content in the I/O path</h2>
+<p>Because the CAE core and the summarizer speak the CTE's task interface, they can be placed where ordinary puts and gets pass through them, and describe data as it is written rather than in a later pass.</p>
+<ul>
+  <li><strong>Indexer.</strong> The default CAE entry forwards to the chain top at 563.0, which runs through the indexer at 564.0. Every imported blob is therefore tokenized and answers <code>SemanticSearch</code>. Point <code>next_pool_id</code> at 512.0 to skip that.</li>
+  <li><strong>Summarizer labels.</strong> <code>clio_cae_summarizer</code> forwards every verb and, after a successful <code>PutBlob</code> whose tag and blob names match a rule in <code>label_matches</code>, sends the bytes to the model named by the rule with the prompt named by the rule, and stores the reply as <code>{blob_name}_label</code> in the same tag with the same placement score. The label is an ordinary blob. Matching uses regex search, not full match, so <code>.*\.txt$</code> matches names ending in <code>.txt</code>. An invalid regex disables that rule with a warning. Inference is synchronous on the handling worker, so scope the rules tightly.</li>
+  <li><strong>CAE as interceptor.</strong> Compose <code>clio_cae_core</code> at 512.0 with <code>next_pool_id</code> pointing at the real core, and a CTE client or the filesystem runs through it unchanged. Only <code>GetOrCreateTag</code>, <code>PutBlob</code>, <code>GetBlob</code> and <code>SemanticSearch</code> are forwarded, so this layout is for dedicated configurations, not the default file.</li>
+</ul>
+<p>To enable the summarizer in the default configuration, uncomment its block, put it after the cache entry, and point the CAE core's <code>next_pool_id</code> at it:</p>
+<pre data-label="yaml">
+  - mod_name: clio_cae_summarizer
+    pool_name: clio_cae_summarizer
+    pool_query: local
+    pool_id: "401.0"
+    next_pool_id: "563.0"
+    label_endpoint: "http://127.0.0.1:11434"
+    label_api: ollama
+    label_prompts:
+      summarize: "Summarize the following text in one short sentence."
+    label_matches:
+      - tag_re: ".*\\.txt$"
+        blob_re: ".*"
+        model: "gemma3:1b"
+        prompt: "summarize"
+        context_length: 4096
+        num_predict: 0
+
+  - mod_name: clio_cae_core
+    pool_name: cae_main
+    pool_query: local
+    pool_id: "400.0"
+    next_pool_id: "401.0"
+</pre>
+<p>With <code>label_api: openai</code> the summarizer posts to <code>{label_endpoint}/chat/completions</code> and sends a bearer token read from <code>label_api_key_file</code> or the variable named by <code>label_api_key_env</code>; both are re-read on every request. The <a href="/modules/summarizer.html">summarizer module page</a> covers chunking and the request bodies, and the <a href="/tutorials/operators.html">operators tutorial</a> shows the compose change step by step.</p>
+
+<h2>Where to go next</h2>
+<ul>
+  <li><a href="/docs/cae/api.html">API reference</a>: every OMNI key, the tool, <code>AssimilationCtx</code>, the C++ client, compose keys and environment variables.</li>
+  <li><a href="/docs/cae/on-demand.html">On-demand ingest and pagify</a>: registering a source without copying it, and page-numbered reads.</li>
+  <li><a href="/docs/cae/extend.html">Writing an assimilator</a>: adding a source scheme.</li>
+  <li><a href="/modules/cae-core.html">CAE core module page</a> and <a href="/design/chain.html">the interposition chain</a>: where the CAE forwards to and why.</li>
+</ul>

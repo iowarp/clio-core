@@ -1,0 +1,44 @@
+<!--
+title: logreg
+heading: <em>logreg:</em> logistic regression.
+description: API reference for clio-ml's binary logistic regression module (full-batch gradient descent on the log-loss): Python fit_logreg, C++ FitLogisticRegression, GlmOptions and GlmResult.
+eyebrow: Docs · Machine learning
+lede: Binary logistic regression by full-batch gradient descent on the log-loss, the equivalent of Spark MLlib's LogisticRegression with a binomial family and no regularisation. It runs on the shared GLM engine.
+facts: Module | ml_logreg ; Header | clio_ml/glm.h ; Rows | features, then 0/1 label
+-->
+<h2>What it does</h2>
+<p>Each iteration is one paged pass that sums the log-loss gradient over all rows, followed by one fixed-step update. No regularisation, no early stop. The recorded loss is the mean log-loss before each update. For more than two classes use <a href="/docs/ml/mlr.html">multinomial logistic regression</a>, which uses L-BFGS.</p>
+
+<h2>Rows</h2>
+<p><code>n_features</code> feature columns followed by a 0/1 label. <code>clio_ml.COLUMNS["logreg"]</code> is 1.</p>
+
+<h2>Python</h2>
+<pre data-label="python">
+import numpy as np, clio_ml as cm
+rng = np.random.default_rng(1)
+X = rng.normal(size=(4096, 7)).astype(np.float32)
+y = (X[:, 0] + X[:, 1] > 0).astype(np.float32)
+data = np.column_stack([X, y]).astype(np.float32)
+
+r = cm.fit_logreg(data, iters=20, learning_rate=0.1)
+p = cm.predict("logreg", r, data[0, :7])       # P(y = 1) for one row
+print(r.weights, p)
+</pre>
+<ul>
+  <li><code>fit_logreg(X, **options)</code> calls the GLM engine with <code>GlmKind.logistic</code>.</li>
+  <li>Options (<code>GlmOptions</code>): <code>iters</code> (100), <code>learning_rate</code> (0.1), <code>threads</code> (256).</li>
+  <li>Result <code>GlmResult</code>: <code>weights</code> (coefficients, then intercept), <code>loss_history</code>, <code>stats</code>.</li>
+  <li><code>predict("logreg", r, x)</code> returns the probability of class 1.</li>
+</ul>
+
+<h2>C++</h2>
+<pre data-label="cpp">
+GlmResult FitLogisticRegression(Dataset &ds, const GlmOptions &opt);   // FitGlm(kLogistic, ...)
+GlmResult FitGlm(GlmKind kind, Dataset &ds, const GlmOptions &opt);
+GlmResult FitGlmPlain(GlmKind kind, const float *data, u64 n_rows, u32 n_features,
+                      u64 elems_per_page, u32 nblocks, const GlmOptions &opt);
+float GlmPredict(GlmKind kind, const std::vector<float> &w, const float *x);  // P(y=1)
+</pre>
+<p><code>GlmOptions</code> and <code>GlmResult</code> are described on the <a href="/docs/ml/linreg.html">linear regression</a> page. <code>clio_ml/logistic_regression.h</code> only includes <code>glm.h</code>. The ChiMod is module <code>ml_logreg</code>.</p>
+
+<p>Related: <a href="/docs/ml/svm.html">linear SVM</a>, <a href="/docs/ml/mlr.html">multinomial logistic regression</a>, <a href="/docs/ml/gbtc.html">gradient-boosted classifier</a>.</p>

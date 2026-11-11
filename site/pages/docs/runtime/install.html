@@ -1,0 +1,90 @@
+<!--
+title: Install
+heading: Install the <em>Context Runtime.</em>
+description: The runtime ships in every CLIO Core install. Building your own modules needs a development install with headers and the CMake package; this page shows how to get one and how to find it from CMake.
+eyebrow: Docs · Context Runtime
+lede: Running the runtime needs nothing beyond a normal install. Writing a ChiMod needs the headers and the clio-core CMake package, which a source or Spack install provides.
+facts: Binary | clio_run ; CMake package | clio-core (alias of iowarp-core) ; Package dir | &lt;prefix&gt;/lib/cmake/clio-core
+-->
+<h2>To run it</h2>
+<p>Every method on the <a href="/docs/installation.html">Installation</a> page installs the runtime: the top-level option <code>CLIO_CORE_ENABLE_RUNTIME</code> defaults to <code>ON</code> and the pip wheel pins it on. After any of them:</p>
+<pre data-label="shell">
+$ pip install iowarp-core
+$ clio_run --help
+$ clio_run start
+</pre>
+<p>The first import of <code>iowarp_core</code> in Python copies the default configuration to <code>~/.clio/clio.yaml</code>. The release packages do not create it; without a file the runtime uses built-in defaults, and <code>CLIO_SERVER_CONF</code> points it at your own. The installed copy at <code>&lt;prefix&gt;/etc/clio/clio_default.yaml</code> documents every key.</p>
+
+<h2>To build modules</h2>
+<p>A ChiMod compiles against the runtime headers and links the <code>clio::run::cxx</code> target, so you need an install that includes them. Build from source and install to a prefix, or use Spack, which installs the same tree.</p>
+<div class="tabs" data-platform data-label="Platform">
+  <section class="tab-panel" data-tab="Linux"><p class="tab-title">Linux</p>
+<pre data-label="shell">
+$ sudo apt install -y build-essential cmake ninja-build pkg-config git \
+    libyaml-cpp-dev libcereal-dev libmsgpack-dev libsodium-dev libzmq3-dev
+$ git clone --recurse-submodules https://github.com/iowarp/clio-core.git
+$ cd clio-core
+$ cmake --preset release
+$ cmake --build build -j"$(nproc)"
+$ cmake --install build --prefix $HOME/clio-inst
+$ export PATH=$HOME/clio-inst/bin:$PATH
+</pre>
+<p>Or let <code>CI/ci-deps.sh --only-deps release</code> build the dependencies into a conda environment first.</p></section>
+  <section class="tab-panel" data-tab="macOS"><p class="tab-title">macOS</p>
+<pre data-label="shell">
+$ git clone --recurse-submodules https://github.com/iowarp/clio-core.git
+$ cd clio-core
+$ ./CI/ci-deps.sh --only-deps release
+$ conda activate iowarp
+$ cmake --preset release -DCLIO_CORE_ENABLE_CONDA=ON
+$ cmake --build build -j"$(sysctl -n hw.ncpu)"
+$ cmake --install build --prefix $HOME/clio-inst
+</pre></section>
+  <section class="tab-panel" data-tab="Windows"><p class="tab-title">Windows</p>
+<pre data-label="powershell">
+PS&gt;git clone --recurse-submodules https://github.com/iowarp/clio-core.git
+PS&gt;cd clio-core
+PS&gt;cmake --preset windows-release
+PS&gt;cmake --build build --config Release
+PS&gt;cmake --install build --config Release --prefix $HOME\clio-inst
+</pre>
+<p>Dependencies come from vcpkg; set <code>VCPKG_ROOT</code> first. Module libraries end in <code>_runtime.dll</code> and <code>CLIO_REPO_PATH</code> entries are separated by <code>;</code>.</p></section>
+</div>
+<p>With Spack, <code>spack install iowarp</code> and then <code>spack load iowarp</code> puts the prefix on the usual CMake search paths.</p>
+
+<h2>Options that matter for module developers</h2>
+<ul>
+  <li><code>CLIO_CORE_ENABLE_RUNTIME</code> (<code>ON</code>): the runtime itself.</li>
+  <li><code>CLIO_CORE_ENABLE_CTE</code>, <code>CLIO_CORE_ENABLE_CAE</code>, <code>CLIO_CORE_ENABLE_CEE</code> (<code>ON</code>): the engines' modules. A module that forwards to the CTE needs <code>clio::cte::core_client</code>, which the package exports only when the CTE was built.</li>
+  <li><code>CLIO_CORE_ENABLE_BOOST_COROUTINES</code> (<code>OFF</code>): stackful fibers instead of C++20 coroutines. The handler macros are the same either way.</li>
+  <li><code>CLIO_CORE_ENABLE_CUDA</code>, <code>CLIO_CORE_ENABLE_ROCM</code>, <code>CLIO_CORE_ENABLE_SYCL</code> (<code>OFF</code>): GPU task submission.</li>
+  <li><code>CLIO_CORE_ENABLE_TESTS</code> (<code>OFF</code>): the runtime's unit tests, including the external-module test under <code>context-runtime/test/unit/external-chimod</code>.</li>
+</ul>
+
+<h2>Finding the CMake package</h2>
+<p>The install writes the package to <code>lib/cmake/iowarp-core</code> and an alias to <code>lib/cmake/clio-core</code>. Either name works; <code>clio-core</code> is the canonical one. Point <code>CMAKE_PREFIX_PATH</code> at the prefix:</p>
+<pre data-label="cmake">
+find_package(clio-core CONFIG REQUIRED)
+</pre>
+<pre data-label="shell">
+$ cmake -S . -B build -DCMAKE_PREFIX_PATH=$HOME/clio-inst
+</pre>
+<p>The package config finds <code>yaml-cpp</code> and <code>Threads</code> for you, looks for Boost, cereal and msgpack quietly, includes the <code>ClioCoreCommon.cmake</code> helpers that define <code>add_clio_module_client</code> and <code>add_clio_module_runtime</code>, and loads the always-available targets <code>clio::run::cxx</code>, <code>clio::run::admin_client</code> and <code>clio::run::bdev_client</code>. It prints what it found:</p>
+<pre data-label="output">
+-- IOWarp Core found:
+--   Version: ...
+--   Prefix: /home/you/clio-inst
+--   Clio Runtime: Available (clio::run::cxx)
+--   Admin: Available (clio::run::admin_client, clio::run::admin_runtime)
+--   Bdev: Available (clio::run::bdev_client, clio::run::bdev_runtime)
+</pre>
+<p>An external repository that uses the per-module packages instead can <code>find_package(clio_run REQUIRED)</code> and <code>find_package(clio_run_admin REQUIRED)</code>, as the external-module test does.</p>
+
+<h2>Check that it works</h2>
+<pre data-label="shell">
+$ ls $HOME/clio-inst/lib/cmake/clio-core
+clio-coreConfig.cmake  clio-coreConfigVersion.cmake
+$ clio_run status
+clio runtime (port 9413): STOPPED (clean)
+</pre>
+<p>Next: <a href="/docs/runtime/usage.html">Usage</a> builds a module against this prefix.</p>

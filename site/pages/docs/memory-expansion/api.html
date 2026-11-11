@@ -1,0 +1,206 @@
+<!--
+title: API reference
+heading: Memory expansion <em>API reference.</em>
+description: Reference for the cpu_vector and gpu_vector class templates: constructors and their defaults, the Fetch, HoldPage, Flush and UnpinRange verbs, host data movement, lazy copies, prefetch hints, diagnostics, the device-side DeviceVector API, and the environment variables and YAML keys that configure them.
+eyebrow: Docs · Memory expansion
+lede: Signatures are taken from <code>context-transfer-engine/adapter/cpu_vector/include/clio_cte/cpu_vector/cpu_vector.h</code> and <code>context-transfer-engine/adapter/gpu_vector/include/clio_cte/gpu_vector/gpu_vector.h</code> with <code>device_vector.h</code>. <code>u32</code> and <code>u64</code> are <code>clio::run::u32</code> and <code>clio::run::u64</code>.
+facts: cpu_vector | clio::cte::cpu_vector::Vector&lt;T&gt; ; gpu_vector | clio::cte::gpu_vector::Vector&lt;T&gt;, DeviceVector&lt;T&gt; ; Page score | 0.5 ; Ranges per verb | kMaxFetchRanges = 8
+-->
+<h2 id="shared">Shared model</h2>
+<ul>
+  <li>Page <code>p</code> of a vector is the blob named <code>p</code> in decimal in the vector's tag, <code>page_bytes</code> long, written at score 0.5 (<code>kVectorBlobScore</code>).</li>
+  <li>Ranges are <code>(offset, count)</code> pairs in elements. One Fetch or Flush takes up to <code>kMaxFetchRanges</code> (8) pairs.</li>
+  <li>The first argument of Fetch and Flush is a generation. 0 is an ordinary transfer. Otherwise a flush stamps that generation on the extents it wrote, and a fetch waits until at least that generation has been published and refetches a resident frame older than it.</li>
+  <li>A page with no blob yet reads as zeros on an ordinary fetch.</li>
+  <li><code>PageOf(off)</code>, <code>PageLo(off)</code> and <code>PageSpan(off, count)</code> convert an element range to whole pages: <code>Fetch(0, v.PageLo(off), v.PageSpan(off, count))</code> fetches every page the range touches.</li>
+</ul>
+
+<h2 id="cpu">cpu_vector</h2>
+<p>Header <code>clio_cte/cpu_vector/cpu_vector.h</code>, namespace <code>clio::cte::cpu_vector</code>, header-only. The verbs block, every verb is thread-safe, and a caller error throws <code>std::runtime_error</code>.</p>
+<h3>Constructor</h3>
+<pre data-label="cpp">
+template &lt;typename T&gt;
+class Vector {
+ public:
+  Vector(const std::string &amp;tag_name, u64 page_bytes, u64 num_elems,
+         u32 nsets, u32 set_size,
+         clio::run::PoolId storage_pool_id = clio::run::PoolId::GetNull(),
+         int compress_lib = 0, int compress_preset = 1,
+         u32 capacity_pages = 0);
+  Vector(const Vector &amp;) = delete;
+};
+</pre>
+<ul>
+  <li><code>tag_name</code>: the CTE tag, created if it does not exist.</li>
+  <li><code>page_bytes</code>: page size; must be non-zero and a multiple of <code>sizeof(T)</code>.</li>
+  <li><code>num_elems</code>: logical length. The last page may be partial.</li>
+  <li><code>nsets</code>, <code>set_size</code>: cache geometry, both non-zero. The cache holds up to <code>nsets * set_size</code> pages.</li>
+  <li><code>storage_pool_id</code>: the pool puts and gets go to. Null means the CTE core pool (<code>kCtePoolId</code>, 512.0).</li>
+  <li><code>compress_lib</code>, <code>compress_preset</code>: the CTE compression context used for every page; 0 means none.</li>
+  <li><code>capacity_pages</code>: page-sized regions backing the frames. 0 means one per frame. Smaller than <code>nsets * set_size</code> makes the frames tags over a tighter memory budget.</li>
+</ul>
+<h3>Verbs</h3>
+<pre data-label="cpp">
+template &lt;typename... Args&gt; void Fetch(u64 generation, Args... off_count_pairs);
+Held&lt;T&gt; HoldPage(u64 off, u64 count, bool write = false);
+Held&lt;T&gt; UpdateRange(u64 off, u64 count, bool write = false, u64 generation = 0);
+template &lt;typename... Args&gt; void Flush(u64 generation, Args... off_count_pairs);
+void UnpinRange(u64 off, u64 count);
+void UnpinRange2(u64 off0, u64 count0, u64 off1, u64 count1);
+</pre>
+<ul>
+  <li><strong>Fetch</strong> makes every page of the ranges resident and pins it. It throws if a get fails or, after <code>kAllocWaitMs</code> (30000 ms) of waiting for a free frame, if every frame of a set is pinned or in flight.</li>
+  <li><strong>HoldPage</strong> returns a view on the part of <code>[off, off+count)</code> that lies on <code>off</code>'s page. A read hold requires the elements to have been fetched; a write hold marks them valid. It never fetches.</li>
+  <li><strong>UpdateRange</strong> is Fetch of the whole pages under the range, then HoldPage. The pins stay until <code>UnpinRange(PageLo(off), PageSpan(off, count))</code>.</li>
+  <li><strong>Flush</strong> writes the named ranges back and waits for the puts. Only elements a resident frame holds are sent; a range whose page is not resident is dropped and counted in <code>flush_skipped</code>.</li>
+  <li><strong>UnpinRange</strong> releases the pins Fetch took on every page of the range. <strong>UnpinRange2</strong> does two ranges.</li>
+</ul>
+<h3>Held&lt;T&gt;</h3>
+<pre data-label="cpp">
+template &lt;typename T&gt; class Held {
+ public:
+  T *ptr() const;                 // first element of the run
+  u64 run() const;                // elements on this page
+  u64 begin_off() const;          // absolute offset of ptr()[0]
+  explicit operator bool() const; // false when empty
+  T &amp;operator[](u64 off) const;   // absolute element offset
+  void Rescore(float rank) const; // eviction rank of the frame; lowest is evicted first
+};
+</pre>
+<p>Move-only. A hold returned by <code>HoldPage</code> does not own the pin; <code>UnpinRange</code> releases it.</p>
+<h3>Host data movement and cache control</h3>
+<pre data-label="cpp">
+template &lt;typename FillFn&gt; void PreloadPages(u64 pg_lo, u64 pg_hi, FillFn fill);   // fill(pg, char *buf)
+void Preload(const T *src, u64 n);
+template &lt;typename SinkFn&gt; u64 DownloadPages(u64 pg_lo, u64 pg_hi, SinkFn sink);  // sink(pg, const char *bytes); returns pages read
+u64 Download(T *dst, u64 n);                                                        // returns elements read
+void Prefetch(u64 pg_lo, u64 pg_hi);        // best effort, leaves pages unpinned
+void FlushResidentToCte();                  // every resident frame's valid elements
+void ClearCache();                          // drops resident pages, discards unflushed writes
+</pre>
+<p><code>PreloadPages</code> and <code>Preload</code> write straight to the CTE and throw if a put fails; resident copies are not updated, so call <code>ClearCache</code> first if those pages may be resident. <code>DownloadPages</code> and <code>Download</code> read straight from the CTE; flush first.</p>
+<h3>Copies</h3>
+<pre data-label="cpp">
+std::unique_ptr&lt;Vector&lt;T&gt;&gt; Copy(const std::string &amp;new_name, bool sync = false);
+u64 MaterializeAll(u32 inflight = 32);      // pages materialized; 0 on the first failure or when not a copy
+void ScoreAllPages(float score);
+</pre>
+<p><code>Copy</code> flushes resident state, creates the checkpoint pool if needed, creates <code>new_name</code> with the checkpoint module as its fault handler and this tag as the source, and returns a vector on the copy with the same geometry. It throws if the source tag name is too long for the fault parameters or any step fails. With <code>sync</code> true every page is materialized before it returns.</p>
+<h3>Tier hints and diagnostics</h3>
+<pre data-label="cpp">
+struct PrefetchHint { u64 page_; float score_; };
+void PrefetchNow(const std::vector&lt;PrefetchHint&gt; &amp;hints);   // non-blocking, deduplicated
+void DrainPrefetch();                                       // wait for outstanding rescores
+void ResetPrefetchHistory();                                // per run, not per phase
+PrefetchStats ReadPrefetchStats() const;  void ResetPrefetchStats();
+
+void EnableStats();  void ResetStats();  Stats ReadStats() const;  Stats ReadStats(int gpu_id) const;
+std::vector&lt;Page&gt; ReadTable() const;  u32 Occupied() const;  u32 MaxPageCopies() const;
+</pre>
+<p><code>Stats</code> counts <code>faults</code>, <code>puts</code>, <code>evicts</code>, <code>get_errors</code>, <code>gen_ok</code>, <code>gen_stale</code>, <code>gen_busy</code>, <code>flush_skipped</code>, <code>put_errors</code> and <code>alloc_waits</code>, and is populated only after <code>EnableStats()</code>. <code>Page</code> is a snapshot of one frame: <code>page_num</code>, <code>data</code>, <code>last_access</code>, <code>generation</code>, <code>score</code>, <code>pins</code>, <code>flushing</code>, <code>fetching</code>, <code>valid_lo</code>, <code>valid_hi</code>.</p>
+<h3>Geometry</h3>
+<p><code>size()</code>, <code>TagId()</code>, <code>PageBytes()</code>, <code>ElemsPerPage()</code>, <code>NumPages()</code>, <code>NumSets()</code>, <code>SetSize()</code>, <code>NumFrames()</code>, <code>Regions()</code>, <code>PageOf(off)</code>, <code>PageLo(off)</code>, <code>PageSpan(off, count)</code>, <code>HomeSet(pn)</code>.</p>
+
+<h2 id="gpu">gpu_vector: host side</h2>
+<p>Header <code>clio_cte/gpu_vector/gpu_vector.h</code>, namespace <code>clio::cte::gpu_vector</code>, header-only. The host <code>Vector&lt;T&gt;</code> owns the device allocations and never pages itself.</p>
+<h3>Constructor</h3>
+<pre data-label="cpp">
+template &lt;typename T&gt;
+class Vector {
+ public:
+  Vector(const std::string &amp;tag_name, const std::vector&lt;int&gt; &amp;gpu_ids,
+         u64 page_bytes, u32 nblocks, u32 set_size, u64 num_elems,
+         clio::run::PoolId storage_pool_id = clio::run::PoolId::GetNull(),
+         int compress_lib = 0, int compress_preset = 1,
+         u32 nsets = 0, u32 capacity_pages = 0);
+  Vector(const Vector &amp;) = delete;
+  DeviceVector&lt;T&gt; GetDevice(int gpu_id) const;
+  static clio::run::PoolId DefaultStoragePool();
+};
+</pre>
+<ul>
+  <li><code>gpu_ids</code>: the GPUs to build device views for. <code>GetDevice(gpu_id)</code> returns the value a kernel takes.</li>
+  <li><code>nblocks</code>: the number of blocks the kernel will launch. Each block owns its own fetch and flush task set, so a kernel that calls <code>Init</code> with a block number at or beyond this traps.</li>
+  <li><code>set_size</code>: frames per associative set. <code>nsets</code> defaults to <code>nblocks</code>. There is one cache for the whole grid and a page is stored once; its home set is a hash of the page number.</li>
+  <li><code>capacity_pages</code>: page-sized regions of device memory; 0 means <code>nsets * set_size</code>.</li>
+  <li><code>storage_pool_id</code>: null means <code>DefaultStoragePool()</code>, which reads <code>CLIO_GV_STORAGE_POOL</code> as <code>major.minor</code> and falls back to the CTE core pool.</li>
+</ul>
+<h3>Host methods</h3>
+<pre data-label="cpp">
+template &lt;typename FillFn&gt; void PreloadPages(u64 pg_lo, u64 pg_hi, FillFn fill);
+void Preload(const T *src, u64 n);
+template &lt;typename SinkFn&gt; u64 DownloadPages(u64 pg_lo, u64 pg_hi, SinkFn sink);
+u64 Download(T *dst, u64 n);
+void Prefetch(u64 pg_lo, u64 pg_hi, int gpu_id = 0, u32 tables = 0);   // tables is ignored
+void ClearCache(int gpu_id = 0);
+void FlushResidentToCte();                 // on every GPU this vector has views for
+
+std::unique_ptr&lt;Vector&lt;T&gt;&gt; Copy(const std::string &amp;new_name, bool sync = false);
+u64 MaterializeAll(u32 inflight = 32);
+void ScoreAllPages(float score);
+
+void RegisterPrefetcher(std::shared_ptr&lt;Prefetcher&gt; p);
+void SetPrefetchPolicy(const PrefetchPolicy &amp;p);  const PrefetchPolicy &amp;GetPrefetchPolicy() const;
+bool HasPrefetchers() const;  std::string PrefetcherNames() const;
+clio::run::gpu::YieldObserverFn YieldObserver();   // drv.SetYieldObserver(vec.YieldObserver())
+void PrefetchRunBegin();
+void PrefetchNow(const std::vector&lt;PrefetchHint&gt; &amp;hints);
+void DrainPrefetch();  void ResetPrefetchHistory();
+PrefetchStats ReadPrefetchStats() const;  void ResetPrefetchStats();
+
+void EnableStats();  void ResetStats();  Stats ReadStats(int gpu_id) const;
+std::vector&lt;Page&gt; ReadTable(int gpu_id) const;  u32 Occupied(int gpu_id) const;  u32 MaxPageCopies(int gpu_id) const;
+clio::cte::core::TagId TagId() const;  u64 PageBytes() const;  u64 ElemsPerPage() const;  u64 NumPages() const;
+</pre>
+<ul>
+  <li>A copy made with <code>Copy</code> builds no device views. A kernel that must read it opens its own <code>Vector</code> on the copy's tag.</li>
+  <li>A <code>Prefetcher</code> (in <code>prefetch.h</code>) implements <code>OnYield(const YieldEvent &amp;, PrefetchSink &amp;)</code>, called once per block per yield round, plus <code>OnRunBegin()</code>, <code>OnRoundEnd(round, sink)</code> and <code>Name()</code>. Several may be registered; for a repeated page the last writer wins. Hints are deduplicated against the score last sent, batched and submitted without blocking.</li>
+  <li>The free function <code>FatalReport()</code> returns a string describing why a kernel trapped, or an empty string if it did not.</li>
+</ul>
+
+<h2 id="device">gpu_vector: DeviceVector&lt;T&gt;</h2>
+<p>Defined in <code>device_vector.h</code>. Every function is block-collective: all threads of the block call it together, and no suspension may sit inside a thread-predicated branch. The awaited verbs exist when the toolchain compiles device coroutines (<code>CLIO_HAS_YCORO</code>).</p>
+<pre data-label="cpp">
+void Init(u32 block);                                             // once, with yv.Block()
+
+__device__ YCoroTask Fetch(u64 generation, Args... off_count_pairs);       // BeginFetch + AwaitFetch
+__device__ YCoroTask BeginFetch(u64 generation, Args... off_count_pairs);  // submit, then compute
+__device__ YCoroTask AwaitFetch();                                         // then wait
+__device__ YCoroTaskT&lt;Held&lt;T&gt;&gt; HoldPage(u64 off, u64 count, bool write = false);
+__device__ YCoroTaskT&lt;Held&lt;T&gt;&gt; UpdateRange(u64 off, u64 count, u32 from, bool write = false, u64 generation = 0);
+__device__ YCoroTask Flush(u64 generation, u64 off, u64 count, Rest... more_pairs);       // BeginFlush + EndFlush
+__device__ YCoroTask BeginFlush(u64 generation, u64 off, u64 count, Rest... more_pairs);
+__device__ YCoroTask EndFlush();
+void UnpinRange(u64 off, u64 count);
+void UnpinRange2(u64 off0, u64 count0, u64 off1, u64 count1);
+</pre>
+<ul>
+  <li><code>YCoroTask</code> and <code>YCoroTaskT</code> are <code>clio::run::gpu::YCoroTask</code> and <code>clio::run::gpu::YCoroTaskT</code>; use them with <code>co_await</code> inside a <code>YCoroMain</code> coroutine run by <code>CLIO_YCORO_RUN</code>.</li>
+  <li><strong>BeginFetch</strong> returns once the fetch is submitted; pair it with <strong>AwaitFetch</strong> before holding. Only the named elements become valid, and a hold over elements the fetch did not name traps.</li>
+  <li><strong>HoldPage</strong> does not fault. A page that is still absent is a caller error and the kernel stops.</li>
+  <li><strong>UpdateRange</strong>'s <code>from</code> argument is accepted and ignored; the verb is Fetch plus HoldPage.</li>
+  <li><strong>BeginFlush</strong> writes back only the named ranges, so several blocks can write different parts of one page. <strong>EndFlush</strong> waits for it. Prefer the split form in a loop so one page's put overlaps the next page's compute.</li>
+  <li>The clio-coroc spellings <code>CoFetch</code>, <code>CoBeginFetch</code>, <code>CoAwaitFetch</code>, <code>CoHoldPage</code> (returning <code>PageRef&lt;T&gt;</code>), <code>CoFlush</code>, <code>CoBeginFlush</code> and <code>CoEndFlush</code> are used with <code>CO_AWAIT</code>.</li>
+</ul>
+<p>Device geometry: <code>size()</code>, <code>PageBytes()</code>, <code>ElemsPerPage()</code>, <code>NumPages()</code>, <code>NumSets()</code>, <code>SetSize()</code>, <code>Regions()</code>, <code>PageOf</code>, <code>PageLo</code>, <code>PageSpan</code>. The device <code>Held&lt;T&gt;</code> has the same <code>ptr()</code>, <code>run()</code>, absolute <code>operator[]</code> and <code>Rescore(rank)</code> as the host one.</p>
+
+<h2 id="config">Configuration</h2>
+<h3>Environment variables</h3>
+<ul>
+  <li><code>CLIO_GV_STORAGE_POOL</code>: the pool a <code>gpu_vector</code> uses when its constructor is given none, as <code>major.minor</code>. For example <code>563.0</code> sends pages through the CTE cache module for node-local caching of remote-owned pages. <code>cpu_vector</code> does not read it.</li>
+  <li><code>CLIO_SERVER_CONF</code>: the runtime configuration file, which must compose a <code>clio_cte_core</code> pool with at least one <code>storage</code> tier.</li>
+  <li><code>CLIO_WITH_RUNTIME</code>: <code>0</code> attaches to a running runtime; <code>1</code> starts one in the process.</li>
+</ul>
+<h3>YAML keys</h3>
+<ul>
+  <li><code>compose[].storage</code> on the <code>clio_cte_core</code> entry: the tiers pages can reach. Pages are written at score 0.5. Under the <code>max_bw</code> placement engine a tier whose <code>score</code> is above 0.5 is not chosen for them on its own; a <code>PrefetchNow</code> hint, a registered <code>Prefetcher</code> or <code>ScoreAllPages</code> moves pages into it. See <a href="/design/placement.html">placement and tiering</a> and the <a href="/docs/cte/api.html#yaml">CTE YAML reference</a>.</li>
+  <li><code>gpu.queue_depth</code>: tasks per GPU queue, default 16. Set it above the number of blocks that will have fetches or flushes in flight at once. The same section also takes <code>threads_per_block</code>.</li>
+  <li>Compression is not a YAML key for the vectors: pass <code>compress_lib</code> and <code>compress_preset</code> to the constructor, and every page is put and got with that context.</li>
+</ul>
+
+<h2>Where to go next</h2>
+<ul>
+  <li><a href="/docs/memory-expansion/usage.html">Usage</a>: the verbs in action on the host and in a kernel.</li>
+  <li><a href="/docs/memory-expansion/install.html">Install</a>: build options and targets.</li>
+  <li><a href="/docs/cte/api.html">Context Transfer Engine API</a>: the client the vectors are built on.</li>
+</ul>

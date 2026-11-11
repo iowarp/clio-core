@@ -172,7 +172,7 @@ storage:
 $ curl -s --data-urlencode name=/mnt/nvme/clio/extra.dat -d bdev_type=file -d capacity=100GB     http://127.0.0.1:8080/api/mod/clio_cte_core/512.0/register_target
 {"ok":true,"name":"/mnt/nvme/clio/extra.dat","bdev_pool_id":"900.0","attached":false}
 </pre>
-<p>To attach a block device you composed yourself, compose it first (for example the <code>tiers.yaml</code> on the <a href="/docs/cli.html#compose">CLI page</a>), then pass its pool id:</p>
+<p>To attach a block device you composed yourself, compose it first (for example the <code>tiers.yaml</code> on the <a href="/docs/runtime/api.html#compose">CLI page</a>), then pass its pool id:</p>
 <pre data-label="shell">
 $ clio_run compose start tiers.yaml
 $ curl -s --data-urlencode name=ram::scratch -d attach_pool_id=320.0     http://127.0.0.1:8080/api/mod/clio_cte_core/512.0/register_target

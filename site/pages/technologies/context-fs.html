@@ -6,6 +6,13 @@ eyebrow: Technologies · Storage
 lede: Mount like any other directory on Windows, macOS and Linux via FUSE. Context FS presents the tiers you compose (RAM, NVMe, disk, erasure-coded arrays, cloud buckets) as one ordinary directory. Applications use it without changes; the stack underneath decides where each page lives.
 facts: Mount | FUSE 3 (libfuse, macFUSE, WinFsp) ; Metadata | Distributed, no metadata server ; Unit of data | 1 MiB page blobs ; Durability | ext4-style, durable on fsync
 -->
+<h2>Key takeaways</h2>
+<ul class="checks">
+  <li>Mount it like any other directory on Linux, macOS and Windows through FUSE. Applications run unchanged.</li>
+  <li>Files spread across the tiers you compose (RAM, NVMe, erasure-coded arrays, Amazon S3 or Google Cloud buckets) by score, with distributed metadata and no metadata server.</li>
+  <li>Every file is also tags and blobs in the Context Transfer Engine, so search, assimilation and the other technologies use it without a copy.</li>
+</ul>
+
 <ul class="headline-stats">
   <li><strong>10 µs</strong><span>stat from the shared-memory mirror</span></li>
   <li><strong>0</strong><span>metadata servers: inodes are homed by path</span></li>
@@ -65,35 +72,78 @@ $ ls ~/clio-mnt/results
 </ul>
 <p>About 91% of each operation's wall time is kernel transit; the daemon itself spends about 9.6 µs of CPU time per operation.</p>
 
-<h3>Parallel I/O with IOR</h3>
-<p>IOR, the standard HPC I/O benchmark, weak-scaled from 1 to 6 MPI ranks on one node: each rank writes and then reads its own 256 MiB file in 1 MiB transfers, with fsync after writing and the page cache dropped between the write and read phases. Context FS (release build of <code>dev</code> at c5dba42bc, default runtime configuration, one DRAM tier) against ext4 on the same machine: WSL2 Ubuntu 24.04 with 6 cores and 11 GB of memory, on a Ryzen 7 3800X with NVMe. Each bar is the mean of three runs, in MiB/s, higher is better.</p>
+<h3>Against OrangeFS on Ares: IO500</h3>
+<p>IO500 on 4 nodes of the Ares cluster, 32 MPI ranks (8 per node). Each node: two Xeon Silver 4114 (40 cores), 46 GB of memory, a Toshiba RD400 NVMe drive, a Seagate ST1000LM049 1 TB HDD, and 40 GbE. Every node is both a server and a client of the filesystem under test.</p>
+<ul class="checks">
+  <li><strong>Context FS</strong>: release build of <code>site-technologies</code> (c89f7f10f), 20% DRAM / 80% NVMe per node: a 3 GB DRAM tier, pre-faulted at start (<code>CLIO_PREFAULT=0</code>), over a 12 GB NVMe tier. No replication.</li>
+  <li><strong>OrangeFS 2.10</strong> (f4854f7): every node a metadata and data server, mounted through <code>pvfs2fuse</code>, with all storage on the NVMe drive or all on the HDD. <code>TroveMethod directio</code>, so OrangeFS reaches its device with O_DIRECT, as Context FS's file tier does.</li>
+  <li><strong>IO500</strong> (5c2237d) with a 60 s stonewall and data capped at about 27 GB, 2.3x the aggregate DRAM tier, so most data lands on NVMe. These are not valid IO500 list submissions, which need a 300 s stonewall. One run per system.</li>
+</ul>
 <div class="chart-grid">
-  <figure><figcaption>Write bandwidth, MiB/s</figcaption>
-<ul class="bars" aria-label="Write bandwidth, MiB/s">
-  <li class="ours"><span>Context FS, 1 rank</span><span class="bar"><i style="width:25%"></i></span><span class="val">359</span></li>
-  <li><span>ext4, 1 rank</span><span class="bar"><i style="width:36%"></i></span><span class="val">530</span></li>
-  <li class="ours"><span>Context FS, 2 ranks</span><span class="bar"><i style="width:33%"></i></span><span class="val">476</span></li>
-  <li><span>ext4, 2 ranks</span><span class="bar"><i style="width:47%"></i></span><span class="val">692</span></li>
-  <li class="ours"><span>Context FS, 4 ranks</span><span class="bar"><i style="width:44%"></i></span><span class="val">643</span></li>
-  <li><span>ext4, 4 ranks</span><span class="bar"><i style="width:84%"></i></span><span class="val">1,225</span></li>
-  <li class="ours"><span>Context FS, 6 ranks</span><span class="bar"><i style="width:42%"></i></span><span class="val">606</span></li>
-  <li><span>ext4, 6 ranks</span><span class="bar"><i style="width:100%"></i></span><span class="val">1,459</span></li>
+  <figure><figcaption>IO500 score (higher is better)</figcaption>
+<ul class="bars" aria-label="IO500 score (higher is better)">
+  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:100%"></i></span><span class="val">0.686</span></li>
+  <li><span>OrangeFS, NVMe</span><span class="bar"><i style="width:62%"></i></span><span class="val">0.426</span></li>
+  <li><span>OrangeFS, HDD</span><span class="bar"><i style="width:18%"></i></span><span class="val">0.123</span></li>
 </ul>
   </figure>
-  <figure><figcaption>Read bandwidth, MiB/s</figcaption>
-<ul class="bars" aria-label="Read bandwidth, MiB/s">
-  <li class="ours"><span>Context FS, 1 rank</span><span class="bar"><i style="width:4%"></i></span><span class="val">182</span></li>
-  <li><span>ext4, 1 rank</span><span class="bar"><i style="width:28%"></i></span><span class="val">1,327</span></li>
-  <li class="ours"><span>Context FS, 2 ranks</span><span class="bar"><i style="width:6%"></i></span><span class="val">277</span></li>
-  <li><span>ext4, 2 ranks</span><span class="bar"><i style="width:57%"></i></span><span class="val">2,672</span></li>
-  <li class="ours"><span>Context FS, 4 ranks</span><span class="bar"><i style="width:6%"></i></span><span class="val">273</span></li>
-  <li><span>ext4, 4 ranks</span><span class="bar"><i style="width:89%"></i></span><span class="val">4,215</span></li>
-  <li class="ours"><span>Context FS, 6 ranks</span><span class="bar"><i style="width:5%"></i></span><span class="val">235</span></li>
-  <li><span>ext4, 6 ranks</span><span class="bar"><i style="width:100%"></i></span><span class="val">4,726</span></li>
+  <figure><figcaption>ior-easy write, GiB/s</figcaption>
+<ul class="bars" aria-label="ior-easy write, GiB/s">
+  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:100%"></i></span><span class="val">0.77</span></li>
+  <li><span>OrangeFS, NVMe</span><span class="bar"><i style="width:49%"></i></span><span class="val">0.38</span></li>
+  <li><span>OrangeFS, HDD</span><span class="bar"><i style="width:10%"></i></span><span class="val">0.08</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>ior-easy read, GiB/s</figcaption>
+<ul class="bars" aria-label="ior-easy read, GiB/s">
+  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:100%"></i></span><span class="val">0.73</span></li>
+  <li><span>OrangeFS, NVMe</span><span class="bar"><i style="width:69%"></i></span><span class="val">0.51</span></li>
+  <li><span>OrangeFS, HDD</span><span class="bar"><i style="width:5%"></i></span><span class="val">0.04</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>ior-hard read, GiB/s</figcaption>
+<ul class="bars" aria-label="ior-hard read, GiB/s">
+  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:58%"></i></span><span class="val">0.12</span></li>
+  <li><span>OrangeFS, NVMe</span><span class="bar"><i style="width:100%"></i></span><span class="val">0.21</span></li>
+  <li><span>OrangeFS, HDD</span><span class="bar"><i style="width:4%"></i></span><span class="val">0.01</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>mdtest-easy stat, ops/s</figcaption>
+<ul class="bars" aria-label="mdtest-easy stat, ops/s">
+  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:100%"></i></span><span class="val">13,923</span></li>
+  <li><span>OrangeFS, NVMe</span><span class="bar"><i style="width:6%"></i></span><span class="val">803</span></li>
+  <li><span>OrangeFS, HDD</span><span class="bar"><i style="width:6%"></i></span><span class="val">805</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>mdtest-easy delete, ops/s</figcaption>
+<ul class="bars" aria-label="mdtest-easy delete, ops/s">
+  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:21%"></i></span><span class="val">143</span></li>
+  <li><span>OrangeFS, NVMe</span><span class="bar"><i style="width:99%"></i></span><span class="val">677</span></li>
+  <li><span>OrangeFS, HDD</span><span class="bar"><i style="width:100%"></i></span><span class="val">682</span></li>
 </ul>
   </figure>
 </div>
-<p>On a single node, ext4 leads at every rank count. ext4 is a kernel filesystem on local NVMe, while Context FS routes every 1 MiB transfer through FUSE to the runtime process and back. Context FS write bandwidth grows 1.8x from 1 to 4 ranks and then levels off at about 600-640 MiB/s; reads stay between 180 and 280 MiB/s. Where Context FS is built to help is across nodes, where it presents one namespace over every node's tiers without a metadata server. Multi-node IOR results on the Ares cluster will be added here.</p>
+<p>Every phase (bandwidth in GiB/s, metadata in thousands of operations per second; higher is better):</p>
+<table>
+  <tr><th>Phase</th><th>Context FS</th><th>OrangeFS, NVMe</th><th>OrangeFS, HDD</th></tr>
+  <tr><td>ior-easy write</td><td><strong>0.773</strong></td><td>0.377</td><td>0.076</td></tr>
+  <tr><td>ior-easy read</td><td><strong>0.728</strong></td><td>0.505</td><td>0.037</td></tr>
+  <tr><td>ior-hard write</td><td><strong>0.225</strong></td><td>0.142</td><td>0.018</td></tr>
+  <tr><td>ior-hard read</td><td>0.123</td><td><strong>0.213</strong></td><td>0.008</td></tr>
+  <tr><td>mdtest-easy write</td><td><strong>2.588</strong></td><td>0.699</td><td>0.685</td></tr>
+  <tr><td>mdtest-easy stat</td><td><strong>13.923</strong></td><td>0.803</td><td>0.805</td></tr>
+  <tr><td>mdtest-easy delete</td><td>0.143</td><td>0.677</td><td><strong>0.682</strong></td></tr>
+  <tr><td>mdtest-hard write</td><td><strong>0.741</strong></td><td>0.566</td><td>0.295</td></tr>
+  <tr><td>mdtest-hard stat</td><td><strong>5.678</strong></td><td>0.807</td><td>0.815</td></tr>
+  <tr><td>mdtest-hard read</td><td><strong>3.257</strong></td><td>0.824</td><td>0.493</td></tr>
+  <tr><td>mdtest-hard delete</td><td>0.035</td><td>0.685</td><td><strong>0.687</strong></td></tr>
+  <tr><td>find</td><td><strong>4.042</strong></td><td>0.364</td><td>0.495</td></tr>
+  <tr><td>Bandwidth score, GiB/s</td><td><strong>0.353</strong></td><td>0.276</td><td>0.026</td></tr>
+  <tr><td>Metadata score, kIOPS</td><td><strong>1.333</strong></td><td>0.659</td><td>0.592</td></tr>
+  <tr><td>IO500 score</td><td><strong>0.686</strong></td><td>0.426</td><td>0.123</td></tr>
+</table>
+<p>Context FS scores 1.6x OrangeFS on NVMe and 5.6x OrangeFS on HDD. It leads on writes, file-per-process reads and every create, stat, read and find phase, by 7-17x on stat and 8x on find. It loses two phases. OrangeFS on NVMe reads the single shared ior-hard file faster (0.21 vs 0.12 GiB/s). Deletes are Context FS's weak point: it removes files at 35-143 per second against about 680 for OrangeFS, so each delete phase took about 22 minutes. At OrangeFS's delete rate, Context FS's metadata score would be 2.35 kIOPS instead of 1.33.</p>
+<p>Two things in this setup cost OrangeFS bandwidth. <code>directio</code> keeps the server page cache from standing in for the device, and <code>pvfs2fuse</code> uses the FUSE 2 API, which splits writes into pieces of at most 128 KiB, so a 2 MiB IOR transfer reaches the device as 16 synchronous writes. OrangeFS through its kernel module, or with its default buffered <code>alt-aio</code> method, would post higher bandwidth. <code>pvfs2fuse</code> also needed a four-line fix: when several nodes create the shared ior-hard file at once, the losers got <code>EEXIST</code> from an <code>open(O_CREAT)</code> without <code>O_EXCL</code>, which aborted IO500 on NVMe every time. The patched client opens the existing file instead, as POSIX requires.</p>
 <h3>Checkpointing a simulation through the tiers</h3>
 <p>From the Eternia paper's evaluation: Gray-Scott on 2 Aurora nodes, 8 steps, a checkpoint every 2 steps. Each checkpoint is a copy-on-write snapshot that CLIO Core drains down the tier stack in the background, in a layout the HDF5 VOL can read. It is compared with a conventional synchronous checkpoint, in which the simulation waits until the snapshot reaches persistent storage; in the Lustre-heavy composition that is a simulation writing its checkpoint to the parallel file system. Total runtime in seconds, lower is better.</p>
 <div class="chart-grid">
@@ -163,6 +213,6 @@ $ ls ~/clio-mnt/results
 
 <h2>Where to go next</h2>
 <ul>
-  <li><a href="/docs/basic-usage.html">Mount your first filesystem</a></li>
+  <li><a href="/docs/context-fs/quickstart.html">Mount your first filesystem</a></li>
   <li><a href="/design/filesystem.html">Filesystem and FUSE design</a> and <a href="/design/durability.html">durability and recovery</a></li>
 </ul>

@@ -470,7 +470,7 @@ dl.notes dd { margin: 0; color: var(--ink-soft); }
 
 .tier-stack { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
 .tier-stack li {
-  display: grid; grid-template-columns: 6.5rem 1fr auto; gap: var(--space-4); align-items: center;
+  display: grid; grid-template-columns: 6.5rem minmax(0, 1fr) auto; gap: var(--space-4); align-items: center;
   border: 1px solid var(--line); border-inline-start: 3px solid var(--accent); border-radius: var(--radius);
   padding: 0.7rem 1rem; margin: 0; background: var(--paper-raised);
 }
@@ -478,7 +478,8 @@ dl.notes dd { margin: 0; color: var(--ink-soft); }
 .tier-stack li:nth-child(3) { border-inline-start-color: color-mix(in srgb, var(--accent) 56%, var(--paper)); }
 .tier-stack li:nth-child(4) { border-inline-start-color: color-mix(in srgb, var(--accent) 38%, var(--paper)); }
 .tier-stack li:nth-child(5) { border-inline-start-color: var(--secondary); }
-.tier-stack .tier-name { font-family: var(--font-mono); font-size: 0.82rem; color: var(--ink); }
+.tier-stack .tier-name { font-family: var(--font-mono); font-size: 0.82rem; color: var(--ink); overflow-wrap: anywhere; }
+.tier-stack.wide li { grid-template-columns: 11.5rem minmax(0, 1fr) auto; }
 .tier-stack .tier-desc { color: var(--ink-soft); font-size: 0.92rem; }
 .tier-stack .tier-type { font-family: var(--font-mono); font-size: 0.75rem; color: var(--muted); }
 
@@ -551,7 +552,7 @@ dl.notes dd { margin: 0; color: var(--ink-soft); }
   .header-tools { margin-inline-start: auto; }
   .page, .guide { padding-inline: var(--space-4); }
   dl.notes > div { grid-template-columns: minmax(0, 1fr); gap: var(--space-1); }
-  .tier-stack li { grid-template-columns: minmax(0, 1fr); gap: var(--space-1); }
+  .tier-stack li, .tier-stack.wide li { grid-template-columns: minmax(0, 1fr); gap: var(--space-1); }
   .page-nav { grid-template-columns: minmax(0, 1fr); }
   .page-nav .next { grid-column: 1; text-align: left; }
   .footer-inner { grid-template-columns: minmax(0, 1fr); padding-inline: var(--space-4); }

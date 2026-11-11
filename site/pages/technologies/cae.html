@@ -1,0 +1,44 @@
+<!--
+title: Context Assimilation Engine
+heading: Context Assimilation Engine: <em>bring any data in.</em>
+description: The Context Assimilation Engine (CAE) imports files, HDF5 datasets, web, Amazon S3, Google Cloud and Globus data into CLIO Core, ingests on fault, and labels and indexes data as it is written.
+eyebrow: Technologies · Context
+lede: Pipeline data rarely starts in one place. The Context Assimilation Engine turns files, datasets and objects from wherever they live into tags and blobs in the stack, so they can be tiered, replicated, searched, mounted and trained on like anything written through CLIO Core.
+facts: Module | clio_cae_core (pool 400.0) ; Sources | file, HDF5, HTTP(S), S3, Google Cloud, Globus ; Submit | clio_cae transfers.yaml ; Labels | clio_cae_summarizer
+-->
+<h2>Key takeaways</h2>
+<ul class="checks">
+  <li>Brings files, HDF5 datasets, web downloads, S3, Google Cloud and Globus data into the stack with one YAML file.</li>
+  <li>Ingests on fault: register a source and only the parts that are read are pulled in, when they are read.</li>
+  <li>Describes data in the I/O path: the summarizer labels it and the indexer makes it searchable as it lands.</li>
+  <li>Serves imported data as numbered pages, so memory expansion and clio-ml can work on it directly.</li>
+</ul>
+
+<h2>One file describes the import</h2>
+<p>An OMNI file lists transfers: a source URL, a destination tag and a format, with optional byte ranges and dependencies. <code>clio_cae transfers.yaml</code> submits it to the running engine, and the source scheme selects the assimilator: <code>file::</code>, <code>hdf5::</code>, <code>http(s)://</code>, <code>s3://</code>, <code>gs://</code> or <code>globus://</code>. Each HDF5 dataset becomes its own tag, so later work can address one variable instead of a whole file.</p>
+<pre data-label="yaml · transfers.yaml">
+name: ocean_run_42
+transfers:
+  - src: hdf5::/scratch/run42/output.h5
+    dst: iowarp::run42
+    format: hdf5
+  - src: s3://climate-obs/sst/2024.bin
+    dst: iowarp::sst_obs
+    format: binary
+</pre>
+
+<h2>Only what is read</h2>
+<p>A transfer marked <code>on_fault</code> copies nothing up front. The engine registers itself as the destination tag's fault handler on every node, and the first read of a missing blob pulls exactly that blob from the source and stores it on the composed tiers. Large archives become usable at once, and data that is never touched is never moved. A reserve keeps re-fetchable data from filling the last of a tier.</p>
+
+<h2>Described as it lands</h2>
+<p>The engine and its summarizer speak the Context Transfer Engine's own interface, so they can sit in the write path. The summarizer sends matching blobs to a language model and stores the reply beside the data as an ordinary blob; the indexer makes both keyword-searchable. Imported data is findable by what it says without a separate pass.</p>
+
+<h2>Pages for paged consumers</h2>
+<p>Memory expansion and clio-ml address data as page 0, page 1, and so on. The engine can serve numbered pages assembled from named blobs, and with an empty blob prefix an imported file's blobs are the pager's pages. That is how <a href="/docs/ml/usage.html">clio-ml trains on an assimilated CSV or Parquet table</a> without first loading it into memory.</p>
+
+<h2>Where to go next</h2>
+<ul>
+  <li><a href="/docs/cae/usage.html">Context Assimilation Engine docs</a>: assimilators, OMNI files, ingest on fault and pagify.</li>
+  <li><a href="/modules/cae-core.html">CAE core</a> and <a href="/modules/summarizer.html">summarizer</a> module reference.</li>
+  <li><a href="/technologies/cee.html">Context Exploration Engine</a>: find and read what was imported.</li>
+</ul>

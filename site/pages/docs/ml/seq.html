@@ -1,0 +1,37 @@
+<!--
+title: seq
+heading: <em>seq:</em> sequential pattern mining.
+description: API reference for clio-ml's sequential pattern mining module: Python fit_seq, C++ API, options, result fields and row layout.
+eyebrow: Docs · Machine learning
+lede: Frequent sequential patterns, the equivalent of Spark MLlib's PrefixSpan restricted to single-item elements.
+facts: Module | ml_seq ; Header | clio_ml/sequential_patterns.h
+-->
+<h2>What it does</h2>
+<p>Frequent sequential patterns, the equivalent of Spark MLlib's PrefixSpan restricted to single-item elements. Level K candidates are frequent (K-1)-patterns extended by one frequent item and pruned unless every subsequence is frequent; support is counted in one paged pass per level. Counts are integers, so results are exact.</p>
+
+<h2>Rows</h2>
+<p>One sequence per row: L item ids stored as floats, padded with -1. <code>clio_ml.COLUMNS["seq"]</code> is 0.</p>
+
+<h2>Python</h2>
+<pre data-label="python">
+import numpy as np, clio_ml as cm
+r = cm.fit_seq(S, num_items=500, min_support=0.05)   # S: item ids, -1 padded
+for p in r.patterns[:5]: print(p.items, p.count)
+</pre>
+<ul>
+  <li><code>fit_seq(X, **options)</code> accepts an in-memory array or a paged <code>Dataset</code> from <code>cm.dataset(X)</code> or <code>cm.assimilate(...)</code>.</li>
+  <li>Options: <code>num_items</code> (required), <code>min_support</code> (0.1, fraction of sequences), <code>max_pattern_length</code> (3), <code>threads</code> (256).</li>
+  <li>Result <code>SequentialPatternResult</code>: <code>patterns</code> (each with <code>items</code> and <code>count</code>, sorted by length then items), <code>stats</code>.</li>
+</ul>
+
+<h2>C++</h2>
+<pre data-label="cpp">
+SequentialPatternResult MineSequentialPatterns(Dataset &amp;ds,
+                                               const SequentialPatternOptions &amp;opt);
+SequentialPatternResult MineSequentialPatternsPlain(const float *data, u64 n_rows, u32 len,
+                                                    u64 elems_per_page, u32 nblocks,
+                                                    const SequentialPatternOptions &amp;opt);
+</pre>
+<p>The paged call needs the runtime; the <code>Plain</code> call runs the same kernel over a plain copy of the data without one.</p>
+
+<p>Related: <a href="/docs/ml/fim.html">frequent itemsets</a>. Back to the <a href="/docs/ml/index.html">machine learning overview</a>.</p>

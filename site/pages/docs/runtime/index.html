@@ -1,0 +1,53 @@
+<!--
+title: Overview
+heading: Context Runtime: <em>the process under everything.</em>
+description: What the Context Runtime is: modules (ChiMods), pools and containers, tasks and coroutine handlers, pool queries, transports, the compose file, and how it grows and handles failure.
+eyebrow: Docs · Context Runtime
+lede: The Context Runtime is one process per node that hosts modules, runs their operations as tasks on a small pool of worker threads, and moves those tasks between processes and nodes. Every other CLIO Core technology is a set of modules running inside it. This section is for people who operate the runtime or write modules for it.
+facts: Daemon | clio_run start ; Unit of code | Module (ChiMod), run as a pool ; Unit of work | Task, run as a coroutine ; Config | ~/.clio/clio.yaml
+-->
+<h2>What it is</h2>
+<p>The runtime, started with <code>clio_run start</code>, loads shared libraries called <strong>ChiMods</strong>, creates <strong>pools</strong> of them, and serves <strong>tasks</strong> that clients submit to those pools. A client is any process that calls <code>CLIO_INIT</code>: a Python script, the FUSE daemon, an MPI rank, or another module inside the runtime. The runtime also serves a web dashboard and, in a cluster, talks to the runtimes on the other nodes listed in its hostfile.</p>
+
+<h2>Key concepts</h2>
+<ul class="checks">
+  <li><strong>Module (ChiMod).</strong> A directory with a <code>clio_mod.yaml</code>, a set of task structs, a client library that programs link, and a runtime library the daemon loads. It defines numbered methods; ids 0 to 9 are reserved for <code>Create</code>, <code>Destroy</code> and <code>Monitor</code>.</li>
+  <li><strong>Pool and container.</strong> A pool is a running instance of a module with a name and a <code>major.minor</code> id. A container is the pool's instance on one node; the container id equals the node id, and the number of containers is fixed by the hostfile. Two pools of one module can run side by side with different settings.</li>
+  <li><strong>Task.</strong> A method call on a pool: a struct with input and output fields. A task lives in the submitting process; its inputs are serialized into a buffer that crosses into the runtime, and only its outputs come back. Tasks are not shared memory.</li>
+  <li><strong>Coroutine handlers.</strong> A container's handler for a method is a coroutine. When it awaits a subtask or a device, its worker thread runs other tasks. The runtime supports C++20 stackless coroutines and, with <code>CLIO_CORE_ENABLE_BOOST_COROUTINES</code>, Boost.Context fibers behind the same macros.</li>
+  <li><strong>Pool query.</strong> Every task carries a <code>PoolQuery</code> that says which containers run it: this node, one container by id or hash, a range, every container, a specific node, or wherever the module decides. Collective queries fold tasks from many submitters into one run.</li>
+  <li><strong>Transports.</strong> A client reaches the runtime over shared memory on the same machine, a Unix socket when shared memory is unavailable, or TCP across machines and containers, chosen automatically unless <code>CLIO_IPC_MODE</code> says otherwise. Runtimes talk to each other over TCP. GPU kernels can submit tasks through a GPU queue.</li>
+  <li><strong>Interposition.</strong> A module can stand in front of another, handle some methods and forward the rest to its <code>next_pool_id</code>. The cache, indexer, replication and compressor modules are built this way.</li>
+  <li><strong>Compose file.</strong> The <code>compose:</code> list of the configuration names the pools to create at startup, in order. <code>clio_run compose start</code> and <code>stop</code> create and destroy the pools of another file while the runtime keeps serving.</li>
+</ul>
+
+<h2>Scheduling</h2>
+<p>The runtime starts a fixed number of worker threads (<code>runtime.num_threads</code>, four by default) with roles: a scheduler, network send and receive workers, a GPU-queue worker, and I/O workers in cost classes. Tasks are mapped by predicted cost, learned from observed run times per module and method. A monitor moves the queue of a worker stuck on one task to a fresh worker, grows a saturated class, and retires idle extra workers. <a href="/design/runtime.html">Runtime and block devices</a> describes the mechanism and its tradeoffs.</p>
+
+<h2>Elasticity and failure handling</h2>
+<ul>
+  <li><strong>Durable pools.</strong> Pools created from the compose file, or with <code>restart: true</code>, are recorded in each node's pool log and recreated by the next <code>clio_run start</code>. <code>--fresh</code> discards the log with the rest of the node's state.</li>
+  <li><strong>Adding nodes.</strong> <code>clio_run start --induct</code> registers a node with an existing cluster. Every container receives an <code>Expand</code> callback and may re-partition its data.</li>
+  <li><strong>Migration and recovery.</strong> A container can be moved with its <code>Migrate</code> callback (<code>clio_run migrate</code>), and rebuilt on another node after a node loss with <code>Recover</code>; <code>ScheduleRecover</code> lets the module choose where. The defaults do nothing beyond re-initialising, so a module that holds state must implement them.</li>
+  <li><strong>Restarted peers</strong> are detected from an incarnation number on every message. Requests in flight to the old incarnation fail and are retried.</li>
+  <li><strong>Silent peers</strong> are probed and declared dead after <code>CLIO_PROBE_SILENCE_S</code> seconds (default 30). A send to an unreachable peer is retried for <code>CLIO_NET_RETRY_TIMEOUT_S</code> seconds (default 30) before its task fails; <code>CLIO_NET_DEAD_FAIL_FAST=1</code> fails tasks to a dead peer at once.</li>
+  <li><strong>Gossip detection</strong> (the <code>swim</code> section) exists but is off by default, because wide collectives starved its probes at scale. With it off, a dead node produces failed tasks, not automatic container recovery. Data availability across node loss comes from the replication module.</li>
+  <li><strong>Clients survive a restarted runtime.</strong> A heartbeat detects the loss, the client waits for the runtime to return, reconnects and resends. The runtime reclaims the shared-memory segments of dead clients after <code>runtime.client_reap_grace_s</code> seconds.</li>
+</ul>
+
+<h2>How it relates to the other technologies</h2>
+<ul>
+  <li><a href="/docs/cte/index.html">Context Transfer Engine</a>: the core, cache, indexer, replication, compressor and block-device modules. The runtime's block-device module, <code>clio_bdev</code>, is what every storage tier is built on.</li>
+  <li><a href="/docs/context-fs/index.html">Context FS</a>: the filesystem and stream modules, plus the FUSE daemon, which is a runtime client.</li>
+  <li><a href="/docs/cae/index.html">Context Assimilation Engine</a> and <a href="/docs/cee/index.html">Context Exploration Engine</a>: modules and clients for importing and querying data.</li>
+  <li><a href="/docs/memory-expansion/index.html">Memory expansion</a>: paged vectors whose pages are tasks on the CTE pools, including tasks submitted from GPU kernels.</li>
+  <li><a href="/docs/ml/index.html">Machine learning</a>: clio-ml algorithms that run over those vectors.</li>
+</ul>
+
+<h2>Where to go next</h2>
+<ul>
+  <li><a href="/docs/runtime/install.html">Install</a>: the runtime is in every install; building a module needs the headers and CMake package.</li>
+  <li><a href="/docs/runtime/usage.html">Usage</a>: write, build, load and compose a ChiMod.</li>
+  <li><a href="/docs/runtime/api.html">API reference</a>: <code>clio_run</code>, client initialisation, <code>PoolQuery</code>, the task and coroutine macros, the container callbacks, the CMake functions, the configuration file and environment variables.</li>
+  <li><a href="/develop/operator.html">Write a chain operator</a>: a complete module in the storage chain, built and run end to end.</li>
+</ul>

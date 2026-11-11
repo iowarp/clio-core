@@ -6,6 +6,13 @@ eyebrow: Technologies · Compute
 lede: clio-ml is a library of classic machine-learning algorithms (the Spark MLlib set) written over CLIO Core's paged vectors. A dataset larger than GPU memory trains without hand-sizing anything; its pages stream from host memory, NVMe or DAOS through a GPU cache.
 facts: Algorithms | 30+ modules; 13 benchmarked below ; Backends | CPU, CUDA, SYCL ; Data | Any CTE tier, including DAOS ; Compared with | Spark MLlib, oneDAL, Dask-ML
 -->
+<h2>Key takeaways</h2>
+<ul class="checks">
+  <li>clio-ml: the Spark MLlib algorithm set, over 30 modules, on CPU, CUDA and SYCL.</li>
+  <li>Trains out of core: data larger than GPU memory streams from the tiers you compose.</li>
+  <li>Measured 8-59x faster per iteration than Spark MLlib.</li>
+</ul>
+
 <ul class="headline-stats">
   <li><strong>8-59x</strong><span>faster per iteration than Spark MLlib, 1-16 nodes</span></li>
   <li><strong>flat</strong><span>time per iteration from 1 to 16 nodes (weak scaling)</span></li>
@@ -129,5 +136,5 @@ facts: Algorithms | 30+ modules; 13 benchmarked below ; Backends | CPU, CUDA, SY
 <h2>Where to go next</h2>
 <ul>
   <li><a href="/technologies/memory-expansion.html">Memory expansion: the paged vectors underneath</a></li>
-  <li><a href="/technologies/kv-store.html">Key-value store</a></li>
+  <li><a href="/technologies/context-transfer-engine.html">Context Transfer Engine</a></li>
 </ul>

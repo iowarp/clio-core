@@ -6,6 +6,13 @@ eyebrow: Technologies · Memory
 lede: Eternia is a software distributed shared memory built on CLIO Core. It extends GPU memory across nodes and down a tiered hierarchy of DRAM and storage, and takes placement, coherence and persistence off the programmer's hands.
 facts: Interface | Paged vector (gpu_vector, cpu_vector) ; GPUs | Intel Max 1550 (SYCL), NVIDIA (CUDA) ; Tiers | HBM, DRAM, DAOS, Lustre, any CTE tier ; Scale | Measured to 64 Aurora nodes
 -->
+<h2>Key takeaways</h2>
+<ul class="checks">
+  <li>Paged vectors for CPU and GPU code whose data is larger than device memory.</li>
+  <li>Pages spill to DRAM and storage tiers; placement, coherence and persistence are handled for you.</li>
+  <li>Measured within 0.88-1.19x of MPI, oneCCL and Intel SHMEM on up to 64 Aurora nodes.</li>
+</ul>
+
 <ul class="headline-stats">
   <li><strong>0.88-1.19x</strong><span>MPI's time on four workloads, 4 to 64 Aurora nodes</span></li>
   <li><strong>2x</strong><span>larger problems than DDN, Hermes and cuFile can run</span></li>

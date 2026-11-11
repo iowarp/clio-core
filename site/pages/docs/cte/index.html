@@ -1,0 +1,43 @@
+<!--
+title: Overview
+heading: The Context <em>Transfer Engine.</em>
+description: What the Context Transfer Engine is, the problem it solves, its tags, blobs, scores, targets and placement model, and how every other CLIO Core technology is built on it.
+eyebrow: Docs · Context Transfer Engine
+lede: The Context Transfer Engine (CTE) is the storage engine under everything else in CLIO Core. It stores named byte ranges in named groups across the memory and storage tiers you compose, places each one by a score, moves it between tiers on request, and answers queries by name, by keyword and by time.
+facts: Module | clio_cte_core ; Core pool | 512.0 ; C++ | clio_cte/core/core_client.h ; Python | clio_cte_core_ext
+-->
+<h2>What it is</h2>
+<p>The CTE is a tiered key-value store that runs as a module inside the <a href="/docs/runtime/index.html">Context Runtime</a>. One container of it runs on every node. A program talks to it through a client library in C++ or Python, or indirectly through a filesystem mount, an I/O adapter, a paged vector or an import job.</p>
+<p>The problem it solves is placement. A node has several kinds of memory and storage with very different speeds and capacities: HBM, DRAM, pinned host memory, local NVMe, a parallel filesystem, object storage. Code that wants to use all of them has to decide where each piece of data goes, move it when the decision changes, and remember where everything is. The CTE takes that work over. You write a blob with a score; the engine chooses the tier, records the location, and moves the blob later when you or a policy change the score.</p>
+
+<h2>Data model</h2>
+<ul>
+  <li><strong>Tag.</strong> A named group of blobs, roughly a bucket. Each tag has a <code>TagId</code> with a <code>major_</code> and <code>minor_</code> part. The name maps to the id, and one container owns the tag. A tag can carry extended attributes and aliases. Context FS uses one tag per file.</li>
+  <li><strong>Blob.</strong> A named byte range inside a tag. Puts and gets address a blob by tag id and blob name plus an offset and a size, so a blob can be written and read in pieces. Blob operations are routed to the blob's owner container by hashing the tag and name.</li>
+  <li><strong>Score.</strong> Every blob has a placement score from 0.0 to 1.0. 1.0 means the fastest tier, 0.0 the slowest. A new blob written without an explicit score lands at 1.0. A put that passes the sentinel -1.0 keeps the blob's current score.</li>
+  <li><strong>Targets and tiers.</strong> Each entry in the <code>storage</code> list of the core's compose entry becomes a block-device pool registered as a target with its own score and capacity. Target types are <code>ram</code>, <code>file</code>, <code>hbm</code>, <code>pinned</code>, <code>noop</code>, <code>s3</code> and <code>gcs</code>, or an already composed pool such as an erasure-coded array through <code>existing_pool_id</code>. Memory tiers are node-local. Persistent tiers can be registered from a neighborhood of nodes.</li>
+  <li><strong>Placement.</strong> At put time the data placement engine (<code>dpe.dpe_type</code>, <code>max_bw</code> by default) picks targets for the blob from its score and the targets' free space. A blob's placement changes later only through reorganization: an explicit <code>ReorganizeBlob</code> with a new score, an <code>Evict</code> that frees the lowest-scored blobs off a tier, or a periodic data organizer policy when one is configured.</li>
+</ul>
+
+<h2>Queries</h2>
+<p>Three kinds of query are answered without reading the blobs back into the caller. <strong>TagQuery</strong> and <strong>BlobQuery</strong> match names against regular expressions from metadata. <strong>SemanticSearch</strong> is BM25 keyword search over blob contents, served by the indexer module rather than the core. <strong>TemporalSearch</strong> returns blobs whose last-modified timestamp lies in a range. The <a href="/docs/cte/usage.html">usage guide</a> shows each one.</p>
+
+<h2>The interposition chain</h2>
+<p>The core is the bottom of a chain of modules that all speak its task interface: cache (563.0), indexer (564.0), optional compressor (562.0), replication (561.0), core (512.0). A client bound to the top of the chain gets all of their behavior. A client bound to 512.0 bypasses them. The <a href="/design/chain.html">chain design page</a> explains the mechanism and the <a href="/modules/cte-core.html">CTE core module page</a> lists every configuration key.</p>
+
+<h2>How the other technologies use it</h2>
+<ul>
+  <li><a href="/docs/context-fs/index.html">Context FS</a> maps every file to a tag and every file page to a blob, and turns fsync into <code>SyncTag</code>.</li>
+  <li>The <a href="/docs/cae/index.html">Context Assimilation Engine</a> imports outside data into tags and blobs, and can register itself as a tag's fault handler so a blob is ingested the first time it is read.</li>
+  <li>The <a href="/docs/cee/index.html">Context Exploration Engine</a> is a bundle, query and retrieve API over tags, blobs and the three queries above.</li>
+  <li><a href="/docs/memory-expansion/index.html">Memory expansion</a> stores every page of a paged CPU or GPU vector as a blob named by its page number.</li>
+  <li><a href="/docs/ml/index.html">Machine learning</a> keeps its datasets in those paged vectors.</li>
+  <li>The <a href="/docs/runtime/index.html">Context Runtime</a> hosts the CTE as a composed pool and runs its tasks on its workers.</li>
+</ul>
+
+<h2>Where to go next</h2>
+<ul>
+  <li><a href="/docs/cte/install.html">Install</a>: what the pip wheel and the other install methods include, and how to link the C++ client.</li>
+  <li><a href="/docs/cte/usage.html">Usage</a>: put and get, tags, queries, reorganization and asynchronous calls in C++ and Python.</li>
+  <li><a href="/docs/cte/api.html">API reference</a>: the C++ <code>Tag</code> and <code>Client</code> classes, the Python module and the compose YAML keys.</li>
+</ul>
