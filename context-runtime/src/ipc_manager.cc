@@ -5029,6 +5029,33 @@ RouteResult IpcManager::RouteTask(Future<Task> &future, bool force_enqueue) {
     if (exec) {
       task_ptr->SetCompleter(exec->container_id_);
     }
+    // A task received from a peer arrives routed (RecvIn sets it) on the
+    // shared ingress lane 0, which one worker drains. Returning ExecHere for
+    // it ran EVERY remote request on that worker: measured on 4 nodes, worker
+    // 0 executed 100% of remote tasks (~5.4 s of a 10 s run) and they waited
+    // 3-5 ms on the lane, capping each node at ~1/r_exec remote ops/s. Place
+    // it once on the least-loaded pool worker instead. The worker passed to
+    // RuntimeMapTask is null on purpose: "the submitter has room, run inline"
+    // is for nested subtasks, and the lane-0 drainer is not this task's
+    // submitter -- its lane backlog is not even counted as its load.
+    // CLIO_NET_SPREAD=0 restores the old behaviour (A/B).
+    static const bool kNetSpread = [] {
+      const char *e = std::getenv("CLIO_NET_SPREAD");
+      return !(e != nullptr && (e[0] == '0' || e[0] == 'f' || e[0] == 'F'));
+    }();
+    Worker *cur = CLIO_CUR_WORKER;
+    if (kNetSpread && exec && cur != nullptr && scheduler_ != nullptr &&
+        !worker_queues_.IsNull() && task_ptr->IsRemote() &&
+        !task_ptr->IsStarted() && !task_ptr->IsNetPlaced()) {
+      task_ptr->SetNetPlaced();
+      u32 dest = scheduler_->RuntimeMapTask(nullptr, future, exec);
+      if (dest != cur->GetId()) {
+        auto &dest_lane = worker_queues_->GetLane(dest, 0);
+        dest_lane.Push(future);
+        AwakenWorker(&dest_lane);
+        return RouteResult::Local;
+      }
+    }
     return RouteResult::ExecHere;
   }
 

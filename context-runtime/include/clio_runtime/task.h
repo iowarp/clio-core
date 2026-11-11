@@ -454,6 +454,8 @@ class Task {
   void SetRouted(bool v = true);
   bool IsStarted() const;
   void SetStarted(bool v = true);
+  bool IsNetPlaced() const;
+  void SetNetPlaced(bool v = true);
   ctp::CpuTimer& RunCpuTimer();
   float PredictedLoad() const;
   void SetPredictedLoad(float v);
@@ -921,6 +923,7 @@ class RunContext {
     RCTX_DID_WORK = 1u << 1,  /**< Task did work in last execution */
     RCTX_ROUTED = 1u << 2,    /**< RouteTask has placed this task */
     RCTX_STARTED = 1u << 3,   /**< Execution has begun */
+    RCTX_NET_PLACED = 1u << 4, /**< Net-received task was given a worker */
   };
 
   /** Coroutine handle for C++20 stackless coroutines (or Boost fiber handle) */
@@ -1246,6 +1249,8 @@ class RunContext {
   void SetRouted(bool v = true) { SetFlag(RCTX_ROUTED, v); }
   bool IsStarted() const { return flags_.Any(RCTX_STARTED); }
   void SetStarted(bool v = true) { SetFlag(RCTX_STARTED, v); }
+  bool IsNetPlaced() const { return flags_.Any(RCTX_NET_PLACED); }
+  void SetNetPlaced(bool v = true) { SetFlag(RCTX_NET_PLACED, v); }
   bool IsYielded() const { return flags_.Any(RCTX_YIELDED); }
   void SetYielded(bool v = true) { SetFlag(RCTX_YIELDED, v); }
   bool DidWork() const { return flags_.Any(RCTX_DID_WORK); }
@@ -1354,6 +1359,7 @@ inline double Task::TruePeriodNs() const { return period_ns_; }
 CLIO_RCTX_FLAG(DidWork, SetDidWork)
 CLIO_RCTX_FLAG(IsRouted, SetRouted)
 CLIO_RCTX_FLAG(IsStarted, SetStarted)
+CLIO_RCTX_FLAG(IsNetPlaced, SetNetPlaced)
 CLIO_RCTX_REF(ctp::CpuTimer, RunCpuTimer, cpu_timer_)
 CLIO_RCTX_GET(float, PredictedLoad, predicted_load_)
 CLIO_RCTX_SET(float, SetPredictedLoad, predicted_load_)
