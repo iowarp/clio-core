@@ -290,6 +290,12 @@ class Runtime : public clio::run::Container {
     clio::run::u32 mode_ = 0xFFFFFFFFu, uid_ = 0xFFFFFFFFu, gid_ = 0xFFFFFFFFu;
     clio::run::u64 dir_id_ = 0;   ///< packed id of the directory addressed
     clio::run::u32 block_ = 0;    ///< directory block addressed
+    /** Row mutations: the requesting container + 1 when it caches a copy of
+     *  the block and takes the change in the reply (FsResp::deltas_) instead
+     *  of as a push; 0 otherwise. */
+    clio::run::u32 from_ = 0;
+    clio::run::u64 have_ = 0;     ///< from_ != 0: version of the requester's copy
+    clio::run::u64 reg_ = 0;      ///< from_ != 0: the registration its copy is under
   };
 
   /** Response of one ShardOp. */
@@ -303,6 +309,14 @@ class Runtime : public clio::run::Container {
     clio::run::u64 handle_ = 0;    ///< open handle
     FsAttr attr_;                  ///< stat result
     std::string str_;              ///< symlink target / xattr value / blob
+    /** kTableFetch: the registration number the home gave the fetching
+     *  holder (TableBlockSlot::reg_). */
+    clio::run::u64 reg_ = 0;
+    /** Row mutations: EncodeTableDeltas of the changes the requester's copy
+     *  of the block has not been pushed (see TableBlockSlot::owed_); the
+     *  requester applies them as it would a push, before completing its
+     *  caller. */
+    std::string deltas_;
   };
 
  private:
@@ -447,6 +461,25 @@ class Runtime : public clio::run::Container {
     std::map<clio::run::u32, clio::run::u64> holder_lease_ms_;
     /** Copy: served without asking the home until then (steady ms). */
     clio::run::u64 lease_until_ms_ = 0;
+    /** Copy: the registration number the home gave this copy when it was
+     *  last fetched or revalidated (the home's holders_ entry). A row
+     *  mutation names it, so the home hands the change back in its reply
+     *  only while this is still the copy it has registered. */
+    clio::run::u64 reg_ = 0;
+    /** Home: per holder, the changes it was handed in the reply to its own
+     *  row mutation instead of being pushed (oldest first, contiguous, the
+     *  newest is the last commit). Whether the reply arrived is unknown, so
+     *  they ride along with the next push to that holder and with each
+     *  later reply to it, until a push delivers them, the holder reports a
+     *  version past them (FsReq::have_) or it fetches the block again. */
+    std::map<clio::run::u32, std::vector<TableDelta>> owed_;
+    /** Home: who the changes in unpushed_ came from (kBatchLocal,
+     *  kBatchMixed or a requesting container + 1; see MergeBatchSource). */
+    clio::run::u32 batch_from_ = kBatchLocal;
+    /** Home: source of the row mutation running under ns_mu_ right now
+     *  (what RecordChangeLocked charges its changes to); kBatchLocal
+     *  outside one. */
+    clio::run::u32 mutator_ = kBatchLocal;
     /** Home, directory journal: the journal holds no image this block's
      *  deltas build on (new, split off, materialized, or a journal write
      *  failed), so the next commit journals the whole block. */
@@ -934,12 +967,75 @@ class Runtime : public clio::run::Container {
    * @param holders containers caching it
    * @param leases each holder's lease end (steady ms), parallel to holders
    * @param gone out: holders to deregister
+   * @param own holders that get their own payload: holder -> the str_ sent
+   *        to it in place of req.str_ (nullptr: everyone gets req)
    */
   clio::run::TaskResume PushToHolders(
       clio::run::u32 op, const FsReq &req,
       const std::vector<clio::run::u32> &holders,
       const std::vector<clio::run::u64> &leases,
-      std::vector<clio::run::u32> *gone);
+      std::vector<clio::run::u32> *gone,
+      const std::map<clio::run::u32, std::string> *own = nullptr);
+  /** What CommitBlock pushes for one commit, and to whom. */
+  struct CommitPush {
+    std::vector<clio::run::u32> holders_;  ///< containers to push to
+    std::vector<clio::run::u64> leases_;   ///< their lease ends, parallel
+    /** Holders owed earlier changes too: holder -> its own payload. */
+    std::map<clio::run::u32, std::string> own_;
+  };
+  /**
+   * Decide who a commit pushes to (ns_mu_ held). A commit whose changes all
+   * came from one container's row mutations hands them to that container in
+   * the replies (they are added to its owed_) and leaves it out of the
+   * push; every other holder is pushed, with what it is still owed in
+   * front. Resets the slot's batch_from_.
+   * @param slot the home block
+   * @param resync true if the commit pushes a snapshot to every container
+   * @param deltas what the commit pushes
+   * @param push out: the push targets and per-holder payloads
+   */
+  void PlanCommitPushLocked(TableBlockSlot &slot, bool resync,
+                            const std::vector<TableDelta> &deltas,
+                            CommitPush *push);
+  /**
+   * After a commit's push (ns_mu_ held, holders already deregistered):
+   * forget what the push delivered, and what is owed to containers that are
+   * no longer holders.
+   * @param slot the home block
+   * @param push what PlanCommitPushLocked planned
+   * @param pushed true if the push was sent
+   */
+  void SettleOwedLocked(TableBlockSlot &slot, const CommitPush &push,
+                        bool pushed);
+  /**
+   * Home side, end of a row mutation (ns_mu_ held): put what the requester
+   * is owed into its reply, if it is still the copy registered here.
+   * @param slot the home block
+   * @param req the mutation
+   * @param resp its reply (deltas_ is set)
+   */
+  static void AttachOwedLocked(const TableBlockSlot &slot, const FsReq &req,
+                               FsResp &resp);
+  /**
+   * Home side, start of a row mutation (ns_mu_ held): work out whether the
+   * requester takes the change in the reply, and forget what its copy
+   * already holds of what it was owed.
+   * @param slot the home block
+   * @param req the mutation
+   * @return the source to charge the mutation's changes to (the requester
+   *         + 1, or kBatchLocal when it must be pushed like any holder)
+   */
+  clio::run::u32 MutationSourceLocked(TableBlockSlot &slot, const FsReq &req);
+  /**
+   * Requester side of a row mutation that named itself (req.from_): apply
+   * the changes its reply carries to the cached copy, exactly as a push
+   * would have; if the reply never came, drop the copy (it may have missed
+   * its own change) so the next use fetches it again.
+   * @param req the mutation as sent
+   * @param resp its reply
+   * @param lost true if the call failed without a reply from the home
+   */
+  void SettleMutationReply(const FsReq &req, FsResp &resp, bool lost);
   /**
    * Insert / replace a row in a home block (ns_mu_ held). req.leaf_ is the
    * caller's spelling; the row is keyed by its canonical name.
@@ -1503,6 +1599,14 @@ class Runtime : public clio::run::Container {
    * @param task the reply to fill (exists_ = 1)
    */
   static void FillGetattr(const FsAttr &a, GetattrTask *task);
+  /**
+   * Copy the attributes the inode's home returned from its open stage into
+   * an Open reply: exactly what FillGetattr would report for them. Only a
+   * regular file's are passed on (has_attr_ = 1).
+   * @param a the attributes (kShardInodeOpen's reply)
+   * @param task the reply to fill
+   */
+  static void FillOpenAttr(const FsAttr &a, OpenTask *task);
   /** Re-resolves of a name whose inode vanished under a racing rename. */
   static constexpr int kNameRaceRetries = 8;
   /**

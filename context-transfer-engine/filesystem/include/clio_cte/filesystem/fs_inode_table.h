@@ -650,6 +650,56 @@ inline bool ApplyTableOps(InodeTableBlock *b, const TableDelta &x) {
   return true;
 }
 
+/** Source of a block's queued changes: the home itself, a split or seal,
+ *  or a remote requester that has to be pushed like any other holder. */
+GLOBAL_CROSS_CONST clio::run::u32 kBatchLocal = 0;
+/** Source of a block's queued changes: more than one. */
+GLOBAL_CROSS_CONST clio::run::u32 kBatchMixed = 0xFFFFFFFFu;
+
+/**
+ * Fold the source of one more change into the source of the batch a block
+ * will commit next. Only a batch whose every change came from the same
+ * remote requester may be handed to it in its replies; any other mix is
+ * pushed to every holder, as a change another node made must reach a holder
+ * before that node's caller is told.
+ * @param first true if the batch held no change yet
+ * @param cur the batch's source so far (ignored when first)
+ * @param src the new change's source (kBatchLocal, or a container + 1)
+ * @return the batch's source with the change in it
+ */
+inline clio::run::u32 MergeBatchSource(bool first, clio::run::u32 cur,
+                                       clio::run::u32 src) {
+  if (first) return src;
+  return cur == src ? cur : kBatchMixed;
+}
+
+/**
+ * Drop the changes a holder's copy already has from what it is owed.
+ * @param owed changes owed to the holder, oldest first
+ * @param have version of the holder's copy
+ */
+inline void TrimOwedDeltas(std::vector<TableDelta> *owed,
+                           clio::run::u64 have) {
+  size_t n = 0;
+  while (n < owed->size() && (*owed)[n].new_version_ <= have) ++n;
+  owed->erase(owed->begin(), owed->begin() + static_cast<std::ptrdiff_t>(n));
+}
+
+/**
+ * What is pushed to a holder that is still owed earlier changes: those,
+ * then the commit's own.
+ * @param owed changes owed to the holder, oldest first
+ * @param batch the commit's changes
+ * @return the two, in version order
+ */
+inline std::vector<TableDelta> WithOwedDeltas(
+    const std::vector<TableDelta> &owed,
+    const std::vector<TableDelta> &batch) {
+  std::vector<TableDelta> out(owed);
+  out.insert(out.end(), batch.begin(), batch.end());
+  return out;
+}
+
 /** How a logged delta fared against the block replay has built so far. */
 enum class ReplayStep {
   kSkipped,   ///< not a row change newer than the block (already folded in)

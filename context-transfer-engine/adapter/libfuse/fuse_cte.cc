@@ -144,6 +144,26 @@ static void ShrinkAfterNoSpace(const std::string &hp,
                                clio::run::u64 first_bad);
 
 namespace {
+/** The attributes a stat is built from (FillStatFromAttrs): a Getattr
+ *  reply's, or the ones the Open that created a file returned for it. */
+struct StatAttrs {
+  bool is_dir = false;
+  bool is_symlink = false;
+  clio::run::u64 size = 0;
+  clio::run::u64 ino = 0;    // stable inode = packed TagId
+  clio::run::u64 ctime = 0;  // ns; 0 if unknown
+  clio::run::u64 mtime = 0;  // ns; 0 if unknown
+  clio::run::u64 atime = 0;  // ns; 0 if unknown
+  clio::run::u32 uid = 0xFFFFFFFFu;   // all-ones = the mounting user
+  clio::run::u32 gid = 0xFFFFFFFFu;   // all-ones = the mounting group
+  clio::run::u32 mode = 0xFFFFFFFFu;  // all-ones = the default mode
+  clio::run::u32 nlink = 1;
+};
+
+/** Bumped by every truncate/chmod/chown/utimens/fallocate through this
+ *  mount: attributes kept from before one are not served (TakeOpenAttrs). */
+std::atomic<clio::run::u64> g_setattr_epoch{0};
+
 /** Per-open-file state: the chimod handle + the path it was opened on. */
 struct CfsHandle {
   clio::run::u64 fh = 0;
@@ -171,6 +191,16 @@ struct CfsHandle {
   // Client no-space epoch this handle last checked (#1129, see
   // CheckWriteBehindNoSpace).
   std::atomic<clio::run::u64> nospace_seen{0};
+  // The attributes the Open that CREATED this file returned with it. They
+  // answer the one getattr(path, fi) the FUSE layer makes inside the same
+  // create request, which otherwise costs a round trip to the inode's home
+  // and registers this node as a holder of the inode. Set by KeepOpenAttrs,
+  // taken (once) by TakeOpenAttrs; open_attr_ok publishes the other fields.
+  StatAttrs open_attr;
+  std::atomic<bool> open_attr_ok{false};
+  std::thread::id open_attr_thread;                    // the creating thread
+  std::chrono::steady_clock::time_point open_attr_at;  // when they were kept
+  clio::run::u64 open_attr_epoch = 0;                  // g_setattr_epoch then
 };
 
 // ---------------------------------------------------------------------------
@@ -2096,41 +2126,42 @@ static void OverlayWriteTime(const std::string &p, cte_stat_t *stbuf) {
 }
 
 /**
- * Fill a stat buffer from the chimod's Getattr reply, overlaying what this
- * mount knows and the chimod does not yet: sizes of writes still queued or
- * in the sieve, and their write times.
- * @param t the Getattr reply (exists_ != 0)
+ * Fill a stat buffer from a file's attributes as the chimod reported them,
+ * overlaying what this mount knows and the chimod does not yet: sizes of
+ * writes still queued or in the sieve, and their write times.
+ * @param a the attributes (a Getattr reply's, or a creating Open's)
  * @param p the path this mount's overlays are keyed by
  * @param stbuf the buffer to fill
  */
-static void FillStatFromGetattr(clio::cte::filesystem::GetattrTask *t,
-                                const std::string &p, cte_stat_t *stbuf) {
+static void FillStatFromAttrs(const StatAttrs &a, const std::string &p,
+                              cte_stat_t *stbuf) {
+  const StatAttrs *t = &a;
   // Owner: a prior chown recorded an override (uid_/gid_ != 0xFFFFFFFF);
   // otherwise report the mounting user's uid/gid (files carry no stored owner).
   stbuf->st_uid =
-      (t->uid_ != 0xFFFFFFFFu) ? static_cast<uid_t>(t->uid_) : getuid();
+      (t->uid != 0xFFFFFFFFu) ? static_cast<uid_t>(t->uid) : getuid();
   stbuf->st_gid =
-      (t->gid_ != 0xFFFFFFFFu) ? static_cast<gid_t>(t->gid_) : getgid();
-  stbuf->st_ino = static_cast<ino_t>(t->ino_);  // stable inode = packed TagId
+      (t->gid != 0xFFFFFFFFu) ? static_cast<gid_t>(t->gid) : getgid();
+  stbuf->st_ino = static_cast<ino_t>(t->ino);  // stable inode = packed TagId
   // A chmod/create recorded permission bits (t->mode_ != 0xFFFFFFFF) win over
   // the synthesized defaults; keep only the low 12 bits (perms + setuid/gid/sticky).
-  const bool have_mode = (t->mode_ != 0xFFFFFFFFu);
-  const unsigned int perm = t->mode_ & 07777u;
-  if (t->is_dir_) {
+  const bool have_mode = (t->mode != 0xFFFFFFFFu);
+  const unsigned int perm = t->mode & 07777u;
+  if (t->is_dir) {
     stbuf->st_mode = S_IFDIR | (have_mode ? perm : 0755u);
     stbuf->st_nlink = 2;
-  } else if (t->is_symlink_) {
+  } else if (t->is_symlink) {
     stbuf->st_mode = S_IFLNK | 0777;
     stbuf->st_nlink = 1;
-    stbuf->st_size = static_cast<cte_off_t>(t->size_);  // target length
+    stbuf->st_size = static_cast<cte_off_t>(t->size);  // target length
   } else {
     stbuf->st_mode = S_IFREG | (have_mode ? perm : 0644u);
     // POSIX link count, computed by the chimod inside the Getattr task —
     // the separate alias round trip this replaced ran on EVERY regular-file
     // stat (2+ times per file on a checkout).
-    stbuf->st_nlink = static_cast<nlink_t>(t->nlink_);
+    stbuf->st_nlink = static_cast<nlink_t>(t->nlink);
     // cte_off_t is off_t on Linux; the WinFsp shim maps it for Windows.
-    stbuf->st_size = static_cast<cte_off_t>(t->size_);
+    stbuf->st_size = static_cast<cte_off_t>(t->size);
     // A deferred write that extended the file may not have advanced the
     // published size yet, but the write(2) it came from already returned —
     // stat must see it. High-water pending end, no drain (same rule as the
@@ -2159,18 +2190,94 @@ static void FillStatFromGetattr(clio::cte::filesystem::GetattrTask *t,
   // no value, so leave that field at the epoch): ctime = last metadata change
   // (last_changed_), mtime = last content change (last_modified_), atime = last
   // access (last_read_). All three are surfaced from the same GetTagSize query.
-  if (t->ctime_ != 0) {
-    NsBitsToTimespec(t->ctime_, stbuf->st_ctim.tv_sec, stbuf->st_ctim.tv_nsec);
+  if (t->ctime != 0) {
+    NsBitsToTimespec(t->ctime, stbuf->st_ctim.tv_sec, stbuf->st_ctim.tv_nsec);
   }
   // Fall back to ctime when mtime is unknown, so a valid file never reports
   // mtime at the epoch while it has a real ctime (merged from #680).
-  clio::run::u64 mtime_ns = (t->mtime_ != 0) ? t->mtime_ : t->ctime_;
+  clio::run::u64 mtime_ns = (t->mtime != 0) ? t->mtime : t->ctime;
   if (mtime_ns != 0) {
     NsBitsToTimespec(mtime_ns, stbuf->st_mtim.tv_sec, stbuf->st_mtim.tv_nsec);
   }
-  if (t->atime_ != 0) {
-    NsBitsToTimespec(t->atime_, stbuf->st_atim.tv_sec, stbuf->st_atim.tv_nsec);
+  if (t->atime != 0) {
+    NsBitsToTimespec(t->atime, stbuf->st_atim.tv_sec, stbuf->st_atim.tv_nsec);
   }
+}
+
+/**
+ * Fill a stat buffer from a Getattr reply (see FillStatFromAttrs).
+ * @param t the Getattr reply (exists_ != 0)
+ * @param p the path this mount's overlays are keyed by
+ * @param stbuf the buffer to fill
+ */
+static void FillStatFromGetattr(clio::cte::filesystem::GetattrTask *t,
+                                const std::string &p, cte_stat_t *stbuf) {
+  StatAttrs a;
+  a.is_dir = t->is_dir_ != 0;
+  a.is_symlink = t->is_symlink_ != 0;
+  a.size = t->size_;
+  a.ino = t->ino_;
+  a.ctime = t->ctime_;
+  a.mtime = t->mtime_;
+  a.atime = t->atime_;
+  a.uid = t->uid_;
+  a.gid = t->gid_;
+  a.mode = t->mode_;
+  a.nlink = t->nlink_;
+  FillStatFromAttrs(a, p, stbuf);
+}
+
+/** How long attributes kept from a create may wait for the getattr of the
+ *  same request. That getattr follows at once; this only keeps a frontend
+ *  that never makes it from leaving them to a much later fstat. */
+static constexpr std::chrono::milliseconds kOpenAttrMaxAge{20};
+
+/**
+ * Keep the attributes an Open returned for the file it just CREATED, for
+ * the getattr(path, fi) that follows inside the same create request. Not
+ * for a file that already existed (others may hold it open, with writes in
+ * flight) and not when the reply carries none.
+ * @param h the new open file
+ * @param t the Open reply
+ */
+static void KeepOpenAttrs(CfsHandle *h, clio::cte::filesystem::OpenTask *t) {
+  if (t->created_ == 0 || t->has_attr_ == 0) return;
+  StatAttrs &a = h->open_attr;
+  a.size = t->size_;
+  a.ino = t->ino_;
+  a.ctime = t->ctime_;
+  a.mtime = t->mtime_;
+  a.atime = t->atime_;
+  a.uid = t->uid_;
+  a.gid = t->gid_;
+  a.mode = t->attr_mode_;
+  a.nlink = t->nlink_;
+  h->open_attr_thread = std::this_thread::get_id();
+  h->open_attr_at = std::chrono::steady_clock::now();
+  h->open_attr_epoch = g_setattr_epoch.load();
+  h->open_attr_ok.store(true);
+}
+
+/**
+ * Take the attributes KeepOpenAttrs kept, if they still describe the file:
+ * at most once per handle, only on the thread that created the file (the
+ * FUSE layer stats it there, in the same request), only right away, and
+ * only if nothing was written, truncated or set through this mount since.
+ * Whatever the answer, the handle keeps none afterwards.
+ * @param h the open file
+ * @param out receives the attributes
+ * @return true when out may answer this getattr
+ */
+static bool TakeOpenAttrs(CfsHandle *h, StatAttrs *out) {
+  if (!h->open_attr_ok.exchange(false)) return false;
+  if (h->open_attr_thread != std::this_thread::get_id()) return false;
+  if (std::chrono::steady_clock::now() - h->open_attr_at > kOpenAttrMaxAge) {
+    return false;
+  }
+  if (h->open_attr_epoch != g_setattr_epoch.load()) return false;
+  if (h->wrote.load() || h->appended.load()) return false;
+  *out = h->open_attr;
+  return true;
 }
 
 static int cte_fuse_getattr_stat_inner(const char *path, cte_stat_t *stbuf,
@@ -2458,17 +2565,30 @@ static int GetattrStatImpl(const char *path, cte_stat_t *stbuf,
     const int aerr = FlushAppends(handle, key);
     if (aerr != 0) return aerr;
   }
+  // The first getattr through a handle uses up whatever its create kept,
+  // whichever branch below answers it.
+  StatAttrs kept;
+  const bool have_kept = handle != nullptr && TakeOpenAttrs(handle, &kept);
   int rc = 0;
   PendingCreate pc;
   if (handle != nullptr && !handle->tag.IsNull() &&
       !PendingCreateLookup(key, &pc) && !PathStillNamesHandle(handle, key)) {
     // fstat: the descriptor's own file, even if its name now leads
     // elsewhere (renamed over) or nowhere (unlinked while open).
-    clio::run::Future<clio::cte::filesystem::GetattrTask> t;
-    rc = GetattrOpenHandle(handle, key, &t);
-    if (rc == 0) {
+    if (have_kept) {
+      // The create that opened it returned these in this same request: no
+      // task. Queued writes under this name are waited out as for a task.
+      clio::cte::core::Client::DeferAwaitKey(
+          clio::cte::core::Client::DeferKeyHashName(key));
       memset(stbuf, 0, sizeof(*stbuf));
-      FillStatFromGetattr(t.get(), key, stbuf);
+      FillStatFromAttrs(kept, key, stbuf);
+    } else {
+      clio::run::Future<clio::cte::filesystem::GetattrTask> t;
+      rc = GetattrOpenHandle(handle, key, &t);
+      if (rc == 0) {
+        memset(stbuf, 0, sizeof(*stbuf));
+        FillStatFromGetattr(t.get(), key, stbuf);
+      }
     }
   } else {
     rc = cte_fuse_getattr_stat_inner(key.c_str(), stbuf, fi);
@@ -2611,6 +2731,7 @@ static int cte_fuse_getattr(const char *path, cte_stat_t *stbuf,
 
 int cte_fuse_utimens(const char *path_in, const cte_timespec_t tv[2],
                             struct fuse_file_info *fi) {
+  g_setattr_epoch.fetch_add(1);  // attributes kept from a create are stale
   if (path_in != nullptr) DirAttrInvalidate(path_in);
   const std::string path_s = OpPath(path_in, fi);
   if (path_s.empty()) return -EBADF;
@@ -2714,6 +2835,7 @@ int cte_fuse_utimens(const char *path_in, const cte_timespec_t tv[2],
 // existence probe is needed.
 int cte_fuse_chmod(const char *path, cte_mode_t mode,
                           struct fuse_file_info *fi) {
+  g_setattr_epoch.fetch_add(1);  // attributes kept from a create are stale
   if (path != nullptr) DirAttrInvalidate(path);
   auto *cfs = CLIO_CFS_CLIENT;
   std::string p = OpPath(path, fi);
@@ -2754,6 +2876,7 @@ int cte_fuse_chmod(const char *path, cte_mode_t mode,
 // exactly the chimod's "unchanged" sentinel, so no translation is needed.
 int cte_fuse_chown(const char *path, uid_t uid, gid_t gid,
                           struct fuse_file_info *fi) {
+  g_setattr_epoch.fetch_add(1);  // attributes kept from a create are stale
   if (path != nullptr) DirAttrInvalidate(path);
   auto *cfs = CLIO_CFS_CLIENT;
   const std::string p = OpPath(path, fi);
@@ -3377,6 +3500,9 @@ int cte_fuse_create(const char *path, cte_mode_t mode,
   MaybeDirectIo(fi);
   MaybeTruncateOnOpen(cfs, p, fi->flags, t->created_);
   if (fi->flags & O_TRUNC) HiwaterClamp(p, 0);
+  // Last: the getattr(path, fi) the FUSE layer makes next, in this request,
+  // is answered from the reply (only for a file this call created).
+  KeepOpenAttrs(handle, t.get());
   return 0;
 }
 
@@ -4085,6 +4211,7 @@ int cte_fuse_write(const char *path, const char *buf, size_t size,
     size = static_cast<size_t>(INT_MAX);
   if (size == 0) return 0;
   handle->wrote.store(true, std::memory_order_relaxed);
+  handle->open_attr_ok.store(false, std::memory_order_relaxed);
   {
     // A page of this file the store refused earlier fails this write.
     const int nospc = CheckWriteBehindNoSpace(handle, hp);
@@ -4190,6 +4317,7 @@ int cte_fuse_unlink(const char *path) {
 
 int cte_fuse_truncate(const char *path_in, cte_off_t size,
                              struct fuse_file_info *fi) {
+  g_setattr_epoch.fetch_add(1);  // attributes kept from a create are stale
   // ftruncate of an open file with no name left (hard_remove) truncates it
   // by its inode key -- common for unlinked temp files (databases).
   const std::string path_s = OpPath(path_in, fi);
@@ -4322,6 +4450,7 @@ static clio::run::u64 StoreRemainingBytes() {
 
 static int cte_fuse_fallocate(const char *path, int mode, cte_off_t offset,
                               cte_off_t length, struct fuse_file_info *fi) {
+  g_setattr_epoch.fetch_add(1);  // attributes kept from a create are stale
   const int kSupportedModes = FALLOC_FL_KEEP_SIZE | FALLOC_FL_ZERO_RANGE;
   if (mode & ~kSupportedModes) {
     return -EOPNOTSUPP;  // punch/collapse/insert: layout-changing

@@ -468,6 +468,7 @@ clio::run::TaskResume Runtime::Open(clio::run::shared_ptr<OpenTask> &task) {
   task->handle_ = 0;
   task->size_ = 0;
   task->created_ = 0;
+  task->has_attr_ = 0;
   if (path == "/") {
     task->return_code_ = EISDIR;
     CLIO_CO_RETURN;
@@ -515,6 +516,9 @@ clio::run::TaskResume Runtime::Open(clio::run::shared_ptr<OpenTask> &task) {
     task->size_ = orr.attr_.size_;
     task->created_ = er.created_;
     task->tag_packed_ = er.id_;
+    // The home had the inode in hand to open it: its attributes go back
+    // too, so the caller need not stat it there right after.
+    if (orr.rc_ == 0) FillOpenAttr(orr.attr_, task.get());
     task->return_code_ = orr.rc_;
     CLIO_CO_RETURN;
   }
@@ -1105,6 +1109,19 @@ void Runtime::FillGetattr(const FsAttr &a, GetattrTask *task) {
   task->mode_ = a.mode_;
   task->nlink_ = a.nlink_;
   task->volume_flags_ = a.volume_flags_;
+}
+
+void Runtime::FillOpenAttr(const FsAttr &a, OpenTask *task) {
+  if (a.type_ != kFsTypeFile) return;
+  task->has_attr_ = 1;
+  task->ino_ = InoFromPacked(a.id_);
+  task->atime_ = a.atime_;
+  task->mtime_ = a.mtime_;
+  task->ctime_ = a.ctime_;
+  task->uid_ = a.uid_;
+  task->gid_ = a.gid_;
+  task->attr_mode_ = a.mode_;
+  task->nlink_ = a.nlink_;
 }
 
 clio::run::TaskResume Runtime::StatSize(clio::run::shared_ptr<StatSizeTask> &task) {

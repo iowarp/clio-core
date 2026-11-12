@@ -755,6 +755,7 @@ clio::run::TaskResume Runtime::FetchBlock(clio::run::u64 dir,
     lrc = EIO;
   }
   slot->home_id_ = home;
+  slot->reg_ = resp.reg_;
   // The lease runs from when we asked: the home granted it later.
   slot->lease_until_ms_ = asked_ms + kCacheLeaseMs;
   CLIO_CO_RETURN;
@@ -791,6 +792,7 @@ clio::run::TaskResume Runtime::RevalidateBlock(
   if (changed && nb.version_ > slot->blk_.version_) {
     slot->blk_ = std::move(nb);
   }
+  slot->reg_ = resp.reg_;  // the home registered this copy anew
   slot->lease_until_ms_ = asked_ms + kCacheLeaseMs;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -813,9 +815,12 @@ clio::run::TaskResume Runtime::ServeBlockFetch(const FsReq &req,
   std::lock_guard<std::mutex> g(ns_mu_);
   const clio::run::u32 holder = static_cast<clio::run::u32>(req.a_);
   if (holder != container_id_) {
-    slot->holders_[holder] = reg_seq_++;
+    resp.reg_ = slot->holders_[holder] = reg_seq_++;
     slot->holder_lease_ms_[holder] =
         SteadyMs() + kCacheLeaseMs + kCacheLeaseSlackMs;
+    // What it is given here (or already has, if unchanged) is the block as
+    // it stands, every change it was owed included.
+    slot->owed_.erase(holder);
   }
   resp.rc_ = 0;
   if (req.b_ != 0 && req.b_ == slot->blk_.version_) {
@@ -931,6 +936,8 @@ clio::run::u64 Runtime::RecordChangeLocked(TableBlockSlot &slot, TableDelta delt
   delta.depth_ = b.depth_;
   delta.mtime_ = b.mtime_;
   delta.sealed_ = b.sealed_;
+  slot.batch_from_ = MergeBatchSource(slot.unpushed_.empty(),
+                                      slot.batch_from_, slot.mutator_);
   slot.unpushed_.push_back(std::move(delta));
   if (persisted) slot.persist_dirty_ = true;
   return b.version_;
@@ -940,7 +947,8 @@ clio::run::TaskResume Runtime::PushToHolders(
     clio::run::u32 op, const FsReq &req,
     const std::vector<clio::run::u32> &holders,
     const std::vector<clio::run::u64> &leases,
-    std::vector<clio::run::u32> *gone) {
+    std::vector<clio::run::u32> *gone,
+    const std::map<clio::run::u32, std::string> *own) {
   CLIO_TASK_BODY_BEGIN
   // (holder, lease end) still owed this push
   std::vector<std::pair<clio::run::u32, clio::run::u64>> todo;
@@ -961,6 +969,10 @@ clio::run::TaskResume Runtime::PushToHolders(
       } else if (!clio::cte::core::ContainerNodeAlive(pool_id_,
                                                       todo[i].first)) {
         wait.push_back(todo[i]);  // may only be cut off: wait out the lease
+      } else if (own != nullptr && own->count(todo[i].first) != 0) {
+        FsReq mine = req;  // this holder's own payload
+        mine.str_ = own->at(todo[i].first);
+        fs.emplace_back(i, SendShard(todo[i].first, op, mine));
       } else {
         fs.emplace_back(i, SendShard(todo[i].first, op, req));
       }
@@ -1109,6 +1121,101 @@ clio::run::TaskResume Runtime::WriteCommitRecords(
   CLIO_TASK_BODY_END
 }
 
+void Runtime::PlanCommitPushLocked(TableBlockSlot &slot, bool resync,
+                                   const std::vector<TableDelta> &deltas,
+                                   CommitPush *push) {
+  const clio::run::u32 from = slot.batch_from_;
+  slot.batch_from_ = kBatchLocal;
+  PushTargetsLocked(slot, resync, &push->holders_, &push->leases_);
+  if (resync) {
+    slot.owed_.clear();  // the snapshot is the whole block
+    return;
+  }
+  if (deltas.empty()) return;  // nothing is pushed: owed changes stay owed
+  const clio::run::u64 now = SteadyMs();
+  for (size_t i = 0; i < push->holders_.size();) {
+    const clio::run::u32 h = push->holders_[i];
+    // Every change of this commit is its own, and its lease is running: it
+    // gets them in its replies (RowMutation). Past the lease it is pushed,
+    // which deregisters it, as ever.
+    if (from != kBatchLocal && from != kBatchMixed && h + 1 == from &&
+        now < push->leases_[i]) {
+      std::vector<TableDelta> &owed = slot.owed_[h];
+      owed.insert(owed.end(), deltas.begin(), deltas.end());
+      push->holders_.erase(push->holders_.begin() +
+                           static_cast<std::ptrdiff_t>(i));
+      push->leases_.erase(push->leases_.begin() +
+                          static_cast<std::ptrdiff_t>(i));
+      continue;
+    }
+    auto ot = slot.owed_.find(h);
+    if (ot != slot.owed_.end() && !ot->second.empty()) {
+      push->own_[h] = EncodeTableDeltas(WithOwedDeltas(ot->second, deltas));
+    }
+    ++i;
+  }
+}
+
+void Runtime::SettleOwedLocked(TableBlockSlot &slot, const CommitPush &push,
+                               bool pushed) {
+  if (pushed) {
+    // The push carried what each was owed; one that did not take it is
+    // deregistered below or has fetched the block again since.
+    for (clio::run::u32 h : push.holders_) slot.owed_.erase(h);
+  }
+  for (auto it = slot.owed_.begin(); it != slot.owed_.end();) {
+    it = slot.holders_.count(it->first) == 0 ? slot.owed_.erase(it) : ++it;
+  }
+}
+
+clio::run::u32 Runtime::MutationSourceLocked(TableBlockSlot &slot,
+                                             const FsReq &req) {
+  if (req.from_ == 0 || req.from_ == kBatchMixed || req.reg_ == 0) {
+    return kBatchLocal;
+  }
+  const clio::run::u32 who = req.from_ - 1;
+  if (who == container_id_) return kBatchLocal;
+  // Only the copy this home has registered: one fetched again since the
+  // request was sent (it gave up on an earlier reply, or renewed its lease)
+  // is pushed like any other holder.
+  auto ht = slot.holders_.find(who);
+  if (ht == slot.holders_.end() || ht->second != req.reg_) return kBatchLocal;
+  auto ot = slot.owed_.find(who);
+  if (ot != slot.owed_.end()) {
+    TrimOwedDeltas(&ot->second, req.have_);
+    if (ot->second.empty()) slot.owed_.erase(ot);
+  }
+  return req.from_;
+}
+
+void Runtime::AttachOwedLocked(const TableBlockSlot &slot, const FsReq &req,
+                               FsResp &resp) {
+  if (req.from_ == 0 || req.reg_ == 0) return;
+  const clio::run::u32 who = req.from_ - 1;
+  auto ht = slot.holders_.find(who);
+  if (ht == slot.holders_.end() || ht->second != req.reg_) return;
+  auto ot = slot.owed_.find(who);
+  if (ot == slot.owed_.end() || ot->second.empty()) return;
+  resp.deltas_ = EncodeTableDeltas(ot->second);
+}
+
+void Runtime::SettleMutationReply(const FsReq &req, FsResp &resp, bool lost) {
+  if (req.from_ == 0) return;
+  // No reply (or one that says the home could not finish): this copy may
+  // lack its own change, and nothing will push it.
+  bool drop = lost || resp.rc_ == EIO;
+  if (!resp.deltas_.empty()) {
+    FsReq pr;
+    pr.str_.swap(resp.deltas_);
+    // ENOENT (the copy is gone meanwhile) is as for a push to a non-holder.
+    if (ApplyTablePush(pr) == EINVAL) drop = true;
+  }
+  if (!drop) return;
+  std::lock_guard<std::mutex> g(ns_mu_);
+  auto it = blocks_.find(TableBlockKey{req.dir_id_, req.block_});
+  if (it != blocks_.end() && !it->second->home_) blocks_.erase(it);
+}
+
 clio::run::TaskResume Runtime::CommitBlock(std::shared_ptr<TableBlockSlot> slot,
                                            clio::run::u64 version, int &rc) {
   CLIO_TASK_BODY_BEGIN
@@ -1118,8 +1225,7 @@ clio::run::TaskResume Runtime::CommitBlock(std::shared_ptr<TableBlockSlot> slot,
     BlockBlobWrite blob;  // what the blob gets: an image or an appended frame
     std::string jrec;
     FsLogRec jtype = FsLogRec::kBlockDeltas;
-    std::vector<clio::run::u32> holders;
-    std::vector<clio::run::u64> leases;  // parallel to holders
+    CommitPush push;  // who is pushed, and what
     std::map<clio::run::u32, clio::run::u64> reg;  // registrations pushed to
     clio::run::u64 v = 0, dir = 0;
     clio::run::u32 k = 0;
@@ -1146,7 +1252,7 @@ clio::run::TaskResume Runtime::CommitBlock(std::shared_ptr<TableBlockSlot> slot,
           slot->holders_unknown_ = false;
           deltas.assign(1, SnapshotDelta(slot->blk_));
         }
-        PushTargetsLocked(*slot, resync, &holders, &leases);
+        PlanCommitPushLocked(*slot, resync, deltas, &push);
       }
     }
     if (!go) {
@@ -1167,12 +1273,14 @@ clio::run::TaskResume Runtime::CommitBlock(std::shared_ptr<TableBlockSlot> slot,
            blob.bytes_.size(), wrc);
     }
     std::vector<clio::run::u32> gone;
-    if (!deltas.empty() && !holders.empty()) {
+    const bool pushed = !deltas.empty() && !push.holders_.empty();
+    if (pushed) {
       FsReq pr;
       pr.str_ = EncodeTableDeltas(deltas);
-      CLIO_CO_AWAIT(PushToHolders(kTablePush, pr, holders, leases, &gone));
+      CLIO_CO_AWAIT(PushToHolders(kTablePush, pr, push.holders_, push.leases_,
+                                  &gone, &push.own_));
     }
-    WarnIfSlowCommit(dir, k, commit_t0, holders.size(), resync);
+    WarnIfSlowCommit(dir, k, commit_t0, push.holders_.size(), resync);
     {
       std::lock_guard<std::mutex> g(ns_mu_);
       if (resync) {
@@ -1181,15 +1289,16 @@ clio::run::TaskResume Runtime::CommitBlock(std::shared_ptr<TableBlockSlot> slot,
         // restart may be trusted until that horizon). Without one they
         // counted as expired: the next change skipped them while they still
         // served their copy without asking.
-        for (size_t i = 0; i < holders.size(); ++i) {
-          const clio::run::u32 h = holders[i];
+        for (size_t i = 0; i < push.holders_.size(); ++i) {
+          const clio::run::u32 h = push.holders_[i];
           if (std::find(gone.begin(), gone.end(), h) != gone.end()) continue;
           if (slot->holders_.count(h) == 0) slot->holders_[h] = reg_seq_++;
           clio::run::u64 &lease = slot->holder_lease_ms_[h];
-          lease = std::max(lease, leases[i]);
+          lease = std::max(lease, push.leases_[i]);
         }
       }
       DropGoneHolders(gone, reg, &slot->holders_, &slot->holder_lease_ms_);
+      SettleOwedLocked(*slot, push, pushed);
       SettleBlobWriteLocked(*slot, blob, wrc, mirror_failed);
       slot->durable_version_ = v;
       slot->committing_ = false;
@@ -1408,12 +1517,17 @@ clio::run::TaskResume Runtime::RowMutation(clio::run::u32 op,
         rc = kFsRedirect;  // it split: the caller re-walks
       } else if (slot->splitting_) {
         rc = kFsRetry;
-      } else if (op == kTableInsert) {
-        rc = InsertRowLocked(*slot, req, resp);
-      } else if (op == kTableRemove) {
-        rc = RemoveRowLocked(*slot, req, resp);
       } else {
-        rc = RespellRowLocked(*slot, req, resp);
+        // A requester that caches this block takes its change in the reply.
+        slot->mutator_ = MutationSourceLocked(*slot, req);
+        if (op == kTableInsert) {
+          rc = InsertRowLocked(*slot, req, resp);
+        } else if (op == kTableRemove) {
+          rc = RemoveRowLocked(*slot, req, resp);
+        } else {
+          rc = RespellRowLocked(*slot, req, resp);
+        }
+        slot->mutator_ = kBatchLocal;
       }
       after = slot->blk_.version_;
     }
@@ -1427,6 +1541,12 @@ clio::run::TaskResume Runtime::RowMutation(clio::run::u32 op,
   }
   resp.rc_ = static_cast<clio::run::u32>(rc);
   if (rc == 0 && op == kTableInsert) CLIO_CO_AWAIT(SplitBlock(slot));
+  {
+    // Whatever the requester's copy was not pushed -- this change, and any
+    // earlier one whose reply may not have arrived -- goes back with this.
+    std::lock_guard<std::mutex> g(ns_mu_);
+    AttachOwedLocked(*slot, req, resp);
+  }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
@@ -2146,9 +2266,21 @@ clio::run::TaskResume Runtime::TableOp(clio::run::u32 op, FsReq req,
       std::lock_guard<std::mutex> g(ns_mu_);
       req.block_ = slot->blk_.index_;
     }
+    const clio::run::u32 home = BlockHome(req.dir_id_, req.block_);
+    {
+      // We cache a copy registered with that home: ask for the change in
+      // the reply instead of a push we would have to wait for as well.
+      std::lock_guard<std::mutex> g(ns_mu_);
+      const bool copy = !slot->home_ && home != container_id_ &&
+                        slot->home_id_ == home && slot->reg_ != 0;
+      req.from_ = copy ? container_id_ + 1 : 0;
+      req.have_ = copy ? slot->blk_.version_ : 0;
+      req.reg_ = copy ? slot->reg_ : 0;
+    }
     bool lost = false;
-    CLIO_CO_AWAIT(CallShard(BlockHome(req.dir_id_, req.block_), op, req, resp,
-                            &lost));
+    CLIO_CO_AWAIT(CallShard(home, op, req, resp, &lost));
+    // Our own change is in our copy before our caller hears of it.
+    SettleMutationReply(req, resp, lost);
     // The block's home died with the call in flight: once it is declared
     // dead BlockHome names its stand-in, which serves the block from its
     // replicated CTE copy (#1263). Walk again rather than fail the lookup

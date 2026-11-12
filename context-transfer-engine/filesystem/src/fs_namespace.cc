@@ -86,6 +86,9 @@ void EncReq(const Runtime::FsReq &r, std::string *out) {
   e.U32(r.gid_);
   e.U64(r.dir_id_);
   e.U32(r.block_);
+  e.U32(r.from_);
+  e.U64(r.have_);
+  e.U64(r.reg_);
 }
 
 /** Decode a request. @return false on a malformed buffer */
@@ -95,7 +98,8 @@ bool DecReq(const std::string &s, Runtime::FsReq *r) {
          d.Str(&r->str2_) && d.U64(&r->id_) && d.U64(&r->a_) &&
          d.U64(&r->b_) && d.U32(&r->type_) && d.U32(&r->flags_) &&
          d.U32(&r->mode_) && d.U32(&r->uid_) && d.U32(&r->gid_) &&
-         d.U64(&r->dir_id_) && d.U32(&r->block_);
+         d.U64(&r->dir_id_) && d.U32(&r->block_) && d.U32(&r->from_) &&
+         d.U64(&r->have_) && d.U64(&r->reg_);
 }
 
 /** Encode a response. */
@@ -110,6 +114,8 @@ void EncResp(const Runtime::FsResp &r, std::string *out) {
   e.U64(r.handle_);
   Runtime::EncodeAttr(e, r.attr_);
   e.Str(r.str_);
+  e.U64(r.reg_);
+  e.Str(r.deltas_);
 }
 
 /** Decode a response. @return false on a malformed buffer */
@@ -117,7 +123,8 @@ bool DecResp(const std::string &s, Runtime::FsResp *r) {
   FsDec d(s.data(), s.size());
   return d.U32(&r->rc_) && d.U64(&r->id_) && d.U32(&r->type_) &&
          d.U64(&r->old_id_) && d.U32(&r->old_type_) && d.U32(&r->created_) &&
-         d.U64(&r->handle_) && Runtime::DecodeAttr(d, &r->attr_) && d.Str(&r->str_);
+         d.U64(&r->handle_) && Runtime::DecodeAttr(d, &r->attr_) && d.Str(&r->str_) &&
+         d.U64(&r->reg_) && d.Str(&r->deltas_);
 }
 
 }  // namespace
