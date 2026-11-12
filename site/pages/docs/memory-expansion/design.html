@@ -1,0 +1,58 @@
+<!--
+title: Memory expansion design
+heading: How memory expansion <em>is built</em>
+description: The pieces of the GPU and CPU vector adapters: host owner, device view, per-block page cache, pages as CTE blobs, and prefetch hints.
+eyebrow: Docs · Memory expansion
+lede: Memory expansion lets a kernel work on a vector larger than device memory. The vector is cut into pages, each page is a CTE blob, and each GPU block keeps a small cache of the pages it is using.
+facts: Source | context-transfer-engine/adapter/gpu_vector ; Backends | CUDA, SYCL, CPU ; Page | one CTE blob
+-->
+
+<figure class="diagram">
+<svg viewBox="0 0 860 300" role="img" aria-label="Memory expansion pieces">
+<defs><marker id="me0" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+<rect class="box alt" x="20" y="20" width="390" height="56" rx="8"/><text class="title" x="32" y="44">Host side (gpu_vector.h)</text><text class="muted" x="32" y="64">owns every allocation, hands out a device view</text>
+<rect class="box hl" x="450" y="20" width="390" height="56" rx="8"/><text class="title" x="462" y="44">Kernel blocks (device_vector.h)</text><text class="muted" x="462" y="64">per-block page cache, block-collective calls</text>
+<rect class="box" x="20" y="120" width="390" height="56" rx="8"/><text class="title" x="32" y="144">Prefetch hints (prefetch.h)</text><text class="muted" x="32" y="164">tier rescoring from yield state</text>
+<rect class="box" x="450" y="120" width="390" height="56" rx="8"/><text class="title" x="462" y="144">Pages (page.h)</text><text class="muted" x="462" y="164">page N is blob "p&lt;N&gt;"; block b owns its range</text>
+<rect class="box alt" x="20" y="220" width="820" height="56" rx="8"/><text class="title" x="32" y="244">Context Transfer Engine</text><text class="muted" x="32" y="264">stores the blobs across tiers; faults missing pages in through the CAE</text>
+<path class="edge" d="M410 48 H450" marker-end="url(#me0)"/>
+<path class="edge" d="M645 76 V120" marker-end="url(#me0)"/>
+<path class="edge" d="M645 176 V220" marker-end="url(#me0)"/>
+<path class="edge" d="M215 176 V220" marker-end="url(#me0)"/>
+</svg>
+<figcaption>The host sets things up; kernels move pages; the CTE holds them.</figcaption>
+</figure>
+
+<h2 id="host-and-device">Host side and device side</h2>
+<p>The work is split in two. The host side creates the vector, makes every allocation, and gives the kernel a <em>device view</em>. A kernel cannot allocate anything, so all memory a kernel will ever touch is sized before launch. The device view is the only thing the kernel sees.</p>
+
+<h2 id="pages">Pages</h2>
+<p>The vector is cut into fixed-size pages. Page <code>N</code> is stored as a CTE blob named <code>p&lt;N&gt;</code>, so pages get every CTE property for free: placement across tiers, persistence, and the chain of modules. Pages are divided among GPU blocks: block <code>b</code> owns a contiguous range of pages, so two blocks never fight over the same page.</p>
+
+<h2 id="cache">The per-block page cache</h2>
+<p>Each block keeps a small cache of pages in device memory. Every public call is <em>block-collective</em>: all threads of the block make it together. Because a block owns its pages and its cache, nothing needs a lock.</p>
+<dl class="notes">
+<div><dt>Slots and regions</dt><dd>A slot is a 64-byte tag that points to a memory region only while it holds a page. Regions are owned per block. Making the cache more associative therefore costs extra tags, not extra pages of memory.</dd></div>
+<div><dt>Eviction</dt><dd>Each freshly faulted page starts at an eviction rank; a higher rank means keep it longer.</dd></div>
+<div><dt>Fetch</dt><dd>A kernel brings a page in with a begin/await pair, so it can start a fetch and keep computing while the page arrives.</dd></div>
+<div><dt>Flush</dt><dd>Dirty pages are written back to the CTE through a hold-and-flush path.</dd></div>
+</dl>
+
+<h2 id="prefetch">Prefetch hints</h2>
+<p>The prefetcher does not copy pages into the GPU cache; only the kernel does that. Instead it uses the state of yielding blocks to predict which pages are next and sends tier hints through the CTE's bulk rescore call, so those blobs move to a faster tier before the kernel asks for them.</p>
+
+<h2 id="faults">Where missing data comes from</h2>
+<p>A page that is not in the CTE yet is faulted in by the same mechanism the CAE uses: the CTE misses, asks the CAE, and the CAE produces the page from the original source. That is how a file larger than memory can be opened as a vector without staging it first.</p>
+
+<h2 id="backends">Backends</h2>
+<p>The adapter has CUDA, SYCL and CPU backends; <code>adapter/cpu_vector</code> provides the same model on host threads. Communication timing can be compiled in with the opt-in <code>GV_COMM_TIMING</code> build flag.</p>
+
+<h2 id="tradeoffs">Tradeoffs</h2>
+<table class="tradeoffs">
+<thead><tr><th>Choice</th><th>Gain</th><th>Cost</th></tr></thead>
+<tbody>
+<tr><td>Host owns all allocation</td><td class="good">No allocator in kernels; memory use is known at launch</td><td class="cost">Cache size is fixed for the run</td></tr>
+<tr><td>Block-owned pages</td><td class="good">No locks, no contention between blocks</td><td class="cost">Uneven access leaves some blocks' caches cold</td></tr>
+<tr><td>Pages as CTE blobs</td><td class="good">Tiering, persistence and faulting come from the CTE</td><td class="cost">Each miss is a runtime round trip</td></tr>
+</tbody>
+</table>

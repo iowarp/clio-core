@@ -33,6 +33,16 @@ facts: Module | clio_cae_core, pool 400.0 ; Tool | clio_cae <omni.yaml> ; Interp
 </ul>
 
 <h2>How it relates to the other technologies</h2>
+
+<ol class="stack-position" aria-label="Where the CAE sits in the CLIO Core stack">
+  <li class="here"><b>Front ends</b><span>Context FS, memory expansion, machine learning, CAE, CEE</span></li>
+  <li><b>Interceptors</b><span>POSIX, STDIO, MPI-IO and HDF5 adapters; FUSE mount</span></li>
+  <li class="here"><b>ChiMod chain</b><span>Cache, replication, compressor, indexer, summarizer</span></li>
+  <li><b>CTE core</b><span>Tags, blobs, placement across tiers</span></li>
+  <li><b>Context Runtime</b><span>Modules, pools, tasks, scheduling, transports</span></li>
+  <li><b>Storage</b><span>Block devices: RAM, NVMe, SSD, HDD, S3/GCS</span></li>
+</ol>
+<p>The CAE is a front end for bringing data in, and its summarizer runs in the module chain. It writes through the CTE and answers CTE misses by producing data from the original source. See <a href="/docs/cae/design.html">the CAE design</a>.</p>
 <ul>
   <li><a href="/docs/runtime/index.html">Context Runtime</a> hosts the CAE core and the summarizer as pools, runs their task coroutines, and loads their configuration from the <code>compose</code> list.</li>
   <li><a href="/docs/cte/index.html">Context Transfer Engine</a> is where everything lands. The CAE core writes through its <code>next_pool_id</code>, by default the top of the interposition chain at 563.0, so imports pass the cache, the indexer and replication before reaching the core.</li>

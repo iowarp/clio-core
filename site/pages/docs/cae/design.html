@@ -1,0 +1,57 @@
+<!--
+title: Design
+heading: Inside the <em>assimilation engine.</em>
+description: How the CAE is built: the clio_cae tool and OMNI loader, the core module, the assimilator factory and its per-source assimilators, ingest on fault with its off-worker I/O pool, pagify and page maps, and the summarizer interposer.
+eyebrow: Docs · Context Assimilation Engine
+lede: The CAE is a runtime module that copies, or lazily maps, outside data into CTE tags. Its work is done by assimilators, one class per kind of source, chosen by the source URL. This page names the pieces and follows a transfer through them.
+facts: Module | clio_cae_core (pool 400.0) ; Methods | ParseOmni, ImportData, ExportData, plus CTE forwarding ; Fault I/O threads | CLIO_CAE_REF_IO_THREADS (32)
+-->
+<h2 id="pieces">The pieces</h2>
+<figure class="diagram">
+  <svg viewBox="0 0 860 360" role="img" aria-label="CAE pieces: the clio_cae tool and CEE submit transfers to the CAE core, which picks an assimilator per source and writes through the CTE chain">
+    <defs><marker id="ca0" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+    <rect class="box alt" x="20" y="20" width="250" height="56" rx="8"/><text class="title" x="32" y="44">clio_cae + OMNI loader</text><text class="muted" x="32" y="62">YAML → AssimilationCtx list</text>
+    <rect class="box alt" x="300" y="20" width="250" height="56" rx="8"/><text class="title" x="312" y="44">CEE / Python / C++</text><text class="muted" x="312" y="62">context_bundle, CAE client</text>
+    <rect class="box hl" x="20" y="106" width="530" height="62" rx="8"/><text class="title" x="32" y="130">CAE core module</text><text class="muted" x="32" y="150">ParseOmni: run transfers in order · fault handler registry</text>
+    <path class="edge hl" d="M145,76 L145,104" marker-end="url(#ca0)"/><path class="edge hl" d="M425,76 L425,104" marker-end="url(#ca0)"/>
+    <rect class="box hl" x="20" y="198" width="530" height="62" rx="8"/><text class="title" x="32" y="222">Assimilator factory</text><text class="muted" x="32" y="242">file · string · hdf5 · http(s) · s3 · gs · globus</text>
+    <path class="edge hl" d="M285,168 L285,196" marker-end="url(#ca0)"/>
+    <rect class="box" x="580" y="106" width="260" height="62" rx="8"/><text class="title" x="592" y="130">Reference I/O pool</text><text class="muted" x="592" y="150">blocking source reads off workers</text>
+    <path class="edge" d="M550,137 L578,137" marker-end="url(#ca0)"/>
+    <rect class="box" x="580" y="198" width="260" height="62" rx="8"/><text class="title" x="592" y="222">Summarizer (optional)</text><text class="muted" x="592" y="242">labels blobs via a model</text>
+    <rect class="box hl" x="20" y="290" width="820" height="50" rx="8"/><text class="title" x="32" y="320">CTE chain (next_pool_id, default the cache at 563.0)</text>
+    <path class="edge hl" d="M285,260 L285,288" marker-end="url(#ca0)"/><path class="edge" d="M710,260 L710,288" marker-end="url(#ca0)"/>
+  </svg>
+  <figcaption>Transfers arrive as one task. The core picks an assimilator
+  per source and writes blobs through the chain, or registers the source
+  so blobs are ingested when first read.</figcaption>
+</figure>
+
+<h2 id="flow">A transfer, step by step</h2>
+<ol class="steps">
+  <li><strong>Load.</strong> The <code>clio_cae</code> tool's OMNI loader reads the YAML, expands each entry into an assimilation context (source, destination, format, range, dataset filters, credentials) and submits the list as one <code>ParseOmni</code> task. The CEE and the language clients build the same contexts directly.</li>
+  <li><strong>Choose.</strong> In the runtime, the core asks the assimilator factory for the class that handles each source's scheme.</li>
+  <li><strong>Assimilate.</strong> The assimilator's schedule coroutine reads the source and puts blobs into the destination tag through the CTE client: 1 MiB <code>chunk_N</code> blobs for files, one tag per dataset for HDF5, one blob for a string. Puts go to the CAE's <code>next_pool_id</code>, so imports pass the cache, indexer and replication like any other write.</li>
+  <li><strong>Finish.</strong> Transfers run in order, each completing before the next starts, and the task returns one status.</li>
+</ol>
+
+<h2 id="assimilators">Assimilators</h2>
+<p>An assimilator is a C++ class implementing a small base interface. Besides scheduling a whole transfer, it can optionally produce the bytes of one destination blob on request (for ingest on fault) and describe the source's page layout (for pagify). The shipped ones cover local files, inline strings, HDF5, HTTP and HTTPS, S3 (with a pooled keep-alive connection set and forwarded credentials, since the daemon does not inherit the client's environment), Google Cloud Storage and Globus. <a href="/docs/cae/extend.html">Extending the CAE</a> adds a new one.</p>
+
+<h2 id="fault">Ingest on fault</h2>
+<p>With <code>on_fault</code> set, a transfer copies nothing. The core records the context in a registry under a hashed id, and the destination carries that id as its fault parameters. When a read misses a blob, the CTE sends the CAE a fault task carrying the id; the core looks up the context and asks the source's assimilator for exactly that blob, stores it, and lets the read continue. Source reads can take seconds on a parallel filesystem, so they run on a separate pool of threads (32 by default, <code>CLIO_CAE_REF_IO_THREADS</code>) while the fault task yields, keeping runtime workers free. <code>CLIO_CAE_FAULT_STATS=1</code> logs per-stage counters every five seconds.</p>
+
+<h2 id="pagify">Pagify and page maps</h2>
+<p>Paged consumers such as memory expansion and clio-ml address data only as page 0, 1, 2 and so on. A <strong>page map</strong>, produced by the assimilator that knows the source layout, is an ordered list of extents saying which bytes of which blob occupy which range of page space. <strong>Pagify</strong> uses it to build a page: it fetches the slices, composes pages made of several blobs, and zero-fills uncovered ranges. The split keeps the arithmetic pure and testable and the I/O injectable.</p>
+
+<h2 id="summarizer">The summarizer</h2>
+<p>The optional summarizer module is a CTE interposer: it forwards every operation, and after a matching put sends the content to a language model endpoint (by default a local Ollama server) and stores the label as a sibling blob. The model call runs inline on the put's task, so every matching put waits for the model. Enable it only for data you want described.</p>
+
+<h2 id="tradeoffs">Costs of this design</h2>
+<table class="tradeoffs">
+  <tr><th>Decision</th><th>Buys</th><th>Costs</th></tr>
+  <tr><td>One task per transfer list</td><td class="good">One round trip; ordered, simple status</td><td class="cost">Transfers in a list do not run in parallel</td></tr>
+  <tr><td>Writes through the chain</td><td class="good">Imported data is cached, indexed and replicated</td><td class="cost">Imports pay every composed module's cost</td></tr>
+  <tr><td>Ingest on fault</td><td class="good">Instant registration of huge sources</td><td class="cost">First reads pay source latency</td></tr>
+  <tr><td>Separate reference I/O pool</td><td class="good">Slow sources never stall workers</td><td class="cost">Extra threads per runtime</td></tr>
+</table>

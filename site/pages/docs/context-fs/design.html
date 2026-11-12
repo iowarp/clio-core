@@ -1,0 +1,62 @@
+<!--
+title: Design
+heading: Inside <em>Context FS.</em>
+description: How Context FS is built: the shared filesystem client library, the FUSE daemon and interceptors, the filesystem and stream modules, directory blocks and inode records stored as blobs, local path resolution, and the record logs that make it crash-safe.
+eyebrow: Docs · Context FS
+lede: Context FS is three layers of code: a client library shared by the FUSE daemon and the interceptors, the filesystem and stream modules in the runtime, and the CTE underneath. This page names the pieces and what each owns. The Filesystem and FUSE design page covers every operation and the consistency model in depth.
+facts: Modules | filesystem, stream ; Daemon | clio_cte_fuse ; Page size | 1 MiB blobs ; Directory block split | 1024 entries
+-->
+<h2 id="pieces">The pieces</h2>
+<figure class="diagram">
+  <svg viewBox="0 0 860 380" role="img" aria-label="Context FS layers: entry points, the shared client library, the filesystem and stream modules, and the CTE chain">
+    <defs><marker id="fs0" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+    <rect class="box alt" x="20" y="20" width="260" height="50" rx="8"/><text class="title" x="32" y="42">FUSE daemon</text><text class="muted" x="32" y="60">libfuse3, macFUSE, WinFsp</text>
+    <rect class="box alt" x="300" y="20" width="260" height="50" rx="8"/><text class="title" x="312" y="42">Interceptors</text><text class="muted" x="312" y="60">POSIX, STDIO, MPI-IO, HDF5 VFD</text>
+    <rect class="box alt" x="580" y="20" width="260" height="50" rx="8"/><text class="title" x="592" y="42">Python / C++ API</text><text class="muted" x="592" y="60">filesystem client directly</text>
+    <rect class="box hl" x="20" y="100" width="820" height="62" rx="8"/><text class="title" x="32" y="124">Filesystem client library</text><text class="muted" x="32" y="144">descriptor table · write sieve and write-behind · zero-IPC read and stat mirrors</text>
+    <path class="edge hl" d="M150,70 L150,98" marker-end="url(#fs0)"/><path class="edge hl" d="M430,70 L430,98" marker-end="url(#fs0)"/><path class="edge hl" d="M710,70 L710,98" marker-end="url(#fs0)"/>
+    <rect class="box hl" x="20" y="192" width="400" height="62" rx="8"/><text class="title" x="32" y="216">Filesystem module</text><text class="muted" x="32" y="236">directory blocks, inodes, handles, leases</text>
+    <rect class="box hl" x="440" y="192" width="190" height="62" rx="8"/><text class="title" x="452" y="216">Stream module</text><text class="muted" x="452" y="236">sizes, appends</text>
+    <rect class="box" x="650" y="192" width="190" height="62" rx="8"/><text class="title" x="662" y="216">File pages</text><text class="muted" x="662" y="236">go straight down</text>
+    <path class="edge hl" d="M220,162 L220,190" marker-end="url(#fs0)"/><path class="edge hl" d="M535,162 L535,190" marker-end="url(#fs0)"/><path class="edge" d="M745,162 L745,190" marker-end="url(#fs0)"/>
+    <rect class="box hl" x="20" y="284" width="820" height="56" rx="8"/><text class="title" x="32" y="308">CTE chain (cache → … → core)</text><text class="muted" x="32" y="326">page blobs, directory-block blobs, inode-record blobs, all tiered and replicated alike</text>
+    <path class="edge" d="M220,254 L220,282" marker-end="url(#fs0)"/><path class="edge" d="M535,254 L535,282" marker-end="url(#fs0)"/><path class="edge" d="M745,254 L745,282" marker-end="url(#fs0)"/>
+  </svg>
+  <figcaption>Namespace operations go to the filesystem module, sizes and
+  appends to the stream module, and file pages straight to the CTE
+  chain.</figcaption>
+</figure>
+
+<h2 id="client">The client library</h2>
+<p>The FUSE daemon, the preloaded interceptors and the language APIs share one client library, so they behave the same. It keeps:</p>
+<ul>
+  <li><strong>A descriptor table</strong> mapping open files to the handle the inode's home node issued, so reads, writes and close go straight to that node.</li>
+  <li><strong>A write sieve</strong>: small writes are gathered into a shared-memory page per file page and shipped as one put shortly after, or at close and <code>fsync</code>. Errors therefore surface at close or <code>fsync</code>.</li>
+  <li><strong>Read and stat mirrors</strong> in shared memory, published by the runtime, so a warm <code>stat</code> or a read of a local RAM page needs no task at all.</li>
+</ul>
+
+<h2 id="modules">The filesystem and stream modules</h2>
+<dl class="notes">
+  <div><dt>Every object is a tag</dt><dd>Each file, directory and symbolic link is a CTE tag. The tag id is the inode number and encodes the node that serves it, its home.</dd></div>
+  <div><dt>Files</dt><dd>Data lives in the file's tag as 1 MiB page blobs named by index; a missing page is a hole. A small inode-record blob holds type, mode, owner, times, link count and a size snapshot. Extended attributes live in one global tag.</dd></div>
+  <div><dt>Directories</dt><dd>Entries live in directory-block blobs placed by name hash. A block over 1024 entries splits by the next hash bit; blocks never merge. Each entry is live, pending or leaving, which lets multi-step operations abort cleanly after a crash.</dd></div>
+  <div><dt>Sizes and appends</dt><dd>The stream module holds each file's logical size and orders concurrent appends from many nodes by staging them, then merging them in one order.</dd></div>
+  <div><dt>Local path resolution</dt><dd>Every path request goes to the local filesystem container, which walks the path from its cache of directory blocks. Blocks it does not own are fetched once, and the owner pushes later changes to it, so a warm walk costs no network round trip.</dd></div>
+  <div><dt>Leases</dt><dd>Cached namespace state is valid only under a lease, so a partitioned node can delay mutations but cannot serve stale names.</dd></div>
+</dl>
+
+<h2 id="durability">Crash safety</h2>
+<p>The filesystem and stream modules keep their node-local metadata in an append-only, self-checking record log: one <code>write</code> per mutation, replayed at startup with a torn tail cut off, then compacted. Operations are ordered so a crash leaks space rather than corrupting: the inode record is stored before its name appears, and link counts rise before links do. Directory and inode blobs themselves are ordinary CTE blobs, so the CTE's metadata log and replication protect them like file data.</p>
+
+<h2 id="fuse">The FUSE daemon</h2>
+<p><code>clio_cte_fuse</code> is a runtime client. It translates kernel requests into client-library calls, configures the kernel's attribute and entry caches (see <a href="/design/filesystem.html#fuse">the FUSE daemon</a>), and takes the sieve and mirror fast paths. Those fast paths are single-node: on a multi-node mount, appends are staged and merged through the stream module.</p>
+
+<h2 id="tradeoffs">Costs of this design</h2>
+<table class="tradeoffs">
+  <tr><th>Decision</th><th>Buys</th><th>Costs</th></tr>
+  <tr><td>Everything is a blob</td><td class="good">One tiering, replication and durability mechanism for data and metadata</td><td class="cost">Metadata blobs consume tier space and logging like data</td></tr>
+  <tr><td>Write-behind sieve</td><td class="good">Microsecond writes</td><td class="cost">Errors appear at close or <code>fsync</code></td></tr>
+  <tr><td>Multi-step rename</td><td class="good">No distributed transactions</td><td class="cost">Intermediate states exist, though invisible or harmless</td></tr>
+  <tr><td>Leases</td><td class="good">Never stale</td><td class="cost">Mutations can stall behind a partitioned holder</td></tr>
+</table>
+<p>See <a href="/design/filesystem.html">Filesystem and FUSE</a> for each operation step by step.</p>

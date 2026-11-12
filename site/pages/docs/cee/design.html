@@ -1,0 +1,48 @@
+<!--
+title: Design
+heading: Inside the <em>exploration engine.</em>
+description: How the CEE is built: a client-side context interface with lazy runtime initialization, its bundle, query, retrieve and destroy operations over the CAE and CTE, the three query modes, batched retrieval, the Python bindings and the MCP server.
+eyebrow: Docs · Context Exploration Engine
+lede: The CEE is not a runtime module. It is a client library, with Python bindings over it, that composes calls to the CAE and the CTE into four operations. This page shows how each operation maps onto the pieces below it.
+facts: Core class | ContextInterface ; Operations | bundle, query, retrieve, destroy ; Agents | iowarp-cei-mcp (MCP server)
+-->
+<h2 id="pieces">The pieces</h2>
+<figure class="diagram">
+  <svg viewBox="0 0 860 330" role="img" aria-label="CEE layers: MCP server and Python bindings over the context interface, which calls the CAE core and the CTE chain inside the runtime">
+    <defs><marker id="cx0" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+    <rect class="box alt" x="20" y="20" width="400" height="50" rx="8"/><text class="title" x="32" y="42">Python bindings</text><text class="muted" x="32" y="60">nanobind module over the interface</text>
+    <rect class="box alt" x="440" y="20" width="400" height="50" rx="8"/><text class="title" x="452" y="42">C++ applications</text><text class="muted" x="452" y="60">link the interface directly</text>
+    <rect class="box hl" x="20" y="100" width="820" height="62" rx="8"/><text class="title" x="32" y="124">Context interface (in the client process)</text><text class="muted" x="32" y="144">lazy runtime init · bundle · query · retrieve · destroy</text>
+    <path class="edge hl" d="M220,70 L220,98" marker-end="url(#cx0)"/><path class="edge hl" d="M640,70 L640,98" marker-end="url(#cx0)"/>
+    <text class="muted" x="20" y="190">INSIDE THE RUNTIME</text>
+    <rect class="box hl" x="20" y="200" width="260" height="56" rx="8"/><text class="title" x="32" y="224">CAE core</text><text class="muted" x="32" y="242">bundle = ParseOmni</text>
+    <rect class="box hl" x="300" y="200" width="540" height="56" rx="8"/><text class="title" x="312" y="224">CTE chain (indexer → core)</text><text class="muted" x="312" y="242">temporal query · BM25 search · regex query · GetBlob · DelTag</text>
+    <path class="edge hl" d="M150,162 L150,198" marker-end="url(#cx0)"/><path class="edge hl" d="M570,162 L570,198" marker-end="url(#cx0)"/>
+    <rect class="box" x="20" y="276" width="820" height="40" rx="8"/><text x="32" y="301">Tiers: RAM, NVMe, disk, buckets</text>
+  </svg>
+  <figcaption>Every CEE operation becomes one or more ordinary CAE or CTE
+  tasks. There is no CEE state in the runtime.</figcaption>
+</figure>
+
+<h2 id="interface">The context interface</h2>
+<p>All logic lives in one C++ class in the caller's process. Constructing it does nothing; the first operation initializes the runtime client, then the CAE client (which brings up the CTE client), and checks that the runtime is reachable. A failed initialization is remembered rather than retried in a loop, because repeatedly creating and destroying the messaging context corrupted the allocator state of Python 3.13.</p>
+
+<h2 id="ops">Operations</h2>
+<dl class="notes">
+  <div><dt>Bundle</dt><dd>Builds assimilation contexts from the caller's list and sends them to the CAE core as one <code>ParseOmni</code> task, then waits. Everything the CAE can import, the CEE can bundle.</dd></div>
+  <div><dt>Query</dt><dd>Returns matching blob names in one of three modes. With a time bound it runs a temporal query. With a text query it runs the CTE's BM25 semantic search, served by the indexer, with a positive top-<em>k</em> (10 if none is given). Otherwise it runs a regular-expression query over tag and blob names.</dd></div>
+  <div><dt>Retrieve</dt><dd>Resolves names with the same three modes, then fetches the blobs in batches: it looks up each size, allocates one shared buffer, issues the gets of a batch asynchronously and waits for them together, and returns the packed bytes. Retrieval stops at the first blob that would overflow the buffer.</dd></div>
+  <div><dt>Destroy</dt><dd>Deletes each named context's tag through the CTE.</dd></div>
+</dl>
+<p>A splice operation is declared but not yet implemented.</p>
+
+<h2 id="mcp">The MCP server</h2>
+<p><code>iowarp-cei-mcp</code> is a Python server (FastMCP) that gives AI agents tools over the Model Context Protocol. It wraps the CTE's Python bindings (<code>clio_cte_core_ext</code>), not the context interface: its tools query tags and blobs by regular expression, put, get, size and delete blobs, rescore a blob, and poll the telemetry log.</p>
+
+<h2 id="tradeoffs">Costs of this design</h2>
+<table class="tradeoffs">
+  <tr><th>Decision</th><th>Buys</th><th>Costs</th></tr>
+  <tr><td>Client-side composition</td><td class="good">No extra module to compose or operate</td><td class="cost">Each call pays client round trips to the CAE and CTE</td></tr>
+  <tr><td>Search via the indexer</td><td class="good">Fast keyword search without rescans</td><td class="cost">Needs the indexer in the chain; lexical matching only</td></tr>
+  <tr><td>Packed retrieval buffer</td><td class="good">One buffer, batched gets</td><td class="cost">Results are bounded by the buffer size</td></tr>
+</table>
