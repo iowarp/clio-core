@@ -545,9 +545,18 @@ dl.notes dd { margin: 0; color: var(--ink-soft); }
   .primary-nav.open { display: flex; }
   .primary-nav a { padding: 0.75rem 0.5rem; min-height: 44px; }
   .primary-nav a[aria-current="page"] { box-shadow: inset 2px 0 0 var(--accent); padding-inline-start: 0.9rem; }
-  .nav-drop { flex-direction: column; align-items: stretch; }
-  .nav-drop-toggle { display: none; }
-  .nav-drop-menu { position: static; opacity: 1; visibility: visible; transform: none; box-shadow: none; border: 0; padding: 0 0 0 var(--space-4); background: transparent; min-width: 0; }
+  .primary-nav { max-height: calc(100dvh - var(--header-h)); overflow-y: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; }
+  .nav-drop { flex-wrap: wrap; align-items: center; }
+  .nav-drop > a { flex: 1 1 auto; }
+  .nav-drop-toggle { display: inline-grid; place-items: center; min-width: 44px; min-height: 44px; }
+  .nav-drop-menu, .nav-drop:hover .nav-drop-menu, .nav-drop:focus-within .nav-drop-menu {
+    display: none; flex-basis: 100%; position: static; opacity: 1; visibility: visible; transform: none;
+    box-shadow: none; border: 0; padding: 0 0 0 var(--space-4); background: transparent; min-width: 0;
+  }
+  .nav-drop.open .nav-drop-menu { display: block; }
+  .nav-drop:hover .nav-drop-toggle svg { transform: none; }
+  .nav-drop.open .nav-drop-toggle svg { transform: rotate(180deg); }
+  .nav-drop-menu a { white-space: normal; }
   .header-inner { padding: 0 var(--space-4); gap: var(--space-3); }
   .header-tools { margin-inline-start: auto; }
   .page, .guide { padding-inline: var(--space-4); }
