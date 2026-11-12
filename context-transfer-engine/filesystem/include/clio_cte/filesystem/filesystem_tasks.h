@@ -924,6 +924,59 @@ struct ReaddirTask : public clio::run::Task {
   }
 };
 
+/**
+ * ReaddirRange: list one chunk of a directory in offset order.
+ *
+ * Every entry has a stable offset derived from its name (DirEntryOff, see
+ * fs_inode_table.h), the same in every process and across opens. The chunk
+ * holds the entries at or after `start_off_`, in ascending (offset, name)
+ * order, and `next_off_` is the exact offset of the first entry after it --
+ * pass it as the next `start_off_` -- or kDirOffEnd when the chunk reaches
+ * the end of the directory. A chunk holds at least `max_entries_` entries
+ * unless the directory ends first, and may hold somewhat more (it is never
+ * cut inside a table block; a directory small enough for one reply comes
+ * back whole). return_code_ is errno-style (0 / ENOENT / ENOTDIR / EIO /
+ * EAGAIN).
+ */
+struct ReaddirRangeTask : public clio::run::Task {
+  IN clio::run::priv::string path_;   ///< directory path
+  IN clio::run::u64 start_off_;       ///< first offset wanted (0: the start)
+  IN clio::run::u32 max_entries_;     ///< entries after which the chunk ends
+  OUT clio::run::priv::vector<clio::run::priv::string> entries_;  ///< full paths
+  OUT clio::run::priv::vector<clio::run::u64> inos_;   ///< inode per entry
+  OUT clio::run::priv::vector<clio::run::u32> types_;  ///< kFsType* per entry
+  OUT clio::run::priv::vector<clio::run::u64> offs_;   ///< offset per entry
+  OUT clio::run::u64 next_off_;       ///< where the next chunk starts
+  ReaddirRangeTask()
+      : clio::run::Task(), path_(CTP_MALLOC), start_off_(0),
+        max_entries_(8192), entries_(CTP_MALLOC), inos_(CTP_MALLOC),
+        types_(CTP_MALLOC), offs_(CTP_MALLOC), next_off_(0) {}
+  explicit ReaddirRangeTask(const clio::run::TaskId &task_id,
+                            const clio::run::PoolId &pool_id,
+                            const clio::run::PoolQuery &pool_query,
+                            const std::string &path, clio::run::u64 start_off,
+                            clio::run::u32 max_entries = 8192)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kReaddirRange),
+        path_(CTP_MALLOC, path), start_off_(start_off),
+        max_entries_(max_entries), entries_(CTP_MALLOC), inos_(CTP_MALLOC),
+        types_(CTP_MALLOC), offs_(CTP_MALLOC), next_off_(0) {}
+  void Copy(const ctp::ipc::FullPtr<ReaddirRangeTask>& o) {
+    // Base fields first (pool id, method, query, flags): a forwarded copy
+    // without them reached SendIn with a null pool and crashed the node.
+    clio::run::Task::Copy(o.template Cast<clio::run::Task>());
+    path_ = o->path_; start_off_ = o->start_off_;
+    max_entries_ = o->max_entries_; entries_ = o->entries_;
+    inos_ = o->inos_; types_ = o->types_; offs_ = o->offs_;
+    next_off_ = o->next_off_;
+  }
+  template <typename Ar> void SerializeIn(Ar &ar) {
+    Task::SerializeIn(ar); ar(path_, start_off_, max_entries_);
+  }
+  template <typename Ar> void SerializeOut(Ar &ar) {
+    Task::SerializeOut(ar); ar(entries_, inos_, types_, offs_, next_off_);
+  }
+};
+
 /** StatSize: lightweight logical-size lookup. */
 struct StatSizeTask : public clio::run::Task {
   IN clio::run::priv::string path_;

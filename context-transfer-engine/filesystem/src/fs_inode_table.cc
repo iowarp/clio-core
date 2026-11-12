@@ -1937,6 +1937,87 @@ bool Runtime::SnapshotDir(
   return true;
 }
 
+clio::run::TaskResume Runtime::CollectDirRange(
+    clio::run::u64 dir, clio::run::u64 start_off, clio::run::u32 max_entries,
+    std::vector<DirRangeEntry> *out, clio::run::u64 *next_off, int &rc) {
+  CLIO_TASK_BODY_BEGIN
+  out->clear();
+  *next_off = kDirOffEnd;
+  // Small or large is read off the root block: it has split root.depth_
+  // times, so with an even hash the directory has about 2^depth_ blocks of at
+  // most split_entries_ rows. Up to one scan task's worth of entries is
+  // listed whole; a lopsided tree only makes that one reply larger.
+  std::shared_ptr<TableBlockSlot> root;
+  CLIO_CO_AWAIT(LoadBlock(dir, 0, root, rc));
+  if (rc != 0) CLIO_CO_RETURN;
+  clio::run::u32 root_depth = 0;
+  {
+    std::lock_guard<std::mutex> g(ns_mu_);
+    root_depth = root->blk_.depth_;
+  }
+  const bool small = (1ULL << root_depth) * split_entries_ <= kScanTaskEntries;
+  if (!small) {
+    CLIO_CO_AWAIT(
+        ScanDirRange(dir, start_off, max_entries, out, next_off, rc));
+    CLIO_CO_RETURN;
+  }
+  // One snapshot of the whole directory, exactly what Readdir lists (a
+  // rename in progress shows once), returned from start_off to the end.
+  std::vector<std::pair<std::string, InodeRow>> listing;
+  clio::run::u64 newest = 0;
+  CLIO_CO_AWAIT(CollectDir(dir, &listing, &newest, rc));
+  if (rc != 0) CLIO_CO_RETURN;
+  out->reserve(listing.size());
+  for (auto &kv : listing) {
+    // The offset is the key's: every spelling of a name has one.
+    const clio::run::u64 off = DirEntryOff(KeyOf(kv.first));
+    if (off < start_off) continue;
+    out->push_back(DirRangeEntry{off, std::move(kv.first), kv.second.id_,
+                                 kv.second.type_});
+  }
+  SortDirRange(out);
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::ScanDirRange(
+    clio::run::u64 dir, clio::run::u64 start_off, clio::run::u32 max_entries,
+    std::vector<DirRangeEntry> *out, clio::run::u64 *next_off, int &rc) {
+  CLIO_TASK_BODY_BEGIN
+  rc = 0;
+  // Whole blocks in offset order, each read under ns_mu_ on its own: unlike
+  // CollectDir this is not one snapshot of the directory, so a rename caught
+  // mid-way is not de-duplicated across blocks (see DirRangeScan).
+  DirRangeScan scan(start_off, std::max<clio::run::u32>(max_entries, 1));
+  TableSubtree sub;
+  size_t loaded = 0;
+  while (scan.Next(&sub)) {
+    std::shared_ptr<TableBlockSlot> slot;
+    CLIO_CO_AWAIT(LoadBlock(dir, sub.index_, slot, rc));
+    if (rc != 0) CLIO_CO_RETURN;
+    bool ok = false;
+    {
+      std::lock_guard<std::mutex> g(ns_mu_);
+      ok = scan.Take(sub, slot->blk_);
+    }
+    if (!ok) {
+      HLOG(kError, "filesystem: directory {} has a corrupt split tree "
+           "(block {} is not the one born at depth {})", dir, sub.index_,
+           sub.born_);
+      rc = EIO;
+      CLIO_CO_RETURN;
+    }
+    // Cached blocks load without suspending: let a long scan share the
+    // worker.
+    if (++loaded % 64 == 0) CLIO_CO_AWAIT(clio::run::yield(1.0));
+  }
+  scan.Finish();
+  *out = std::move(scan.entries());
+  *next_off = scan.next_off();
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 clio::run::TaskResume Runtime::StatDir(clio::run::u64 dir, FsResp &resp) {
   CLIO_TASK_BODY_BEGIN
   std::vector<clio::run::u32> blocks;

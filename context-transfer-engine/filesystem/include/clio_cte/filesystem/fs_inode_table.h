@@ -65,6 +65,7 @@
 #ifndef CLIO_CTE_FILESYSTEM_FS_INODE_TABLE_H_
 #define CLIO_CTE_FILESYSTEM_FS_INODE_TABLE_H_
 
+#include <algorithm>
 #include <map>
 #include <string>
 #include <utility>
@@ -204,6 +205,223 @@ inline size_t TableBlockLiveCount(const InodeTableBlock &b) {
   }
   return n;
 }
+
+// ---------------------------------------------------------------------------
+// Directory offsets: where a name sits in a listing
+//
+// A listing is ordered by an offset derived from the name alone, so the
+// offset of an entry is the same in every process and across opens, and a
+// reader can seek to any offset (telldir/seekdir, or a walker handing a
+// range of one directory to another process).
+//
+// The offset is the bit-reversed TableHash, shifted into 63 bits. A block
+// holds the keys whose low `depth_` hash bits equal its index; reversed,
+// those are the TOP bits, so every block covers one contiguous offset
+// interval and the blocks of a directory tile the offset space. A listing in
+// offset order therefore reads whole blocks, one after another.
+// ---------------------------------------------------------------------------
+
+/** Offset of the first real entry: 0 is "start", 1 and 2 follow "." and
+ *  "..". */
+GLOBAL_CROSS_CONST clio::run::u64 kDirOffFirst = 3;
+/** Offset meaning "end of directory" (INT64_MAX: the largest off_t). */
+GLOBAL_CROSS_CONST clio::run::u64 kDirOffEnd = 0x7FFFFFFFFFFFFFFFULL;
+
+/**
+ * Reverse the bits of a 64-bit value (bit 0 becomes bit 63).
+ * @param x value
+ * @return x with its bit order reversed
+ */
+inline clio::run::u64 BitReverse64(clio::run::u64 x) {
+  x = ((x >> 1) & 0x5555555555555555ULL) | ((x & 0x5555555555555555ULL) << 1);
+  x = ((x >> 2) & 0x3333333333333333ULL) | ((x & 0x3333333333333333ULL) << 2);
+  x = ((x >> 4) & 0x0F0F0F0F0F0F0F0FULL) | ((x & 0x0F0F0F0F0F0F0F0FULL) << 4);
+  x = ((x >> 8) & 0x00FF00FF00FF00FFULL) | ((x & 0x00FF00FF00FF00FFULL) << 8);
+  x = ((x >> 16) & 0x0000FFFF0000FFFFULL) |
+      ((x & 0x0000FFFF0000FFFFULL) << 16);
+  return (x >> 32) | (x << 32);
+}
+
+/**
+ * Listing offset of a key with hash `h`: the reversed hash in 63 bits, kept
+ * clear of the reserved offsets at both ends.
+ * @param h TableHash of the canonical name
+ * @return offset in [kDirOffFirst, kDirOffEnd)
+ */
+inline clio::run::u64 DirOffOfHash(clio::run::u64 h) {
+  const clio::run::u64 off = BitReverse64(h) >> 1;
+  if (off < kDirOffFirst) return kDirOffFirst;
+  if (off >= kDirOffEnd) return kDirOffEnd - 1;
+  return off;
+}
+
+/**
+ * Listing offset of a canonical name.
+ * @param key canonical name (the row's key, not its spelling)
+ * @return offset in [kDirOffFirst, kDirOffEnd)
+ */
+inline clio::run::u64 DirEntryOff(const std::string &key) {
+  return DirOffOfHash(TableHash(key));
+}
+
+/**
+ * The offset interval [lo, hi) of the keys whose low `depth` hash bits equal
+ * `index`. With a block's depth_ it is the interval of the block's own rows;
+ * with its born_ it is the interval of the block and everything it split off.
+ * Every offset of such a key lies in the interval (the clamping in
+ * DirOffOfHash moves an offset by at most 2, never across an interval edge:
+ * intervals are at least 2^39 wide).
+ * @param index block index (bits at and above `depth` are zero)
+ * @param depth number of hash bits that select the interval (<= 24)
+ * @param lo receives the first offset of the interval
+ * @param hi receives one past the last offset (up to 2^63)
+ */
+inline void DirOffRange(clio::run::u32 index, clio::run::u32 depth,
+                        clio::run::u64 *lo, clio::run::u64 *hi) {
+  *lo = BitReverse64(index) >> 1;
+  *hi = *lo + (1ULL << (63 - depth));
+}
+
+/** A block and everything it split off, named without loading it. */
+struct TableSubtree {
+  clio::run::u32 index_ = 0;  ///< the subtree's root block
+  clio::run::u32 born_ = 0;   ///< depth that block was created at
+};
+
+/**
+ * The subtrees `b` split off, in listing (offset) order. All of them follow
+ * b's own rows: b keeps the keys whose hash bits [born_, depth_) are zero,
+ * the child split at bit j holds those with bit j set and the bits below it
+ * zero, and after the reversal a lower bit is more significant -- so the
+ * deepest split comes first.
+ * @param b block
+ * @return child subtrees, ascending by offset
+ */
+inline std::vector<TableSubtree> ChildSubtreesByOffset(
+    const InodeTableBlock &b) {
+  std::vector<TableSubtree> out;
+  for (clio::run::u32 d = b.depth_; d > b.born_; --d) {
+    out.push_back(TableSubtree{b.index_ + (1u << (d - 1)), d});
+  }
+  return out;
+}
+
+/** One entry of a ranged listing. */
+struct DirRangeEntry {
+  clio::run::u64 off_ = 0;   ///< DirEntryOff of the entry's key
+  std::string name_;         ///< the name as listed (RowName)
+  clio::run::u64 id_ = 0;    ///< packed id of the inode it names
+  clio::run::u32 type_ = 0;  ///< kFsType*
+};
+
+/**
+ * Put entries in listing order: ascending offset, then name (names with the
+ * same offset collided in the hash and always share a block).
+ * @param v entries to sort in place
+ */
+inline void SortDirRange(std::vector<DirRangeEntry> *v) {
+  std::sort(v->begin(), v->end(),
+            [](const DirRangeEntry &a, const DirRangeEntry &b) {
+              return a.off_ != b.off_ ? a.off_ < b.off_ : a.name_ < b.name_;
+            });
+}
+
+/**
+ * One chunk of a directory listing in offset order, built block by block.
+ *
+ * The caller asks Next() which block to load, loads it and hands it to
+ * Take(), until Next() returns false; Finish() then sorts the chunk. Blocks
+ * whose interval ends at or before the start offset are never asked for.
+ * The chunk takes whole blocks until it holds at least `max_entries`
+ * entries, then keeps going only to find the offset of the first entry after
+ * it (blocks with no visible row are passed over), so the next chunk can
+ * start exactly there.
+ *
+ * Pending rows are hidden. A leaving row is listed: a rename caught mid-way
+ * can show a file under both names, or -- unlike a whole-directory snapshot
+ * -- under neither, when its new name falls in a block read before the
+ * rename and its old name in one read after. Telling the two apart needs
+ * every block at once, which a ranged read does not have.
+ */
+class DirRangeScan {
+ public:
+  /**
+   * @param start_off first offset wanted (below kDirOffFirst: from the start)
+   * @param max_entries entries after which the chunk stops taking blocks
+   */
+  DirRangeScan(clio::run::u64 start_off, size_t max_entries)
+      : start_off_(start_off), max_entries_(max_entries) {
+    todo_.push_back(TableSubtree{0, 0});
+  }
+
+  /**
+   * The next block to load.
+   * @param sub receives the block (and the depth it must have been born at)
+   * @return false when the chunk is complete
+   */
+  bool Next(TableSubtree *sub) {
+    while (!done_ && !todo_.empty()) {
+      *sub = todo_.back();
+      todo_.pop_back();
+      clio::run::u64 lo = 0, hi = 0;
+      DirOffRange(sub->index_, sub->born_, &lo, &hi);
+      if (hi > start_off_) return true;  // else: wholly before the start
+    }
+    return false;
+  }
+
+  /**
+   * Account for the block Next() asked for.
+   * @param sub what Next() returned
+   * @param b the loaded block
+   * @return false if the block is not the one its parent says it split off
+   *         (a corrupt split tree)
+   */
+  bool Take(const TableSubtree &sub, const InodeTableBlock &b) {
+    if (b.index_ != sub.index_ || b.born_ != sub.born_) return false;
+    // Depth first, nearest offset on top of the stack.
+    const std::vector<TableSubtree> kids = ChildSubtreesByOffset(b);
+    for (auto it = kids.rbegin(); it != kids.rend(); ++it) {
+      todo_.push_back(*it);
+    }
+    clio::run::u64 lo = 0, hi = 0;
+    DirOffRange(b.index_, b.depth_, &lo, &hi);
+    if (hi <= start_off_) return true;  // its own rows end before the start
+    const bool full = entries_.size() >= max_entries_;
+    for (const auto &kv : b.rows_) {
+      if (kv.second.state_ == kRowPending) continue;
+      const clio::run::u64 off = DirEntryOff(kv.first);
+      if (off < start_off_) continue;
+      if (full) {
+        // Only where the next chunk starts is still wanted.
+        next_off_ = std::min(next_off_, off);
+        done_ = true;
+      } else {
+        entries_.push_back(DirRangeEntry{off, RowName(kv.first, kv.second),
+                                         kv.second.id_, kv.second.type_});
+      }
+    }
+    return true;
+  }
+
+  /** Sort the chunk into listing order (call once, after the last Take). */
+  void Finish() { SortDirRange(&entries_); }
+
+  /** @return the chunk's entries (in listing order after Finish) */
+  std::vector<DirRangeEntry> &entries() { return entries_; }
+
+  /** @return offset of the first entry after the chunk; kDirOffEnd when the
+   *          chunk reaches the end of the directory */
+  clio::run::u64 next_off() const { return next_off_; }
+
+ private:
+  clio::run::u64 start_off_;
+  size_t max_entries_;
+  std::vector<TableSubtree> todo_;       ///< subtrees not visited, nearest last
+  std::vector<DirRangeEntry> entries_;
+  clio::run::u64 next_off_ = kDirOffEnd;
+  bool done_ = false;                    ///< next_off_ is known
+};
 
 // ---------------------------------------------------------------------------
 // Codec

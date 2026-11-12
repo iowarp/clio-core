@@ -121,6 +121,7 @@ class Runtime : public clio::run::Container {
         return stat;
       }
       case Method::kReaddir:
+      case Method::kReaddirRange:
         // A listing is a trigram regex query over the tag index plus one
         // result marshalled per entry — CPU-bound, and by far the most
         // expensive metadata call. The entry count is not known until the
@@ -194,6 +195,13 @@ class Runtime : public clio::run::Container {
   clio::run::TaskResume Utimens(clio::run::shared_ptr<UtimensTask> &task);
   clio::run::TaskResume Chown(clio::run::shared_ptr<ChownTask> &task);
   clio::run::TaskResume Readdir(clio::run::shared_ptr<ReaddirTask> &task);
+  /**
+   * List one chunk of a directory in offset order (Method::kReaddirRange).
+   * @param task path_, start_off_ and max_entries_ in; the chunk, its
+   *        entries' offsets and next_off_ out; rc as Readdir
+   */
+  clio::run::TaskResume ReaddirRange(
+      clio::run::shared_ptr<ReaddirRangeTask> &task);
   clio::run::TaskResume StatSize(clio::run::shared_ptr<StatSizeTask> &task);
   clio::run::TaskResume ShardOp(clio::run::shared_ptr<ShardOpTask> &task);
 
@@ -1037,6 +1045,44 @@ class Runtime : public clio::run::Container {
       clio::run::u64 dir,
       std::vector<std::pair<std::string, InodeRow>> *out,
       clio::run::u64 *newest, int &rc);
+  /**
+   * One chunk of a directory's listing in offset order (see DirRangeScan in
+   * fs_inode_table.h).
+   *
+   * A directory whose root block says it fits one reply is listed whole
+   * through CollectDir -- one snapshot, a rename in progress listed once --
+   * and returned from `start_off` on. A larger one is read block by block
+   * in offset order, loading only the blocks at or after `start_off`, until
+   * the chunk holds `max_entries` entries; it then reads on to the first
+   * visible entry after the chunk, whose offset is `next_off`.
+   * @param dir packed directory id
+   * @param start_off first offset wanted
+   * @param max_entries entries after which the chunk stops taking blocks
+   * @param out receives the chunk in (offset, name) order
+   * @param next_off receives the offset of the first entry after the chunk,
+   *        kDirOffEnd when it reaches the end of the directory
+   * @param rc 0, ENOENT, EIO or EAGAIN
+   */
+  clio::run::TaskResume CollectDirRange(clio::run::u64 dir,
+                                        clio::run::u64 start_off,
+                                        clio::run::u32 max_entries,
+                                        std::vector<DirRangeEntry> *out,
+                                        clio::run::u64 *next_off, int &rc);
+  /**
+   * The large-directory half of CollectDirRange: blocks in offset order
+   * from `start_off` on, each read under ns_mu_.
+   * @param dir packed directory id
+   * @param start_off first offset wanted
+   * @param max_entries entries after which the chunk stops taking blocks
+   * @param out receives the chunk in (offset, name) order
+   * @param next_off receives where the next chunk starts (kDirOffEnd: end)
+   * @param rc 0, ENOENT or EIO
+   */
+  clio::run::TaskResume ScanDirRange(clio::run::u64 dir,
+                                     clio::run::u64 start_off,
+                                     clio::run::u32 max_entries,
+                                     std::vector<DirRangeEntry> *out,
+                                     clio::run::u64 *next_off, int &rc);
   /**
    * Blocks one LoadBlocksConcurrently subtask may load: the number of
    * blocks whose entries fit in kScanTaskEntries, at least one.

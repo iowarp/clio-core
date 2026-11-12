@@ -1716,6 +1716,46 @@ clio::run::TaskResume Runtime::Readdir(clio::run::shared_ptr<ReaddirTask> &task)
   CLIO_TASK_BODY_END
 }
 
+clio::run::TaskResume Runtime::ReaddirRange(
+    clio::run::shared_ptr<ReaddirRangeTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  const std::string dir = FsNormPath(task->path_.str());
+  task->entries_ = clio::run::priv::vector<clio::run::priv::string>(CTP_MALLOC);
+  task->inos_ = clio::run::priv::vector<clio::run::u64>(CTP_MALLOC);
+  task->types_ = clio::run::priv::vector<clio::run::u32>(CTP_MALLOC);
+  task->offs_ = clio::run::priv::vector<clio::run::u64>(CTP_MALLOC);
+  task->next_off_ = kDirOffEnd;
+  CLIO_FS_RESOLVE(dir, de, dpar, rc);
+  (void)dpar;
+  if (rc == 0 && de.type_ != kFsTypeDir) rc = ENOTDIR;
+  std::vector<DirRangeEntry> chunk;
+  clio::run::u64 next_off = kDirOffEnd;
+  if (rc == 0) {
+    CLIO_CO_AWAIT(CollectDirRange(de.id_, task->start_off_,
+                                  task->max_entries_, &chunk, &next_off, rc));
+  }
+  if (rc != 0) {
+    // A failed chunk carries nothing: never half a listing that looks whole.
+    chunk.clear();
+    next_off = kDirOffEnd;
+  }
+  task->entries_.reserve(chunk.size());
+  task->inos_.reserve(chunk.size());
+  task->types_.reserve(chunk.size());
+  task->offs_.reserve(chunk.size());
+  for (const DirRangeEntry &e : chunk) {
+    task->entries_.push_back(
+        clio::run::priv::string(CTP_MALLOC, FsJoin(dir, e.name_)));
+    task->inos_.push_back(InoFromPacked(e.id_));
+    task->types_.push_back(e.type_);
+    task->offs_.push_back(e.off_);
+  }
+  task->next_off_ = next_off;
+  task->return_code_ = rc;
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 // ===========================================================================
 // Extended attributes
 // ===========================================================================
