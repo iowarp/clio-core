@@ -42,6 +42,10 @@ export CLIO_BDEV_PERSIST_STATS=0
 # Tier files take only buffered I/O: concurrent O_DIRECT writes to the Flare
 # tier failed with EIO once requests ran in parallel (see posix_aio.h).
 export CTP_POSIX_AIO_DIRECT=${CTP_POSIX_AIO_DIRECT:-0}
+# Descriptor pool per backing file for POSIX AIO (glibc runs one queue per
+# descriptor): 16 is what these runs were measured with; the library default
+# is 1.
+export CTP_POSIX_AIO_FDS=${CTP_POSIX_AIO_FDS:-16}
 # Readdir stat prefetch (N getattrs in flight per large listing). Off: readdir
 # now reports entry types, so pfind stats only its matches and the prefetch
 # was 2.6 s of a 4 s find at 64 nodes. Set to 256 for walkers that stat all.
@@ -93,6 +97,13 @@ fi
 while [ ! -e "$OUT/stop" ]; do
   [ -z "$RT" ] || kill -0 $RT 2>/dev/null || { log "clio_run DIED"; tail -20 "$LOG.runtime.log"; break; }
   kill -0 $FU 2>/dev/null || { log "clio_cte_fuse DIED"; tail -20 "$LOG.fuse.log"; break; }
+  # $OUT/dump (touched by the job script when HANG_DUMP_S elapses with IO500
+  # still running) asks for every thread's stack of both daemons, once.
+  if [ -e "$OUT/dump" ] && [ ! -e "$LOG.runtime.stacks" ]; then
+    [ -n "$RT" ] && timeout 120 gstack $RT > "$LOG.runtime.stacks" 2>&1
+    timeout 120 gstack $FU > "$LOG.fuse.stacks" 2>&1
+    log "stacks dumped"
+  fi
   sleep 2
 done
 timeout 30 fusermount3 -u "$LR/mnt" 2>/dev/null || fusermount3 -u -z "$LR/mnt"

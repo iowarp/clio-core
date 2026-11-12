@@ -79,8 +79,14 @@ namespace ctp {
  * kPosixAioMinHelperThreads lifts (glibc only).
  */
 
-/** Default descriptors per kind (buffered / O_DIRECT), original fd included. */
-inline constexpr size_t kPosixAioDefaultFdsPerKind = 16;
+/**
+ * Default descriptors per kind (buffered / O_DIRECT), original fd included.
+ * 1 = no pool. A pool multiplies the descriptors every worker holds for every
+ * backing file (16 per kind exhausted the 256-descriptor default on macOS in
+ * the safe-bdev stress tests), so it is opt-in: set CTP_POSIX_AIO_FDS where
+ * the serialized queue is the bottleneck and the descriptor limit allows it.
+ */
+inline constexpr size_t kPosixAioDefaultFdsPerKind = 1;
 /** Smallest accepted CTP_POSIX_AIO_FDS value (1 = original single-fd path). */
 inline constexpr size_t kPosixAioMinFdsPerKind = 1;
 /** Largest accepted CTP_POSIX_AIO_FDS value. */

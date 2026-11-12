@@ -30,6 +30,14 @@
 # (build/fs), IO500 (binary), DAOS_POOL (IOWarp), DAOS_CONT (io500_<nodes>n).
 # CLIO_FUSE_DIR_ATTR_CACHE_S (unset = off on multi-node): seconds the adapter
 # caches directory attributes; passed through to clio_cte_fuse unchanged.
+# DAOS_API (MODE=daos; dfuse): dfs runs IO500 on libdfs directly, no FUSE.
+# HANG_DUMP_S (unset = off): seconds after IO500 starts at which a still-running
+# job dumps every node's runtime and adapter stacks (hang diagnosis).
+# PFIND_HASH (unset/0 = off): 1 adds
+# pfind-parallelize-single-dir-access-using-hashing = TRUE to io500.ini's
+# [find] section, so pfind splits one large directory across ranks by
+# telldir/seekdir offset. Needs directory offsets that are stable across
+# processes (clio-fs's are; see docs/docs/deployment/adapter.md).
 set -u
 MODE=${MODE:-cliofs}
 PPN=${PPN:-16}
@@ -249,14 +257,24 @@ elif [ "$MODE" = daos ]; then
     stop_nodes; exit 3
   fi
   DATADIR=/tmp/$USER/daos_io500/data/daos_${NN}n_$JOB
+  # DAOS_API=dfs: IO500 talks to the container through libdfs instead of the
+  # dfuse mount (the mount stays up but carries no benchmark I/O).
+  if [ "${DAOS_API:-dfuse}" = dfs ]; then
+    DATADIR=/io500_${NN}n_$JOB
+    DFS_API="DFS --dfs.pool=$DAOS_POOL --dfs.cont=$DAOS_CONT"
+  fi
 else
   DATADIR=$FLARE/data/flare_${NN}n_$JOB
   mkdir -p "$DATADIR"
 fi
 
+DFS_API=${DFS_API:-}
+API_LINE=""
+[ -n "$DFS_API" ] && API_LINE="API = $DFS_API"
 cat > io500.ini <<EOF
 [global]
 datadir = $DATADIR
+${DFS_API:+api = $DFS_API}
 resultdir = $OUT/results
 timestamp-resultdir = FALSE
 drop-caches = FALSE
@@ -266,20 +284,32 @@ stonewall-time = $STONEWALL
 
 [ior-easy]
 blockSize = ${EASY_MB}m
+$API_LINE
 
 [ior-hard]
 segmentCount = $HARD_SEG
+$API_LINE
 
 [mdtest-easy]
 n = $MD_N
+$API_LINE
 
 [mdtest-hard]
 n = $MD_N
+$API_LINE
 
 # Not part of the score; random 4 KiB reads ran for 20 minutes at 64 nodes.
 [ior-rnd4K-easy-read]
 run = FALSE
 EOF
+if [ "${PFIND_HASH:-0}" = 1 ]; then
+  cat >> io500.ini <<EOF
+
+[find]
+pfind-parallelize-single-dir-access-using-hashing = TRUE
+EOF
+  echo "=== pfind: single-directory access parallelized by hashing"
+fi
 echo "=== caps: ior-easy ${EASY_MB}MB/rank, ior-hard $HARD_SEG seg/rank, mdtest $MD_N files/rank"
 mkdir -p results
 if [ "${BENCH:-io500}" = ior ]; then
@@ -328,9 +358,14 @@ elif [ "${BENCH:-io500}" = mdtest ]; then
   rc=0
 else
 echo "=== IO500 start $(date)"
+# HANG_DUMP_S: if IO500 is still running after this many seconds, ask every
+# node for the stacks of its runtime and adapter (logs/<host>.*.stacks).
+HD=""
+[ -n "${HANG_DUMP_S:-}" ] && { ( sleep "$HANG_DUMP_S"; touch dump; echo "=== hang dump requested $(date)" ) & HD=$!; }
 mpiexec -n $(( NN * PPN )) -ppn "$PPN" --cpu-bind depth -d 4 --envall \
   "$IO500" io500.ini > io500.log 2>&1
 rc=$?
+[ -n "$HD" ] && kill "$HD" 2>/dev/null
 echo "=== IO500 rc=$rc end $(date)"
 grep -E '^\[RESULT|^\[SCORE' io500.log results/result_summary.txt 2>/dev/null | sort -u
 echo "IO500CELL mode=$MODE nodes=$NN ppn=$PPN rc=$rc $(grep -h '^\[SCORE' results/result_summary.txt io500.log 2>/dev/null | head -1)"
