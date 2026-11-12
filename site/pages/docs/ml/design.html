@@ -4,7 +4,7 @@ heading: How clio-ml <em>is built</em>
 description: The pieces of clio-ml: page-aligned datasets, a shared CPU/GPU backend, deterministic reductions, per-algorithm runtime modules, and cluster sharding.
 eyebrow: Docs · Machine learning
 lede: clio-ml trains classic and neural models directly on data held in the CTE. Every algorithm is the same shape: per-row math over pages, block-private partial results, and an ordered reduction, wrapped in a runtime module so a fit can run on every node at once.
-facts: Algorithms | about 30 ; Backends | GPU or CPU, bit-identical ; Unit of work | one page
+facts: Algorithms | about 30 ; Backends | GPU or CPU, same math ; Unit of work | one page
 -->
 
 <figure class="diagram">
@@ -14,7 +14,7 @@ facts: Algorithms | about 30 ; Backends | GPU or CPU, bit-identical ; Unit of wo
 <rect class="box hl" x="20" y="100" width="820" height="50" rx="8"/><text class="title" x="32" y="122">Algorithm module (clio_ml_&lt;algo&gt;_chimod)</text><text class="muted" x="32" y="140">shared container template plus a small adapter that calls the fit</text>
 <rect class="box" x="20" y="180" width="400" height="50" rx="8"/><text class="title" x="32" y="202">Fit: per-row math + ordered reduce</text><text class="muted" x="32" y="220">block-private partials, no global atomics</text>
 <rect class="box" x="440" y="180" width="400" height="50" rx="8"/><text class="title" x="452" y="202">Dataset (page-aligned float32)</text><text class="muted" x="452" y="220">shard &lt;tag&gt;_n&lt;container&gt; per node</text>
-<rect class="box alt" x="20" y="260" width="820" height="50" rx="8"/><text class="title" x="32" y="282">Backend: gpu_vector, or cpu_vector with CLIO_ML_CPU=1</text><text class="muted" x="32" y="300">pages are CTE blobs; the CAE maps staged files onto tags</text>
+<rect class="box alt" x="20" y="260" width="820" height="50" rx="8"/><text class="title" x="32" y="282">Backend: gpu_vector, or cpu_vector if built with CLIO_ML_CPU=1</text><text class="muted" x="32" y="300">pages are CTE blobs; the CAE maps staged files onto tags</text>
 <path class="edge" d="M430 70 V100" marker-end="url(#ml0)"/>
 <path class="edge" d="M220 150 V180" marker-end="url(#ml0)"/>
 <path class="edge" d="M640 150 V180" marker-end="url(#ml0)"/>
@@ -27,7 +27,7 @@ facts: Algorithms | about 30 ; Backends | GPU or CPU, bit-identical ; Unit of wo
 <p>A dataset is a page-aligned, row-major table of 32-bit floats stored in a memory-expansion vector. A page is the unit of work, and no row may straddle a page boundary, so the row width must divide evenly into the page. Data reaches the CTE through the CAE, which maps a staged float32 file onto a tag with one blob per page.</p>
 
 <h2 id="backend">One code path for GPU and CPU</h2>
-<p>The backend selects the GPU vector by default, or the CPU vector on host threads when <code>CLIO_ML_CPU=1</code>. Both run the same per-row math in the same order, so a model trained on a laptop CPU and one trained on a GPU are bit-identical.</p>
+<p>The backend selects the GPU vector by default, or the CPU vector on host threads when the code is built with <code>CLIO_ML_CPU=1</code>. Both run the same per-row math in the same order, so a CPU fit and a GPU fit of one dataset agree to the bit wherever the host and device math libraries agree (operations that need it use exact exp/log routines).</p>
 
 <h2 id="reduce">Deterministic reductions</h2>
 <p>Each GPU block computes its own partial result (sums, counts, gradients). Partials are combined in a fixed order instead of with global atomic adds. That is slightly more work, but it makes every run reproducible. An iterative fit that hits its round cap throws instead of silently returning an unconverged model.</p>
