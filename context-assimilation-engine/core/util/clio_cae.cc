@@ -147,7 +147,8 @@ int main(int argc, char* argv[]) {
            contexts.size());
       HLOG(kError,
            "  Likely causes: include_patterns matched no dataset, or the CTE "
-           "tier is full (look for 'PutBlob failed' in the runtime log).");
+           "tier is full (look for 'PutBlob failed' in the runtime log). "
+           "Set CLIO_CAE_TELEMETRY=<path> for per-phase counts and timings.");
       return 1;
     }
 
