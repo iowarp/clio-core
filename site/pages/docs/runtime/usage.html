@@ -6,6 +6,48 @@ eyebrow: Docs · Context Runtime
 lede: A ChiMod is a directory with a YAML descriptor, a public header set and two shared libraries: a client library that user programs link, and a runtime library the daemon loads. This page walks through writing one, building it, loading it and composing it. The signatures it relies on are in the API reference; a complete worked example is Write a chain operator.
 facts: Template | context-runtime/modules/MOD_NAME ; External example | context-runtime/test/unit/external-chimod ; Worked example | /develop/operator.html
 -->
+<h2 id="what-a-module-does">What a module does</h2>
+<p>A module adds one service to the runtime: store blocks on a device, keep a cache, index text, train a model. It defines a small set of <strong>methods</strong>, and each call to a method is a <strong>task</strong>: a struct carrying the method's inputs and, once it has run, its outputs.</p>
+<p>Every module has two pieces.</p>
+<ul class="checks">
+  <li><strong>The runtime piece</strong> is a shared library the daemon loads. It defines a <em>container</em> class with one coroutine handler per method. The runtime creates a container of it on every node for each pool of the module, and runs the handlers on its worker threads. This is where the module's state and logic live.</li>
+  <li><strong>The client piece</strong> is a shared library that programs link. It gives them one ordinary function per method, which fills in a task, submits it to the pool and returns a future. Clients never run module code themselves; they only send tasks to it.</li>
+</ul>
+<p>A handler can itself be a client of other pools: the cache handler calls the CTE, the CTE calls the block devices. That is how modules stack.</p>
+<figure class="diagram">
+  <svg viewBox="0 0 860 430" role="img" aria-label="Client processes submit tasks through queues to the runtime; the scheduler maps them to workers that run module containers; runtimes on different nodes exchange tasks over the network">
+    <defs><marker id="ud0" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+    <text class="muted" x="20" y="22">CLIENT PROCESSES</text>
+    <rect class="box alt" x="20" y="32" width="170" height="62" rx="8"/><text class="title" x="32" y="56">Application</text><text class="muted" x="32" y="76">module client library</text>
+    <rect class="box alt" x="20" y="108" width="170" height="62" rx="8"/><text class="title" x="32" y="132">FUSE daemon</text><text class="muted" x="32" y="152">module client library</text>
+    <rect class="box alt" x="20" y="184" width="170" height="62" rx="8"/><text class="title" x="32" y="208">GPU kernel</text><text class="muted" x="32" y="228">device task ring</text>
+
+    <text class="muted" x="230" y="22">NODE A: RUNTIME</text>
+    <rect class="box" x="222" y="32" width="616" height="300" rx="10" stroke-dasharray="6 5"/>
+    <rect class="box" x="240" y="46" width="150" height="190" rx="8"/><text class="title" x="252" y="70">Queues</text><text class="muted" x="252" y="92">shared memory</text><text class="muted" x="252" y="110">Unix socket / TCP</text><text class="muted" x="252" y="128">GPU ring</text><text class="muted" x="252" y="160">one per transport,</text><text class="muted" x="252" y="178">chosen automatically</text>
+    <path class="edge hl" d="M190,63 L238,90" marker-end="url(#ud0)"/>
+    <path class="edge hl" d="M190,139 L238,139" marker-end="url(#ud0)"/>
+    <path class="edge hl" d="M190,215 L238,190" marker-end="url(#ud0)"/>
+    <rect class="box hl" x="410" y="46" width="170" height="80" rx="8"/><text class="title" x="422" y="70">Scheduler</text><text class="muted" x="422" y="90">picks a worker lane</text><text class="muted" x="422" y="108">replaceable</text>
+    <path class="edge hl" d="M390,86 L408,86" marker-end="url(#ud0)"/>
+    <rect class="box" x="600" y="46" width="220" height="80" rx="8"/><text class="title" x="612" y="70">Worker threads</text><text class="muted" x="612" y="90">lanes of tasks, run as</text><text class="muted" x="612" y="108">coroutines</text>
+    <path class="edge hl" d="M580,86 L598,86" marker-end="url(#ud0)"/>
+    <rect class="box hl" x="410" y="150" width="410" height="86" rx="8"/><text class="title" x="422" y="174">Module containers (runtime pieces)</text><text class="muted" x="422" y="194">one per pool: your handlers, state, cost model</text><text class="muted" x="422" y="212">subtasks to other pools go back through the scheduler</text>
+    <path class="edge" d="M710,126 L710,148" marker-end="url(#ud0)"/>
+    <rect class="box" x="240" y="256" width="580" height="60" rx="8"/><text class="title" x="252" y="280">Network send / receive workers</text><text class="muted" x="252" y="300">tasks whose PoolQuery names another node leave here; replies come back here</text>
+    <path class="edge" d="M520,236 L520,254" marker-end="url(#ud0)"/>
+
+    <text class="muted" x="230" y="362">NODE B, C, ...: SAME RUNTIME, SAME MODULES</text>
+    <rect class="box" x="222" y="372" width="616" height="46" rx="10" stroke-dasharray="6 5"/><text class="muted" x="240" y="400">queues, scheduler, workers, containers of the same pools</text>
+    <path class="edge hl" d="M600,316 L600,370" marker-end="url(#ud0)" marker-start="url(#ud0)"/><text class="muted" x="612" y="348">TCP</text>
+  </svg>
+  <figcaption>Clients only submit tasks and wait on futures. The runtime
+  receives them through a queue, the scheduler assigns each to a worker,
+  and the worker runs the module's handler. The highlighted pieces are the ones you extend: module containers
+  and the scheduler (plus dashboard routes, not drawn); see <a href="/docs/runtime/extend.html">Extending the runtime</a>.</figcaption>
+</figure>
+<p>The rest of this page builds both pieces of a module, step by step. <a href="/docs/runtime/design.html">Design</a> describes the runtime's internals in more depth.</p>
+
 <h2>1. Lay out the module</h2>
 <p>Start from the template in <code>context-runtime/modules/MOD_NAME</code>. Replace <code>MOD_NAME</code> with your module name and <code>clio_runtime</code> with your include namespace:</p>
 <pre data-label="files">

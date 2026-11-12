@@ -84,17 +84,59 @@ $ cmake --build build -j"$(nproc)" && sudo cmake --install build
     <div class="section-heading">
       <p class="eyebrow"><span class="chapter">02 /</span> Compose</p>
       <h2 id="compose-title">Compose a storage stack<br><em>special for your case.</em></h2>
-      <p>One YAML file describes the whole stack. Its <code>compose</code> section lists the modules to start, and each one runs as a pool inside the runtime. Block devices turn RAM, files, NVMe, erasure-coded arrays and S3 or Google Cloud buckets into tiers. The Context Transfer Engine places data across them by score. Above it sit <strong>data operators</strong>: modules that each handle one concern and pass everything else down the chain through <code>next_pool_id</code>.</p>
+      <p>Every workload wants something different from storage. A simulation wants fast checkpoints, an analysis wants its hot files close at hand, and an archive wants cheap space that survives failures. CLIO Core lets you build the stack each one needs from a menu of parts, and leave out the parts it doesn't.</p>
       <ul class="checks">
-        <li><strong>Placement.</strong> Give each tier a capacity and a score; choose the placement policy (<code>max_bw</code>, <code>round_robin</code> or <code>random</code>).</li>
-        <li><strong>Persistence.</strong> Mark a tier <code>temporary</code> or <code>long_term</code>, and set where the metadata log lives and how large it may grow.</li>
-        <li><strong>Replication.</strong> Choose the replication factor and which tier holds the replicas, so data survives restarts and node loss.</li>
-        <li><strong>Caching.</strong> Keep hot copies only on tiers above a minimum score.</li>
-        <li><strong>Compression and indexing.</strong> Pick a codec and preset, or let the compressor choose per workload; index what is written for keyword search.</li>
+        <li><strong>Use what you already own.</strong> RAM, NVMe, disks and S3 or Google Cloud buckets each become a storage tier. You rank them, and CLIO Core keeps the most important data on the fastest one.</li>
+        <li><strong>Pick a way in.</strong> Mount a folder, keep your HDF5, MPI-IO or POSIX code as it is, or call the key-value API from C++ or Python.</li>
+        <li><strong>Add only the features you need.</strong> Caching, replication, compression and search are separate modules. Each does one job and each costs a little time or space, so you turn on the ones you use.</li>
+        <li><strong>One file describes it all.</strong> A short YAML file lists the parts, and the runtime starts them.</li>
       </ul>
-      <p>Leave an operator out and the chain closes around the gap; add one and nothing else changes.</p>
-      <a class="text-link" href="/modules/index.html">The module reference <span aria-hidden="true">→</span></a>
+      <p>Leave a module out and the stack closes around the gap; add one and nothing else changes.</p>
+      <a class="text-link" href="/design/index.html">How the pieces fit together <span aria-hidden="true">→</span></a>
     </div>
+    <div>
+      <figure class="diagram">
+  <svg viewBox="0 0 860 560" role="img" aria-label="The CLIO Core stack: front ends, interceptors, namespace, ChiMod chain, CTE core, runtime and storage devices">
+    <defs><marker id="ah0" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+    <text class="muted" x="20" y="22">FRONT ENDS (what you use)</text>
+    <rect class="box alt" x="20" y="32" width="152" height="50" rx="8"/><text class="title" x="32" y="54">Context FS</text><text class="muted" x="32" y="72">a mounted folder</text>
+    <rect class="box alt" x="184" y="32" width="152" height="50" rx="8"/><text class="title" x="196" y="54">Memory exp.</text><text class="muted" x="196" y="72">paged GPU/CPU vectors</text>
+    <rect class="box alt" x="348" y="32" width="152" height="50" rx="8"/><text class="title" x="360" y="54">Machine learning</text><text class="muted" x="360" y="72">clio-ml, out of core</text>
+    <rect class="box alt" x="512" y="32" width="152" height="50" rx="8"/><text class="title" x="524" y="54">CAE · CEE</text><text class="muted" x="524" y="72">import, search, retrieve</text>
+    <rect class="box alt" x="676" y="32" width="164" height="50" rx="8"/><text class="title" x="688" y="54">Key-value API</text><text class="muted" x="688" y="72">C++, Python, GPU</text>
+
+    <text class="muted" x="20" y="112">INTERCEPTORS (unmodified applications)</text>
+    <rect class="box alt" x="20" y="122" width="260" height="46" rx="8"/><text class="title" x="32" y="144">FUSE mount</text><text class="muted" x="32" y="160">Linux, macOS, Windows</text>
+    <rect class="box alt" x="296" y="122" width="260" height="46" rx="8"/><text class="title" x="308" y="144">POSIX · STDIO · MPI-IO</text><text class="muted" x="308" y="160">preloaded interceptors</text>
+    <rect class="box alt" x="572" y="122" width="268" height="46" rx="8"/><text class="title" x="584" y="144">HDF5 · ADIOS2</text><text class="muted" x="584" y="160">VOL, VFD, engine plugins</text>
+
+    <text class="muted" x="20" y="198">NAMESPACE AND STREAMS</text>
+    <rect class="box hl" x="20" y="208" width="536" height="46" rx="8"/><text class="title" x="32" y="230">Filesystem ChiMod (clio-fs)</text><text class="muted" x="32" y="246">directories, inodes and file handles, stored as blobs</text>
+    <rect class="box hl" x="572" y="208" width="268" height="46" rx="8"/><text class="title" x="584" y="230">Stream</text><text class="muted" x="584" y="246">file sizes, ordered appends</text>
+
+    <text class="muted" x="20" y="284">CHIMOD CHAIN (optional data operators)</text>
+    <rect class="box hl" x="20" y="294" width="152" height="44" rx="8"/><text class="title" x="32" y="321">Cache</text>
+    <rect class="box hl" x="192" y="294" width="152" height="44" rx="8"/><text class="title" x="204" y="321">Indexer</text>
+    <rect class="box" x="364" y="294" width="152" height="44" rx="8" stroke-dasharray="5 4"/><text class="title" x="376" y="321">Compressor</text>
+    <rect class="box hl" x="536" y="294" width="152" height="44" rx="8"/><text class="title" x="548" y="321">Replication</text>
+    <rect class="box" x="708" y="294" width="132" height="44" rx="8" stroke-dasharray="5 4"/><text class="title" x="720" y="321">Your module</text>
+    <path class="edge hl" d="M172,316 L190,316" marker-end="url(#ah0)"/>
+    <path class="edge hl" d="M344,316 L362,316" marker-end="url(#ah0)"/>
+    <path class="edge hl" d="M516,316 L534,316" marker-end="url(#ah0)"/>
+
+    <text class="muted" x="20" y="368">CONTEXT TRANSFER ENGINE (CTE core)</text>
+    <rect class="box hl" x="20" y="378" width="820" height="50" rx="8"/><text class="title" x="32" y="400">Tags and blobs, placed by score</text><text class="muted" x="32" y="418">hash-owned metadata · placement engine · metadata log · reorganize, flush, evict</text>
+
+    <text class="muted" x="20" y="458">STORAGE (block-device pools)</text>
+    <rect class="box" x="20" y="468" width="194" height="40" rx="8"/><text x="32" y="493">RAM / HBM</text>
+    <rect class="box" x="228" y="468" width="194" height="40" rx="8"/><text x="240" y="493">NVMe / SSD</text>
+    <rect class="box" x="436" y="468" width="194" height="40" rx="8"/><text x="448" y="493">HDD / parallel FS</text>
+    <rect class="box" x="644" y="468" width="196" height="40" rx="8"/><text x="656" y="493">S3 / GCS buckets</text>
+    <text class="muted" x="20" y="540">CONTEXT RUNTIME: every box above is a module running as tasks in one process per node.</text>
+  </svg>
+        <figcaption>Front ends on top, storage devices at the bottom. Everything in between is an optional, swappable module.</figcaption>
+      </figure>
+      <details class="yaml-example"><summary>The YAML for a stack like this</summary>
 <pre data-label="yaml">
 compose:
   - mod_name: clio_cte_core            # tiers and placement
@@ -136,11 +178,38 @@ compose:
     next_pool_id: "564.0"
     min_score: 0.5
 </pre>
+      </details>
+    </div>
+  </section>
+
+  <section class="chapter-row reveal" id="extend" aria-labelledby="extend-title">
+    <div class="section-heading">
+      <p class="eyebrow"><span class="chapter">03 /</span> Extend</p>
+      <h2 id="extend-title">Develop, upgrade, and install<br><em>custom extensions with ease.</em></h2>
+      <p>Everything in CLIO Core, from the block devices to the filesystem, is a <strong>module</strong> (a ChiMod): a small shared library the runtime loads. Yours are built the same way and get the same powers: they run next to the data, on every node, scheduled by the same runtime as the built-in ones. You build them out of tree against an installed CLIO Core, and you need no fork.</p>
+      <ul class="checks">
+        <li><strong>Two halves, one module.</strong> A runtime library holds the code that runs inside the daemon; a client library gives applications a typed way to call it. A short <code>clio_mod.yaml</code> names the module and its methods.</li>
+        <li><strong>Drop into the data path.</strong> A module can sit in the chain in front of storage, handle the calls it cares about and pass the rest on, so the applications above it never change.</li>
+        <li><strong>Add and remove while it runs.</strong> <code>clio_run compose start</code> creates pools of your module in a running cluster, and <code>compose stop</code> removes them, while every other pool keeps serving.</li>
+        <li><strong>Upgrade without rebooting the machine.</strong> Installing a new module library, or a new version of one, takes a restart of the CLIO runtime only. Connected clients detect the restart, wait and reconnect, and pools recorded in the pool log come back by themselves.</li>
+      </ul>
+      <a class="text-link" href="/develop/index.html">Write your first module <span aria-hidden="true">→</span></a>
+    </div>
+    <div>
+      <dl class="notes">
+        <div><dt>Data operators</dt><dd>Encrypt, checksum, deduplicate or redact data on its way to storage; tag what each file contains for later search.</dd></div>
+        <div><dt>Storage backends</dt><dd>Turn a new device, an object store or a remote service into a tier that the placement engine ranks like any other.</dd></div>
+        <div><dt>In-situ analysis</dt><dd>Compute statistics, thumbnails or summaries of simulation output as it is written, on the node that holds it.</dd></div>
+        <div><dt>Domain services</dt><dd>A key-value store with your own semantics, a catalog for an instrument, or a feature store for training.</dd></div>
+        <div><dt>Accelerated kernels</dt><dd>Analytics and ML kernels that run on GPUs over paged data larger than device memory, as clio-ml does.</dd></div>
+      </dl>
+      <p class="panel-meta">Swapping a module's code inside a live pool, with no runtime restart at all, is designed for but not yet enabled; see <a href="/docs/runtime/extend.html">Extending the runtime</a>.</p>
+    </div>
   </section>
 
   <section class="chapter-row reveal" id="scale" aria-labelledby="scale-title">
     <div class="section-heading">
-      <p class="eyebrow"><span class="chapter">03 /</span> Scale</p>
+      <p class="eyebrow"><span class="chapter">04 /</span> Scale</p>
       <h2 id="scale-title">Support for parallelism<br><em>at extreme scales.</em></h2>
       <p>CLIO Core runs as one runtime per node, and every module is a pool with a container on each node. Work and data spread across the machine instead of funnelling through a central server, so a pipeline that grows from one node to many keeps the same configuration.</p>
       <a class="text-link" href="/design/runtime.html">How the runtime schedules work <span aria-hidden="true">&rarr;</span></a>
@@ -162,7 +231,7 @@ compose:
 
   <section class="chapter-row reveal" id="assimilate" aria-labelledby="assimilate-title">
     <div class="section-heading">
-      <p class="eyebrow"><span class="chapter">04 /</span> Assimilate</p>
+      <p class="eyebrow"><span class="chapter">05 /</span> Assimilate</p>
       <h2 id="assimilate-title">Assimilate diverse data<br><em>for better agentic exploration.</em></h2>
       <p>Pipeline data rarely lives in one place. The Context Assimilation Engine pulls it into the stack from local files, HDF5 datasets, web URLs, Amazon S3, Google Cloud Storage and Globus endpoints. Each source becomes a tag of blobs that every product can read, the indexer can search and an agent can explore.</p>
       <ul class="checks">
@@ -192,7 +261,7 @@ $ clio_cae transfers.yaml
 
   <section class="chapter-row reveal" id="query" aria-labelledby="query-title">
     <div class="section-heading">
-      <p class="eyebrow"><span class="chapter">05 /</span> Explore</p>
+      <p class="eyebrow"><span class="chapter">06 /</span> Explore</p>
       <h2 id="query-title">Ask for data<br><em>by what it says.</em></h2>
       <p>The Context Exploration Engine is one interface over everything in the stack, whichever product wrote it. Bundle sources in, then query them three ways: by tag and blob name patterns, by keyword relevance (BM25) against the contents, or by when the data was last modified. Retrieve the matches as one packed buffer, capped in size, ready to hand to an analysis or a model.</p>
       <ul class="checks">
@@ -226,7 +295,7 @@ data = ctx.context_retrieve("run42.*", ".*", max_results=5,
 
   <section class="chapter-row reveal" id="observe" aria-labelledby="observe-title">
     <div class="section-heading">
-      <p class="eyebrow"><span class="chapter">06 /</span> Observe</p>
+      <p class="eyebrow"><span class="chapter">07 /</span> Observe</p>
       <h2 id="observe-title">Watch it work<br><em>in the dashboard.</em></h2>
       <p>Every runtime serves a web dashboard on <code>127.0.0.1:8080</code>. It shows the nodes in your cluster, the load on each worker thread, and every storage tier's free space and traffic. You can add or remove pools there too, with no separate process to install.</p>
       <a class="text-link" href="/tutorials/dashboard.html">Navigate the dashboard <span aria-hidden="true">→</span></a>
@@ -240,7 +309,7 @@ data = ctx.context_retrieve("run42.*", ".*", max_results=5,
 
   <section class="chapter-row reveal" id="agents" aria-labelledby="agents-title">
     <div class="section-heading">
-      <p class="eyebrow"><span class="chapter">07 /</span> Agents</p>
+      <p class="eyebrow"><span class="chapter">08 /</span> Agents</p>
       <h2 id="agents-title">Bring your AI<br><em>to your data.</em></h2>
       <p>CLIO Core is the data layer of the Clio family. Clio Agent and Clio Coder are IOWarp's agents for science: one manages and analyzes data, the other writes scientific software. Anything they write through Context FS or the key-value store is stored, tiered and indexed like the rest of your pipeline's data.</p>
       <a class="text-link" href="/tutorials/python-semantic-query.html">Query that data from Python <span aria-hidden="true">→</span></a>
@@ -253,7 +322,7 @@ data = ctx.context_retrieve("run42.*", ".*", max_results=5,
 
   <section class="chapter-row reveal" id="stack" aria-labelledby="stack-title">
     <div class="section-heading">
-      <p class="eyebrow"><span class="chapter">08 /</span> Under the hood</p>
+      <p class="eyebrow"><span class="chapter">09 /</span> Under the hood</p>
       <h2 id="stack-title">Five engines,<br><em>one runtime.</em></h2>
       <p>Every product is built from these layers, and you can use each one directly. Each layer has its own C++ and Python interfaces. The Design section explains how they fit together and which tradeoffs they make for speed and reliability.</p>
       <a class="text-link" href="/design/index.html">Read the design <span aria-hidden="true">→</span></a>
@@ -270,7 +339,7 @@ data = ctx.context_retrieve("run42.*", ".*", max_results=5,
 
   <section class="chapter-row reveal faq" id="questions" aria-labelledby="faq-title">
     <div class="section-heading">
-      <p class="eyebrow"><span class="chapter">09 /</span> Questions</p>
+      <p class="eyebrow"><span class="chapter">10 /</span> Questions</p>
       <h2 id="faq-title">Common questions.</h2>
     </div>
     <div>
