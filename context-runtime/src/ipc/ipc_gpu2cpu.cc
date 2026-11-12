@@ -6,6 +6,7 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <atomic>
 #include <unordered_map>
 #include <vector>
@@ -85,15 +86,49 @@ constexpr double kEvBucketUs[EvChan::kBuckets - 1] = {
 // queries, and the copy itself.
 // 17-18: from SYCL event profiling on the copy helpers' queues -- how long
 // the copy waited on the device before starting, and how long it ran.
-EvChan g_chan[19];
-const char *g_chan_name[19] = {"multi_total", "multi_await", "get_total",
+// 19-30: rtt_remote split into per-stage spans on the node that runs each
+// stage -- see clio_runtime/evlat.h for the map.
+constexpr int kNumEvChan = 34;
+EvChan g_chan[kNumEvChan];
+const char *g_chan_name[kNumEvChan] = {"multi_total", "multi_await", "get_total",
                               "bdev_h2d",   "read_await",  "get_meta",
                               "bdev_read",  "direct_read",
                               "reorg_stall", "reorg_move",
                               "rtt_remote", "evq_wait",
                               "pput_bounce", "pput_send", "pput_await",
                               "dam_ptrq", "dam_copy",
-                              "cp_queue", "cp_xfer"};
+                              "cp_queue", "cp_xfer",
+                              "o_netq", "o_send",
+                              "r_read", "r_recvin", "r_lane", "r_exec",
+                              "r_netq", "r_send", "r_resid",
+                              "o_read", "o_recvout", "peer_poll",
+                              "c_e2e", "o_res_loc", "o_res_rem"};
+
+// TSC rate. The report used to assume a 3 GHz TSC (2995 cycles/us); on a
+// 2.2 GHz part every printed microsecond was 27% short. Measured once at
+// startup under CLIO_EVLAT (CalibrateTsc), 2995 otherwise (nothing reports).
+double g_cyc_per_us = 2995.0;
+unsigned long long g_tsc0 = 0;  // cycle stamp at calibration (busy windows)
+void CalibrateTsc() {
+  const auto w0 = std::chrono::steady_clock::now();
+  const unsigned long long c0 = clio::run::CycleNow();
+  while (std::chrono::steady_clock::now() - w0 < std::chrono::milliseconds(20)) {
+  }
+  const auto w1 = std::chrono::steady_clock::now();
+  const unsigned long long c1 = clio::run::CycleNow();
+  const double us =
+      std::chrono::duration<double, std::micro>(w1 - w0).count();
+  if (us > 0 && c1 > c0) g_cyc_per_us = static_cast<double>(c1 - c0) / us;
+  g_tsc0 = c1;
+}
+
+// Busy time per ~1 s window for the single threads on the cross-node path
+// (evlat.h Busy). A thread that is ~100% busy in its loaded windows is a
+// serialization point no matter what its per-op latency says.
+constexpr int kBusyWindows = 4096;
+std::atomic<unsigned long long> g_busy_cyc[2][kBusyWindows];
+std::atomic<unsigned long long> g_busy_ops[2][kBusyWindows];
+const char *g_busy_name[2] = {"peer_recv", "net_send"};
 std::terminate_handler g_prev_term = nullptr;
 void EvDumpOnTerminate() {
   const unsigned long long end = g_ev_seq.load();
@@ -142,7 +177,7 @@ void EvLatencyReport() {
   auto rep = [](const char *name, std::vector<double> &v) {
     if (v.empty()) return;
     std::sort(v.begin(), v.end());
-    const double us = 1.0 / 2995.0;   // ~3 GHz TSC -> microseconds
+    const double us = 1.0 / g_cyc_per_us;
     fprintf(stderr, "clio-evlat %-4s n=%zu p50=%.0fus p90=%.0fus p99=%.0fus\n",
             name, v.size(), v[v.size() / 2] * us,
             v[(size_t) (v.size() * 0.9)] * us,
@@ -156,24 +191,73 @@ void EvLatencyReport() {
 }  // namespace
 
 extern "C" void clio_evlat_add(int which, unsigned long long cycles) {
-  if (which < 0 || which >= 19) return;
+  if (which < 0 || which >= kNumEvChan) return;
   g_chan[which].sum.fetch_add(cycles, std::memory_order_relaxed);
   g_chan[which].cnt.fetch_add(1, std::memory_order_relaxed);
   unsigned long long m = g_chan[which].mx.load(std::memory_order_relaxed);
   while (cycles > m &&
          !g_chan[which].mx.compare_exchange_weak(m, cycles)) {
   }
-  const double us = static_cast<double>(cycles) / 2995.0;
+  const double us = static_cast<double>(cycles) / g_cyc_per_us;
   int b = 0;
   while (b < EvChan::kBuckets - 1 && us >= kEvBucketUs[b]) ++b;
   g_chan[which].hist[b].fetch_add(1, std::memory_order_relaxed);
 }
 
+extern "C" void clio_evlat_busy(int which, unsigned long long start,
+                                unsigned long long end) {
+  if (which < 0 || which >= 2 || g_tsc0 == 0 || start < g_tsc0 || end <= start) {
+    return;
+  }
+  const unsigned long long win = static_cast<unsigned long long>(
+      static_cast<double>(start - g_tsc0) / (g_cyc_per_us * 1e6));
+  if (win >= static_cast<unsigned long long>(kBusyWindows)) return;
+  g_busy_cyc[which][win].fetch_add(end - start, std::memory_order_relaxed);
+  g_busy_ops[which][win].fetch_add(1, std::memory_order_relaxed);
+}
+
+extern "C" double clio_evlat_cycles_per_us() { return g_cyc_per_us; }
+
+namespace {
+
+/** Per busy kind: the loaded windows (ops >= 10% of the busiest window's)
+ *  and their mean / max busy fraction. */
+void EvBusyReport() {
+  const double win_cyc = g_cyc_per_us * 1e6;
+  for (int k = 0; k < 2; ++k) {
+    unsigned long long max_ops = 0;
+    for (int w = 0; w < kBusyWindows; ++w) {
+      max_ops = std::max(max_ops, g_busy_ops[k][w].load());
+    }
+    if (max_ops == 0) continue;
+    int n = 0;
+    double sum = 0, mx = 0;
+    unsigned long long ops = 0;
+    for (int w = 0; w < kBusyWindows; ++w) {
+      const unsigned long long o = g_busy_ops[k][w].load();
+      if (o * 10 < max_ops) continue;
+      const double f = static_cast<double>(g_busy_cyc[k][w].load()) / win_cyc;
+      ++n;
+      sum += f;
+      mx = std::max(mx, f);
+      ops += o;
+    }
+    fprintf(stderr,
+            "clio-evbusy %-9s loaded_windows=%d (1s) busy_avg=%.0f%% "
+            "busy_max=%.0f%% ops/s=%.0f\n",
+            g_busy_name[k], n, n ? 100.0 * sum / n : 0.0, 100.0 * mx,
+            n ? static_cast<double>(ops) / n : 0.0);
+  }
+}
+
+}  // namespace
+
 namespace {
 
 void EvChanReport() {
-  const double us = 1.0 / 2995.0;
-  for (int i = 0; i < 19; ++i) {
+  const double us = 1.0 / g_cyc_per_us;
+  fprintf(stderr, "clio-evchan tsc=%.1f cycles/us\n", g_cyc_per_us);
+  for (int i = 0; i < kNumEvChan; ++i) {
     const unsigned long long c = g_chan[i].cnt.load();
     if (c == 0) continue;
     fprintf(stderr, "clio-evchan %-12s n=%llu avg=%.0fus max=%.0fus\n",
@@ -216,7 +300,9 @@ struct EvInit {
     signal(SIGUSR1, EvDumpOnSignal);
 #endif
     if (std::getenv("CLIO_EVLAT") != nullptr) {
+      CalibrateTsc();
       std::atexit(EvChanReport);
+      std::atexit(EvBusyReport);
     }
     if (std::getenv("CLIO_EVLAT") != nullptr) {
       std::atexit(EvLatencyReport);

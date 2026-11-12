@@ -496,6 +496,18 @@ DynamicContainer PoolManager::GetRealOrStaticContainer(PoolId pool_id) const {
                                          : info.static_container_;
 }
 
+DynamicContainer PoolManager::GetLocalContainer(PoolId pool_id) const {
+  if (!is_initialized_) {
+    return DynamicContainer();
+  }
+  PoolMetaReadLock lock(pool_metadata_mutex_);
+  auto it = pool_metadata_.find(pool_id);
+  if (it == pool_metadata_.end()) {
+    return DynamicContainer();
+  }
+  return it->second.local_container_;
+}
+
 void PoolManager::PlugContainer(PoolId pool_id, ContainerId container_id) {
   DynamicContainer dc = GetContainerRaw(pool_id, container_id);
   ContainerHold container = dc.get();
