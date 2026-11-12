@@ -977,10 +977,20 @@ clio::run::TaskResume Runtime::PushToHolders(
       // Backoff starts at 25 us: a flat 20 ms poll put a 20 ms floor under
       // every commit (atime updates included), and a 28,800-file tree walk
       // went from ~5 ms to ~30 ms a file (dirs_crash_restart timed out).
-      double poll_us = 25.0;
+      //
+      // The interval is an eighth of the time this holder has been waited
+      // for, clamped to [25 us, 20 ms]. Doubling it on every poll overshot a
+      // reply by up to its own latency: with replies arriving after ~0.5 ms
+      // a push to 4 holders took 2.2 ms of a 2.6 ms create (8 nodes, mdtest;
+      // CLIO_EVLAT fs_row_push). A proportional interval notices the reply
+      // within 1/8 of its latency and still reaches 20 ms for a holder that
+      // is not answering.
+      const auto poll_t0 = std::chrono::steady_clock::now();
       while (!xf.second.IsComplete() && SteadyMs() < h.second) {
-        CLIO_CO_AWAIT(clio::run::yield(poll_us));
-        poll_us = std::min(poll_us * 2.0, 20000.0);
+        const double waited_us = std::chrono::duration<double, std::micro>(
+            std::chrono::steady_clock::now() - poll_t0).count();
+        CLIO_CO_AWAIT(clio::run::yield(
+            std::clamp(waited_us / 8.0, 25.0, 20000.0)));
       }
       if (!xf.second.IsComplete()) {
         gone->push_back(h.first);
