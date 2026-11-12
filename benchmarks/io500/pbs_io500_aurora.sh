@@ -28,6 +28,8 @@
 # Knobs (qsub -v): MODE, PPN (IO500 ranks per node, 16), STONEWALL (300 s,
 # the IO500 rule), RAM_PCT (25), DAOS_PCT (50), FLARE_X (4), BUILD_DIR
 # (build/fs), IO500 (binary), DAOS_POOL (IOWarp), DAOS_CONT (io500_<nodes>n).
+# CLIO_FUSE_DIR_ATTR_CACHE_S (unset = off on multi-node): seconds the adapter
+# caches directory attributes; passed through to clio_cte_fuse unchanged.
 set -u
 MODE=${MODE:-cliofs}
 PPN=${PPN:-16}

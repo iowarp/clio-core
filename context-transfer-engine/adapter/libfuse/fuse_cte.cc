@@ -770,8 +770,9 @@ void TimesOverlayDropMtime(const std::string &p);
 // 400k Getattr tasks of a 16k-file checkout). Directory attributes from the
 // runtime are kept for the mount's attribute TTL, the staleness the kernel
 // attribute cache already allows here, and dropped on every change this
-// mount makes to the directory or its entries. Single-node mounts only:
-// there every change passes through this mount.
+// mount makes to the directory or its entries. On by default on single-node
+// mounts only (there every change passes through this mount); multi-node
+// mounts opt in with CLIO_FUSE_DIR_ATTR_CACHE_S and accept that staleness.
 struct DirAttrEntry {
   cte_stat_t st;
   std::chrono::steady_clock::time_point expiry;
@@ -1843,7 +1844,23 @@ static void *cte_fuse_init(struct fuse_conn_info *conn,
   cfg->attr_timeout = attr_ttl;
   cfg->entry_timeout = entry_ttl;
   g_entry_ttl_s = entry_ttl;
+  // Directory attribute cache (see DirAttrEntry). Single-node: on for
+  // attr_ttl. Multi-node: off by default, opt in with
+  // CLIO_FUSE_DIR_ATTR_CACHE_S. Why it is worth opting in: with attr_timeout
+  // 0 and default_permissions the kernel re-fetches the attributes of every
+  // ancestor directory on each path walk, so each syscall costs one getattr
+  // per path component; this cache answers those from the adapter. Trade:
+  // this mount's own changes invalidate the entry, but a change made through
+  // another node (chmod/chown of a directory, entries added/removed changing
+  // nlink/mtime, rmdir) can be seen stale for up to the TTL. File attributes
+  // are never cached here. A set value applies on any mount; 0 disables and
+  // negative values clamp to 0.
   g_dir_attr_ttl_s = MultiNode() ? 0.0 : attr_ttl;
+  if (const char *dir_ttl_env = getenv("CLIO_FUSE_DIR_ATTR_CACHE_S")) {
+    if (*dir_ttl_env != '\0') {
+      g_dir_attr_ttl_s = std::max(0.0, atof(dir_ttl_env));
+    }
+  }
   cfg->negative_timeout = attr_ttl;
   // Writeback cache: OFF by default. Enabling it batches write()s in the
   // kernel page cache, but the kernel then requires the filesystem to be a
