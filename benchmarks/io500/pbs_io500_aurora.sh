@@ -302,7 +302,11 @@ $API_LINE
 [ior-rnd4K-easy-read]
 run = FALSE
 EOF
-if [ "${PFIND_HASH:-0}" = 1 ]; then
+if [ -n "$DFS_API" ]; then
+  # IO500's built-in pfind walks a POSIX path; a libdfs datadir has none.
+  printf '\n[find]\nrun = FALSE\n' >> io500.ini
+  echo "=== find skipped: no POSIX path in DAOS_API=dfs mode"
+elif [ "${PFIND_HASH:-0}" = 1 ]; then
   cat >> io500.ini <<EOF
 
 [find]
@@ -362,8 +366,25 @@ echo "=== IO500 start $(date)"
 # node for the stacks of its runtime and adapter (logs/<host>.*.stacks).
 HD=""
 [ -n "${HANG_DUMP_S:-}" ] && { ( sleep "$HANG_DUMP_S"; touch dump; echo "=== hang dump requested $(date)" ) & HD=$!; }
-mpiexec -n $(( NN * PPN )) -ppn "$PPN" --cpu-bind depth -d 4 --envall \
-  "$IO500" io500.ini > io500.log 2>&1
+# libdfs clients reach the DAOS servers over the fabric themselves, which the
+# launcher's per-job VNI blocks (NA_HOSTUNREACH); --no-vni as for dfuse.
+NOVNI=""
+[ -n "$DFS_API" ] && NOVNI="--no-vni"
+mpiexec -n $(( NN * PPN )) -ppn "$PPN" $NOVNI --cpu-bind depth -d 4 --envall \
+  "$IO500" io500.ini > io500.log 2>&1 &
+MPI_PID=$!
+if [ -n "$DFS_API" ]; then
+  # With libdfs the ranks never exited after IO500 wrote its results (a
+  # 2-node run sat until walltime). Once the summary line is out, give them
+  # a minute and end the launcher.
+  ( while kill -0 $MPI_PID 2>/dev/null; do
+      if grep -q 'result files are stored' io500.log 2>/dev/null; then
+        sleep 60; kill $MPI_PID 2>/dev/null; break
+      fi
+      sleep 5
+    done ) &
+fi
+wait $MPI_PID
 rc=$?
 [ -n "$HD" ] && kill "$HD" 2>/dev/null
 echo "=== IO500 rc=$rc end $(date)"

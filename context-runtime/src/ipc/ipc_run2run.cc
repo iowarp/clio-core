@@ -52,6 +52,7 @@ extern "C" void clio_evlat_add(int which, unsigned long long cycles);
 #include <clio_ctp/thread/thread_model_manager.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <unordered_set>
 #include <mutex>
@@ -1041,6 +1042,18 @@ int IpcManagerRun2Run::RecvOutDeserialize(
   return 0;
 }
 
+namespace {
+/**
+ * Lock that serializes reply aggregation into one origin task.
+ * @param net_key the origin's key in the send map
+ * @return one of a fixed set of mutexes, the same for equal keys
+ */
+std::mutex &AggregateLock(size_t net_key) {
+  static std::array<std::mutex, 256> locks;
+  return locks[(net_key * 0x9E3779B97F4A7C15ull >> 32) % locks.size()];
+}
+}  // namespace
+
 int IpcManagerRun2Run::RecvOutAggregate(
     const std::vector<clio::run::TaskInfo> &task_infos) {
   auto *ipc_manager = CLIO_IPC;
@@ -1097,6 +1110,14 @@ int IpcManagerRun2Run::RecvOutAggregate(
     //
     // pool_query_ has no operator== and is deliberately trivially copyable and
     // raw-byte compared elsewhere in the tree, so memcmp is the right test.
+    //
+    // One reply at a time per origin: with several peer receive threads
+    // (CLIO_NET_TIER_LANES) the replies of a broadcast arrive on different
+    // threads, and AggregateOut implementations that copy the replica and
+    // then restore the origin's identity are not safe to run concurrently on
+    // one origin (a second thread saw, and completed on, the half-copied
+    // task). A lock striped by net_key serializes them.
+    std::unique_lock<std::mutex> agg_lk(AggregateLock(net_key));
     const clio::run::TaskId id_before = origin_task->task_id_;
     const clio::run::PoolQuery query_before = origin_task->pool_query_;
     const clio::run::u32 method_before = origin_task->method_;
@@ -1119,6 +1140,7 @@ int IpcManagerRun2Run::RecvOutAggregate(
       origin_task->pool_query_ = query_before;
       origin_task->method_ = method_before;
     }
+    agg_lk.unlock();
 
     HLOG(kDebug, "[RecvOut] Task {}", origin_task->task_id_);
 
