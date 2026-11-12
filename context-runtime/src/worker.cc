@@ -1220,12 +1220,26 @@ void Worker::SuspendMe() {
     // already spun ~1ms with no work, and every producer that feeds a
     // sub-millisecond periodic (EnqueueNetTask, SHM shard, lanes) wakes the
     // worker explicitly, so the fast period only matters while busy.
+    //
+    // Idle backoff: a fixed 1ms floor still woke the worker hosting the admin
+    // SendPoll/ClientSend periodics ~1000 times/s forever, each wake running
+    // ContinueBlockedTasks twice plus the due periodics (two thread-CPU-time
+    // syscalls per ExecTask). On an idle macOS desktop that one worker was
+    // ~10-15% of a core. Every consecutive park that times out with no work
+    // doubles the floor (1, 2, 4 ... ms) up to max_sleep; any work resets
+    // sleep_count_ in Run(). Producers still wake the worker explicitly, and
+    // max_sleep remains the bound on a missed wakeup, exactly as for a worker
+    // with no periodic task, so this only stretches polling nobody is waiting on.
     constexpr int kMinParkUs = 1000;
+    constexpr u64 kMaxParkBackoffShift = 6;
+    const int park_floor_us =
+        kMinParkUs
+        << static_cast<int>(std::min<u64>(sleep_count_, kMaxParkBackoffShift));
     double suspend_period_us = GetSuspendPeriod();
     int timeout_us = (suspend_period_us < 0)
                          ? static_cast<int>(max_sleep)
                          : std::min(std::max(static_cast<int>(suspend_period_us),
-                                             kMinParkUs),
+                                             park_floor_us),
                                     static_cast<int>(max_sleep));
 
     // issue #807: park protocol for the inbound SHM shard. The ORDER is
