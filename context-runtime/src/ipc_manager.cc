@@ -4369,15 +4369,22 @@ static constexpr int kRecvErrorRetryUs = 1000;
 static constexpr int kRecvErrorBackoffUs = 10000;
 static constexpr size_t kRecvErrorFastRetries = 32;
 
+// Milliseconds the unix-socket client (IPC mode, and every local mode on macOS)
+// waits in poll() before re-checking the running flag. poll() returns as soon
+// as a response arrives, so this only bounds shutdown and reconnect join
+// latency; idle it costs 100 wakeups a second, like kRecvErrorBackoffUs.
+static constexpr int kSocketPollTimeoutMs = 10;
+
 void IpcManager::RecvZmqClientThread() {
   // Client-side thread: blocks for completed task responses. In TCP mode these
   // arrive on the dedicated response listener (an ephemeral ROUTER bound in
   // ClientInit) that the runtime dials back into — fully decoupled from the
   // request DEALER, so there is no shared sock_mtx_ between send and recv. In
   // IPC mode there is no listener; responses come back over the unix-socket
-  // transport (zmq_transport_) as before. Uses ZMQ's native zmq_poll (via
-  // Transport::PollRecv) rather than the EventManager, because ZMQ_FD cannot be
-  // registered with WSAEventSelect on Windows.
+  // transport (zmq_transport_) as before. Waits via Transport::PollRecv (ZMQ's
+  // native zmq_poll, or poll() on the unix socket) rather than the
+  // EventManager, because ZMQ_FD cannot be registered with WSAEventSelect on
+  // Windows.
   ctp::lbm::Transport *recv_transport = client_response_listener_
                                             ? client_response_listener_.get()
                                             : zmq_transport_.get();
@@ -4385,6 +4392,10 @@ void IpcManager::RecvZmqClientThread() {
     HLOG(kError, "RecvZmqClientThread: No response transport");
     return;
   }
+  const int poll_timeout_ms =
+      recv_transport->type_ == ctp::lbm::TransportType::kSocket
+          ? kSocketPollTimeoutMs
+          : kZmqPollTimeoutMs;
 
   // Instrumentation: count of responses this client has received and signaled
   // (FUTURE_COMPLETE set). Mismatch vs daemon-side send count = lost responses.
@@ -4533,8 +4544,8 @@ void IpcManager::RecvZmqClientThread() {
     }
 
     // Only block when the drain loop found nothing; if we just processed
-    // messages, loop back immediately to drain more. zmq_poll wakes the instant
-    // a response arrives, so this adds no latency to message delivery.
+    // messages, loop back immediately to drain more. zmq_poll and poll() wake
+    // the instant a response arrives, so this adds no latency to delivery.
     if (drained_any) {
       error_streak = 0;
       continue;
@@ -4552,7 +4563,7 @@ void IpcManager::RecvZmqClientThread() {
       continue;
     }
     error_streak = 0;
-    recv_transport->PollRecv(kZmqPollTimeoutMs);
+    recv_transport->PollRecv(poll_timeout_ms);
   }
 
   // One-shot teardown tally (#968). recv_count / miss_count were only ever

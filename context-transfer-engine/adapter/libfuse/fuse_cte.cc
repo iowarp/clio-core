@@ -770,8 +770,9 @@ void TimesOverlayDropMtime(const std::string &p);
 // 400k Getattr tasks of a 16k-file checkout). Directory attributes from the
 // runtime are kept for the mount's attribute TTL, the staleness the kernel
 // attribute cache already allows here, and dropped on every change this
-// mount makes to the directory or its entries. Single-node mounts only:
-// there every change passes through this mount.
+// mount makes to the directory or its entries. On by default on single-node
+// mounts only (there every change passes through this mount); multi-node
+// mounts opt in with CLIO_FUSE_DIR_ATTR_CACHE_S and accept that staleness.
 struct DirAttrEntry {
   cte_stat_t st;
   std::chrono::steady_clock::time_point expiry;
@@ -787,6 +788,55 @@ double g_entry_ttl_s = 0.0;  ///< kernel entry TTL, set at init (#1323)
  * @param stbuf receives the attributes on a hit
  * @return true on a fresh hit
  */
+// READDIR PREFETCH (opt-in, CLIO_FUSE_READDIR_PREFETCH=<window>): a listing
+// of a large directory issues its children's getattrs concurrently, `window`
+// in flight, and parks the results here. find/ls -l then stat every entry;
+// without this each stat was its own serial round trip to the entry's owner
+// node (IO500 find at 16 nodes: one pfind rank stat'ing 512k entries of
+// mdtest-hard one by one took >12 min). Each result is consumed by the
+// first getattr of that path and expires after kPrefetchTtlNs, so staleness
+// is bounded by that window. Off by default: multi-node mounts otherwise
+// keep exact close-to-open attributes.
+// pfind/ls read the WHOLE listing before stat'ing anything, so the TTL must
+// cover the full stat pass over a large directory (a 2 s TTL expired most of
+// a 512k-entry prefetch before its first stat). CLIO_FUSE_READDIR_PREFETCH_TTL_S.
+static int64_t PrefetchTtlNs() {
+  static const int64_t ttl = [] {
+    const char *e = getenv("CLIO_FUSE_READDIR_PREFETCH_TTL_S");
+    const double s = (e != nullptr && *e != '\0') ? atof(e) : 60.0;
+    return static_cast<int64_t>(s * 1e9);
+  }();
+  return ttl;
+}
+static std::mutex g_pf_mtx;
+static std::unordered_map<std::string, std::pair<cte_stat_t, int64_t>> g_pf;
+static int64_t PfNowNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+static int PrefetchWindow() {
+  static const int w = [] {
+    const char *e = getenv("CLIO_FUSE_READDIR_PREFETCH");
+    return (e != nullptr && *e != '\0') ? atoi(e) : 0;
+  }();
+  return w;
+}
+static bool PrefetchTake(const std::string &p, cte_stat_t *st) {
+  if (PrefetchWindow() <= 0) return false;
+  std::lock_guard<std::mutex> lk(g_pf_mtx);
+  auto it = g_pf.find(p);
+  if (it == g_pf.end()) return false;
+  const bool fresh = PfNowNs() - it->second.second < PrefetchTtlNs();
+  if (fresh) *st = it->second.first;
+  g_pf.erase(it);
+  return fresh;
+}
+static void PrefetchDrop(const std::string &p) {
+  if (PrefetchWindow() <= 0) return;
+  std::lock_guard<std::mutex> lk(g_pf_mtx);
+  g_pf.erase(p);
+}
+
 static bool DirAttrLookup(const std::string &p, cte_stat_t *stbuf) {
   if (g_dir_attr_ttl_s <= 0.0) return false;
   std::lock_guard<std::mutex> lk(g_dir_attr_mtx);
@@ -826,6 +876,7 @@ static void DirAttrClear() {
  * @param p the path being created, removed, renamed or changed
  */
 static void DirAttrInvalidate(const std::string &p) {
+  PrefetchDrop(p);
   if (g_dir_attr_ttl_s <= 0.0) return;
   std::lock_guard<std::mutex> lk(g_dir_attr_mtx);
   g_dir_attr.erase(p);
@@ -1793,7 +1844,23 @@ static void *cte_fuse_init(struct fuse_conn_info *conn,
   cfg->attr_timeout = attr_ttl;
   cfg->entry_timeout = entry_ttl;
   g_entry_ttl_s = entry_ttl;
+  // Directory attribute cache (see DirAttrEntry). Single-node: on for
+  // attr_ttl. Multi-node: off by default, opt in with
+  // CLIO_FUSE_DIR_ATTR_CACHE_S. Why it is worth opting in: with attr_timeout
+  // 0 and default_permissions the kernel re-fetches the attributes of every
+  // ancestor directory on each path walk, so each syscall costs one getattr
+  // per path component; this cache answers those from the adapter. Trade:
+  // this mount's own changes invalidate the entry, but a change made through
+  // another node (chmod/chown of a directory, entries added/removed changing
+  // nlink/mtime, rmdir) can be seen stale for up to the TTL. File attributes
+  // are never cached here. A set value applies on any mount; 0 disables and
+  // negative values clamp to 0.
   g_dir_attr_ttl_s = MultiNode() ? 0.0 : attr_ttl;
+  if (const char *dir_ttl_env = getenv("CLIO_FUSE_DIR_ATTR_CACHE_S")) {
+    if (*dir_ttl_env != '\0') {
+      g_dir_attr_ttl_s = std::max(0.0, atof(dir_ttl_env));
+    }
+  }
   cfg->negative_timeout = attr_ttl;
   // Writeback cache: OFF by default. Enabling it batches write()s in the
   // kernel page cache, but the kernel then requires the filesystem to be a
@@ -2264,6 +2331,7 @@ static int cte_fuse_getattr_stat_inner(const char *path, cte_stat_t *stbuf,
     }
   }
 
+  if (PrefetchTake(p, stbuf)) return 0;
   // Delegate to the filesystem chimod: it owns exists/is-dir/logical-size.
   auto t = cfs->AsyncGetattr(p);
   t.Wait();
@@ -2721,6 +2789,20 @@ int cte_fuse_readdir_flush_guard() {
   return 0;
 }
 
+/**
+ * File-type bits (S_IFMT) for a directory entry of the given filesystem type.
+ * @param fs_type kFsType* as stored in the directory row
+ * @return S_IFREG, S_IFDIR or S_IFLNK; 0 (DT_UNKNOWN) for anything else
+ */
+static mode_t DirentMode(clio::run::u32 fs_type) {
+  switch (fs_type) {
+    case clio::cte::filesystem::kFsTypeFile: return S_IFREG;
+    case clio::cte::filesystem::kFsTypeDir: return S_IFDIR;
+    case clio::cte::filesystem::kFsTypeSymlink: return S_IFLNK;
+    default: return 0;
+  }
+}
+
 int cte_fuse_readdir(const char *path, void *buf,
                             ClioFuseFillDirT filler, cte_off_t offset,
                             struct fuse_file_info *fi,
@@ -2750,6 +2832,51 @@ int cte_fuse_readdir(const char *path, void *buf,
   }
   size_t prefix_len = p.size();
   if (!p.empty() && p.back() != '/') prefix_len++;
+  // Only directories too large for the caller's own parallelism, and one
+  // prefetch per mount at a time: pfind lists hundreds of directories at
+  // once, and prefetching all of them (2000-entry mdtest-easy dirs too)
+  // put ~65k getattrs in flight per node, saturated every runtime worker
+  // and made a stat of the mount root take 61 s.
+  static const size_t pf_min = [] {
+    const char *e = getenv("CLIO_FUSE_READDIR_PREFETCH_MIN");
+    return (e != nullptr && *e != '\0') ? static_cast<size_t>(atoll(e))
+                                         : static_cast<size_t>(8192);
+  }();
+  static std::mutex pf_one;
+  std::unique_lock<std::mutex> pf_lk(pf_one, std::defer_lock);
+  if (const int win = PrefetchWindow();
+      win > 0 && t->entries_.size() >= pf_min && pf_lk.try_lock()) {
+    using GetattrFuture = decltype(cfs->AsyncGetattr(p));
+    std::vector<std::pair<std::string, GetattrFuture>> inflight;
+    inflight.reserve(static_cast<size_t>(win));
+    auto drain = [&]() {
+      for (auto &kv : inflight) {
+        kv.second.Wait();
+        if (kv.second->GetReturnCode() != 0 || kv.second->exists_ == 0) continue;
+        cte_stat_t pst;
+        memset(&pst, 0, sizeof(pst));
+        FillStatFromGetattr(kv.second.get(), kv.first, &pst);
+        std::lock_guard<std::mutex> lk(g_pf_mtx);
+        g_pf[kv.first] = {pst, PfNowNs()};
+      }
+      inflight.clear();
+    };
+    const int64_t pf_t0 = PfNowNs();
+    for (size_t i = 0; i < t->entries_.size(); ++i) {
+      std::string full = t->entries_[i].str();
+      if (!full.empty() && full.back() == '/') full.pop_back();
+      if (full.size() <= prefix_len) continue;
+      if (full.find(".fuse_hidden", prefix_len) == prefix_len) continue;
+      auto f = cfs->AsyncGetattr(full);
+      inflight.emplace_back(std::move(full), std::move(f));
+      if (inflight.size() >= static_cast<size_t>(win)) drain();
+    }
+    drain();
+    if (t->entries_.size() >= 4096) {
+      HLOG(kWarning, "clio_cte_fuse: readdir prefetch of {} ({} entries) took {} ms",
+           p, t->entries_.size(), (PfNowNs() - pf_t0) / 1000000);
+    }
+  }
   // entries_ and inos_ are index-aligned (the chimod builds them together).
   for (size_t i = 0; i < t->entries_.size(); ++i) {
     std::string full = t->entries_[i].str();
@@ -2764,12 +2891,15 @@ int cte_fuse_readdir(const char *path, void *buf,
     // as POSIX is concerned: listing it made `ls` show debris and let rm -r
     // trip over it.
     if (name.rfind(".fuse_hidden", 0) == 0) continue;
-    // Supply only d_ino (the child's tag-derived inode) so getdents agrees with
-    // a subsequent stat (generic/637). Leave st_mode = 0 (DT_UNKNOWN): the entry
-    // type is not reliably known here, so the kernel issues a getattr to resolve
-    // it — setting a wrong d_type would mislead `rm -rf`/`find`.
+    // Supply d_ino (the child's tag-derived inode) so getdents agrees with a
+    // subsequent stat (generic/637), and d_type from the type stored in the
+    // directory row (immutable for an inode). Without d_type a walker stats
+    // every entry just to tell files from directories: pfind did 128,000
+    // serial stats on one rank for one shared directory. An entry whose type
+    // the chimod did not report stays DT_UNKNOWN (st_mode = 0).
     cte_stat_t st;
     memset(&st, 0, sizeof(st));
+    st.st_mode = i < t->types_.size() ? DirentMode(t->types_[i]) : 0;
     st.st_ino = i < t->inos_.size() ? static_cast<ino_t>(t->inos_[i]) : 0;
     // d_ino = 0 means "deleted" to glibc's readdir(3), which silently DROPS
     // the entry — children whose ino lookup missed became invisible to ls

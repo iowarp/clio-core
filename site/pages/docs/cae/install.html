@@ -1,0 +1,89 @@
+<!--
+title: Install
+heading: Install the <em>Context Assimilation Engine.</em>
+description: Which CLIO Core packages include the Context Assimilation Engine, the CMake options that add HDF5, Amazon S3, Google Cloud Storage and Globus import, what the summarizer needs, and how to check the install.
+eyebrow: Docs · Context Assimilation Engine
+lede: The CAE core module ships in every CLIO Core package. The file, string and HTTP assimilators need nothing extra. HDF5, S3, Google Cloud Storage and Globus are opt-in at build time, so for those you build from source or pick a package that enabled them.
+facts: CMake | CLIO_CORE_ENABLE_CAE=ON by default ; HDF5 | CLIO_CORE_ENABLE_HDF5=ON ; Cloud | CAE_ENABLE_S3, CAE_ENABLE_GCS, CAE_ENABLE_GLOBUS ; Summarizer | libcurl + nlohmann_json
+-->
+<h2>What each package includes</h2>
+<p>The general <a href="/docs/installation.html">installation page</a> covers every method. This page says what each one gives you for the CAE.</p>
+<ul class="checks">
+  <li><strong>pip wheel</strong> (<code>pip install iowarp-core</code>). Built with <code>CLIO_CORE_ENABLE_CAE=ON</code> and <code>CLIO_CORE_ENABLE_HDF5=OFF</code>; the S3, GCS and Globus options are left at their OFF defaults. The wheel contains the CAE core client and runtime libraries, so <code>clio_run</code> composes the CAE pool from the default configuration and the Python <code>clio_cee</code> module can submit transfers. The wheel does not install a <code>clio_cae</code> command: its console scripts are <code>clio_run</code>, <code>clio_cte_fuse</code>, <code>clio_cte_bench</code> and <code>clio_run_thrpt_bench</code>. Use <a href="/docs/cee/usage.html">clio_cee</a> to import from a pip install.</li>
+  <li><strong>conda</strong> (<code>iowarp-core</code> on the <code>iowarp</code> channel). Includes the CAE and installs <code>clio_cae</code> under <code>$CONDA_PREFIX/bin</code>. The recipe's cloud SDK lines are commented out; to add S3 or GCS, build the recipe yourself with the matching CMake flag.</li>
+  <li><strong>Docker</strong> (<code>iowarp/deploy-cpu</code>). Built with the <code>build-cpu-release</code> preset, which leaves <code>CLIO_CORE_ENABLE_HDF5</code> and the cloud options at their OFF defaults. The image has <code>clio_cae</code> with the file, string and HTTP assimilators. The HDF5 VOL connector it ships is a CTE adapter, not the CAE HDF5 assimilator.</li>
+  <li><strong>Spack</strong>. The <code>iowarp</code> package has variants <code>+cae</code> (default on), <code>+s3_cae</code> for <code>s3://</code> import and <code>+gcs</code> for <code>gs://</code> import. Both cloud variants require <code>+cae</code>.</li>
+  <li><strong>.deb, .rpm, AppImage, Windows installer.</strong> Ship the native binaries without Python bindings. The Linux packages include <code>clio_cae</code>. The Windows presets build the CAE with HDF5 off.</li>
+  <li><strong>Source.</strong> Everything below.</li>
+</ul>
+
+<h2>Build options</h2>
+<p>All options are set at configure time on the top-level project. The CAE is on by default; the sources that need an SDK are off by default.</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Option</th><th>Default</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>CLIO_CORE_ENABLE_CAE</code></td><td>ON</td><td>Builds <code>context-assimilation-engine</code>: the core module, the summarizer, <code>clio_cae</code> and the tests.</td></tr>
+    <tr><td><code>CLIO_CORE_ENABLE_HDF5</code></td><td>OFF</td><td>HDF5 support in the CAE: the <code>hdf5::</code> assimilator, the <code>hdf5_vol</code> format and <code>.h5</code> export. Needs the HDF5 library.</td></tr>
+    <tr><td><code>CAE_ENABLE_S3</code></td><td>OFF</td><td><code>s3://</code> import. Needs the AWS SDK for C++ (component <code>s3</code>) for the <code>cae_s3_tool</code> helper and Poco (Net, NetSSL, Crypto) for the in-process read path. If either is missing, configure warns and turns the option off.</td></tr>
+    <tr><td><code>CAE_ENABLE_GCS</code></td><td>OFF</td><td><code>gs://</code> and <code>gcs://</code> import. Needs google-cloud-cpp with the storage component. Missing SDK: warn and turn off.</td></tr>
+    <tr><td><code>CAE_ENABLE_GLOBUS</code></td><td>OFF</td><td><code>globus://</code> import and the <code>globus</code> format. Needs Poco (Net, NetSSL, Crypto, JSON) and nlohmann_json. Missing: warn and turn off.</td></tr>
+    <tr><td><code>CLIO_CAE_ENABLE_SUMMARY</code></td><td>OFF</td><td>Builds the summarizer's live-model tests and the semantic-search tests. They need a running Ollama server. The summarizer module itself builds regardless.</td></tr>
+  </tbody>
+</table></div>
+<p>The summarizer compiles its HTTP client when libcurl and nlohmann_json are found. Without libcurl the module still builds and forwards operations, but labeling returns false. <code>http://</code> and <code>https://</code> sources are POSIX only: the assimilator spawns <code>curl</code>, and the <code>cae_http_tool</code> helper is not built on Windows.</p>
+
+<h2>Build from source</h2>
+<p>Start from the general source instructions, then add the CAE options you need. A Linux example with HDF5 and S3:</p>
+<pre data-label="shell">
+$ sudo apt install -y libhdf5-dev libpoco-dev
+$ git clone --recurse-submodules https://github.com/iowarp/clio-core.git
+$ cd clio-core
+$ cmake --preset release \
+    -DCLIO_CORE_ENABLE_HDF5=ON \
+    -DCAE_ENABLE_S3=ON
+$ cmake --build build -j"$(nproc)"
+$ sudo cmake --install build
+</pre>
+<p>The AWS SDK for C++ is not an apt package on most distributions; install it from source or through <code>CI/ci-deps.sh</code>, Spack (<code>+s3_cae</code>) or conda before configuring. Check the configure output for these lines:</p>
+<pre data-label="text">
+found AWS SDK + Poco (CAE S3 support: ENABLED)
+found google-cloud-cpp storage (CAE GCS support: ENABLED)
+CAE summarization support: ENABLED (libcurl + nlohmann_json found)
+    Context Assimilation:       ON
+</pre>
+<p>The install puts <code>clio_cae</code> in <code>bin</code>, with <code>clio_cae_omni</code> as a symlink (a copy on Windows) for older scripts, and <code>cae_s3_tool</code> and <code>cae_http_tool</code> beside it when built.</p>
+
+<h2>Runtime configuration</h2>
+<p>The default configuration already composes the CAE core at pool 400.0 with <code>next_pool_id: "563.0"</code>. If you wrote your own <code>clio.yaml</code>, the entry you need is:</p>
+<pre data-label="yaml">
+compose:
+  # ... CTE core and chain entries first ...
+  - mod_name: clio_cae_core
+    pool_name: cae_main
+    pool_query: local
+    pool_id: "400.0"
+    next_pool_id: "563.0"
+</pre>
+<p>The entry must come after the pool its <code>next_pool_id</code> names. Point <code>next_pool_id</code> at <code>"512.0"</code> to write to the bare core, skipping the cache and the indexer. The summarizer entry is in the default file, commented out; see <a href="/docs/cae/usage.html#describing-content-in-the-i-o-path">the usage page</a> to enable it.</p>
+
+<h2>Check the install</h2>
+<p>Start the runtime with <code>clio_run start</code>. From a pip install, import an inline string through the CEE and list it back:</p>
+<pre data-label="python">
+import clio_cee as cee
+ctx = cee.ContextInterface()
+rc = ctx.context_bundle([cee.AssimilationCtx(
+    src='string::hello', dst='iowarp::cae_check', format='binary',
+    src_data="hello from the CAE")])
+print("bundle rc", rc)
+print(ctx.context_query("cae_check", ".*"))   # ['hello']
+ctx.context_destroy(["cae_check"])
+</pre>
+<p>With a native install, check the tool against a real file:</p>
+<pre data-label="shell">
+$ clio_run start &amp;
+$ head -c 3M /dev/urandom &gt; /tmp/sample.bin
+$ printf 'transfers:\n  - src: file::/tmp/sample.bin\n    dst: iowarp::sample\n    format: binary\n' &gt; /tmp/sample.yaml
+$ clio_cae /tmp/sample.yaml
+$ cte_search 'sample.*'
+</pre>
+<p>A successful run prints <code>ParseOmni completed successfully!</code> and the number of transfers scheduled. The tool exits 1 if the runtime is not running, if the OMNI file is invalid, if a transfer's scheme was not compiled in, or if nothing was scheduled.</p>

@@ -1,0 +1,168 @@
+<!--
+title: API reference
+heading: Context Exploration Engine <em>API reference.</em>
+description: Reference for the Context Exploration Engine: the iowarp::ContextInterface C++ class and the clio_cee Python module with every method, argument, default and return format, the AssimilationCtx binding, the CTE operations each call maps to, environment variables, the CMake package, and the MCP server's tools.
+eyebrow: Docs · Context Exploration Engine
+lede: Signatures and defaults below are taken from context-exploration-engine/api/include/clio_cee/api/context_interface.h and api/src/python_bindings.cc. The Python names are snake_case versions of the C++ methods with the same defaults.
+facts: Header | clio_cee/api/context_interface.h ; Module | clio_cee (nanobind) ; CMake | find_package(clio_cee_api), clio::cee::api ; MCP | iowarp-cei-mcp/server.py
+-->
+<h2>ContextInterface (C++)</h2>
+<pre data-label="cpp">
+#include &lt;clio_cee/api/context_interface.h&gt;
+
+namespace iowarp {
+class ContextInterface {
+ public:
+  ContextInterface();      // does not touch the runtime
+  ~ContextInterface();
+
+  int ContextBundle(const std::vector&lt;clio::cae::core::AssimilationCtx&gt; &amp;bundle);
+
+  std::vector&lt;std::string&gt; ContextQuery(const std::string &amp;tag_re,
+                                        const std::string &amp;blob_re,
+                                        unsigned int max_results = 0,
+                                        const std::string &amp;prompt = "",
+                                        uint64_t time_begin = 0,
+                                        uint64_t time_end = 0);
+
+  std::vector&lt;std::string&gt; ContextRetrieve(const std::string &amp;tag_re,
+                                           const std::string &amp;blob_re,
+                                           unsigned int max_results = 1024,
+                                           size_t max_context_size = 256 * 1024 * 1024,
+                                           unsigned int batch_size = 32,
+                                           const std::string &amp;prompt = "",
+                                           uint64_t time_begin = 0,
+                                           uint64_t time_end = 0);
+
+  int ContextSplice(const std::string &amp;new_ctx, const std::string &amp;tag_re,
+                    const std::string &amp;blob_re);
+
+  int ContextDestroy(const std::vector&lt;std::string&gt; &amp;context_names);
+};
+}
+</pre>
+
+<h3>Initialization</h3>
+<p>Every public method first calls a private <code>EnsureInitialized()</code>. On the first call it runs <code>clio::run::CLIO_INIT(RuntimeMode::kClient, false)</code>, then <code>CLIO_CAE_CLIENT_INIT()</code>, which initializes the CTE client, then checks that the IPC manager exists. If <code>CLIO_INIT</code> fails, the failure is cached in a static flag for the rest of the process and every later call fails immediately. On failure the methods return 1 (bundle, destroy) or an empty vector (query, retrieve) and log an error.</p>
+
+<h3>ContextBundle(bundle)</h3>
+<ul>
+  <li><strong>bundle</strong>: vector of <code>AssimilationCtx</code>. Empty: logs a warning, returns 0.</li>
+  <li>Creates a <code>clio::cae::core::Client</code> on <code>kCaePoolId</code> (400.0), calls <code>AsyncParseOmni(bundle)</code> and waits.</li>
+  <li><strong>Returns</strong>: 0 on success; the task's <code>result_code_</code> when non-zero; 1 on an exception. The CAE result codes are on the <a href="/docs/cae/api.html#parseomni-result-codes">CAE API page</a>.</li>
+</ul>
+
+<h3>ContextQuery(tag_re, blob_re, max_results, prompt, time_begin, time_end)</h3>
+<ul>
+  <li><strong>tag_re</strong>, <strong>blob_re</strong>: full-string regular expressions over tag and blob names.</li>
+  <li><strong>max_results</strong> (0): result cap. 0 means unlimited for regex and temporal, and 10 for semantic.</li>
+  <li><strong>prompt</strong> (<code>""</code>): BM25 query text. Empty disables semantic mode.</li>
+  <li><strong>time_begin</strong>, <strong>time_end</strong> (0): inclusive bounds on last-modified time; 0 means no bound. Any non-zero value selects temporal mode.</li>
+  <li><strong>Mode selection</strong>, in order: temporal if either time bound is non-zero; else semantic if <code>prompt</code> is non-empty; else regex.</li>
+  <li><strong>Calls</strong>: <code>AsyncTemporalSearch(tag_re, blob_re, time_begin, time_end, max_results, PoolQuery::Broadcast())</code>, <code>AsyncSemanticSearch(tag_re, blob_re, prompt, k, PoolQuery::Broadcast())</code> with <code>k = max_results &gt; 0 ? max_results : 10</code>, or <code>AsyncBlobQuery(tag_re, blob_re, max_results, PoolQuery::Broadcast())</code>.</li>
+  <li><strong>Returns</strong>: blob names only. Temporal results are sorted ascending by timestamp; semantic results are ordered by descending score; regex results are in the order the runtime returned them. Empty vector on failure.</li>
+</ul>
+
+<h3>ContextRetrieve(tag_re, blob_re, max_results, max_context_size, batch_size, prompt, time_begin, time_end)</h3>
+<ul>
+  <li>Same mode selection and CTE calls as query, but keeps (tag name, blob name) pairs.</li>
+  <li><strong>max_results</strong> (1024): same 0 rules as query.</li>
+  <li><strong>max_context_size</strong> (268435456, 256 MiB): size of one buffer allocated with <code>CLIO_IPC-&gt;AllocateBuffer</code> before any read. The loop stops at the first blob that would exceed it.</li>
+  <li><strong>batch_size</strong> (32): number of <code>AsyncGetBlob</code> futures in flight per batch. For each blob in a batch the code waits on <code>AsyncGetOrCreateTag(tag_name)</code> and <code>AsyncGetBlobSize(tag_id, blob_name)</code> sequentially, skips the blob if the tag id is null or the size is 0, then issues <code>AsyncGetBlob(tag_id, blob_name, 0, size, 0, ptr)</code> into the next free offset of the buffer. All futures of the batch are then waited; a non-zero return code logs a warning and leaves the reserved bytes in place.</li>
+  <li><strong>Returns</strong>: a vector with one <code>std::string</code> holding the bytes written to the buffer, back to back and in query order, or an empty vector when no blob matched or no bytes were copied. The buffer is freed before return.</li>
+</ul>
+
+<h3>ContextSplice(new_ctx, tag_re, blob_re)</h3>
+<p>Not implemented. Logs a warning and returns 1 without initializing anything.</p>
+
+<h3>ContextDestroy(context_names)</h3>
+<ul>
+  <li><strong>context_names</strong>: tag names. Empty: logs a warning, returns 0.</li>
+  <li>For each name, waits on <code>AsyncDelTag(name)</code>.</li>
+  <li><strong>Returns</strong>: 0 if every delete returned 0, else 1.</li>
+</ul>
+
+<h2>clio_cee (Python)</h2>
+<p>Built with nanobind from <code>api/src/python_bindings.cc</code>. The module docstring is <code>IOWarp Context Exploration Engine API - Python Bindings</code>. Lists map to Python lists and strings to <code>str</code>.</p>
+<pre data-label="python">
+import clio_cee as cee
+
+class cee.ContextInterface:
+    def __init__(self)
+    def context_bundle(self, bundle: list[AssimilationCtx]) -&gt; int
+    def context_query(self, tag_re: str, blob_re: str, max_results: int = 0,
+                      prompt: str = "", time_begin: int = 0, time_end: int = 0) -&gt; list[str]
+    def context_retrieve(self, tag_re: str, blob_re: str, max_results: int = 1024,
+                         max_context_size: int = 268435456, batch_size: int = 32,
+                         prompt: str = "", time_begin: int = 0, time_end: int = 0) -&gt; list[str]
+    def context_splice(self, new_ctx: str, tag_re: str, blob_re: str) -&gt; int
+    def context_destroy(self, context_names: list[str]) -&gt; int
+</pre>
+<p>Arguments can be passed by keyword. Behavior and return values are those of the C++ methods above. <code>context_retrieve</code> returns a list of zero or one <code>str</code>; nanobind converts the packed bytes to <code>str</code>, so binary payloads that are not valid UTF-8 are not safely recoverable through this call.</p>
+
+<h3>AssimilationCtx</h3>
+<p>The CAE's <code>clio::cae::core::AssimilationCtx</code>, bound as <code>cee.AssimilationCtx</code>. Three constructors:</p>
+<pre data-label="python">
+cee.AssimilationCtx()
+cee.AssimilationCtx(src, dst, format, depends_on="", range_off=0, range_size=0,
+                    src_token="", dst_token="")
+cee.AssimilationCtx(src, dst, format, src_data, depends_on="", range_off=0, range_size=0,
+                    src_token="", dst_token="")
+</pre>
+<p>The third form is selected by passing a fourth positional argument or the <code>src_data</code> keyword. Read-write attributes:</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Attribute</th><th>Type</th><th>Default</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td><code>src</code></td><td>str</td><td>required</td><td>Source URL, for example <code>file::/path/to/file</code> or <code>string::&lt;blob_name&gt;</code>.</td></tr>
+    <tr><td><code>dst</code></td><td>str</td><td>required</td><td>Destination URL, <code>iowarp::&lt;tag_name&gt;</code>.</td></tr>
+    <tr><td><code>format</code></td><td>str</td><td>required</td><td>Data format: <code>binary</code>, <code>hdf5</code>, <code>hdf5_vol</code> or <code>globus</code>.</td></tr>
+    <tr><td><code>depends_on</code></td><td>str</td><td><code>""</code></td><td>The <code>src</code> or <code>dst</code> of an earlier item in the same bundle.</td></tr>
+    <tr><td><code>range_off</code></td><td>int</td><td>0</td><td>Byte offset in the source.</td></tr>
+    <tr><td><code>range_size</code></td><td>int</td><td>0</td><td>Bytes to read; 0 means to the end.</td></tr>
+    <tr><td><code>src_token</code></td><td>str</td><td><code>""</code></td><td>Source credential (HTTP bearer token, Globus access token).</td></tr>
+    <tr><td><code>dst_token</code></td><td>str</td><td><code>""</code></td><td>Destination credential.</td></tr>
+    <tr><td><code>src_data</code></td><td>str</td><td><code>""</code></td><td>Inline payload for a <code>string::</code> source, stored verbatim as one blob named by the part after <code>string::</code>.</td></tr>
+  </tbody>
+</table></div>
+<p><code>repr()</code> gives <code>&lt;AssimilationCtx src='...' dst='...' format='...'&gt;</code>. The C++ fields <code>s3_region</code>, <code>s3_profile</code>, <code>include_patterns</code>, <code>exclude_patterns</code>, <code>on_fault</code>, <code>chunk_size</code> and <code>blob_prefix</code> are not bound; see the <a href="/docs/cae/api.html#assimilationctx">CAE API page</a> for them.</p>
+
+<h2>Environment variables</h2>
+<ul>
+  <li><code>CLIO_CTE_POOL</code> (<code>major.minor</code>): binds the CTE client to an interposing pool. Set <code>563.0</code> or <code>564.0</code> for semantic queries to reach the indexer. A malformed value is ignored with an error in the log.</li>
+  <li><code>CLIO_WITH_RUNTIME</code>: <code>1</code> or <code>true</code> makes the client try to start a runtime in-process; otherwise it only attaches. CEE passes attach-only as the default.</li>
+  <li><code>CLIO_SERVER_CONF</code>: the runtime configuration file the client reads. Must describe the same runtime the server started.</li>
+  <li><code>CLIO_BIND_ADDR</code>, <code>CLIO_SERVER_ADDR</code>: bind and connect addresses; use <code>127.0.0.1</code> for both on Windows.</li>
+</ul>
+
+<h2>Build and link</h2>
+<ul>
+  <li>Library target <code>clio_cee_api</code> (shared, SOVERSION 1, C++20). Alias <code>clio::cee::api</code>. Links <code>clio::run::cxx</code>, <code>clio_cte_core_client</code> and <code>clio_cae_core_client</code> publicly.</li>
+  <li>Installed CMake package <code>clio_cee_api</code> under <code>lib/cmake/clio_cee_api</code>, version 1.0.0, compatibility <code>AnyNewerVersion</code>. Its config finds <code>clio_run</code>, <code>clio_cte_core</code> and <code>clio_cae_core</code>.</li>
+  <li>Python module target <code>clio_cee</code>, built only with <code>CLIO_CORE_ENABLE_PYTHON=ON</code>, installed to <code>PYTHON_SITE_PACKAGES</code> (and to <code>iowarp_core/ext</code> in the pip wheel).</li>
+  <li>Tests are added under <code>api/test</code> when <code>BUILD_TESTING</code> is on.</li>
+</ul>
+
+<h2>MCP tools</h2>
+<p>Defined in <code>context-exploration-engine/iowarp-cei-mcp/server.py</code> with FastMCP under the server name <code>IOWarp Context Transfer Engine (CTE) MCP Server</code>. Every tool returns a JSON string. The tools wrap <code>clio_cte_core_ext</code>; there is no tool for <code>clio_cee</code> methods and no semantic or temporal search.</p>
+<h3>Safe before initialization</h3>
+<ul>
+  <li><code>get_client_status()</code>: <code>available</code>, <code>initialized</code>, <code>pool_query_available</code>, <code>message</code>, plus <code>note</code> or <code>warning</code> when something is missing.</li>
+  <li><code>get_cte_types()</code>: which of <code>TagId</code>, <code>BlobId</code>, <code>CteTelemetry</code> and <code>PoolQuery</code> are bound, and the <code>CteOp</code> values.</li>
+  <li><code>initialize_cte_runtime()</code>: sets <code>CLIO_REPO_PATH</code> and <code>LD_LIBRARY_PATH</code> to the module's directory, uses <code>CLIO_SERVER_CONF</code> or generates a one-tier file configuration (port 9129 to 9199, <code>num_threads: 2</code>, a 512MB <code>file</code> tier under the temp directory), calls <code>clio_init(RuntimeMode.kClient, True)</code>, waits 0.5 s, calls <code>initialize_cte(config_path, PoolQuery.Dynamic())</code>, and registers a 512 MB file target at pool id 700.0. Returns <code>success</code>, <code>runtime_init</code>, <code>client_init</code>, <code>cte_init</code>, <code>messages</code>, and <code>target_registered</code> and <code>target_path</code> when it got that far. Progress is also written to <code>cte_init_log_&lt;pid&gt;.json</code> in the temp directory.</li>
+</ul>
+<h3>Data operations</h3>
+<ul>
+  <li><code>put_blob(tag_name, blob_name, data, offset=0)</code>: <code>Tag(tag_name).PutBlob(blob_name, data.encode(), offset)</code>. Returns <code>data_size</code> and <code>success</code>.</li>
+  <li><code>get_blob(tag_name, blob_name, size=0, offset=0)</code>: size 0 means the blob's size; a blob of size 0 is reported as not found. Returns <code>data</code> when the bytes are UTF-8, otherwise <code>data_base64</code>.</li>
+  <li><code>get_blob_size(tag_name, blob_name)</code>: <code>size</code> and <code>size_bytes</code>.</li>
+  <li><code>list_blobs_in_tag(tag_name)</code>: <code>blobs</code> and <code>count</code>.</li>
+  <li><code>delete_blob(tag_name, blob_name)</code>: <code>Client.DelBlob(tag_id, blob_name)</code>; <code>success</code>.</li>
+</ul>
+<h3>Query and placement</h3>
+<ul>
+  <li><code>tag_query(tag_regex, max_tags=0)</code>: <code>Client.TagQuery</code> with <code>PoolQuery.Dynamic()</code>; <code>tags</code> and <code>count</code>.</li>
+  <li><code>blob_query(tag_regex, blob_regex, max_blobs=0)</code>: <code>Client.BlobQuery</code>; <code>blobs</code> as (tag name, blob name) pairs and <code>count</code>.</li>
+  <li><code>poll_telemetry_log(minimum_logical_time=0)</code>: entries with <code>op</code>, <code>off</code>, <code>size</code>, <code>tag_id</code> (<code>major</code>, <code>minor</code>, <code>is_null</code>), <code>logical_time</code>, and <code>mod_time</code> and <code>read_time</code> when serializable.</li>
+  <li><code>reorganize_blob(tag_id_major, tag_id_minor, blob_name, new_score)</code>: <code>Client.ReorganizeBlob</code>; <code>result_code</code> and <code>success</code>.</li>
+</ul>
+<p>The query and placement tools return an error object when the client is not initialized, but the README documents that calling them before <code>initialize_cte_runtime</code> can still crash the server process.</p>

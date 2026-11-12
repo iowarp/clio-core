@@ -293,7 +293,7 @@ TEST_CASE("Stream appends to a dropped stream are discarded", "[stream]") {
   // Discarded staged bytes are reaped in the background: wait for it.
   bool clean = false;
   for (int attempt = 0; attempt < 100 && !clean; ++attempt) {
-    auto blobs = cte->AsyncGetContainedBlobs(st->tag_id_);
+    auto blobs = cte->AsyncGetContainedBlobs(st->tag_id_, clio::run::PoolQuery::Broadcast());
     blobs.Wait();
     clean = true;
     for (const auto &n : blobs->blob_names_) {

@@ -1285,6 +1285,20 @@ bool Runtime::IsNodeLocalRefTag(const TagId &tag_id) {
   return p.compare(0, 6, "fault:") == 0;  // CAE ingest-on-fault tag
 }
 
+/**
+ * Resolve a Dynamic pool query for a CTE task into a concrete route.
+ *
+ * The rule: a Dynamic query is resolved by HASHING the task's key to its
+ * owner container, or LOCALLY when the operation is a per-container scan or
+ * answer. A Dynamic query is never resolved to Broadcast. A caller that wants
+ * the cluster-wide view passes PoolQuery::Broadcast() explicitly.
+ *
+ * Only called by the IPC manager for Dynamic queries; explicit routes pass
+ * through untouched.
+ *
+ * @param task the CTE task whose method_ selects the rule
+ * @return the concrete PoolQuery the task should be routed with
+ */
 clio::run::PoolQuery Runtime::ScheduleTask(const clio::run::shared_ptr<clio::run::Task> &task) {
   using namespace clio::cte::core;
   switch (task->method_) {
@@ -1313,6 +1327,26 @@ clio::run::PoolQuery Runtime::ScheduleTask(const clio::run::shared_ptr<clio::run
       clio::run::u32 hash_value = static_cast<clio::run::u32>(string_hasher(tag_name));
       return clio::run::PoolQuery::DirectHash(hash_value);
     }
+
+    // DelTag by NAME goes to the name's hash owner, with no local shortcut:
+    // the delete must reach the owner whether or not this container holds a
+    // copy. DelTag by ID removes this container's share of the tag (its
+    // TagInfo and the blobs it holds), so it runs locally.
+    case Method::kDelTag: {
+      auto typed = task.template Cast<DelTagTask>();
+      if (typed->tag_id_.IsNull() && !typed->tag_name_.str().empty()) {
+        std::hash<std::string> string_hasher;
+        clio::run::u32 hash_value =
+            static_cast<clio::run::u32>(string_hasher(typed->tag_name_.str()));
+        return clio::run::PoolQuery::DirectHash(hash_value);
+      }
+      return clio::run::PoolQuery::Local();
+    }
+
+    // Tag-name publication is a per-container table update; each filesystem
+    // container publishes the names it owns into its own node's CTE.
+    case Method::kUpdateTagNames:
+      return clio::run::PoolQuery::Local();
 
     // Blob operations: hash blob name to container -- except on a CAE
     // INGEST-ON-FAULT tag (fault_params "fault:..."): its source is readable
@@ -1384,8 +1418,9 @@ clio::run::PoolQuery Runtime::ScheduleTask(const clio::run::shared_ptr<clio::run
       return HashBlobToContainer(typed->tag_id_, typed->blob_name_.str());
     }
 
+    // Per-container scan: each container answers for the tags it holds.
     case Method::kTagQuery:
-      return clio::run::PoolQuery::Broadcast();
+      return clio::run::PoolQuery::Local();
     case Method::kTruncateBlob: {
       // Blob-keyed: it must reach the container that OWNS the blob. The
       // default (Local) silently truncated nothing on every other node.
@@ -1393,13 +1428,10 @@ clio::run::PoolQuery Runtime::ScheduleTask(const clio::run::shared_ptr<clio::run
       return HashBlobToContainer(typed->tag_id_, typed->blob_name_.str());
     }
 
-    // GetTagSize backs every stat: a broadcast that waited out the 30 s
-    // retry window for each DEAD node made every stat on every survivor
-    // take 30 s while one node was down. net_timeout 0 skips nodes already
-    // declared dead (live nodes are unaffected; the answer covers the
-    // containers that are reachable).
+    // GetTagSize answers for the blobs this container holds. A caller that
+    // wants the cluster-wide size passes Broadcast(0.0f) explicitly.
     case Method::kGetTagSize:
-      return clio::run::PoolQuery::Broadcast(0.0f);
+      return clio::run::PoolQuery::Local();
 
     // A tag's xattr section lives on the container its id hashes to.
     case Method::kTagXattr: {
@@ -1407,12 +1439,13 @@ clio::run::PoolQuery Runtime::ScheduleTask(const clio::run::shared_ptr<clio::run
       return TagXattrOwner(typed->tag_id_);
     }
 
-    // Broadcast operations
+    // Per-container scans and answers: each container reports its own share.
+    // A caller that wants the cluster-wide answer passes Broadcast explicitly.
     case Method::kGetContainedBlobs:
     case Method::kBlobQuery:
     case Method::kEvict:
     case Method::kReorganizeHint:
-      return clio::run::PoolQuery::Broadcast();
+      return clio::run::PoolQuery::Local();
 
     default:
       return task->pool_query_;
@@ -2069,6 +2102,34 @@ clio::run::TaskResume Runtime::GetTargetInfo(clio::run::shared_ptr<GetTargetInfo
   CLIO_TASK_BODY_END
 }
 
+/**
+ * Decides whether a kCtePutAppend put must be refused because its shape is one
+ * the append path cannot honour (see kCtePutAppend). Logs the first refusal in
+ * the process at kWarning, so a misuse cannot flood the log.
+ * @param flags PutBlobTask::flags_ of the put
+ * @param replica Context::replica_ of the put (0 = primary blob)
+ * @param vectored true when the put carries vectored segments
+ * @return true when the put must fail with kCtePutAppendInvalidRc
+ */
+static bool AppendPutRefused(clio::run::u32 flags, int replica, bool vectored) {
+  if ((flags & kCtePutAppend) == 0) return false;
+  const char *reason = nullptr;
+  if ((flags & kCtePutReplace) != 0) {
+    reason = "combined with kCtePutReplace";
+  } else if (replica != 0) {
+    reason = "on a replica-targeted put";
+  } else if (vectored) {
+    reason = "on a vectored put";
+  }
+  if (reason == nullptr) return false;
+  static std::atomic<bool> warned{false};
+  if (!warned.exchange(true)) {
+    HLOG(kWarning, "PutBlob kCtePutAppend refused: {} (rc {})", reason,
+         kCtePutAppendInvalidRc);
+  }
+  return true;
+}
+
 template <typename TaskT>
 clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
   CLIO_TASK_BODY_BEGIN
@@ -2201,6 +2262,12 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     }
     if (blob_name.empty()) {
       task->return_code_ = 4;
+      CLIO_CO_RETURN;
+    }
+    // Append shapes this path cannot honour fail before any blob state is
+    // touched. See kCtePutAppend.
+    if (AppendPutRefused(task->flags_, task->context_.replica_, vectored)) {
+      task->return_code_ = kCtePutAppendInvalidRc;
       CLIO_CO_RETURN;
     }
 
@@ -2462,6 +2529,13 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     // a prior holder, it may have grown the blob while we were suspended, so this
     // must be read here — never hoisted above the acquire.
     old_blob_size = blob_info_ptr->GetTotalSize();
+    // kCtePutAppend: the write position is the blob's size as it stands under
+    // the token, read just above. The caller's offset_ input is ignored. Every
+    // later use of `offset` (extend, hole fill, modify, WAL, telemetry, size
+    // accounting, generation stamp, SLOW-PUT) sees this resolved value.
+    if (task->flags_ & kCtePutAppend) {
+      offset = old_blob_size;
+    }
     // State BEFORE the extend, for the tail-write scan hint (see below). Capture
     // the last block's index and its start offset in the blob (blocks' sizes sum
     // to old_blob_size, so the last block starts at old_blob_size - its size).
@@ -2946,7 +3020,9 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
         !task->context_.emulate_) {
       bool ok = true;
       if ((task->context_.replica_flags_ & REPLICA_VERIFY_COMPLETE) != 0) {
-        ok = task->offset_ == 0 && task->size_ >= old_blob_size;
+        // `offset`, not task->offset_: an append's resolved offset is only
+        // published below, and the check must see where the bytes went.
+        ok = offset == 0 && task->size_ >= old_blob_size;
         if constexpr (TaskT::kSupportsVectored) {
           ok = ok && task->segments_.empty();
         }
@@ -2974,6 +3050,9 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
       }
     }
 
+    // Report where the bytes landed. For an ordinary put this echoes the input
+    // offset; for kCtePutAppend it is the resolved append position.
+    task->offset_ = offset;
     task->return_code_ = 0;
   } catch (const std::exception &e) {
     HLOG(kError, "PutBlob failed with exception: {}", e.what());
@@ -4649,6 +4728,8 @@ clio::run::TaskResume Runtime::PodPutBlob(
       CLIO_CO_AWAIT(fut);
       clio_evlat_add(14, clio::run::CycleNow() - ev_p2);
       task->SetReturnCode(fut->GetReturnCode());
+      // The owner resolved any kCtePutAppend position; hand it back.
+      task->offset_ = fut->offset_;
       CLIO_CO_RETURN;
     }
   }
@@ -10036,6 +10117,28 @@ clio::run::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, clio::run::u64 of
        ordered_targets.size());
 
   if (ordered_targets.empty()) {
+    // Say WHY nothing qualified (rate-limited): every registered target with
+    // the inputs each filter above looks at. A refusal here reaches clio-fs
+    // as a failed mkdir/create (rc 12), seen at 64+ nodes with all three
+    // tiers registered and the Flare tier nearly empty.
+    static std::atomic<clio::run::u64> no_candidate_logs{0};
+    if (no_candidate_logs.fetch_add(1, std::memory_order_relaxed) < 8) {
+      std::string desc;
+      for (const TargetInfo &t : available_targets) {
+        desc += " [pool " + std::to_string(t.bdev_client_.pool_id_.major_) +
+                " remaining " + std::to_string(t.remaining_space_) +
+                " score " + std::to_string(t.target_score_) +
+                " persistence " +
+                std::to_string(static_cast<int>(t.persistence_level_)) +
+                " ttl_days " + std::to_string(t.expected_ttl_days_) +
+                " alive " + std::to_string(TargetNodeAlive(t) ? 1 : 0) + "]";
+      }
+      HLOG(kWarning,
+           "ExtendBlob: no candidate target for {} byte(s) (blob score {}, "
+           "min persistence {}, max persistence {}); {} registered:{}",
+           additional_size, blob_score, min_persistence_level,
+           max_persistence_level, available_targets.size(), desc);
+    }
     undo_fill();
     if (shortfall != nullptr) {
       *shortfall = needed_size;

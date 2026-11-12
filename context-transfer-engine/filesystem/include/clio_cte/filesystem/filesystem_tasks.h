@@ -29,6 +29,7 @@
 #include <clio_runtime/clio_runtime.h>
 #include <clio_runtime/task.h>
 #include <clio_runtime/admin/admin_tasks.h>
+#include <clio_ctp/util/config_parse.h>
 #include <clio_cte/core/core_tasks.h>
 #include <clio_cte/filesystem/autogen/filesystem_methods.h>
 
@@ -90,6 +91,13 @@ struct FilesystemConfig {
    */
   clio::run::u32 dir_split_entries_;
   /**
+   * Bytes of delta frames a directory block's CTE blob may hold past its
+   * image frame before the next commit rewrites it whole (YAML
+   * `dir_log_compact_bytes`, a size, default 256KB; 0 rewrites the whole
+   * block on every commit, the earlier behaviour).
+   */
+  clio::run::u64 dir_log_compact_bytes_;
+  /**
    * Compare names case-insensitively, as NTFS does (YAML `case_insensitive`,
    * default false). Names keep the spelling they were created with. Fixed
    * when the volume is created: a volume opened with the other setting is
@@ -101,12 +109,14 @@ struct FilesystemConfig {
       : next_pool_id_(clio::run::PoolId::GetNull()),
         stream_pool_id_(565, 0),
         dir_split_entries_(1024),
+        dir_log_compact_bytes_(256ull << 10),
         case_insensitive_(false) {}
   FilesystemConfig(const clio::run::PoolId &pool_id, const FilesystemConfig &other)
       : next_pool_id_(other.next_pool_id_),
         metadata_log_path_(other.metadata_log_path_),
         stream_pool_id_(other.stream_pool_id_),
         dir_split_entries_(other.dir_split_entries_),
+        dir_log_compact_bytes_(other.dir_log_compact_bytes_),
         case_insensitive_(other.case_insensitive_) {
     (void)pool_id;
   }
@@ -114,7 +124,7 @@ struct FilesystemConfig {
   template <class Archive>
   void serialize(Archive &ar) {
     ar(next_pool_id_, metadata_log_path_, stream_pool_id_, dir_split_entries_,
-       case_insensitive_);
+       case_insensitive_, dir_log_compact_bytes_);
   }
 
   void LoadConfig(const clio::run::PoolConfig &pool_config) {
@@ -141,6 +151,10 @@ struct FilesystemConfig {
       }
       if (node["dir_split_entries"]) {
         dir_split_entries_ = node["dir_split_entries"].as<clio::run::u32>();
+      }
+      if (node["dir_log_compact_bytes"]) {
+        dir_log_compact_bytes_ = ctp::ConfigParse::ParseSize(
+            node["dir_log_compact_bytes"].as<std::string>());
       }
       if (node["case_insensitive"]) {
         case_insensitive_ = node["case_insensitive"].as<bool>();
@@ -884,24 +898,29 @@ struct ReaddirTask : public clio::run::Task {
   IN clio::run::priv::string path_;
   OUT clio::run::priv::vector<clio::run::priv::string> entries_;
   OUT clio::run::priv::vector<clio::run::u64> inos_;  // packed TagId per entry (parallel)
+  /** kFsType* of each entry (parallel to entries_): the type stored in the
+   *  directory row, so a lister gets d_type without a stat per entry. */
+  OUT clio::run::priv::vector<clio::run::u32> types_;
   ReaddirTask()
       : clio::run::Task(), path_(CTP_MALLOC), entries_(CTP_MALLOC),
-        inos_(CTP_MALLOC) {}
+        inos_(CTP_MALLOC), types_(CTP_MALLOC) {}
   explicit ReaddirTask(const clio::run::TaskId &task_id, const clio::run::PoolId &pool_id,
                        const clio::run::PoolQuery &pool_query, const std::string &path)
       : clio::run::Task(task_id, pool_id, pool_query, Method::kReaddir),
-        path_(CTP_MALLOC, path), entries_(CTP_MALLOC), inos_(CTP_MALLOC) {}
+        path_(CTP_MALLOC, path), entries_(CTP_MALLOC), inos_(CTP_MALLOC),
+        types_(CTP_MALLOC) {}
   void Copy(const ctp::ipc::FullPtr<ReaddirTask>& o) {
     // Base fields first (pool id, method, query, flags): a forwarded copy
     // without them reached SendIn with a null pool and crashed the node.
     clio::run::Task::Copy(o.template Cast<clio::run::Task>());
     path_ = o->path_; entries_ = o->entries_; inos_ = o->inos_;
+    types_ = o->types_;
   }
   template <typename Ar> void SerializeIn(Ar &ar) {
     Task::SerializeIn(ar); ar(path_);
   }
   template <typename Ar> void SerializeOut(Ar &ar) {
-    Task::SerializeOut(ar); ar(entries_, inos_);
+    Task::SerializeOut(ar); ar(entries_, inos_, types_);
   }
 };
 

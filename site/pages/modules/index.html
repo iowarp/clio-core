@@ -12,7 +12,7 @@ facts: Module type | ChiMod (runtime pool) ; Composed in | compose: section of t
 
 <h2>The default composition</h2>
 <p>The runtime's default configuration (<code>context-runtime/config/clio_default.yaml</code>) composes this stack, top to bottom. Requests enter at the top and travel down:</p>
-<ol class="tier-stack" aria-label="Default module chain">
+<ol class="tier-stack wide" aria-label="Default module chain">
   <li><span class="tier-name">clio_cae_core</span><span class="tier-desc">Assimilation: imports external data into the store</span><span class="tier-type">400.0</span></li>
   <li><span class="tier-name">clio_cte_cache</span><span class="tier-desc">Keeps hot copies on fast tiers; the chain top for writes and reads</span><span class="tier-type">563.0</span></li>
   <li><span class="tier-name">clio_cte_indexer</span><span class="tier-desc">Indexes what is written for keyword and name search</span><span class="tier-type">564.0</span></li>

@@ -1,0 +1,72 @@
+<!--
+title: Install
+heading: Install the <em>Context Transfer Engine.</em>
+description: The Context Transfer Engine ships in every CLIO Core install. How to get its Python module and its C++ client from the pip wheel, conda, Docker, Spack or a source build, and how to check that it works.
+eyebrow: Docs · Context Transfer Engine
+lede: The CTE is part of every CLIO Core build. Nothing has to be enabled for it. This page says which install gives you which client, and how to confirm the engine is reachable.
+facts: pip | pip install iowarp-core ; Python module | clio_cte_core_ext ; CMake target | clio::cte::core_client ; Header | clio_cte/core/core_client.h
+-->
+<h2>Which install to pick</h2>
+<p>Every method on the <a href="/docs/installation.html">general install page</a> builds the CTE, because the CMake option that controls it, <code>CLIO_CORE_ENABLE_CTE</code>, defaults to ON and the packaging files pin it ON. What differs is which client you get.</p>
+<ul>
+  <li><strong>pip.</strong> <code>pip install iowarp-core</code> gives you the <code>clio_run</code> runtime command, the <code>clio_cte_bench</code> benchmark and the Python module <code>clio_cte_core_ext</code>. The wheel is built with <code>CLIO_CORE_ENABLE_PYTHON=ON</code> and the cache and replication modules pinned ON, so the default interposition chain above the core is present. The wheel does not install C++ headers or CMake packages. Use it for Python programs.</li>
+  <li><strong>conda.</strong> The <code>iowarp-core</code> package on the <code>iowarp</code> channel is built from the <code>release</code> preset. It installs the runtime and the C++ libraries into the environment prefix.</li>
+  <li><strong>Docker.</strong> <code>iowarp/deploy-cpu</code> runs <code>clio_run start</code> with the default configuration, which composes the CTE core and its chain. Clients in other containers or on the host reach it over the runtime's port.</li>
+  <li><strong>Spack.</strong> <code>spack install iowarp</code> installs the runtime and C++ libraries. Add <code>+python</code> for the Python module.</li>
+  <li><strong>Source.</strong> A source build is needed for GPU tiers (<code>hbm</code>, <code>pinned</code>), for the S3 and GCS block devices (<code>CLIO_ENABLE_AMAZON_DRIVE</code>, <code>CLIO_ENABLE_GOOGLE_CLOUD</code>), for the compressor module (<code>CLIO_CTE_ENABLE_COMPRESS</code>) and for the I/O adapters. The <a href="/docs/installation.html">install page</a> lists the presets and options.</li>
+</ul>
+
+<h2>Python</h2>
+<p>The module is built with nanobind from <code>context-transfer-engine/wrapper/python/core_bindings.cc</code>. It needs a running runtime. Start one in another terminal, then import the module with <code>CLIO_WITH_RUNTIME=0</code> so the client attaches instead of starting a second runtime.</p>
+<pre data-label="shell">
+$ pip install iowarp-core
+$ clio_run start
+</pre>
+<pre data-label="python">
+import os
+os.environ["CLIO_WITH_RUNTIME"] = "0"
+
+import clio_cte_core_ext as cte
+assert cte.clio_init(cte.RuntimeMode.kClient, False)
+assert cte.initialize_cte("", cte.PoolQuery.Dynamic())
+
+tag = cte.Tag("install_check")
+tag.PutBlob("hello", b"hello", 0)
+assert tag.GetBlob("hello", 5, 0) == b"hello"
+print("ok")
+</pre>
+<p>Set environment variables before the import. The client reads them once when it connects. On Windows, bind the runtime and the client to the loopback address: <code>CLIO_BIND_ADDR=127.0.0.1</code> and <code>CLIO_SERVER_ADDR=127.0.0.1</code>.</p>
+
+<h2>C++</h2>
+<p>An installed tree exports the client as a CMake target. Find the umbrella package and link the target; the header directory comes with it.</p>
+<pre data-label="cmake">
+find_package(clio-core CONFIG REQUIRED)   # iowarp-core is the legacy name of the same package
+add_executable(cte_check cte_check.cc)
+target_link_libraries(cte_check clio::cte::core_client)
+</pre>
+<p>The umbrella package includes the <code>clio_cte_core</code> module package, which defines <code>clio::cte::core_client</code> and <code>clio::cte::core_runtime</code>. The historical names <code>clio_cte::core_client</code> and <code>wrp_cte::core_client</code> are emitted as aliases. The client header is <code>clio_cte/core/core_client.h</code>; the runtime entry points are in <code>clio_runtime/clio_runtime.h</code>.</p>
+<pre data-label="cpp · cte_check.cc">
+#include &lt;clio_runtime/clio_runtime.h&gt;
+#include &lt;clio_cte/core/core_client.h&gt;
+#include &lt;string&gt;
+
+int main() {
+  if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient)) return 1;
+  if (!clio::cte::core::CLIO_CTE_CLIENT_INIT()) return 1;
+  clio::cte::core::Tag tag("install_check");
+  std::string in = "hello", out(5, '\0');
+  tag.PutBlob("hello", in.data(), in.size());
+  tag.GetBlob("hello", out.data(), out.size());
+  return out == in ? 0 : 2;
+}
+</pre>
+<p>Run it with a runtime already started by <code>clio_run start</code>. <code>CLIO_INIT(kClient)</code> attaches to it; <code>CLIO_INIT(kClient, true)</code> starts a runtime inside the process when none is running, which is what the adapter tests do.</p>
+
+<h2>Configuration the engine needs</h2>
+<p>The runtime's configuration file must compose a <code>clio_cte_core</code> pool with at least one <code>storage</code> tier. The default file installed to <code>~/.clio/clio.yaml</code> by the wheel, and <code>&lt;prefix&gt;/etc/clio/clio_default.yaml</code> in other installs, already does this with a RAM tier and a file tier under <code>CLIO_STORAGE_ROOT</code>. The <a href="/docs/cte/api.html#yaml">API reference</a> lists the keys, and the <a href="/tutorials/compose.html">compose tutorial</a> walks through adding tiers.</p>
+
+<h2>Where to go next</h2>
+<ul>
+  <li><a href="/docs/cte/usage.html">Usage</a>: tags, blobs, queries and asynchronous calls with examples.</li>
+  <li><a href="/docs/cte/api.html">API reference</a>: every signature, the Python module and the YAML keys.</li>
+</ul>

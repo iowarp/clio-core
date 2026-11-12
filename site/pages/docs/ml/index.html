@@ -1,0 +1,81 @@
+<!--
+title: Overview
+heading: clio-ml: <em>machine learning on paged data.</em>
+description: What clio-ml is: Spark MLlib-equivalent algorithms over CLIO Core's paged vectors, with CPU, CUDA and SYCL backends and out-of-core training from Python or C++.
+eyebrow: Docs · Machine learning
+lede: clio-ml is a library of Spark-MLlib-style algorithms written over CLIO Core's paged vectors. A training set is a <code>Dataset</code> whose pages live in Context Transfer Engine tiers and stream through a page cache, so a fit is not bounded by GPU or host memory. The same code runs on CPU, CUDA and SYCL, and every algorithm is also a ChiMod.
+facts: Source | external/clio-ml ; Backends | CPU, CUDA, SYCL ; Python | clio_ml (nanobind) ; Algorithms | 26
+-->
+<h2>What it is</h2>
+<p>clio-ml is a separate repository that builds inside a CLIO Core checkout at <code>external/clio-ml</code>. It is laid out as a ChiMod repository: one top-level directory per algorithm, each with a C++ API header under <code>include/clio_ml/</code>, a ChiMod client and runtime under <code>src/</code>, and a <code>clio_mod.yaml</code>. Shared code lives in <code>common/</code>: the <code>Dataset</code> wrapper, backend selection, the cluster exchange, and the three paged engines (k-means, generalized linear models, and a generic pass over the rows) for CPU, CUDA and SYCL.</p>
+<p>The Python package <code>clio_ml</code> wraps all of it. Every algorithm is a <code>fit_&lt;name&gt;</code> function that accepts either a NumPy array (in memory, no runtime) or a paged <code>Dataset</code> (through the runtime, out of core when the cache is smaller than the data).</p>
+
+<h2>The problem it solves</h2>
+<p>MLlib-style algorithms are usually bounded by the memory of the device that runs them. clio-ml stores the rows in a paged vector instead. Each algorithm reads its data one page at a time and accumulates partial results per block in a fixed order. For a fixed data layout, block count and page size, the result is bit-identical whether the page cache holds the whole dataset or a fraction of it, and whether one node or several take part. Fits run for a fixed iteration count rather than to a tolerance, which keeps runs comparable.</p>
+
+<h2>Key concepts</h2>
+<ul>
+  <li><strong>Dataset.</strong> A row-major float32 matrix of <code>n_samples</code> rows by <code>n_features</code> columns, stored in one paged vector under one Context Transfer Engine tag. Page <code>i</code> is the blob named <code>"i"</code> in that tag.</li>
+  <li><strong>Row layout.</strong> Features come first, then the label columns the algorithm expects. <code>clio_ml.COLUMNS[name]</code> gives the number of trailing non-feature columns (0 for k-means, 1 for a label, 2 for AFT's time and event).</li>
+  <li><strong>Page geometry.</strong> A row never straddles a page, so <code>page_bytes / 4</code> must be a multiple of the column count. The constructor throws otherwise.</li>
+  <li><strong>Blocks and cache frames.</strong> <code>nblocks</code> device blocks each own a contiguous page range. <code>set_size</code> cache frames per block bound the page cache. Fewer frames than pages makes the fit out of core; the result's <code>stats.evicts</code> counts the pages written back.</li>
+  <li><strong>Backend.</strong> Chosen at build time: CUDA when the core build has CUDA, SYCL when it has SYCL without CUDA, otherwise CPU over <code>cpu_vector</code>. <code>clio_ml.backend</code> reports which one.</li>
+  <li><strong>Options and results.</strong> Each algorithm has a C++ <code>Options</code> struct and a <code>Result</code> struct. In Python, options are keyword arguments named exactly as the struct fields, and results are the native objects.</li>
+</ul>
+
+<h2>How it relates to the other technologies</h2>
+<ul>
+  <li><a href="/docs/memory-expansion/index.html">Memory expansion</a> provides the paged vectors (<code>gpu_vector</code> and <code>cpu_vector</code>) that a <code>Dataset</code> wraps. Cache, tiering and coherence rules are the same.</li>
+  <li><a href="/docs/cte/index.html">Context Transfer Engine</a> holds every page as a blob in a tag. The pool's storage tiers decide where pages live when they are not in the cache.</li>
+  <li><a href="/docs/cae/index.html">Context Assimilation Engine</a> maps a staged float32 file onto a dataset's tag, one blob per page. This is how <code>clio_ml.assimilate</code> trains on a CSV or Parquet file without loading it into memory.</li>
+  <li><a href="/docs/runtime/index.html">Context Runtime</a> runs the ChiMods. Each algorithm is a module named <code>ml_&lt;key&gt;</code> that fits its node's shard and merges across nodes.</li>
+</ul>
+
+<h2>Algorithms</h2>
+<p>Each page gives the Python and C++ API with option defaults, the row layout and a short example.</p>
+<h3>Clustering</h3>
+<ul>
+  <li><a href="/docs/ml/kmeans.html">kmeans</a>: k-means (Lloyd)</li>
+  <li><a href="/docs/ml/bkm.html">bkm</a>: bisecting k-means</li>
+  <li><a href="/docs/ml/gmm.html">gmm</a>: Gaussian mixture model</li>
+  <li><a href="/docs/ml/pic.html">pic</a>: power iteration clustering</li>
+</ul>
+<h3>Regression</h3>
+<ul>
+  <li><a href="/docs/ml/linreg.html">linreg</a>: linear regression</li>
+  <li><a href="/docs/ml/enet.html">enet</a>: elastic net and Lasso</li>
+  <li><a href="/docs/ml/pglm.html">pglm</a>: Poisson generalized linear model</li>
+  <li><a href="/docs/ml/iso.html">iso</a>: isotonic regression</li>
+  <li><a href="/docs/ml/aft.html">aft</a>: accelerated failure time survival regression</li>
+  <li><a href="/docs/ml/fm.html">fm</a>: factorization machine regression</li>
+  <li><a href="/docs/ml/gbt.html">gbt</a>: gradient-boosted regression trees</li>
+</ul>
+<h3>Classification</h3>
+<ul>
+  <li><a href="/docs/ml/logreg.html">logreg</a>: binary logistic regression</li>
+  <li><a href="/docs/ml/mlr.html">mlr</a>: multinomial logistic regression</li>
+  <li><a href="/docs/ml/svm.html">svm</a>: linear support vector machine</li>
+  <li><a href="/docs/ml/nb.html">nb</a>: Gaussian naive Bayes</li>
+  <li><a href="/docs/ml/knn.html">knn</a>: k-nearest neighbours</li>
+  <li><a href="/docs/ml/tree.html">tree</a>: decision tree</li>
+  <li><a href="/docs/ml/rf.html">rf</a>: random forest</li>
+  <li><a href="/docs/ml/gbtc.html">gbtc</a>: gradient-boosted tree classifier</li>
+  <li><a href="/docs/ml/mlp.html">mlp</a>: multilayer perceptron</li>
+</ul>
+<h3>Decomposition, recommendation, text and patterns</h3>
+<ul>
+  <li><a href="/docs/ml/pca.html">pca</a>: principal component analysis</li>
+  <li><a href="/docs/ml/als.html">als</a>: alternating least squares</li>
+  <li><a href="/docs/ml/lda.html">lda</a>: latent Dirichlet allocation</li>
+  <li><a href="/docs/ml/w2v.html">w2v</a>: word2vec</li>
+  <li><a href="/docs/ml/fim.html">fim</a>: frequent itemsets and association rules</li>
+  <li><a href="/docs/ml/seq.html">seq</a>: sequential pattern mining</li>
+</ul>
+
+<h2>Where to go next</h2>
+<ul>
+  <li><a href="/docs/ml/install.html">Install</a>: build clio-ml inside CLIO Core, pick a backend, enable the assimilate path.</li>
+  <li><a href="/docs/ml/usage.html">Usage</a>: train on a CSV or Parquet table, on a NumPy array, or from C++; compose storage; run as ChiMods.</li>
+  <li><a href="/docs/ml/api.html">API reference</a>: the <code>clio_ml</code> Python package, the C++ <code>Dataset</code> class and <code>AssimilateFloat32File</code>.</li>
+  <li>The algorithm pages listed above.</li>
+</ul>

@@ -1,0 +1,85 @@
+<!--
+title: Writing an assimilator
+heading: Writing an <em>assimilator.</em>
+description: How to add a new source scheme to the Context Assimilation Engine: the BaseAssimilator interface, what Schedule must do, the optional ReadBlob, BlobBytes and BuildPageMap hooks, the factory branch, and the CMake pattern for sources that need an SDK.
+eyebrow: Docs · Context Assimilation Engine
+lede: An assimilator is one C++ class that reads one kind of source and writes blobs through the CTE client. Adding one means subclassing BaseAssimilator, implementing a coroutine, and adding a branch to the factory. The string and binary assimilators are the smallest examples to copy.
+facts: Interface | clio_cae/core/factory/base_assimilator.h ; Factory | core/src/factory/assimilator_factory.cc ; Smallest example | string_data_assimilator.cc
+-->
+<h2>Where the code lives</h2>
+<p>Assimilators are part of the CAE core module under <code>context-assimilation-engine/core</code>. Each has an interface header under <code>include/clio_cae/core/factory/</code> and an implementation under <code>src/factory/</code>. The shipped classes, all in namespace <code>clio::cae::core</code>:</p>
+<ul>
+  <li><code>BinaryFileAssimilator</code> for <code>file::</code>. Implements <code>ReadBlob</code> and <code>BlobBytes</code>, so it supports ingest on fault.</li>
+  <li><code>StringDataAssimilator</code> for <code>string::</code>. Only <code>Schedule</code>.</li>
+  <li><code>Hdf5FileAssimilator</code> for <code>hdf5::</code>, behind <code>CLIO_CAE_ENABLE_HDF5</code>.</li>
+  <li><code>HttpFileAssimilator</code> for <code>http://</code> and <code>https://</code>, behind <code>CAE_ENABLE_HTTP</code> (POSIX builds).</li>
+  <li><code>S3FileAssimilator</code> behind <code>CAE_ENABLE_S3</code>, <code>GcsFileAssimilator</code> behind <code>CAE_ENABLE_GCS</code>, <code>GlobusFileAssimilator</code> behind <code>CAE_ENABLE_GLOBUS</code>.</li>
+</ul>
+
+<h2>The interface</h2>
+<pre data-label="cpp · base_assimilator.h">
+namespace clio::cae::core {
+class BaseAssimilator {
+ public:
+  virtual ~BaseAssimilator() = default;
+
+  // Required. A coroutine: co_await CTE operations, report failure in error_code.
+  virtual clio::run::TaskResume Schedule(const AssimilationCtx&amp; ctx, int&amp; error_code) = 0;
+
+  // Optional, for ingest on fault. The bytes of ONE destination blob, exactly as
+  // Schedule would have stored them. Blocking I/O, no tasks. Returns the byte
+  // count, 0 past the end of the source, or -errno. Default: -38 (ENOSYS).
+  virtual long long ReadBlob(const AssimilationCtx&amp; ctx, const std::string&amp; blob_name,
+                             char* dst, clio::run::u64 cap);
+
+  // Optional. Bytes per blob for ctx. Default 0 = unsupported.
+  virtual clio::run::u64 BlobBytes(const AssimilationCtx&amp; ctx);
+
+  // Optional, for pagify. The page-space layout of the source. Default: empty map.
+  virtual PageMap BuildPageMap(const AssimilationCtx&amp; ctx, clio::run::u64 page_size);
+
+  // Helpers over a map, not virtual.
+  std::vector&lt;PageSlice&gt; ToPage(const PageMap&amp; map, clio::run::u64 page_id) const;
+  std::vector&lt;PageRef&gt;   FromPage(const PageMap&amp; map, const std::string&amp; blob,
+                                  clio::run::u64 off, clio::run::u64 size) const;
+};
+}
+</pre>
+<p>Only <code>Schedule</code> is required. The three hooks opt a source into the features on the <a href="/docs/cae/on-demand.html">on-demand page</a>: <code>ReadBlob</code> and <code>BlobBytes</code> together make a source usable with <code>on_fault</code>, and <code>BuildPageMap</code> is where a source would publish its page layout. None of the shipped assimilators overrides <code>BuildPageMap</code> yet.</p>
+
+<h2>What Schedule must do</h2>
+<p><code>Schedule</code> runs inside the CAE pool as a runtime coroutine. It receives the context the user built and a reference to an error code it must set. The pattern the shipped assimilators follow:</p>
+<ol class="steps">
+  <li>Parse <code>ctx.src</code>: the part after the scheme is the path, object key or payload name. Derive the tag name from <code>ctx.dst</code> by stripping <code>iowarp::</code>.</li>
+  <li>Open the source and apply <code>ctx.range_off</code> and <code>ctx.range_size</code> when they apply to the source.</li>
+  <li>Get or create the destination tag with <code>cte_client_-&gt;AsyncGetOrCreateTag(tag_name)</code> and <code>CLIO_CO_AWAIT</code> the future.</li>
+  <li>For each piece: allocate a buffer with <code>CLIO_IPC-&gt;AllocateBuffer(size)</code>, fill it, and <code>CLIO_CO_AWAIT</code> an <code>AsyncPutBlob(tag_id, blob_name, 0, size, buffer, score, context)</code>. Name blobs <code>ctx.blob_prefix + index</code> and size them by <code>ctx.chunk_size</code> (0 means your default) so the <code>on_fault</code> path can reproduce the same names and sizes.</li>
+  <li>Free the buffers, set <code>error_code</code> to 0, and <code>CLIO_CO_RETURN</code>. On any failure set a non-zero <code>error_code</code>; <code>ParseOmni</code> copies it into <code>result_code_</code>, sets <code>error_message_</code> to <code>Assimilator failed</code>, and stops processing later transfers.</li>
+</ol>
+<p>Blocking work that takes long, such as a remote download, should not block a runtime worker. The HTTP assimilator spawns a child process and the S3 assimilator streams through Poco inside a coroutine; the fault path runs <code>ReadBlob</code> on a dedicated thread pool for the same reason. The constructor receives a <code>std::shared_ptr&lt;clio::cte::core::Client&gt;</code>; the S3 assimilator also takes the shared connection pool.</p>
+
+<h2>Register the scheme in the factory</h2>
+<p><code>AssimilatorFactory::Get(src)</code> in <code>src/factory/assimilator_factory.cc</code> extracts the scheme with <code>GetUrlProtocol</code> (the text before <code>://</code> or <code>::</code>) and returns a <code>std::unique_ptr&lt;BaseAssimilator&gt;</code>, or <code>nullptr</code> with a logged error. One special case comes first: a URL starting with <code>https://app.globus.org</code> goes to the Globus assimilator before the scheme is examined. Add a branch:</p>
+<pre data-label="cpp">
+} else if (protocol == "myscheme") {
+#ifdef CAE_ENABLE_MYSCHEME
+  return std::make_unique&lt;MySchemeAssimilator&gt;(cte_client_);
+#else
+  HLOG(kError, "AssimilatorFactory: myscheme requested but support not compiled in. "
+               "Rebuild with -DCAE_ENABLE_MYSCHEME=ON.");
+  return nullptr;
+#endif
+}
+</pre>
+<p>Returning <code>nullptr</code> makes <code>ParseOmni</code> fail that transfer with result code -2 and the message <code>No assimilator found for source</code>, which is what <code>clio_cae</code> prints. Keep the <code>#ifdef</code> for any source that needs an SDK so a build without it still compiles and reports the missing option at run time.</p>
+
+<h2>Build wiring</h2>
+<ul>
+  <li>Declare the option in the top-level <code>CMakeLists.txt</code> next to <code>CAE_ENABLE_S3</code>, find the dependency there, and turn the option off with a warning when it is missing. That is the pattern S3 and GCS follow.</li>
+  <li>Add the source file to the <code>clio_cae_core_runtime</code> target in <code>core/CMakeLists.txt</code> under the option, and add a compile definition with the option's name so the factory branch and the include see it.</li>
+  <li>If the SDK must not be loaded into the runtime process, as with the AWS SDK, follow <code>cae_s3_tool</code>: a separate executable that links the SDK, spawned by the assimilator.</li>
+  <li>Add a unit test under <code>test/unit/</code>. <code>test_cloud_factory_guard.cc</code> checks that each scheme returns an assimilator or <code>nullptr</code> according to the build flags, and is the place to add the new scheme.</li>
+</ul>
+
+<h2>Adding an OMNI key</h2>
+<p>If the source needs a new per-transfer key, add the field to <code>AssimilationCtx</code> and its <code>serialize</code> list, read it in <code>LoadOmni</code> in <code>src/omni_loader.cc</code>, and add the key name to <code>KnownTransferKeys</code> in the same file so the loader stops warning about it. If the field must survive an <code>on_fault</code> registration, add it to <code>EncodeCtx</code> and <code>DecodeCtx</code> in <code>core_runtime.cc</code>, which carry the context to other nodes. If Python callers need it, add a <code>def_rw</code> in <code>context-exploration-engine/api/src/python_bindings.cc</code>.</p>

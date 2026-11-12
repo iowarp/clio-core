@@ -432,6 +432,28 @@ inline bool ApplyTableOps(InodeTableBlock *b, const TableDelta &x) {
   return true;
 }
 
+/** How a logged delta fared against the block replay has built so far. */
+enum class ReplayStep {
+  kSkipped,   ///< not a row change newer than the block (already folded in)
+  kApplied,   ///< applied; the block advanced to x.new_version_
+  kMismatch,  ///< the block is not at x.base_version_: the log ends here
+};
+
+/**
+ * Replay one delta read back from a log (the directory journal or a block
+ * blob) onto the block it builds on. A delta not newer than the block is one
+ * a compaction's image already holds, so it is skipped.
+ * @param b the block as replay has it
+ * @param x the delta
+ * @return what happened to x
+ */
+inline ReplayStep ReplayTableDelta(InodeTableBlock *b, const TableDelta &x) {
+  if (x.kind_ != TableDeltaKind::kOps || x.new_version_ <= b->version_) {
+    return ReplayStep::kSkipped;
+  }
+  return ApplyTableOps(b, x) ? ReplayStep::kApplied : ReplayStep::kMismatch;
+}
+
 }  // namespace clio::cte::filesystem
 
 #endif  // CLIO_CTE_FILESYSTEM_FS_INODE_TABLE_H_

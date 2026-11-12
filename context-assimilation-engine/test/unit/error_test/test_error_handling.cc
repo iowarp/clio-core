@@ -163,7 +163,7 @@ size_t TagSize(const std::string& tag_name) {
   auto *cte_client = CLIO_CTE_CLIENT;
   auto tag_task = cte_client->AsyncGetOrCreateTag(tag_name);
   tag_task.Wait();
-  auto size_task = cte_client->AsyncGetTagSize(tag_task->tag_id_);
+  auto size_task = cte_client->AsyncGetTagSize(tag_task->tag_id_, clio::run::PoolQuery::Broadcast(0.0f));
   size_task.Wait();
   return size_task->tag_size_;
 }

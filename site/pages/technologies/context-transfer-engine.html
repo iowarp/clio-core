@@ -1,11 +1,19 @@
 <!--
-title: Key-value store
-heading: A key-value store <em>over every tier.</em>
-description: CLIO Core's tag and blob store is a key-value store for C++ and Python, with tier placement scores, regex queries, keyword search and a shared-memory read path.
+title: Context Transfer Engine
+heading: Context Transfer Engine: <em>a key-value store over every tier.</em>
+description: The Context Transfer Engine (CTE), CLIO Core's tag and blob store, is a key-value store for C++ and Python, with tier placement scores, regex queries, keyword search and a shared-memory read path.
 eyebrow: Technologies · Storage
-lede: Underneath every CLIO Core product is a key-value store: tags (namespaces) hold blobs (values), and each blob is placed on a tier by its score. Use it directly when your pipeline thinks in objects, not files.
+lede: Underneath every CLIO Core product is the Context Transfer Engine, a key-value store: tags (namespaces) hold blobs (values), and each blob is placed on a tier by its score. Use it directly when your pipeline thinks in objects, not files.
 facts: Keys | Tag + blob name ; Values | Arbitrary bytes, partial put/get by offset ; Clients | C++, Python ; Transport | Shared memory, TCP, Unix sockets
 -->
+<h2>Key takeaways</h2>
+<ul class="checks">
+  <li>A key-value store for C++ and Python: tags hold blobs, with partial reads and writes by offset.</li>
+  <li>Each blob is placed on a tier by its score; changing the score moves it.</li>
+  <li>Regex, keyword and time-window queries, and a shared-memory path for clients on the same node.</li>
+  <li>The substrate every other technology writes to.</li>
+</ul>
+
 <ul class="headline-stats">
   <li><strong>42.6k</strong><span>YCSB-B ops/s, against Redis 16.8k</span></li>
   <li><strong>~2x</strong><span>Redis on read-heavy YCSB workloads</span></li>
@@ -27,7 +35,7 @@ size = tag.GetBlobSize("params")
 print(tag.GetBlob("params", size, 0))        # get bytes back
 print(tag.GetContainedBlobs())               # list keys in the tag
 </pre>
-<p>The same operations exist in C++ (<code>clio::cte::core::Tag::PutBlob</code>, <code>GetBlob</code>), with asynchronous variants such as <code>AsyncPutBlob</code>, and on the client for whole-store queries (<code>TagQuery</code>, <code>BlobQuery</code>, <code>SemanticSearch</code>). The <a href="/docs/python-api.html">Python API reference</a> lists them all.</p>
+<p>The same operations exist in C++ (<code>clio::cte::core::Tag::PutBlob</code>, <code>GetBlob</code>), with asynchronous variants such as <code>AsyncPutBlob</code>, and on the client for whole-store queries (<code>TagQuery</code>, <code>BlobQuery</code>, <code>SemanticSearch</code>). The <a href="/docs/cte/python.html">Python API reference</a> lists them all.</p>
 
 <h2>Performance against Redis, RocksDB and DynamoDB</h2>
 <p>The repository's YCSB binding (<code>context-transfer-engine/benchmark/ycsb</code>) runs the standard workloads against CLIO Core and three other stores. Throughput in operations per second, higher is better:</p>

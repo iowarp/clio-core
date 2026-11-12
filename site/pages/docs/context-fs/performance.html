@@ -1,0 +1,87 @@
+<!--
+title: Performance and tuning
+heading: Performance pitfalls <em>and tuning knobs.</em>
+description: Context FS performance pitfalls (cold RAM-tier page faults and CLIO_PREFAULT, kernel caching, multi-node coherence, write windows) and the main tuning variables, with defaults taken from source.
+eyebrow: Docs · Context FS
+lede: Context FS is usually fast out of the box, but a few defaults trade speed for memory or for coherence. This page lists the pitfalls that most often cost performance and the knobs that control them. Every default here is read from the source; measure on your own hardware before and after a change.
+facts: Biggest single knob | CLIO_PREFAULT ; Set in | The runtime's environment (clio_run) ; Mount-side knobs | CLIO_FUSE_* on clio_cte_fuse ; Tier knobs | populate_unit, alloc in compose YAML
+-->
+<h2>Where each knob is read</h2>
+<p>Context FS has two processes, and a variable only works in the one that reads it.</p>
+<ul class="checks">
+  <li><strong>The runtime</strong> (<code>clio_run start</code>) owns the tiers and the block devices. <code>CLIO_PREFAULT</code> and the block-device YAML keys apply here.</li>
+  <li><strong>The mount</strong> (<code>clio_cte_fuse</code>) owns the kernel interface. <code>CLIO_FUSE_*</code> and <code>CLIO_CFS_*</code> apply here.</li>
+</ul>
+<p>Set each variable in the environment of the right process before it starts. Changing one later has no effect until that process restarts.</p>
+
+<h2>Pitfall 1: cold RAM-tier page faults</h2>
+<p>This is the most common reason a first run is slow. A RAM tier is a large shared-memory mapping that the operating system backs lazily: a page of physical memory is only committed the first time it is touched. Without help, the first write into each 4 KiB page takes a page fault inside the copy, and a write-heavy job pays that fault for every page of fresh tier it fills.</p>
+<p>The runtime softens this by itself. When an allocation crosses the populated watermark, it bulk-faults the next <code>populate_unit</code> bytes (64 MiB by default) in one step, so copies stop faulting page by page. That still leaves a stall every time the watermark moves, and the first touch of the tier is still cold.</p>
+<p><strong>The fix is <code>CLIO_PREFAULT</code></strong>, which faults the RAM tier in when it is composed rather than while your job runs:</p>
+<pre data-label="bash">
+# Fault in the whole RAM tier at startup
+CLIO_PREFAULT=0 clio_run start
+
+# Or only the first 4 GB of it
+CLIO_PREFAULT=4GB clio_run start
+</pre>
+<ul class="checks">
+  <li><code>0</code> means the whole mapping. Any other value is a size string such as <code>512MB</code> or <code>4GB</code>, clamped to the tier's size. Unset (the default) keeps incremental population.</li>
+  <li>The runtime logs how much it pre-faulted and how long it took: look for <code>CLIO_PREFAULT=… pre-faulted … bytes</code> in its output.</li>
+  <li>Population resumes past the pre-faulted prefix, so a partial prefault still works for a tier larger than it.</li>
+</ul>
+<div class="callout"><span class="callout-title">The cost</span><p>Whatever is pre-faulted is committed RAM at once. <code>CLIO_PREFAULT=0</code> on a 16 GB RAM tier commits 16 GB at startup, whether or not the job uses it. Size the RAM tier's <code>capacity_limit</code> to what the node can spare, or pre-fault a prefix instead of the whole tier.</p></div>
+
+<h3>Related tier keys</h3>
+<p>These go on a block device or storage entry in the compose YAML.</p>
+<ul class="checks">
+  <li><code>populate_unit</code> (size string, default 64 MiB): how much the RAM tier bulk-faults each time allocation crosses the watermark. Raising it means fewer, larger stalls. <code>0</code> turns population off and gives pure demand faulting, the slowest setting for writes.</li>
+  <li><code>alloc</code> (<code>auto</code>, <code>eager</code> or <code>lazy</code>): when a memory-backed device commits its pages. <code>eager</code> commits the whole size up front, and falls back to lazy if the device has no size.</li>
+  <li><code>growth_unit</code> (size string, default 1 GiB): file-backed tiers grow their backing file in steps of this size instead of reserving the whole capacity at startup. RAM and GPU tiers ignore it.</li>
+</ul>
+
+<h2>Pitfall 2: GPU copies from unpinned memory</h2>
+<p>On a node with a GPU, the RAM tier pins the memory it commits, so copies between the tier and the GPU run asynchronously at full speed. Unpinned shared memory turns each of those copies into a slower, synchronous, driver-staged copy. <code>CLIO_BDEV_NO_PIN=1</code> turns pinning off. Only set it if pinned memory is scarce, and expect GPU copies to slow down.</p>
+
+<h2>Pitfall 3: the kernel's 4 KiB writes</h2>
+<p>Without the writeback cache, FUSE hands the filesystem one 4 KiB write for every dirty page, so a large write becomes many small operations. Context FS avoids this for write-only file handles: files opened <code>O_WRONLY</code> use direct I/O, so each <code>write()</code> arrives at its full size. Compilers, git and archive tools create files this way. This is on by default; <code>CLIO_FUSE_DIRECT_WRONLY=0</code> turns it off.</p>
+<p>The kernel writeback cache (<code>CLIO_FUSE_WRITEBACK=1</code>) batches writes even further but is <strong>off by default for correctness</strong>. With it on, the kernel's view of a file's size can run ahead of what has been published, and a git clone was observed to corrupt its pack file. Only turn it on for single-writer workloads that call <code>fsync</code>.</p>
+
+<h2>Pitfall 4: coherence costs on multi-node mounts</h2>
+<p>On one node, the mount caches file attributes and directory entries for 1 second, which removes most metadata round trips. On a multi-node mount (<code>CLIO_FUSE_MULTINODE</code>), attributes are not cached by default, so that a reader on another node never sees a stale file size. Directory entries are still cached for 1 second: the namespace is spread across nodes, and without that cache every path component of every call becomes its own network round trip.</p>
+<ul class="checks">
+  <li><code>CLIO_FUSE_ATTR_CACHE_S</code> (seconds): attribute cache lifetime. Default 1 on one node and 0 on multi-node. Raise it for read-mostly data that no other node changes; set it to 0 when several processes or mounts share files and need exact sizes.</li>
+  <li><code>CLIO_FUSE_ENTRY_CACHE_S</code> (seconds): directory entry cache lifetime. Default 1 on multi-node, otherwise the attribute value. Deep directory trees such as <code>.git/objects</code> benefit most.</li>
+  <li><code>CLIO_FUSE_STATFS_TTL_MS</code> (default 1000): how long <code>statfs</code> results (free space) are cached.</li>
+</ul>
+
+<h2>Pitfall 5: write windows and memory</h2>
+<p>Writes return before they reach the tiers. They are kept in a shared-memory window and published in the background. That makes writes fast, but the window holds memory, and once it is full a writer waits for the oldest writes to finish.</p>
+<ul class="checks">
+  <li><code>CLIO_FUSE_WRITE_INFLIGHT_MB</code> (default 256): the mount's in-flight write window in MiB. <code>0</code> removes the bound. Raise it for fast tiers and large sequential writes, and lower it when many writers fill memory.</li>
+  <li><code>CLIO_CFS_ASYNC_WRITES</code> (default on): asynchronous writes. <code>0</code> makes every write wait for completion. Use that only to rule out write-behind when debugging.</li>
+  <li><code>CLIO_CFS_WRITE_WINDOW_COUNT</code> (default 256) and <code>CLIO_CFS_WRITE_WINDOW_BYTES</code> (default 64 MiB): the client's write-behind window by count and by bytes. The byte budget is global, not per file.</li>
+  <li><code>CLIO_FUSE_ASYNC_FLUSH</code> and <code>CLIO_FUSE_ASYNC_CLOSE</code> (both default on): <code>close()</code> does not wait for the server's bookkeeping round trip. Set them to <code>0</code> to make close wait.</li>
+</ul>
+
+<h2>Fast paths that are on by default</h2>
+<p>These are on by default and are worth checking only when a run is unexpectedly slow. Each has a switch to turn it off, meant for debugging.</p>
+<ul class="checks">
+  <li><code>CLIO_FUSE_SIEVE</code>: file data goes through the mount's buffer directly, and only namespace operations become runtime tasks. <code>0</code> sends all I/O through tasks.</li>
+  <li><code>CLIO_CFS_SHM_READ</code>: reads are served from shared memory without a round trip to the runtime. <code>0</code> forces every read through the runtime.</li>
+  <li><code>CLIO_DIRECT_READ</code> and <code>CLIO_DIRECT_WRITE</code>, read by the runtime: a node-local RAM tier is read and written in place, without dispatching a separate task.</li>
+  <li><code>CLIO_TASK_BATCHING</code>, read by the runtime: workers dequeue tasks in batches.</li>
+</ul>
+
+<h2>Runtime threads</h2>
+<p>The runtime's worker count comes from <code>num_threads</code> in the runtime section of its configuration (4 in the default configuration). On a many-core node serving several busy writers, more workers raise throughput; on a laptop, the default leaves cores for the application.</p>
+
+<h2>A starting configuration</h2>
+<pre data-label="bash · single node, write-heavy">
+# Runtime: fault in the RAM tier up front (commits its full size)
+CLIO_PREFAULT=0 clio_run start &
+
+# Mount: larger write window for big sequential writes
+CLIO_WITH_RUNTIME=0 CLIO_FUSE_WRITE_INFLIGHT_MB=1024 clio_cte_fuse ~/clio-mnt -f
+</pre>
+<p>Change one knob at a time and measure. The <a href="/docs/context-fs/api.html">API reference</a> lists every environment variable the mount reads, and the <a href="/docs/runtime/api.html">Context Runtime API</a> covers the runtime configuration file.</p>

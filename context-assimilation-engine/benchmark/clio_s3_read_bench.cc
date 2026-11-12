@@ -443,7 +443,7 @@ int VerifyTags(const BenchConfig& c, const std::vector<size_t>& indices) {
       ++bad;
       continue;
     }
-    auto size_task = cte_client->AsyncGetTagSize(tag_id);
+    auto size_task = cte_client->AsyncGetTagSize(tag_id, clio::run::PoolQuery::Broadcast(0.0f));
     size_task.Wait();
     if (size_task->tag_size_ != expected) {
       HLOG(kError, "Verify: object {} tag size {} != expected {}", idx,

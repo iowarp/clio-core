@@ -6,6 +6,13 @@ eyebrow: Technologies · Storage
 lede: Mount like any other directory on Windows, macOS and Linux via FUSE. Context FS presents the tiers you compose (RAM, NVMe, disk, erasure-coded arrays, cloud buckets) as one ordinary directory. Applications use it without changes; the stack underneath decides where each page lives.
 facts: Mount | FUSE 3 (libfuse, macFUSE, WinFsp) ; Metadata | Distributed, no metadata server ; Unit of data | 1 MiB page blobs ; Durability | ext4-style, durable on fsync
 -->
+<h2>Key takeaways</h2>
+<ul class="checks">
+  <li>Mount it like any other directory on Linux, macOS and Windows through FUSE. Applications run unchanged.</li>
+  <li>Files spread across the tiers you compose (RAM, NVMe, erasure-coded arrays, Amazon S3 or Google Cloud buckets) by score, with distributed metadata and no metadata server.</li>
+  <li>Every file is also tags and blobs in the Context Transfer Engine, so search, assimilation and the other technologies use it without a copy.</li>
+</ul>
+
 <ul class="headline-stats">
   <li><strong>10 µs</strong><span>stat from the shared-memory mirror</span></li>
   <li><strong>0</strong><span>metadata servers: inodes are homed by path</span></li>
@@ -65,35 +72,6 @@ $ ls ~/clio-mnt/results
 </ul>
 <p>About 91% of each operation's wall time is kernel transit; the daemon itself spends about 9.6 µs of CPU time per operation.</p>
 
-<h3>Parallel I/O with IOR</h3>
-<p>IOR, the standard HPC I/O benchmark, weak-scaled from 1 to 6 MPI ranks on one node: each rank writes and then reads its own 256 MiB file in 1 MiB transfers, with fsync after writing and the page cache dropped between the write and read phases. Context FS (release build of <code>dev</code> at c5dba42bc, default runtime configuration, one DRAM tier) against ext4 on the same machine: WSL2 Ubuntu 24.04 with 6 cores and 11 GB of memory, on a Ryzen 7 3800X with NVMe. Each bar is the mean of three runs, in MiB/s, higher is better.</p>
-<div class="chart-grid">
-  <figure><figcaption>Write bandwidth, MiB/s</figcaption>
-<ul class="bars" aria-label="Write bandwidth, MiB/s">
-  <li class="ours"><span>Context FS, 1 rank</span><span class="bar"><i style="width:25%"></i></span><span class="val">359</span></li>
-  <li><span>ext4, 1 rank</span><span class="bar"><i style="width:36%"></i></span><span class="val">530</span></li>
-  <li class="ours"><span>Context FS, 2 ranks</span><span class="bar"><i style="width:33%"></i></span><span class="val">476</span></li>
-  <li><span>ext4, 2 ranks</span><span class="bar"><i style="width:47%"></i></span><span class="val">692</span></li>
-  <li class="ours"><span>Context FS, 4 ranks</span><span class="bar"><i style="width:44%"></i></span><span class="val">643</span></li>
-  <li><span>ext4, 4 ranks</span><span class="bar"><i style="width:84%"></i></span><span class="val">1,225</span></li>
-  <li class="ours"><span>Context FS, 6 ranks</span><span class="bar"><i style="width:42%"></i></span><span class="val">606</span></li>
-  <li><span>ext4, 6 ranks</span><span class="bar"><i style="width:100%"></i></span><span class="val">1,459</span></li>
-</ul>
-  </figure>
-  <figure><figcaption>Read bandwidth, MiB/s</figcaption>
-<ul class="bars" aria-label="Read bandwidth, MiB/s">
-  <li class="ours"><span>Context FS, 1 rank</span><span class="bar"><i style="width:4%"></i></span><span class="val">182</span></li>
-  <li><span>ext4, 1 rank</span><span class="bar"><i style="width:28%"></i></span><span class="val">1,327</span></li>
-  <li class="ours"><span>Context FS, 2 ranks</span><span class="bar"><i style="width:6%"></i></span><span class="val">277</span></li>
-  <li><span>ext4, 2 ranks</span><span class="bar"><i style="width:57%"></i></span><span class="val">2,672</span></li>
-  <li class="ours"><span>Context FS, 4 ranks</span><span class="bar"><i style="width:6%"></i></span><span class="val">273</span></li>
-  <li><span>ext4, 4 ranks</span><span class="bar"><i style="width:89%"></i></span><span class="val">4,215</span></li>
-  <li class="ours"><span>Context FS, 6 ranks</span><span class="bar"><i style="width:5%"></i></span><span class="val">235</span></li>
-  <li><span>ext4, 6 ranks</span><span class="bar"><i style="width:100%"></i></span><span class="val">4,726</span></li>
-</ul>
-  </figure>
-</div>
-<p>On a single node, ext4 leads at every rank count. ext4 is a kernel filesystem on local NVMe, while Context FS routes every 1 MiB transfer through FUSE to the runtime process and back. Context FS write bandwidth grows 1.8x from 1 to 4 ranks and then levels off at about 600-640 MiB/s; reads stay between 180 and 280 MiB/s. Where Context FS is built to help is across nodes, where it presents one namespace over every node's tiers without a metadata server; the IO500 comparison below measures that on the Ares cluster.</p>
 <h3>Against OrangeFS on Ares: IO500</h3>
 <p>IO500 on 4 nodes of the Ares cluster, 32 MPI ranks (8 per node). Each node: two Xeon Silver 4114 (40 cores), 46 GB of memory, a Toshiba RD400 NVMe drive, a Seagate ST1000LM049 1 TB HDD, and 40 GbE. Every node is both a server and a client of the filesystem under test.</p>
 <ul class="checks">
@@ -235,6 +213,6 @@ $ ls ~/clio-mnt/results
 
 <h2>Where to go next</h2>
 <ul>
-  <li><a href="/docs/basic-usage.html">Mount your first filesystem</a></li>
+  <li><a href="/docs/context-fs/quickstart.html">Mount your first filesystem</a></li>
   <li><a href="/design/filesystem.html">Filesystem and FUSE design</a> and <a href="/design/durability.html">durability and recovery</a></li>
 </ul>

@@ -43,10 +43,16 @@
 #include <unistd.h>
 #include <cerrno>
 #include <cstring>
+#include <sys/types.h>
+#include <algorithm>
 #include <atomic>
+#include <cstdint>
+#include <cstdlib>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <memory>
+#include <vector>
 
 // O_DIRECT is a Linux extension; Darwin has no equivalent open flag and
 // instead exposes uncached I/O through fcntl(F_NOCACHE) post-open. Define
@@ -60,10 +66,34 @@
 
 namespace ctp {
 
+/*
+ * Why a pool of descriptors: glibc's POSIX AIO keeps ONE request queue per
+ * file descriptor and runs every request for the same aio_fildes strictly
+ * sequentially on one helper thread. A bdev tier is a single backing file, so
+ * with one fd all I/O to a tier was serialized. Measured on Aurora (IO500
+ * through clio-fs on DAOS dfuse / Lustre, where libaio submits synchronously):
+ * FUSE read callbacks averaged 45-115 ms with ~10 in flight, i.e. only
+ * ~100-200 backing I/Os per second per node regardless of client count.
+ * Duplicating the fd gives glibc several independent queues to run in
+ * parallel. glibc also caps its helper pool at 20 threads by default, which
+ * kPosixAioMinHelperThreads lifts (glibc only).
+ */
+
+/** Default descriptors per kind (buffered / O_DIRECT), original fd included. */
+inline constexpr size_t kPosixAioDefaultFdsPerKind = 16;
+/** Smallest accepted CTP_POSIX_AIO_FDS value (1 = original single-fd path). */
+inline constexpr size_t kPosixAioMinFdsPerKind = 1;
+/** Largest accepted CTP_POSIX_AIO_FDS value. */
+inline constexpr size_t kPosixAioMaxFdsPerKind = 64;
+/** Floor for glibc's aio_threads helper pool size. */
+inline constexpr size_t kPosixAioMinHelperThreads = 64;
+/** glibc aio_num: max outstanding requests per process. */
+inline constexpr size_t kPosixAioMaxOutstanding = 1024;
+
 class PosixAsyncIO : public AsyncIO {
  public:
   PosixAsyncIO(uint32_t io_depth)
-      : direct_fd_(-1), regular_fd_(-1), next_token_(1) {
+      : direct_fd_(-1), regular_fd_(-1), next_token_(1), rr_counter_(0) {
     (void)io_depth;
   }
 
@@ -71,6 +101,15 @@ class PosixAsyncIO : public AsyncIO {
     Close();
   }
 
+  /**
+   * Open the file twice (buffered and O_DIRECT) and build the descriptor
+   * pools. Pool width comes from CTP_POSIX_AIO_FDS (see ResolveFdsPerKind).
+   * @param path file to open
+   * @param flags open flags; O_DIRECT is stripped from the buffered fd
+   * @param mode creation mode
+   * @return false if the buffered open fails; a failed O_DIRECT open is
+   *         tolerated and only disables the direct pool
+   */
   bool Open(const std::string &path, int flags, mode_t mode) override {
     std::lock_guard<std::mutex> lock(mutex_);
 
@@ -79,7 +118,23 @@ class PosixAsyncIO : public AsyncIO {
     regular_fd_ = open(path.c_str(), base_flags, mode);
     if (regular_fd_ < 0) return false;
 
-    direct_fd_ = open(path.c_str(), base_flags | O_DIRECT, mode);
+    // CTP_POSIX_AIO_DIRECT=0 keeps every request on the buffered descriptors.
+    // A tier file sees aligned requests (O_DIRECT) and unaligned ones
+    // (buffered) for neighbouring ranges; once the pool runs them
+    // concurrently, direct writes to a Lustre file failed with EIO
+    // (IO500 ior-hard on Aurora), as mixing the two modes on one range can.
+    const char *direct_env = std::getenv("CTP_POSIX_AIO_DIRECT");
+    const bool use_direct =
+        direct_env == nullptr || std::string(direct_env) != "0";
+    direct_fd_ =
+        use_direct ? open(path.c_str(), base_flags | O_DIRECT, mode) : -1;
+
+    size_t fds_per_kind = ResolveFdsPerKind();
+    InitGlibcAioOnce(fds_per_kind);
+    regular_fds_ = BuildFdPool(regular_fd_, fds_per_kind);
+    if (direct_fd_ >= 0) {
+      direct_fds_ = BuildFdPool(direct_fd_, fds_per_kind);
+    }
 
     return true;
   }
@@ -136,24 +191,25 @@ class PosixAsyncIO : public AsyncIO {
     return true;
   }
 
+  /**
+   * Cancel all pending requests on the descriptor each was submitted to, then
+   * close every pooled descriptor (originals included) exactly once.
+   */
   void Close() override {
     std::lock_guard<std::mutex> lock(mutex_);
 
-    // Cancel pending operations
+    // Requests are spread over the pool, so cancel each on its own fd.
     for (auto &kv : pending_) {
-      aio_cancel(regular_fd_, kv.second.get());
+      aio_cancel(kv.second->aio_fildes, kv.second.get());
     }
     pending_.clear();
     done_.clear();
 
-    if (direct_fd_ >= 0) {
-      close(direct_fd_);
-      direct_fd_ = -1;
-    }
-    if (regular_fd_ >= 0) {
-      close(regular_fd_);
-      regular_fd_ = -1;
-    }
+    // Slot 0 of each pool is the original fd, so closing the pools covers it.
+    CloseFdPool(direct_fds_);
+    CloseFdPool(regular_fds_);
+    direct_fd_ = -1;
+    regular_fd_ = -1;
   }
 
   int GetEventFd() const override {
@@ -240,30 +296,111 @@ class PosixAsyncIO : public AsyncIO {
   }
 
   /**
-   * Choose the O_DIRECT fd only when the buffer, the length AND the file
-   * offset are all DirectIoAlign()-aligned (4 KiB, or the page size when that
-   * is larger -- Lustre needs it); anything else uses the buffered fd. The
-   * offset check was missing: an aligned buffer written at an unaligned file
-   * offset (a truncate zeroing a page tail) went to O_DIRECT and failed with
-   * EINVAL.
+   * Read the descriptor pool width from CTP_POSIX_AIO_FDS. Unset or
+   * unparsable values use kPosixAioDefaultFdsPerKind; set values are clamped
+   * to [kPosixAioMinFdsPerKind, kPosixAioMaxFdsPerKind].
+   * @return descriptors per kind, original fd included
+   */
+  static size_t ResolveFdsPerKind() {
+    const char *env = std::getenv("CTP_POSIX_AIO_FDS");
+    if (env == nullptr || *env == '\0') return kPosixAioDefaultFdsPerKind;
+    char *end = nullptr;
+    long value = std::strtol(env, &end, 10);
+    if (end == env || *end != '\0') return kPosixAioDefaultFdsPerKind;
+    if (value < static_cast<long>(kPosixAioMinFdsPerKind)) {
+      return kPosixAioMinFdsPerKind;
+    }
+    if (value > static_cast<long>(kPosixAioMaxFdsPerKind)) {
+      return kPosixAioMaxFdsPerKind;
+    }
+    return static_cast<size_t>(value);
+  }
+
+  /**
+   * Raise glibc's AIO helper-thread and outstanding-request limits. Runs once
+   * per process, before the first aio submission, because aio_init only
+   * takes effect for requests issued after it. Non-glibc platforms (macOS)
+   * keep their own limits; their EAGAIN path falls back to synchronous I/O.
+   * @param fds_per_kind pool width in use, sizes the helper thread count
+   */
+  static void InitGlibcAioOnce(size_t fds_per_kind) {
+#if defined(__GLIBC__)
+    static std::once_flag aio_init_once;
+    std::call_once(aio_init_once, [fds_per_kind]() {
+      struct aioinit init;
+      std::memset(&init, 0, sizeof(init));
+      init.aio_threads = static_cast<int>(
+          std::max(kPosixAioMinHelperThreads, fds_per_kind * 2));
+      init.aio_num = static_cast<int>(kPosixAioMaxOutstanding);
+      aio_init(&init);
+    });
+#else
+    (void)fds_per_kind;
+#endif
+  }
+
+  /**
+   * Build one descriptor pool by dup()-ing the original fd. Slot 0 is the
+   * original; each dup is a distinct fd and so a distinct glibc per-fd queue.
+   * A dup() failure stops growth and is not an error.
+   * @param original_fd fd returned by open(), must be >= 0
+   * @param width total slots wanted, original included
+   * @return the pool; slot 0 is original_fd
+   */
+  static std::vector<int> BuildFdPool(int original_fd, size_t width) {
+    std::vector<int> pool{original_fd};
+    while (pool.size() < width) {
+      int dup_fd = dup(original_fd);
+      if (dup_fd < 0) break;
+      pool.push_back(dup_fd);
+    }
+    return pool;
+  }
+
+  /**
+   * Close every descriptor in a pool and empty the pool.
+   * @param pool descriptors to close; cleared on return
+   */
+  static void CloseFdPool(std::vector<int> &pool) {
+    for (int fd : pool) {
+      close(fd);
+    }
+    pool.clear();
+  }
+
+  /**
+   * Choose the descriptor for one request. The O_DIRECT pool is used only
+   * when the buffer, the length AND the file offset are all
+   * DirectIoAlign()-aligned (4 KiB, or the page size when that is larger --
+   * Lustre needs it); anything else uses the buffered pool. The offset check
+   * was missing: an aligned buffer written at an unaligned file offset (a
+   * truncate zeroing a page tail) went to O_DIRECT and failed with EINVAL.
+   * Within the chosen pool, descriptors are taken round-robin so concurrent
+   * requests spread over independent glibc per-fd queues.
    * @param buffer I/O buffer
    * @param size I/O length
    * @param offset file offset
-   * @return fd to submit on
+   * @return fd to submit on, or -1 if the file is not open
    */
   int SelectFd(void *buffer, size_t size, int64_t offset) const {
-    if (direct_fd_ >= 0 &&
+    bool aligned =
         (reinterpret_cast<uintptr_t>(buffer) % DirectIoAlign() == 0) &&
         (size % DirectIoAlign() == 0) &&
-        (offset % static_cast<int64_t>(DirectIoAlign()) == 0)) {
-      return direct_fd_;
-    }
-    return regular_fd_;
+        (offset % static_cast<int64_t>(DirectIoAlign()) == 0);
+    const std::vector<int> &pool =
+        (aligned && !direct_fds_.empty()) ? direct_fds_ : regular_fds_;
+    if (pool.empty()) return -1;
+    size_t slot =
+        rr_counter_.fetch_add(1, std::memory_order_relaxed) % pool.size();
+    return pool[slot];
   }
 
   int direct_fd_;
   int regular_fd_;
+  std::vector<int> direct_fds_;   /**< O_DIRECT pool; slot 0 is direct_fd_ */
+  std::vector<int> regular_fds_;  /**< buffered pool; slot 0 is regular_fd_ */
   std::atomic<IoToken> next_token_;
+  mutable std::atomic<size_t> rr_counter_; /**< round-robin pool cursor */
   std::mutex mutex_;
   std::unordered_map<IoToken, std::unique_ptr<struct aiocb>> pending_;
   std::unordered_map<IoToken, IoResult> done_;  /**< completed synchronously */
