@@ -59,8 +59,11 @@
 #include <clio_runtime/pool_manager.h>
 #include <clio_cte/core/blob_placement.h>
 #include <clio_cte/filesystem/filesystem_runtime.h>
+#include <clio_runtime/evlat.h>
 
 namespace clio::cte::filesystem {
+
+namespace ev = clio::run::evlat;
 
 namespace {
 
@@ -322,6 +325,12 @@ clio::run::TaskResume Runtime::ExecShardOp(clio::run::u32 op, const FsReq &req,
     case kShardPurgeLocal:
       CLIO_CO_AWAIT(PurgeLocal(req));
       break;
+    case kShardInodeCreate:
+      CLIO_CO_AWAIT(InodeCreateOpen(req, resp, rc));
+      break;
+    case kShardInodeDiscard:
+      CLIO_CO_AWAIT(InodeDiscard(req));
+      break;
     default:
       if (op >= kShardInodeStat && op <= kShardInodeXattr) {
         CLIO_CO_AWAIT(ExecInodeOp(op, req, resp, rc));
@@ -339,7 +348,9 @@ clio::run::TaskResume Runtime::ExecShardOp(clio::run::u32 op, const FsReq &req,
       op != kTableFetch && op != kTableStandInFetch &&
       op != kTableLoadBlocks) {
     int ferr = 0;
+    const unsigned long long ev_f0 = ev::Now();
     CLIO_CO_AWAIT(FlushInodes(&ferr, since));
+    ev::Span(ev::kFsOpFlush, ev_f0, ev::Now());
     // The change could not be made durable (a full store): say so rather
     // than acknowledge it.
     if (rc == 0 && ferr != 0) rc = ferr;

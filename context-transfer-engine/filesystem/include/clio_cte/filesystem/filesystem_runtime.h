@@ -806,11 +806,14 @@ class Runtime : public clio::run::Container {
    * @param jrec journal record (empty: none)
    * @param wrc receives 0 or the error (ENOSPC or EIO)
    * @param mirror_failed receives true when only the mirror hit a full store
+   * @param ev_timed true to record the journal append and the blob write on
+   *        the CLIO_EVLAT channels fs_row_journal / fs_row_blob
    */
   clio::run::TaskResume WriteCommitRecords(clio::run::u64 dir, clio::run::u32 k,
                                            BlockBlobWrite &blob, FsLogRec jtype,
                                            const std::string &jrec, int &wrc,
-                                           bool &mirror_failed);
+                                           bool &mirror_failed,
+                                           bool ev_timed = false);
   /**
    * Hand the replayed image of block (dir, k) to its home's first load.
    * @param dir packed directory id
@@ -937,6 +940,11 @@ class Runtime : public clio::run::Container {
    *         stops pushing it here)
    */
   int ApplyTablePush(const FsReq &req);
+  /** CLIO_EVLAT timing one row mutation accumulates across its waits. */
+  struct RowEvlat {
+    /** Cycles spent waiting before its commit started (fs_row_wait). */
+    unsigned long long wait_cyc_ = 0;
+  };
   /**
    * Record a change to a home block (ns_mu_ held): bumps its version and
    * queues the delta for the next push.
@@ -953,9 +961,13 @@ class Runtime : public clio::run::Container {
    * @param slot home block
    * @param version version the caller needs committed
    * @param rc 0 or EIO (the blob write failed)
+   * @param ev CLIO_EVLAT timing of the row mutation this commit is for, or
+   *        null (untimed): the wait before this task's commit starts is
+   *        added to it, and the commit's stages are recorded (fs_row_*)
    */
   clio::run::TaskResume CommitBlock(std::shared_ptr<TableBlockSlot> slot,
-                                    clio::run::u64 version, int &rc);
+                                    clio::run::u64 version, int &rc,
+                                    RowEvlat *ev = nullptr);
   /**
    * Send a push (shard op `op`, request `req`) to every holder of a cached
    * block or inode in parallel and wait for them. Holders that no longer
@@ -1292,6 +1304,39 @@ class Runtime : public clio::run::Container {
    */
   clio::run::TaskResume DiscardInodeRecord(const clio::cte::core::TagId &id);
   /**
+   * kShardInodeCreate, on the new inode's owner: store the record of a new
+   * regular file (and its mirror on the successor, awaited) exactly as
+   * CreateInodeRecord does, keep the inode resident, and open it. One
+   * request does what a record store from the creator followed by a
+   * kShardInodeOpen did, and the open needs no record read (EnsureInode)
+   * since the inode never left memory. The name is not published yet: the
+   * creator inserts the row after this returns, and sends
+   * kShardInodeDiscard if that does not publish this inode.
+   * @param req id_ the minted id, mode_ the permission bits, dir_ the path
+   *        it is created under
+   * @param resp OUT handle_ and attr_, as kShardInodeOpen fills them
+   * @param rc OUT 0; kFsRedirect when this container does not own the id
+   *        (nothing was stored: the creator uses the two-step form);
+   *        ENOSPC / EIO when the record could not be stored
+   */
+  clio::run::TaskResume InodeCreateOpen(const FsReq &req, FsResp &resp,
+                                        int &rc);
+  /**
+   * kShardInodeDiscard, on the container that ran kShardInodeCreate: close
+   * the handle that create opened and discard the inode and its record
+   * (DiscardInodeRecord). For an inode whose name was never published.
+   * @param req id_ the inode, a_ the handle kShardInodeCreate returned
+   */
+  clio::run::TaskResume InodeDiscard(const FsReq &req);
+  /**
+   * True when a create-and-open of `packed` may be sent to its owner as one
+   * kShardInodeCreate: the owner is another container (homed here, the
+   * two-step form already costs no round trip) and the shared-memory mirror
+   * is off (an open publishes the path there, which must follow the name).
+   * @param packed the new inode's packed id
+   */
+  bool CombinedCreateOk(clio::run::u64 packed);
+  /**
    * Create an inode and its first name: mint an id homed by the path (or
    * adopt the client-minted r.id_), store the inode's record, then insert
    * the row on its block's home. A name taken meanwhile yields the existing
@@ -1302,11 +1347,51 @@ class Runtime : public clio::run::Container {
    * @param symlink target (symlinks)
    * @param flags kInsExcl, kInsPending (mkdir) or 0
    * @param er OUT the insert result; created_ != 0 when the name is new
+   * @param opened when non-null (a regular file the caller opens next, id
+   *        minted here): OUT handle_ != 0 and attr_ set when the inode's
+   *        owner stored the record and opened the file in one request
+   *        (kShardInodeCreate) and the name was published for it; the
+   *        caller then skips its kShardInodeOpen. Left with handle_ == 0
+   *        otherwise (two-step form used, or the create did not publish
+   *        this inode -- its handle is already closed).
    */
   clio::run::TaskResume CreateEntry(FsReq r, clio::run::u32 type,
                                     clio::run::u32 mode,
                                     const std::string &symlink,
-                                    clio::run::u32 flags, FsResp &er);
+                                    clio::run::u32 flags, FsResp &er,
+                                    FsResp *opened = nullptr);
+  /**
+   * CreateEntry's one-request form of "store the record, then open": ask
+   * the new file's owner to do both (kShardInodeCreate).
+   * @param owner the container that owns the id (InodeOwner)
+   * @param packed the new inode's packed id
+   * @param mode permission bits
+   * @param path the path it is created under
+   * @param opened OUT the owner's reply (handle_, attr_) when stored
+   * @param rc OUT 0, or the errno the create fails with (nothing is left
+   *        open on the owner)
+   * @param stored OUT true: the record is stored and the file is open on
+   *        the owner. false with rc == 0: the owner declined (it does not
+   *        own the id in its view) and stored nothing -- the caller stores
+   *        the record itself
+   */
+  clio::run::TaskResume CreateOpenAtOwner(clio::run::u32 owner,
+                                          clio::run::u64 packed,
+                                          clio::run::u32 mode,
+                                          const std::string &path,
+                                          FsResp &opened, int &rc,
+                                          bool &stored);
+  /**
+   * Take back what CreateOpenAtOwner left on the owner: close the handle
+   * and discard the record there (kShardInodeDiscard); when the owner
+   * cannot be reached, delete the record from here (DiscardInodeRecord).
+   * @param owner the container CreateOpenAtOwner asked
+   * @param id the inode
+   * @param handle the handle it returned
+   */
+  clio::run::TaskResume DiscardAtOwner(clio::run::u32 owner,
+                                       clio::cte::core::TagId id,
+                                       clio::run::u64 handle);
   /**
    * The root directory's record, created by its home the first time the
    * volume is used: it carries the volume's flags (kVolume*) from then on.
@@ -1502,6 +1587,46 @@ class Runtime : public clio::run::Container {
   clio::run::TaskResume StoreInodeRec(clio::run::u64 packed,
                                       const std::string &rec, int &rc);
   /**
+   * StoreInodeRec's first half: store the record in its owner's CTE
+   * container and wait for it. No mirror.
+   * @param packed the inode's packed tag id
+   * @param rec the encoded record
+   * @param rc OUT the store's return code (0 on success; EIO when the CTE
+   *        is not bound yet)
+   */
+  clio::run::TaskResume StoreInodeRecPrimary(clio::run::u64 packed,
+                                             const std::string &rec, int &rc);
+  /**
+   * StoreInodeRec's second half, not awaited: send the record's mirror to
+   * the home's first successor, when there is one to send it to (more than
+   * one container, the successor alive and not the container the record was
+   * just stored on). The caller awaits what is appended; the result is not
+   * an error (the mirror is best effort).
+   * @param packed the inode's packed tag id
+   * @param rec the encoded record
+   * @param out the mirror's future is appended (nothing when not sent)
+   */
+  void SendInodeMirror(
+      clio::run::u64 packed, const std::string &rec,
+      std::vector<clio::run::Future<clio::cte::core::TagXattrTask>> *out);
+  /**
+   * FlushInodes' work on one inode: store its record here, then mirror it
+   * on the successor and push the attributes to its holders at the same
+   * time; all three have completed when this returns.
+   * @param packed the inode's packed tag id
+   * @param rec the encoded record
+   * @param push the encoded attribute push (kShardInodePush payload)
+   * @param holders the containers caching the inode (with registrations)
+   * @param leases their lease ends (steady ms)
+   * @param src OUT the store's return code (0 on success)
+   * @param gone OUT holders PushToHolders gave up on
+   */
+  clio::run::TaskResume StoreAndPushInode(
+      clio::run::u64 packed, const std::string &rec, const std::string &push,
+      const std::map<clio::run::u32, clio::run::u64> &holders,
+      const std::map<clio::run::u32, clio::run::u64> &leases, int &src,
+      std::vector<clio::run::u32> *gone);
+  /**
    * Store every dirty inode record and push it to its holders. Each dirty
    * inode is tried once per call: one that cannot be stored (a full store)
    * stays dirty for a later flush instead of being retried in a loop that
@@ -1617,9 +1742,12 @@ class Runtime : public clio::run::Container {
    * @param name dir_id_ / dir_ / leaf_ of the name
    * @param er out: id_, type_, created_ of the entry
    * @param done out: true when the task's reply is final
+   * @param opened out: handle_ != 0 when a create already opened the new
+   *        file on its inode's owner (see CreateEntry); the second stage is
+   *        then skipped
    */
   clio::run::TaskResume OpenName(OpenTask *task, const FsReq &name,
-                                 FsResp &er, bool &done);
+                                 FsResp &er, bool &done, FsResp &opened);
   /** Holder side of an inode push (req.id_, attrs in req.str_; b_=1 drop). */
   int ApplyInodePush(const FsReq &req);
   /**
@@ -1746,6 +1874,8 @@ enum FsShardOp : clio::run::u32 {
   kShardInodePush = 20,     ///< apply an inode home's attribute push
   kTableStandInFetch = 21,  ///< send the block this container served as a stand-in (#1322)
   kTableLoadBlocks = 22,    ///< load a group of a directory's blocks into this container's cache
+  kShardInodeCreate = 23,   ///< store a new file's record, keep it resident and open it
+  kShardInodeDiscard = 24,  ///< undo kShardInodeCreate: close its handle, drop its record
 };
 
 /** Insert flags (FsReq::flags_ of kTableInsert). */

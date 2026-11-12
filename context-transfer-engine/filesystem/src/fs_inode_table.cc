@@ -65,8 +65,11 @@
 
 #include <clio_cte/core/blob_placement.h>
 #include <clio_cte/filesystem/filesystem_runtime.h>
+#include <clio_runtime/evlat.h>
 
 namespace clio::cte::filesystem {
+
+namespace ev = clio::run::evlat;
 
 namespace {
 
@@ -1086,22 +1089,32 @@ void WarnIfSlowCommit(clio::run::u64 dir, clio::run::u32 k,
 
 clio::run::TaskResume Runtime::WriteCommitRecords(
     clio::run::u64 dir, clio::run::u32 k, BlockBlobWrite &blob, FsLogRec jtype,
-    const std::string &jrec, int &wrc, bool &mirror_failed) {
+    const std::string &jrec, int &wrc, bool &mirror_failed, bool ev_timed) {
   CLIO_TASK_BODY_BEGIN
   wrc = 0;
   mirror_failed = false;
   if (!dir_journal_) {
     // The blob is the only persistence.
-    if (!blob.bytes_.empty()) CLIO_CO_AWAIT(WriteBlockBlob(dir, k, blob, wrc));
+    if (!blob.bytes_.empty()) {
+      const unsigned long long ev_b0 = ev_timed ? ev::Now() : 0;
+      CLIO_CO_AWAIT(WriteBlockBlob(dir, k, blob, wrc));
+      ev::Span(ev::kFsRowBlob, ev_b0, ev::Now());
+    }
     CLIO_CO_RETURN;
   }
   // With the journal, the record is journaled first and the blob is the
   // replicated mirror a stand-in reads while this node is down (#1263); the
   // change is acknowledged only once both are written.
-  if (!jrec.empty()) wrc = JournalAppend(jtype, jrec);
+  if (!jrec.empty()) {
+    const unsigned long long ev_j0 = ev_timed ? ev::Now() : 0;
+    wrc = JournalAppend(jtype, jrec);
+    ev::Span(ev::kFsRowJournal, ev_j0, ev::Now());
+  }
   if (wrc == 0 && !blob.bytes_.empty()) {
     int mrc = 0;
+    const unsigned long long ev_b0 = ev_timed ? ev::Now() : 0;
     CLIO_CO_AWAIT(WriteBlockBlob(dir, k, blob, mrc));
+    ev::Span(ev::kFsRowBlob, ev_b0, ev::Now());
     if (mrc == ENOSPC) {
       // The change is durable in this node's journal; only the replicated
       // mirror a stand-in would read is behind. Failing the operation for
@@ -1217,9 +1230,14 @@ void Runtime::SettleMutationReply(const FsReq &req, FsResp &resp, bool lost) {
 }
 
 clio::run::TaskResume Runtime::CommitBlock(std::shared_ptr<TableBlockSlot> slot,
-                                           clio::run::u64 version, int &rc) {
+                                           clio::run::u64 version, int &rc,
+                                           RowEvlat *ev) {
   CLIO_TASK_BODY_BEGIN
   rc = 0;
+  // fs_row_wait: from here until this task's own commit starts, or until it
+  // finds its version made durable by another task's commit (group commit).
+  const unsigned long long ev_w0 = ev != nullptr ? clio::run::CycleNow() : 0;
+  bool ev_waiting = ev != nullptr;
   for (;;) {
     std::vector<TableDelta> deltas;
     BlockBlobWrite blob;  // what the blob gets: an image or an appended frame
@@ -1259,11 +1277,15 @@ clio::run::TaskResume Runtime::CommitBlock(std::shared_ptr<TableBlockSlot> slot,
       CLIO_CO_AWAIT(clio::run::yield(kCommitPollUs));
       continue;
     }
+    if (ev_waiting) {
+      ev->wait_cyc_ += clio::run::CycleNow() - ev_w0;
+      ev_waiting = false;
+    }
     int wrc = 0;
     bool mirror_failed = false;
     const auto commit_t0 = std::chrono::steady_clock::now();
     CLIO_CO_AWAIT(WriteCommitRecords(dir, k, blob, jtype, jrec, wrc,
-                                     mirror_failed));
+                                     mirror_failed, ev != nullptr));
     if (TraceDirBlock()) {
       HLOG(kWarning, "[DIRBLOCK] commit {}/{} wrote {} of {} bytes (rc {})",
            dir, k,
@@ -1277,8 +1299,14 @@ clio::run::TaskResume Runtime::CommitBlock(std::shared_ptr<TableBlockSlot> slot,
     if (pushed) {
       FsReq pr;
       pr.str_ = EncodeTableDeltas(deltas);
+      const unsigned long long ev_p0 = ev != nullptr ? ev::Now() : 0;
       CLIO_CO_AWAIT(PushToHolders(kTablePush, pr, push.holders_, push.leases_,
                                   &gone, &push.own_));
+      ev::Span(ev::kFsRowPush, ev_p0, ev::Now());
+    }
+    // Fan-out of this commit: 0 when nothing was pushed.
+    if (ev != nullptr) {
+      ev::Count(ev::kFsRowHolders, pushed ? push.holders_.size() : 0);
     }
     WarnIfSlowCommit(dir, k, commit_t0, push.holders_.size(), resync);
     {
@@ -1308,6 +1336,7 @@ clio::run::TaskResume Runtime::CommitBlock(std::shared_ptr<TableBlockSlot> slot,
       break;
     }
   }
+  if (ev_waiting) ev->wait_cyc_ += clio::run::CycleNow() - ev_w0;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
@@ -1500,9 +1529,16 @@ clio::run::TaskResume Runtime::RowMutation(clio::run::u32 op,
     resp.rc_ = kFsRedirect;
     CLIO_CO_RETURN;
   }
+  // CLIO_EVLAT: this container is the block's home. fs_row_exec is the whole
+  // mutation from here; row_ev collects its waits (fs_row_wait).
+  ev::ScopedSpan ev_exec(ev::kFsRowExec);
+  RowEvlat row_ev;
+  RowEvlat *const evp = ev::On() ? &row_ev : nullptr;
   std::shared_ptr<TableBlockSlot> slot;
   int rc = 0;
+  const unsigned long long ev_l0 = ev::Now();
   CLIO_CO_AWAIT(LoadBlock(req.dir_id_, req.block_, slot, rc));
+  ev::Span(ev::kFsRowLoad, ev_l0, ev::Now());
   if (rc != 0) {
     resp.rc_ = static_cast<clio::run::u32>(rc);
     CLIO_CO_RETURN;
@@ -1532,15 +1568,23 @@ clio::run::TaskResume Runtime::RowMutation(clio::run::u32 op,
       after = slot->blk_.version_;
     }
     if (rc != kFsRetry) break;
+    const unsigned long long ev_y0 = ev::Now();
     CLIO_CO_AWAIT(clio::run::yield(50));
+    if (ev_y0 != 0) row_ev.wait_cyc_ += clio::run::CycleNow() - ev_y0;
   }
   if (after != before) {
     int crc = 0;
-    CLIO_CO_AWAIT(CommitBlock(slot, after, crc));
+    CLIO_CO_AWAIT(CommitBlock(slot, after, crc, evp));
     if (crc != 0 && rc == 0) rc = crc;
   }
+  // One sample per mutation that reached its block, 0 included.
+  ev::Add(ev::kFsRowWait, row_ev.wait_cyc_);
   resp.rc_ = static_cast<clio::run::u32>(rc);
-  if (rc == 0 && op == kTableInsert) CLIO_CO_AWAIT(SplitBlock(slot));
+  if (rc == 0 && op == kTableInsert) {
+    const unsigned long long ev_s0 = ev::Now();
+    CLIO_CO_AWAIT(SplitBlock(slot));
+    ev::Span(ev::kFsRowSplit, ev_s0, ev::Now());
+  }
   {
     // Whatever the requester's copy was not pushed -- this change, and any
     // earlier one whose reply may not have arrived -- goes back with this.
