@@ -31,6 +31,7 @@
 # CLIO_FUSE_DIR_ATTR_CACHE_S (unset = off on multi-node): seconds the adapter
 # caches directory attributes; passed through to clio_cte_fuse unchanged.
 # DAOS_API (MODE=daos; dfuse): dfs runs IO500 on libdfs directly, no FUSE.
+# NO_FLARE (0): 1 drops the Flare tier; tiers are then DRAM + DAOS only.
 # HANG_DUMP_S (unset = off): seconds after IO500 starts at which a still-running
 # job dumps every node's runtime and adapter stacks (hang diagnosis).
 # PFIND_HASH (unset/0 = off): 1 adds
@@ -116,6 +117,9 @@ fi
 if [ "$MODE" = cliofs ]; then
   test -x "$BUILD_DIR/bin/clio_cte_fuse" || { echo "NO $BUILD_DIR/bin/clio_cte_fuse"; exit 2; }
   RAM_GB=$(( DATA_MB * RAM_PCT / 100 )); DAOS_GB=$(( DATA_MB * DAOS_PCT / 100 )); FL_GB=$(( DATA_MB * FLARE_X ))
+  # NO_FLARE=1: DRAM + DAOS only (the configuration to compare against DAOS).
+  # The DAOS tier becomes the overflow tier, sized DAOS_X (2) x the dataset.
+  if [ "${NO_FLARE:-0}" = 1 ]; then DAOS_GB=$(( DATA_MB * ${DAOS_X:-2} )); FL_GB=0; fi
   echo "=== cache module ${CACHE:-1}; data per node ${DATA_MB}MB; tiers per node: DRAM ${RAM_GB}MB (${RAM_PCT}%)  DAOS ${DAOS_GB}MB (${DAOS_PCT}%)  Flare ${FL_GB}MB (overflow)"
   daos pool query "$DAOS_POOL" 2>&1 | grep -i -E 'total size|free' | head -4
   daos cont query "$DAOS_POOL" "$DAOS_CONT" > /dev/null 2>&1 \
@@ -158,6 +162,8 @@ EOF
         capacity_limit: "${DAOS_GB}MB"
         score: 0.6
         persistence_level: "${PERSIST:-temporary}"
+EOF
+    [ "${NO_FLARE:-0}" = 1 ] || cat >> clio_server.yaml <<EOF
       - path: "$FLARE/tiers/$JOB/__HOST__.dat"
         bdev_type: "file"
         capacity_limit: "${FL_GB}MB"
@@ -366,6 +372,24 @@ echo "=== IO500 start $(date)"
 # node for the stacks of its runtime and adapter (logs/<host>.*.stacks).
 HD=""
 [ -n "${HANG_DUMP_S:-}" ] && { ( sleep "$HANG_DUMP_S"; touch dump; echo "=== hang dump requested $(date)" ) & HD=$!; }
+# SYNC_FS_ONLY=1: mdtest ends each phase with system("sync"), a whole-node
+# flush. On Aurora that blocked in the kernel on some nodes (16 sync processes
+# per node in D state for 10+ minutes with the filesystem under test idle),
+# hanging the run. This puts a `sync` first in PATH that flushes only the
+# filesystem under test (sync -f). It changes what the benchmark flushes, so
+# use the same setting for every system being compared.
+if [ "${SYNC_FS_ONLY:-0}" = 1 ]; then
+  case "$MODE" in
+    cliofs) SYNC_DIR=$LR/mnt ;;
+    daos)   SYNC_DIR=/tmp/$USER/daos_io500 ;;
+    *)      SYNC_DIR=$DATADIR ;;
+  esac
+  mkdir -p "$OUT/bin"
+  printf '#!/bin/sh\nexec /usr/bin/sync -f %s\n' "$SYNC_DIR" > "$OUT/bin/sync"
+  chmod +x "$OUT/bin/sync"
+  export PATH=$OUT/bin:$PATH
+  echo "=== sync limited to $SYNC_DIR"
+fi
 # libdfs clients reach the DAOS servers over the fabric themselves, which the
 # launcher's per-job VNI blocks (NA_HOSTUNREACH); --no-vni as for dfuse.
 NOVNI=""
