@@ -67,6 +67,7 @@
 // fuse_cte_main.cc. This file holds only the operation callbacks.
 
 #include "clio_runtime/clio_runtime.h"
+#include "clio_runtime/evlat.h"  // CLIO_EVLAT rd_* / wr_* stage timers
 #include "clio_cte/core/content_transfer_engine.h"
 #include "clio_cte/core/core_client.h"  // CLIO_CTE_CLIENT + GetCapacity
 #include "clio_cte/filesystem/filesystem_client.h"
@@ -163,6 +164,10 @@ struct StatAttrs {
 /** Bumped by every truncate/chmod/chown/utimens/fallocate through this
  *  mount: attributes kept from before one are not served (TakeOpenAttrs). */
 std::atomic<clio::run::u64> g_setattr_epoch{0};
+/** Seconds the kernel may cache FILE attributes (cfg->attr_timeout); set at
+ *  init. When positive, a read through an open handle reuses the size it
+ *  last fetched for that long (see ReadClampSize). 0: every read asks. */
+double g_file_attr_ttl_s = 0.0;
 
 /** Per-open-file state: the chimod handle + the path it was opened on. */
 struct CfsHandle {
@@ -201,6 +206,11 @@ struct CfsHandle {
   std::thread::id open_attr_thread;                    // the creating thread
   std::chrono::steady_clock::time_point open_attr_at;  // when they were kept
   clio::run::u64 open_attr_epoch = 0;                  // g_setattr_epoch then
+  // Size last fetched for a read through this handle, reused for
+  // g_file_attr_ttl_s (ReadClampSize). rd_size_ns == 0: nothing kept.
+  std::atomic<clio::run::u64> rd_size{0};
+  std::atomic<int64_t> rd_size_ns{0};  // steady-clock ns when it was fetched
+  std::atomic<clio::run::u64> rd_size_epoch{0};  // g_setattr_epoch then
 };
 
 // ---------------------------------------------------------------------------
@@ -1866,6 +1876,7 @@ static void *cte_fuse_init(struct fuse_conn_info *conn,
   if (const char *ttl_env = getenv("CLIO_FUSE_ATTR_CACHE_S")) {
     if (*ttl_env != '\0') attr_ttl = atof(ttl_env);
   }
+  g_file_attr_ttl_s = attr_ttl > 0.0 ? attr_ttl : 0.0;
   // The ENTRY (name -> inode) cache is kept even on multi-node mounts. The
   // namespace is hash-sharded, so with a zero entry TTL every path component
   // of every syscall was its own round trip to that component's owner
@@ -2546,6 +2557,49 @@ static int OpenHandleSize(CfsHandle *h, const std::string &hp,
   clio::run::Future<clio::cte::filesystem::GetattrTask> t;
   const int rc = GetattrOpenHandle(h, hp, &t);
   *size = rc == 0 ? t->size_ : 0;
+  return rc;
+}
+
+/**
+ * The size a read of [off, off+len) through `h` clamps to. With a file
+ * attribute TTL (CLIO_FUSE_ATTR_CACHE_S > 0) the size fetched by an earlier
+ * read of this handle is reused while it is younger than the TTL, no
+ * truncate/setattr went through this mount since, and the read ends inside
+ * it; a read reaching the kept size asks again, so end-of-file is always
+ * decided on a fresh answer. Without a TTL every read asks, as before: on a
+ * multi-node mount the lookup is a round trip to the file's home whenever
+ * this node's mirror has no record of the file, and it was 28% of a 284 KiB
+ * read (8 nodes, CLIO_EVLAT rd_size 262 us of rd_total 934 us).
+ * @param h the open file
+ * @param hp its current path
+ * @param off read offset
+ * @param len read length
+ * @param size out: the file's logical size
+ * @return 0, -ENOENT or -EIO
+ */
+static int ReadClampSize(CfsHandle *h, const std::string &hp,
+                         clio::run::u64 off, clio::run::u64 len,
+                         clio::run::u64 *size) {
+  const double ttl = g_file_attr_ttl_s;
+  const clio::run::u64 epoch = g_setattr_epoch.load(std::memory_order_relaxed);
+  const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+  if (ttl > 0.0) {
+    const int64_t at = h->rd_size_ns.load(std::memory_order_acquire);
+    const clio::run::u64 kept = h->rd_size.load(std::memory_order_relaxed);
+    if (at != 0 && static_cast<double>(now_ns - at) < ttl * 1e9 &&
+        h->rd_size_epoch.load(std::memory_order_relaxed) == epoch &&
+        off + len <= kept) {
+      *size = kept;
+      return 0;
+    }
+  }
+  const int rc = OpenHandleSize(h, hp, size);
+  if (ttl > 0.0 && rc == 0) {
+    h->rd_size.store(*size, std::memory_order_relaxed);
+    h->rd_size_epoch.store(epoch, std::memory_order_relaxed);
+    h->rd_size_ns.store(now_ns, std::memory_order_release);
+  }
   return rc;
 }
 
@@ -4054,6 +4108,8 @@ static void TouchAtimeOnRead(CfsHandle *handle, const std::string &hp) {
 
 int cte_fuse_read(const char *path, char *buf, size_t size,
                          cte_off_t offset, struct fuse_file_info *fi) {
+  namespace ev = clio::run::evlat;
+  ev::ScopedSpan ev_total(ev::kRdTotal);
   auto *handle = GetHandle(fi);
   if (!handle) return -EBADF;
   const std::string hp = HandlePath(handle, path);
@@ -4094,12 +4150,14 @@ int cte_fuse_read(const char *path, char *buf, size_t size,
              total_ms, size_ms, pages, rc, k + 1);
       }
     };
+    const unsigned long long ev_sz0 = ev::Now();
     if (!PendingCreateLookup(hp, &pc_probe)) {
       // A pending minted create's whole size story is local; only ask the
       // chimod once the file exists server-side.
       // The descriptor's own file: after a rename over its name the path
       // names another file (or, mid-rename, none) and read 0 bytes.
-      const int src = OpenHandleSize(handle, hp, &fsize);
+      const int src = ReadClampSize(
+          handle, hp, static_cast<clio::run::u64>(offset), size, &fsize);
       size_ms = std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - read_t0)
                     .count();
@@ -4113,16 +4171,20 @@ int cte_fuse_read(const char *path, char *buf, size_t size,
     }
     clio::run::u64 hw = HiwaterFor(hp);
     if (hw > fsize) fsize = hw;
+    ev::Span(ev::kRdSize, ev_sz0, ev::Now());
     clio::run::u64 off = static_cast<clio::run::u64>(offset);
     if (off >= fsize) return 0;
     clio::run::u64 want = std::min<clio::run::u64>(size, fsize - off);
     std::memset(buf, 0, want);  // holes / short pages read as zeros
     clio::run::u64 done = 0;
+    clio::run::u64 ev_pages = 0;
     while (done < want) {
       clio::run::u64 cur = off + done;
       clio::run::u64 page_off = cur % clio::cte::filesystem::kFsPageSize;
       clio::run::u64 n = std::min<clio::run::u64>(
           clio::cte::filesystem::kFsPageSize - page_off, want - done);
+      const unsigned long long ev_pg0 = ev::Now();
+      ++ev_pages;
       // A page sent to its owner just before the owner was declared dead
       // completes with the node-lost code; sent again it routes to the
       // stand-in, which serves it. Only after the retries is it EIO.
@@ -4159,6 +4221,7 @@ int cte_fuse_read(const char *path, char *buf, size_t size,
         std::this_thread::sleep_for(
             std::chrono::milliseconds(kReadNodeLostRetryMs));
       }
+      ev::Span(ev::kRdPage, ev_pg0, ev::Now());
       if (attempt > 0) {
         // Where a slow failing read spent its time (#1169): how many
         // node-lost answers it retried and what it ended with. Rate-limited:
@@ -4192,6 +4255,8 @@ int cte_fuse_read(const char *path, char *buf, size_t size,
     }
     slow_read(0, (want + clio::cte::filesystem::kFsPageSize - 1) /
                      clio::cte::filesystem::kFsPageSize);
+    ev::Count(ev::kRdPages, ev_pages);
+    ev::Count(ev::kRdBytes, (want + 512) / 1024);
     return static_cast<int>(want);
   }
   // cfs tiered read fallback.
@@ -4225,6 +4290,8 @@ static int CheckWriteBehindNoSpace(CfsHandle *handle, const std::string &hp) {
 
 int cte_fuse_write(const char *path, const char *buf, size_t size,
                           cte_off_t offset, struct fuse_file_info *fi) {
+  namespace ev = clio::run::evlat;
+  ev::ScopedSpan ev_total(ev::kWrTotal);
   auto *handle = GetHandle(fi);
   if (!handle) return -EBADF;
   const std::string hp = HandlePath(handle, path);
@@ -4275,12 +4342,14 @@ int cte_fuse_write(const char *path, const char *buf, size_t size,
       clio::run::u64 page_off = cur % clio::cte::filesystem::kFsPageSize;
       clio::run::u64 n = std::min<clio::run::u64>(
           clio::cte::filesystem::kFsPageSize - page_off, size - done);
+      const unsigned long long ev_pg0 = ev::Now();
       int rc = cte->AsyncPutBlobDefer(
           handle->tag, clio::cte::filesystem::PageName(cur), page_off, n,
           buf + done,
           g_page_score.ScoreOf(cur / clio::cte::filesystem::kFsPageSize),
           clio::cte::core::Context(), 0,
           clio::run::PoolQuery::Dynamic(), WriteInflightBytes());
+      ev::Span(ev::kWrPage, ev_pg0, ev::Now());
       if (rc != 0) {
         // A full store is ENOSPC (as on ext4); anything else is EIO.
         return (rc > 0 && clio::cte::core::PutRcIsNoSpace(

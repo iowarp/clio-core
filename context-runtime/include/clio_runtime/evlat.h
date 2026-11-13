@@ -133,7 +133,47 @@ enum Chan : int {
   kFsSzHome = 58,
   kFsSzStream = 59,
   kFsSzFlush = 60,
-  kNumChan = 61,
+  // 61-76: the clio-fs file data path, each stage timed in the process that
+  // runs it. Microseconds except rd_pages (a count) and rd_bytes (KiB).
+  //   FUSE adapter (a client process; CLIO_EVLAT in ITS environment):
+  //     rd_total  whole cte_fuse_read
+  //     rd_size   size lookup of a sieve read: OpenHandleSize + hiwater
+  //     rd_page   one page: AsyncGetBlobDefer -> Wait returned (bytes in the
+  //               caller's buffer), any node-lost retries included
+  //     rd_pages  pages one read fetched;  rd_bytes  KiB one read returned
+  //     wr_total  whole cte_fuse_write
+  //     wr_page   one AsyncPutBlobDefer call (pacing wall, overlap drain,
+  //               staging copy, submit -- the put itself is NOT awaited)
+  //   originating container (cache module, where the client's task runs):
+  //     gb_local  GetBlob served by this node's core, inline
+  //     gb_fwd    GetBlob sent to the blob's owner, send -> reply
+  //     pb_fwd    PutBlob sent to the blob's owner, send -> reply
+  //   owner container (core GetBlobImpl / PutBlobImpl). The whole get is the
+  //   older get_total; get_meta is entry -> read start (it CONTAINS gb_tok);
+  //   read_await is the target read (direct_read = one inline block copy):
+  //     gb_tok    writer wait (torn-layout guard) + reader-pin retries
+  //     pb_exec   whole PutBlobImpl
+  //     pb_tok    waiting for the blob's write token
+  //     pb_drain  waiting for pinned readers to leave
+  //     pb_alloc  PlaceBlobBytes (extend / allocate / make room)
+  //     pb_bdev   the data write(s) to the target (ModifyExistingData)
+  kRdTotal = 61,
+  kRdSize = 62,
+  kRdPage = 63,
+  kRdPages = 64,
+  kRdBytes = 65,
+  kWrTotal = 66,
+  kWrPage = 67,
+  kGbLocal = 68,
+  kGbFwd = 69,
+  kPbFwd = 70,
+  kGbTok = 71,
+  kPbExec = 72,
+  kPbTok = 73,
+  kPbDrain = 74,
+  kPbAlloc = 75,
+  kPbBdev = 76,
+  kNumChan = 77,
 };
 
 enum Busy : int { kBusyPeerRecv = 0, kBusyNetSend = 1, kNumBusy = 2 };

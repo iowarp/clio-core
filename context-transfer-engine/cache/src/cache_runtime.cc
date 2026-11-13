@@ -9,6 +9,7 @@
 
 #include <clio_cte/cache/cache_runtime.h>
 #include <clio_cte/core/blob_placement.h>
+#include <clio_runtime/evlat.h>
 
 namespace clio::cte::cache {
 
@@ -441,11 +442,15 @@ clio::run::TaskResume Runtime::PutBlobMdOnly(
     clio::run::u32 rc = 0;
     Context out_ctx = orig_ctx;
     for (size_t i = 0; i < regions.size() && rc == 0; ++i) {
+      // CLIO_EVLAT pb_fwd: the put at the blob's owner, send -> reply.
+      const unsigned long long ev_f0 = clio::run::evlat::Now();
       auto put = next->AsyncPutBlob(task->tag_id_, blob_name,
                                     regions[i].blob_off_, regions[i].size_,
                                     regions[i].data_, task->score_,
                                     orig_ctx, task->flags_);
       CLIO_CO_AWAIT(put);
+      clio::run::evlat::Span(clio::run::evlat::kPbFwd, ev_f0,
+                             clio::run::evlat::Now());
       rc = put->GetReturnCode();
       out_ctx = put->context_;
       if (task->flags_ & clio::cte::core::kCtePutAppend) {
@@ -675,11 +680,15 @@ clio::run::TaskResume Runtime::FetchFromOwnerChain(
     clio::run::u32 out_tflags = 0;
     clio::run::u64 fetch_version = 0;
     for (size_t i = 0; i < regions.size() && rc == 0; ++i) {
+      // CLIO_EVLAT gb_fwd: the get at the blob's owner, send -> reply.
+      const unsigned long long ev_f0 = clio::run::evlat::Now();
       auto get = next->AsyncGetBlob(
           task->tag_id_, blob_name, regions[i].blob_off_, regions[i].size_,
           task->flags_, regions[i].data_, clio::run::PoolQuery::Dynamic(),
           task->context_);
       CLIO_CO_AWAIT(get);
+      clio::run::evlat::Span(clio::run::evlat::kGbFwd, ev_f0,
+                             clio::run::evlat::Now());
       rc = get->GetReturnCode();
       out_tflags = get->context_.transform_flags_;
       if (i == 0) {
@@ -705,8 +714,12 @@ clio::run::TaskResume Runtime::GetBlobMdOnly(
     // this node never creates a copy, so there is none to drop. The owner
     // node reads its node-local primary inline, as the full path does.
     if (IsBlobOwnerLocal(task->tag_id_, task->blob_name_.str())) {
+      // CLIO_EVLAT gb_local: the get served by this node's own core.
+      const unsigned long long ev_l0 = clio::run::evlat::Now();
       CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kGetBlob,
                                   task.template Cast<clio::run::Task>()));
+      clio::run::evlat::Span(clio::run::evlat::kGbLocal, ev_l0,
+                             clio::run::evlat::Now());
       CLIO_CO_RETURN;
     }
     CLIO_CO_AWAIT(FetchFromOwnerChain(task));
