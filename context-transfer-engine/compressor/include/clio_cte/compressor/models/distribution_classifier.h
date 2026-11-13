@@ -53,6 +53,9 @@
 
 namespace clio::cte::compressor {
 
+/** pi; M_PI is not standard C++ (absent without _USE_MATH_DEFINES on Windows). */
+inline constexpr double kPi = 3.14159265358979323846;
+
 /**
  * Distribution type enumeration
  */
@@ -275,7 +278,7 @@ class DistributionClassifier {
       double bin_center = data_min + (i + 0.5) * bin_width;
       double z = (bin_center - mean) / sigma;
       // Normal PDF: 1/(σ√2π) * exp(-z²/2)
-      double expected = std::exp(-0.5 * z * z) / (sigma * std::sqrt(2.0 * M_PI));
+      double expected = std::exp(-0.5 * z * z) / (sigma * std::sqrt(2.0 * kPi));
       expected *= bin_width;  // Convert PDF to probability in bin
 
       if (expected < 1e-10) expected = 1e-10;
@@ -313,7 +316,7 @@ class DistributionClassifier {
 
     // Precompute log(Gamma(k)) using Stirling approximation for large k
     double log_gamma_k = (k > 10) ?
-        (k - 0.5) * std::log(k) - k + 0.5 * std::log(2 * M_PI) :
+        (k - 0.5) * std::log(k) - k + 0.5 * std::log(2 * kPi) :
         std::lgamma(k);
 
     for (size_t i = 0; i < n; ++i) {

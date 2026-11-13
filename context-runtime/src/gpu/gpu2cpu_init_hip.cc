@@ -482,7 +482,13 @@ CLIO_RUN_GPU_API bool ChiServerBootstrapHipGpu(IpcManager *self,
 // CPU-launched copy KERNEL service (see mem_bdev_transport bounce): engine
 // copies of device memory stall in channel order behind a resident kernel;
 // kernels are SM-scheduled and run on free SMs. C linkage so the plain-C++
-// transport TU can call it.
+// transport TU can call it. Exported explicitly: a Windows DLL exports
+// nothing by default, and gpu_api.h calls this from other modules.
+// (A linker directive, not __declspec: the first declaration is in
+// gpu_api.h, and dllexport cannot be added on a redeclaration.)
+#if defined(_WIN32) && !defined(__CUDA_ARCH__)
+#pragma comment(linker, "/EXPORT:ctp_copy_kernel_launch")
+#endif
 extern "C" void ctp_copy_kernel_launch(char *dst, const char *src, size_t n,
                                        void *stream) {
 #if CTP_ENABLE_CUDA

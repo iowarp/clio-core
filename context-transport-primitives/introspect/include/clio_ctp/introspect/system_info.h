@@ -172,6 +172,41 @@ class SystemInfo {
 
   CTP_DLL void SetCpuMaxFreqKhz(int cpu, size_t cpu_freq_khz);
 
+  /**
+   * Register a cleanup FatalExit runs before the process ends (last added,
+   * first run). For state the OS cannot tear down safely on its own -- a
+   * CUDA context with work in flight is the reason this exists: a process
+   * that dies around one (exit() racing on several threads, a hard kill)
+   * can wedge inside the GPU driver and never finish terminating.
+   * @param fn  the cleanup; must not call FatalExit
+   * @param arg passed to fn
+   * @return an id for RemoveExitCleanup
+   */
+  CTP_DLL static int AddExitCleanup(void (*fn)(void *), void *arg);
+
+  /** Drop a cleanup registered with AddExitCleanup (it no longer applies). */
+  CTP_DLL static void RemoveExitCleanup(int id);
+
+  /**
+   * End the process after an unrecoverable error, in order. Exactly ONE
+   * caller proceeds: it runs the registered cleanups on a helper thread
+   * (bounded by CLIO_FATAL_CLEANUP_MS, default 15000, so a cleanup that
+   * blocks cannot keep the process alive), flushes stdio and calls _Exit --
+   * no atexit handlers or static destructors running under live threads.
+   * Any later caller, from any thread, parks forever: it must not re-enter
+   * teardown.
+   * @param code the process exit code
+   */
+  [[noreturn]] CTP_DLL static void FatalExit(int code);
+
+  /**
+   * Route the abnormal ways a process ends through FatalExit:
+   * std::terminate (uncaught exceptions, including on std::threads),
+   * Ctrl-C / Ctrl-Break / console close on Windows, SIGINT / SIGTERM on
+   * POSIX. Idempotent.
+   */
+  CTP_DLL static void InstallExitGuards();
+
   CTP_DLL static int GetCpuCount();
 
   CTP_DLL static int GetPageSize();

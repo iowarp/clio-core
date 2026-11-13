@@ -36,6 +36,7 @@
 
 #include <algorithm>
 #include <array>
+#include <deque>
 #include <memory>
 #include <atomic>
 #include <functional>
@@ -357,7 +358,7 @@ public:
    * @param blocks the blob's current layout
    * @return the minimum PersistenceLevel (as int); 0 for an empty layout
    */
-  int DurabilityFloor(const clio::run::priv::vector<BlobBlock> &blocks);
+  int DurabilityFloor(const BlockList &blocks);
 
   void LogBlobLayout(const TagId &tag_id, const std::string &blob_name,
                      const BlobInfo &blob_info);
@@ -369,7 +370,7 @@ public:
    * @param level persistence level
    * @return true if at least one block is below `level`
    */
-  bool HasBlocksBelowLevelLocked(const clio::run::priv::vector<BlobBlock> &blocks,
+  bool HasBlocksBelowLevelLocked(const BlockList &blocks,
                                  int level);
 
   /**
@@ -419,6 +420,41 @@ public:
                                             const std::string &blob_name,
                                             clio::run::u64 &freed_bytes,
                                             clio::run::u32 &rc);
+
+  /** @return true when `pool` is a configured read_cache target. */
+  bool IsReadCachePool(const clio::run::PoolId &pool) const;
+
+  /** @return free bytes across every read_cache target (canonical values). */
+  clio::run::u64 ReadCacheFreeBytes();
+
+  /**
+   * Pick the copy a PRIMARY read should be served from: the blob's
+   * read-promotion copy when it is current (same version, size and
+   * transform state as the primary), else the primary.
+   * @param blob the blob being read (caller holds a read pin)
+   * @return raw 1-based replica index of the current read-cache copy, or 0
+   */
+  int CurrentReadCacheCopy(BlobInfo &blob);
+
+  /**
+   * Read promotion into the read_cache tier (the VRAM buffering tier when
+   * that tier is hbm). Copies the bytes a primary read just delivered into
+   * `src` -- the blob's whole STORED image -- into a REPLICA_READ_CACHE copy,
+   * evicting the oldest promoted copies first when the tier is full.
+   * Best-effort: any failure leaves the blob without a copy, never with a
+   * partial one, and never fails the read that triggered it.
+   * @param tag_id the blob's tag
+   * @param blob_name the blob's name
+   * @param src buffer holding the whole stored blob (host or device memory)
+   * @param size stored size in bytes
+   * @param version the blob's last_modified_ when `src` was read; the copy
+   *        is skipped if the blob has changed since
+   */
+  clio::run::TaskResume PromoteToReadCache(const TagId &tag_id,
+                                           const std::string &blob_name,
+                                           ctp::ipc::ShmPtr<> src,
+                                           clio::run::u64 size,
+                                           clio::run::u64 version);
 
   /** Put blob (Method::kPutBlob) - allocates and writes data to blob. */
   clio::run::TaskResume PutBlob(clio::run::shared_ptr<PutBlobTask> &task);
@@ -847,7 +883,7 @@ private:
    */
   void TraceCopyRead(const TagId &tag_id, const std::string &blob_name,
                      int replica_sel,
-                     const clio::run::priv::vector<BlobBlock> &blocks,
+                     const BlockList &blocks,
                      clio::run::u64 offset, clio::run::u64 size,
                      size_t declared_size);
 
@@ -889,6 +925,39 @@ private:
   // Cached Data Placement Engine — built once from config_ in Create() so
   // ExtendBlob does not allocate a fresh DPE on every PutBlob.
   std::unique_ptr<DataPlacementEngine> dpe_;
+
+  // ---- Read-cache (VRAM buffering) tier ----
+  /** bdev pools of the targets configured with read_cache: true. Written
+   *  once in Create before targets_ready_, read-only afterwards. */
+  std::vector<clio::run::PoolId> read_cache_pools_;
+  /** Promoted copies, oldest first: eviction order of the read-cache tier.
+   *  A key may be stale (its copy already reclaimed); reclaim tolerates it. */
+  struct ReadCacheEntry {
+    TagId tag_id;           /**< the promoted blob's tag */
+    std::string blob_name;  /**< the promoted blob's name */
+    Timestamp stamp_ns = 0; /**< when it entered (or re-entered) the queue */
+  };
+  std::deque<ReadCacheEntry> read_cache_lru_;
+  std::mutex read_cache_mu_;  /**< guards read_cache_lru_; never held across co_await */
+  std::atomic<clio::run::u64> rc_hits_{0};       /**< reads served from the tier */
+  std::atomic<clio::run::u64> rc_promotions_{0}; /**< copies made */
+  std::atomic<clio::run::u64> rc_evictions_{0};  /**< copies evicted for room */
+  std::atomic<clio::run::u64> rc_skipped_{0};    /**< promotions abandoned */
+  std::atomic<clio::run::u64> rc_events_{0};     /**< hits + promotions + skips: log pacing */
+  /** Count one read-cache event and log the counters every 4096 events. */
+  void ReadCacheEvent();
+  /** Age after which an unread read-cache copy may be evicted
+   *  (CLIO_READ_CACHE_COLD_MS, default 60000 ms: longer than a decode step, which re-reads each page once). */
+  static clio::run::u64 ReadCacheColdNs();
+  std::atomic<clio::run::u64> rc_noroom_{0};
+  /** Bytes the tier's free-space counter has been seen to overstate what
+   *  the bdev can actually allocate (learned from failed copy writes);
+   *  added to every room check so eviction starts before the bdev refuses. */
+  std::atomic<clio::run::u64> rc_skew_{0};
+  std::atomic<clio::run::u64> rc_noslot_{0};     /**< misses: blob never promoted */
+  std::atomic<clio::run::u64> rc_emptyslot_{0};  /**< misses: copy was evicted */
+  std::atomic<clio::run::u64> rc_writefail_{0};  /**< of rc_skipped_: copy write failed */     /**< of rc_skipped_: no room made */
+  std::atomic<clio::run::u64> rc_partial_{0};    /**< slow-tier reads too partial to promote */
 
   // Internal data organizer — built once from config_ in Create() (issue
   // #738). nullptr when config_.organizer_.name_ is "none"/unknown; the
@@ -1150,13 +1219,16 @@ private:
    * @param max_persistence_level Highest persistence level a target may have
    *                  (-1: no cap). Cache copies pass the temporary level so
    *                  they never take durable capacity (#1140).
+   * @param read_cache_place true: place ONLY on read_cache targets (a read
+   *                  promotion); false: never on them.
    */
   clio::run::TaskResume ExtendBlob(BlobInfo &blob_info, clio::run::u64 offset, clio::run::u64 size,
                              float blob_score, clio::run::u32 &error_code,
                              int min_persistence_level = 0,
                              clio::run::u64 preallocate = 0,
                              clio::run::u64 *shortfall = nullptr,
-                             int max_persistence_level = -1);
+                             int max_persistence_level = -1,
+                             bool read_cache_place = false);
 
   /**
    * One placement attempt for a put: grow-to-cover (ExtendBlob) or
@@ -1325,7 +1397,7 @@ private:
       std::vector<clio::run::Future<clio::run::bdev::WriteTask>> &write_tasks,
       std::vector<size_t> &expected_write_sizes,
       std::vector<std::pair<clio::run::u64, clio::run::u64>> &write_targets);
-  clio::run::TaskResume ModifyExistingData(const clio::run::priv::vector<BlobBlock> &blocks,
+  clio::run::TaskResume ModifyExistingData(const BlockList &blocks,
                                      ctp::ipc::ShmPtr<> data, size_t data_size,
                                      size_t data_offset_in_blob, clio::run::u32 &error_code,
                                      size_t start_block_idx = 0,
@@ -1341,7 +1413,7 @@ private:
    * Returns TaskResume for coroutine-based async operations
    */
 
-  clio::run::TaskResume ReadData(const clio::run::priv::vector<BlobBlock> &blocks, ctp::ipc::ShmPtr<> data,
+  clio::run::TaskResume ReadData(const BlockList &blocks, ctp::ipc::ShmPtr<> data,
                            size_t data_size, size_t data_offset_in_blob, clio::run::u32 &error_code,
                            size_t *bytes_covered = nullptr);
 
@@ -1360,7 +1432,7 @@ private:
    * @param is_write true = use write latency/bandwidth, false = read
    * @return Modeled duration in nanoseconds (0 if no blocks overlap)
    */
-  clio::run::u64 EstimateIoTimeNs(const clio::run::priv::vector<BlobBlock> &blocks,
+  clio::run::u64 EstimateIoTimeNs(const BlockList &blocks,
                                   clio::run::u64 offset, clio::run::u64 size,
                                   bool is_write);
 

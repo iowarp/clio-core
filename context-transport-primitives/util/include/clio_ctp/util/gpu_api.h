@@ -51,8 +51,10 @@
 #endif
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <thread>
+#include <cstdlib>
 #include <chrono>
 #include <atomic>
 #include <string>
@@ -166,6 +168,31 @@ class GpuApi {
 #elif CTP_ENABLE_SYCL
     // SYCL device selection is done via queue construction; no global set
     (void)gpu_id;
+#endif
+  }
+
+  /**
+   * Reset every device for process exit (SystemInfo::FatalExit cleanup).
+   * Destroys this process's primary context on each device, which aborts its
+   * in-flight work and releases its allocations and host registrations while
+   * the process is still whole -- so the OS never has to tear down a busy or
+   * faulted context of a dying process (that wedged processes inside the
+   * driver on Windows). Raw calls, errors ignored: a checked call would log
+   * kFatal and re-enter FatalExit from inside its own cleanup.
+   */
+  static void ResetAllDevicesForExit() {
+#if CTP_ENABLE_CUDA
+    int n = 0;
+    if (cudaGetDeviceCount(&n) != cudaSuccess) return;
+    for (int d = 0; d < n; ++d) {
+      if (cudaSetDevice(d) == cudaSuccess) (void)cudaDeviceReset();
+    }
+#elif CTP_ENABLE_ROCM
+    int n = 0;
+    if (hipGetDeviceCount(&n) != hipSuccess) return;
+    for (int d = 0; d < n; ++d) {
+      if (hipSetDevice(d) == hipSuccess) (void)hipDeviceReset();
+    }
 #endif
   }
 
@@ -441,34 +468,71 @@ class GpuApi {
     return dev;
   }
 
-  /** Free streams per device. Function-local so the header stays standalone. */
-  static std::unordered_map<int, std::vector<void *>> &StreamPool() {
-    static std::unordered_map<int, std::vector<void *>> pool;
-    return pool;
+  /**
+   * ALL stream-pool state, ONE PER PROCESS.
+   *
+   * This used to be function-local statics in these inline methods. On ELF
+   * that is one copy per process (the dynamic linker merges them). On
+   * WINDOWS EVERY DLL GETS ITS OWN COPY: the runtime warmed its pool,
+   * clio_bdev_runtime.dll saw an un-warmed one, bootstrapped a single stream
+   * and then spun on nullptr -- a gpu_vector fault livelock ("bdev write has
+   * waited ~10s for a stream (outstanding=1)", then ROUND CAP HIT). On
+   * Windows the first module to ask publishes the state's address in the
+   * process environment (shared by every DLL under the dynamic UCRT, /MD)
+   * and every other module adopts it. No <windows.h>: its macros collide
+   * with names across this tree.
+   */
+  struct StreamPoolState {
+    std::unordered_map<int, std::vector<void *>> pool;
+    std::mutex mtx;
+    std::atomic<long> borrows{0}, returns{0}, warmed{0};
+    std::unordered_map<int, bool> pool_warmed;
+    std::vector<void *> reserved;
+    std::atomic<int> reserved_next{0};
+  };
+  static StreamPoolState &PoolState() {
+#if defined(_WIN32)
+    static StreamPoolState *state = [] {
+      constexpr const char *kVar = "CTP_GPU_STREAM_POOL_ADDR";
+      auto adopt = [&]() -> StreamPoolState * {
+        const char *v = std::getenv(kVar);
+        if (v == nullptr || *v == '\0') return nullptr;
+        return reinterpret_cast<StreamPoolState *>(
+            static_cast<uintptr_t>(std::strtoull(v, nullptr, 16)));
+      };
+      if (StreamPoolState *s = adopt()) return s;
+      auto *mine = new StreamPoolState();  // process lifetime, never freed
+      char buf[32];
+      std::snprintf(buf, sizeof(buf), "%llx",
+                    static_cast<unsigned long long>(
+                        reinterpret_cast<uintptr_t>(mine)));
+      if (std::getenv(kVar) == nullptr) _putenv_s(kVar, buf);
+      // Re-read: if another module won a concurrent first call, use its.
+      StreamPoolState *s = adopt();
+      return s != nullptr ? s : mine;
+    }();
+    return *state;
+#else
+    static StreamPoolState state;
+    return state;
+#endif
   }
 
-  static std::mutex &StreamPoolMutex() {
-    static std::mutex mtx;
-    return mtx;
+  /** Free streams per device. */
+  static std::unordered_map<int, std::vector<void *>> &StreamPool() {
+    return PoolState().pool;
   }
+
+  static std::mutex &StreamPoolMutex() { return PoolState().mtx; }
 
   /** Borrow/return accounting. Exhaustion with (borrows - returns) far below
    *  the warmed count means streams are LEAKING; equal to it means they are
    *  legitimately all in flight. Those need opposite fixes, and the stacks
    *  alone could not tell them apart. */
-  static std::atomic<long> &StreamBorrows() {
-    static std::atomic<long> n{0};
-    return n;
-  }
-  static std::atomic<long> &StreamReturns() {
-    static std::atomic<long> n{0};
-    return n;
-  }
+  static std::atomic<long> &StreamBorrows() { return PoolState().borrows; }
+  static std::atomic<long> &StreamReturns() { return PoolState().returns; }
   /** Streams handed out by WarmStreamPool, for comparison against the above. */
-  static std::atomic<long> &StreamWarmed() {
-    static std::atomic<long> n{0};
-    return n;
-  }
+  static std::atomic<long> &StreamWarmed() { return PoolState().warmed; }
 
   /**
    * Per-device free-list sizes, e.g. "dev0=0 dev1=64".
@@ -493,8 +557,7 @@ class GpuApi {
 
   /** Whether a device's pool has been pre-created. */
   static std::unordered_map<int, bool> &PoolWarmed() {
-    static std::unordered_map<int, bool> warmed;
-    return warmed;
+    return PoolState().pool_warmed;
   }
 
   /**
@@ -541,14 +604,8 @@ class GpuApi {
    * never yields, so a thread cannot re-enter it and cannot overlap two uses
    * of its own stream.
    */
-  static std::vector<void *> &ReservedStreams() {
-    static std::vector<void *> v;
-    return v;
-  }
-  static std::atomic<int> &ReservedNext() {
-    static std::atomic<int> n{0};
-    return n;
-  }
+  static std::vector<void *> &ReservedStreams() { return PoolState().reserved; }
+  static std::atomic<int> &ReservedNext() { return PoolState().reserved_next; }
 
   /**
    * This thread's reserved stream, or nullptr when the reserve is used up

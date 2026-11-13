@@ -134,13 +134,20 @@ struct StorageDeviceConfig {
   // filesystem (tmpfs) every file tier costs this much memory up front.
   // YAML key: growth_unit (size string). Default matches the bdev's 1 GiB.
   clio::run::u64 growth_unit_;
+  // READ-CACHE tier (YAML key: read_cache). The target never takes a blob's
+  // primary or durable copies; it only holds read-promotion copies the core
+  // makes when a read is served from a slower tier, evicted oldest-first
+  // when it fills. On an hbm device this is a VRAM buffering tier: a GPU
+  // page fault for a promoted blob becomes a device-to-device copy.
+  bool read_cache_;
 
   StorageDeviceConfig()
       : capacity_limit_(0),
         score_(-1.0f),
         persistence_level_("volatile"),
         existing_pool_id_(clio::run::PoolId::GetNull()),
-        growth_unit_(clio::run::u64(1) << 30) {}
+        growth_unit_(clio::run::u64(1) << 30),
+        read_cache_(false) {}
   StorageDeviceConfig(const std::string &path, const std::string &bdev_type,
                       clio::run::u64 capacity, float score = -1.0f,
                       const std::string &persistence_level = "volatile")
@@ -150,7 +157,8 @@ struct StorageDeviceConfig {
         score_(score),
         persistence_level_(persistence_level),
         existing_pool_id_(clio::run::PoolId::GetNull()),
-        growth_unit_(clio::run::u64(1) << 30) {}
+        growth_unit_(clio::run::u64(1) << 30),
+        read_cache_(false) {}
 
   // True when this target should bind to an existing pool rather than create
   // its own bdev. Pool-id major 0 is reserved for "not set" (CTE/admin pools

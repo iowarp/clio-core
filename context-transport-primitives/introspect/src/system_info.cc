@@ -50,10 +50,17 @@
 // LCOV_EXCL_STOP
 #include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <condition_variable>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <fstream>
+#include <mutex>
 #include <string>
+#include <thread>
+#include <vector>
 
 #if CTP_HAS_POCO
 #include <Poco/Exception.h>
@@ -1926,6 +1933,131 @@ std::string SystemInfo::PredictDriveFailure(const std::string &drive_type,
 #else
   (void)payload;
   return "{}";
+#endif
+}
+
+// ---- Ordered exit after an unrecoverable error ------------------------------
+
+namespace {
+
+/** One registered cleanup. */
+struct ExitCleanup {
+  int id;
+  void (*fn)(void *);
+  void *arg;
+};
+
+std::mutex &ExitCleanupMu() {
+  static std::mutex mu;
+  return mu;
+}
+
+std::vector<ExitCleanup> &ExitCleanups() {
+  static std::vector<ExitCleanup> v;
+  return v;
+}
+
+std::atomic<int> g_exit_cleanup_next{1};
+std::atomic<bool> g_fatal_exiting{false};
+std::atomic<bool> g_exit_guards_installed{false};
+
+/** Run every cleanup, last registered first. */
+void RunExitCleanups() {
+  std::vector<ExitCleanup> todo;
+  {
+    // try_lock: the thread that hit the error may itself hold the lock
+    // (a cleanup being registered as it failed); run what we can see.
+    std::unique_lock<std::mutex> lk(ExitCleanupMu(), std::try_to_lock);
+    todo = ExitCleanups();
+  }
+  for (auto it = todo.rbegin(); it != todo.rend(); ++it) {
+    it->fn(it->arg);
+  }
+}
+
+/** std::terminate: an uncaught exception, on any thread. */
+[[noreturn]] void OnTerminate() {
+  std::fprintf(stderr, "ctp: std::terminate -- ending the process in order\n");
+  ctp::SystemInfo::FatalExit(134);
+}
+
+#if CTP_ENABLE_WINDOWS_SYSINFO
+/** Ctrl-C, Ctrl-Break, console close: runs on its own thread. */
+BOOL WINAPI OnConsoleCtrl(DWORD type) {
+  if (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT || type == CTRL_CLOSE_EVENT) {
+    std::fprintf(stderr, "ctp: console control %lu -- ending the process in order\n",
+                 static_cast<unsigned long>(type));
+    ctp::SystemInfo::FatalExit(130);
+  }
+  return FALSE;
+}
+#else
+/** SIGINT / SIGTERM. Not async-signal-safe -- FatalExit takes locks and
+ *  starts a thread -- but this is the last thing the process does, and the
+ *  alternative (dying around live GPU state) is worse. */
+void OnSignal(int sig) { ctp::SystemInfo::FatalExit(128 + sig); }
+#endif
+
+}  // namespace
+
+int SystemInfo::AddExitCleanup(void (*fn)(void *), void *arg) {
+  const int id = g_exit_cleanup_next.fetch_add(1);
+  std::lock_guard<std::mutex> lk(ExitCleanupMu());
+  ExitCleanups().push_back({id, fn, arg});
+  return id;
+}
+
+void SystemInfo::RemoveExitCleanup(int id) {
+  std::lock_guard<std::mutex> lk(ExitCleanupMu());
+  auto &v = ExitCleanups();
+  v.erase(std::remove_if(v.begin(), v.end(),
+                         [id](const ExitCleanup &c) { return c.id == id; }),
+          v.end());
+}
+
+void SystemInfo::FatalExit(int code) {
+  if (g_fatal_exiting.exchange(true)) {
+    // Another thread is already ending the process. Re-entering teardown is
+    // exactly the race this exists to prevent (several threads calling exit()
+    // around a live CUDA context wedged the process inside the driver).
+    for (;;) std::this_thread::sleep_for(std::chrono::hours(1));
+  }
+  // Cleanups run on a helper thread so a cleanup that blocks (a device reset
+  // waiting on a kernel that never ends) cannot hold the process forever.
+  long budget_ms = 15000;
+  if (const char *e = std::getenv("CLIO_FATAL_CLEANUP_MS")) budget_ms = std::atol(e);
+  std::mutex mu;
+  std::condition_variable cv;
+  bool done = false;
+  std::thread worker([&]() {
+    RunExitCleanups();
+    std::lock_guard<std::mutex> lk(mu);
+    done = true;
+    cv.notify_all();
+  });
+  {
+    std::unique_lock<std::mutex> lk(mu);
+    if (!cv.wait_for(lk, std::chrono::milliseconds(budget_ms), [&] { return done; })) {
+      std::fprintf(stderr, "ctp: exit cleanups exceeded %ld ms; exiting anyway\n", budget_ms);
+    }
+  }
+  if (done) {
+    worker.join();
+  } else {
+    worker.detach();
+  }
+  std::fflush(nullptr);
+  std::_Exit(code);
+}
+
+void SystemInfo::InstallExitGuards() {
+  if (g_exit_guards_installed.exchange(true)) return;
+  std::set_terminate(OnTerminate);
+#if CTP_ENABLE_WINDOWS_SYSINFO
+  SetConsoleCtrlHandler(OnConsoleCtrl, TRUE);
+#else
+  std::signal(SIGINT, OnSignal);
+  std::signal(SIGTERM, OnSignal);
 #endif
 }
 

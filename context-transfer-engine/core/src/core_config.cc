@@ -371,6 +371,9 @@ void Config::EmitYaml(YAML::Emitter &emitter) const {
         emitter << YAML::Key << "growth_unit" << YAML::Value
                 << FormatSizeBytes(device.growth_unit_);
       }
+      if (device.read_cache_) {
+        emitter << YAML::Key << "read_cache" << YAML::Value << true;
+      }
       
       // Emit score only if it's manually set (not using automatic scoring)
       if (device.score_ >= 0.0f) {
@@ -617,6 +620,23 @@ bool Config::ParseStorageConfig(const YAML::Node &node) {
       }
     }
     // score_ defaults to -1.0f (use automatic scoring) if not specified
+
+    // read_cache (optional): this target only buffers read-promotion copies.
+    // Only a memory tier can be one -- a file read cache would just be a
+    // second disk, and it must be volatile because its copies are never
+    // logged.
+    if (device_node["read_cache"]) {
+      device_config.read_cache_ = device_node["read_cache"].as<bool>();
+      if (device_config.read_cache_ && device_config.bdev_type_ != "hbm" &&
+          device_config.bdev_type_ != "ram" &&
+          device_config.bdev_type_ != "pinned") {
+        HLOG(kError,
+             "Config error: read_cache needs a memory tier (hbm, ram or "
+             "pinned), not '{}', for device {}",
+             device_config.bdev_type_, device_config.path_);
+        return false;
+      }
+    }
 
     // Targets that bind to an existing pool skip the path/capacity validation
     // below — routing is purely by existing_pool_id_.

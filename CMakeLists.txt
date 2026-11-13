@@ -1355,7 +1355,11 @@ endif()
 # Use CLIO_CORE_MSVC_LIKE (not just MSVC) so clang-cl / icx.exe on Windows take
 # the MSVC-style flag path; GNU flags break icx's /Fo handling (see issue #555).
 if(NOT CLIO_CORE_MSVC_LIKE)
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC")
+    # -fPIC has no meaning on Windows (PE/COFF) and GNU-style clang++ targeting
+    # x86_64-pc-windows-msvc rejects it outright.
+    if(NOT WIN32)
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC")
+    endif()
     if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "NVHPC")
         # Add compiler flags following Google C++ style guide
         set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -pedantic")
@@ -2583,7 +2587,25 @@ endif()
 # clio-ml (external/clio-ml, its own repo): Spark-MLlib-style algorithms over
 # gpu_vector / cpu_vector. Must come after CTE so the vector targets exist.
 option(CLIO_CORE_ENABLE_CLIO_ML "Add external/clio-ml to the build" OFF)
+option(CLIO_CORE_ENABLE_CLIO_INFER "Add external/clio-infer to the build" OFF)
 if(CLIO_CORE_ENABLE_CLIO_ML)
   set(CLIO_ML_ENABLE_CUDA ${CLIO_CORE_ENABLE_CUDA} CACHE BOOL "" FORCE)
+  # On SYCL, clio-infer's gather kernel joins clio-ml's ONE SYCL kernel library
+  # (it owns the runtime's device globals; see clio-ml common/src/CMakeLists).
+  set(_ci_src "${CMAKE_CURRENT_SOURCE_DIR}/external/clio-infer/src")
+  if(CLIO_CORE_ENABLE_CLIO_INFER AND EXISTS "${_ci_src}/gather_launch_sycl.inc")
+    set(CLIO_ML_SYCL_EXTRA_LAUNCH "${_ci_src}/gather_launch_sycl.inc")
+    set(CLIO_ML_SYCL_EXTRA_EXPECT "${_ci_src}/gather_kernels.h")
+    set(CLIO_ML_SYCL_EXTRA_INCLUDE_DIRS "${_ci_src}")
+  endif()
   add_subdirectory(external/clio-ml)
+endif()
+
+# clio-infer (external/clio-infer, its own repo): LLM inference with model
+# weights assimilated into the CTE as one compressed, pagified gpu_vector.
+# Needs clio-ml (clio_torch; CUDA or SYCL), and CLIO_CTE_ENABLE_COMPRESS for
+# codecs. (The option is declared above, with clio-ml's SYCL kernel hook.)
+if(CLIO_CORE_ENABLE_CLIO_INFER AND CLIO_CORE_ENABLE_CLIO_ML
+   AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/external/clio-infer/CMakeLists.txt")
+  add_subdirectory(external/clio-infer)
 endif()

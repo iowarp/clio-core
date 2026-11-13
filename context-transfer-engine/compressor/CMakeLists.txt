@@ -37,6 +37,11 @@ add_clio_module_runtime(
   LINK_LIBRARIES
     ctp::compress
 )
+# The model predictors parse JSON. The root CMakeLists finds or fetches
+# nlohmann_json; link it rather than relying on a system-wide header.
+if(TARGET nlohmann_json::nlohmann_json)
+  target_link_libraries(clio_cte_compressor_runtime PRIVATE nlohmann_json::nlohmann_json)
+endif()
 
 # CUDA DRIVER API. A GPU codec runs in its own CUDA context (cuCtxCreate) and
 # returns results with cuMemcpyPeer, neither of which the CUDA runtime API can

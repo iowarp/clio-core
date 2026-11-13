@@ -52,6 +52,7 @@
 #endif
 
 #include "clio_runtime/admin/admin_client.h"
+#include "clio_ctp/util/gpu_api.h"
 #include "clio_runtime/restart_log.h"
 #include "clio_runtime/singletons.h"
 
@@ -169,10 +170,31 @@ RuntimeManager::~RuntimeManager() {
 
 namespace {
 void MaybeAllowPtrace();  // defined with ServerInit below
+
+/** FatalExit cleanup: reset every GPU before the process ends. */
+void ResetGpusForExit(void *) { ctp::GpuApi::ResetAllDevicesForExit(); }
+
+/**
+ * Make every abnormal end of this process an ORDERED one (once per process).
+ *
+ * A process holding CUDA contexts that died any other way -- several threads
+ * calling exit() on CUDA errors at once, an uncaught exception, a console
+ * interrupt -- could wedge inside the GPU driver during teardown: terminated,
+ * one thread stuck in a kernel wait, unkillable until a reboot. Routing those
+ * ends through SystemInfo::FatalExit resets the GPUs first (contexts gone,
+ * in-flight work aborted, pinned memory released) and only then exits.
+ */
+void InstallProcessExitGuards() {
+  static std::atomic<bool> done{false};
+  if (done.exchange(true)) return;
+  ctp::SystemInfo::InstallExitGuards();
+  ctp::SystemInfo::AddExitCleanup(ResetGpusForExit, nullptr);
+}
 }  // namespace
 
 bool RuntimeManager::ClientInit() {
   HLOG(kInfo, "RuntimeManager::ClientInit");
+  InstallProcessExitGuards();
   if (is_client_initialized_ || client_is_initializing_ ||
       runtime_is_initializing_) {
     return true;
@@ -325,6 +347,7 @@ bool RuntimeManager::ServerInit() {
       client_is_initializing_) {
     return true;
   }
+  InstallProcessExitGuards();
   RaiseFdLimit();
   MaybeAllowPtrace();
 

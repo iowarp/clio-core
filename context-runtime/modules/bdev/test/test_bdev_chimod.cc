@@ -55,6 +55,8 @@
 #endif
 #include <clio_ctp/introspect/system_info.h>
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <csignal>
 #include <cstdlib>
@@ -779,6 +781,211 @@ TEST_CASE("bdev_unaligned_alloc_free_accounting", "[bdev][allocate][align]") {
     // capacity. Hence exact equality rather than a one-sided bound.
     REQUIRE(remaining_after == remaining_before);
   }
+}
+
+/**
+ * A full tier whose free list holds only blocks a little SMALLER than each
+ * new request must still allocate from its free bytes. The assembly path
+ * took one freed block and was left a sliver short; it could only use a
+ * block no larger than the sliver, there was none, and the request failed
+ * with most of the tier free. Variable-size extents (compressed pages
+ * cycling through a VRAM tier) hit this on every allocation once the tier
+ * had turned over once. The fix splits the smallest freed block that covers
+ * the remainder.
+ */
+TEST_CASE("bdev_alloc_splits_free_block_for_remainder",
+          "[bdev][allocate][fragment]") {
+  BdevChimodFixture fixture;
+  REQUIRE(g_initialized);
+  clio::run::PoolId pool_id(8020, 0);
+  clio::run::bdev::Client client(pool_id);
+  const clio::run::u64 ram_size = 1024 * 1024;
+  std::string pool_name =
+      "ram_split_" + std::to_string(getpid()) + "_" + std::to_string(8020);
+  REQUIRE(BdevChimodFixture::CreateBdevAsync(
+      client, clio::run::PoolQuery::Dynamic(), pool_name, pool_id,
+      clio::run::bdev::BdevType::kRam, ram_size));
+  auto pool_query = clio::run::PoolQuery::DirectHash(0);
+
+  // Fill the heap with 12 KiB blocks, then free them all: the free list now
+  // holds only 12 KiB extents and the heap has (almost) nothing left.
+  const clio::run::u64 kSmall = 12 * 1024;
+  const clio::run::u64 kBig = 16 * 1024;
+  std::vector<clio::run::bdev::Block> held;
+  for (;;) {
+    auto alloc = client.AsyncAllocateBlocks(pool_query, kSmall);
+    alloc.Wait();
+    if (alloc->return_code_ != 0) break;
+    held.insert(held.end(), alloc->blocks_.begin(), alloc->blocks_.end());
+  }
+  REQUIRE(held.size() >= (ram_size / kSmall) - 1);
+  {
+    auto freed = client.AsyncFreeBlocks(pool_query, held);
+    freed.Wait();
+    REQUIRE(freed->return_code_ == 0);
+  }
+
+  // 16 KiB requests: each needs one 12 KiB block plus 4 KiB split off
+  // another. Nearly all of the freed bytes must be reachable.
+  std::vector<clio::run::bdev::Block> big;
+  size_t big_count = 0;
+  for (;;) {
+    auto alloc = client.AsyncAllocateBlocks(pool_query, kBig);
+    alloc.Wait();
+    if (alloc->return_code_ != 0) break;
+    clio::run::u64 covered = 0;
+    for (const auto &b : alloc->blocks_) covered += b.size_;
+    REQUIRE(covered >= kBig);
+    big.insert(big.end(), alloc->blocks_.begin(), alloc->blocks_.end());
+    ++big_count;
+  }
+  HLOG(kInfo, "split test: {} x 12 KiB freed, {} x 16 KiB reallocated",
+       held.size(), big_count);
+  REQUIRE(big_count >= (held.size() * kSmall) / kBig - 1);
+  {
+    auto freed = client.AsyncFreeBlocks(pool_query, big);
+    freed.Wait();
+    REQUIRE(freed->return_code_ == 0);
+  }
+}
+
+namespace {
+/**
+ * Footprint of a block: its size rounded up to the allocator's alignment,
+ * which is what it occupies and what the allocator charges for it.
+ * @param b The block
+ * @param align Allocator alignment in bytes
+ */
+clio::run::u64 BlockFootprint(const clio::run::bdev::Block &b,
+                              clio::run::u64 align) {
+  return ((b.size_ + align - 1) / align) * align;
+}
+
+/**
+ * Check the allocator's invariants over every live allocation: each extent
+ * is aligned and inside the device, no two extents overlap, and the
+ * allocator's byte accounting equals the sum of the live footprints.
+ * @param alloc The allocator under test
+ * @param live Live allocations (one vector of blocks per request)
+ * @param capacity Device capacity in bytes
+ * @param align Allocator alignment in bytes
+ */
+void CheckAllocatorInvariants(
+    const clio::run::bdev::StandardBlockAllocator &alloc,
+    const std::vector<std::vector<clio::run::bdev::Block>> &live,
+    clio::run::u64 capacity, clio::run::u64 align) {
+  std::vector<std::pair<clio::run::u64, clio::run::u64>> ext;
+  clio::run::u64 live_bytes = 0;
+  for (const auto &a : live) {
+    for (const auto &b : a) {
+      const clio::run::u64 fp = BlockFootprint(b, align);
+      REQUIRE(b.offset_ % align == 0);
+      REQUIRE(b.offset_ + fp <= capacity);
+      ext.emplace_back(b.offset_, b.offset_ + fp);
+      live_bytes += fp;
+    }
+  }
+  std::sort(ext.begin(), ext.end());
+  for (size_t i = 1; i < ext.size(); ++i) {
+    if (ext[i - 1].second > ext[i].first) {
+      INFO("[" << ext[i - 1].first << ", " << ext[i - 1].second
+           << ") overlaps [" << ext[i].first << ", " << ext[i].second << ")");
+    }
+    REQUIRE(ext[i - 1].second <= ext[i].first);  // no two owners of a byte
+  }
+  REQUIRE(capacity - alloc.GetRemainingSize() == live_bytes);
+}
+
+/**
+ * Churn variable-size extents through an allocator: fill it, then
+ * repeatedly free a random half of the live allocations and refill,
+ * checking the invariants after every phase. Every refill request MUST
+ * succeed while the free bytes cover it plus the heap's unusable tail (the
+ * heap never retreats, so at most one request's worth is stuck below its
+ * cursor).
+ * @param align Allocator alignment: 4096 for file tiers, 512 for the
+ *              byte-addressable RAM/HBM/pinned tiers
+ */
+void RunVariableSizeChurn(clio::run::u64 align) {
+  constexpr clio::run::u64 kCapacity = 64ull << 20;
+  constexpr clio::run::u64 kMinSize = 690000;
+  constexpr clio::run::u64 kMaxSize = 730000;
+  constexpr int kWorkers = 4;
+  constexpr int kRounds = 40;
+  const clio::run::u64 slack = kMaxSize + align;
+
+  clio::run::bdev::StandardBlockAllocator alloc;
+  alloc.Init(kWorkers, kCapacity, static_cast<clio::run::u32>(align));
+  std::mt19937_64 rng(0xC110u + align);
+  std::uniform_int_distribution<clio::run::u64> size_dist(kMinSize, kMaxSize);
+  std::uniform_int_distribution<int> worker_dist(0, kWorkers - 1);
+  std::vector<std::vector<clio::run::bdev::Block>> live;
+
+  // Allocate until the device is full, asserting no request that fits fails.
+  auto refill = [&]() {
+    for (;;) {
+      const clio::run::u64 size = size_dist(rng);
+      const clio::run::u64 need = ((size + align - 1) / align) * align;
+      const clio::run::u64 free_bytes = alloc.GetRemainingSize();
+      std::vector<clio::run::bdev::Block> blocks;
+      const bool ok = alloc.AllocateBlocks(size, worker_dist(rng), blocks);
+      if (!ok) {
+        if (free_bytes >= need + slack) {
+          INFO("refused " << size << " B with " << free_bytes << " B free");
+        }
+        REQUIRE(free_bytes < need + slack);
+        REQUIRE(blocks.empty());
+        return;
+      }
+      clio::run::u64 covered = 0;
+      for (const auto &b : blocks) covered += BlockFootprint(b, align);
+      REQUIRE(covered >= size);
+      live.push_back(std::move(blocks));
+    }
+  };
+
+  refill();
+  REQUIRE(live.size() >= kCapacity / kMaxSize - 1);
+  CheckAllocatorInvariants(alloc, live, kCapacity, align);
+  for (int round = 0; round < kRounds; ++round) {
+    std::shuffle(live.begin(), live.end(), rng);
+    const size_t keep = live.size() / 2;
+    for (size_t i = keep; i < live.size(); ++i) {
+      alloc.FreeBlocks(worker_dist(rng), live[i]);
+    }
+    live.resize(keep);
+    CheckAllocatorInvariants(alloc, live, kCapacity, align);
+    refill();
+    CheckAllocatorInvariants(alloc, live, kCapacity, align);
+  }
+  for (const auto &a : live) alloc.FreeBlocks(0, a);
+  live.clear();
+  CheckAllocatorInvariants(alloc, live, kCapacity, align);
+}
+}  // namespace
+
+/**
+ * Variable-size churn (compressed pages cycling through a cache tier,
+ * ~690-730 KB each) on a 4 KiB-aligned allocator. A free list holding only
+ * blocks slightly smaller than the request used to fail here with most of
+ * the device free -- the assembly path could not split a block to cover
+ * its last few KiB.
+ */
+TEST_CASE("bdev_block_allocator_variable_size_churn",
+          "[bdev][allocate][fragment][unit]") {
+  RunVariableSizeChurn(4096);
+}
+
+/**
+ * The same churn at 512 B alignment, the quantum of the RAM/HBM/pinned
+ * tiers. Code that rounds a free block up to 4 KiB when judging whether it
+ * covers a request picks a block up to 3.5 KiB too small there, and the
+ * allocation runs into the next block's live bytes (seen as corrupted
+ * compressed pages on a VRAM tier).
+ */
+TEST_CASE("bdev_block_allocator_variable_size_churn_512",
+          "[bdev][allocate][fragment][unit]") {
+  RunVariableSizeChurn(512);
 }
 
 TEST_CASE("bdev_write_read_basic", "[bdev][io][basic]") {

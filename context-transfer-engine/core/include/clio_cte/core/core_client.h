@@ -4153,11 +4153,24 @@ class Client : public clio::run::ContainerClient {
     ctp::ipc::PosixShmMmap backend;
     char *base = nullptr;  /**< byte 0 of device space */
   };
-  // Keyed by target pool. Attaching is not free, and the fast path is meant to
-  // be a few hundred nanoseconds, so a miss here would dominate the cost.
-  std::unordered_map<clio::run::u64, RamBdevMap> ram_bdevs_;
   /**
-   * Guards ram_bdevs_ (issue #817).
+   * Attached RAM-bdev segments of THIS process, keyed by (runtime pid, target
+   * pool). Attaching is not free, and the fast path is meant to be a few
+   * hundred nanoseconds, so a miss here would dominate the cost.
+   *
+   * Process-wide, not per Client: Clients are constructed and copied freely
+   * (one per vector / tag / chimod), and PosixShmMmap does not detach on
+   * destruction, so a per-instance cache attached the same segment again for
+   * every Client -- one more fd and one more full-capacity mapping each. A
+   * long run held 9522 fds and 19044 mappings of a single segment and could
+   * not exit. Leaked on purpose: the mappings live for the process.
+   */
+  static std::unordered_map<std::string, RamBdevMap> &RamBdevs() {
+    static auto *m = new std::unordered_map<std::string, RamBdevMap>();
+    return *m;
+  }
+  /**
+   * Guards RamBdevs() (issue #817).
    *
    * The process-wide CTE client is shared by every thread of an application,
    * and the POSIX/STDIO interceptors hand it arbitrary multi-threaded callers,
@@ -4187,24 +4200,7 @@ class Client : public clio::run::ContainerClient {
    * cannot be mapped is not retried on every single read.
    */
   char *MapRamBdev(const clio::run::PoolId &pool_id) {
-    clio::run::u64 key = pool_id.ToU64();
-    {
-      // Steady state: the segment is already attached, so this is a shared
-      // lock and a hash lookup.
-      std::shared_lock<std::shared_mutex> rd(RamBdevMutex());
-      auto it = ram_bdevs_.find(key);
-      if (it != ram_bdevs_.end()) {
-        return it->second.base;
-      }
-    }
-    std::unique_lock<std::shared_mutex> wr(RamBdevMutex());
-    // Re-check: another thread may have attached between the two locks.
-    auto found = ram_bdevs_.find(key);
-    if (found != ram_bdevs_.end()) {
-      return found->second.base;
-    }
     auto *ipc = CLIO_CPU_IPC;
-    RamBdevMap &slot = ram_bdevs_[key];  // caches the negative result too
     if (ipc == nullptr) {
       return nullptr;
     }
@@ -4212,8 +4208,26 @@ class Client : public clio::run::ContainerClient {
     if (server_pid == 0) {
       return nullptr;
     }
+    // The segment name is the key: (runtime pid, pool) identify the segment.
     std::string name =
         clio::run::bdev::MemBdevTransport::ShmSegmentName(server_pid, pool_id);
+    auto &bdevs = RamBdevs();
+    {
+      // Steady state: the segment is already attached, so this is a shared
+      // lock and a hash lookup.
+      std::shared_lock<std::shared_mutex> rd(RamBdevMutex());
+      auto it = bdevs.find(name);
+      if (it != bdevs.end()) {
+        return it->second.base;
+      }
+    }
+    std::unique_lock<std::shared_mutex> wr(RamBdevMutex());
+    // Re-check: another thread may have attached between the two locks.
+    auto found = bdevs.find(name);
+    if (found != bdevs.end()) {
+      return found->second.base;
+    }
+    RamBdevMap &slot = bdevs[name];  // caches the negative result too
     if (!slot.backend.shm_attach(name)) {
       return nullptr;
     }

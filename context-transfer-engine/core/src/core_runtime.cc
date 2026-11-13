@@ -706,7 +706,7 @@ static int TraceCopyReadsEnv() {
  * @param blocks the blob's blocks
  * @return the layout string
  */
-static std::string BlockLayout(const clio::run::priv::vector<BlobBlock> &blocks) {
+static std::string BlockLayout(const BlockList &blocks) {
   std::string layout;
   for (size_t i = 0; i < blocks.size() && i < 32; ++i) {
     layout += std::to_string(blocks[i].bdev_client_.pool_id_.major_) + ":" +
@@ -718,7 +718,7 @@ static std::string BlockLayout(const clio::run::priv::vector<BlobBlock> &blocks)
 
 void Runtime::TraceCopyRead(const TagId &tag_id, const std::string &blob_name,
                             int replica_sel,
-                            const clio::run::priv::vector<BlobBlock> &blocks,
+                            const BlockList &blocks,
                             clio::run::u64 offset, clio::run::u64 size,
                             size_t declared_size) {
   // Which copy served a read, and from where: a FOREIGN block found by a
@@ -1004,6 +1004,13 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
         if (result == 0) {
           HLOG(kDebug, "  - Registered target: {} on node {}", target_path,
                target_node);
+          if (device.read_cache_) {
+            read_cache_pools_.push_back(bdev_id);
+            HLOG(kInfo,
+                 "cte_core: {} ({}, {} bytes) is a READ-CACHE tier: it holds "
+                 "only read-promotion copies",
+                 target_path, device.bdev_type_, capacity_bytes);
+          }
         } else {
           // Left unregistered, this node refuses every put it owns for the
           // whole run (rc 11), which looks exactly like the startup race
@@ -2963,9 +2970,12 @@ clio::run::TaskResume Runtime::WriteReplicaData(
         cache_copy ? static_cast<int>(clio::run::bdev::PersistenceLevel::
                                           kTemporaryNonVolatile)
                    : -1;
+    const bool read_cache_place =
+        (task->context_.replica_flags_ & REPLICA_READ_CACHE) != 0;
     CLIO_CO_AWAIT(ExtendBlob(staging, offset, size, rep_score, step_result,
                         rep_min_pers,
-                        task->context_.preallocate_, nullptr, rep_max_pers));
+                        task->context_.preallocate_, nullptr, rep_max_pers,
+                        read_cache_place));
     if (step_result != 0) {
       error_code = 10 + step_result;
     } else if (!task->context_.emulate_) {
@@ -3031,9 +3041,13 @@ clio::run::TaskResume Runtime::WriteReplicaData(
       rep->score_ = rep_score;
     }
 
-    // WAL: full-replacement record of this replica's layout.
+    // WAL: full-replacement record of this replica's layout. Read-promotion
+    // copies are never logged: they live on a volatile tier and are always
+    // re-derivable, and logging every promotion would put a WAL write on
+    // the GPU fault path.
     if (error_code == 0 && !task->context_.emulate_ &&
-        !blob_txn_logs_.empty() && !rep->blocks_.empty()) {
+        !blob_txn_logs_.empty() && !rep->blocks_.empty() &&
+        !(rep->flags_ & REPLICA_READ_CACHE)) {
       clio::run::u32 wid = CLIO_CUR_WORKER->GetWorkerStats().worker_id_;
       TxnExtendReplica txn;
       txn.tag_major_ = tag_id.major_;
@@ -3075,7 +3089,7 @@ clio::run::TaskResume Runtime::WriteReplicaData(
 }
 
 clio::run::u64 Runtime::EstimateIoTimeNs(
-    const clio::run::priv::vector<BlobBlock> &blocks, clio::run::u64 offset,
+    const BlockList &blocks, clio::run::u64 offset,
     clio::run::u64 size, bool is_write) {
   // Fallbacks when a target is unknown or reports zeroed metrics — same
   // defaults the bdev module seeds for un-benchmarked devices.
@@ -3135,6 +3149,15 @@ template <typename TaskT>
 clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
   CLIO_TASK_BODY_BEGIN
   const unsigned long long ev_g0 = clio::run::CycleNow();
+  // Read promotion into the read-cache tier, decided inside the try and run
+  // after it: the read pin must be released first, since promotion takes
+  // the blob's write token.
+  bool rc_promote = false;
+  TagId rc_tag;
+  std::string rc_name;
+  ctp::ipc::ShmPtr<> rc_src;
+  clio::run::u64 rc_size = 0;
+  clio::run::u64 rc_ver = 0;
   try {
     // Extract input parameters
     TagId tag_id = task->tag_id_;
@@ -3531,9 +3554,23 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     // it is atomic with respect to other tasks on this worker (cooperative
     // scheduling only switches at co_await); the reader then iterates its own
     // stable copy. #680 read-vs-write safety.
-    clio::run::priv::vector<BlobBlock> blocks_snapshot(
-        replica_sel > 0
-            ? blob_info_ptr->GetReplica(replica_sel, false)->blocks_
+    // READ-CACHE TIER: a primary read is served from the blob's promotion
+    // copy when that copy is current. Same stored bytes, so the caller
+    // cannot tell -- except that a GPU fault becomes a device-to-device copy
+    // when the tier is hbm. The read pin taken above keeps the copy alive:
+    // reclaiming it drains readers first.
+    int serve_sel = replica_sel;
+    if (replica_sel == 0 && !vectored && !task->context_.emulate_ &&
+        !read_cache_pools_.empty()) {
+      serve_sel = CurrentReadCacheCopy(*blob_info_ptr);
+      if (serve_sel > 0) {
+        rc_hits_.fetch_add(1, std::memory_order_relaxed);
+        ReadCacheEvent();
+      }
+    }
+    BlockList blocks_snapshot(
+        serve_sel > 0
+            ? blob_info_ptr->GetReplica(serve_sel, false)->blocks_
             : blob_info_ptr->blocks_);
 
     // A block's CAPACITY can exceed the blob's declared size (whole-block
@@ -3632,6 +3669,37 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
           CLIO_CO_RETURN;
         }
       }
+      // Promote a WHOLE-blob primary read that came off a slower tier: the
+      // caller's buffer now holds the blob's complete stored image, which is
+      // exactly what the read-cache copy must hold.
+      if (serve_sel == 0 && replica_sel == 0 && !read_cache_pools_.empty() &&
+          !(offset == 0 && declared_size > 0 && covered == declared_size)) {
+        const clio::run::u64 npart =
+            rc_partial_.fetch_add(1, std::memory_order_relaxed) + 1;
+        if ((npart & 8191) == 0) {
+          HLOG(kInfo, "read-cache: {} partial slow-tier reads (not promoted), "
+               "{} promotions, {} hits", npart, rc_promotions_.load(),
+               rc_hits_.load());
+        }
+      }
+      if (serve_sel == 0 && replica_sel == 0 && !read_cache_pools_.empty() &&
+          offset == 0 && declared_size > 0 && covered == declared_size) {
+        bool on_cache_tier = false;
+        for (size_t bi = 0; bi < blocks_snapshot.size(); ++bi) {
+          if (IsReadCachePool(blocks_snapshot[bi].bdev_client_.pool_id_)) {
+            on_cache_tier = true;
+            break;
+          }
+        }
+        if (!on_cache_tier) {
+          rc_promote = true;
+          rc_tag = tag_id;
+          rc_name = blob_name;
+          rc_src = blob_data_ptr;
+          rc_size = declared_size;
+          rc_ver = task->context_.version_;
+        }
+      }
     }
 
     // Step 3: Update timestamp (no lock needed - just updating values, not
@@ -3682,6 +3750,9 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
 
   } catch (const std::exception &e) {
     task->return_code_ = 1;
+  }
+  if (rc_promote && task->return_code_ == 0) {
+    CLIO_CO_AWAIT(PromoteToReadCache(rc_tag, rc_name, rc_src, rc_size, rc_ver));
   }
   clio_evlat_add(2, clio::run::CycleNow() - ev_g0);
   CLIO_CO_RETURN;
@@ -5139,8 +5210,12 @@ clio::run::TaskResume Runtime::ReclaimCacheReplica(const TagId &tag_id,
     if (free_rc != 0) {
       rc = 10 + free_rc;
     }
-    // WAL: full-replacement empty layout for the reclaimed cache copy.
-    if (!blob_txn_logs_.empty()) {
+    // WAL: full-replacement empty layout for the reclaimed cache copy (a
+    // read-promotion copy was never logged, so neither is its reclaim).
+    Replica *rep_now = blob_info_ptr->GetReplica(idx, /*create=*/false);
+    const bool was_read_cache = (rep_now->flags_ & REPLICA_READ_CACHE) != 0;
+    rep_now->src_version_ = 0;
+    if (!blob_txn_logs_.empty() && !was_read_cache) {
       clio::run::u32 wid = CLIO_CUR_WORKER->GetWorkerStats().worker_id_;
       Replica *rep2 = blob_info_ptr->GetReplica(idx, /*create=*/false);
       TxnExtendReplica txn;
@@ -5163,6 +5238,291 @@ clio::run::TaskResume Runtime::ReclaimCacheReplica(const TagId &tag_id,
       MirrorBlobToShm(shm_key, *blob_info_ptr);
     }
   }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+bool Runtime::IsReadCachePool(const clio::run::PoolId &pool) const {
+  for (const auto &p : read_cache_pools_) {
+    if (p == pool) return true;
+  }
+  return false;
+}
+
+clio::run::u64 Runtime::ReadCacheFreeBytes() {
+  clio::run::u64 free_bytes = 0;
+  for (const auto &p : read_cache_pools_) {
+    TargetInfo *t = registered_targets_.find(p);
+    if (t != nullptr) {
+      free_bytes += ctp::ipc::atomic_ref<clio::run::u64>(t->remaining_space_)
+                        .load(std::memory_order_relaxed);
+    }
+  }
+  return free_bytes;
+}
+
+clio::run::u64 Runtime::ReadCacheColdNs() {
+  static const clio::run::u64 cold_ns = [] {
+    const char *e = std::getenv("CLIO_READ_CACHE_COLD_MS");
+    const clio::run::u64 ms =
+        (e != nullptr && *e) ? std::strtoull(e, nullptr, 10) : 60000ull;
+    return ms * 1000ull * 1000ull;
+  }();
+  return cold_ns;
+}
+
+void Runtime::ReadCacheEvent() {
+  const clio::run::u64 n =
+      rc_events_.fetch_add(1, std::memory_order_relaxed) + 1;
+  if ((n & 4095) != 0) return;
+  HLOG(kInfo,
+       "read-cache: {} hits, {} promotions, {} evictions, {} skipped ({} for "
+       "room, {} failed writes), {} partial reads, skew {} MiB, misses: {} "
+       "never cached / {} evicted, {} MiB free",
+       rc_hits_.load(), rc_promotions_.load(), rc_evictions_.load(),
+       rc_skipped_.load(), rc_noroom_.load(), rc_writefail_.load(),
+       rc_partial_.load(), rc_skew_.load() >> 20, rc_noslot_.load(),
+       rc_emptyslot_.load(),
+       ReadCacheFreeBytes() >> 20);
+}
+
+int Runtime::CurrentReadCacheCopy(BlobInfo &blob) {
+  const int idx = blob.CacheReplicaIndex(/*create=*/false);
+  if (idx <= 0) {
+    rc_noslot_.fetch_add(1, std::memory_order_relaxed);
+    return 0;
+  }
+  const Replica *rep = blob.GetReplica(idx, /*create=*/false);
+  if (rep == nullptr || !(rep->flags_ & REPLICA_READ_CACHE) ||
+      rep->blocks_.empty() || rep->total_size_cache_ == 0) {
+    rc_emptyslot_.fetch_add(1, std::memory_order_relaxed);
+    return 0;
+  }
+  // Byte-exact image of the CURRENT primary, or nothing: a write since the
+  // promotion moved last_modified_, and a copy taken of an older size or
+  // transform state is not these bytes.
+  if (rep->src_version_ != blob.last_modified_ ||
+      rep->total_size_cache_ != blob.GetTotalSize() ||
+      rep->transform_flags_ != blob.transform_flags_) {
+    // CLIO_READ_CACHE_TRACE: why a present copy was not served.
+    static const bool trace = std::getenv("CLIO_READ_CACHE_TRACE") != nullptr;
+    static std::atomic<int> ntrace{0};
+    if (trace && ntrace.fetch_add(1) < 20) {
+      HLOG(kWarning,
+           "read-cache: copy of {} not current: src_version {} vs "
+           "last_modified {}, size {} vs {}, transform {} vs {}",
+           blob.blob_name_.str(), rep->src_version_, blob.last_modified_,
+           rep->total_size_cache_, blob.GetTotalSize(), rep->transform_flags_,
+           blob.transform_flags_);
+    }
+    return 0;
+  }
+  return idx;
+}
+
+namespace {
+/** Allocation slack per promotion: the bdev rounds extents up to its slab. */
+constexpr clio::run::u64 kReadCacheSlackBytes = 64ull << 10;
+/** Most queue entries one promotion may inspect: a second-chance re-queue
+ *  is a lookup and a push, so the budget is large -- with a small one, a
+ *  queue whose copies were all read recently re-queued its whole budget and
+ *  then gave up, skipping the promotion. */
+constexpr int kReadCacheMaxInspect = 1 << 16;
+/** Most copies one promotion may evict to make room. */
+constexpr int kReadCacheMaxVictims = 64;
+/** Once the tier is too full for a promotion, evict until this much is free.
+ *  Promotions run on many workers at once: evicting just enough for one
+ *  page let every concurrent promoter see that same page of room, all but
+ *  one then failed to allocate, and most promotions were lost. */
+constexpr clio::run::u64 kReadCacheLowWaterBytes = 32ull << 20;
+/** Largest free-counter skew learned from failed copy writes: a few pages'
+ *  worth of allocator slack, never a share of the tier. */
+constexpr clio::run::u64 kReadCacheMaxSkewBytes = 16ull << 20;
+}  // namespace
+
+clio::run::TaskResume Runtime::PromoteToReadCache(const TagId &tag_id,
+                                                  const std::string &blob_name,
+                                                  ctp::ipc::ShmPtr<> src,
+                                                  clio::run::u64 size,
+                                                  clio::run::u64 version) {
+#ifdef CLIO_ENABLE_BOOST_COROUTINES
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
+#endif
+  CLIO_TASK_BODY_BEGIN
+  // Two attempts: the second follows a copy write the bdev refused for
+  // space, after a forced batch eviction.
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    // 1. ROOM. Oldest copies go first, with one second chance: a copy READ
+    //    since it was queued (last_read_ past its stamp) is re-queued at the
+    //    back instead -- the pages every token touches stay resident while
+    //    one-shot pages cycle through. Room counts the learned skew between
+    //    the tier's free counter and what its bdev can really allocate.
+    {
+      const clio::run::u64 skew = rc_skew_.load(std::memory_order_relaxed);
+      const clio::run::u64 need = size + kReadCacheSlackBytes + skew;
+      const bool forced = attempt > 0;
+      const clio::run::u64 want_free =
+          (forced || ReadCacheFreeBytes() < need)
+              ? std::max<clio::run::u64>(kReadCacheLowWaterBytes + skew, need)
+              : 0;
+      // Only COLD copies are evicted: none read for ReadCacheColdNs(). A
+      // decode step sweeps the same pages in the same order every token, and
+      // when that sweep is larger than the tier, evicting the oldest copy to
+      // admit each new one is the classic cyclic-LRU failure -- every copy is
+      // evicted just before its next use and nothing ever hits (measured: 0
+      // hits in 49k promotions). Keeping a stable resident subset instead
+      // hits on every token; pages a phase stops using go cold and are
+      // replaced. The queue is ordered by stamp (last known use), so a warm
+      // front means nothing behind it is cold either: one look, no scan.
+      const clio::run::u64 cold_ns = ReadCacheColdNs();
+      int victims = 0;
+      int inspected = 0;
+      while ((ReadCacheFreeBytes() < want_free ||
+              (forced && victims < kReadCacheMaxVictims / 2)) &&
+             victims < kReadCacheMaxVictims &&
+             inspected < kReadCacheMaxInspect) {
+        ++inspected;
+        ReadCacheEntry victim;
+        const clio::run::u64 now = GetCurrentTimeNs();
+        {
+          std::lock_guard<std::mutex> g(read_cache_mu_);
+          if (read_cache_lru_.empty()) break;
+          if (now - read_cache_lru_.front().stamp_ns < cold_ns) break;
+          victim = std::move(read_cache_lru_.front());
+          read_cache_lru_.pop_front();
+        }
+        std::shared_ptr<BlobInfo> vb =
+            CheckBlobExists(victim.blob_name, victim.tag_id);
+        if (vb == nullptr) continue;  // deleted: its copy went with it
+        if (CurrentReadCacheCopy(*vb) > 0 && vb->last_read_ > victim.stamp_ns &&
+            now - vb->last_read_ < cold_ns) {
+          // Read since queued: still warm. Back of the queue, stamped with
+          // its last use.
+          victim.stamp_ns = vb->last_read_;
+          std::lock_guard<std::mutex> g(read_cache_mu_);
+          read_cache_lru_.push_back(std::move(victim));
+          continue;
+        }
+        ++victims;
+        clio::run::u64 freed = 0;
+        clio::run::u32 rrc = 0;
+        CLIO_CO_AWAIT(ReclaimCacheReplica(victim.tag_id, victim.blob_name,
+                                          freed, rrc));
+        if (freed > 0) rc_evictions_.fetch_add(1, std::memory_order_relaxed);
+      }
+      if (ReadCacheFreeBytes() < need) {
+        rc_skipped_.fetch_add(1, std::memory_order_relaxed);
+        rc_noroom_.fetch_add(1, std::memory_order_relaxed);
+        ReadCacheEvent();
+        CLIO_CO_RETURN;
+      }
+    }
+    std::shared_ptr<BlobInfo> bi = CheckBlobExists(blob_name, tag_id);
+    if (bi == nullptr || bi->last_modified_ != version) {
+      rc_skipped_.fetch_add(1, std::memory_order_relaxed);
+      ReadCacheEvent();
+      CLIO_CO_RETURN;
+    }
+    // 2. A STALE copy (taken before the blob last changed) is dropped
+    //    first; a cache slot that is not ours (the cache chimod's raw copy)
+    //    is left alone.
+    {
+      const int idx = bi->CacheReplicaIndex(/*create=*/false);
+      if (idx > 0) {
+        const Replica *rep = bi->GetReplica(idx, /*create=*/false);
+        if (!(rep->flags_ & REPLICA_READ_CACHE)) {
+          rc_skipped_.fetch_add(1, std::memory_order_relaxed);
+          ReadCacheEvent();
+          CLIO_CO_RETURN;
+        }
+        if (!rep->blocks_.empty()) {
+          if (CurrentReadCacheCopy(*bi) == idx) CLIO_CO_RETURN;  // raced
+          clio::run::u64 freed = 0;
+          clio::run::u32 rrc = 0;
+          CLIO_CO_AWAIT(ReclaimCacheReplica(tag_id, blob_name, freed, rrc));
+        }
+      }
+    }
+    // 3. COPY, under the blob's write token, version re-checked under it.
+    clio::run::u32 werr = 0;
+    {
+      const clio::run::u64 lock_tok =
+          reinterpret_cast<clio::run::u64>(&version);
+      while (!bi->TryLockWrite(lock_tok, "PromoteToReadCache",
+                               GetCurrentTimeNs())) {
+        CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
+      }
+      BlobWriteLockGuard guard(bi.get(), lock_tok);
+      if (bi->last_modified_ != version || bi->GetTotalSize() != size) {
+        rc_skipped_.fetch_add(1, std::memory_order_relaxed);
+        ReadCacheEvent();
+        CLIO_CO_RETURN;
+      }
+      {
+        const int idx = bi->CacheReplicaIndex(/*create=*/false);
+        if (idx > 0 && !bi->GetReplica(idx, false)->blocks_.empty()) {
+          CLIO_CO_RETURN;  // another reader promoted it meanwhile
+        }
+      }
+      Context ctx;
+      ctx.replica_ = kCacheReplica;
+      ctx.replica_flags_ = REPLICA_CACHE | REPLICA_READ_CACHE;
+      ctx.transform_flags_ = bi->transform_flags_;  // the STORED image
+      const int ridx = bi->ResolveReplicaSel(kCacheReplica, /*create=*/true);
+      bi->GetReplica(ridx, false)->src_version_ = 0;
+      auto put = CLIO_CPU_IPC->NewTask<PutBlobTask>(
+          clio::run::CreateTaskId(), pool_id_, clio::run::PoolQuery::Local(),
+          tag_id, blob_name.c_str(), 0, size, src, 1.0f, ctx, 0u);
+      CLIO_CO_AWAIT(WriteReplicaData(put, *bi, blob_name, tag_id, ridx, 0,
+                                     size, 1.0f, 1.0f, werr));
+      if (werr == 0) {
+        bi->GetReplica(ridx, false)->src_version_ = version;
+      }
+    }
+    if (werr == 0) {
+      {
+        std::lock_guard<std::mutex> g(read_cache_mu_);
+        read_cache_lru_.push_back(
+            ReadCacheEntry{tag_id, blob_name, GetCurrentTimeNs()});
+      }
+      rc_promotions_.fetch_add(1, std::memory_order_relaxed);
+      break;
+    }
+    // The counter said there was room and the bdev disagreed: what the
+    // counter shows at the moment of failure -- BEFORE the failed copy's
+    // blocks are reclaimed, which would add them back -- is the skew. Capped:
+    // a sample racing other workers' evictions must not reserve a large
+    // share of the tier forever (an uncapped sample once learned 2.7 GiB).
+    {
+      const clio::run::u64 seen =
+          std::min<clio::run::u64>(ReadCacheFreeBytes(), kReadCacheMaxSkewBytes);
+      clio::run::u64 cur = rc_skew_.load(std::memory_order_relaxed);
+      while (seen > cur &&
+             !rc_skew_.compare_exchange_weak(cur, seen,
+                                             std::memory_order_relaxed)) {
+      }
+    }
+    // Failed: blocks a failed write placed belong to the slot now; give them
+    // back so no partial copy survives.
+    {
+      clio::run::u64 freed = 0;
+      clio::run::u32 rrc = 0;
+      CLIO_CO_AWAIT(ReclaimCacheReplica(tag_id, blob_name, freed, rrc));
+    }
+    const clio::run::u64 nf =
+        rc_writefail_.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (nf <= 3) {
+      HLOG(kWarning,
+           "read-cache: copy write #{} failed: blob {} size {} rc {} ({} MiB "
+           "free, learned skew {} MiB); evicting and retrying",
+           nf, blob_name, size, werr, ReadCacheFreeBytes() >> 20,
+           rc_skew_.load() >> 20);
+    }
+    if (attempt == 1) {
+      rc_skipped_.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+  ReadCacheEvent();
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
@@ -7809,7 +8169,7 @@ bool Runtime::HasDurableReplica(const BlobInfo &blob_info, clio::run::u64 size,
   return false;
 }
 
-int Runtime::DurabilityFloor(const clio::run::priv::vector<BlobBlock> &blocks) {
+int Runtime::DurabilityFloor(const BlockList &blocks) {
   if (blocks.empty()) return 0;
   int floor = std::numeric_limits<int>::max();
   clio::run::ScopedCoRwReadLock read_lock(target_lock_);
@@ -7842,7 +8202,7 @@ void Runtime::LogBlobLayout(const TagId &tag_id, const std::string &blob_name,
 }
 
 bool Runtime::HasBlocksBelowLevelLocked(
-    const clio::run::priv::vector<BlobBlock> &blocks, int level) {
+    const BlockList &blocks, int level) {
   for (const auto &block : blocks) {
     TargetInfo *tinfo = registered_targets_.find(block.bdev_client_.pool_id_);
     if (tinfo && static_cast<int>(tinfo->persistence_level_) < level) {
@@ -7988,7 +8348,7 @@ clio::run::TaskResume Runtime::SyncTagDevices(
   std::unordered_map<clio::run::PoolId, clio::run::PoolQuery> devices;
   {
     clio::run::ScopedCoRwReadLock read_lock(target_lock_);
-    auto add = [&](const clio::run::priv::vector<BlobBlock> &blocks) {
+    auto add = [&](const BlockList &blocks) {
       for (const auto &b : blocks) {
         TargetInfo *t = registered_targets_.find(b.bdev_client_.pool_id_);
         if (t == nullptr || t->persistence_level_ ==
@@ -9038,7 +9398,7 @@ void Runtime::ReserveRestoredBlockSpace() {
   // set of targets whose ON-DISK bytes are still live and must not be
   // reallocated.
   std::unordered_map<clio::run::PoolId, clio::run::u64> reserve_end;
-  auto scan_blocks = [&](const clio::run::priv::vector<BlobBlock> &blocks) {
+  auto scan_blocks = [&](const BlockList &blocks) {
     for (const auto &block : blocks) {
       clio::run::u64 end = block.target_offset_ + block.size_;
       clio::run::u64 &cur = reserve_end[block.bdev_client_.pool_id_];
@@ -9578,7 +9938,8 @@ clio::run::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, clio::run::u64 of
                                     int min_persistence_level,
                                     clio::run::u64 preallocate,
                                     clio::run::u64 *shortfall,
-                                    int max_persistence_level) {
+                                    int max_persistence_level,
+                                  bool read_cache_place) {
 #ifdef CLIO_ENABLE_BOOST_COROUTINES
   clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
 #endif
@@ -9724,6 +10085,19 @@ clio::run::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, clio::run::u64 of
   // Use cached Data Placement Engine (built once in Create() from config)
   std::vector<TargetInfo> ordered_targets =
       dpe_->SelectTargets(available_targets, blob_score, additional_size);
+
+  // READ-CACHE tiers take read-promotion copies and nothing else: a primary
+  // or durable copy placed there would be lost with the volatile tier and
+  // would crowd out the promotions the tier exists for.
+  if (!read_cache_pools_.empty() || read_cache_place) {
+    ordered_targets.erase(
+        std::remove_if(ordered_targets.begin(), ordered_targets.end(),
+                       [this, read_cache_place](const TargetInfo &t) {
+                         return IsReadCachePool(t.bdev_client_.pool_id_) !=
+                                read_cache_place;
+                       }),
+        ordered_targets.end());
+  }
 
   // A neighbor's target whose node is down cannot take the blocks: placing
   // there only fails the put (or, with neighborhood > 1, strands the blob on
@@ -10333,7 +10707,7 @@ void Runtime::FlushWriteRun(
 }
 
 clio::run::TaskResume Runtime::ModifyExistingData(
-    const clio::run::priv::vector<BlobBlock> &blocks, ctp::ipc::ShmPtr<> data, size_t data_size,
+    const BlockList &blocks, ctp::ipc::ShmPtr<> data, size_t data_size,
     size_t data_offset_in_blob, clio::run::u32 &error_code,
     size_t start_block_idx, size_t start_block_offset_in_blob) {
 #ifdef CLIO_ENABLE_BOOST_COROUTINES
@@ -10529,7 +10903,7 @@ clio::run::TaskResume Runtime::ModifyExistingData(
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::ReadData(const clio::run::priv::vector<BlobBlock> &blocks,
+clio::run::TaskResume Runtime::ReadData(const BlockList &blocks,
                                   ctp::ipc::ShmPtr<> data, size_t data_size,
                                   size_t data_offset_in_blob,
                                   clio::run::u32 &error_code,

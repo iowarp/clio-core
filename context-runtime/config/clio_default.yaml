@@ -308,6 +308,14 @@ compose:
     #        Placement filters (Context::min_persistence_level_) and replica
     #        durability (REPLICA_PERSISTENT, issue #886) key off this — a
     #        tier left at "volatile" can never satisfy a persistence request.
+    # read_cache: true (memory tiers only: hbm, ram, pinned; default false).
+    #        The tier takes NO primaries or durable copies. It buffers reads:
+    #        a whole-blob read served from a slower tier is copied here in its
+    #        stored form, later reads of the blob are served from the copy,
+    #        and the oldest copies are evicted when it fills (copies read
+    #        since they arrived get one second chance). An hbm read_cache is
+    #        a VRAM buffering tier: GPU page faults on promoted blobs become
+    #        device-to-device copies. Copies are never WAL'd.
     storage:
       - path: "ram::cte_ram_tier1"       # "ram::<name>" for DRAM, filesystem path for disk
         bdev_type: "ram"                 # Options: file, ram, hbm, pinned, noop
@@ -327,6 +335,13 @@ compose:
         # growth_unit: "1GB"
         score: 0.2
         persistence_level: "temporary"
+
+      # VRAM buffering tier (GPU builds; uncomment to enable):
+      # - path: "${CLIO_STORAGE_ROOT}/cte_vram_tier"
+      #   bdev_type: "hbm"
+      #   capacity_limit: "4GB"
+      #   score: 1.0
+      #   read_cache: true
 
     # Metadata durability ---------------------------------------------------
     # Write-ahead log + periodic snapshots for tag/blob metadata. Required

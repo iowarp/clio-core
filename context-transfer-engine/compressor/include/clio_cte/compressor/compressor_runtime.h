@@ -45,6 +45,7 @@
 #include <unordered_map>
 #include <thread>
 #include <vector>
+#include <clio_cte/compressor/codec_pool.h>
 #include <clio_cte/compressor/compressor_tasks.h>
 #include <clio_cte/compressor/compressor_client.h>
 #include <clio_cte/compressor/models/compression_features.h>
@@ -211,6 +212,22 @@ private:
                        clio::run::u64 *out_size);
 
   std::unique_ptr<clio::cte::core::Client> core_client_;
+
+  /**
+   * Decompress a stored buffer on the codec pool (DecompressStored's
+   * contract), yielding this coroutine until it is done, so the worker keeps
+   * serving other tasks -- and other decodes -- meanwhile.
+   * @param rc_out DecompressStored's return code
+   */
+  clio::run::TaskResume DecompressStoredAsync(const char *stored,
+                                              clio::run::u64 stored_size,
+                                              char *dst, clio::run::u64 dst_cap,
+                                              clio::run::u64 *out_size,
+                                              int *rc_out);
+  /** Host threads for CPU codec work (codec_pool.h); created on first use. */
+  CodecPool *Codecs();
+  std::once_flag codec_pool_once_;
+  std::unique_ptr<CodecPool> codec_pool_;
 
   /**
    * Create the container (Method::kCreate)
@@ -439,6 +456,7 @@ private:
    * synchronize, so doing either while a kernel spins is its own deadlock.
    */
   void *codec_ctx_ = nullptr;    // CUcontext, owned
+  int codec_exit_cleanup_ = 0;   // SystemInfo exit-cleanup id for codec_ctx_
   void *primary_ctx_ = nullptr;  // CUcontext of the faulting side, not owned
   /**
    * A pool of independent codec slots, NOT one shared buffer.
@@ -518,6 +536,10 @@ private:
   struct CachedChunks {
     size_t stored_size = 0;
     int wire = 0;        // codec from the blob's CTEC header
+    /** Identity of the blob the table was parsed from (see
+     *  PendingDecomp::blob_key): an address alone can be reused by another
+     *  blob of the same stored size once the organizer moves pages. */
+    unsigned long long blob_key = 0;
     BlobChunksPub bc;
   };
   std::unordered_map<const void *, CachedChunks> bd_cache_;
@@ -598,6 +620,10 @@ private:
      * occupant of its scratch slot. Only stable sources may be cached.
      */
     bool src_stable = false;
+    /** Hash of (tag, blob name) for src_stable sources; part of the chunk
+     *  cache key so a reused tier address never serves another blob's
+     *  table. */
+    unsigned long long blob_key = 0;
     size_t stored_size = 0;
     void *dst = nullptr;
     size_t dst_bytes = 0;
@@ -640,12 +666,7 @@ private:
   static constexpr size_t kDecompSlots = 64;
   static constexpr size_t kSlotMaxChunks = 64;
   DecompSlot dslots_[kDecompSlots];
-  std::mutex dslot_mu_;   // slot claim/free + temp high-water only
-  void *dtemp_ = nullptr;
-  size_t dtemp_cap_ = 0;
-  size_t dtemp_bytes_ = 0;
-  size_t dtemp_hw_nch_ = 0;
-  size_t dtemp_hw_unc_ = 0;
+  std::mutex dslot_mu_;   // slot claim/free
 
   /**
    * Launch the decode of one or more pages sharing a slot.
@@ -712,9 +733,6 @@ private:
     size_t dev_cap = 0;
     void *temp = nullptr;
     size_t temp_cap = 0;
-    size_t temp_bytes = 0;   // requirement at the high-water shape
-    size_t hw_nch = 0;       // high-water chunk count for temp reuse
-    size_t hw_maxunc = 0;
     void *ev = nullptr;      // cudaEvent_t, created on first use
     bool busy = false;
     std::vector<std::shared_ptr<PendingDecomp>> owners;

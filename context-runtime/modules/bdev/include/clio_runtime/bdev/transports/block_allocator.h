@@ -54,7 +54,19 @@ class WorkerBlockMap {
    *  block >= a size in one category, this scans every bucket for a block that
    *  FITS what is left -- a freed 8 KiB block bucketed under 16 KiB is exactly
    *  the case the >= match could never reach. */
-  bool AllocateAnyUpTo(size_t max_bytes, Block& block);
+  bool AllocateAnyUpTo(size_t max_bytes, size_t align, Block& block);
+  /**
+   * Pull the SMALLEST freed block whose footprint is >= min_bytes, from any
+   * bucket. Used to finish an assembled allocation whose remainder is
+   * smaller than every freed block: the caller splits the block.
+   * @param min_bytes Smallest acceptable footprint (bytes)
+   * @param align The allocator's alignment: a block's footprint is its size
+   *              rounded up to this, NOT to 4 KiB -- RAM/HBM tiers allocate
+   *              at 512 B, and over-rounding picks a block too small
+   * @param block Receives the block
+   * @return true if a block was found
+   */
+  bool AllocateSmallestAtLeast(size_t min_bytes, size_t align, Block& block);
   void FreeBlock(Block block);
 
  private:
@@ -72,7 +84,12 @@ class GlobalBlockMap {
   bool AllocateBlock(int worker, size_t io_size, Block& block);
   /** @copydoc WorkerBlockMap::AllocateAnyUpTo -- searches this worker's map
    *  first, then steals from the others. */
-  bool AllocateAnyUpTo(int worker, size_t max_bytes, Block& block);
+  bool AllocateAnyUpTo(int worker, size_t max_bytes, size_t align,
+                       Block& block);
+  /** @copydoc WorkerBlockMap::AllocateSmallestAtLeast -- searches this
+   *  worker's map first, then steals from the others. */
+  bool AllocateSmallestAtLeast(int worker, size_t min_bytes, size_t align,
+                               Block& block);
   bool FreeBlock(int worker, Block& block);
 
   /**

@@ -23,7 +23,11 @@
 #include <clio_cte/gpu_vector/page.h>
 #include <clio_cte/gpu_vector/prefetch.h>
 
+#if defined(_WIN32)
+#include <io.h>  // _write: the async-signal-safe stderr write below
+#else
 #include <unistd.h>
+#endif
 
 #include <cmath>
 #include <csignal>
@@ -246,7 +250,11 @@ inline unsigned long long *FatalMirror() {
         char buf[512];
         const int w = FatalFormat(FatalMirror(), buf, sizeof(buf));
         if (w > 0) {
+#if defined(_WIN32)
+          const int r = ::_write(2, buf, static_cast<unsigned>(w));
+#else
           const ssize_t r = ::write(2, buf, static_cast<size_t>(w));
+#endif
           (void)r;
         }
         std::signal(sig, SIG_DFL);
@@ -350,6 +358,21 @@ class Vector {
         gpu_ids_(gpu_ids) {
     if (page_bytes_ == 0 || nblocks_ == 0 || set_size_ == 0 || nsets_ == 0) {
       throw std::runtime_error("gpu_vector: zero page size / blocks / sets");
+    }
+    // A page needs a TAG (one of nsets * set_size) as well as a region, so
+    // regions beyond the tag count are allocated and never used: a cache
+    // asked for 8000 pages with the default nsets (= nblocks = 32) and 64
+    // ways held at most 2048, with 5.9 GB of device memory idle. Say so.
+    if (static_cast<clio::run::u64>(capacity_pages_) >
+        static_cast<clio::run::u64>(nsets_) * set_size_) {
+      std::fprintf(stderr,
+                   "gpu_vector %s: WARNING capacity %u pages exceeds the %llu "
+                   "tags of %u sets x %u ways; at most %llu pages can be "
+                   "resident -- pass nsets >= ceil(capacity / set_size)\n",
+                   tag_name.c_str(), capacity_pages_,
+                   static_cast<unsigned long long>(nsets_) * set_size_, nsets_,
+                   set_size_,
+                   static_cast<unsigned long long>(nsets_) * set_size_);
     }
     clio::cte::core::Client cte(clio::cte::core::kCtePoolId);
     auto tag = cte.AsyncGetOrCreateTag(tag_name);

@@ -297,9 +297,13 @@ class Logger {
       fflush(fout_);
     }
 
-    // Fatal errors terminate the program
+    // Fatal errors terminate the program -- in order. A bare exit(1) here ran
+    // on whichever thread failed, while others were still inside CUDA calls;
+    // several threads hitting a CUDA error at once all called exit(), and the
+    // process wedged in the GPU driver during teardown (unkillable until a
+    // reboot). FatalExit lets one thread end it after the GPU cleanups.
     if (LOG_CODE == kFatal) {
-      exit(1);
+      SystemInfo::FatalExit(1);
     }
 #endif
   }

@@ -907,6 +907,19 @@ struct BlobBlock {
         capacity_(capacity) {}
 };
 
+/**
+ * The block list of a blob (and of each replica).
+ *
+ * ONE element inline, not priv::vector's default eight: every blob keeps a
+ * BlobInfo resident for as long as it exists, so the inline buffer is paid
+ * per blob. Nearly every blob is one block (a whole put lands in one
+ * extent); longer lists move to the heap. With eight inline BlobBlocks --
+ * and eight inline Replicas, each with eight inline blocks of its own -- a
+ * BlobInfo was 9.2 KB, i.e. 3.5 GB of host RAM to hold the metadata of a
+ * 392k-page model store.
+ */
+using BlockList = ctp::priv::vector<BlobBlock, CLIO_PRIV_ALLOC_T, 1>;
+
 /** Replica flags (issue #886). OR'd into a replica via
  *  Context::replica_flags_ on any replica-targeted write. */
 /// The reorganizer must not move this replica: ReorganizeBlob on it is a
@@ -938,6 +951,13 @@ static constexpr clio::run::u32 REPLICA_UPDATE_ONLY = 0x8;
  *  writer to drop the copy otherwise. Without the flag, registration is
  *  unconditional (the writer mirrors an existing complete copy in place). */
 static constexpr clio::run::u32 REPLICA_VERIFY_COMPLETE = 0x10;
+/** This REPLICA_CACHE copy is a READ-PROMOTION copy on a `read_cache`
+ *  target (a device-memory buffering tier): a byte-exact image of the
+ *  primary's STORED bytes (same transform state), taken by the core itself
+ *  when a read is served from a slower tier. Valid only while
+ *  Replica::src_version_ equals the blob's last_modified_; never WAL'd
+ *  (the tier is volatile and the copy is always re-derivable). */
+static constexpr clio::run::u32 REPLICA_READ_CACHE = 0x20;
 /** Return code of an UPDATE_ONLY replica write against an absent slot. */
 static constexpr clio::run::u32 kReplicaAbsentRc = 12;
 /** PutBlob could not place the bytes: every eligible tier is full (10 +
@@ -1012,7 +1032,7 @@ static constexpr clio::run::u32 kBlobOwnerDownRc = 63;
  */
 struct Replica {
   clio::run::priv::string name_;
-  clio::run::priv::vector<BlobBlock> blocks_;
+  BlockList blocks_;
   // Mirror of sum(blocks_[i].size_), same contract as
   // BlobInfo::total_size_cache_ but for this replica's layout.
   clio::run::u64 total_size_cache_;
@@ -1037,11 +1057,15 @@ struct Replica {
   // still reclaim a REPLICA_CACHE copy's blocks regardless. Propagated via
   // Context::replica_min_score_.
   float min_score_;
+  // REPLICA_READ_CACHE copies only: the primary's last_modified_ when the
+  // copy was taken. A copy whose src_version_ no longer matches is stale
+  // and is never served (0 = not a read-promotion copy).
+  clio::run::u64 src_version_;
 
   CTP_CROSS_FUN Replica()
       : name_(CLIO_PRIV_ALLOC), blocks_(CLIO_PRIV_ALLOC),
         total_size_cache_(0), score_(-1.0f), flags_(0),
-        transform_flags_(0), min_score_(-1.0f) {}
+        transform_flags_(0), min_score_(-1.0f), src_version_(0) {}
 
   /** True when this copy's stored bytes are not the producer's bytes. */
   CTP_CROSS_FUN bool IsTransformed() const { return transform_flags_ != 0; }
@@ -1130,25 +1154,31 @@ struct RegisterReplicaContainerTask : public clio::run::Task {
   }
 };
 
+/** A blob's replicas and replica-holding nodes: empty for almost every
+ *  blob, so one inline element (see BlockList for why this matters). */
+using ReplicaList = ctp::priv::vector<Replica, CLIO_PRIV_ALLOC_T, 1>;
+using ReplicaNodeList = ctp::priv::vector<clio::run::u64, CLIO_PRIV_ALLOC_T, 1>;
+
 /**
  * Blob information structure with block-based management
  */
 struct BlobInfo {
   clio::run::priv::string blob_name_;
-  clio::run::priv::vector<BlobBlock> blocks_;
+  BlockList blocks_;
   // Replicas of this blob's data (issue #886). Empty unless the replication
   // module (or a caller using Context::replica_) created some — the common
-  // no-replica blob pays only an empty vector. Replica block lifecycles are
+  // no-replica blob pays only an empty ReplicaList (one inline slot -- with
+  // the default eight it was 7.8 KB per blob). Replica block lifecycles are
   // owned here exactly like blocks_: DelBlob frees them, and their layouts
   // persist through kExtendReplica WAL records.
-  clio::run::priv::vector<Replica> replicas_;
+  ReplicaList replicas_;
   // Nodes that registered a cached/replicated copy of this blob (issue #886
   // distributed coherence; kRegisterReplicaContainer). The next primary
   // write invalidates each registered node's copy and clears the list —
   // caches re-register when they re-populate. Deliberately NOT persisted:
   // remote caches are volatile, so a rebooted owner starts with no
   // registrations and no stale invalidation targets.
-  clio::run::priv::vector<clio::run::u64> replica_nodes_;
+  ReplicaNodeList replica_nodes_;
   float score_;  // 0-1 score for reorganization
   /**
    * Highest generation stamped by a generational put (Context::generation_).

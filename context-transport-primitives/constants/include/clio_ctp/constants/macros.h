@@ -66,8 +66,11 @@
 #define CTP_IS_HOST 1
 #endif
 
-/** Import / export flags for MSVC DLLs */
-#if CTP_COMPILER_MSVC
+/** Import / export flags for Windows DLLs. Keyed on the PLATFORM, not the
+ *  compiler: GNU-frontend clang++ targeting x86_64-pc-windows-msvc (the
+ *  CLIO_GPU_CLANG toolchain on Windows) also needs __declspec, or nothing is
+ *  exported from the DLLs. Not in the CUDA device pass (nvptx has no DLLs). */
+#if CTP_COMPILER_MSVC || (defined(_WIN32) && !defined(__CUDA_ARCH__))
 #define CTP_DLL_EXPORT __declspec(dllexport)
 #define CTP_DLL_IMPORT __declspec(dllimport)
 #else
@@ -109,7 +112,7 @@
  * per-target define was always meant to mean. Nothing outside the defining
  * library ever needs to take the address of these.
  */
-#if CTP_COMPILER_MSVC
+#if CTP_COMPILER_MSVC || defined(_WIN32)
 #define CTP_SO_LOCAL
 #else
 #define CTP_SO_LOCAL __attribute__((visibility("hidden")))

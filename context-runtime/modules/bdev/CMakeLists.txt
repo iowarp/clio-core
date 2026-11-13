@@ -10,6 +10,12 @@ endif()
 set(BDEV_GPU_LIBS "")
 if(CLIO_CORE_ENABLE_CUDA)
   list(APPEND BDEV_GPU_LIBS ctp::cuda_cxx)
+  # mem_bdev_transport.cc calls ctp_copy_kernel_launch, defined in
+  # clio_run_cxx_gpu. ELF resolves it at load time; a Windows DLL must link
+  # the import library.
+  if(WIN32 AND TARGET clio_run_cxx_gpu)
+    list(APPEND BDEV_GPU_LIBS clio_run_cxx_gpu)
+  endif()
 elseif(CLIO_CORE_ENABLE_ROCM)
   list(APPEND BDEV_GPU_LIBS ctp::rocm_cxx)
 endif()

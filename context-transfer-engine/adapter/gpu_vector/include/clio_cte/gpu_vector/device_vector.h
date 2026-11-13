@@ -121,6 +121,30 @@ typedef GV_G BlockTasks GBlockTasks;
 /** Eviction rank a freshly faulted page starts at. Higher means keep. */
 constexpr float kDefaultScore = 1.0f;
 
+/**
+ * Stop the calling thread after a FATAL that is already latched (h_->fatal_,
+ * FatalNote): the host reads it from FatalMirror() and the yield driver stops
+ * relaunching (clio-ml YieldRunner aborts its loop on a latched fatal).
+ *
+ * NOT __trap() on CUDA. A trap leaves the context in a sticky error (719),
+ * and on Windows (WDDM) a process whose kernel trapped could not finish
+ * terminating however it exited -- terminated, one thread stuck inside the
+ * driver, unkillable until a reboot (seen three times). PTX `exit` ends the
+ * thread normally: the block finishes, the context stays sound, the error
+ * travels as a latched note and a host exception. An exited thread counts
+ * as arrived at later barriers, so peers of a thread-0-only site do not
+ * hang; every block-collective site stops the whole block. Other targets
+ * keep __trap(): Level Zero aborts the process on a trap by design, and
+ * that path prints the latched note on the way down (FatalMirror).
+ */
+CTP_GPU_FUN inline void GvStop() {
+#if CTP_IS_GPU && CTP_IS_CUDA_COMPILER
+  asm volatile("exit;");
+#else
+  __trap();
+#endif
+}
+
 /** table_ before Init binds it. */
 constexpr clio::run::u32 kUnbound = ~0u;
 
@@ -371,7 +395,7 @@ class DeviceVector {
         h_->fatal_[2] = h_->nblocks_;
         __threadfence_system();
       }
-      __trap();
+      GvStop();
     }
     table_ = block;
   }
@@ -675,7 +699,7 @@ class DeviceVector {
         FatalNote(kFatalNotResident, pn, SetOf(pn), h_->set_size_, have,
                   fetching, free_n);
       }
-      __trap();
+      GvStop();
     }
     // RESIDENT IS NOT VALID. The frame may hold a different slice of this
     // page -- a fetch transfers only the range it was given -- and reading
@@ -699,7 +723,7 @@ class DeviceVector {
                  p->valid_hi);
         }
         FatalNote(kFatalNotCovered, PageOf(off), in, p->valid_hi);
-        __trap();
+        GvStop();
       }
     }
     co_return Pin(p, off, count, write);
@@ -1086,7 +1110,7 @@ class DeviceVector {
         FatalNote(kFatalNotResident, pn, SetOf(pn), h_->set_size_, have,
                   fetching, free_n);
       }
-      __trap();
+      GvStop();
     }
     // RESIDENT IS NOT VALID: the frame may hold a different slice of the
     // page, and reading the rest would hand back what it held before.
@@ -1104,7 +1128,7 @@ class DeviceVector {
                  (unsigned) (in + run), p->valid_lo, p->valid_hi);
         }
         FatalNote(kFatalNotCovered, PageOf(off), in, p->valid_hi);
-        __trap();
+        GvStop();
       }
     }
     // NO NAMED Held LOCAL. Every declaration in a block that contains a
@@ -1292,7 +1316,7 @@ class DeviceVector {
         FatalNote(kFatalNotResident, pn, SetOf(pn), h_->set_size_, have,
                   fetching, free_n);
       }
-      __trap();
+      GvStop();
     }
     // Resident is not valid: a fetch transfers only the range it was given.
     if (!write) {
@@ -1310,7 +1334,7 @@ class DeviceVector {
                  (unsigned) (in + run), p->valid_lo, p->valid_hi);
         }
         FatalNote(kFatalNotCovered, PageOf(off), in, p->valid_hi);
-        __trap();
+        GvStop();
       }
     }
     *out = Pin(p, off, count, write);
@@ -1413,7 +1437,7 @@ class DeviceVector {
         atomicCAS(h_->fatal_, kFatalNone, kFatalUnbound);
         __threadfence_system();
       }
-      __trap();
+      GvStop();
     }
     return table_;
   }
@@ -2087,7 +2111,7 @@ class DeviceVector {
             ReportSetFull(pn, &t4, &t5, &t6);
             FatalNote(kFatalSetFull, pn, SetOf(pn), PinnedInSet(SetOf(pn)),
                       t4, t5, t6);
-            __trap();
+            GvStop();
           }
           if (!is_new) {
             const bool stale = bt->fetch_generation != 0 &&
@@ -2269,7 +2293,7 @@ class DeviceVector {
              "kernel is stopped here rather than reading them.\n",
              Table(), (unsigned)bt->fetch_n, (unsigned long long)first_pn,
              (unsigned long long)bt->fetch_gen_sub);
-      __trap();
+      GvStop();
       return;
     }
     for (clio::run::u32 i = 0; i < bt->fetch_n; ++i) {
@@ -2382,7 +2406,7 @@ class DeviceVector {
              "task carries %u. Split the range.\n",
              Table(), n + dropped, clio::cte::core::kPodMultiMax);
       FatalNote(kFatalFlushSplit, n + dropped, clio::cte::core::kPodMultiMax, 0);
-      __trap();
+      GvStop();
     }
     if (n == 0) return;
     FinishFlushSubmit(t, n);
@@ -2466,7 +2490,7 @@ class DeviceVector {
       FatalNote(kFatalPutFailed, first_pn,
                 static_cast<clio::run::u64>(bt->flush_n),
                 static_cast<clio::run::u64>(bt->flush_generation));
-      __trap();
+      GvStop();
       return;
     }
     for (clio::run::u32 i = 0; i < bt->flush_n; ++i) {

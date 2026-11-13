@@ -35,6 +35,7 @@
 #include <clio_cte/core/core_runtime.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cmath>
 #include <vector>
 
@@ -64,13 +65,34 @@ clio::run::TaskResume HotSetDataOrganizer::Reorganize(
   const clio::run::u64 budget =
       static_cast<clio::run::u64>(static_cast<double>(fast_bytes) * kFillFactor);
   clio::run::u64 spent = 0;
+  // CLIO_ORGANIZER_TRACE: one line per round -- the tier budget, what was
+  // considered, and how each move came back (rc 0 moved, 3 not found, 7 no
+  // room / backing off; see ReorganizeBlobInternal for the rest).
+  const bool trace = std::getenv("CLIO_ORGANIZER_TRACE") != nullptr;
+  clio::run::u64 hot = 0, tried = 0;
+  clio::run::u64 rc_hist[8] = {0, 0, 0, 0, 0, 0, 0, 0};
   for (const OrganizerBlobStat &stat : stats) {
     if (spent + stat.size_ > budget) break;   // tier full; the rest stay put
     spent += stat.size_;
-    if (std::fabs(kHotScore - stat.score_) < kEpsilon) continue;  // already hot
+    if (std::fabs(kHotScore - stat.score_) < kEpsilon) {  // already hot
+      ++hot;
+      continue;
+    }
     clio::run::u32 rc = 0;
     CLIO_CO_AWAIT(server->ReorganizeBlobInternal(stat.tag_id_, stat.blob_name_,
                                                  kHotScore, rc));
+    ++tried;
+    ++rc_hist[rc < 7 ? rc : 7];
+  }
+  if (trace) {
+    HLOG(kInfo,
+         "hotset: fast tier {} MiB, budget {} MiB, {} blobs seen, top access "
+         "count {}, {} already hot, {} moves tried: rc0={} rc1={} rc3={} "
+         "rc5={} rc6={} rc7+={}",
+         fast_bytes >> 20, budget >> 20, stats.size(),
+         stats.empty() ? 0 : stats.front().access_count_, hot, tried,
+         rc_hist[0], rc_hist[1], rc_hist[3], rc_hist[5], rc_hist[6],
+         rc_hist[7]);
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END

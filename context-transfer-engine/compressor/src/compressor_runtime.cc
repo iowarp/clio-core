@@ -67,6 +67,21 @@ extern "C" int clio_cte_locate(const void *tag_id, const char *name,
                                unsigned long long *stored_size);
 extern "C" char *clio_direct_dev_base(unsigned long long pool_id);
 
+/**
+ * Identity of a blob for the drain's chunk-table cache.
+ * @param major tag id major
+ * @param minor tag id minor
+ * @param name  blob name (may hold raw bytes, e.g. a packed page number)
+ * @return a hash of all three; never 0 for a real blob in practice
+ */
+static unsigned long long TierBlobKey(unsigned long long major,
+                                      unsigned long long minor,
+                                      const std::string &name) {
+  unsigned long long h = std::hash<std::string>{}(name);
+  h ^= ((major << 32) ^ minor) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+  return h;
+}
+
 // Fault-path accounting: which route does a compressed page actually take?
 static std::atomic<long long> g_path_tier_d2d{0};    // device tier, decoded in place
 static std::atomic<long long> g_path_spill_stage{0}; // host tier, staged to device
@@ -99,18 +114,46 @@ static void PathTrace(const char *what) {
 
 namespace clio::cte::compressor {
 
+/**
+ * Where the CTE core keeps a blob this interposer stores or reads.
+ *
+ * The compressed bytes are placed exactly like a raw blob: by the core's own
+ * placement (Dynamic, hashed on the blob), never on whichever node's
+ * compressor container happened to run the put. Every node's compressor
+ * then finds a page the same way a raw read does, so a GPU page fault on one
+ * node decompresses a page that was assimilated, and stored, on another.
+ * On a single node this resolves to the local container.
+ */
+inline clio::run::PoolQuery StoredQuery() { return clio::run::PoolQuery::Dynamic(); }
+
 /** Waiter poll interval and cap for the batched GPU decompress path. 20us x
  *  5000 = 100 ms: far longer than a batch needs, far shorter than a hang. */
 static constexpr double kDecompWaitPollUs = 20.0;
+
+/** First method id of the compressor's own verbs (clio_mod.yaml: kDynamicSchedule);
+ *  ids below it are core verbs this interposer forwards. */
+static constexpr clio::run::u32 kFirstModuleMethod = 100;
 /**
  * The wait must cover QUEUEING, not just one batch.
  *
  * A request that arrives just after a batch starts waits for that batch, then
  * the linger, then its own batch -- with 50-70 ms batches that is ~140 ms, and
  * a 100 ms budget timed out reliably. The bound exists only so a wedged
- * drainer cannot hang a worker forever, so it should be generous: 2 s.
+ * drainer cannot hang a worker forever, so it is generous: 10 s.
+ *
+ * WALL CLOCK, NOT A POLL COUNT. It used to be 100000 polls "= 2 s", but each
+ * poll is a scheduler yield, and under load a yield is milliseconds, not the
+ * 20 us asked for: a decode that could never complete held a worker -- and
+ * with it the runtime's shutdown -- for 36 minutes.
  */
-static constexpr int kDecompWaitMaxSpins = 100000;
+static constexpr long long kDecompWaitBudgetMs = 10000;
+
+/** True once a decode waiter that started at `t0` has used its budget. */
+inline bool DecompWaitOver(std::chrono::steady_clock::time_point t0) {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now() - t0)
+             .count() >= kDecompWaitBudgetMs;
+}
 
 // Bring chi namespace items into scope for CLIO_CUR_WORKER macro
 using clio::run::chi_cur_worker_key_;
@@ -386,7 +429,15 @@ clio::run::PoolQuery Runtime::ScheduleTask(const clio::run::shared_ptr<clio::run
         std::hash<clio::cte::core::TagId>{}(compress_task->tag_id_));
     return clio::run::PoolQuery::DirectHash(hash);
   }
-  // Other Dynamic methods (Decompress, periodic ticks) resolve Local.
+  // Forwarded CORE verbs (tags, blobs: ids below the module range) route
+  // exactly as the core routes them -- to the blob's / tag name's owner
+  // container (CoreInterposer::ScheduleTask). Resolving them Local made the
+  // blob namespace per-node behind the compressor: a reader on another node
+  // got a fresh local tag and never found blobs another node had put.
+  if (task->method_ < kFirstModuleMethod) {
+    return clio::cte::core::CoreInterposer::ScheduleTask(task);
+  }
+  // Other Dynamic module methods (Decompress, periodic ticks) resolve Local.
   return clio::run::PoolQuery::Local();
 }
 
@@ -837,7 +888,7 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
       auto put_task = core_client_->AsyncPutBlob(
           task->tag_id_, task->blob_name_.str(), task->offset_, task->size_,
           task->blob_data_, task->score_, context, task->flags_,
-          clio::run::PoolQuery::Local());
+          StoredQuery());
       CLIO_CO_AWAIT(put_task);
       task->context_ = put_task->context_;
       task->return_code_ = put_task->return_code_;
@@ -933,7 +984,7 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
       auto put_task = core_client_->AsyncPutBlob(
           task->tag_id_, task->blob_name_.str(), task->offset_,
           total_stored_size, compressed_shm_ptr, task->score_, context,
-          task->flags_, clio::run::PoolQuery::Local());
+          task->flags_, StoredQuery());
       CLIO_CO_AWAIT(put_task);
 
       // Free compressed data buffer
@@ -970,7 +1021,7 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
       auto put_task = core_client_->AsyncPutBlob(
           task->tag_id_, task->blob_name_.str(), task->offset_, task->size_,
           task->blob_data_, task->score_, context, task->flags_,
-          clio::run::PoolQuery::Local());
+          StoredQuery());
       CLIO_CO_AWAIT(put_task);
 
       task->context_ = put_task->context_;
@@ -1028,7 +1079,7 @@ clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> 
     // Call GetBlob to retrieve the (potentially compressed) data
     auto get_task = core_client_->AsyncGetBlob(
         task->tag_id_, task->blob_name_.str(), task->offset_, expected_size,
-        task->flags_, temp_buffer_ptr, clio::run::PoolQuery::Local());
+        task->flags_, temp_buffer_ptr, StoredQuery());
     CLIO_CO_AWAIT(get_task);
 
     if (get_task->return_code_ != 0) {
@@ -1427,6 +1478,12 @@ bool Runtime::InitCodecContext() {
   CUcontext popped = nullptr;
   cuCtxPopCurrent(&popped);
   codec_ctx_ = ctx;
+  // If the process ends abnormally, destroy this context before the runtime
+  // resets the devices (cleanups run last-registered first): a second
+  // context left to the OS on a dying process is the same hazard as the
+  // primary one (see SystemInfo::FatalExit).
+  codec_exit_cleanup_ = ctp::SystemInfo::AddExitCleanup(
+      [](void *c) { (void)cuCtxDestroy(static_cast<CUcontext>(c)); }, ctx);
 
   size_t buf = 8ULL << 20;
   if (const char *e = std::getenv("CLIO_COMPRESS_GPU_BUF_MB")) {
@@ -1624,6 +1681,10 @@ void Runtime::DestroyCodecContext() {
   }
   codec_slots_.clear();
   codec_free_.clear();
+  if (codec_exit_cleanup_ != 0) {
+    ctp::SystemInfo::RemoveExitCleanup(codec_exit_cleanup_);
+    codec_exit_cleanup_ = 0;
+  }
   cuCtxDestroy(static_cast<CUcontext>(codec_ctx_));
   codec_ctx_ = nullptr;
   codec_buf_bytes_ = 0;
@@ -1680,24 +1741,42 @@ class DeviceArray {
  * The nine algorithms take identical parameters and differ only in the opts
  * struct, so this is a switch and nothing more. Keeping it in one place is
  * what makes the path codec-agnostic instead of LZ4-only.
+ *
+ * The ids MUST match CompressionFactory's registry, which is what the write
+ * path encodes with (13 = nvcomp-zstd, 15 = nvcomp-deflate). These two
+ * switches once had 13 and 15 swapped, so every Zstd or Deflate page was
+ * handed to the other algorithm's batched decoder.
  */
 #define CLIO_NVC_CASE_TEMP(WID, ALGO)                                         \
   case WID:                                                                   \
-    return nvcompBatched##ALGO##DecompressGetTempSizeSync(                    \
-               cptr, csz, nch, max_unc, temp_bytes, 0,                        \
-               nvcompBatched##ALGO##DecompressDefaultOpts, status, stream) == \
-           nvcompSuccess;
+    return nvcompBatched##ALGO##DecompressGetTempSizeAsync(                   \
+               nch, max_unc, nvcompBatched##ALGO##DecompressDefaultOpts,      \
+               temp_bytes, total_unc) == nvcompSuccess;
 
-bool NvcompBatchedTempSizeImpl(int wire, const void *const *cptr,
-                               const size_t *csz, size_t nch, size_t max_unc,
-                               size_t *temp_bytes, nvcompStatus_t *status,
-                               cudaStream_t stream) {
+/**
+ * Scratch bytes one batched decode needs, from the batch's SHAPE alone.
+ *
+ * The *Async* query is host-only and returns an upper bound valid for ANY
+ * data of that shape. The *Sync* one (used before) reads the compressed
+ * chunks and returns the requirement of THAT data, so caching its answer and
+ * reusing it for later batches -- which both callers did -- under-sized the
+ * scratch: Zstd, GDeflate and ANS decodes then wrote past it and faulted the
+ * context (CUDA 719); Deflate, which needs little scratch, survived.
+ * @param wire       CTE wire id (11..16)
+ * @param nch        chunks in the batch
+ * @param max_unc    largest uncompressed chunk, bytes
+ * @param total_unc  sum of uncompressed chunk sizes, bytes
+ * @param temp_bytes out: required scratch bytes
+ * @return false for an unknown wire id or an nvcomp error
+ */
+bool NvcompBatchedTempSizeImpl(int wire, size_t nch, size_t max_unc,
+                               size_t total_unc, size_t *temp_bytes) {
   switch (wire) {
     CLIO_NVC_CASE_TEMP(11, LZ4)
     CLIO_NVC_CASE_TEMP(12, Snappy)
-    CLIO_NVC_CASE_TEMP(13, Deflate)
+    CLIO_NVC_CASE_TEMP(13, Zstd)
     CLIO_NVC_CASE_TEMP(14, Gdeflate)
-    CLIO_NVC_CASE_TEMP(15, Zstd)
+    CLIO_NVC_CASE_TEMP(15, Deflate)
     CLIO_NVC_CASE_TEMP(16, ANS)
     default:
       return false;
@@ -1720,9 +1799,9 @@ bool NvcompBatchedDecompressImpl(int wire, const void *const *cptr,
   switch (wire) {
     CLIO_NVC_CASE_DEC(11, LZ4)
     CLIO_NVC_CASE_DEC(12, Snappy)
-    CLIO_NVC_CASE_DEC(13, Deflate)
+    CLIO_NVC_CASE_DEC(13, Zstd)
     CLIO_NVC_CASE_DEC(14, Gdeflate)
-    CLIO_NVC_CASE_DEC(15, Zstd)
+    CLIO_NVC_CASE_DEC(15, Deflate)
     CLIO_NVC_CASE_DEC(16, ANS)
     default:
       return false;
@@ -1751,34 +1830,56 @@ constexpr unsigned long long kHlifMagic = 1385239334ull;
 /** Parse `hdr` (a host copy of the blob's first bytes). */
 bool ParseBlobChunks(const unsigned char *hdr, size_t hdr_len,
                      size_t stored_size, BlobChunks *out) {
-  if (hdr_len < 32 + 72) return false;
+  // CLIO_CODEC_TRACE: say WHICH check rejected the blob -- a page that fails
+  // here is decoded by nobody, and the faulting kernel only sees "error".
+  auto reject = [&](int why) {
+    if (getenv("CLIO_CODEC_TRACE") != nullptr) {
+      unsigned long long f[8] = {};
+      for (int k = 0; k < 8 && 32 + 8 * (k + 1) <= hdr_len; ++k) {
+        std::memcpy(&f[k], hdr + 32 + 8 * k, 8);
+      }
+      fprintf(stderr,
+              "[PARSE] reject %d hdr_len=%zu stored=%zu hlif=%llx %llx %llx "
+              "%llx %llx %llx %llx %llx\n",
+              why, hdr_len, stored_size, f[0], f[1], f[2], f[3], f[4], f[5],
+              f[6], f[7]);
+    }
+    return false;
+  };
+  if (hdr_len < 32 + 72) return reject(1);
   unsigned int magic = 0;
   std::memcpy(&magic, hdr, 4);
-  if (magic != kCtecMagic) return false;          // stored RAW, not encoded
+  if (magic != kCtecMagic) return reject(2);          // stored RAW, not encoded
   std::memcpy(&out->orig, hdr + 16, 8);
-  if (out->orig == 0) return false;
+  if (out->orig == 0) return reject(3);
   const unsigned char *hl = hdr + 32;
   unsigned long long v = 0;
   std::memcpy(&v, hl, 8);
-  if ((v & 0xffffffffull) != kHlifMagic) return false;
+  if ((v & 0xffffffffull) != kHlifMagic) return reject(4);
   std::memcpy(&v, hl + 16, 8);
-  if (v != out->orig) return false;
+  if (v != out->orig) return reject(5);
   unsigned long long nchunks = 0;
   std::memcpy(&nchunks, hl + 24, 8);
-  if (nchunks == 0 || nchunks > (1ull << 20)) return false;
+  if (nchunks == 0 || nchunks > (1ull << 20)) return reject(6);
   std::memcpy(&out->chunk_raw, hl + 48, 8);
-  if (out->chunk_raw == 0) return false;
+  if (out->chunk_raw == 0) return reject(7);
+  // The data-start offset is a 32-bit field like the magic: the encoder
+  // leaves the 4 bytes after it UNINITIALIZED, so they hold whatever was in
+  // the output buffer (stale page bytes were seen there with Zstd, GDeflate
+  // and ANS). Comparing all 8 bytes rejected those pages, which then had no
+  // decoder at all; Deflate only passed because its padding happened to be 0.
   unsigned long long dstart = 0;
   std::memcpy(&dstart, hl + 56, 8);
-  if (dstart != 72 + 16 * nchunks) return false;
-  if (hdr_len < 32 + dstart) return false;        // table not fully copied
+  dstart &= 0xffffffffull;
+  if (dstart != 72 + 16 * nchunks) return reject(8);
+  if (hdr_len < 32 + dstart) return reject(9);        // table not fully copied
   out->rel.resize(nchunks);
   out->csz.resize(nchunks);
   for (unsigned long long c = 0; c < nchunks; ++c) {
     unsigned long long rel = 0, cs = 0;
     std::memcpy(&rel, hl + 72 + 8 * c, 8);
     std::memcpy(&cs, hl + 72 + 8 * nchunks + 8 * c, 8);
-    if (cs == 0 || 32 + dstart + rel + cs > stored_size) return false;
+    if (cs == 0 || 32 + dstart + rel + cs > stored_size) return reject(10);
     out->rel[c] = 32 + dstart + rel;              // from the blob's start
     out->csz[c] = cs;
   }
@@ -1960,26 +2061,18 @@ int Runtime::LaunchDecompOne(const OneDecomp *items, size_t n) {
   }
   cudaMemcpyAsync(dev, pin, C * 32, cudaMemcpyHostToDevice, stream);
   cudaMemsetAsync(dev + C * 32, 0, C * 8 + C * st_sz, stream);
-  {
-    // Temp requirement: high-water cached globally (mutex); the BUFFER is per
-    // slot, because launches on different streams overlap and cannot share
-    // scratch.
-    std::lock_guard<std::mutex> g(dslot_mu_);
-    if (w > dtemp_hw_nch_ || max_unc > dtemp_hw_unc_) {
-      size_t tb = 0;
-      if (!NvcompBatchedTempSizeImpl(wire, d_cptr, d_csz, w, max_unc, &tb,
-                                     d_status, stream)) {
-        release();
-        return -1;
-      }
-      dtemp_hw_nch_ = w;
-      dtemp_hw_unc_ = max_unc;
-      dtemp_bytes_ = tb;
-    }
+  // Scratch for THIS launch's shape (host-only query); the buffer is per
+  // slot, because launches on different streams overlap.
+  size_t total_unc = 0;
+  for (size_t k = 0; k < w; ++k) total_unc += h_obytes[k];
+  size_t tb = 0;
+  if (!NvcompBatchedTempSizeImpl(wire, w, max_unc, total_unc, &tb)) {
+    release();
+    return -1;
   }
-  if (dtemp_bytes_ > sl.temp_cap) {
+  if (tb > sl.temp_cap) {
     if (sl.temp != nullptr) cudaFree(sl.temp);
-    sl.temp_cap = dtemp_bytes_ * 2;
+    sl.temp_cap = tb * 2;
     if (cudaMalloc(&sl.temp, sl.temp_cap) != cudaSuccess) {
       sl.temp = nullptr;
       sl.temp_cap = 0;
@@ -1988,7 +2081,7 @@ int Runtime::LaunchDecompOne(const OneDecomp *items, size_t n) {
     }
   }
   if (!NvcompBatchedDecompressImpl(wire, d_cptr, d_csz, d_obytes, d_osz, w,
-                                   sl.temp, dtemp_bytes_, d_optr, d_status,
+                                   sl.temp, tb, d_optr, d_status,
                                    stream)) {
     release();
     return -1;
@@ -2010,9 +2103,10 @@ clio::run::TaskResume Runtime::CombinedDecompWait(
     std::lock_guard<std::mutex> g(comb_mu_);
     comb_q_.push_back(req);
   }
+  const auto wait_t0 = std::chrono::steady_clock::now();
   int spins = 0;
   while (req->state.load(std::memory_order_acquire) == 0 &&
-         spins < kDecompWaitMaxSpins) {
+         !DecompWaitOver(wait_t0)) {
     bool expected = false;
     if (comb_launching_.compare_exchange_strong(expected, true,
                                                 std::memory_order_acq_rel)) {
@@ -2259,7 +2353,8 @@ bool Runtime::LaunchDecompBatch(
     if (owners[i]->src_stable) {
       auto it = bd_cache_.find(owners[i]->src_device);
       if (it != bd_cache_.end() &&
-          it->second.stored_size == owners[i]->stored_size) {
+          it->second.stored_size == owners[i]->stored_size &&
+          it->second.blob_key == owners[i]->blob_key) {
         tbl[i] = &it->second;
         continue;
       }
@@ -2278,7 +2373,11 @@ bool Runtime::LaunchDecompBatch(
       if (ParseBlobChunks(hb, owners[i]->stored_bytes.size(),
                           owners[i]->stored_size, &cc.bc)) {
         if (owners[i]->src_stable) {
-          auto ins = bd_cache_.emplace(owners[i]->src_device, std::move(cc));
+          cc.blob_key = owners[i]->blob_key;
+          // insert_or_assign, not emplace: a mismatched entry for this
+          // address must be REPLACED, or the stale table is what gets used.
+          auto ins =
+              bd_cache_.insert_or_assign(owners[i]->src_device, std::move(cc));
           tbl[i] = &ins.first->second;
         } else {
           local[i] = std::move(cc);
@@ -2327,7 +2426,11 @@ bool Runtime::LaunchDecompBatch(
       if (ParseBlobChunks(h, std::min(owners[i]->stored_size, kHdrMax),
                           owners[i]->stored_size, &cc.bc)) {
         if (owners[i]->src_stable) {
-          auto ins = bd_cache_.emplace(owners[i]->src_device, std::move(cc));
+          cc.blob_key = owners[i]->blob_key;
+          // insert_or_assign, not emplace: a mismatched entry for this
+          // address must be REPLACED, or the stale table is what gets used.
+          auto ins =
+              bd_cache_.insert_or_assign(owners[i]->src_device, std::move(cc));
           tbl[i] = &ins.first->second;
         } else {
           local[i] = std::move(cc);
@@ -2424,30 +2527,25 @@ bool Runtime::LaunchDecompBatch(
   cudaMemcpyAsync(dev, pin, nch * 32, cudaMemcpyHostToDevice, stream);
   cudaMemsetAsync(dev + nch * 32, 0, nch * 8 + nch * st_sz, stream);
 
-  // Temp: reuse the high-water requirement; TempSize (which synchronizes
-  // internally, nothing to be done about that) runs only when the batch
-  // SHAPE exceeds anything seen before -- a handful of times ever.
-  if (nch > seg->hw_nch || max_unc > seg->hw_maxunc) {
-    size_t tb = 0;
-    if (!NvcompBatchedTempSizeImpl(wire, d_cptr, d_csz, nch, max_unc, &tb,
-                                   d_status, stream)) {
+  // Temp: sized for THIS batch's shape by the host-only query (no sync, so
+  // it is cheap to ask every launch); the buffer grows geometrically.
+  size_t total_unc = 0;
+  for (size_t k = 0; k < nch; ++k) total_unc += h_obytes[k];
+  size_t tb = 0;
+  if (!NvcompBatchedTempSizeImpl(wire, nch, max_unc, total_unc, &tb)) {
+    return fail_all();
+  }
+  if (tb > seg->temp_cap) {
+    if (seg->temp != nullptr) cudaFree(seg->temp);
+    seg->temp_cap = tb * 2;
+    if (cudaMalloc(&seg->temp, seg->temp_cap) != cudaSuccess) {
+      seg->temp = nullptr;
+      seg->temp_cap = 0;
       return fail_all();
-    }
-    seg->hw_nch = nch;
-    seg->hw_maxunc = max_unc;
-    seg->temp_bytes = tb;
-    if (tb > seg->temp_cap) {
-      if (seg->temp != nullptr) cudaFree(seg->temp);
-      seg->temp_cap = tb * 2;
-      if (cudaMalloc(&seg->temp, seg->temp_cap) != cudaSuccess) {
-        seg->temp = nullptr;
-        seg->temp_cap = 0;
-        return fail_all();
-      }
     }
   }
   if (!NvcompBatchedDecompressImpl(wire, d_cptr, d_csz, d_obytes, d_osz, nch,
-                                   seg->temp, seg->temp_bytes, d_optr,
+                                   seg->temp, tb, d_optr,
                                    d_status, stream)) {
     return fail_all();
   }
@@ -2946,6 +3044,34 @@ int Runtime::DecompressStored(const char *stored, clio::run::u64 stored_size,
   return 0;
 }
 
+CodecPool *Runtime::Codecs() {
+  std::call_once(codec_pool_once_, [this] { codec_pool_ = std::make_unique<CodecPool>(); });
+  return codec_pool_.get();
+}
+
+clio::run::TaskResume Runtime::DecompressStoredAsync(
+    const char *stored, clio::run::u64 stored_size, char *dst,
+    clio::run::u64 dst_cap, clio::run::u64 *out_size, int *rc_out) {
+  CLIO_TASK_BODY_BEGIN
+  struct Job {
+    std::atomic<bool> done{false};
+    int rc = 0;
+    clio::run::u64 out = 0;
+  };
+  auto job = std::make_shared<Job>();
+  Codecs()->Submit([this, job, stored, stored_size, dst, dst_cap] {
+    job->rc = DecompressStored(stored, stored_size, dst, dst_cap, &job->out);
+    job->done.store(true, std::memory_order_release);
+  });
+  while (!job->done.load(std::memory_order_acquire)) {
+    CLIO_CO_AWAIT(clio::run::yield(kDecompWaitPollUs));
+  }
+  *out_size = job->out;
+  *rc_out = job->rc;
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 void Runtime::ResolveDefaultCodec() {
   default_mode_ = clio::cte::core::kCompressSkip;
   default_lib_ = 0;
@@ -3030,7 +3156,7 @@ clio::run::TaskResume Runtime::PutBlob(
       auto put = core_client_->AsyncPutBlob(
           task->tag_id_, task->GetBlobName(), 0, stored_size,
           stored.shm_.template Cast<void>(), task->score_, ctx, task->flags_,
-          clio::run::PoolQuery::Local());
+          StoredQuery());
       CLIO_CO_AWAIT(put);
       CLIO_IPC->FreeBuffer(stored);
       task->context_ = put->context_;
@@ -3239,7 +3365,7 @@ clio::run::TaskResume Runtime::CompressPodPutBlob(
     auto put = core_client_->AsyncPutBlob(
         task->tag_id_, task->GetBlobName(), 0, stored_size,
         stored.shm_.template Cast<void>(), task->score_, ctx, task->flags_,
-        clio::run::PoolQuery::Local());
+        StoredQuery());
     CLIO_CO_AWAIT(put);
     task->context_ = put->context_;
     task->return_code_ = put->GetReturnCode();
@@ -3337,6 +3463,9 @@ clio::run::TaskResume Runtime::DecompressPodGetBlob(
                 // raw's ~65us.
                 auto req = std::make_shared<PendingDecomp>();
                 req->src_stable = true;
+                req->blob_key = TierBlobKey(task->tag_id_.major_,
+                                            task->tag_id_.minor_,
+                                            task->GetBlobName());
                 req->src_device = tier + loff;
                 req->stored_size = static_cast<size_t>(lsz);
                 req->dst = dst_probe.ptr_;
@@ -3345,9 +3474,10 @@ clio::run::TaskResume Runtime::DecompressPodGetBlob(
                   std::lock_guard<std::mutex> g(batch_mu_);
                   batch_.push_back(req);
                 }
+                const auto wait_t0 = std::chrono::steady_clock::now();
                 int spins = 0;
                 while (!req->done.load(std::memory_order_acquire) &&
-                       spins < kDecompWaitMaxSpins) {
+                       !DecompWaitOver(wait_t0)) {
                   CLIO_CO_AWAIT(clio::run::yield(kDecompWaitPollUs));
                   ++spins;
                 }
@@ -3384,9 +3514,10 @@ clio::run::TaskResume Runtime::DecompressPodGetBlob(
                 std::lock_guard<std::mutex> g(batch_mu_);
                 batch_.push_back(req);
               }
+              const auto wait_t0 = std::chrono::steady_clock::now();
               int spins = 0;
               while (!req->done.load(std::memory_order_acquire) &&
-                     spins < kDecompWaitMaxSpins) {
+                     !DecompWaitOver(wait_t0)) {
                 CLIO_CO_AWAIT(clio::run::yield(kDecompWaitPollUs));
                 ++spins;
               }
@@ -3415,7 +3546,7 @@ clio::run::TaskResume Runtime::DecompressPodGetBlob(
     {
       auto get = core_client_->AsyncGetBlob(
           task->tag_id_, task->GetBlobName(), 0, stored_size, 0,
-          buf.shm_.template Cast<void>(), clio::run::PoolQuery::Local());
+          buf.shm_.template Cast<void>(), StoredQuery());
       CLIO_CO_AWAIT(get);
       if (get->GetReturnCode() != 0) {
         task->return_code_ = get->GetReturnCode();
@@ -3460,23 +3591,53 @@ clio::run::TaskResume Runtime::DecompressPodGetBlob(
         req->stored_size = stored_size;
         req->dst = dst_dev.ptr_;
         req->dst_bytes = static_cast<size_t>(task->size_);
+        // THE DRAIN DECODES FROM DEVICE MEMORY ONLY: LaunchDecompBatch
+        // publishes a request without src_device as done/!ok on sight. This
+        // path used to hand it the host copy alone, so every page that got
+        // here was refused ("could not be served by the codec context") --
+        // which is every GPU-codec page on Windows, where the scratch read
+        // above (GetBlob straight into device scratch) does not succeed.
+        // Stage the bytes into GPU scratch so the drain can take them.
+        char *hscratch = nullptr;
+        for (int attempt = 0; attempt < 10000 && hscratch == nullptr;
+             ++attempt) {
+          hscratch = AcquireGpuScratch(stored_size);
+          if (hscratch == nullptr) CLIO_CO_AWAIT(clio::run::yield(50.0));
+        }
+        if (hscratch != nullptr) {
+          // A non-blocking stream of the pool, NOT the legacy default stream,
+          // which would serialize against the gather kernel's stream.
+          auto hs = static_cast<cudaStream_t>(ModuleStreamRR());
+          if (hs != nullptr &&
+              cudaMemcpyAsync(hscratch, buf.ptr_, stored_size,
+                              cudaMemcpyHostToDevice, hs) == cudaSuccess &&
+              cudaStreamSynchronize(hs) == cudaSuccess) {
+            req->src_device = hscratch;
+          }
+        }
         {
           std::lock_guard<std::mutex> g(batch_mu_);
           batch_.push_back(req);
         }
+        const auto wait_t0 = std::chrono::steady_clock::now();
         int spins = 0;
         while (!req->done.load(std::memory_order_acquire) &&
-               spins < kDecompWaitMaxSpins) {
+               !DecompWaitOver(wait_t0)) {
           CLIO_CO_AWAIT(clio::run::yield(kDecompWaitPollUs));
           ++spins;
         }
+        const bool served = req->done.load(std::memory_order_acquire) && req->ok;
         if (!req->done.load(std::memory_order_acquire)) {
           req->abandoned.store(true, std::memory_order_release);
           if (getenv("CLIO_CODEC_TRACE")) {
             fprintf(stderr, "[DRAIN] waiter TIMEOUT\n");
             fflush(stderr);
           }
-        } else if (req->ok) {
+        }
+        // Same lifetime rule as the scratch read above: done means the
+        // batch's event fired, so the GPU is finished with the scratch.
+        if (hscratch != nullptr) ReleaseGpuScratch(hscratch);
+        if (served) {
           CLIO_IPC->FreeBuffer(buf);
           task->return_code_ = 0;
           CLIO_CO_RETURN;
@@ -3521,27 +3682,37 @@ clio::run::TaskResume Runtime::DecompressPodGetBlob(
       size_t payload = (header->compressed_size_ != 0)
                            ? static_cast<size_t>(header->compressed_size_)
                            : (stored_size - hdr);
-      // Per-thread and reused, for the same reason as the put side: this runs
-      // inside a synchronous device page fault, and a page-sized allocation
-      // per fault is pure latency. Nothing suspends between the decompress
-      // and the copy out, so the buffer cannot be observed mid-use.
-      static thread_local std::vector<char> plain;
+      // Decode on the codec pool and yield meanwhile: this handler runs on
+      // the worker serving the device's page faults, and an inline decode (a
+      // 1 MB bzip2 page is tens of ms) blocked every fault queued behind it,
+      // so pages decoded one at a time.
+      struct PlainJob {
+        std::atomic<bool> done{false};
+        bool ok = false;
+        std::vector<char> plain;
+      };
+      auto job = std::make_shared<PlainJob>();
       const size_t original = static_cast<size_t>(header->original_size_);
-      if (plain.size() < original) {
-        plain.resize(original);
+      std::shared_ptr<ctp::Compressor> shared_codec(std::move(codec));
+      const char *src = buf.ptr_ + hdr;
+      auto decode = [job, shared_codec, src, payload, original] {
+        job->plain.resize(original);
+        size_t out = original;
+        job->ok = shared_codec->Decompress(job->plain.data(), out, const_cast<char *>(src),
+                                           payload) && out == original;
+        job->done.store(true, std::memory_order_release);
+      };
+      Codecs()->Submit(decode);
+      while (!job->done.load(std::memory_order_acquire)) {
+        CLIO_CO_AWAIT(clio::run::yield(kDecompWaitPollUs));
       }
-      size_t out = original;
-      if (!codec->Decompress(plain.data(), out, buf.ptr_ + hdr, payload) ||
-          out != original) {
+      if (!job->ok) {
         task->return_code_ = 5;
         CLIO_IPC->FreeBuffer(buf);
         CLIO_CO_RETURN;
       }
-      // `original`, NOT plain.size(): the buffer is reused and only grows, so
-      // its size is a high-water mark from some earlier, larger blob. Copying
-      // that many bytes would hand the caller the tail of a previous page.
       const size_t n = std::min<size_t>(task->size_, original);
-      ctp::DeviceAwareMemcpy(dst_full.ptr_, plain.data(), n);
+      ctp::DeviceAwareMemcpy(dst_full.ptr_, job->plain.data(), n);
     } else {
       // Stored raw: hand the bytes back untouched.
       const size_t n = std::min<size_t>(task->size_, stored_size);
@@ -3598,6 +3769,10 @@ clio::run::TaskResume Runtime::DecompressPodMultiGetBlob(
   CLIO_TASK_BODY_BEGIN
   task->NormalizeBlobName();
   const auto mg_t0 = std::chrono::steady_clock::now();
+  // CLIO_CODEC_TIME phase marks: scratch acquire [t0,t1), GetBlob fan-out
+  // [t1,t2), decode wait [t3,t4).
+  auto ph_t0 = mg_t0, ph_t1 = mg_t0, ph_t2 = mg_t0, ph_t3 = mg_t0,
+       ph_t4 = mg_t0;
 
   {
     auto *ipc_manager = CLIO_CPU_IPC;
@@ -3605,6 +3780,7 @@ clio::run::TaskResume Runtime::DecompressPodMultiGetBlob(
     int first_rc = 0;
     clio::run::u32 n = task->count_;
     if (n > clio::cte::core::kPodMultiMax) n = clio::cte::core::kPodMultiMax;
+    const clio::run::u32 total = n;
 
 #if CTP_ENABLE_GPU && CTP_ENABLE_NVCOMP
     // Enqueue EVERY record's decode, then wait for all of them, so one
@@ -3640,6 +3816,8 @@ clio::run::TaskResume Runtime::DecompressPodMultiGetBlob(
       PathTrace("tier");
       auto r = std::make_shared<PendingDecomp>();
       r->src_stable = true;      // the blob's home on the tier
+      r->blob_key = TierBlobKey(task->tag_id_.major_, task->tag_id_.minor_,
+                                std::string(req.blob_name_.c_str()));
       r->src_device = tier + loff;
       r->stored_size = static_cast<size_t>(lsz);
       r->dst = dst.ptr_;
@@ -3684,6 +3862,7 @@ clio::run::TaskResume Runtime::DecompressPodMultiGetBlob(
         sp_sz.push_back(lsz);
       }
       if (!sp_idx.empty()) {
+        ph_t0 = std::chrono::steady_clock::now();
         for (int a = 0; a < 10000 && sp_slab == nullptr; ++a) {
           sp_slab = AcquireGpuScratch(sp_idx.size() * slot_b);
           if (sp_slab == nullptr) CLIO_CO_AWAIT(clio::run::yield(50.0));
@@ -3708,9 +3887,11 @@ clio::run::TaskResume Runtime::DecompressPodMultiGetBlob(
                 sp_sz[k], 0, ScratchShmPtr(sp_slab + k * slot_b),
                 clio::run::PoolQuery::Local()));
           }
+          ph_t1 = std::chrono::steady_clock::now();
           for (auto &f : futs) {
             CLIO_CO_AWAIT(f);
           }
+          ph_t2 = std::chrono::steady_clock::now();
           for (size_t k = 0; k < sp_idx.size(); ++k) {
             if (futs[k]->GetReturnCode() != 0) continue;
             const clio::run::u32 i = sp_idx[k];
@@ -3736,7 +3917,8 @@ clio::run::TaskResume Runtime::DecompressPodMultiGetBlob(
       }
       // ONE wait for the whole group, not one per page.
       const auto t_wait0 = std::chrono::steady_clock::now();
-      for (int spins = 0; spins < kDecompWaitMaxSpins; ++spins) {
+      ph_t3 = t_wait0;
+      for (int spins = 0; !DecompWaitOver(t_wait0); ++spins) {
         bool all = true;
         for (clio::run::u32 i = 0; i < n; ++i) {
           if (reqs[i] && !reqs[i]->done.load(std::memory_order_acquire)) {
@@ -3747,6 +3929,7 @@ clio::run::TaskResume Runtime::DecompressPodMultiGetBlob(
         if (all) break;
         CLIO_CO_AWAIT(clio::run::yield(kDecompWaitPollUs));
       }
+      ph_t4 = std::chrono::steady_clock::now();
       if (getenv("CLIO_WAIT_TRACE")) {
         static std::atomic<long long> nw{0}, tot_us{0};
         const double us = std::chrono::duration<double, std::micro>(
@@ -3780,6 +3963,39 @@ clio::run::TaskResume Runtime::DecompressPodMultiGetBlob(
     }
 #endif
 
+    if (!IsGpuCodec(task->context_.compress_lib_)) {
+      // CPU codecs: every remaining record as its own task, all in flight at
+      // once, then awaited together -- the records are independent, and
+      // awaiting them one at a time decoded a multi-get's pages serially.
+      using SubFutT = decltype(ipc_manager->Send(
+          ipc_manager->NewTask<clio::cte::core::PodGetBlobTask>()));
+      std::vector<SubFutT> futs;
+      std::vector<clio::run::u32> idx;
+      for (clio::run::u32 i = 0; i < n; ++i) {
+#if CTP_ENABLE_GPU && CTP_ENABLE_NVCOMP
+        if (reqs[i]) continue;        // already served by the batch above
+#endif
+        auto &req = task->reqs_[i];
+        auto sub = ipc_manager->NewTask<clio::cte::core::PodGetBlobTask>(
+            clio::run::CreateTaskId(), task->pool_id_,
+            clio::run::PoolQuery::Local(), task->tag_id_,
+            req.blob_name_.c_str(), req.offset_, req.size_, task->flags_,
+            req.data_, task->context_);
+        futs.push_back(ipc_manager->Send(sub));
+        idx.push_back(i);
+      }
+      for (size_t k = 0; k < futs.size(); ++k) {
+        CLIO_CO_AWAIT(futs[k]);
+        const int rc = futs[k]->GetReturnCode();
+        task->reqs_[idx[k]].rc_ = static_cast<clio::run::u32>(rc);
+        if (rc == 0) {
+          task->num_ok_++;
+        } else if (first_rc == 0) {
+          first_rc = rc;
+        }
+      }
+      n = 0;  // every record is settled; skip the serial loop below
+    }
     for (clio::run::u32 i = 0; i < n; ++i) {
 #if CTP_ENABLE_GPU && CTP_ENABLE_NVCOMP
       if (reqs[i]) continue;          // already served by the batch above
@@ -3801,18 +4017,28 @@ clio::run::TaskResume Runtime::DecompressPodMultiGetBlob(
       }
     }
     if (getenv("CLIO_CODEC_TIME")) {
-      static std::atomic<long long> mgn{0}, mgus{0}, mgpages{0};
-      mgus += std::chrono::duration_cast<std::chrono::microseconds>(
-                  std::chrono::steady_clock::now() - mg_t0).count();
-      mgpages += n;
+      static std::atomic<long long> mgn{0}, mgus{0}, mgpages{0}, scr_us{0},
+          get_us{0}, wait_us{0};
+      auto us_of = [](auto d) {
+        return static_cast<long long>(
+            std::chrono::duration_cast<std::chrono::microseconds>(d).count());
+      };
+      mgus += us_of(std::chrono::steady_clock::now() - mg_t0);
+      scr_us += us_of(ph_t1 - ph_t0);
+      get_us += us_of(ph_t2 - ph_t1);
+      wait_us += us_of(ph_t4 - ph_t3);
+      mgpages += total;
       const long long c = ++mgn;
       if (c % 128 == 0) {
-        fprintf(stderr, "[TIME] multi n=%lld avg=%lldus avg_pages=%.1f\n", c,
-                mgus.load() / c, (double) mgpages.load() / c);
+        fprintf(stderr,
+                "[TIME] multi n=%lld avg=%lldus avg_pages=%.1f scratch=%lldus "
+                "get=%lldus decode_wait=%lldus\n",
+                c, mgus.load() / c, (double) mgpages.load() / c,
+                scr_us.load() / c, get_us.load() / c, wait_us.load() / c);
         fflush(stderr);
       }
     }
-    task->SetReturnCode(task->num_ok_ == n ? 0 : first_rc);
+    task->SetReturnCode(task->num_ok_ == total ? 0 : first_rc);
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -3859,7 +4085,7 @@ clio::run::TaskResume Runtime::GetBlob(
       auto get = core_client_->AsyncGetBlob(
           task->tag_id_, task->GetBlobName(), 0, stored_size,
           /*flags=*/0, stored.shm_.template Cast<void>(),
-          clio::run::PoolQuery::Local());
+          StoredQuery());
       CLIO_CO_AWAIT(get);
       if (get->GetReturnCode() != 0) {
         CLIO_IPC->FreeBuffer(stored);
@@ -3878,8 +4104,9 @@ clio::run::TaskResume Runtime::GetBlob(
       CLIO_CO_RETURN;
     }
     clio::run::u64 out_size = 0;
-    int rc = DecompressStored(stored.ptr_, stored_size, scratch.ptr_,
-                              original_size, &out_size);
+    int rc = 0;
+    CLIO_CO_AWAIT(DecompressStoredAsync(stored.ptr_, stored_size, scratch.ptr_,
+                                        original_size, &out_size, &rc));
     CLIO_IPC->FreeBuffer(stored);
     if (rc != 0) {
       CLIO_IPC->FreeBuffer(scratch);
@@ -3939,7 +4166,7 @@ clio::run::TaskResume Runtime::GetBlobSize(
       auto get = core_client_->AsyncGetBlob(
           task->tag_id_, task->blob_name_.str(), 0, sizeof(CompressionHeader),
           /*flags=*/0, hdr_buf.shm_.template Cast<void>(),
-          clio::run::PoolQuery::Local());
+          StoredQuery());
       CLIO_CO_AWAIT(get);
       if (get->GetReturnCode() == 0 &&
           (get->context_.transform_flags_ &
