@@ -35,7 +35,6 @@
 #include <clio_runtime/ipc_manager.h>
 #ifndef _WIN32
 #include <fnmatch.h>
-#include <sys/stat.h>
 #endif
 #include <clio_cae/core/constants.h>  // For kCaePoolId
 #include <clio_cae/core/core_client.h>
@@ -45,7 +44,12 @@
 #include "adapter/hdf5_vol/clio_vol_layout.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <system_error>
 #include <vector>
 
 // Include clio_cte headers after closing any clio_cae namespace to avoid Method
@@ -59,12 +63,100 @@ Hdf5FileAssimilator::Hdf5FileAssimilator(
     std::shared_ptr<clio::cte::core::Client> cte_client)
     : cte_client_(cte_client) {}
 
+
+// ---------------------------------------------------------------------------
+// CAE telemetry
+//
+// Set CLIO_CAE_TELEMETRY=<path> to append one JSON object per assimilation to
+// that file. Each record carries the phase timings needed to locate a
+// bottleneck (open / discover / filter / assimilate) and enough of the request
+// to replay it (src, dst, include/exclude patterns).
+//
+// Off by default: with the variable unset this writes nothing and costs one
+// getenv per transfer.
+// ---------------------------------------------------------------------------
+namespace {
+
+double CaeNowMs() {
+  return std::chrono::duration<double, std::milli>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+std::string CaeJsonEscape(const std::string& in) {
+  std::string out;
+  out.reserve(in.size() + 8);
+  for (char c : in) {
+    if (c == '"' || c == '\\') { out += '\\'; out += c; }
+    else if (c == '\n') { out += "\\n"; }
+    else { out += c; }
+  }
+  return out;
+}
+
+std::string CaeJsonArray(const std::vector<std::string>& v) {
+  std::string out = "[";
+  for (size_t i = 0; i < v.size(); ++i) {
+    if (i) out += ",";
+    out += "\"" + CaeJsonEscape(v[i]) + "\"";
+  }
+  return out + "]";
+}
+
+/** Append one telemetry record. Silently does nothing unless
+ *  CLIO_CAE_TELEMETRY names a writable path. */
+void CaeEmitTelemetry(const std::string& src, const std::string& dst,
+                      const std::vector<std::string>& include_patterns,
+                      const std::vector<std::string>& exclude_patterns,
+                      size_t discovered, size_t filtered, int errors,
+                      const char* mode, size_t num_nodes,
+                      double t_open_ms, double t_discover_ms,
+                      double t_filter_ms, double t_assimilate_ms,
+                      int error_code) {
+  const char* path = std::getenv("CLIO_CAE_TELEMETRY");
+  if (path == nullptr || *path == '\0') {
+    return;
+  }
+  std::ofstream f(path, std::ios::app);
+  if (!f.is_open()) {
+    return;
+  }
+  const double total = t_open_ms + t_discover_ms + t_filter_ms + t_assimilate_ms;
+  f << "{"
+    << "\"wall_ms\":" << CaeNowMs()
+    << ",\"src\":\"" << CaeJsonEscape(src) << "\""
+    << ",\"dst\":\"" << CaeJsonEscape(dst) << "\""
+    << ",\"include_patterns\":" << CaeJsonArray(include_patterns)
+    << ",\"exclude_patterns\":" << CaeJsonArray(exclude_patterns)
+    << ",\"datasets_discovered\":" << discovered
+    << ",\"datasets_filtered\":" << filtered
+    << ",\"dataset_errors\":" << errors
+    << ",\"mode\":\"" << mode << "\""
+    << ",\"num_nodes\":" << num_nodes
+    << ",\"open_ms\":" << t_open_ms
+    << ",\"discover_ms\":" << t_discover_ms
+    << ",\"filter_ms\":" << t_filter_ms
+    << ",\"assimilate_ms\":" << t_assimilate_ms
+    << ",\"total_ms\":" << total
+    << ",\"error_code\":" << error_code
+    << "}\n";
+}
+
+}  // namespace
+
 clio::run::TaskResume Hdf5FileAssimilator::Schedule(const AssimilationCtx& ctx,
                                               int& error_code) {
 #ifdef CLIO_ENABLE_BOOST_COROUTINES
   clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
 #endif
   CLIO_TASK_BODY_BEGIN
+  // Telemetry phase timers (see CaeEmitTelemetry above; inert unless
+  // CLIO_CAE_TELEMETRY is set).
+  double t_phase0 = CaeNowMs();
+  double t_open_ms = 0, t_discover_ms = 0, t_filter_ms = 0, t_assimilate_ms = 0;
+  size_t tele_discovered = 0, tele_filtered = 0;
+  const char* tele_mode = "single";
+  size_t tele_nodes = 1;
   HLOG(kDebug, "Hdf5FileAssimilator::Schedule() - ENTRY");
   HLOG(kDebug, "  ctx.src: '{}'", ctx.src);
   HLOG(kDebug, "  ctx.dst: '{}'", ctx.dst);
@@ -124,6 +216,8 @@ clio::run::TaskResume Hdf5FileAssimilator::Schedule(const AssimilationCtx& ctx,
   HLOG(kDebug,
        "Hdf5FileAssimilator: HDF5 file opened successfully (file_id: {})",
        file_id);
+  t_open_ms = CaeNowMs() - t_phase0;
+  t_phase0 = CaeNowMs();
 
   // Discover all datasets in the file
   HLOG(kDebug, "Hdf5FileAssimilator: Discovering datasets...");
@@ -137,8 +231,11 @@ clio::run::TaskResume Hdf5FileAssimilator::Schedule(const AssimilationCtx& ctx,
     CLIO_CO_RETURN;
   }
 
-  HLOG(kDebug, "Hdf5FileAssimilator: Discovered {} dataset(s) in '{}'",
-       dataset_paths.size(), src_path);
+  t_discover_ms = CaeNowMs() - t_phase0;
+  t_phase0 = CaeNowMs();
+  tele_discovered = dataset_paths.size();
+  HLOG(kInfo, "Hdf5FileAssimilator: Discovered {} dataset(s) in '{}' ({:.1f} ms)",
+       dataset_paths.size(), src_path, t_discover_ms);
 
   // Apply dataset filtering if patterns are specified
   std::vector<std::string> filtered_paths;
@@ -167,20 +264,24 @@ clio::run::TaskResume Hdf5FileAssimilator::Schedule(const AssimilationCtx& ctx,
         filtered_paths.push_back(dataset_path);
       }
     }
-    HLOG(kDebug, "Hdf5FileAssimilator: Filtered to {} dataset(s) (from {})",
+    HLOG(kInfo, "Hdf5FileAssimilator: Filtered to {} dataset(s) (from {})",
          filtered_paths.size(), dataset_paths.size());
     if (filtered_paths.empty() && !ctx.include_patterns.empty()) {
       // The caller asked for specific datasets and got none. Returning success
       // here is what made a mistyped pattern indistinguishable from a working
       // ingest: the transfer still counts as "scheduled", so the client prints
-      // "ParseOmni completed successfully! Tasks scheduled: 1" over a run that
-      // stored nothing. Treat it as an error so it reaches the exit status.
+      // "ParseOmni completed successfully! Tasks scheduled: 1" over an empty
+      // run. Treat it as an error (-9) so it reaches the exit status.
       HLOG(kError,
            "Hdf5FileAssimilator: NO datasets matched the {} include pattern(s) "
            "out of {} discovered -- nothing would be assimilated. Check pattern "
            "syntax against the discovered dataset paths (CTP_LOG_LEVEL=debug "
            "lists them); note '*' DOES cross '/' here (fnmatch flags=0).",
            ctx.include_patterns.size(), dataset_paths.size());
+      CaeEmitTelemetry(src_path, ctx.dst, ctx.include_patterns,
+                       ctx.exclude_patterns, dataset_paths.size(), 0, 0,
+                       "single", 1, t_open_ms, t_discover_ms,
+                       CaeNowMs() - t_phase0, 0.0, -9);
       CloseHdf5File(file_id);
       error_code = -9;
       CLIO_CO_RETURN;
@@ -191,6 +292,10 @@ clio::run::TaskResume Hdf5FileAssimilator::Schedule(const AssimilationCtx& ctx,
          "datasets");
     filtered_paths = dataset_paths;
   }
+
+  t_filter_ms = CaeNowMs() - t_phase0;
+  t_phase0 = CaeNowMs();
+  tele_filtered = filtered_paths.size();
 
   // Get distributed processing info from CTE/IPC manager
   size_t num_nodes = 1;
@@ -225,6 +330,8 @@ clio::run::TaskResume Hdf5FileAssimilator::Schedule(const AssimilationCtx& ctx,
     // Create a local CAE client with the correct pool_id for distributed tasks
     // Do NOT use CLIO_CAE_CLIENT global singleton as it may not be properly initialized
     // with the correct pool_id from the runtime's compose configuration
+    tele_mode = "distributed";
+    tele_nodes = num_nodes;
     clio::cae::core::Client cae_client(kCaePoolId);
     HLOG(kInfo, "Hdf5FileAssimilator: Created CAE client with pool_id {} for distributed tasks",
           kCaePoolId);
@@ -306,10 +413,16 @@ clio::run::TaskResume Hdf5FileAssimilator::Schedule(const AssimilationCtx& ctx,
 
   HLOG(kDebug, "Hdf5FileAssimilator: HDF5 file closed");
 
+  t_assimilate_ms = CaeNowMs() - t_phase0;
+
   if (total_errors > 0) {
     HLOG(kError,
          "Hdf5FileAssimilator: Completed with {} error(s) out of {} dataset(s)",
          total_errors, filtered_paths.size());
+    CaeEmitTelemetry(src_path, ctx.dst, ctx.include_patterns,
+                     ctx.exclude_patterns, tele_discovered, tele_filtered,
+                     total_errors, tele_mode, tele_nodes, t_open_ms,
+                     t_discover_ms, t_filter_ms, t_assimilate_ms, -6);
     error_code = -6;
     CLIO_CO_RETURN;
   }
@@ -318,6 +431,16 @@ clio::run::TaskResume Hdf5FileAssimilator::Schedule(const AssimilationCtx& ctx,
       kDebug,
       "Hdf5FileAssimilator: Successfully processed all {} dataset(s) from '{}'",
       filtered_paths.size(), src_path);
+  HLOG(kInfo,
+       "Hdf5FileAssimilator: assimilated {} dataset(s) "
+       "[open {:.1f} ms, discover {:.1f} ms, filter {:.1f} ms, "
+       "assimilate {:.1f} ms]",
+       filtered_paths.size(), t_open_ms, t_discover_ms, t_filter_ms,
+       t_assimilate_ms);
+  CaeEmitTelemetry(src_path, ctx.dst, ctx.include_patterns,
+                   ctx.exclude_patterns, tele_discovered, tele_filtered, 0,
+                   tele_mode, tele_nodes, t_open_ms, t_discover_ms,
+                   t_filter_ms, t_assimilate_ms, 0);
   HLOG(kDebug, "Hdf5FileAssimilator::Schedule() - EXIT (success)");
 
   error_code = 0;
@@ -529,13 +652,14 @@ clio::run::TaskResume Hdf5FileAssimilator::StageForVol(
 
 hid_t Hdf5FileAssimilator::OpenHdf5File(const std::string& file_path) {
   HLOG(kDebug, "OpenHdf5File: Checking if file exists: '{}'", file_path);
-  // Check if file exists
-  struct stat st;
-  if (stat(file_path.c_str(), &st) != 0) {
+  // Check if file exists (std::filesystem: portable across POSIX and Windows)
+  std::error_code ec;
+  const auto file_size = std::filesystem::file_size(file_path, ec);
+  if (ec) {
     HLOG(kError, "Hdf5FileAssimilator: File does not exist: '{}'", file_path);
     return -1;
   }
-  HLOG(kDebug, "OpenHdf5File: File exists, size: {} bytes", st.st_size);
+  HLOG(kDebug, "OpenHdf5File: File exists, size: {} bytes", file_size);
 
   // Open HDF5 file for reading (serial, read-only)
   HLOG(kDebug, "OpenHdf5File: Calling H5Fopen...");
@@ -950,13 +1074,121 @@ std::string Hdf5FileAssimilator::GetUrlPath(const std::string& url) {
   return url.substr(pos + 2);
 }
 
+#ifdef _WIN32
+namespace {
+
+/**
+ * Match one character against a bracket expression in a glob pattern.
+ *
+ * Supports "[abc]", ranges "[a-z]" and negation "[!abc]" / "[^abc]", with a
+ * leading ']' taken literally, mirroring fnmatch(3). An unterminated bracket
+ * is treated as a literal '[' character, as fnmatch does.
+ *
+ * @param pattern The full glob pattern.
+ * @param pos In: index of the opening '['. Out: index just past the
+ *            expression (or past the literal '[' when unterminated).
+ * @param c The character to test.
+ * @return true if c matches the bracket expression.
+ */
+bool MatchBracket(const std::string& pattern, size_t& pos, char c) {
+  size_t i = pos + 1;
+  bool negate = false;
+  if (i < pattern.size() && (pattern[i] == '!' || pattern[i] == '^')) {
+    negate = true;
+    ++i;
+  }
+  bool matched = false;
+  bool first = true;
+  while (i < pattern.size() && (first || pattern[i] != ']')) {
+    first = false;
+    char lo = pattern[i];
+    char hi = lo;
+    if (i + 2 < pattern.size() && pattern[i + 1] == '-' &&
+        pattern[i + 2] != ']') {
+      hi = pattern[i + 2];
+      i += 2;
+    }
+    if (lo <= c && c <= hi) {
+      matched = true;
+    }
+    ++i;
+  }
+  if (i >= pattern.size()) {  // no closing ']': literal '['
+    pos = pos + 1;
+    return c == '[';
+  }
+  pos = i + 1;
+  return matched != negate;
+}
+
+/**
+ * Portable glob matcher equivalent to fnmatch(pattern, str, 0).
+ *
+ * '*' matches any sequence (including '/'), '?' any single character,
+ * "[...]" a bracket expression, and '\\' escapes the next pattern character.
+ * Uses the classic single-backtrack-point algorithm for '*'.
+ *
+ * @param pattern Glob pattern.
+ * @param str String to test.
+ * @return true if the whole string matches the whole pattern.
+ */
+bool GlobMatch(const std::string& pattern, const std::string& str) {
+  const size_t npos = std::string::npos;
+  size_t p = 0, s = 0, star_p = npos, star_s = 0;
+  while (s < str.size()) {
+    if (p < pattern.size()) {
+      size_t next_p = p + 1;
+      bool matched = false;
+      char pc = pattern[p];
+      if (pc == '*') {
+        star_p = p;
+        star_s = s;
+        ++p;
+        continue;
+      } else if (pc == '?') {
+        matched = true;
+      } else if (pc == '[') {
+        next_p = p;
+        matched = MatchBracket(pattern, next_p, str[s]);
+      } else {
+        if (pc == '\\' && p + 1 < pattern.size()) {
+          pc = pattern[p + 1];
+          next_p = p + 2;
+        }
+        matched = (pc == str[s]);
+      }
+      if (matched) {
+        p = next_p;
+        ++s;
+        continue;
+      }
+    }
+    if (star_p == npos) {
+      return false;
+    }
+    p = star_p + 1;  // backtrack: let the last '*' absorb one more char
+    s = ++star_s;
+  }
+  while (p < pattern.size() && pattern[p] == '*') {
+    ++p;
+  }
+  return p == pattern.size();
+}
+
+}  // namespace
+#endif
+
 bool Hdf5FileAssimilator::MatchGlobPattern(const std::string& str,
                                            const std::string& pattern) {
+#ifdef _WIN32
+  // MSVC/icx-cl have no fnmatch(3); use the portable matcher above.
+  return GlobMatch(pattern, str);
+#else
   // Use fnmatch for glob pattern matching (supports *, ?, [])
-  // FNM_PATHNAME: '/' must be matched explicitly
-  // FNM_PERIOD: leading '.' must be matched explicitly
+  // No FNM_PATHNAME: '*' also matches '/', so "*/RawData" spans groups.
   int result = fnmatch(pattern.c_str(), str.c_str(), 0);
   return result == 0;
+#endif
 }
 
 bool Hdf5FileAssimilator::MatchesFilter(

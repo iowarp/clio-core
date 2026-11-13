@@ -333,9 +333,10 @@ public:
   /** Reorganize single blob (Method::kReorganizeBlob) - update score. */
   clio::run::TaskResume ReorganizeBlob(clio::run::shared_ptr<ReorganizeBlobTask> &task);
   /** Evict lowest-score blobs off a tier until a byte budget is reclaimed
-   *  (Method::kEvict). Broadcast; each shard reports its share. */
+   *  (Method::kEvict). Dynamic resolves Local; each container reports its own share.
+   *  A cluster-wide sweep passes Broadcast explicitly. */
   clio::run::TaskResume Evict(clio::run::shared_ptr<EvictTask> &task);
-  /** Store the organizer phase hint (Method::kReorganizeHint). Broadcast;
+  /** Store the organizer phase hint (Method::kReorganizeHint). Dynamic resolves Local;
    *  the value itself is opaque here and interpreted by the organizer. */
   clio::run::TaskResume ReorganizeHint(
       clio::run::shared_ptr<ReorganizeHintTask> &task);
@@ -581,14 +582,19 @@ public:
   /**
    * UpdateTagNames (Method::kUpdateTagNames) - apply a batch of tag-name
    * operations (add / remove / rename / set root) to this container's name
-   * table and search index. Broadcast by the publisher, so every container
-   * holds every name.
+   * table and search index. Routed Local by each filesystem container: a container
+   * publishes the names it owns into its own node CTE.
    */
   clio::run::TaskResume UpdateTagNames(
       clio::run::shared_ptr<UpdateTagNamesTask> &task);
 
   /**
    * Schedule a task by resolving Dynamic pool queries.
+   *
+   * A Dynamic query is resolved by HASHING the task key to its owner container,
+   * or LOCALLY for per-container scans and answers. It is never resolved to
+   * Broadcast. A caller that wants the cluster-wide view passes Broadcast()
+   * explicitly.
    */
   clio::run::PoolQuery ScheduleTask(const clio::run::shared_ptr<clio::run::Task> &task) override;
 

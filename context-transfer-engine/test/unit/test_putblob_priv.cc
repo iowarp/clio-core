@@ -385,7 +385,7 @@ TEST_CASE("Private PutBlob rejects degenerate requests", "[cte][830]") {
   p_zero.Wait();
 
   // Neither name may exist: a rejected request must not reach the runtime.
-  auto listed = cte->AsyncGetContainedBlobs(tag_id);
+  auto listed = cte->AsyncGetContainedBlobs(tag_id, clio::run::PoolQuery::Broadcast());
   listed.Wait();
   REQUIRE(listed->GetReturnCode() == 0);
   for (const std::string &name : listed->blob_names_) {

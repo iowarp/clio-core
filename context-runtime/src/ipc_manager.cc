@@ -51,6 +51,7 @@
 #endif
 
 #include "clio_runtime/ipc_manager.h"
+#include "clio_runtime/evlat.h"
 
 #include <clio_ctp/lightbeam/transport_factory_impl.h>
 #include <zmq.h>
@@ -2437,6 +2438,24 @@ const std::string &IpcManager::GetCurrentHostname() const {
   return this_host_.ip_address;
 }
 
+namespace {
+// Peer (run2run) transport, experiment: CLIO_PEER_TRANSPORT=socket swaps the
+// peer listener(s) and peer connections from ZeroMQ to lightbeam's plain TCP
+// SocketTransport (one sendmsg per message, TCP_NODELAY, no I/O threads).
+// Measured on ares: a raw libzmq DEALER->ROUTER 64 B round trip is 253 us vs
+// 79 us for blocking TCP between the same two nodes.
+ctp::lbm::TransportType PeerTransportType() {
+  static const ctp::lbm::TransportType t = [] {
+    const char *e = std::getenv("CLIO_PEER_TRANSPORT");
+    if (e != nullptr && std::string(e) == "socket") {
+      return ctp::lbm::TransportType::kSocket;
+    }
+    return ctp::lbm::TransportType::kZeroMq;
+  }();
+  return t;
+}
+}  // namespace
+
 bool IpcManager::TryStartMainServer(const std::string &hostname) {
   ConfigManager *config = CLIO_CONFIG_MANAGER;
 
@@ -2447,8 +2466,32 @@ bool IpcManager::TryStartMainServer(const std::string &hostname) {
 
     HLOG(kDebug, "Attempting to start main server on {}:{}", hostname, port);
 
+    // Size-tier listeners first: the peer recv thread starts once
+    // main_transport_ is set and then reads tier_transports_ as final.
+    tier_transports_.clear();
+    for (int i = 0; i < NetTierSlots(); ++i) {
+      u32 tport = port + kNetTierPortOffset + static_cast<u32>(i);
+      ctp::lbm::TransportPtr t = ctp::lbm::TransportFactory::Get(
+          hostname,
+          NetTierUsesZmq(i) ? ctp::lbm::TransportType::kZeroMq
+                            : PeerTransportType(),
+          ctp::lbm::TransportMode::kServer, protocol, tport);
+      if (!t) {
+        HLOG(kError, "Failed to bind size-tier peer port {}:{}", hostname,
+             tport);
+        tier_transports_.clear();
+        return false;
+      }
+      tier_transports_.push_back(std::move(t));
+    }
+    if (!tier_transports_.empty()) {
+      HLOG(kInfo, "Size-tier peer ports: {} slots on {}..{}",
+           tier_transports_.size(), port + kNetTierPortOffset,
+           port + kNetTierPortOffset + tier_transports_.size() - 1);
+    }
+
     main_transport_ = ctp::lbm::TransportFactory::Get(
-        hostname, ctp::lbm::TransportType::kZeroMq,
+        hostname, PeerTransportType(),
         ctp::lbm::TransportMode::kServer, protocol, port);
 
     if (!main_transport_) {
@@ -2476,6 +2519,71 @@ bool IpcManager::TryStartMainServer(const std::string &hostname) {
 
 ctp::lbm::Transport *IpcManager::GetMainTransport() const {
   return main_transport_.get();
+}
+
+namespace {
+struct NetTierCfg {
+  std::vector<size_t> bounds;  // ascending upper bounds; tiers = bounds+1
+  int lanes = 1;
+  int slots = 0;
+};
+const NetTierCfg &GetNetTierCfg() {
+  static const NetTierCfg cfg = [] {
+    NetTierCfg c;
+    if (const char *e = std::getenv("CLIO_NET_TIERS")) {
+      std::string s(e);
+      size_t pos = 0;
+      while (pos < s.size()) {
+        size_t comma = s.find(',', pos);
+        std::string tok = s.substr(pos, comma == std::string::npos
+                                            ? std::string::npos
+                                            : comma - pos);
+        if (!tok.empty() && tok != "0") {
+          c.bounds.push_back(
+              static_cast<size_t>(ctp::ConfigParse::ParseSize(tok)));
+        }
+        if (comma == std::string::npos) break;
+        pos = comma + 1;
+      }
+      std::sort(c.bounds.begin(), c.bounds.end());
+    }
+    if (const char *e = std::getenv("CLIO_NET_TIER_LANES")) {
+      c.lanes = std::max(1, std::atoi(e));
+    }
+    if (!c.bounds.empty() || c.lanes > 1) {
+      c.slots = static_cast<int>(c.bounds.size() + 1) * c.lanes;
+    }
+    return c;
+  }();
+  return cfg;
+}
+}  // namespace
+
+int IpcManager::NetTierSlots() { return GetNetTierCfg().slots; }
+
+bool IpcManager::NetTierUsesZmq(int slot) {
+  static const int zmq_from = [] {
+    const char *e = std::getenv("CLIO_NET_TIER_ZMQ_FROM");
+    return (e != nullptr && *e != '\0') ? std::atoi(e) : -1;
+  }();
+  const NetTierCfg &c = GetNetTierCfg();
+  if (zmq_from < 0 || slot < 0 || slot >= c.slots) return false;
+  return slot / c.lanes >= zmq_from;
+}
+
+int IpcManager::NetTierSlot(size_t bytes) {
+  const NetTierCfg &c = GetNetTierCfg();
+  if (c.slots == 0) return -1;
+  size_t tier = 0;
+  while (tier < c.bounds.size() && bytes >= c.bounds[tier]) ++tier;
+  int lane = 0;
+  if (c.lanes > 1) {
+    // Senders are single threads (the net send worker), but keep it safe.
+    static std::atomic<u32> rr{0};
+    lane = static_cast<int>(rr.fetch_add(1, std::memory_order_relaxed) %
+                            static_cast<u32>(c.lanes));
+  }
+  return static_cast<int>(tier) * c.lanes + lane;
 }
 
 ctp::lbm::Transport *IpcManager::GetClientTransport(IpcMode mode) const {
@@ -2751,6 +2859,20 @@ void IpcManager::FreeBuffer(FullPtr<char> buffer_ptr) {
 #endif  // CTP_IS_HOST
 }
 
+namespace {
+thread_local int tls_send_slot = -1;
+}  // namespace
+
+int IpcManager::NetSendThreads() {
+  static const int n = [] {
+    const char *e = std::getenv("CLIO_NET_SEND_THREADS");
+    return e != nullptr ? std::max(0, std::atoi(e)) : 0;
+  }();
+  return n;
+}
+
+void IpcManager::SetSendSlot(int slot) { tls_send_slot = slot; }
+
 ctp::lbm::Transport *IpcManager::GetOrCreateClient(const std::string &addr,
                                                     int port,
                                                     const char *lane) {
@@ -2761,6 +2883,9 @@ ctp::lbm::Transport *IpcManager::GetOrCreateClient(const std::string &addr,
   if (lane != nullptr && *lane != '\0') {
     key += "#";
     key += lane;
+  }
+  if (tls_send_slot >= 0) {
+    key += "#s" + std::to_string(tls_send_slot);
   }
 
   // Lock the pool for thread-safe access
@@ -2781,9 +2906,14 @@ ctp::lbm::Transport *IpcManager::GetOrCreateClient(const std::string &addr,
   HLOG(kInfo, "[ClientPool] Creating new persistent connection to {}", key);
   ctp::lbm::TransportPtr transport;
   try {
+    ctp::lbm::TransportType ttype = PeerTransportType();
+    {
+      const int slot = port - static_cast<int>(CLIO_CONFIG_MANAGER->GetPort()) -
+                       static_cast<int>(kNetTierPortOffset);
+      if (NetTierUsesZmq(slot)) ttype = ctp::lbm::TransportType::kZeroMq;
+    }
     transport = ctp::lbm::TransportFactory::Get(
-        addr, ctp::lbm::TransportType::kZeroMq,
-        ctp::lbm::TransportMode::kClient, "tcp", port);
+        addr, ttype, ctp::lbm::TransportMode::kClient, "tcp", port);
   } catch (const std::exception &e) {
     HLOG(kError, "[ClientPool] Failed to dial {}: {}", key, e.what());
     return nullptr;
@@ -2971,6 +3101,14 @@ void IpcManager::NetProfMarkRecvIn(const clio::run::shared_ptr<Task> &task) {
   netqprof::life_start[key] = netqprof::NowNs();
 }
 
+/** The four cross-node Send priorities (not the client response ones). */
+static inline bool IsCrossNodeSend(NetQueuePriority p) {
+  return p == NetQueuePriority::kSendInLatency ||
+         p == NetQueuePriority::kSendInIO ||
+         p == NetQueuePriority::kSendOutLatency ||
+         p == NetQueuePriority::kSendOutIO;
+}
+
 void IpcManager::EnqueueNetTask(Future<Task> future,
                                 NetQueuePriority priority) {
   if (net_queue_.IsNull()) {
@@ -2982,6 +3120,12 @@ void IpcManager::EnqueueNetTask(Future<Task> future,
   u32 priority_idx = static_cast<u32>(priority);
   auto &lane = net_queue_->GetLane(0, priority_idx);
   bool was_empty = lane.Empty();
+  if (evlat::On() && IsCrossNodeSend(priority)) {
+    auto t = future.GetTaskPtr();
+    if (!t.IsNull()) {
+      if (RunContext *rc = t->RunCtxPtr()) rc->net_enq_cyc_ = CycleNow();
+    }
+  }
   if (netqprof::On()) {
     netqprof::push_ns[priority_idx].store(netqprof::NowNs(),
                                           std::memory_order_relaxed);
@@ -3078,6 +3222,10 @@ bool IpcManager::TryPopNetTask(NetQueuePriority priority,
   u32 priority_idx = static_cast<u32>(priority);
   auto &lane = net_queue_->GetLane(0, priority_idx);
 
+  // With dedicated send threads the ring has several consumers; the pop is
+  // cheap, the send that follows runs unlocked.
+  std::unique_lock<std::mutex> pop_lk(net_pop_mu_, std::defer_lock);
+  if (NetSendThreads() > 0) pop_lk.lock();
   bool popped = lane.Pop(future);
   if (!popped &&
       net_overflow_size_[priority_idx].load(std::memory_order_relaxed) != 0) {
@@ -3093,6 +3241,17 @@ bool IpcManager::TryPopNetTask(NetQueuePriority priority,
     }
   }
   if (popped) {
+    if (evlat::On() && IsCrossNodeSend(priority)) {
+      auto t = future.GetTaskPtr();
+      RunContext *rc = t.IsNull() ? nullptr : t->RunCtxPtr();
+      if (rc != nullptr && rc->net_enq_cyc_ != 0) {
+        const bool is_in = priority == NetQueuePriority::kSendInLatency ||
+                           priority == NetQueuePriority::kSendInIO;
+        evlat::Span(is_in ? evlat::kOriginNetQ : evlat::kRemoteNetQ,
+                    rc->net_enq_cyc_, CycleNow());
+        rc->net_enq_cyc_ = 0;
+      }
+    }
     if (netqprof::On()) {
       uint64_t pushed =
           netqprof::push_ns[priority_idx].load(std::memory_order_relaxed);
@@ -4588,6 +4747,8 @@ bool IpcManager::DrainShmResponses() {
       continue;
     }
     Task *task = it->second.task;
+    clio::run::evlat::Span(clio::run::evlat::kClientE2E, it->second.submit_cyc,
+                           clio::run::evlat::Now());
     // Park the archive; RecvOut moves it out and deserializes into the task.
     // Demuxing here (not just for our own net_key) is what lets one draining
     // waiter serve every waiter's response.
@@ -4709,6 +4870,7 @@ void IpcManager::EnqueueShmSend(const std::string &dest,
     std::lock_guard<std::mutex> lk(q->mtx);
     q->pending.push_back(std::move(future));
   }
+  shm_send_pending_.fetch_add(1, std::memory_order_release);
   // No wake needed: the workers drain these queues in their poll loop
   // (DrainShmSends), and the enqueuing worker itself will drain on its next
   // iteration; the 50ms max_sleep cap bounds the worst case if all workers park.
@@ -4730,6 +4892,13 @@ u32 IpcManager::DrainShmSends(ctp::lbm::Transport *transport, u32 budget) {
   // mutex, and conn->Send serialises per client ring via its own send_mu_, so
   // two workers transferring to the same client are safe. The client demuxes
   // responses by net_key, so cross-worker delivery order does not matter.
+  static const bool kFastEmpty = [] {
+    const char *e = std::getenv("CLIO_SHM_DRAIN_FAST");
+    return !(e != nullptr && (e[0] == '0' || e[0] == 'f' || e[0] == 'F'));
+  }();
+  if (kFastEmpty && shm_send_pending_.load(std::memory_order_acquire) == 0) {
+    return 0;
+  }
   u32 sent = 0;
   std::vector<ShmSendQueue *> queues;
   {
@@ -4746,6 +4915,7 @@ u32 IpcManager::DrainShmSends(ctp::lbm::Transport *transport, u32 budget) {
         fut = std::move(q->pending.front());
         q->pending.pop_front();
       }
+      shm_send_pending_.fetch_sub(1, std::memory_order_acq_rel);
       clio::run::shared_ptr<Task> task = fut.GetTaskPtr();
       if (!task.IsNull()) {
         IpcCpu2Cpu::SendOutTransfer(this, task, transport);
@@ -5013,6 +5183,44 @@ RouteResult IpcManager::RouteTask(Future<Task> &future, bool force_enqueue) {
     ContainerHold exec = task_ptr->ExecContainer().get();
     if (exec) {
       task_ptr->SetCompleter(exec->container_id_);
+    }
+    // A task received from a peer arrives routed (RecvIn sets it) on the
+    // shared ingress lane 0, which one worker drains. Returning ExecHere for
+    // it ran EVERY remote request on that worker: measured on 4 nodes, worker
+    // 0 executed 100% of remote tasks (~5.4 s of a 10 s run) and they waited
+    // 3-5 ms on the lane, capping each node at ~1/r_exec remote ops/s. Place
+    // it once on the least-loaded pool worker instead. The worker passed to
+    // RuntimeMapTask is null on purpose: "the submitter has room, run inline"
+    // is for nested subtasks, and the lane-0 drainer is not this task's
+    // submitter -- its lane backlog is not even counted as its load.
+    // CLIO_NET_SPREAD=0 restores the old behaviour (A/B).
+    // CLIO_NET_SPREAD: 0 = off, 1 = always hand off, 2 (default) = hand off
+    // only when more peer tasks are queued behind this one on the ingress
+    // lane. Mode 1 cost 10-20% at 1 outstanding request (an extra lane push +
+    // wakeup per request); with an empty lane running it here is the fastest
+    // path and delays nothing.
+    static const int kSpreadMode = [] {
+      const char *e = std::getenv("CLIO_NET_SPREAD");
+      if (e == nullptr || *e == '\0') return 2;
+      if (e[0] == 'f' || e[0] == 'F') return 0;
+      return std::atoi(e);
+    }();
+    const bool kNetSpread =
+        kSpreadMode == 1 ||
+        (kSpreadMode == 2 && task_ptr->Lane() != nullptr &&
+         task_ptr->Lane()->Size() > 0);
+    Worker *cur = CLIO_CUR_WORKER;
+    if (kNetSpread && exec && cur != nullptr && scheduler_ != nullptr &&
+        !worker_queues_.IsNull() && task_ptr->IsRemote() &&
+        !task_ptr->IsStarted() && !task_ptr->IsNetPlaced()) {
+      task_ptr->SetNetPlaced();
+      u32 dest = scheduler_->RuntimeMapTask(nullptr, future, exec);
+      if (dest != cur->GetId()) {
+        auto &dest_lane = worker_queues_->GetLane(dest, 0);
+        dest_lane.Push(future);
+        AwakenWorker(&dest_lane);
+        return RouteResult::Local;
+      }
     }
     return RouteResult::ExecHere;
   }

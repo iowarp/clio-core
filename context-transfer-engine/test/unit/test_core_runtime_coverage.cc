@@ -495,7 +495,7 @@ TEST_CASE("Runtime - GetTagSize Success", "[runtime][tag]") {
   ipc->FreeBuffer(shm2);
 
   // Get tag size
-  auto size_task = client->AsyncGetTagSize(tag_task->tag_id_);
+  auto size_task = client->AsyncGetTagSize(tag_task->tag_id_, clio::run::PoolQuery::Broadcast(0.0f));
   size_task.Wait();
 
   REQUIRE(size_task->GetReturnCode() == 0);
@@ -577,7 +577,7 @@ TEST_CASE("Runtime - GetContainedBlobs Success", "[runtime][blob]") {
   }
 
   // Get contained blobs
-  auto blobs_task = client->AsyncGetContainedBlobs(tag_task->tag_id_);
+  auto blobs_task = client->AsyncGetContainedBlobs(tag_task->tag_id_, clio::run::PoolQuery::Broadcast());
   blobs_task.Wait();
 
   REQUIRE(blobs_task->GetReturnCode() == 0);
@@ -596,7 +596,7 @@ TEST_CASE("Runtime - GetContainedBlobs Empty Tag", "[runtime][blob]") {
   REQUIRE(tag_task->GetReturnCode() == 0);
 
   // Get contained blobs (should be empty)
-  auto blobs_task = client->AsyncGetContainedBlobs(tag_task->tag_id_);
+  auto blobs_task = client->AsyncGetContainedBlobs(tag_task->tag_id_, clio::run::PoolQuery::Broadcast());
   blobs_task.Wait();
 
   REQUIRE(blobs_task->GetReturnCode() == 0);
