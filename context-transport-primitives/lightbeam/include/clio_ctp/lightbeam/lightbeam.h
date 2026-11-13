@@ -225,7 +225,8 @@ class Transport {
   void UnregisterEventManager();
 
   // Block up to timeout_ms until readable, using the transport's native
-  // readiness primitive (ZMQ: zmq_poll; client-mode socket: poll on its fd).
+  // readiness primitive (ZMQ: zmq_poll; client-mode socket: poll on its fd;
+  // Thallium listener: its receive queue's condition variable).
   // Other transports, and server-mode sockets, return 0 at once — they use the
   // EventManager path instead. Used by recv threads to block instead of
   // spin-polling.
