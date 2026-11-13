@@ -179,7 +179,7 @@ compose:
     pool_name: "ram::chi_default_bdev"
     pool_query: local
     pool_id: "301.0"
-    bdev_type: ram                       # Options: file, ram, hbm, pinned, noop
+    bdev_type: ram                       # Options: file, ram, hbm, pinned, noop, s3, gcs, daos
     capacity: "0g"                       # 0/0g = default to 80% of total system DRAM
 
   # === Block Device (File) ===
@@ -199,6 +199,42 @@ compose:
   #   # "<pool_name>.fail" exists, every read, write and sync of this device
   #   # fails with an I/O error, as a dead disk would; delete the file and it
   #   # works again. Checked at most every 100 ms; off unless the file exists.
+
+  # === Block Device (native DAOS) ===
+  # Needs a build with -DCLIO_ENABLE_DAOS=ON (Spack: iowarp +daos); without
+  # it the pool is refused with an error naming the option.
+  # The device is one file of a DAOS POSIX container, read and written through
+  # the DAOS client library (libdfs) -- no dfuse mount in the data path. The
+  # pool_name says where it lives:
+  #   daos://<pool>/<container>/<file path>[?<option>=<value>[&...]]
+  # <pool> and <container> are DAOS labels (or UUIDs); the container must
+  # already exist and be of type POSIX (daos cont create --type POSIX).
+  # Missing directories of <file path> are created. Options (all optional):
+  #   chunk_size=<size>  DFS chunk size of the file, e.g. 1m, 4m (default 1m;
+  #                      applies when the file is created)
+  #   oclass=<name>      DAOS object class of the file, e.g. SX, EC_16P2GX
+  #                      (default: the container's; applies at creation)
+  #   alloc_log=<path>   LOCAL path of the allocator log (same as the
+  #                      alloc_log key below, for places that only take a path)
+  #   prezero=<0|1>      1 (default): zero the destination before each read,
+  #                      so never-written blocks read as zeros even if the
+  #                      DAOS client leaves holes untouched. 0 skips that
+  #                      extra pass over the buffer; only for a DAOS version
+  #                      known to return zeros for holes.
+  # capacity is required and is a cap: DAOS allocates space as data is
+  # written. The process needs the usual DAOS client environment (agent
+  # socket, e.g. DAOS_AGENT_DRPC_DIR) and must be able to reach the servers.
+  # - mod_name: clio_bdev
+  #   pool_name: "daos://mypool/mycont/clio/chi_bdev.dat"
+  #   pool_query: local
+  #   pool_id: "303.0"
+  #   bdev_type: daos
+  #   capacity: "100GB"
+  #   # No allocator log by default (there is no local file to put it next
+  #   # to). Give a LOCAL path to keep one; it is then replayed on every
+  #   # start, exactly like a file bdev's explicit alloc_log. Without it a
+  #   # restart that keeps metadata may hand out blocks still in use.
+  #   # alloc_log: "/var/lib/clio/chi_bdev_daos.alloc_log"
 
   # === Safe Block Device (erasure-coded array over member bdevs) ===
   # One logical device over several member bdevs (disks): data members plus
@@ -347,8 +383,9 @@ compose:
     #        durability (REPLICA_PERSISTENT, issue #886) key off this — a
     #        tier left at "volatile" can never satisfy a persistence request.
     storage:
-      - path: "ram::cte_ram_tier1"       # "ram::<name>" for DRAM, filesystem path for disk
-        bdev_type: "ram"                 # Options: file, ram, hbm, pinned, noop
+      - path: "ram::cte_ram_tier1"       # "ram::<name>" for DRAM, filesystem path for disk,
+                                         # s3://bucket/prefix, daos://pool/container/file
+        bdev_type: "ram"                 # Options: file, ram, hbm, pinned, noop, s3, gcs, daos
         capacity_limit: "0g"             # 0/0g = default to 80% of total system DRAM
         score: 1.0                       # DRAM = highest-performance tier
 
@@ -365,6 +402,21 @@ compose:
         # growth_unit: "1GB"
         score: 0.2
         persistence_level: "temporary"
+
+      # Native DAOS tier (needs -DCLIO_ENABLE_DAOS=ON). One file of a DAOS
+      # POSIX container per node, driven through libdfs instead of a dfuse
+      # mount; see "Block Device (native DAOS)" above for the path format
+      # and its options. CTE names each node's target "<path>_node<N>", so
+      # the file on node 3 below is /clio/cte_tier.dat_node3. Give every
+      # node a distinct file if several runtimes share the container.
+      # capacity_limit is a cap (nothing is preallocated); growth_unit is
+      # ignored. The tier keeps no allocator log unless the path carries
+      # alloc_log=<local path>.
+      # - path: "daos://mypool/mycont/clio/cte_tier.dat"
+      #   bdev_type: "daos"
+      #   capacity_limit: "500GB"
+      #   score: 0.6
+      #   persistence_level: "temporary"
 
     # Metadata durability ---------------------------------------------------
     # Write-ahead log + periodic snapshots for tag/blob metadata. Required

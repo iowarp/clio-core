@@ -932,6 +932,8 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
         bdev_type = clio::run::bdev::BdevType::kS3;
       } else if (device.bdev_type_ == "gcs") {
         bdev_type = clio::run::bdev::BdevType::kGcs;
+      } else if (device.bdev_type_ == "daos") {
+        bdev_type = clio::run::bdev::BdevType::kDaos;
       }
 
       // Memory tiers stay node-local (issue #1110): a blob placed in another

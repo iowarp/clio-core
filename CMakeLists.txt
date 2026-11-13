@@ -162,6 +162,7 @@ option(CLIO_CORE_ENABLE_SYCL "Enable Intel GPU support via SYCL/oneAPI (icpx -fs
 option(CLIO_CORE_ENABLE_JARVIS "Enable Jarvis CI infrastructure installation" OFF)
 option(CLIO_ENABLE_AMAZON_DRIVE "Enable Amazon S3 intermediate storage" OFF)
 option(CLIO_ENABLE_GOOGLE_CLOUD "Enable Google Cloud Storage intermediate storage" OFF)
+option(CLIO_ENABLE_DAOS "Enable the native DAOS bdev transport (bdev_type: daos; needs libdaos + libdfs + libgurt)" OFF)
 
 #------------------------------------------------------------------------------
 # ClioCtp (context-transport-primitives) Options
@@ -1120,6 +1121,27 @@ if(CLIO_ENABLE_AMAZON_DRIVE AND NOT Poco_FOUND)
 endif()
 if(CLIO_ENABLE_AMAZON_DRIVE)
   message(STATUS "Amazon S3 bdev support: ENABLED (Poco found)")
+endif()
+
+# The DAOS adapter (kDaos bdev transport) talks to a DAOS pool through the
+# client library itself (libdfs files + libdaos event queues) instead of going
+# through a dfuse mount. Same auto-disable treatment as the cloud adapters
+# above: a build that asks for it without the DAOS development files warns and
+# continues without the transport (bdev_type "daos" is then rejected at pool
+# creation with an error naming this option).
+if(CLIO_ENABLE_DAOS)
+  find_package(DAOS QUIET)
+  if(NOT DAOS_FOUND)
+    message(WARNING "CLIO_ENABLE_DAOS is ON but the DAOS client development "
+                    "files (daos_fs.h, libdfs, libdaos, libgurt) were not "
+                    "found. DAOS bdev support will be disabled. Install "
+                    "daos-devel or point DAOS_ROOT / CMAKE_PREFIX_PATH at a "
+                    "DAOS install to enable it.")
+    set(CLIO_ENABLE_DAOS OFF)
+  endif()
+endif()
+if(CLIO_ENABLE_DAOS)
+  message(STATUS "DAOS bdev support: ENABLED (${DAOS_DFS_LIBRARY})")
 endif()
 
 # AWS SDK for C++ (optional - for the CAE S3 assimilator, s3://). Reuses the

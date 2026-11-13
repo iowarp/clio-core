@@ -20,6 +20,7 @@
 #              per node, sized from the node's share of the dataset D:
 #                ram::            RAM_PCT% of D  (score 1.0)
 #                file on dfuse    DAOS_PCT% of D (DAOS pool $DAOS_POOL, score 0.6)
+#                                 (DAOS_NATIVE=1: the same file through libdfs)
 #                file on Flare    FLARE_X x D    (score 0.2, overflow tier)
 #              With the defaults (25 + 50) 75% of the data fits in DRAM+DAOS
 #              and the remaining 25% has to spill to Flare.
@@ -32,6 +33,19 @@
 # caches directory attributes; passed through to clio_cte_fuse unchanged.
 # DAOS_API (MODE=daos; dfuse): dfs runs IO500 on libdfs directly, no FUSE.
 # NO_FLARE (0): 1 drops the Flare tier; tiers are then DRAM + DAOS only.
+# DAOS_NATIVE (unset/0 = off; MODE=cliofs): 1 makes the DAOS tier a native
+# DAOS bdev (bdev_type "daos") instead of a file on the dfuse mount: the
+# runtime reads and writes daos://$DAOS_POOL/$DAOS_CONT/tiers/<job>/<host>.dat
+# through libdfs, with no FUSE layer in the data path. Size, score and
+# persistence_level of the tier are unchanged. BUILD_DIR must be a build
+# configured with -DCLIO_ENABLE_DAOS=ON (checked up front). The dfuse mount is
+# still brought up: the tier file is an ordinary file of the container, so
+# the per-node du sampling and the teardown rm keep working through it.
+# DAOS_NATIVE_OPTS (unset): options appended to the daos:// path, e.g.
+# "chunk_size=4m&oclass=SX&prezero=0" (see
+# docs/docs/deployment/configuration.md). prezero=0 drops the transport's
+# zeroing of every read buffer; safe only once the DAOS client is known to
+# return zeros for holes.
 # META_RAM_MB (unset = off): MB of an extra DRAM target per node,
 # ram::clio_fs_meta (score 1.0), reserved for filesystem metadata and the
 # first MiB of each file. The bulk DRAM target (still RAM_PCT% of D) drops to
@@ -178,9 +192,22 @@ EOF
   # RAM_ONLY=1 leaves out the DAOS and Flare file tiers: a software-stack
   # ceiling with no storage I/O at all (diagnostic, not a real deployment).
   if [ "${RAM_ONLY:-0}" != 1 ]; then
+    # DAOS_NATIVE=1: the same file of the container (<host>.dat under
+    # tiers/$JOB), reached through libdfs by the bdev's DAOS transport
+    # instead of through the dfuse mount.
+    if [ "${DAOS_NATIVE:-0}" = 1 ]; then
+      ldd "$BUILD_DIR/bin/libclio_bdev_runtime.so" 2>/dev/null | grep -q 'libdfs' \
+        || { echo "DAOS_NATIVE=1 needs a build with -DCLIO_ENABLE_DAOS=ON; $BUILD_DIR has no DAOS transport"; exit 2; }
+      DAOS_TIER_PATH="daos://$DAOS_POOL/$DAOS_CONT/tiers/$JOB/__HOST__.dat${DAOS_NATIVE_OPTS:+?$DAOS_NATIVE_OPTS}"
+      DAOS_TIER_TYPE=daos
+      echo "=== DAOS tier: native (bdev_type daos) $DAOS_TIER_PATH"
+    else
+      DAOS_TIER_PATH="/tmp/$USER/daos_io500/tiers/$JOB/__HOST__.dat"
+      DAOS_TIER_TYPE=file
+    fi
     cat >> clio_server.yaml <<EOF
-      - path: "/tmp/$USER/daos_io500/tiers/$JOB/__HOST__.dat"
-        bdev_type: "file"
+      - path: "$DAOS_TIER_PATH"
+        bdev_type: "$DAOS_TIER_TYPE"
         capacity_limit: "${DAOS_GB}MB"
         score: 0.6
         persistence_level: "${PERSIST:-temporary}"
