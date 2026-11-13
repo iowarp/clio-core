@@ -24,23 +24,23 @@ class BaseAssimilator {
   virtual ~BaseAssimilator() = default;
 
   // Required. A coroutine: co_await CTE operations, report failure in error_code.
-  virtual clio::run::TaskResume Schedule(const AssimilationCtx&amp; ctx, int&amp; error_code) = 0;
+  virtual clio::run::TaskResume Schedule(const AssimilationCtx& ctx, int& error_code) = 0;
 
   // Optional, for ingest on fault. The bytes of ONE destination blob, exactly as
   // Schedule would have stored them. Blocking I/O, no tasks. Returns the byte
   // count, 0 past the end of the source, or -errno. Default: -38 (ENOSYS).
-  virtual long long ReadBlob(const AssimilationCtx&amp; ctx, const std::string&amp; blob_name,
+  virtual long long ReadBlob(const AssimilationCtx& ctx, const std::string& blob_name,
                              char* dst, clio::run::u64 cap);
 
   // Optional. Bytes per blob for ctx. Default 0 = unsupported.
-  virtual clio::run::u64 BlobBytes(const AssimilationCtx&amp; ctx);
+  virtual clio::run::u64 BlobBytes(const AssimilationCtx& ctx);
 
   // Optional, for pagify. The page-space layout of the source. Default: empty map.
-  virtual PageMap BuildPageMap(const AssimilationCtx&amp; ctx, clio::run::u64 page_size);
+  virtual PageMap BuildPageMap(const AssimilationCtx& ctx, clio::run::u64 page_size);
 
   // Helpers over a map, not virtual.
-  std::vector&lt;PageSlice&gt; ToPage(const PageMap&amp; map, clio::run::u64 page_id) const;
-  std::vector&lt;PageRef&gt;   FromPage(const PageMap&amp; map, const std::string&amp; blob,
+  std::vector<PageSlice> ToPage(const PageMap& map, clio::run::u64 page_id) const;
+  std::vector<PageRef>   FromPage(const PageMap& map, const std::string& blob,
                                   clio::run::u64 off, clio::run::u64 size) const;
 };
 }
@@ -63,7 +63,7 @@ class BaseAssimilator {
 <pre data-label="cpp">
 } else if (protocol == "myscheme") {
 #ifdef CAE_ENABLE_MYSCHEME
-  return std::make_unique&lt;MySchemeAssimilator&gt;(cte_client_);
+  return std::make_unique<MySchemeAssimilator>(cte_client_);
 #else
   HLOG(kError, "AssimilatorFactory: myscheme requested but support not compiled in. "
                "Rebuild with -DCAE_ENABLE_MYSCHEME=ON.");

@@ -103,9 +103,9 @@ GLOBAL_CROSS_CONST clio::run::u32 kMonitor = 9;
 GLOBAL_CROSS_CONST clio::run::u32 kCustom = 10;
 GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 11;
 
-inline const std::vector&lt;std::string&gt;&amp; GetMethodNames() {
-  static const std::vector&lt;std::string&gt; names = [] {
-    std::vector&lt;std::string&gt; v(kMaxMethodId);
+inline const std::vector<std::string>& GetMethodNames() {
+  static const std::vector<std::string> names = [] {
+    std::vector<std::string> v(kMaxMethodId);
     v[kCreate] = "Create";
     v[kDestroy] = "Destroy";
     v[kMonitor] = "Monitor";
@@ -122,8 +122,8 @@ inline const std::vector&lt;std::string&gt;&amp; GetMethodNames() {
 <h3>CreateParams and the inherited tasks</h3>
 <p><code>CreateParams</code> is the configuration the container receives at creation. It must carry a static <code>chimod_lib_name</code> naming the library the runtime loads, a cereal <code>serialize</code>, and only fields that cereal can serialize. Create, destroy and monitor come from the admin module:</p>
 <pre data-label="c++ · MOD_NAME_tasks.h">
-#include &lt;clio_runtime/clio_runtime.h&gt;
-#include &lt;clio_runtime/admin/admin_tasks.h&gt;
+#include <clio_runtime/clio_runtime.h>
+#include <clio_runtime/admin/admin_tasks.h>
 #include "autogen/MOD_NAME_methods.h"
 
 namespace clio::run::MOD_NAME {
@@ -132,17 +132,17 @@ struct CreateParams {
   clio::run::u32 worker_count_;
   clio::run::u32 config_flags_;
 
-  // Required: the library the module manager loads (lib&lt;name&gt;_runtime.so).
+  // Required: the library the module manager loads (lib<name>_runtime.so).
   static constexpr const char* chimod_lib_name = "clio_MOD_NAME";
 
   CreateParams(clio::run::u32 worker_count = 1, clio::run::u32 config_flags = 0)
       : worker_count_(worker_count), config_flags_(config_flags) {}
 
-  template&lt;class Archive&gt;
-  void serialize(Archive&amp; ar) { ar(worker_count_, config_flags_); }
+  template<class Archive>
+  void serialize(Archive& ar) { ar(worker_count_, config_flags_); }
 };
 
-using CreateTask  = clio::run::admin::GetOrCreatePoolTask&lt;CreateParams&gt;;
+using CreateTask  = clio::run::admin::GetOrCreatePoolTask<CreateParams>;
 using DestroyTask = clio::run::admin::DestroyTask;
 using MonitorTask = clio::run::admin::MonitorTask;
 </pre>
@@ -156,10 +156,10 @@ struct CustomTask : public clio::run::Task {
 
   CustomTask() : clio::run::Task(), data_(CLIO_PRIV_ALLOC), operation_id_(0) {}
 
-  explicit CustomTask(const clio::run::TaskId &amp;task_node,
-                      const clio::run::PoolId &amp;pool_id,
-                      const clio::run::PoolQuery &amp;pool_query,
-                      const std::string &amp;data, clio::run::u32 operation_id)
+  explicit CustomTask(const clio::run::TaskId &task_node,
+                      const clio::run::PoolId &pool_id,
+                      const clio::run::PoolQuery &pool_query,
+                      const std::string &data, clio::run::u32 operation_id)
       : clio::run::Task(task_node, pool_id, pool_query, Method::kCustom),
         data_(CLIO_PRIV_ALLOC, data), operation_id_(operation_id) {
     task_id_ = task_node;
@@ -171,26 +171,26 @@ struct CustomTask : public clio::run::Task {
 
   CTP_CROSS_FUN ~CustomTask() {}
 
-  template&lt;typename Archive&gt;
-  CTP_CROSS_FUN void SerializeIn(Archive&amp; ar) {
+  template<typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive& ar) {
     Task::SerializeIn(ar);
     ar(data_, operation_id_);
   }
-  template&lt;typename Archive&gt;
-  CTP_CROSS_FUN void SerializeOut(Archive&amp; ar) {
+  template<typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive& ar) {
     Task::SerializeOut(ar);
     ar(data_);
   }
-  void Copy(const ctp::ipc::FullPtr&lt;CustomTask&gt; &amp;other) {
-    Task::Copy(other.template Cast&lt;Task&gt;());
-    data_ = other-&gt;data_;
-    operation_id_ = other-&gt;operation_id_;
+  void Copy(const ctp::ipc::FullPtr<CustomTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    data_ = other->data_;
+    operation_id_ = other->operation_id_;
   }
   // Merge ONLY the OUT fields of a replica. Never delegate to Copy():
   // that would overwrite this task's identity.
-  void AggregateOut(const ctp::ipc::FullPtr&lt;clio::run::Task&gt; &amp;other_base) {
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
-    data_ = other_base.template Cast&lt;CustomTask&gt;()-&gt;data_;
+    data_ = other_base.template Cast<CustomTask>()->data_;
   }
 };
 
@@ -205,10 +205,10 @@ struct CustomTask : public clio::run::Task {
 <h2>4. Write the container and its handlers</h2>
 <p>The runtime class derives from <code>clio::run::Container</code>, exposes <code>using CreateParams = ...;</code> for the <code>CLIO_TASK_CC</code> macro, and declares one handler per method. A handler takes a <code>clio::run::shared_ptr&lt;TaskType&gt; &amp;</code> and returns <code>clio::run::TaskResume</code>.</p>
 <pre data-label="c++ · MOD_NAME_runtime.h">
-#include &lt;clio_runtime/clio_runtime.h&gt;
-#include &lt;clio_runtime/container.h&gt;
-#include &lt;clio_runtime/comutex.h&gt;
-#include &lt;clio_runtime/corwlock.h&gt;
+#include <clio_runtime/clio_runtime.h>
+#include <clio_runtime/container.h>
+#include <clio_runtime/comutex.h>
+#include <clio_runtime/corwlock.h>
 #include "MOD_NAME_tasks.h"
 #include "MOD_NAME_client.h"
 
@@ -218,15 +218,15 @@ class Runtime : public clio::run::Container {
  public:
   using CreateParams = clio::run::MOD_NAME::CreateParams;
 
-  void Init(const clio::run::PoolId&amp; pool_id, const std::string&amp; pool_name,
+  void Init(const clio::run::PoolId& pool_id, const std::string& pool_name,
             clio::run::u32 container_id = 0) override;
   clio::run::TaskResume Run(clio::run::u32 method,
-                            clio::run::shared_ptr&lt;clio::run::Task&gt; task_ptr) override;
+                            clio::run::shared_ptr<clio::run::Task> task_ptr) override;
 
-  clio::run::TaskResume Create(clio::run::shared_ptr&lt;CreateTask&gt; &amp;task);
-  clio::run::TaskResume Custom(clio::run::shared_ptr&lt;CustomTask&gt; &amp;task);
-  clio::run::TaskResume Monitor(clio::run::shared_ptr&lt;MonitorTask&gt; &amp;task);
-  clio::run::TaskResume Destroy(clio::run::shared_ptr&lt;DestroyTask&gt; &amp;task);
+  clio::run::TaskResume Create(clio::run::shared_ptr<CreateTask> &task);
+  clio::run::TaskResume Custom(clio::run::shared_ptr<CustomTask> &task);
+  clio::run::TaskResume Monitor(clio::run::shared_ptr<MonitorTask> &task);
+  clio::run::TaskResume Destroy(clio::run::shared_ptr<DestroyTask> &task);
 
   clio::run::u64 GetWorkRemaining() const override;
   // Serialization and copy plumbing (SaveTask, LoadTask, AllocLoadTask,
@@ -245,28 +245,28 @@ class Runtime : public clio::run::Container {
 
 namespace clio::run::MOD_NAME {
 
-clio::run::TaskResume Runtime::Create(clio::run::shared_ptr&lt;CreateTask&gt; &amp;task) {
+clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   CLIO_TASK_BODY_BEGIN
-  // Init() already ran. Read task-&gt;GetParams() here if you need the config.
+  // Init() already ran. Read task->GetParams() here if you need the config.
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::Custom(clio::run::shared_ptr&lt;CustomTask&gt; &amp;task) {
+clio::run::TaskResume Runtime::Custom(clio::run::shared_ptr<CustomTask> &task) {
   CLIO_TASK_BODY_BEGIN
   // A subtask through the module's own client. The worker runs other tasks
   // while this one waits; the result is read from the future afterwards.
-  auto sub = client_.AsyncCustom(task-&gt;pool_query_, "child", 0);
+  auto sub = client_.AsyncCustom(task->pool_query_, "child", 0);
   CLIO_CO_AWAIT(sub);
-  task-&gt;data_ = sub-&gt;data_;
-  task-&gt;return_code_ = 0;
+  task->data_ = sub->data_;
+  task->return_code_ = 0;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::Destroy(clio::run::shared_ptr&lt;DestroyTask&gt; &amp;task) {
+clio::run::TaskResume Runtime::Destroy(clio::run::shared_ptr<DestroyTask> &task) {
   CLIO_TASK_BODY_BEGIN
-  task-&gt;return_code_ = 0;
+  task->return_code_ = 0;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
@@ -286,7 +286,7 @@ CLIO_TASK_CC(clio::run::MOD_NAME::Runtime)
 <h3>The dispatch file</h3>
 <p>The dispatch file implements the virtual methods of <code>Container</code> by switching on the method id. <code>Init</code> calls the base <code>Init</code>, builds the module's own client, and registers the cost model and method names. <code>Run</code> casts the task to its concrete type and awaits the handler:</p>
 <pre data-label="c++ · autogen/MOD_NAME_lib_exec.cc (excerpt)">
-void Runtime::Init(const clio::run::PoolId &amp;pool_id, const std::string &amp;pool_name,
+void Runtime::Init(const clio::run::PoolId &pool_id, const std::string &pool_name,
                    clio::run::u32 container_id) {
   clio::run::Container::Init(pool_id, pool_name, container_id);
   client_ = Client(pool_id);
@@ -295,16 +295,16 @@ void Runtime::Init(const clio::run::PoolId &amp;pool_id, const std::string &amp;
 }
 
 clio::run::TaskResume Runtime::Run(clio::run::u32 method,
-                                   clio::run::shared_ptr&lt;clio::run::Task&gt; task_ptr) {
+                                   clio::run::shared_ptr<clio::run::Task> task_ptr) {
   CLIO_TASK_BODY_BEGIN
   switch (method) {
     case Method::kCreate: {
-      auto&amp; typed = task_ptr.template Cast&lt;CreateTask&gt;();
+      auto& typed = task_ptr.template Cast<CreateTask>();
       CLIO_CO_AWAIT(Create(typed));
       break;
     }
     case Method::kCustom: {
-      auto&amp; typed = task_ptr.template Cast&lt;CustomTask&gt;();
+      auto& typed = task_ptr.template Cast<CustomTask>();
       CLIO_CO_AWAIT(Custom(typed));
       break;
     }
@@ -325,33 +325,33 @@ namespace clio::run::MOD_NAME {
 class Client : public clio::run::ContainerClient {
  public:
   Client() = default;
-  explicit Client(const clio::run::PoolId&amp; pool_id) { Init(pool_id); }
+  explicit Client(const clio::run::PoolId& pool_id) { Init(pool_id); }
 
-  clio::run::Future&lt;CreateTask&gt; AsyncCreate(const clio::run::PoolQuery&amp; pool_query,
-                                            const std::string&amp; pool_name,
-                                            const clio::run::PoolId&amp; custom_pool_id) {
+  clio::run::Future<CreateTask> AsyncCreate(const clio::run::PoolQuery& pool_query,
+                                            const std::string& pool_name,
+                                            const clio::run::PoolId& custom_pool_id) {
     auto* ipc_manager = CLIO_CPU_IPC;
-    auto task = ipc_manager-&gt;NewTask&lt;CreateTask&gt;(
+    auto task = ipc_manager->NewTask<CreateTask>(
         clio::run::CreateTaskId(), clio::run::kAdminPoolId, pool_query,
         CreateParams::chimod_lib_name, pool_name, custom_pool_id, this);
-    return ipc_manager-&gt;Send(task);
+    return ipc_manager->Send(task);
   }
 
-  clio::run::Future&lt;CustomTask&gt; AsyncCustom(const clio::run::PoolQuery&amp; pool_query,
-                                            const std::string&amp; input_data,
+  clio::run::Future<CustomTask> AsyncCustom(const clio::run::PoolQuery& pool_query,
+                                            const std::string& input_data,
                                             clio::run::u32 operation_id) {
     auto* ipc_manager = CLIO_CPU_IPC;
-    auto task = ipc_manager-&gt;NewTask&lt;CustomTask&gt;(
+    auto task = ipc_manager->NewTask<CustomTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, input_data, operation_id);
-    return ipc_manager-&gt;Send(task);
+    return ipc_manager->Send(task);
   }
 
-  clio::run::Future&lt;MonitorTask&gt; AsyncMonitor(const clio::run::PoolQuery&amp; pool_query,
-                                              const std::string&amp; query) {
+  clio::run::Future<MonitorTask> AsyncMonitor(const clio::run::PoolQuery& pool_query,
+                                              const std::string& query) {
     auto* ipc_manager = CLIO_CPU_IPC;
-    auto task = ipc_manager-&gt;NewTask&lt;MonitorTask&gt;(
+    auto task = ipc_manager->NewTask<MonitorTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, query);
-    return ipc_manager-&gt;Send(task);
+    return ipc_manager->Send(task);
   }
 };
 
@@ -395,16 +395,16 @@ $ cmake --build build
 <pre data-label="shell">
 $ export CLIO_REPO_PATH=$HOME/MOD_NAME/build
 $ export CLIO_SERVER_CONF=$HOME/clio.yaml
-$ clio_run start &amp;
+$ clio_run start &
 </pre>
 
 <h2>8. Create the pool</h2>
 <h3>From a client program</h3>
 <p>A program calls <code>clio::run::CLIO_INIT</code> once before touching any client and <code>clio::run::CLIO_RUNTIME_FINALIZE()</code> before it exits. With <code>CLIO_WITH_RUNTIME=0</code> in the environment it attaches to the running daemon.</p>
 <pre data-label="c++ · main.cc">
-#include &lt;clio_runtime/clio_runtime.h&gt;
-#include &lt;clio_runtime/admin/admin_client.h&gt;
-#include &lt;clio_runtime/MOD_NAME/MOD_NAME_client.h&gt;
+#include <clio_runtime/clio_runtime.h>
+#include <clio_runtime/admin/admin_client.h>
+#include <clio_runtime/MOD_NAME/MOD_NAME_client.h>
 
 int main() {
   // Attach to a running runtime (CLIO_WITH_RUNTIME=0), else start one here.
@@ -419,7 +419,7 @@ int main() {
 
   auto fut = client.AsyncCustom(pq, "hello", 1);
   fut.Wait();
-  // fut-&gt;data_ and fut-&gt;return_code_ are now valid.
+  // fut->data_ and fut->return_code_ are now valid.
 
   clio::run::CLIO_RUNTIME_FINALIZE();
   return 0;

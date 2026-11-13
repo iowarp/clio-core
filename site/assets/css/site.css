@@ -121,7 +121,7 @@ kbd { border: 1px solid var(--line-control); border-bottom-width: 2px; border-ra
   margin: 0 0 var(--space-3);
 }
 .eyebrow .chapter { color: var(--muted); }
-.lede { font-size: clamp(1.1rem, 1rem + 0.45vw, 1.3rem); color: var(--ink-soft); line-height: 1.55; max-width: 62ch; }
+.lede { font-size: clamp(1.1rem, 1rem + 0.45vw, 1.3rem); color: var(--ink-soft); line-height: 1.55; max-width: 62ch; overflow-wrap: break-word; }
 .muted { color: var(--muted); }
 .tag {
   display: inline-block;
@@ -355,6 +355,13 @@ figure { margin: var(--space-6) 0; }
 figcaption { color: var(--muted); font-size: 0.9rem; margin-top: var(--space-3); }
 figure.diagram { border: 1px solid var(--line); border-radius: var(--radius); padding: var(--space-4); background: var(--paper-raised); }
 figure.diagram svg { width: 100%; display: block; }
+/* On phones a full-width 860-unit diagram renders its labels at ~4px. Keep a
+   readable minimum width and let the diagram scroll inside its frame. */
+@media (max-width: 720px) {
+  figure.diagram { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  figure.diagram svg { min-width: 680px; }
+  figure.diagram figcaption { position: sticky; left: 0; }
+}
 .diagram .box { fill: var(--paper); stroke: var(--line-control); stroke-width: 1.3; }
 .diagram .box.hl { stroke: var(--accent); }
 .diagram .box.alt { stroke: var(--secondary); }

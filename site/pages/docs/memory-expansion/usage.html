@@ -9,8 +9,8 @@ facts: Host | clio::cte::cpu_vector::Vector&lt;T&gt; ; Device | clio::cte::gpu_v
 <h2>Start the runtime and the client</h2>
 <p>A vector needs a CTE core pool with at least one storage tier. Point <code>CLIO_SERVER_CONF</code> at a configuration like the one on the <a href="/docs/memory-expansion/install.html">install page</a>. <code>CLIO_INIT(kClient, true)</code> starts a runtime inside the process when none is running, which is how the adapter tests run; <code>CLIO_INIT(kClient)</code> attaches to one started with <code>clio_run start</code>. Then attach the CTE client.</p>
 <pre data-label="cpp">
-#include &lt;clio_runtime/clio_runtime.h&gt;
-#include &lt;clio_cte/core/core_client.h&gt;
+#include <clio_runtime/clio_runtime.h>
+#include <clio_cte/core/core_client.h>
 
 if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true)) return 1;
 if (!clio::cte::core::CLIO_CTE_CLIENT_INIT()) return 1;
@@ -21,10 +21,10 @@ clio::run::CLIO_RUNTIME_FINALIZE();
 <h2>cpu_vector from host threads</h2>
 <p>The constructor names the tag, the page size in bytes, the logical length in elements and the cache geometry. The verbs block instead of suspending, and every verb is thread-safe, so any number of host threads can share one vector. A caller error throws <code>std::runtime_error</code>. This example follows the adapter's own test.</p>
 <pre data-label="cpp · cpu_vector_example.cc">
-#include &lt;clio_cte/core/core_client.h&gt;
-#include &lt;clio_cte/cpu_vector/cpu_vector.h&gt;
-#include &lt;clio_runtime/clio_runtime.h&gt;
-#include &lt;vector&gt;
+#include <clio_cte/core/core_client.h>
+#include <clio_cte/cpu_vector/cpu_vector.h>
+#include <clio_runtime/clio_runtime.h>
+#include <vector>
 
 namespace cv = clio::cte::cpu_vector;
 using clio::run::u64;
@@ -36,29 +36,29 @@ int main() {
   const u64 page_bytes = 4096;
   const u64 epp = page_bytes / sizeof(u64);      // elements per page
   const u64 n = 6 * epp;
-  cv::Vector&lt;u64&gt; v("my_vector", page_bytes, n, /*nsets=*/2, /*set_size=*/4);
+  cv::Vector<u64> v("my_vector", page_bytes, n, /*nsets=*/2, /*set_size=*/4);
 
   // Write: fetch (a page with no blob yet reads as zeros), hold for write, flush, unpin.
   v.Fetch(0, 0, n);
-  for (u64 off = 0; off &lt; n; off += epp) {
+  for (u64 off = 0; off < n; off += epp) {
     auto h = v.HoldPage(off, epp, /*write=*/true);
-    for (u64 i = off; i &lt; off + h.run(); ++i) h[i] = i * 3;
+    for (u64 i = off; i < off + h.run(); ++i) h[i] = i * 3;
   }
   v.Flush(0, 0, n);
   v.UnpinRange(0, n);
 
   // Read back through the cache.
   v.Fetch(0, 0, n);
-  for (u64 off = 0; off &lt; n; off += epp) {
+  for (u64 off = 0; off < n; off += epp) {
     auto h = v.HoldPage(off, epp);
-    for (u64 i = off; i &lt; off + h.run(); ++i) {
+    for (u64 i = off; i < off + h.run(); ++i) {
       if (h[i] != i * 3) return 2;
     }
   }
   v.UnpinRange(0, n);
 
   // Or straight from the CTE, bypassing the cache.
-  std::vector&lt;u64&gt; out(n);
+  std::vector<u64> out(n);
   v.Download(out.data(), n);
 
   clio::run::CLIO_RUNTIME_FINALIZE();
@@ -85,35 +85,35 @@ int main() {
 <h3>Lazy copies</h3>
 <p><code>Copy("my_vector_ckpt")</code> flushes resident state, creates the tag <code>my_vector_ckpt</code> with the checkpoint module as its fault handler and <code>my_vector</code> as the source, and returns a new <code>Vector</code> on that tag with the same geometry. No bytes are copied: a page of the copy is materialized from the source the first time it is read. Because the source may keep changing, a snapshot meant as a checkpoint should be materialized while the source still holds the state you want: pass <code>sync = true</code>, or call <code>MaterializeAll()</code> on the copy, which returns the number of pages materialized. <code>ScoreAllPages(score)</code> rescores every page of a vector, for draining a checkpoint out of the fast tier.</p>
 <pre data-label="cpp">
-auto ckpt = v.Copy("my_vector_ckpt", /*sync=*/true);   // std::unique_ptr&lt;cv::Vector&lt;u64&gt;&gt;
-ckpt-&gt;ScoreAllPages(0.0f);                             // push the snapshot to the slowest tier
+auto ckpt = v.Copy("my_vector_ckpt", /*sync=*/true);   // std::unique_ptr<cv::Vector<u64>>
+ckpt->ScoreAllPages(0.0f);                             // push the snapshot to the slowest tier
 </pre>
 
 <h2>gpu_vector from a CUDA kernel</h2>
 <p>The host class <code>Vector&lt;T&gt;</code> owns the allocations and hands out a <code>DeviceVector&lt;T&gt;</code> that the kernel takes by value. The device side does the paging: a block fetches, holds, flushes and unpins from inside the kernel, and the runtime's CPU workers complete the transfers. The kernel is a device coroutine run by the yield driver, so the fetching verbs are awaited. Every <code>DeviceVector</code> call is block-collective: all threads of the block call it together, and no suspension may sit inside a thread-predicated branch.</p>
 <p>This is the adapter's smoke test, cut down. One block fills a vector page by page, flushing as it goes, then a second kernel reads it back. <code>gv::ResumeWhenComplete</code> holds a parked block back until its transfer has landed.</p>
 <pre data-label="cpp · gpu_vector_example.cc (CUDA, compiled with clang)">
-#include &lt;clio_runtime/clio_runtime.h&gt;
-#include &lt;clio_runtime/gpu/gpu_ipc_manager.h&gt;
-#include &lt;clio_runtime/gpu/yield_stack.h&gt;
-#include &lt;clio_runtime/gpu/yieldable.h&gt;
-#include &lt;clio_cte/core/core_client.h&gt;
-#include &lt;clio_cte/gpu_vector/gpu_vector.h&gt;
+#include <clio_runtime/clio_runtime.h>
+#include <clio_runtime/gpu/gpu_ipc_manager.h>
+#include <clio_runtime/gpu/yield_stack.h>
+#include <clio_runtime/gpu/yieldable.h>
+#include <clio_cte/core/core_client.h>
+#include <clio_cte/gpu_vector/gpu_vector.h>
 
 namespace gv = clio::cte::gpu_vector;
 namespace gy = clio::run::gpu;
 using clio::run::u32;
 using clio::run::u64;
 
-__device__ gy::YCoroMain FillCoro(gv::DeviceVector&lt;u32&gt; v, u64 n) {
-  for (u64 i = 0; i &lt; n;) {
+__device__ gy::YCoroMain FillCoro(gv::DeviceVector<u32> v, u64 n) {
+  for (u64 i = 0; i < n;) {
     u64 run = 0;
     {
       co_await v.Fetch(0, v.PageLo(i), v.PageSpan(i, 1));
       auto h = co_await v.HoldPage(i, n - i, /*write=*/true);
       run = h.run();
-      for (u64 k = threadIdx.x; k &lt; run; k += blockDim.x) {
-        h[i + k] = static_cast&lt;u32&gt;((i + k) * 7 + 1);
+      for (u64 k = threadIdx.x; k < run; k += blockDim.x) {
+        h[i + k] = static_cast<u32>((i + k) * 7 + 1);
       }
     }
     co_await v.Flush(0, i, run);                  // the vector never writes back on its own
@@ -123,8 +123,8 @@ __device__ gy::YCoroMain FillCoro(gv::DeviceVector&lt;u32&gt; v, u64 n) {
 }
 
 __global__ void FillKernel(clio::run::IpcManagerGpuInfo info,
-                           gv::DeviceVector&lt;u32&gt; v, u64 n,
-                           gy::YieldableView&lt;&gt; yv, gy::YieldStackView ys) {
+                           gv::DeviceVector<u32> v, u64 n,
+                           gy::YieldableView<> yv, gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
   v.Init(yv.Block());                 // the logical block id, not blockIdx.x
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
@@ -132,13 +132,13 @@ __global__ void FillKernel(clio::run::IpcManagerGpuInfo info,
   CLIO_YCORO_RUN(FillCoro(v, n));
 }
 
-__device__ gy::YCoroMain CheckCoro(gv::DeviceVector&lt;u32&gt; v, u64 n,
+__device__ gy::YCoroMain CheckCoro(gv::DeviceVector<u32> v, u64 n,
                                    unsigned long long *bad) {
-  for (u64 i = 0; i &lt; n;) {
+  for (u64 i = 0; i < n;) {
     co_await v.Fetch(0, v.PageLo(i), v.PageSpan(i, 1));
     auto h = co_await v.HoldPage(i, n - i);
-    for (u64 k = threadIdx.x; k &lt; h.run(); k += blockDim.x) {
-      if (h[i + k] != static_cast&lt;u32&gt;((i + k) * 7 + 1)) atomicAdd(bad, 1ull);
+    for (u64 k = threadIdx.x; k < h.run(); k += blockDim.x) {
+      if (h[i + k] != static_cast<u32>((i + k) * 7 + 1)) atomicAdd(bad, 1ull);
     }
     const u64 run = h.run();
     v.UnpinRange(v.PageLo(i), v.PageSpan(i, 1));
@@ -147,9 +147,9 @@ __device__ gy::YCoroMain CheckCoro(gv::DeviceVector&lt;u32&gt; v, u64 n,
 }
 
 __global__ void CheckKernel(clio::run::IpcManagerGpuInfo info,
-                            gv::DeviceVector&lt;u32&gt; v, u64 n,
+                            gv::DeviceVector<u32> v, u64 n,
                             unsigned long long *bad,
-                            gy::YieldableView&lt;&gt; yv, gy::YieldStackView ys) {
+                            gy::YieldableView<> yv, gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
   v.Init(yv.Block());
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
@@ -158,12 +158,12 @@ __global__ void CheckKernel(clio::run::IpcManagerGpuInfo info,
 }
 
 #if !CTP_IS_DEVICE_PASS
-template &lt;typename LaunchT&gt;
-static void RunYieldable(unsigned nblocks, LaunchT &amp;&amp;launch) {
-  gy::Yieldable&lt;&gt; drv(nblocks, 32);
+template <typename LaunchT>
+static void RunYieldable(unsigned nblocks, LaunchT &&launch) {
+  gy::Yieldable<> drv(nblocks, 32);
   gy::YieldStack stack(nblocks, 32, 8192);
   drv.RunToCompletion(
-      [&amp;](dim3 g, dim3 b, gy::YieldableView&lt;&gt; view) { launch(g, b, view, stack.View()); },
+      [&](dim3 g, dim3 b, gy::YieldableView<> view) { launch(g, b, view, stack.View()); },
       [] {}, /*max_rounds=*/200000, gv::ResumeWhenComplete);
 }
 
@@ -173,26 +173,26 @@ int main() {
   // the blocks you launch (the default is 16).
   if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true)) return 1;
   if (!clio::cte::core::CLIO_CTE_CLIENT_INIT()) return 1;
-  auto gpu_info = CLIO_CPU_IPC-&gt;GetGpuIpcManager()-&gt;GetGpuInfo(0);
+  auto gpu_info = CLIO_CPU_IPC->GetGpuIpcManager()->GetGpuInfo(0);
 
   const u64 page_bytes = 4096, n = 4096;   // 4 pages of u32
-  gv::Vector&lt;u32&gt; vec("gv_example", {0}, page_bytes,
+  gv::Vector<u32> vec("gv_example", {0}, page_bytes,
                       /*nblocks=*/1, /*set_size=*/4, n);
 
-  RunYieldable(1, [&amp;](dim3 g, dim3 b, gy::YieldableView&lt;&gt; vw, gy::YieldStackView sv) {
-    FillKernel&lt;&lt;&lt;g, b, CLIO_YIELD_SMEM_BYTES&gt;&gt;&gt;(gpu_info, vec.GetDevice(0), n, vw, sv);
+  RunYieldable(1, [&](dim3 g, dim3 b, gy::YieldableView<> vw, gy::YieldStackView sv) {
+    FillKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu_info, vec.GetDevice(0), n, vw, sv);
   });
   ctp::GpuApi::Synchronize();
 
-  auto *d_bad = ctp::GpuApi::Malloc&lt;unsigned long long&gt;(sizeof(unsigned long long));
+  auto *d_bad = ctp::GpuApi::Malloc<unsigned long long>(sizeof(unsigned long long));
   ctp::GpuApi::Memset(d_bad, 0, sizeof(unsigned long long));
-  RunYieldable(1, [&amp;](dim3 g, dim3 b, gy::YieldableView&lt;&gt; vw, gy::YieldStackView sv) {
-    CheckKernel&lt;&lt;&lt;g, b, CLIO_YIELD_SMEM_BYTES&gt;&gt;&gt;(gpu_info, vec.GetDevice(0), n, d_bad, vw, sv);
+  RunYieldable(1, [&](dim3 g, dim3 b, gy::YieldableView<> vw, gy::YieldStackView sv) {
+    CheckKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(gpu_info, vec.GetDevice(0), n, d_bad, vw, sv);
   });
   ctp::GpuApi::Synchronize();
 
   unsigned long long bad = 0;
-  ctp::GpuApi::Memcpy(&amp;bad, d_bad, sizeof(bad));
+  ctp::GpuApi::Memcpy(&bad, d_bad, sizeof(bad));
   ctp::GpuApi::Free(d_bad);
   clio::run::CLIO_RUNTIME_FINALIZE();
   return bad == 0 ? 0 : 2;

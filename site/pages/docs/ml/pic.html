@@ -26,9 +26,9 @@ print(r.assignment[:10])
 
 <h2>C++</h2>
 <pre data-label="cpp">
-PicResult FitPic(Dataset &amp;ds, const PicOptions &amp;opt);
+PicResult FitPic(Dataset &ds, const PicOptions &opt);
 PicResult FitPicPlain(const float *edges, u64 n_edges, u64 elems_per_page,
-                      u32 nblocks, const PicOptions &amp;opt);
+                      u32 nblocks, const PicOptions &opt);
 </pre>
 <p>The paged call needs the runtime; the <code>Plain</code> call runs the same kernel over a plain copy of the data without one.</p>
 

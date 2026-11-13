@@ -30,7 +30,7 @@ facts: Daemon | clio_cte_fuse ; Modules | clio_cte_filesystem (560.0), clio_cte_
 
 <h2>clio_cte_fuse</h2>
 <pre data-label="usage">
-clio_cte_fuse &lt;mountpoint&gt; [FUSE options]
+clio_cte_fuse <mountpoint> [FUSE options]
 </pre>
 <p>The daemon attaches to the runtime, creates or binds the filesystem pool (<code>560.0</code>, <code>clio_cte_filesystem</code>), and serves the mount until it is unmounted. Every argument after the mountpoint goes to the FUSE library.</p>
 <ul>

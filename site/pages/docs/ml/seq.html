@@ -26,11 +26,11 @@ for p in r.patterns[:5]: print(p.items, p.count)
 
 <h2>C++</h2>
 <pre data-label="cpp">
-SequentialPatternResult MineSequentialPatterns(Dataset &amp;ds,
-                                               const SequentialPatternOptions &amp;opt);
+SequentialPatternResult MineSequentialPatterns(Dataset &ds,
+                                               const SequentialPatternOptions &opt);
 SequentialPatternResult MineSequentialPatternsPlain(const float *data, u64 n_rows, u32 len,
                                                     u64 elems_per_page, u32 nblocks,
-                                                    const SequentialPatternOptions &amp;opt);
+                                                    const SequentialPatternOptions &opt);
 </pre>
 <p>The paged call needs the runtime; the <code>Plain</code> call runs the same kernel over a plain copy of the data without one.</p>
 
