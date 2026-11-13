@@ -236,6 +236,149 @@ TEST_CASE("inode_table_delta_apply", "[fs][inodetable]") {
   REQUIRE_FALSE(ApplyTableOps(&stale, got[1]));
 }
 
+namespace {
+
+/**
+ * Record one row insert on a home block the way RecordChangeLocked does.
+ * @param home the home's block (its version is bumped)
+ * @param name the row's canonical name
+ * @return the delta holders are sent
+ */
+TableDelta HomeInsert(InodeTableBlock *home, const std::string &name) {
+  TableDelta x;
+  x.dir_ = home->dir_;
+  x.index_ = home->index_;
+  x.base_version_ = home->version_;
+  x.new_version_ = ++home->version_;
+  x.depth_ = home->depth_;
+  x.mtime_ = 1000 + home->version_;
+  home->mtime_ = x.mtime_;
+  x.ops_.push_back({name, true, InodeRow{500u + home->version_, kFsTypeFile,
+                                         name, kRowLive}});
+  home->rows_[name] = x.ops_.back().row_;
+  return x;
+}
+
+/**
+ * Deliver encoded deltas to a holder's copy the way ApplyTablePush does for
+ * row changes: one not newer than the copy is skipped, one the copy is not
+ * at the base of means a change was missed.
+ * @param copy the holder's copy
+ * @param wire EncodeTableDeltas output (a push, or a reply's deltas)
+ * @return false if the copy must be dropped and fetched again
+ */
+bool Deliver(InodeTableBlock *copy, const std::string &wire) {
+  std::vector<TableDelta> ds;
+  if (!DecodeTableDeltas(wire, &ds)) return false;
+  for (const TableDelta &x : ds) {
+    if (ReplayTableDelta(copy, x) == ReplayStep::kMismatch) return false;
+  }
+  return true;
+}
+
+}  // namespace
+
+TEST_CASE("inode_table_batch_source", "[fs][inodetable]") {
+  const clio::run::u32 a = 3 + 1, b = 5 + 1;  // requesters (container + 1)
+  // The first change names the batch's source.
+  REQUIRE(MergeBatchSource(true, kBatchMixed, a) == a);
+  REQUIRE(MergeBatchSource(true, a, kBatchLocal) == kBatchLocal);
+  // More changes from the same requester keep it.
+  REQUIRE(MergeBatchSource(false, a, a) == a);
+  // Another requester, or the home itself (a split, a seal, a local
+  // create), makes it mixed: everyone is pushed.
+  REQUIRE(MergeBatchSource(false, a, b) == kBatchMixed);
+  REQUIRE(MergeBatchSource(false, a, kBatchLocal) == kBatchMixed);
+  REQUIRE(MergeBatchSource(false, kBatchLocal, a) == kBatchMixed);
+  REQUIRE(MergeBatchSource(false, kBatchLocal, kBatchLocal) == kBatchLocal);
+  // Mixed stays mixed.
+  REQUIRE(MergeBatchSource(false, kBatchMixed, a) == kBatchMixed);
+  REQUIRE(MergeBatchSource(false, kBatchMixed, kBatchLocal) == kBatchMixed);
+}
+
+TEST_CASE("inode_table_owed_deltas", "[fs][inodetable]") {
+  InodeTableBlock home;
+  home.dir_ = 9;
+  home.version_ = 20;
+  InodeTableBlock copy = home;  // the requester's cached copy
+
+  // Commit 21: the requester's own change, handed back in its reply.
+  std::vector<TableDelta> owed;
+  std::vector<TableDelta> c21{HomeInsert(&home, "a")};
+  owed.insert(owed.end(), c21.begin(), c21.end());
+  const std::string reply21 = EncodeTableDeltas(owed);
+
+  // Commit 22: someone else's change, pushed with what the requester is
+  // still owed in front.
+  std::vector<TableDelta> c22{HomeInsert(&home, "b")};
+  const std::string push22 = EncodeTableDeltas(WithOwedDeltas(owed, c22));
+
+  SECTION("reply first, then the push") {
+    InodeTableBlock c = copy;
+    REQUIRE(Deliver(&c, reply21));
+    REQUIRE(c.version_ == 21);
+    REQUIRE(c.rows_.count("a") == 1);
+    REQUIRE(Deliver(&c, push22));  // 21 is skipped, not applied twice
+    REQUIRE(c.version_ == 22);
+    REQUIRE(c.rows_.size() == 2);
+    REQUIRE(EncodeTableBlock(c, false) == EncodeTableBlock(home, false));
+  }
+  SECTION("the push overtakes the reply") {
+    InodeTableBlock c = copy;
+    REQUIRE(Deliver(&c, push22));  // carries 21 too: no gap
+    REQUIRE(c.version_ == 22);
+    REQUIRE(Deliver(&c, reply21));  // late reply: nothing left to apply
+    REQUIRE(c.version_ == 22);
+    REQUIRE(EncodeTableBlock(c, false) == EncodeTableBlock(home, false));
+  }
+  SECTION("the reply is lost") {
+    InodeTableBlock c = copy;
+    REQUIRE(Deliver(&c, push22));
+    REQUIRE(EncodeTableBlock(c, false) == EncodeTableBlock(home, false));
+  }
+  SECTION("a push without what is owed would be a gap") {
+    InodeTableBlock c = copy;
+    REQUIRE_FALSE(Deliver(&c, EncodeTableDeltas(c22)));  // drop and refetch
+  }
+  SECTION("the reply is applied twice") {
+    InodeTableBlock c = copy;
+    REQUIRE(Deliver(&c, reply21));
+    REQUIRE(Deliver(&c, reply21));
+    REQUIRE(c.version_ == 21);
+    REQUIRE(c.rows_.size() == 1);
+  }
+
+  // Two of the requester's commits in a row: the second reply carries both,
+  // so it lands whether or not the first reply did.
+  std::vector<TableDelta> owed2{c21[0]};
+  InodeTableBlock home2 = copy;
+  home2.version_ = 21;
+  home2.rows_ = {{"a", c21[0].ops_[0].row_}};
+  owed2.push_back(HomeInsert(&home2, "c"));
+  {
+    InodeTableBlock c = copy;  // never saw reply 21
+    REQUIRE(Deliver(&c, EncodeTableDeltas(owed2)));
+    REQUIRE(c.version_ == 22);
+    REQUIRE(c.rows_.count("a") == 1);
+    REQUIRE(c.rows_.count("c") == 1);
+  }
+
+  // What the requester reports having is dropped from what it is owed.
+  std::vector<TableDelta> t = owed2;
+  TrimOwedDeltas(&t, 20);
+  REQUIRE(t.size() == 2);
+  TrimOwedDeltas(&t, 21);
+  REQUIRE(t.size() == 1);
+  REQUIRE(t[0].new_version_ == 22);
+  REQUIRE(t[0].base_version_ == 21);
+  TrimOwedDeltas(&t, 30);
+  REQUIRE(t.empty());
+  TrimOwedDeltas(&t, 30);  // empty stays empty
+  REQUIRE(t.empty());
+  // Nothing owed: the push is just the commit.
+  REQUIRE(EncodeTableDeltas(WithOwedDeltas(t, c22)) == EncodeTableDeltas(c22));
+}
+
 TEST_CASE("inode_table_split_tree", "[fs][inodetable]") {
   for (bool ci : {false, true}) {
     Blocks blocks;

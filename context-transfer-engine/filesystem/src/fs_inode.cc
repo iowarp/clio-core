@@ -43,8 +43,11 @@
 #include <algorithm>
 #include <clio_cte/core/blob_placement.h>
 #include <clio_cte/filesystem/filesystem_runtime.h>
+#include <clio_runtime/evlat.h>
 
 namespace clio::cte::filesystem {
+
+namespace ev = clio::run::evlat;
 
 namespace {
 /** Xattr key of an inode's record in the file's tag section. */
@@ -117,6 +120,67 @@ clio::run::TaskResume Runtime::DiscardInodeRecord(
       CLIO_CO_AWAIT(dm);
     }
   }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+bool Runtime::CombinedCreateOk(clio::run::u64 packed) {
+  return InodeOwner(packed) != container_id_ && !shm_fs_cache_.IsEnabled();
+}
+
+clio::run::TaskResume Runtime::InodeCreateOpen(const FsReq &req, FsResp &resp,
+                                               int &rc) {
+  CLIO_TASK_BODY_BEGIN
+  rc = 0;
+  if (req.id_ == 0 || InodeOwner(req.id_) != container_id_) {
+    // The sender's view of who serves this id differs from ours (a node
+    // just died or rejoined): a record stored here would not stay resident
+    // and could not be opened. Nothing is stored; the sender falls back.
+    rc = kFsRedirect;
+    CLIO_CO_RETURN;
+  }
+  // CLIO_EVLAT fs_ino_exec: the handler from here (this container owns the
+  // id) to its return; the FlushInodes ExecShardOp runs after is fs_op_flush.
+  ev::ScopedSpan ev_exec(ev::kFsInoExec);
+  Inode ino;
+  ino.tag_id_ = FsUnpack(req.id_);
+  ino.type_ = kFsTypeFile;
+  ino.mode_ = req.mode_;
+  // Stored here and mirrored on the successor before anything is answered;
+  // this container owns the id, so the inode is resident afterwards.
+  CLIO_CO_AWAIT(CreateInodeRecord(ino, req.dir_, rc));
+  if (rc != 0) CLIO_CO_RETURN;
+  // The path is already the inode's mirror_path_ (CreateInodeRecord); it is
+  // not passed to the open, which would publish it in the shared-memory
+  // mirror before the creator has published the name.
+  FsReq o;
+  o.id_ = req.id_;
+  rc = InodeOpenLocal(o, resp);
+  if (rc != 0) {
+    // Not resident after all (ownership moved while the record was being
+    // stored): take the record back, so "nothing was stored" holds, and
+    // let the sender use the two-step form.
+    resp = FsResp();
+    CLIO_CO_AWAIT(DiscardInodeRecord(ino.tag_id_));
+    rc = kFsRedirect;
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::InodeDiscard(const FsReq &req) {
+  CLIO_TASK_BODY_BEGIN
+  {
+    std::lock_guard<std::mutex> g(meta_mu_);
+    auto it = handles_.find(req.a_);
+    // Only the handle of this very inode: a wrong or replayed request must
+    // not close someone else's file.
+    if (it != handles_.end() && FsPack(it->second->tag_id_) == req.id_) {
+      if (it->second->open_count_ > 0) it->second->open_count_--;
+      handles_.erase(it);
+    }
+  }
+  CLIO_CO_AWAIT(DiscardInodeRecord(FsUnpack(req.id_)));
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
@@ -200,9 +264,9 @@ static void TraceInodeRec(const char *what, clio::run::u64 packed,
        ino.ctime_, ok ? "" : " (undecodable)");
 }
 
-clio::run::TaskResume Runtime::StoreInodeRec(clio::run::u64 packed,
-                                             const std::string &rec,
-                                             int &rc) {
+clio::run::TaskResume Runtime::StoreInodeRecPrimary(clio::run::u64 packed,
+                                                    const std::string &rec,
+                                                    int &rc) {
   CLIO_TASK_BODY_BEGIN
   TraceInodeRec("store", packed, rec, container_id_);
   {
@@ -223,24 +287,89 @@ clio::run::TaskResume Runtime::StoreInodeRec(clio::run::u64 packed,
                                  InodeRecQuery(packed));
   CLIO_CO_AWAIT(p);
   rc = static_cast<int>(p->GetReturnCode());
-  if (rc == 0 && NumContainers() > 1) {
-    // Mirror the record on the home's first successor: that is the node
-    // failover hands the inode to while the home is down, and it can only
-    // serve (stat, truncate, fsync an open file) what it has a record of.
-    // Tag xattrs are not blobs, so the replication chimod never copies them.
-    // Skipped when the successor is where it was just stored (it is the
-    // stand-in now). Best effort: a missed mirror costs availability during
-    // the next outage, never correctness (EnsureInode takes the newer).
-    const clio::run::u32 n = NumContainers();
-    const clio::run::u32 succ = (InodeHome(packed) + 1) % n;
-    if (succ != InodeOwner(packed) &&
-        clio::cte::core::ContainerNodeAlive(pool_id_, succ)) {
-      auto m = cte_.AsyncTagSetXattr(
-          FsUnpack(packed), kInodeKey, rec, 0,
-          clio::run::PoolQuery::DirectId(
-              static_cast<clio::run::ContainerId>(succ)));
-      CLIO_CO_AWAIT(m);
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+void Runtime::SendInodeMirror(
+    clio::run::u64 packed, const std::string &rec,
+    std::vector<clio::run::Future<clio::cte::core::TagXattrTask>> *out) {
+  const clio::run::u32 n = NumContainers();
+  if (n <= 1) return;
+  // Mirror the record on the home's first successor: that is the node
+  // failover hands the inode to while the home is down, and it can only
+  // serve (stat, truncate, fsync an open file) what it has a record of.
+  // Tag xattrs are not blobs, so the replication chimod never copies them.
+  // Skipped when the successor is where it was just stored (it is the
+  // stand-in now). Best effort: a missed mirror costs availability during
+  // the next outage, never correctness (EnsureInode takes the newer).
+  const clio::run::u32 succ = (InodeHome(packed) + 1) % n;
+  if (succ == InodeOwner(packed) ||
+      !clio::cte::core::ContainerNodeAlive(pool_id_, succ)) {
+    return;
+  }
+  out->push_back(cte_.AsyncTagSetXattr(
+      FsUnpack(packed), kInodeKey, rec, 0,
+      clio::run::PoolQuery::DirectId(
+          static_cast<clio::run::ContainerId>(succ))));
+}
+
+clio::run::TaskResume Runtime::StoreInodeRec(clio::run::u64 packed,
+                                             const std::string &rec,
+                                             int &rc) {
+  CLIO_TASK_BODY_BEGIN
+  const unsigned long long ev_s0 = ev::Now();
+  CLIO_CO_AWAIT(StoreInodeRecPrimary(packed, rec, rc));
+  const unsigned long long ev_s1 = ev::Now();
+  ev::Span(ev::kFsInoStore, ev_s0, ev_s1);
+  if (rc == 0) {
+    std::vector<clio::run::Future<clio::cte::core::TagXattrTask>> mirror;
+    SendInodeMirror(packed, rec, &mirror);
+    for (auto &m : mirror) CLIO_CO_AWAIT(m);
+    // Only when a mirror was sent (send -> reply).
+    if (!mirror.empty()) ev::Span(ev::kFsInoMirror, ev_s1, ev::Now());
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::StoreAndPushInode(
+    clio::run::u64 packed, const std::string &rec, const std::string &push,
+    const std::map<clio::run::u32, clio::run::u64> &holders,
+    const std::map<clio::run::u32, clio::run::u64> &leases, int &src,
+    std::vector<clio::run::u32> *gone) {
+  CLIO_TASK_BODY_BEGIN
+  src = 0;
+  const clio::run::u64 t_store = SteadyMs();
+  CLIO_CO_AWAIT(StoreInodeRecPrimary(packed, rec, src));
+  const clio::run::u64 t_push = SteadyMs();
+  // The record is stored here. Its mirror and the holders' pushes do not
+  // depend on each other: both go out now and are awaited together, where
+  // the mirror used to be awaited before the first push was sent. As
+  // before, the mirror follows only a successful store and its result is
+  // not an error (best effort); the pushes go out either way.
+  std::vector<clio::run::Future<clio::cte::core::TagXattrTask>> mirror;
+  if (src == 0) SendInodeMirror(packed, rec, &mirror);
+  if (!holders.empty()) {
+    FsReq r;
+    r.id_ = packed;
+    r.str_ = push;
+    std::vector<clio::run::u32> hs;
+    std::vector<clio::run::u64> ls;
+    for (const auto &hv : holders) {
+      hs.push_back(hv.first);
+      auto lt = leases.find(hv.first);
+      ls.push_back(lt == leases.end() ? 0 : lt->second);
     }
+    CLIO_CO_AWAIT(PushToHolders(kShardInodePush, r, hs, ls, gone));
+  }
+  // Still awaited before the caller acknowledges the change.
+  for (auto &m : mirror) CLIO_CO_AWAIT(m);
+  const clio::run::u64 t_done = SteadyMs();
+  if (t_done - t_store >= kSlowCloseMs) {
+    HLOG(kWarning, "filesystem: inode {} record took {} ms to store (rc {}) "
+         "and {} ms to mirror and push to {} holder(s)", packed,
+         t_push - t_store, src, t_done - t_push, holders.size());
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -325,31 +454,9 @@ clio::run::TaskResume Runtime::FlushInodes(int *err, clio::run::u64 since) {
     }
     for (const InodeWork &w : work) {
       int src = 0;
-      const clio::run::u64 t_store = SteadyMs();
-      CLIO_CO_AWAIT(StoreInodeRec(w.packed, w.rec, src));
-      const clio::run::u64 t_push = SteadyMs();
       std::vector<clio::run::u32> gone;
-      if (!w.holders.empty()) {
-        FsReq r;
-        r.id_ = w.packed;
-        r.str_ = w.push;
-        std::vector<clio::run::u32> hs;
-        std::vector<clio::run::u64> ls;
-        for (const auto &hv : w.holders) {
-          hs.push_back(hv.first);
-          auto lt = w.leases.find(hv.first);
-          ls.push_back(lt == w.leases.end() ? 0 : lt->second);
-        }
-        CLIO_CO_AWAIT(PushToHolders(kShardInodePush, r, hs, ls, &gone));
-      }
-      {
-        const clio::run::u64 t_done = SteadyMs();
-        if (t_done - t_store >= kSlowCloseMs) {
-          HLOG(kWarning, "filesystem: inode {} record took {} ms to store "
-               "(rc {}) and {} ms to push to {} holder(s)", w.packed,
-               t_push - t_store, src, t_done - t_push, w.holders.size());
-        }
-      }
+      CLIO_CO_AWAIT(StoreAndPushInode(w.packed, w.rec, w.push, w.holders,
+                                      w.leases, src, &gone));
       std::lock_guard<std::mutex> g(meta_mu_);
       inode_storing_.erase(w.packed);
       auto fit = inodes_.find(w.packed);

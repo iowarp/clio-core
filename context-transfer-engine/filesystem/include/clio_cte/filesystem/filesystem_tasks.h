@@ -266,16 +266,35 @@ struct OpenTask : public clio::run::Task {
   // Packed TagId (major<<32|minor) of the file's tag, so adapters can drive
   // page-blob I/O (sieve writes, RYW reads) through the CTE client directly.
   OUT clio::run::u64 tag_packed_;
+  // The file's attributes as its inode's home held them when it opened the
+  // file (after an O_TRUNC truncation), i.e. what a Getattr at that instant
+  // reports: has_attr_ = 1 and the fields below are GetattrTask's of the
+  // same names (attr_mode_ is its mode_; the size is size_). Only for a
+  // regular file. A caller can answer the stat that follows a create from
+  // them instead of asking again.
+  OUT clio::run::u32 has_attr_;
+  OUT clio::run::u64 ino_;
+  OUT clio::run::u64 ctime_;
+  OUT clio::run::u64 mtime_;
+  OUT clio::run::u64 atime_;
+  OUT clio::run::u32 uid_;
+  OUT clio::run::u32 gid_;
+  OUT clio::run::u32 attr_mode_;
+  OUT clio::run::u32 nlink_;
 
   OpenTask()
       : clio::run::Task(), path_(CTP_MALLOC), flags_(0), mode_(0644),
-        handle_(0), size_(0), created_(0), tag_packed_(0) {}
+        handle_(0), size_(0), created_(0), tag_packed_(0), has_attr_(0),
+        ino_(0), ctime_(0), mtime_(0), atime_(0), uid_(0xFFFFFFFFu),
+        gid_(0xFFFFFFFFu), attr_mode_(0xFFFFFFFFu), nlink_(1) {}
   explicit OpenTask(const clio::run::TaskId &task_id, const clio::run::PoolId &pool_id,
                     const clio::run::PoolQuery &pool_query, const std::string &path,
                     clio::run::u32 flags, clio::run::u32 mode)
       : clio::run::Task(task_id, pool_id, pool_query, Method::kOpen),
         path_(CTP_MALLOC, path), flags_(flags), mode_(mode), handle_(0),
-        size_(0), created_(0), tag_packed_(0) {}
+        size_(0), created_(0), tag_packed_(0), has_attr_(0), ino_(0),
+        ctime_(0), mtime_(0), atime_(0), uid_(0xFFFFFFFFu),
+        gid_(0xFFFFFFFFu), attr_mode_(0xFFFFFFFFu), nlink_(1) {}
   void Copy(const ctp::ipc::FullPtr<OpenTask>& o) {
     // Base fields first (pool id, method, query, flags): a forwarded copy
     // without them reached SendIn with a null pool and crashed the node.
@@ -283,12 +302,17 @@ struct OpenTask : public clio::run::Task {
     path_ = o->path_; flags_ = o->flags_; mode_ = o->mode_;
     handle_ = o->handle_; size_ = o->size_; created_ = o->created_;
     tag_packed_ = o->tag_packed_;
+    has_attr_ = o->has_attr_; ino_ = o->ino_; ctime_ = o->ctime_;
+    mtime_ = o->mtime_; atime_ = o->atime_; uid_ = o->uid_; gid_ = o->gid_;
+    attr_mode_ = o->attr_mode_; nlink_ = o->nlink_;
   }
   template <typename Ar> void SerializeIn(Ar &ar) {
     Task::SerializeIn(ar); ar(path_, flags_, mode_);
   }
   template <typename Ar> void SerializeOut(Ar &ar) {
-    Task::SerializeOut(ar); ar(handle_, size_, created_, tag_packed_);
+    Task::SerializeOut(ar);
+    ar(handle_, size_, created_, tag_packed_, has_attr_, ino_, ctime_, mtime_,
+       atime_, uid_, gid_, attr_mode_, nlink_);
   }
 };
 

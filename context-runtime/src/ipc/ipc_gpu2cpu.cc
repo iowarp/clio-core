@@ -88,9 +88,10 @@ constexpr double kEvBucketUs[EvChan::kBuckets - 1] = {
 // the copy waited on the device before starting, and how long it ran.
 // 19-30: rtt_remote split into per-stage spans on the node that runs each
 // stage -- see clio_runtime/evlat.h for the map.
-constexpr int kNumEvChan = 34;
+// 34-60: the clio-fs create / unlink / size-advance stages (same header).
+constexpr int kNumEvChan = 61;
 EvChan g_chan[kNumEvChan];
-const char *g_chan_name[kNumEvChan] = {"multi_total", "multi_await", "get_total",
+const char *g_chan_name[] = {"multi_total", "multi_await", "get_total",
                               "bdev_h2d",   "read_await",  "get_meta",
                               "bdev_read",  "direct_read",
                               "reorg_stall", "reorg_move",
@@ -102,7 +103,22 @@ const char *g_chan_name[kNumEvChan] = {"multi_total", "multi_await", "get_total"
                               "r_read", "r_recvin", "r_lane", "r_exec",
                               "r_netq", "r_send", "r_resid",
                               "o_read", "o_recvout", "peer_poll",
-                              "c_e2e", "o_res_loc", "o_res_rem"};
+                              "c_e2e", "o_res_loc", "o_res_rem",
+                              "fs_cr_total", "fs_cr_parent", "fs_cr_lookup",
+                              "fs_cr_mint", "fs_cr_inode", "fs_cr_row",
+                              "fs_cr_open",
+                              "fs_row_exec", "fs_row_load", "fs_row_wait",
+                              "fs_row_journal", "fs_row_blob", "fs_row_push",
+                              "fs_row_holders", "fs_row_split",
+                              "fs_ino_exec", "fs_ino_store", "fs_ino_mirror",
+                              "fs_op_flush",
+                              "fs_un_total", "fs_un_parent", "fs_un_row",
+                              "fs_un_nlink",
+                              "fs_sz_total", "fs_sz_home", "fs_sz_stream",
+                              "fs_sz_flush"};
+// A name for every channel: a missing initializer would be a null %s.
+static_assert(sizeof(g_chan_name) / sizeof(g_chan_name[0]) == kNumEvChan,
+              "g_chan_name must name every channel");
 
 // TSC rate. The report used to assume a 3 GHz TSC (2995 cycles/us); on a
 // 2.2 GHz part every printed microsecond was 27% short. Measured once at
@@ -217,6 +233,18 @@ extern "C" void clio_evlat_busy(int which, unsigned long long start,
 }
 
 extern "C" double clio_evlat_cycles_per_us() { return g_cyc_per_us; }
+
+/**
+ * Record a plain number on a latency channel, scaled so the report's
+ * microsecond figures for that channel read as the number itself (avg = mean,
+ * max = largest), e.g. a fan-out per operation.
+ * @param which channel index
+ * @param n the number to record
+ */
+extern "C" void clio_evlat_count(int which, unsigned long long n) {
+  clio_evlat_add(which, static_cast<unsigned long long>(
+                            static_cast<double>(n) * g_cyc_per_us + 0.5));
+}
 
 namespace {
 

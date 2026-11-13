@@ -44,6 +44,9 @@
 extern "C" void clio_evlat_add(int which, unsigned long long cycles);
 extern "C" void clio_evlat_busy(int which, unsigned long long start,
                                 unsigned long long end);
+/** Record the plain number `n` (not a duration) on channel `which`: the
+ *  report's "us" figures for that channel then read as that number. */
+extern "C" void clio_evlat_count(int which, unsigned long long n);
 
 namespace clio::run::evlat {
 
@@ -71,7 +74,66 @@ enum Chan : int {
   kClientE2E = 31,
   kOriginResLocal = 32,
   kOriginResRemote = 33,
-  kNumChan = 34,
+  // 34-60: the clio-fs create / unlink / size-advance path, each stage timed
+  // on the container that runs it (map in the filesystem module, next to
+  // each stamp). All microseconds except fs_row_holders, a plain count.
+  //   originating container, file create (Runtime::Open -> CreateEntry):
+  //     fs_cr_total  whole Open task that created a file
+  //     fs_cr_parent resolving the parent directory (same Opens)
+  //     fs_cr_lookup the name lookup that found the name free, before create
+  //     fs_cr_mint   minting the id
+  //     fs_cr_inode  inode step: combined create+open shard op, and/or the
+  //                  record store of the two-step form (send -> reply)
+  //     fs_cr_row    TableOp(kTableInsert) (walk + send -> reply)
+  //     fs_cr_open   the separate kShardInodeOpen, when still sent
+  //   directory block's home (Runtime::RowMutation, insert and remove):
+  //     fs_row_exec  whole RowMutation
+  //     fs_row_load  LoadBlock (incl. its poll loops)
+  //     fs_row_wait  per mutation: retry yields while the block splits, plus
+  //                  CommitBlock entry -> its own commit starts (or another
+  //                  task's commit made its version durable)
+  //     fs_row_journal / fs_row_blob / fs_row_push  one commit's journal
+  //                  append, blob write, PushToHolders
+  //     fs_row_holders  holders that commit pushed to (count, not time)
+  //     fs_row_split SplitBlock after an insert
+  //   inode step's container:
+  //     fs_ino_exec  whole combined create+open handler
+  //     fs_ino_store / fs_ino_mirror  StoreInodeRec: primary store, mirror
+  //   any shard op's executor:
+  //     fs_op_flush  the FlushInodes that ends ExecShardOp
+  //   originating container, unlink: fs_un_total / fs_un_parent / fs_un_row
+  //     (TableOp(kTableRemove)) / fs_un_nlink (kShardInodeNlink)
+  //   size advance: fs_sz_total (forward to the inode's home, send -> reply),
+  //     and at the home fs_sz_home (whole local part), fs_sz_stream
+  //     (FileSizeOp), fs_sz_flush (FlushInodes)
+  kFsCrTotal = 34,
+  kFsCrParent = 35,
+  kFsCrLookup = 36,
+  kFsCrMint = 37,
+  kFsCrInode = 38,
+  kFsCrRow = 39,
+  kFsCrOpen = 40,
+  kFsRowExec = 41,
+  kFsRowLoad = 42,
+  kFsRowWait = 43,
+  kFsRowJournal = 44,
+  kFsRowBlob = 45,
+  kFsRowPush = 46,
+  kFsRowHolders = 47,
+  kFsRowSplit = 48,
+  kFsInoExec = 49,
+  kFsInoStore = 50,
+  kFsInoMirror = 51,
+  kFsOpFlush = 52,
+  kFsUnTotal = 53,
+  kFsUnParent = 54,
+  kFsUnRow = 55,
+  kFsUnNlink = 56,
+  kFsSzTotal = 57,
+  kFsSzHome = 58,
+  kFsSzStream = 59,
+  kFsSzFlush = 60,
+  kNumChan = 61,
 };
 
 enum Busy : int { kBusyPeerRecv = 0, kBusyNetSend = 1, kNumBusy = 2 };
@@ -91,6 +153,18 @@ inline unsigned long long Now() { return On() ? CycleNow() : 0; }
 /** Record t1 - t0 on channel `ch`; no-op if either stamp is unset. */
 inline void Span(int ch, unsigned long long t0, unsigned long long t1) {
   if (t0 != 0 && t1 > t0) clio_evlat_add(ch, t1 - t0);
+}
+
+/** Record an already-summed duration of `cycles` (0 included) on channel
+ *  `ch`, when enabled: for stages accumulated over several waits. */
+inline void Add(int ch, unsigned long long cycles) {
+  if (On()) clio_evlat_add(ch, cycles);
+}
+
+/** Record the plain number `n` on channel `ch`, when enabled (see
+ *  clio_evlat_count). */
+inline void Count(int ch, unsigned long long n) {
+  if (On()) clio_evlat_count(ch, n);
 }
 
 /** Record [t0, now) on channel `ch` (and optionally a busy kind) on scope
