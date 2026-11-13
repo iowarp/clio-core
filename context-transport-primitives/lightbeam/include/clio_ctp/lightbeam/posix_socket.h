@@ -157,6 +157,51 @@ CTP_DLL socket_t Accept(socket_t listen_fd);
 CTP_DLL uint32_t HostToNet32(uint32_t host);
 CTP_DLL uint32_t NetToHost32(uint32_t net);
 
+// --- Non-blocking primitives (SocketTransport frame reassembly) ---
+
+/** Portable readiness flags for PollFds (mapped to POLLIN/POLLOUT or
+ *  POLLRDNORM/POLLWRNORM in the platform .cc). */
+constexpr short kPollIn = 0x1;
+constexpr short kPollOut = 0x2;
+constexpr short kPollErr = 0x4;  ///< error / hang-up (revents only)
+
+/** One entry of a PollFds set. */
+struct PollFd {
+  socket_t fd;     ///< socket to watch
+  short events;    ///< kPollIn | kPollOut
+  short revents;   ///< filled by PollFds: kPollIn | kPollOut | kPollErr
+};
+
+/** Wait until any socket in fds is ready (poll on POSIX, WSAPoll on Windows).
+ *  @param fds sockets and the events to wait for; revents is filled in
+ *  @param count number of entries in fds
+ *  @param timeout_ms wait limit in ms (-1 = forever, 0 = do not block)
+ *  @return number of ready entries, 0 on timeout, -1 on error */
+CTP_DLL int PollFds(PollFd* fds, int count, int timeout_ms);
+
+/** Read whatever is available, without blocking.
+ *  @param fd non-blocking socket
+ *  @param buf destination
+ *  @param len capacity of buf
+ *  @param got bytes read (set only on success)
+ *  @return 0 on success (*got > 0), EAGAIN if nothing is ready, -1 on EOF or
+ *          error */
+CTP_DLL int RecvSome(socket_t fd, char* buf, size_t len, size_t* got);
+
+/** Shut down both directions of a connection without closing the socket, so
+ *  the peer sees EOF (and drops any partial frame) while another thread may
+ *  still be polling this socket. The owner closes it later. */
+CTP_DLL void Shutdown(socket_t fd);
+
+/** Write as much of iov as the socket takes now, without blocking.
+ *  @param fd non-blocking socket
+ *  @param iov buffers, in order (at most kSendSomeMaxIov are used)
+ *  @param count entries in iov
+ *  @return bytes written (0 if the socket is full), or -1 on error */
+constexpr int kSendSomeMaxIov = 64;
+CTP_DLL ssize_t SendSomeV(socket_t fd, const IoBuffer* iov, int count);
+
+
 #ifdef __linux__
 /** Create an epoll file descriptor. Returns epoll fd or -1 on error. */
 int EpollCreate();

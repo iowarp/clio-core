@@ -50,6 +50,7 @@
 #include <ws2tcpip.h>
 #include <afunix.h>
 
+#include <climits>
 #include <cstring>
 
 namespace ctp::lbm::sock {
@@ -384,6 +385,70 @@ socket_t Accept(socket_t listen_fd) {
 
 uint32_t HostToNet32(uint32_t host) { return htonl(host); }
 uint32_t NetToHost32(uint32_t net) { return ntohl(net); }
+
+// --- Non-blocking primitives ---
+
+int PollFds(PollFd* fds, int count, int timeout_ms) {
+  constexpr int kMaxPoll = 1024;
+  WSAPOLLFD pfds[kMaxPoll];
+  int n = count < kMaxPoll ? count : kMaxPoll;
+  for (int i = 0; i < n; ++i) {
+    pfds[i].fd = static_cast<SOCKET>(fds[i].fd);
+    pfds[i].events = static_cast<SHORT>(
+        ((fds[i].events & kPollIn) ? POLLRDNORM : 0) |
+        ((fds[i].events & kPollOut) ? POLLWRNORM : 0));
+    pfds[i].revents = 0;
+  }
+  int rc = WSAPoll(pfds, static_cast<ULONG>(n), timeout_ms);
+  if (rc == SOCKET_ERROR) return -1;
+  for (int i = 0; i < n; ++i) {
+    SHORT r = pfds[i].revents;
+    fds[i].revents = static_cast<short>(
+        ((r & POLLRDNORM) ? kPollIn : 0) | ((r & POLLWRNORM) ? kPollOut : 0) |
+        ((r & (POLLERR | POLLHUP | POLLNVAL)) ? kPollErr : 0));
+  }
+  return rc;
+}
+
+int RecvSome(socket_t fd, char* buf, size_t len, size_t* got) {
+  int want = len > static_cast<size_t>(INT_MAX) ? INT_MAX
+                                                 : static_cast<int>(len);
+  while (true) {
+    int n = ::recv(static_cast<SOCKET>(fd), buf, want, 0);
+    if (n > 0) {
+      *got = static_cast<size_t>(n);
+      return 0;
+    }
+    if (n == 0) return -1;  // orderly shutdown by the peer
+    int err = WSAGetLastError();
+    if (err == WSAEINTR) continue;
+    if (err == WSAEWOULDBLOCK) return EAGAIN;
+    return -1;
+  }
+}
+
+void Shutdown(socket_t fd) {
+  if (fd != kInvalidSocket) ::shutdown(static_cast<SOCKET>(fd), SD_BOTH);
+}
+
+ssize_t SendSomeV(socket_t fd, const IoBuffer* iov, int count) {
+  WSABUF wsa_bufs[kSendSomeMaxIov];
+  int n_iov = count < kSendSomeMaxIov ? count : kSendSomeMaxIov;
+  for (int i = 0; i < n_iov; ++i) {
+    wsa_bufs[i].buf = static_cast<char*>(iov[i].base);
+    wsa_bufs[i].len = static_cast<ULONG>(
+        iov[i].len < ULONG_MAX ? iov[i].len : ULONG_MAX);
+  }
+  while (true) {
+    ::DWORD sent = 0;
+    int rc = WSASend(fd, wsa_bufs, n_iov, &sent, 0, nullptr, nullptr);
+    if (rc == 0) return static_cast<ssize_t>(sent);
+    int err = WSAGetLastError();
+    if (err == WSAEINTR) continue;
+    if (err == WSAEWOULDBLOCK) return 0;
+    return -1;
+  }
+}
 
 }  // namespace ctp::lbm::sock
 

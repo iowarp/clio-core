@@ -353,6 +353,71 @@ socket_t Accept(socket_t listen_fd) {
 uint32_t HostToNet32(uint32_t host) { return htonl(host); }
 uint32_t NetToHost32(uint32_t net) { return ntohl(net); }
 
+// --- Non-blocking primitives ---
+
+int PollFds(PollFd* fds, int count, int timeout_ms) {
+  constexpr int kMaxPoll = 1024;
+  struct pollfd pfds[kMaxPoll];
+  int n = count < kMaxPoll ? count : kMaxPoll;
+  for (int i = 0; i < n; ++i) {
+    pfds[i].fd = fds[i].fd;
+    pfds[i].events = static_cast<short>(
+        ((fds[i].events & kPollIn) ? POLLIN : 0) |
+        ((fds[i].events & kPollOut) ? POLLOUT : 0));
+    pfds[i].revents = 0;
+  }
+  int rc;
+  do {
+    rc = ::poll(pfds, n, timeout_ms);
+  } while (rc < 0 && errno == EINTR);
+  if (rc < 0) return -1;
+  for (int i = 0; i < n; ++i) {
+    short r = pfds[i].revents;
+    fds[i].revents = static_cast<short>(
+        ((r & POLLIN) ? kPollIn : 0) | ((r & POLLOUT) ? kPollOut : 0) |
+        ((r & (POLLERR | POLLHUP | POLLNVAL)) ? kPollErr : 0));
+  }
+  return rc;
+}
+
+int RecvSome(socket_t fd, char* buf, size_t len, size_t* got) {
+  while (true) {
+    ssize_t n = ::recv(fd, buf, len, 0);
+    if (n > 0) {
+      *got = static_cast<size_t>(n);
+      return 0;
+    }
+    if (n == 0) return -1;  // orderly shutdown by the peer
+    if (errno == EINTR) continue;
+    if (errno == EAGAIN || errno == EWOULDBLOCK) return EAGAIN;
+    return -1;
+  }
+}
+
+void Shutdown(socket_t fd) {
+  if (fd != kInvalidSocket) ::shutdown(fd, SHUT_RDWR);
+}
+
+ssize_t SendSomeV(socket_t fd, const IoBuffer* iov, int count) {
+  struct iovec local_iov[kSendSomeMaxIov];
+  int n_iov = count < kSendSomeMaxIov ? count : kSendSomeMaxIov;
+  for (int i = 0; i < n_iov; ++i) {
+    local_iov[i].iov_base = iov[i].base;
+    local_iov[i].iov_len = iov[i].len;
+  }
+  struct msghdr msg;
+  std::memset(&msg, 0, sizeof(msg));
+  msg.msg_iov = local_iov;
+  msg.msg_iovlen = n_iov;
+  while (true) {
+    ssize_t n = ::sendmsg(fd, &msg, MSG_NOSIGNAL);
+    if (n >= 0) return n;
+    if (errno == EINTR) continue;
+    if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+    return -1;
+  }
+}
+
 }  // namespace ctp::lbm::sock
 
 #endif  // !_WIN32

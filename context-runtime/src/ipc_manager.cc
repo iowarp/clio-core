@@ -2873,6 +2873,21 @@ int IpcManager::NetSendThreads() {
 
 void IpcManager::SetSendSlot(int slot) { tls_send_slot = slot; }
 
+bool IpcManager::NetInlineSend() {
+  static const bool on = [] {
+    const char *e = std::getenv("CLIO_NET_INLINE_SEND");
+    if (e == nullptr || std::atoi(e) == 0) return false;
+    if (PeerTransportType() != ctp::lbm::TransportType::kSocket) {
+      HLOG(kWarning, "CLIO_NET_INLINE_SEND needs CLIO_PEER_TRANSPORT=socket; "
+                     "using the net send queue");
+      return false;
+    }
+    HLOG(kInfo, "Inline network send: on");
+    return true;
+  }();
+  return on;
+}
+
 ctp::lbm::Transport *IpcManager::GetOrCreateClient(const std::string &addr,
                                                     int port,
                                                     const char *lane) {
@@ -5650,6 +5665,15 @@ RouteResult IpcManager::RouteGlobal(Future<Task> &future,
   NetQueuePriority sendin_prio = (io_size >= kNetQueueIoThreshold)
                                      ? NetQueuePriority::kSendInIO
                                      : NetQueuePriority::kSendInLatency;
+  if (NetInlineSend() && !task_ptr->task_flags_.Any(TASK_FIRE_AND_FORGET)) {
+    // Inline send: this worker serializes and sends the task. Mark it routed
+    // first, since the reply may complete it before SendIn returns. `owning`
+    // keeps the task alive through the send, as the net queue entry would.
+    task_ptr->SetRouted();
+    Future<Task> owning = future;
+    GetRun2Run()->SendIn(owning.GetTaskPtr());
+    return RouteResult::Network;
+  }
   EnqueueNetTask(future, sendin_prio);
 
   // Set TASK_ROUTED flag on original task

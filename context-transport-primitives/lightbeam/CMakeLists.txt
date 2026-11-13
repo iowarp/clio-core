@@ -5,6 +5,8 @@ if(WIN32)
 else()
     clio_ctp_add_sources(src/socket_posix.cc)
 endif()
+# Platform-neutral SocketTransport framing (uses only the sock:: API).
+clio_ctp_add_sources(src/socket_frame.cc src/socket_engine.cc)
 
 if(CLIO_CORE_ENABLE_TESTS)
     add_subdirectory(test)

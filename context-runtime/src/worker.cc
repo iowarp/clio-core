@@ -1711,6 +1711,14 @@ void Worker::EndTask(clio::run::shared_ptr<Task> &task_ptr, bool can_resched) {
     NetQueuePriority prio = (io_size >= kNetQueueIoThreshold)
                                 ? NetQueuePriority::kSendOutIO
                                 : NetQueuePriority::kSendOutLatency;
+    if (IpcManager::NetInlineSend()) {
+      // Inline send: reply from this worker. `owning` keeps the task alive
+      // through SendOut once the self-cycle is broken, like a queue entry.
+      Future<Task> owning = task_ptr->RunFuture();
+      break_self_cycle();
+      CLIO_IPC->GetRun2Run()->SendOut(owning.GetTaskPtr());
+      return;
+    }
     CLIO_IPC->EnqueueNetTask(task_ptr->RunFuture(), prio);
     // EnqueueNetTask copied an owning Future into the net queue (keeps the task
     // alive through SendOut), so this RunContext's back-reference can drop its

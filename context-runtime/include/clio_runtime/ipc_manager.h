@@ -1306,6 +1306,15 @@ class IpcManager {
   static int NetSendThreads();
   /** Mark the calling thread as send slot `slot` (-1 = shared connections). */
   static void SetSendSlot(int slot);
+  /**
+   * Inline network send (experiment, CLIO_NET_INLINE_SEND=1, socket peer
+   * transport only): the worker that routes a task to another node, or ends
+   * a task that came from one, serializes and sends it itself instead of
+   * queueing it for the net send worker. The socket transport's Send never
+   * waits on the network (its I/O threads flush what the kernel cannot take
+   * yet), and its connections may be shared across threads.
+   */
+  static bool NetInlineSend();
   /** Number of inbound client SHM shards (worker w < this drains shard w). */
   u32 GetShmInShards() const { return shm_in_shards_; }
 
