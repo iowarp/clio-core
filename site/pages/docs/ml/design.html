@@ -14,7 +14,7 @@ facts: Algorithms | about 30 ; Backends | GPU or CPU, same math ; Unit of work |
 <rect class="box hl" x="20" y="100" width="820" height="50" rx="8"/><text class="title" x="32" y="122">Algorithm module (clio_ml_&lt;algo&gt;_chimod)</text><text class="muted" x="32" y="140">shared container template plus a small adapter that calls the fit</text>
 <rect class="box" x="20" y="180" width="400" height="50" rx="8"/><text class="title" x="32" y="202">Fit: per-row math + ordered reduce</text><text class="muted" x="32" y="220">block-private partials, no global atomics</text>
 <rect class="box" x="440" y="180" width="400" height="50" rx="8"/><text class="title" x="452" y="202">Dataset (page-aligned float32)</text><text class="muted" x="452" y="220">shard &lt;tag&gt;_n&lt;container&gt; per node</text>
-<rect class="box alt" x="20" y="260" width="820" height="50" rx="8"/><text class="title" x="32" y="282">Backend: gpu_vector, or cpu_vector if built with CLIO_ML_CPU=1</text><text class="muted" x="32" y="300">pages are CTE blobs; the CAE maps staged files onto tags</text>
+<rect class="box alt" x="20" y="260" width="820" height="50" rx="8"/><text class="title" x="32" y="282">Backend: gpu_vector, or cpu_vector if built with CLIO_ML_CPU=1</text><text class="muted" x="32" y="300">one CTE blob per page, named by its index; a page cache in GPU or host memory</text>
 <path class="edge" d="M430 70 V100" marker-end="url(#ml0)"/>
 <path class="edge" d="M220 150 V180" marker-end="url(#ml0)"/>
 <path class="edge" d="M640 150 V180" marker-end="url(#ml0)"/>
@@ -24,13 +24,94 @@ facts: Algorithms | about 30 ; Backends | GPU or CPU, same math ; Unit of work |
 </figure>
 
 <h2 id="dataset">Datasets are pages</h2>
-<p>A dataset is a page-aligned, row-major table of 32-bit floats stored in a memory-expansion vector. A page is the unit of work, and no row may straddle a page boundary, so the row width must divide evenly into the page. Data reaches the CTE through the CAE, which maps a staged float32 file onto a tag with one blob per page.</p>
+<p>A dataset is a page-aligned, row-major table of 32-bit floats stored in a memory-expansion vector. A page is the unit of work, and no row may straddle a page boundary, so the page must hold a whole number of rows; the dataset refuses a page size that does not. The vector is one CTE tag with one blob per page, named by the page's index. Data gets there through a host preload that writes every page, which is what the Python front end does, or through the CAE, which can serve page numbers over data it has ingested.</p>
+
+<h2 id="layout">How a dataset is laid out</h2>
+<figure class="diagram">
+<svg viewBox="0 0 860 640" role="img" aria-label="A 1,000,000-row dataset as 1954 page blobs of one CTE tag, split into four contiguous page runs, one per GPU block, and a GPU page cache of 4 sets of 16 frames whose home set is a hash of the page number">
+<defs><marker id="ml1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+<rect class="box alt" x="20" y="20" width="820" height="72" rx="8"/><text class="title" x="32" y="42">Python: ds = clio_ml.dataset(X, cache_pages=64)</text>
+<text class="muted" x="32" y="62">X: 1,000,000 rows × 8 float32 columns (32 B a row) · a 16 KiB page holds 512 whole rows · 4 blocks</text>
+<text class="muted" x="32" y="80">then clio_ml.fit_kmeans(ds, k=8, init_centroids=C); fit_kmeans(X) on a plain array runs in memory, no runtime</text>
+<path class="edge" d="M300,92 L300,118" marker-end="url(#ml1)"/><text class="muted" x="312" y="110">preload: one blob put per page</text>
+<rect class="box" x="20" y="120" width="820" height="162" rx="10" stroke-dasharray="6 5"/>
+<text class="title" x="32" y="144">CTE tag clio_ml_py_0</text><text class="muted" x="32" y="162">one tag per dataset; page blobs are named by index ("0" … "1953") and placed by the CTE like any blob</text>
+<rect class="box hl" x="36" y="176" width="185" height="56" rx="8"/><text class="title" x="48" y="198">pages 0 – 487</text><text class="muted" x="48" y="218">block 0 · 488 pages</text>
+<rect class="box hl" x="237" y="176" width="185" height="56" rx="8"/><text class="title" x="249" y="198">pages 488 – 976</text><text class="muted" x="249" y="218">block 1 · 489 pages</text>
+<rect class="box hl" x="438" y="176" width="185" height="56" rx="8"/><text class="title" x="450" y="198">pages 977 – 1464</text><text class="muted" x="450" y="218">block 2 · 488 pages</text>
+<rect class="box hl" x="639" y="176" width="185" height="56" rx="8"/><text class="title" x="651" y="198">pages 1465 – 1953</text><text class="muted" x="651" y="218">block 3 · 489 pages</text>
+<text class="muted" x="36" y="254">Block b owns pages [⌊b·N/4⌋, ⌊(b+1)·N/4⌋), N = 1954 pages: one contiguous run each.</text>
+<text class="muted" x="36" y="270">A row never straddles a page; the last page, 1953, holds the final 64 rows.</text>
+<path class="edge hl" d="M300,282 L300,314" marker-end="url(#ml1)"/><text class="muted" x="312" y="304">fetch: whole pages, one MultiGet per block</text>
+<rect class="box" x="20" y="316" width="820" height="306" rx="10" stroke-dasharray="6 5"/><text class="muted" x="32" y="338">GPU 0 MEMORY</text>
+<rect class="box hl" x="36" y="352" width="500" height="184" rx="8"/>
+<text class="title" x="48" y="374">Page cache: 4 sets × 16 frames (1 MiB)</text>
+<text class="muted" x="48" y="394">home set = hash(page number) mod 4, the same for every block,</text>
+<text class="muted" x="48" y="410">so a page that several blocks read is stored once</text>
+<text class="muted" x="48" y="436">set 0</text><rect class="box alt" x="100" y="424" width="22" height="16" rx="3"/><rect class="box alt" x="126" y="424" width="22" height="16" rx="3"/><rect class="box alt" x="152" y="424" width="22" height="16" rx="3"/><rect class="box alt" x="178" y="424" width="22" height="16" rx="3"/><rect class="box alt" x="204" y="424" width="22" height="16" rx="3"/><rect class="box alt" x="230" y="424" width="22" height="16" rx="3"/><rect class="box alt" x="256" y="424" width="22" height="16" rx="3"/><rect class="box" x="282" y="424" width="22" height="16" rx="3" stroke-dasharray="3 3"/><rect class="box alt" x="308" y="424" width="22" height="16" rx="3"/><rect class="box alt" x="334" y="424" width="22" height="16" rx="3"/><rect class="box" x="360" y="424" width="22" height="16" rx="3" stroke-dasharray="3 3"/><rect class="box alt" x="386" y="424" width="22" height="16" rx="3"/><rect class="box" x="412" y="424" width="22" height="16" rx="3" stroke-dasharray="3 3"/><rect class="box alt" x="438" y="424" width="22" height="16" rx="3"/><rect class="box alt" x="464" y="424" width="22" height="16" rx="3"/><rect class="box alt" x="490" y="424" width="22" height="16" rx="3"/>
+<text class="muted" x="48" y="458">set 1</text><rect class="box alt" x="100" y="446" width="22" height="16" rx="3"/><rect class="box" x="126" y="446" width="22" height="16" rx="3" stroke-dasharray="3 3"/><rect class="box alt" x="152" y="446" width="22" height="16" rx="3"/><rect class="box" x="178" y="446" width="22" height="16" rx="3" stroke-dasharray="3 3"/><rect class="box alt" x="204" y="446" width="22" height="16" rx="3"/><rect class="box alt" x="230" y="446" width="22" height="16" rx="3"/><rect class="box" x="256" y="446" width="22" height="16" rx="3" stroke-dasharray="3 3"/><rect class="box alt" x="282" y="446" width="22" height="16" rx="3"/><rect class="box alt" x="308" y="446" width="22" height="16" rx="3"/><rect class="box alt" x="334" y="446" width="22" height="16" rx="3"/><rect class="box" x="360" y="446" width="22" height="16" rx="3" stroke-dasharray="3 3"/><rect class="box alt" x="386" y="446" width="22" height="16" rx="3"/><rect class="box" x="412" y="446" width="22" height="16" rx="3" stroke-dasharray="3 3"/><rect class="box" x="438" y="446" width="22" height="16" rx="3" stroke-dasharray="3 3"/><rect class="box" x="464" y="446" width="22" height="16" rx="3" stroke-dasharray="3 3"/><rect class="box" x="490" y="446" width="22" height="16" rx="3" stroke-dasharray="3 3"/>
+<text class="muted" x="48" y="480">set 2</text><rect class="box alt" x="100" y="468" width="22" height="16" rx="3"/><rect class="box" x="126" y="468" width="22" height="16" rx="3" stroke-dasharray="3 3"/><rect class="box alt" x="152" y="468" width="22" height="16" rx="3"/><rect class="box" x="178" y="468" width="22" height="16" rx="3" stroke-dasharray="3 3"/><rect class="box" x="204" y="468" width="22" height="16" rx="3" stroke-dasharray="3 3"/><rect class="box alt" x="230" y="468" width="22" height="16" rx="3"/><rect class="box alt" x="256" y="468" width="22" height="16" rx="3"/><rect class="box alt" x="282" y="468" width="22" height="16" rx="3"/><rect class="box" x="308" y="468" width="22" height="16" rx="3" stroke-dasharray="3 3"/><rect class="box alt" x="334" y="468" width="22" height="16" rx="3"/><rect class="box alt" x="360" y="468" width="22" height="16" rx="3"/><rect class="box alt" x="386" y="468" width="22" height="16" rx="3"/><rect class="box alt" x="412" y="468" width="22" height="16" rx="3"/><rect class="box alt" x="438" y="468" width="22" height="16" rx="3"/><rect class="box alt" x="464" y="468" width="22" height="16" rx="3"/><rect class="box alt" x="490" y="468" width="22" height="16" rx="3"/>
+<text class="muted" x="48" y="502">set 3</text><rect class="box alt" x="100" y="490" width="22" height="16" rx="3"/><rect class="box" x="126" y="490" width="22" height="16" rx="3" stroke-dasharray="3 3"/><rect class="box alt" x="152" y="490" width="22" height="16" rx="3"/><rect class="box" x="178" y="490" width="22" height="16" rx="3" stroke-dasharray="3 3"/><rect class="box" x="204" y="490" width="22" height="16" rx="3" stroke-dasharray="3 3"/><rect class="box" x="230" y="490" width="22" height="16" rx="3" stroke-dasharray="3 3"/><rect class="box alt" x="256" y="490" width="22" height="16" rx="3"/><rect class="box alt" x="282" y="490" width="22" height="16" rx="3"/><rect class="box" x="308" y="490" width="22" height="16" rx="3" stroke-dasharray="3 3"/><rect class="box" x="334" y="490" width="22" height="16" rx="3" stroke-dasharray="3 3"/><rect class="box" x="360" y="490" width="22" height="16" rx="3" stroke-dasharray="3 3"/><rect class="box alt" x="386" y="490" width="22" height="16" rx="3"/><rect class="box" x="412" y="490" width="22" height="16" rx="3" stroke-dasharray="3 3"/><rect class="box alt" x="438" y="490" width="22" height="16" rx="3"/><rect class="box" x="464" y="490" width="22" height="16" rx="3" stroke-dasharray="3 3"/><rect class="box alt" x="490" y="490" width="22" height="16" rx="3"/>
+<text class="muted" x="48" y="524">filled: a resident page · dashed: a free frame</text>
+<rect class="box alt" x="552" y="352" width="272" height="184" rx="8"/>
+<text class="title" x="564" y="374">Frame record (64 B)</text>
+<text class="muted" x="564" y="398">page number, valid element range</text>
+<text class="muted" x="564" y="416">pins: a pinned frame is never evicted</text>
+<text class="muted" x="564" y="434">score, last access: the victim is the</text>
+<text class="muted" x="564" y="452">lowest score, then the least recent</text>
+<text class="muted" x="564" y="470">fetching, flushing: a transfer is in</text>
+<text class="muted" x="564" y="488">flight, so the frame cannot be taken</text>
+<path class="edge" d="M536,444 L550,444" marker-end="url(#ml1)"/>
+<rect class="box" x="36" y="550" width="788" height="56" rx="8"/><text class="title" x="48" y="572">Resident, not paged</text>
+<text class="muted" x="48" y="592">centroids (k × 8) · each block's sums (k × 8) and counts (k) · row labels · one MultiGet and one MultiPut task per block</text>
+</svg>
+<figcaption>A worked example: a million 8-column rows become 1954 page blobs of one tag, and each of the 4 GPU blocks owns one contiguous run of them. The GPU holds only a 64-frame cache, far smaller than the 30 MiB dataset, so every pass is out of core. A page's cache set depends on the page, not on the block that asks for it, so the whole grid shares one copy.</figcaption>
+</figure>
 
 <h2 id="backend">One code path for GPU and CPU</h2>
 <p>The backend selects the GPU vector by default, or the CPU vector on host threads when the code is built with <code>CLIO_ML_CPU=1</code>. Both run the same per-row math in the same order, so a CPU fit and a GPU fit of one dataset agree to the bit wherever the host and device math libraries agree (operations that need it use exact exp/log routines).</p>
 
+<h2 id="pass">One pass through the page cache</h2>
+<figure class="diagram">
+<svg viewBox="0 0 860 584" role="img" aria-label="One k-means iteration: the host launches 4 blocks; each block fetches, holds, folds and unpins each of its pages in turn; a miss sends a MultiGet to the runtime and parks the block until the yield driver relaunches it; the host then merges per-block partials in block order">
+<defs><marker id="ml2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+<rect class="box alt" x="20" y="20" width="820" height="56" rx="8"/><text class="title" x="32" y="42">Host: FitKMeans, Lloyd iteration it = 0 … iters − 1</text>
+<text class="muted" x="32" y="62">a fixed iteration count, no early stop · copy the centroids in · zero every block's sums and counts</text>
+<path class="edge" d="M315,76 L315,106" marker-end="url(#ml2)"/><text class="muted" x="327" y="96">launch 4 blocks × 256 threads (YieldRunner)</text>
+<rect class="box" x="20" y="108" width="590" height="260" rx="10" stroke-dasharray="6 5"/>
+<text class="title" x="32" y="132">Kernel, block 1: for each of its pages 488 … 976</text>
+<rect class="box hl" x="36" y="148" width="270" height="88" rx="8"/><text class="title" x="48" y="170">1 · CoFetch(page)</text>
+<text class="muted" x="48" y="190">find or claim a frame in the page's home</text><text class="muted" x="48" y="206">set and pin it; on a miss, evict the lowest</text><text class="muted" x="48" y="222">score, send a MultiGet, and park</text>
+<rect class="box hl" x="324" y="148" width="270" height="88" rx="8"/><text class="title" x="336" y="170">2 · CoHoldPage</text>
+<text class="muted" x="336" y="190">a pointer to the frame's bytes;</text><text class="muted" x="336" y="206">read-only, so the page stays clean</text>
+<rect class="box hl" x="324" y="264" width="270" height="88" rx="8"/><text class="title" x="336" y="286">3 · FoldPage</text>
+<text class="muted" x="336" y="306">label each row with its nearest centroid,</text><text class="muted" x="336" y="322">then one thread per (cluster, dim) adds</text><text class="muted" x="336" y="338">the rows in order into block 1's partial</text>
+<rect class="box hl" x="36" y="264" width="270" height="88" rx="8"/><text class="title" x="48" y="286">4 · UnpinRange</text>
+<text class="muted" x="48" y="306">drop the pin; the page stays resident</text><text class="muted" x="48" y="322">for the next iteration until a fetch</text><text class="muted" x="48" y="338">evicts it, with no write-back</text>
+<path class="edge" d="M306,192 L322,192" marker-end="url(#ml2)"/>
+<path class="edge" d="M459,236 L459,262" marker-end="url(#ml2)"/>
+<path class="edge" d="M324,308 L308,308" marker-end="url(#ml2)"/>
+<path class="edge" d="M171,264 L171,238" marker-end="url(#ml2)"/><text class="muted" x="183" y="255">next page</text>
+<rect class="box alt" x="630" y="108" width="210" height="120" rx="8"/><text class="title" x="642" y="130">Runtime GPU worker</text>
+<text class="muted" x="642" y="152">pops the block's MultiGet</text><text class="muted" x="642" y="168">off the GPU-to-CPU queue;</text><text class="muted" x="642" y="184">the CTE copies page blobs</text><text class="muted" x="642" y="200">("488", …) into frames</text>
+<rect class="box alt" x="630" y="248" width="210" height="120" rx="8"/><text class="title" x="642" y="270">Yield driver (host)</text>
+<text class="muted" x="642" y="292">relaunches a parked block</text><text class="muted" x="642" y="308">only when its fetch's</text><text class="muted" x="642" y="324">completion word flips; it</text><text class="muted" x="642" y="340">resumes where it parked</text>
+<path class="edge hl" d="M610,168 L628,168" marker-end="url(#ml2)"/>
+<path class="edge" d="M735,228 L735,246" marker-end="url(#ml2)"/>
+<path class="edge hl" d="M630,330 L612,330" marker-end="url(#ml2)"/>
+<path class="edge" d="M315,368 L315,398" marker-end="url(#ml2)"/>
+<rect class="box hl" x="20" y="400" width="820" height="74" rx="8"/><text class="title" x="32" y="422">Host, after every block finishes</text>
+<text class="muted" x="32" y="442">copy back 4 × (k × 8) sums and 4 × k counts · on a cluster, all-gather them, node 0's blocks first</text>
+<text class="muted" x="32" y="460">add blocks 0, 1, 2, 3 in that order · new centroid = sum ÷ count · start the next iteration</text>
+<rect class="box alt" x="20" y="494" width="820" height="74" rx="8"/><text class="title" x="32" y="516">Built with CLIO_ML_CPU=1</text>
+<text class="muted" x="32" y="536">blocks run on host threads (CLIO_ML_CPU_THREADS, default every core) over a cpu_vector page cache in host RAM;</text>
+<text class="muted" x="32" y="554">the same fetch → hold → fold → unpin per page and the same block order, so the same sums</text>
+</svg>
+<figcaption>Each block walks its own pages through the shared cache: fetch and pin, hold, fold into a block-private partial, unpin. A block does not wait out a miss on the GPU: it parks, the runtime copies the page blob into its frame, and the host relaunches the block when that transfer completes. The host then sums the block partials in a fixed order, which is why eviction never changes the answer.</figcaption>
+</figure>
+
 <h2 id="reduce">Deterministic reductions</h2>
-<p>Each GPU block computes its own partial result (sums, counts, gradients). Partials are combined in a fixed order instead of with global atomic adds. That is slightly more work, but it makes every run reproducible. An iterative fit that hits its round cap throws instead of silently returning an unconverged model.</p>
+<p>Each GPU block computes its own partial result (sums, counts, gradients). Partials are combined in a fixed order instead of with global atomic adds. That is slightly more work, but it makes every run reproducible. A paged kernel that hits the yield driver's round cap throws instead of returning the result of a partly executed pass.</p>
 
 <h2 id="module">Each algorithm is a runtime module</h2>
 <p>Every algorithm (k-means, random forests, gradient boosting, PCA, LSTMs and more) is packaged as its own runtime module named <code>clio_ml_&lt;algo&gt;_chimod</code>. The modules share one container template; each algorithm adds only a short adapter that calls its fit function. Besides the standard create, destroy and monitor methods, each has a compute method that the client sends to every container at once with a broadcast query. Because it is an ordinary module, an algorithm is installed, composed and monitored like any other.</p>
@@ -43,7 +124,7 @@ facts: Algorithms | about 30 ; Backends | GPU or CPU, same math ; Unit of work |
 <thead><tr><th>Choice</th><th>Gain</th><th>Cost</th></tr></thead>
 <tbody>
 <tr><td>Ordered reductions</td><td class="good">Reproducible, bit-identical results across CPU, GPU and node counts</td><td class="cost">Slower than atomic accumulation</td></tr>
-<tr><td>Page-aligned float32 rows</td><td class="good">Simple, cache-friendly work units</td><td class="cost">Data must be converted and padded to fit</td></tr>
+<tr><td>Page-aligned float32 rows</td><td class="good">Simple, cache-friendly work units</td><td class="cost">Data must be float32, with a page size that holds whole rows</td></tr>
 <tr><td>One module per algorithm</td><td class="good">Enable only the algorithms you use</td><td class="cost">Each enabled module is loaded by the runtime</td></tr>
 </tbody>
 </table>
