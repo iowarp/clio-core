@@ -35,10 +35,54 @@ facts: Core module | clio_cte_core ; Placement | max_bw, round_robin, random ; O
 <p>The core is the module <code>clio_cte_core</code>. Each node runs one container of it, and that container owns a slice of all tags and blobs: a blob's owner is chosen by hashing its tag and name, so metadata is spread over the cluster with no central server. The container keeps, for the keys it owns:</p>
 <ul>
   <li><strong>The tag table</strong>: tag name to id, and per-tag statistics.</li>
-  <li><strong>The blob table</strong>: for each blob, its score, generation, transform flags, and a list of extents, each naming a target, an offset and a size there (the blob's size is their sum). A blob can span several extents and, during a move, several targets.</li>
+  <li><strong>The blob table</strong>: for each blob, its score, generation, transform flags, and a list of extents, each naming a target, an offset and a size there (the blob's size is their sum). A blob can span several extents on several targets, for example when it grew after its first tier filled.</li>
   <li><strong>The target table</strong>: the block-device pools composed as tiers, with their capacity, score, persistence level and live free-space and bandwidth figures.</li>
 </ul>
-<p>Concurrency on one blob is a per-blob token: readers proceed together, a writer takes the token and drains readers. Different blobs never contend. <a href="/design/cte-core.html#concurrency">Concurrency</a> explains the rules.</p>
+<p>Concurrency on one blob is a per-blob token: readers proceed together without it, writers take it one at a time, and a change that frees extents (a move, a delete, a truncate) also waits for in-flight readers to finish first. Different blobs never contend. <a href="/design/cte-core.html#concurrency">Concurrency</a> explains the rules.</p>
+
+<h2 id="tables">How tags and blobs are stored</h2>
+<figure class="diagram">
+  <svg viewBox="0 0 860 636" role="img" aria-label="Worked example on four nodes: the tag /sim/run1 is owned by node 2, which holds its tag table entry and TagInfo; blob step_42 of that tag is owned by node 1, whose blob table entry lists two extents, one on the RAM tier and one on the disk tier, both entries of node 1's target table">
+    <defs><marker id="cte1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+    <rect class="box alt" x="20" y="20" width="400" height="130" rx="8"/><text class="title" x="32" y="44">Choosing the owner</text>
+    <text class="muted" x="32" y="66">tag: hash(name) % containers; the owner gives it</text><text class="muted" x="32" y="82">an id of (its node id, a counter)</text>
+    <text class="muted" x="32" y="102">blob: hash(tag id, blob name) % containers</text>
+    <text class="muted" x="32" y="122">owner down: the next live container stands in</text><text class="muted" x="32" y="138">(failover_to_successor, majority side only)</text>
+    <rect class="box" x="440" y="20" width="91" height="56" rx="8"/><text class="title" x="452" y="44">node 0</text>
+    <rect class="box hl" x="543" y="20" width="91" height="56" rx="8"/><text class="title" x="555" y="44">node 1</text><text class="muted" x="555" y="64">the blob</text>
+    <rect class="box hl" x="646" y="20" width="91" height="56" rx="8"/><text class="title" x="658" y="44">node 2</text><text class="muted" x="658" y="64">the tag</text>
+    <rect class="box" x="749" y="20" width="91" height="56" rx="8"/><text class="title" x="761" y="44">node 3</text>
+    <text class="muted" x="440" y="102">4 nodes, one core container each (container id = node id)</text>
+    <text class="muted" x="440" y="120">tag "/sim/run1" hashes to node 2, which names it 2.7</text>
+    <text class="muted" x="440" y="138">blob "step_42" of tag 2.7 hashes to node 1</text>
+
+    <rect class="box" x="20" y="170" width="400" height="334" rx="10" stroke-dasharray="6 5"/><text class="muted" x="32" y="188">NODE 2 · CORE CONTAINER</text>
+    <rect class="box alt" x="36" y="198" width="368" height="56" rx="8"/><text class="title" x="48" y="220">Tag table</text><text class="muted" x="48" y="240">name → id: "/sim/run1" → 2.7, plus each alias</text>
+    <rect class="box hl" x="36" y="266" width="368" height="126" rx="8"/><text class="title" x="48" y="288">TagInfo of 2.7</text>
+    <text class="muted" x="48" y="308">canonical name: /sim/run1</text><text class="muted" x="48" y="324">aliases: more names for this id (hard links)</text><text class="muted" x="48" y="340">total size of its blobs</text><text class="muted" x="48" y="356">modified, read and changed times</text><text class="muted" x="48" y="372">fault handler: a pool asked to fill a missing blob</text>
+    <rect class="box alt" x="36" y="404" width="368" height="56" rx="8"/><text class="title" x="48" y="426">Tag search index</text><text class="muted" x="48" y="446">regex queries over tag names, trigram prefilter</text>
+    <text class="muted" x="36" y="486">The tag's blobs are spread over every node by hash.</text>
+
+    <rect class="box" x="440" y="170" width="400" height="334" rx="10" stroke-dasharray="6 5"/><text class="muted" x="452" y="188">NODE 1 · CORE CONTAINER</text>
+    <rect class="box alt" x="456" y="198" width="368" height="56" rx="8"/><text class="title" x="468" y="220">Blob table</text><text class="muted" x="468" y="240">"2.7.step_42" → BlobInfo; a per-tag name index</text>
+    <rect class="box hl" x="456" y="266" width="368" height="222" rx="8"/><text class="title" x="468" y="288">BlobInfo of step_42</text>
+    <text class="muted" x="468" y="308">score 1.0 · generation · access count · times</text><text class="muted" x="468" y="324">transform flags (sticky) · droppable</text><text class="muted" x="468" y="340">placement generation · content seqlock</text><text class="muted" x="468" y="356">write token · reader pins</text><text class="muted" x="468" y="372">nodes holding a cached copy (dropped on write)</text><text class="muted" x="468" y="392">replicas: own extents, score and flags each</text>
+    <text class="muted" x="468" y="414">EXTENTS · blob size = sum of their sizes</text>
+    <rect class="box" x="468" y="424" width="166" height="52" rx="6"/><text class="title" x="480" y="446">[0] RAM tier</text><text class="muted" x="480" y="464">offset 0 · 3 MiB</text>
+    <rect class="box" x="646" y="424" width="166" height="52" rx="6"/><text class="title" x="658" y="446">[1] disk tier</text><text class="muted" x="658" y="464">offset 1.2 GiB · 1 MiB</text>
+
+    <rect class="box alt" x="20" y="540" width="400" height="76" rx="8"/><text class="title" x="32" y="562">Target table (node 1)</text><text class="muted" x="32" y="582">per target: bdev pool, score, persistence, capacity,</text><text class="muted" x="32" y="598">free space, bandwidth, latency, I/O counts, lifetime</text>
+    <rect class="box" x="440" y="540" width="196" height="76" rx="8"/><text class="title" x="452" y="562">RAM tier (ram)</text><text class="muted" x="452" y="582">score 1.0 · volatile</text><text class="muted" x="452" y="598">on this node only</text>
+    <rect class="box" x="644" y="540" width="196" height="76" rx="8"/><text class="title" x="656" y="562">Disk tier (file)</text><text class="muted" x="656" y="582">score 0.2 · temporary</text><text class="muted" x="656" y="598">may be a neighbor's</text>
+    <path class="edge hl" d="M551,476 L551,538" marker-end="url(#cte1)"/>
+    <path class="edge hl" d="M729,476 L729,538" marker-end="url(#cte1)"/>
+  </svg>
+  <figcaption>No node keeps a directory of every tag and blob: hashing picks
+  one owner for each. Node 2 records the tag <code>/sim/run1</code>, and each
+  of its blobs is recorded wherever its own hash lands. A blob's record lists
+  extents, each a range on one storage target; this one grew after the RAM
+  tier filled, so its last 1 MiB went to disk.</figcaption>
+</figure>
 
 <h2 id="placement">Placement engines and organizers</h2>
 <p>Two pluggable policies decide where bytes go.</p>
@@ -48,8 +92,55 @@ facts: Core module | clio_cte_core ; Placement | max_bw, round_robin, random ; O
 </dl>
 <p>Movement always copies before it frees: a reorganized blob is written to its new target, its extents are swapped in the table and logged, and only then is the old space released. <a href="/design/placement.html">Placement and tiering</a> covers scores, flushing and eviction.</p>
 
+<h2 id="write-path">A write, step by step</h2>
+<figure class="diagram">
+  <svg viewBox="0 0 860 744" role="img" aria-label="A put passes the client, cache, indexer, optional compressor and replication layers to the core container on the blob's owner node, where the placement engine picks extents, the blob table and a per-worker log shard record them, and the shared-memory mirror is refreshed; the organizer and flush tasks reuse those steps; the log shards and snapshot sit on disk, and a same-node client reads RAM-resident blobs straight from the mirror">
+    <defs><marker id="cte2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+    <rect class="box alt" x="20" y="20" width="126" height="76" rx="8"/><text class="title" x="32" y="42">Client</text><text class="muted" x="32" y="62">core client API</text><text class="muted" x="32" y="80">any process</text>
+    <rect class="box hl" x="158" y="20" width="126" height="76" rx="8"/><text class="title" x="170" y="42">cache</text><text class="muted" x="170" y="62">pool 563</text><text class="muted" x="170" y="80">raw local copy</text>
+    <rect class="box hl" x="296" y="20" width="126" height="76" rx="8"/><text class="title" x="308" y="42">indexer</text><text class="muted" x="308" y="62">pool 564</text><text class="muted" x="308" y="80">search index</text>
+    <rect class="box hl" x="434" y="20" width="126" height="76" rx="8" stroke-dasharray="4 4"/><text class="title" x="446" y="42">compressor</text><text class="muted" x="446" y="62">pool 562</text><text class="muted" x="446" y="80">optional codec</text>
+    <rect class="box hl" x="572" y="20" width="126" height="76" rx="8"/><text class="title" x="584" y="42">replication</text><text class="muted" x="584" y="62">pool 561</text><text class="muted" x="584" y="80">durable copies</text>
+    <rect class="box hl" x="710" y="20" width="130" height="76" rx="8"/><text class="title" x="722" y="42">core</text><text class="muted" x="722" y="62">pool 512</text><text class="muted" x="722" y="80">owner's tables</text>
+    <path class="edge hl" d="M146,58 L156,58" marker-end="url(#cte2)"/><path class="edge hl" d="M284,58 L294,58" marker-end="url(#cte2)"/><path class="edge hl" d="M422,58 L432,58" marker-end="url(#cte2)"/><path class="edge hl" d="M560,58 L570,58" marker-end="url(#cte2)"/><path class="edge hl" d="M698,58 L708,58" marker-end="url(#cte2)"/>
+    <text class="muted" x="20" y="118">Each layer overrides a few data verbs and forwards every other core method to its next_pool_id (shipped chain shown).</text>
+    <text class="muted" x="20" y="134">The cache answers on the caller's node; the indexer, replication and core run on the blob's owner node, chosen by hash.</text>
+
+    <rect class="box" x="20" y="150" width="820" height="288" rx="10" stroke-dasharray="6 5"/><text class="muted" x="32" y="168">CORE CONTAINER ON THE BLOB'S OWNER NODE</text>
+    <rect class="box alt" x="36" y="178" width="388" height="104" rx="8"/><text class="title" x="48" y="200">Data organizer (optional)</text>
+    <text class="muted" x="48" y="220">every 5 s: snapshot blob stats and rescore them</text><text class="muted" x="48" y="236">(hotset, frecency, cyclic, scatter, grayscott)</text><text class="muted" x="48" y="252">move a blob only if its score moved by 0.05 or more:</text><text class="muted" x="48" y="268">place a new copy, swap it in, log, then free the old</text>
+    <rect class="box alt" x="436" y="178" width="388" height="104" rx="8"/><text class="title" x="448" y="200">Flush and eviction</text>
+    <text class="muted" x="448" y="220">every 10 s: move bytes on volatile tiers to a</text><text class="muted" x="448" y="236">persistent one, by the same place, swap, free steps</text><text class="muted" x="448" y="252">eviction reclaims droppable copies when a tier is full</text><text class="muted" x="448" y="268">a graceful stop flushes RAM-tier data to disk</text>
+    <path class="edge" d="M160,282 L160,300" marker-end="url(#cte2)"/>
+    <rect class="box hl" x="36" y="302" width="250" height="120" rx="8"/><text class="title" x="48" y="324">1 · Placement (max_bw)</text>
+    <text class="muted" x="48" y="344">keep targets with room for the bytes</text><text class="muted" x="48" y="360">prefer score ≤ blob's, hottest first</text><text class="muted" x="48" y="376">then hotter tiers, closest first</text><text class="muted" x="48" y="392">ties: bandwidth; latency if &lt; 32 KiB</text><text class="muted" x="48" y="408">skip dead nodes, wrong persistence</text>
+    <rect class="box hl" x="298" y="302" width="264" height="120" rx="8"/><text class="title" x="310" y="324">2 · Blob table and log</text>
+    <text class="muted" x="310" y="344">swap the new extents into the BlobInfo</text><text class="muted" x="310" y="360">and bump its placement generation;</text><text class="muted" x="310" y="376">append one record to this worker's</text><text class="muted" x="310" y="392">shard: [type][seq][size][payload], seq</text><text class="muted" x="310" y="408">from one counter per container</text>
+    <rect class="box hl" x="574" y="302" width="250" height="120" rx="8"/><text class="title" x="586" y="324">3 · Mirror update</text>
+    <text class="muted" x="586" y="344">withdraw the blob's record before</text><text class="muted" x="586" y="360">its old extents are freed, then</text><text class="muted" x="586" y="376">republish extents, generation,</text><text class="muted" x="586" y="392">flags, tag size and times</text><text class="muted" x="586" y="408">best effort: never fails a write</text>
+    <path class="edge hl" d="M286,362 L296,362" marker-end="url(#cte2)"/><path class="edge hl" d="M562,362 L572,362" marker-end="url(#cte2)"/>
+
+    <path class="edge" d="M400,422 L400,460" marker-end="url(#cte2)"/><path class="edge" d="M700,422 L700,460" marker-end="url(#cte2)"/>
+    <rect class="box" x="20" y="462" width="400" height="166" rx="8"/><text class="title" x="32" y="484">Metadata log files (disk)</text>
+    <text class="muted" x="32" y="504">cte_metadata_log.blob.i and .tag.i: a shard per worker</text><text class="muted" x="32" y="520">records: create, extend (full layout), clear, delete,</text><text class="muted" x="32" y="536">transform, replica layout, droppable, tag name, xattr</text><text class="muted" x="32" y="552">cte_metadata_log: the snapshot, built in .tmp, renamed</text><text class="muted" x="32" y="568">every 5 s: fsync the shards; snapshot when they pass</text><text class="muted" x="32" y="584">32 MB, or 60 s after a score change; cut what it covers</text><text class="muted" x="32" y="604">restart: load the snapshot, replay the shards by seq</text>
+    <rect class="box" x="440" y="462" width="400" height="166" rx="8"/><text class="title" x="452" y="484">Shared-memory mirror (this node)</text>
+    <text class="muted" x="452" y="504">tag name → id; tag id → size and times</text><text class="muted" x="452" y="520">"2.7.step_42" → blob record:</text><text class="muted" x="452" y="536">· up to 16 extents (pool, offset, size, tier, node)</text><text class="muted" x="452" y="552">· placement generation and content seqlock</text><text class="muted" x="452" y="568">· flags: direct-readable, truncated, transformed</text><text class="muted" x="452" y="584">· the cache copy's extents, when it has one</text><text class="muted" x="452" y="604">direct-readable: every extent in this node's RAM</text>
+    <path class="edge hl" d="M640,628 L640,650" marker-end="url(#cte2)"/>
+    <rect class="box alt" x="20" y="652" width="820" height="76" rx="8"/><text class="title" x="32" y="674">Zero-IPC read (a client on the same node)</text>
+    <text class="muted" x="32" y="694">look up the record; refuse when it is not direct-readable or its seqlock is odd;</text>
+    <text class="muted" x="32" y="712">copy the bytes out of the RAM tier; if the generation or seqlock moved meanwhile, discard them and send a task</text>
+  </svg>
+  <figcaption>A put passes the interposers and reaches the core container that
+  owns the blob. There the placement engine picks extents, the blob table
+  takes them, the worker's log shard records them, and the node's
+  shared-memory mirror is refreshed. The organizer and the flush task move
+  blobs later through the same steps, always writing the new copy before
+  freeing the old, and a reader on the same node copies a RAM-resident blob
+  with no task at all.</figcaption>
+</figure>
+
 <h2 id="logs">Metadata log and recovery</h2>
-<p>Each worker appends the metadata changes it makes (new tags, new extents, deletes; a score change travels inside the extent record) to its own log file under <code>metadata_log_path</code>, so logging never contends between threads. The log is off when that path is empty; the shipped configuration sets it. Periodic snapshots bound replay time. On <code>clio_run start</code> the core container replays its logs and rebuilds its tables; data on volatile tiers that was not flushed reads as an I/O error, never as zeros. Modules that keep their own node-local metadata, such as the filesystem and stream, use a shared append-only record log with the same crash rules. <a href="/design/durability.html">Durability and recovery</a> states what survives what.</p>
+<p>Each worker appends the metadata changes it makes (new tags, new extents, deletes, renames) to its own log shard under <code>metadata_log_path</code>, so logging never contends between threads; one sequence counter per container orders the shards for replay. The log is off when that path is empty; the shipped configuration sets it. A snapshot, taken when the shards pass <code>transaction_log_capacity</code> (32 MB), bounds replay time. Score changes are not logged: they reach disk with the next snapshot, which is taken at most about a minute after one. On <code>clio_run start</code> the core container replays its logs and rebuilds its tables; data on volatile tiers that was not flushed reads as an I/O error, never as zeros. Modules that keep their own node-local metadata, such as the filesystem and stream, use a shared append-only record log with the same crash rules. <a href="/design/durability.html">Durability and recovery</a> states what survives what.</p>
 
 <h2 id="reads">The shared-memory read path</h2>
 <p>For blobs whose bytes are in a RAM target on the same node, the core publishes metadata into a shared-memory segment the client maps. A local reader can find the blob's location and copy the bytes directly, with no task and no context switch. Version checks make a concurrent overwrite visible, and transformed (for example, compressed) blobs are refused on this path because their stored bytes are not the caller's bytes. The same mirrors serve file sizes and statistics.</p>
