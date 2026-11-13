@@ -578,6 +578,13 @@ int cte_fuse_link(const char *from, const char *to);
  *  definition in fuse_cte.cc is unguarded. Declaring it inside the guard built
  *  fine on Linux/macOS and broke the WinFsp adapter build. */
 void cte_fuse_mark_session_live();
+
+/**
+ * Whether cte_fuse_init failed to bind the CLIO clients (the mount was given
+ * up). clio_cte_fuse exits non-zero when it did.
+ * @return true after a failed init
+ */
+bool cte_fuse_init_failed();
 #endif  // CLIO_CTE_FUSE_ENABLED
 
 #endif  // CLIO_CTE_ADAPTER_LIBFUSE_FUSE_CTE_H_

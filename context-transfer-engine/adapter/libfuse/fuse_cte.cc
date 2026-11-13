@@ -1742,6 +1742,34 @@ void cte_fuse_mark_session_live() {
   g_fuse_session_live.store(true, std::memory_order_release);
 }
 
+namespace {
+/** Set when cte_fuse_init could not bind the CLIO clients. */
+std::atomic<bool> g_fuse_init_failed{false};
+
+/**
+ * Give up the mount after the clients failed to initialize. A FUSE init
+ * callback cannot refuse a mount, so without this the mount stays live with
+ * unbound clients and every request goes to pool 0.0, which the runtime holds
+ * forever (a hang, not an error). Ending the session unmounts and makes
+ * clio_cte_fuse exit non-zero (cte_fuse_init_failed()). Only a real mount has
+ * a FUSE context; a direct call (test_fuse_ops) just records the failure.
+ */
+void FailMountInit() {
+  g_fuse_init_failed.store(true, std::memory_order_release);
+  if (!g_fuse_session_live.load(std::memory_order_acquire)) {
+    return;
+  }
+  struct fuse_context *cx = fuse_get_context();
+  if (cx != nullptr && cx->fuse != nullptr) {
+    fuse_exit(cx->fuse);
+  }
+}
+}  // namespace
+
+bool cte_fuse_init_failed() {
+  return g_fuse_init_failed.load(std::memory_order_acquire);
+}
+
 // ============================================================================
 // FUSE lifecycle
 // ============================================================================
@@ -1906,13 +1934,16 @@ static void *cte_fuse_init(struct fuse_conn_info *conn,
 
   bool success = clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
   if (!success) {
-    fprintf(stderr, "ERROR: CLIO_INIT failed\n");
+    fprintf(stderr, "ERROR: CLIO_INIT failed; giving up the mount\n");
+    FailMountInit();
     return nullptr;
   }
-  // Create-or-bind the filesystem chimod pool (which also brings up the CTE
-  // core pool it sits over). Every FUSE op below routes through CLIO_CFS_CLIENT.
+  // Bind the composed filesystem pool (found by name) and the pools it is
+  // configured with. Every FUSE op below routes through CLIO_CFS_CLIENT.
   if (!clio::cte::filesystem::CLIO_CFS_CLIENT_INIT()) {
-    fprintf(stderr, "ERROR: filesystem client init failed\n");
+    fprintf(stderr, "ERROR: filesystem client init failed; giving up the "
+            "mount\n");
+    FailMountInit();
     return nullptr;
   }
   // Every CTE call below (page blobs, capacity, fsync) goes through the
