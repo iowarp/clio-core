@@ -68,6 +68,12 @@ class BlobReplicasFixture {
     metadata_log_path_ = chi_test_data_dir() + "/blob_replicas_meta.log";
     mixed_storage_path_ = chi_test_data_dir() + "/blob_replicas_mixed.dat";
     Cleanup();
+    // The mixed core's backing file (<path>_node0) is removed only HERE,
+    // before the runtime starts: the fixture is destroyed at the end of the
+    // first test case while the runtime and its cores keep running, so
+    // removing it in Cleanup() deleted a live bdev's file (later reads
+    // failed: "cannot open a worker I/O context").
+    RemovePrefixed(mixed_storage_path_);
     CreateConfigFile();
     ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", config_path_.c_str(), 1);
 
@@ -81,6 +87,20 @@ class BlobReplicasFixture {
 
   ~BlobReplicasFixture() { Cleanup(); }
 
+  /** Remove every file in the test data dir whose name starts with the
+   *  basename of `path_prefix`. */
+  static void RemovePrefixed(const std::string &path_prefix) {
+    const fs::path base(path_prefix);
+    const std::string stem = base.filename().string();
+    std::error_code ec;
+    for (const auto &entry : fs::directory_iterator(base.parent_path(), ec)) {
+      CTP_MSAN_UNPOISON_OBJ(entry);
+      std::string name = entry.path().filename().string();
+      CTP_MSAN_UNPOISON_STRING(name);
+      if (name.rfind(stem, 0) == 0) fs::remove(entry.path(), ec);
+    }
+  }
+
   void Cleanup() {
     if (fs::exists(config_path_)) fs::remove(config_path_);
     if (fs::exists(file_storage_path_)) fs::remove(file_storage_path_);
@@ -93,8 +113,7 @@ class BlobReplicasFixture {
       CTP_MSAN_UNPOISON_OBJ(entry);
       std::string name = entry.path().filename().string();
       CTP_MSAN_UNPOISON_STRING(name);
-      if (name.rfind("blob_replicas_meta.log", 0) == 0 ||
-          name.rfind("blob_replicas_mixed.dat", 0) == 0) {
+      if (name.rfind("blob_replicas_meta.log", 0) == 0) {
         fs::remove(entry.path(), ec);
       }
     }
