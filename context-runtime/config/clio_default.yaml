@@ -265,6 +265,19 @@ compose:
   #                      DAOS client leaves holes untouched. 0 skips that
   #                      extra pass over the buffer; only for a DAOS version
   #                      known to return zeros for holes.
+  #   io_threads=<n>     dedicated DAOS I/O threads of the process, 1-64
+  #                      (default: env CLIO_DAOS_IO_THREADS, else 4). All
+  #                      DAOS I/O is issued and reaped by these threads, each
+  #                      with its own DAOS event queue (network context);
+  #                      runtime workers only queue requests and wait. The
+  #                      threads are shared by every DAOS device of the
+  #                      process: the first device opened decides the count.
+  # Environment (read when the first DAOS device of a process is opened):
+  #   CLIO_DAOS_IO_THREADS=<n>  I/O thread count when io_threads is not given
+  #   CLIO_DAOS_POLL_US=<us>    how long an I/O thread waits in one event-queue
+  #                             poll while it has I/O in flight (default 200;
+  #                             0 = non-blocking polls, the thread spins while
+  #                             I/O is in flight). Idle threads always sleep.
   # capacity is required and is a cap: DAOS allocates space as data is
   # written. The process needs the usual DAOS client environment (agent
   # socket, e.g. DAOS_AGENT_DRPC_DIR) and must be able to reach the servers.

@@ -11,6 +11,7 @@
 #include <unordered_map>
 #include <vector>
 #include "clio_runtime/cycle_counter.h"
+#include "clio_runtime/evlat.h"
 #include <exception>
 #include <mutex>
 #include <csignal>
@@ -91,7 +92,8 @@ constexpr double kEvBucketUs[EvChan::kBuckets - 1] = {
 // 34-60: the clio-fs create / unlink / size-advance stages (same header).
 // 61-76: the clio-fs file read / write data path (same header).
 // 77-79: the FUSE adapter's sequential read-ahead (same header).
-constexpr int kNumEvChan = 80;
+// 80-82: the stages of one native DAOS bdev block I/O (same header).
+constexpr int kNumEvChan = 83;
 EvChan g_chan[kNumEvChan];
 const char *g_chan_name[] = {"multi_total", "multi_await", "get_total",
                               "bdev_h2d",   "read_await",  "get_meta",
@@ -123,10 +125,13 @@ const char *g_chan_name[] = {"multi_total", "multi_await", "get_total",
                               "gb_local", "gb_fwd", "pb_fwd", "gb_tok",
                               "pb_exec", "pb_tok", "pb_drain", "pb_alloc",
                               "pb_bdev",
-                              "ra_hit", "ra_wait", "ra_miss"};
+                              "ra_hit", "ra_wait", "ra_miss",
+                              "daos_q", "daos_io", "daos_done"};
 // A name for every channel: a missing initializer would be a null %s.
 static_assert(sizeof(g_chan_name) / sizeof(g_chan_name[0]) == kNumEvChan,
               "g_chan_name must name every channel");
+static_assert(kNumEvChan == clio::run::evlat::kNumChan,
+              "kNumEvChan must match clio::run::evlat::kNumChan");
 
 // TSC rate. The report used to assume a 3 GHz TSC (2995 cycles/us); on a
 // 2.2 GHz part every printed microsecond was 27% short. Measured once at
