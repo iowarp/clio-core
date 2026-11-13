@@ -1,0 +1,22 @@
+# LZ4 ChiMod: a GPU-portable page compressor in front of the CTE core.
+# Pages are stored in the ctp gpu_lz4 format (chunked standard LZ4 blocks,
+# clio_ctp/compress/gpu_lz4.h): encoded on the host when put, decoded on the
+# GPU -- CUDA, ROCm or SYCL, one shared decoder -- when a device reader such
+# as gpu_vector faults them in. No nvCOMP. Speaks the core's task interface:
+# point a clio::cte::core::Client at this pool. A put is compressed only when
+# its Context asks for codec kGpuLz4Lib (25, "gpu-lz4" in the ctp codec registry); everything else forwards as is.
+module_name: lz4
+namespace: clio::cte
+version: 1.0.0
+
+kCreate: 0
+kDestroy: 1
+kMonitor: 9
+
+# Interposed core data verbs (MUST equal the core's ids)
+kPutBlob: 15
+kGetBlob: 16
+kGetBlobSize: 23
+kPodPutBlob: 43
+kPodGetBlob: 44
+kPodMultiGetBlob: 52

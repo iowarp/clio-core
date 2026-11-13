@@ -69,6 +69,7 @@
 #include "sycl_ans.h"
 #endif
 
+#include "gpu_lz4_compressor.h"
 #if CTP_ENABLE_SYCL_ZSTD
 #include "sycl_zstd.h"
 #endif
@@ -569,6 +570,10 @@ class CompressionFactory {
   }
   // GPU (SYCL) Zstd-STYLE: LZ77 + rANS combined codec (NOT libzstd-compatible).
   // Single-mode. Returns nullptr when the SYCL Zstd kernels are not built.
+  // gpu_lz4 page format, host side (always available: no dependency).
+  static std::unique_ptr<Compressor> MakeGpuLz4(CompressionPreset) {
+    return std::make_unique<GpuLz4>();
+  }
   static std::unique_ptr<Compressor> MakeSyclZstd(CompressionPreset) {
 #if CTP_ENABLE_SYCL_ZSTD
     return std::make_unique<SyclZstd>();
@@ -661,6 +666,9 @@ class CompressionFactory {
         CompressorInfo{"sycl-snappy",     22, 24, true,  &MakeSyclSnappy, true},
         CompressorInfo{"sycl-ans",        23, 25, true,  &MakeSyclAns, true},
         CompressorInfo{"sycl-zstd",       24, 26, true,  &MakeSyclZstd, true},
+        // Host codec for the portable gpu_lz4 page format; the LZ4 ChiMod
+        // decodes it on CUDA/ROCm/SYCL itself, so device=false here.
+        CompressorInfo{"gpu-lz4",         25, 27, true,  &MakeGpuLz4, false},
     };
     return kRegistry;
   }

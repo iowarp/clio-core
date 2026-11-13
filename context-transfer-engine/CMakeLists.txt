@@ -108,6 +108,14 @@ else()
     message(STATUS "CTE: cache chimod disabled (use -DCLIO_CTE_ENABLE_CACHE=ON)")
 endif()
 
+# LZ4 ChiMod -- GPU-portable page compression (ctp gpu_lz4): host encode on
+# put, one shared decoder on CUDA / ROCm / SYCL on device reads. No nvCOMP.
+option(CLIO_CTE_ENABLE_LZ4 "Build the LZ4 page-compression chimod" ON)
+if(CLIO_CTE_ENABLE_LZ4)
+    message(STATUS "CTE: building lz4 chimod")
+    add_subdirectory(lz4)
+endif()
+
 # Checkpoint chimod -- the fault handler behind vector.Copy's lazy copies.
 option(CLIO_CTE_ENABLE_CHECKPOINT "Build the checkpoint chimod" ON)
 if(CLIO_CTE_ENABLE_CHECKPOINT)

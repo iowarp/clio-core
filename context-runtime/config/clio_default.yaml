@@ -477,6 +477,23 @@ compose:
     # owner returns. Default: "" (kept in memory only).
     # handoff_log_path: "/var/lib/clio/cte_handoff_log"
 
+  # === GPU-portable page compression (optional) ===
+  # LZ4 pages in the ctp gpu_lz4 format: encoded on the host when a put asks
+  # for codec 25 ("gpu-lz4"), decoded on the GPU -- one shared decoder for
+  # CUDA, ROCm and SYCL (Intel), no nvCOMP -- straight into a device reader's
+  # memory (gpu_vector page faults). A page on a device (hbm) tier decodes in
+  # place; a page on a host or file tier is staged into device memory first.
+  # Other codecs, and puts that ask for none, forward untouched.
+  # - mod_name: clio_cte_lz4
+  #   pool_name: clio_cte_lz4
+  #   pool_query: local
+  #   pool_id: "565.0"
+  #   next_pool_id: "512.0"             # usually the CTE core
+  #   depth: 32                         # encoder hash-chain depth (ratio vs
+  #                                     # encode speed); default 32
+  #   staging_mb: 256                   # device staging for pages that are
+  #                                     # not on a device tier; default 256
+
   # === Compression (optional, issue #886) ===
   # Encoding layer: transparently compresses on the way down and
   # decompresses on the way out. Requires a build with

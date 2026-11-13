@@ -823,6 +823,33 @@ if(CLIO_CORE_ENABLE_CUDA)
   )
 endif()
 
+# gpu_lz4: host-encoded pages decode on the GPU (the runtime GPU library's
+# ctp_gpu_lz4_decode_launch) to the original bytes; malformed pages fail
+# cleanly. Host code only -- the kernel is in clio_run_cxx_gpu.
+if(CLIO_CORE_ENABLE_CUDA)
+  add_cuda_executable(test_gpu_lz4 FALSE
+    gpu/test_gpu_lz4_gpu.cc
+    INCLUDE_DIRS
+      ${CLIO_RUN_ROOT}/include
+      ${CLIO_RUN_ROOT}/test
+    LINK_LIBS
+      clio_run_cxx
+      clio_run_cxx_gpu
+      ctp::cuda_cxx
+      ${CMAKE_THREAD_LIBS_INIT}
+  )
+  set_target_properties(test_gpu_lz4 PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  add_test(NAME cr_gpu_lz4_cuda COMMAND test_gpu_lz4
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_gpu_lz4_cuda PROPERTIES
+    TIMEOUT 120
+    LABELS "gpu;cuda;compress"
+  )
+endif()
+
 # gpu2cpu ring backpressure: a producer-only kernel that submits far more tasks
 # than `queue_depth` parks inside ring_buffer::Emplace()'s wait-for-space spin.
 # Asserts the CPU consumer still drains every one of them. See the file header
