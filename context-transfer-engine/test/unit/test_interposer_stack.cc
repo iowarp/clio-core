@@ -178,6 +178,9 @@ TEST_CASE("InterposerStack - compressor over replication over core",
         clio::cte::replication::kReplicationPoolId, clio::cte::core::kCtePoolId);
     clio::cte::replication::ReplicationConfig params;
     params.next_pool_id_ = clio::cte::core::kCtePoolId;
+    // One local durable replica (index 1): the default replication_factor
+    // keeps only the primary, and this test inspects the replica.
+    params.num_replicas_ = 1;
     auto create = repl.AsyncCreateReplication(
         clio::run::PoolQuery::Local(),
         clio::cte::replication::kReplicationPoolName,
@@ -227,15 +230,15 @@ TEST_CASE("InterposerStack - compressor over replication over core",
     REQUIRE(get->GetReturnCode() == 0);
     REQUIRE(std::memcmp(got.data(), val.data(), kValSize) == 0);
 
-    // Zero-IPC fast path FUNCTIONAL: the mirror hands out a direct view of
-    // the untransformed primary.
+    // The core is persistent (file tier only: a core may not mix
+    // durability classes), and the zero-IPC view serves only memory-tier
+    // blobs, so it must REFUSE here rather than hand out a view; the task
+    // path above served the bytes. Memory-tier views are covered by the
+    // volatile-core tests (test_cfs_shm_read, test_policy_cache).
     const char *view = nullptr;
     clio::run::u64 view_size = 0, gen = 0;
-    REQUIRE(stack_io.TryGetBlobViewShm(tag_id, "plain_blob", &view,
-                                       &view_size, &gen));
-    REQUIRE(view_size == kValSize);
-    REQUIRE(std::memcmp(view, val.data(), kValSize) == 0);
-    REQUIRE(stack_io.CheckBlobGenShm(tag_id, "plain_blob", gen));
+    REQUIRE_FALSE(stack_io.TryGetBlobViewShm(tag_id, "plain_blob", &view,
+                                             &view_size, &gen));
   }
 
   // ======================================================================

@@ -334,7 +334,7 @@ TEST_CASE("BlobReplicas - REPLICA_FIXED pins a replica against the organizer",
   REQUIRE(std::memcmp(got.data(), replica_val.data(), kValSize) == 0);
 }
 
-TEST_CASE("BlobReplicas - REPLICA_PERSISTENT excludes volatile tiers",
+TEST_CASE("BlobReplicas - REPLICA_PERSISTENT on a persistent core",
           "[cte][replicas][persistence][886]") {
   auto *client = CLIO_CTE_CLIENT;
   REQUIRE(client != nullptr);
@@ -342,18 +342,11 @@ TEST_CASE("BlobReplicas - REPLICA_PERSISTENT excludes volatile tiers",
   clio::cte::core::Tag tag("replica_persist_tag");
   const clio::cte::core::TagId tag_id = tag.GetTagId();
 
-  // A payload bigger than the ONLY non-volatile tier (1MB file): as a plain
-  // replica it lands in RAM; as a PERSISTENT replica it has nowhere legal
-  // to go and the put must fail — proof the flag really excludes the
-  // volatile tier rather than merely preferring the file one.
+  // A core is uniform in durability, so there is no volatile tier for a
+  // PERSISTENT replica to be kept off. A payload bigger than the core's
+  // only tier (1MB file) has nowhere to go and the put must fail cleanly.
   const clio::run::u64 kBig = 4ULL * 1024 * 1024;
   const std::string big(kBig, 'B');
-  {
-    auto fut = client->AsyncPutBlob(tag_id, "persist_blob", 0, kBig,
-                                    big.data(), -1.0f, ReplicaCtx(1));
-    fut.Wait();
-    REQUIRE(fut->GetReturnCode() == 0);
-  }
   {
     clio::cte::core::Context ctx = ReplicaCtx(2);
     ctx.replica_flags_ = clio::cte::core::REPLICA_PERSISTENT;
@@ -364,8 +357,8 @@ TEST_CASE("BlobReplicas - REPLICA_PERSISTENT excludes volatile tiers",
   }
 
   // A small PERSISTENT replica fits the file tier; seed it with a LOW score,
-  // then reorganize it toward the volatile tier's score — the move must
-  // succeed while staying on non-volatile storage (rc 0, bytes intact).
+  // then reorganize it to a high score -- the move must succeed with its
+  // bytes intact.
   const clio::run::u64 kSmall = 64 * 1024;
   const std::string small_val(kSmall, 'S');
   PutTo(client, tag_id, "persist_small", std::string(kSmall, 'p'), 0);
@@ -761,10 +754,6 @@ TEST_CASE("BlobReplicas - snapshot replica layouts restore into a fresh pool",
     y << "targets:\n"
       << "  neighborhood: 1\n"
       << "storage:\n"
-      << "  - path: \"ram::blob_replicas_dram\"\n"
-      << "    bdev_type: \"ram\"\n"
-      << "    capacity_limit: \"64MB\"\n"
-      << "    score: 1.0\n"
       << "  - path: \"" << chi_test_data_dir() + "/blob_replicas_file.dat" << "\"\n"
       << "    bdev_type: \"file\"\n"
       << "    capacity_limit: \"1MB\"\n"
@@ -847,10 +836,12 @@ TEST_CASE("BlobReplicas - legacy type-0 tag snapshot restores into a new pool",
     y << "targets:\n"
       << "  neighborhood: 1\n"
       << "storage:\n"
-      << "  - path: \"ram::legacy_tag_dram\"\n"
-      << "    bdev_type: \"ram\"\n"
+      // A persistent core: a RAM-only core is volatile, runs without a
+      // WAL, and would (correctly) restore nothing.
+      << "  - path: \"" << log_path + ".dat" << "\"\n"
+      << "    bdev_type: \"file\"\n"
       << "    capacity_limit: \"16MB\"\n"
-      << "    score: 1.0\n"
+      << "    persistence_level: \"temporary\"\n"
       << "performance:\n"
       << "  metadata_log_path: " << log_path << "\n";
     cfg.config_ = y.str();

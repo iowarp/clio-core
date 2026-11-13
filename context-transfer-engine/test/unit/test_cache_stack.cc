@@ -190,6 +190,9 @@ TEST_CASE("CacheStack - cache over compressor over replication over core",
         clio::cte::replication::kReplicationPoolId, clio::cte::core::kCtePoolId);
     clio::cte::replication::ReplicationConfig params;
     params.next_pool_id_ = clio::cte::core::kCtePoolId;
+    // One local durable replica (index 1): the default replication_factor
+    // keeps only the primary, and this test inspects the replica.
+    params.num_replicas_ = 1;
     auto create = repl.AsyncCreateReplication(
         clio::run::PoolQuery::Local(),
         clio::cte::replication::kReplicationPoolName,
