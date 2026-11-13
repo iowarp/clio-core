@@ -73,7 +73,7 @@ BUILD_DIR=${BUILD_DIR:-/home/llogan/clio-core/build/fs}
 IO500=${IO500:-/lus/flare/projects/IOWarp/llogan/io500/src/io500}
 DAOS_POOL=${DAOS_POOL:-IOWarp}
 FLARE=${FLARE:-/lus/flare/projects/IOWarp/llogan/io500}
-HERE=/home/llogan/clio-core/benchmarks/io500
+HERE=${HERE:-/home/llogan/clio-core/benchmarks/io500}
 
 # Ask the per-node scripts to tear down and wait at most DOWN_WAIT seconds:
 # at 256 nodes a teardown that never finished held the whole allocation
@@ -378,16 +378,37 @@ if [ "${BENCH:-io500}" = ior ]; then
   # instead of the half hour the metadata phases take.
   IOR=${IOR:-$(dirname "$IO500")/bin/ior}
   mkdir -p "$DATADIR/ior-easy" 2>/dev/null
-  for ph in write read; do
+  # IOR_VARIANTS: "fuse" (through the mount, default) and/or "preload"
+  # (the POSIX interposition adapter: no kernel FUSE, same filesystem client).
+  # STRACE=1: the first rank of each node runs under strace -T (ior_wrap.sh).
+  # After every phase each node's runtime and adapter get SIGUSR1, which
+  # prints the cumulative CLIO_EVLAT report, so phases can be told apart.
+  for v in ${IOR_VARIANTS:-fuse}; do
+   if [ $v = preload ]; then
+    mkdir -p "$DATADIR/ior-easy-pl" 2>/dev/null
+    tgt="clio::/$(basename "$DATADIR")/ior-easy-pl/ior_file_easy"; sfx="-preload"
+    pre="env LD_PRELOAD=$BUILD_DIR/bin/libclio_cte_posix.so CLIO_SERVER_CONF=$LR/clio_server.yaml CLIO_WITH_RUNTIME=0 CLIO_IPC_MODE=SHM CLIO_MEMFD_DIR=$LR/memfd"
+   else
+    tgt="$DATADIR/ior-easy/ior_file_easy"; sfx=""; pre=""
+   fi
+   for ph in write read; do
     [ $ph = write ] && fl="-w" || fl="-r"
     # PROFILE=1: sample thread CPU and stacks on this node during the phase.
     [ "${PROFILE:-0}" = 1 ] && bash "$HERE/sample_stacks.sh" "$OUT/prof_$ph" \
-      "${PROFILE_DELAY:-1}" > /dev/null 2>&1 &
+      "${PROFILE_DELAY:-1}" "${PROFILE_N:-8}" "${PROFILE_GAP:-0.4}" > /dev/null 2>&1 &
+    wrap=""
+    [ "${STRACE:-0}" = 1 ] && wrap="$HERE/ior_wrap.sh $OUT/ior$sfx-$ph $PPN"
     mpiexec -n $(( NN * PPN )) -ppn "$PPN" --cpu-bind depth -d 4 --envall \
-      "$IOR" -g -G 271828 -k -e -o "$DATADIR/ior-easy/ior_file_easy" -C -Q 1 \
-      -t 2m -b "${EASY_MB}m" -F $fl -a POSIX ${IOR_EXTRA:-} > "ior-easy-$ph.txt" 2>&1
+      $wrap $pre "$IOR" -g -G 271828 -k -e -o "$tgt" -C -Q 1 \
+      -t 2m -b "${EASY_MB}m" -F $fl -a POSIX ${IOR_EXTRA:-} > "ior-easy$sfx-$ph.txt" 2>&1
     rc=$?
-    echo "IORCELL tag=${RUN_TAG:-none} nodes=$NN phase=$ph rc=$rc $(grep -E '^(write|read) ' "ior-easy-$ph.txt" | awk '{print "MiB/s=" $2, "open_s=" $7, "io_s=" $8, "close_s=" $9}')"
+    echo "IORCELL tag=${RUN_TAG:-none} variant=$v nodes=$NN phase=$ph rc=$rc $(grep -E '^(write|read) ' "ior-easy$sfx-$ph.txt" | awk '{print "MiB/s=" $2, "open_s=" $7, "io_s=" $8, "close_s=" $9}')"
+    if [ "$MODE" = cliofs ]; then
+      mpiexec -n "$NN" -ppn 1 --cpu-bind none bash -c \
+        'pkill -USR1 -x clio_run; pkill -USR1 -x clio_cte_fuse; true' >/dev/null 2>&1
+      sleep 3
+    fi
+   done
   done
 elif [ "${BENCH:-io500}" = mdtest ]; then
   # BENCH=mdtest: create then delete, for the per-rank-directory layout

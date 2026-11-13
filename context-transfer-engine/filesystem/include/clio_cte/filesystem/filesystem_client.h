@@ -1214,6 +1214,13 @@ class Client : public clio::cte::core::Client {
   /** stat(2): fill *buf for a clio:: path; ENOENT if it does not exist. */
   template <typename StatT>
   int StatPath(const std::string &raw_path, StatT *buf) {
+    // A stat can be the first clio:: call a process makes (IOR stats its
+    // target before opening it), so it must bring the client up itself.
+    if (!EnsureInit()) {
+      std::memset(buf, 0, sizeof(StatT));
+      errno = EIO;
+      return -1;
+    }
     std::string path = StripClioPrefix(raw_path);
     clio::run::u64 size = 0;
     bool exists = false;
