@@ -38,6 +38,8 @@
 #include <climits>
 #include <condition_variable>
 #include <deque>
+#include <map>
+#include <new>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -77,6 +79,7 @@
 #include "clio_cte/stream/stream_client.h"  // deferred O_APPEND
 #include "clio_cte/replication/replication_tasks.h"  // FlushTagTask (fsync barrier)
 #include "fuse_cte_profile.h"  // CLIO_FUSE_PROFILE: per-callback timing
+#include "fuse_readahead.h"  // CLIO_FUSE_READAHEAD_PAGES: detector, windows
 
 // Bridge the POSIX type spellings the callbacks use to the concrete types
 // each platform's FUSE layer expects in `struct fuse_operations`. On Linux
@@ -140,6 +143,10 @@ using namespace clio::cae::fuse;
 // Defined below, outside the anonymous namespace; used by fsync's size step.
 static clio::cte::stream::Client &StreamClient();
 static clio::run::u64 PackTag(const clio::cte::core::TagId &tag);
+// A handle's read-ahead cache (CLIO_FUSE_READAHEAD_PAGES), defined with the
+// read path; RaInit reads the setting at mount.
+struct RaCache;
+static void RaInit();
 // Defined below; used by the closer's background publish on ENOSPC.
 static void ShrinkAfterNoSpace(const std::string &hp,
                                clio::run::u64 first_bad);
@@ -168,6 +175,9 @@ std::atomic<clio::run::u64> g_setattr_epoch{0};
  *  init. When positive, a read through an open handle reuses the size it
  *  last fetched for that long (see ReadClampSize). 0: every read asks. */
 double g_file_attr_ttl_s = 0.0;
+/** Pages kept fetched ahead of a sequential reader per open handle
+ *  (CLIO_FUSE_READAHEAD_PAGES); set at init (RaInit). 0: read-ahead off. */
+clio::run::u32 g_ra_pages = 0;
 
 /** Per-open-file state: the chimod handle + the path it was opened on. */
 struct CfsHandle {
@@ -211,6 +221,9 @@ struct CfsHandle {
   std::atomic<clio::run::u64> rd_size{0};
   std::atomic<int64_t> rd_size_ns{0};  // steady-clock ns when it was fetched
   std::atomic<clio::run::u64> rd_size_epoch{0};  // g_setattr_epoch then
+  // Read-ahead cache (CLIO_FUSE_READAHEAD_PAGES): created by the handle's
+  // first read when read-ahead is on, freed by RaRelease. Null otherwise.
+  std::atomic<RaCache *> ra{nullptr};
 };
 
 // ---------------------------------------------------------------------------
@@ -1956,6 +1969,7 @@ static void *cte_fuse_init(struct fuse_conn_info *conn,
       conn->congestion_threshold = static_cast<unsigned>(v * 3 / 4);
     }
   }
+  RaInit();  // CLIO_FUSE_READAHEAD_PAGES (needs g_file_attr_ttl_s)
   HLOG(kInfo, "clio_cte_fuse: max_write {} max_readahead {} max_background {} "
        "congestion_threshold {}", conn->max_write, conn->max_readahead,
        conn->max_background, conn->congestion_threshold);
@@ -3713,6 +3727,646 @@ static clio::run::u64 PackTag(const clio::cte::core::TagId &tag) {
          static_cast<clio::run::u64>(tag.minor_);
 }
 
+// ============================================================================
+// Sequential read-ahead (CLIO_FUSE_READAHEAD_PAGES)
+// ============================================================================
+//
+// Opt-in. Each open handle that reads a file sequentially (RaSeqDetector,
+// fuse_readahead.h) keeps the page its stream ends in and the next
+// g_ra_pages pages fetched, or in flight, in buffers of its own, so the
+// kernel's next read-ahead request is answered by a memcpy and the fetches
+// of several pages -- each a round trip to another node on a multi-node
+// mount -- overlap. Pages are fetched whole with the same client call the
+// read path uses (AsyncGetBlobDefer), never past the size the read that
+// started them clamped to.
+//
+// What a cached page may be stale against, and how each is bounded:
+//  - writes, appends, truncates and fallocates through THIS mount, on any
+//    handle: never. Each bumps a counter when it is done and before it is
+//    acknowledged (RaInvalidateTag / RaInvalidateAll); a page fetched under
+//    another counter value is not served. A fetch started while the write
+//    was still running carries the old value, so it is dropped too.
+//  - any setattr through this mount (g_setattr_epoch): never, same rule.
+//  - deferred O_APPEND bytes this mount accepted but has not flushed: the
+//    file's stream home merges them on its own schedule, so the cache is
+//    bypassed for that file until they are flushed (RaAppendsPending).
+//  - writes through OTHER nodes: a page is served for at most the file
+//    attribute TTL (CLIO_FUSE_ATTR_CACHE_S) after its fetch was issued --
+//    the same window in which the kernel already serves a stale size. With
+//    that TTL 0 read-ahead is off whatever CLIO_FUSE_READAHEAD_PAGES says.
+//
+// Memory: at most g_ra_pages + 1 page buffers (1 MiB each) per open handle,
+// counting pages whose fetch is still in flight; all freed at release.
+
+/** Slots of the per-file invalidation counters; a file's tag hashes to one
+ *  (two files sharing a slot only invalidate each other needlessly). */
+static constexpr size_t kRaSlots = 1024;
+/** Bumped after every write through this mount to a file of the slot. */
+static std::atomic<clio::run::u64> g_ra_gen[kRaSlots];
+/** Deferred appends accepted through this mount, per slot. */
+static std::atomic<clio::run::u64> g_ra_append_seq[kRaSlots];
+/** The g_ra_append_seq value known merged into the file, per slot. */
+static std::atomic<clio::run::u64> g_ra_append_flushed[kRaSlots];
+/** Bumped after every truncate / fallocate through this mount (any file). */
+static std::atomic<clio::run::u64> g_ra_epoch{0};
+/** 30 s waits a read gives a prefetch before fetching the bytes itself. */
+static constexpr int kRaReadWaitSlices = 4;
+/** 30 s waits release gives a prefetch that is still out. */
+static constexpr int kRaReleaseWaitSlices = 20;
+
+/**
+ * The invalidation slot of a file.
+ * @param tag the file's tag
+ * @return index into the g_ra_* slot arrays
+ */
+static size_t RaSlot(const clio::cte::core::TagId &tag) {
+  return static_cast<size_t>((PackTag(tag) * 0x9E3779B97F4A7C15ull) >> 54);
+}
+
+/**
+ * Drop every read-ahead page of a file, on all handles: called when a write
+ * to it through this mount is done, before the write is acknowledged.
+ * @param tag the file's tag (null: nothing to do)
+ */
+static inline void RaInvalidateTag(const clio::cte::core::TagId &tag) {
+  if (g_ra_pages == 0 || tag.IsNull()) return;
+  g_ra_gen[RaSlot(tag)].fetch_add(1, std::memory_order_seq_cst);
+}
+
+/** Drop every read-ahead page of every file (truncate, fallocate: the file
+ *  is not always known by tag there, and both are rare). */
+static inline void RaInvalidateAll() {
+  if (g_ra_pages == 0) return;
+  g_ra_epoch.fetch_add(1, std::memory_order_seq_cst);
+}
+
+/** Invalidates a file's read-ahead pages when a write op returns, on every
+ *  return path. */
+struct RaTagGuard {
+  clio::cte::core::TagId tag;  ///< the written file
+  /** @param t the written file's tag */
+  explicit RaTagGuard(const clio::cte::core::TagId &t) : tag(t) {}
+  ~RaTagGuard() { RaInvalidateTag(tag); }
+};
+
+/** Invalidates all read-ahead pages when a truncate / fallocate returns. */
+struct RaAllGuard {
+  RaAllGuard() = default;
+  ~RaAllGuard() { RaInvalidateAll(); }
+};
+
+/**
+ * Note a deferred append this mount accepted: until it is flushed the file
+ * changes whenever its stream home merges, so its reads bypass the cache.
+ * @param tag the appended file
+ */
+static inline void RaAppendAccepted(const clio::cte::core::TagId &tag) {
+  if (g_ra_pages == 0) return;
+  g_ra_append_seq[RaSlot(tag)].fetch_add(1, std::memory_order_seq_cst);
+}
+
+/**
+ * Taken BEFORE a flush of a file's deferred appends is sent: every append
+ * counted in it was accepted before the flush, so the flush merges it.
+ * @param tag the file
+ * @return the mark to pass to RaAppendsFlushed
+ */
+static inline clio::run::u64 RaAppendMark(const clio::cte::core::TagId &tag) {
+  if (g_ra_pages == 0) return 0;
+  return g_ra_append_seq[RaSlot(tag)].load(std::memory_order_seq_cst);
+}
+
+/**
+ * A flush of a file's deferred appends succeeded: the appends up to `mark`
+ * are in the file, which changed -- drop its pages.
+ * @param tag the file
+ * @param mark RaAppendMark taken before the flush was sent
+ */
+static inline void RaAppendsFlushed(const clio::cte::core::TagId &tag,
+                                    clio::run::u64 mark) {
+  if (g_ra_pages == 0) return;
+  std::atomic<clio::run::u64> &flushed = g_ra_append_flushed[RaSlot(tag)];
+  clio::run::u64 cur = flushed.load(std::memory_order_seq_cst);
+  while (cur < mark && !flushed.compare_exchange_weak(cur, mark)) {
+  }
+  RaInvalidateTag(tag);
+}
+
+/**
+ * Whether deferred appends accepted through this mount may still be
+ * unmerged for a file of this slot.
+ * @param slot the file's slot (RaSlot)
+ * @return true when the cache must be bypassed
+ */
+static inline bool RaAppendsPending(size_t slot) {
+  return g_ra_append_seq[slot].load(std::memory_order_seq_cst) !=
+         g_ra_append_flushed[slot].load(std::memory_order_seq_cst);
+}
+
+/** What a page was fetched under; it is served only while all still hold. */
+struct RaToken {
+  clio::run::u64 gen = 0;      ///< g_ra_gen of the file's slot
+  clio::run::u64 setattr = 0;  ///< g_setattr_epoch
+  clio::run::u64 epoch = 0;    ///< g_ra_epoch
+  /** @return whether both tokens name the same state */
+  bool operator==(const RaToken &o) const {
+    return gen == o.gen && setattr == o.setattr && epoch == o.epoch;
+  }
+};
+
+/**
+ * The current invalidation state of a slot.
+ * @param slot the file's slot
+ * @return the token a page fetched now would carry
+ */
+static RaToken RaTokenNow(size_t slot) {
+  RaToken t;
+  t.gen = g_ra_gen[slot].load(std::memory_order_seq_cst);
+  t.setattr = g_setattr_epoch.load(std::memory_order_seq_cst);
+  t.epoch = g_ra_epoch.load(std::memory_order_seq_cst);
+  return t;
+}
+
+/** @return steady-clock nanoseconds */
+static int64_t RaNowNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+/** One page of a handle's read-ahead cache. Guarded by RaCache::mu, except
+ *  `fut` and the bytes of `buf`, which belong to whoever holds the page in
+ *  kIssuing / kWaiting until it leaves that state. */
+struct RaPage {
+  enum class State {
+    kIssuing,   ///< a thread is sending the fetch (no future yet)
+    kInFlight,  ///< fetch sent; nobody is waiting on it
+    kWaiting,   ///< a thread is waiting on the fetch
+    kReady,     ///< buf holds the page's first `len` bytes
+    kFailed     ///< the fetch failed: never served
+  };
+  clio::run::u64 page = 0;  ///< page number
+  clio::run::u64 len = 0;   ///< bytes fetched: RaPageLen at issue
+  std::unique_ptr<char[]> buf;  ///< kFsPageSize bytes; zeros past the data
+  clio::run::Future<clio::cte::core::GetBlobTask> fut;  ///< the fetch
+  State state = State::kIssuing;
+  int pins = 0;         ///< threads using the page: it is not freed
+  bool in_map = false;  ///< still in RaCache::pages (else a zombie)
+  RaToken token;        ///< invalidation state when the fetch was issued
+  int64_t issued_ns = 0;  ///< RaNowNs when the fetch was issued
+};
+
+/** The read-ahead cache of one open handle. */
+struct RaCache {
+  std::mutex mu;  ///< guards everything below; never held across a fetch
+  std::condition_variable cv;  ///< a page left kIssuing / kWaiting / a pin
+  size_t slot = 0;             ///< the file's invalidation slot
+  RaSeqDetector seq;           ///< this handle's stream
+  std::map<clio::run::u64, std::unique_ptr<RaPage>> pages;  ///< by page no.
+  /// Pages dropped from `pages` whose buffer cannot be reused yet: pinned,
+  /// or their fetch is still out (the runtime may yet write the buffer).
+  std::vector<std::unique_ptr<RaPage>> zombies;
+  std::vector<std::unique_ptr<char[]>> free_bufs;  ///< buffers not in use
+  clio::run::u32 allocated = 0;  ///< buffers that exist (<= g_ra_pages + 1)
+};
+
+/**
+ * Whether a page may still be served: nothing invalidated it and it is
+ * younger than the file attribute TTL.
+ * @param c the cache (mu held)
+ * @param pg the page
+ * @param now_ns RaNowNs
+ * @return true when the page's bytes are current enough to serve
+ */
+static bool RaPageValid(const RaCache &c, const RaPage &pg, int64_t now_ns) {
+  return pg.token == RaTokenNow(c.slot) &&
+         static_cast<double>(now_ns - pg.issued_ns) < g_file_attr_ttl_s * 1e9;
+}
+
+/**
+ * Whether a page's buffer can be reused now: nobody uses the page and its
+ * fetch is over (a completed fetch nobody waited on is simply dropped).
+ * @param pg the page (cache mu held)
+ * @return true when the page can be freed
+ */
+static bool RaPageIdle(const RaPage &pg) {
+  if (pg.pins != 0) return false;
+  if (pg.state == RaPage::State::kReady || pg.state == RaPage::State::kFailed) {
+    return true;
+  }
+  return pg.state == RaPage::State::kInFlight && pg.fut.IsComplete();
+}
+
+/**
+ * Free an idle page: its buffer goes back to the cache's free list.
+ * @param c the cache (mu held)
+ * @param pg the page (RaPageIdle)
+ */
+static void RaFreePageLocked(RaCache &c, std::unique_ptr<RaPage> pg) {
+  std::unique_ptr<char[]> buf = std::move(pg->buf);
+  pg.reset();  // the fetch's future goes first: it is complete
+  c.free_bufs.push_back(std::move(buf));
+}
+
+/**
+ * Take a page out of the cache: freed now if idle, else kept as a zombie
+ * until its fetch completes and its users are gone.
+ * @param c the cache (mu held)
+ * @param it the page's entry in c.pages
+ */
+static void RaRetireLocked(
+    RaCache &c,
+    std::map<clio::run::u64, std::unique_ptr<RaPage>>::iterator it) {
+  std::unique_ptr<RaPage> pg = std::move(it->second);
+  c.pages.erase(it);
+  pg->in_map = false;
+  if (RaPageIdle(*pg)) {
+    RaFreePageLocked(c, std::move(pg));
+  } else {
+    c.zombies.push_back(std::move(pg));
+  }
+}
+
+/**
+ * Take `pg` out of the cache if it is still in it.
+ * @param c the cache (mu held)
+ * @param pg a pinned page of c
+ */
+static void RaRetirePageLocked(RaCache &c, RaPage *pg) {
+  if (!pg->in_map) return;
+  auto it = c.pages.find(pg->page);
+  if (it != c.pages.end() && it->second.get() == pg) RaRetireLocked(c, it);
+}
+
+/**
+ * Free every zombie that became idle.
+ * @param c the cache (mu held)
+ */
+static void RaReapLocked(RaCache &c) {
+  for (size_t i = 0; i < c.zombies.size();) {
+    if (RaPageIdle(*c.zombies[i])) {
+      std::unique_ptr<RaPage> pg = std::move(c.zombies[i]);
+      c.zombies[i] = std::move(c.zombies.back());
+      c.zombies.pop_back();
+      RaFreePageLocked(c, std::move(pg));
+    } else {
+      ++i;
+    }
+  }
+}
+
+/**
+ * Take every page out of the cache (a non-sequential read, release).
+ * @param c the cache (mu held)
+ */
+static void RaRetireAllLocked(RaCache &c) {
+  while (!c.pages.empty()) RaRetireLocked(c, c.pages.begin());
+}
+
+/**
+ * Drop a pin. `pg` may be freed by this call.
+ * @param c the cache (mu held)
+ * @param pg the pinned page
+ */
+static void RaUnpinLocked(RaCache &c, RaPage *pg) {
+  if (--pg->pins == 0 && !pg->in_map) {
+    RaReapLocked(c);
+    c.cv.notify_all();
+  }
+}
+
+/**
+ * A buffer for a new page, within the handle's budget of g_ra_pages + 1:
+ * a free one, a new one, or that of the lowest idle page outside `keep`.
+ * @param c the cache (mu held)
+ * @param keep the pages wanted now (never evicted)
+ * @return the buffer, or null when the budget is used by pages in use
+ */
+static std::unique_ptr<char[]> RaTakeBufLocked(RaCache &c,
+                                               const RaWindow &keep) {
+  if (c.free_bufs.empty() && c.allocated < g_ra_pages + 1) {
+    char *raw = new (std::nothrow) char[clio::cte::filesystem::kFsPageSize];
+    if (raw == nullptr) return nullptr;
+    ++c.allocated;
+    return std::unique_ptr<char[]>(raw);
+  }
+  if (c.free_bufs.empty()) {
+    for (auto it = c.pages.begin(); it != c.pages.end(); ++it) {
+      if (!keep.Has(it->first) && RaPageIdle(*it->second)) {
+        RaRetireLocked(c, it);
+        break;
+      }
+    }
+  }
+  if (c.free_bufs.empty()) return nullptr;
+  std::unique_ptr<char[]> buf = std::move(c.free_bufs.back());
+  c.free_bufs.pop_back();
+  return buf;
+}
+
+/**
+ * Wait for a page's fetch. The caller owns the wait (page in kWaiting,
+ * pinned) and holds no lock.
+ * @param h the open file (for the log)
+ * @param pg the page
+ * @param slices 30 s waits to give it
+ * @param rc out: the fetch's return code when it completed
+ * @return true when the fetch completed, false when it is still out
+ */
+static bool RaAwaitFetch(CfsHandle *h, RaPage *pg, int slices, int *rc) {
+  for (int slice = 1; !pg->fut.Wait(30.0f); ++slice) {
+    HLOG(kWarning, "clio_cte_fuse: read-ahead of tag {}.{} page {} (len {}) "
+         "still outstanding after {} wait(s) of 30 s", h->tag.major_,
+         h->tag.minor_, pg->page, pg->len, slice);
+    if (slice >= slices) return false;
+  }
+  *rc = static_cast<int>(pg->fut->GetReturnCode());
+  return true;
+}
+
+/**
+ * Bring a pinned page to rest: wait for its fetch -- as the one waiter, or
+ * for the thread that already is -- so no second fetch of it is issued.
+ * @param c the cache
+ * @param h the open file
+ * @param pg the pinned page
+ * @param lk c.mu, held on entry and return, released while waiting
+ * @return true when the page is kReady (its bytes can be copied)
+ */
+static bool RaSettleLocked(RaCache &c, CfsHandle *h, RaPage *pg,
+                           std::unique_lock<std::mutex> &lk) {
+  namespace ev = clio::run::evlat;
+  using State = RaPage::State;
+  if (pg->state == State::kReady || pg->state == State::kFailed) {
+    return pg->state == State::kReady;
+  }
+  const unsigned long long ev_t0 = ev::Now();
+  bool out = false;  // our wait gave up with the fetch still out
+  while (!out && pg->state != State::kReady && pg->state != State::kFailed) {
+    if (pg->state == State::kInFlight) {
+      pg->state = State::kWaiting;
+      lk.unlock();
+      int rc = -1;
+      const bool done = RaAwaitFetch(h, pg, kRaReadWaitSlices, &rc);
+      lk.lock();
+      // 0 = read, 1 = a hole (the zeroed buffer is the answer), as in the
+      // uncached read; anything else is not served from here.
+      pg->state = !done ? State::kInFlight
+                        : (rc == 0 || rc == 1) ? State::kReady
+                                               : State::kFailed;
+      out = !done;
+      c.cv.notify_all();
+    } else {
+      c.cv.wait(lk, [pg] {
+        return pg->state != State::kWaiting && pg->state != State::kIssuing;
+      });
+    }
+  }
+  ev::Span(ev::kRaWait, ev_t0, ev::Now());
+  return pg->state == State::kReady;
+}
+
+/**
+ * Serve one page part of a read from the handle's read-ahead cache: copy it
+ * if the page is cached, waiting for its fetch if that is in flight. On any
+ * doubt (stale, too short, failed) the page is dropped and the caller
+ * fetches the part the normal way.
+ * @param c the handle's cache (RaPrepare)
+ * @param h the open file
+ * @param cur file offset of the part
+ * @param page_off its offset inside its page
+ * @param n its length
+ * @param dst where the bytes go
+ * @return true when dst holds the part
+ */
+static bool RaServe(RaCache *c, CfsHandle *h, clio::run::u64 cur,
+                    clio::run::u64 page_off, clio::run::u64 n, char *dst) {
+  namespace ev = clio::run::evlat;
+  std::unique_lock<std::mutex> lk(c->mu);
+  const bool active = c->seq.Active();
+  RaPage *pg = nullptr;
+  auto it = c->pages.find(cur / clio::cte::filesystem::kFsPageSize);
+  if (it != c->pages.end()) {
+    if (RaPageValid(*c, *it->second, RaNowNs()) &&
+        it->second->state != RaPage::State::kFailed &&
+        RaCovers(it->second->len, page_off, n)) {
+      pg = it->second.get();
+    } else {
+      RaRetireLocked(*c, it);
+    }
+  }
+  if (pg == nullptr) {
+    if (active) ev::Count(ev::kRaMiss, 1);
+    return false;
+  }
+  ++pg->pins;
+  const bool ok = RaSettleLocked(*c, h, pg, lk);
+  if (ok) {
+    lk.unlock();
+    std::memcpy(dst, pg->buf.get() + page_off, n);
+    lk.lock();
+  } else {
+    RaRetirePageLocked(*c, pg);
+  }
+  RaUnpinLocked(*c, pg);
+  if (ok) {
+    ev::Count(ev::kRaHit, 1);
+  } else if (active) {
+    ev::Count(ev::kRaMiss, 1);
+  }
+  return ok;
+}
+
+/**
+ * Start the fetch of one page into the cache. The page is entered first
+ * (kIssuing) so a concurrent reader waits for it instead of fetching it
+ * again, and its token is taken before the fetch is sent.
+ * @param c the cache
+ * @param h the open file
+ * @param page page number (not in c.pages)
+ * @param len bytes to fetch (RaPageLen)
+ * @param buf the page's buffer
+ * @param lk c.mu, held on entry and return, released while sending
+ */
+static void RaIssueLocked(RaCache &c, CfsHandle *h, clio::run::u64 page,
+                          clio::run::u64 len, std::unique_ptr<char[]> buf,
+                          std::unique_lock<std::mutex> &lk) {
+  auto owned = std::make_unique<RaPage>();
+  RaPage *pg = owned.get();
+  pg->page = page;
+  pg->len = len;
+  pg->buf = std::move(buf);
+  pg->pins = 1;
+  pg->in_map = true;
+  pg->token = RaTokenNow(c.slot);
+  pg->issued_ns = RaNowNs();
+  c.pages[page] = std::move(owned);
+  lk.unlock();
+  // Holes and short pages read as zeros, as in the uncached read.
+  std::memset(pg->buf.get(), 0, len);
+  auto fut = CLIO_CTE_CLIENT->AsyncGetBlobDefer(
+      h->tag,
+      clio::cte::filesystem::PageName(page *
+                                      clio::cte::filesystem::kFsPageSize),
+      0, len, pg->buf.get());
+  lk.lock();
+  if (fut.IsNull()) {
+    pg->state = RaPage::State::kFailed;  // no staging memory: not sent
+    RaRetirePageLocked(c, pg);
+  } else {
+    pg->fut = std::move(fut);
+    pg->state = RaPage::State::kInFlight;
+  }
+  c.cv.notify_all();
+  RaUnpinLocked(c, pg);
+}
+
+/**
+ * Make sure the pages of `w` are cached or being fetched, as far as the
+ * handle's buffer budget allows. Does not wait for any fetch.
+ * @param c the cache
+ * @param h the open file
+ * @param w the pages wanted
+ * @param fsize the size this read clamps to
+ * @param lk c.mu, held on entry and return
+ */
+static void RaEnsureAhead(RaCache &c, CfsHandle *h, const RaWindow &w,
+                          clio::run::u64 fsize,
+                          std::unique_lock<std::mutex> &lk) {
+  if (w.Empty()) return;
+  const int64_t now_ns = RaNowNs();
+  for (auto it = c.pages.begin(); it != c.pages.end();) {
+    auto cur = it++;
+    if (!RaPageValid(c, *cur->second, now_ns)) RaRetireLocked(c, cur);
+  }
+  RaReapLocked(c);
+  for (clio::run::u64 q = w.first; q <= w.last; ++q) {
+    if (c.pages.count(q) != 0) continue;
+    const clio::run::u64 len =
+        RaPageLen(q, fsize, clio::cte::filesystem::kFsPageSize);
+    if (len == 0) break;
+    std::unique_ptr<char[]> buf = RaTakeBufLocked(c, w);
+    if (buf == nullptr) break;
+    RaIssueLocked(c, h, q, len, std::move(buf), lk);
+  }
+}
+
+/**
+ * The handle's read-ahead cache, created at its first read.
+ * @param h the open file (tag set)
+ * @return the cache
+ */
+static RaCache *RaCacheOf(CfsHandle *h) {
+  RaCache *c = h->ra.load(std::memory_order_acquire);
+  if (c != nullptr) return c;
+  auto *fresh = new RaCache();
+  fresh->slot = RaSlot(h->tag);
+  if (h->ra.compare_exchange_strong(c, fresh, std::memory_order_acq_rel)) {
+    return fresh;
+  }
+  delete fresh;  // another reader of this handle created it
+  return c;
+}
+
+/**
+ * Read-ahead step of a read: classify it against the handle's stream and,
+ * when the stream is sequential, start fetching the pages ahead of it.
+ * @param h the open file (tag set)
+ * @param off the read's offset (inside the file)
+ * @param want the read's clamped length (> 0)
+ * @param fsize the size the read clamps to
+ * @return the cache to serve the read's page parts from, or null when the
+ *         read must take the normal path for all of them
+ */
+static RaCache *RaPrepare(CfsHandle *h, clio::run::u64 off,
+                          clio::run::u64 want, clio::run::u64 fsize) {
+  RaCache *c = RaCacheOf(h);
+  std::unique_lock<std::mutex> lk(c->mu);
+  const RaSeq cls =
+      c->seq.Observe(off, want, clio::cte::filesystem::kFsPageSize);
+  if (cls == RaSeq::kRandom || RaAppendsPending(c->slot)) {
+    RaRetireAllLocked(*c);
+    RaReapLocked(*c);
+    return nullptr;
+  }
+  if (cls == RaSeq::kSequential && c->seq.Active()) {
+    RaEnsureAhead(*c, h,
+                  RaWindowFor(c->seq.End(), fsize, g_ra_pages,
+                              clio::cte::filesystem::kFsPageSize),
+                  fsize, lk);
+  }
+  return c;
+}
+
+/**
+ * Free a handle's read-ahead cache at release. A fetch still out is waited
+ * for: its buffer and future must outlive it. One that does not complete
+ * within kRaReleaseWaitSlices is abandoned WITH its buffer (leaked, logged)
+ * rather than freed under a runtime that may still write it.
+ * @param h the handle being released
+ */
+static void RaRelease(CfsHandle *h) {
+  RaCache *c = h->ra.exchange(nullptr, std::memory_order_acq_rel);
+  if (c == nullptr) return;
+  std::unique_lock<std::mutex> lk(c->mu);
+  RaRetireAllLocked(*c);
+  for (;;) {
+    RaReapLocked(*c);
+    if (c->zombies.empty()) break;
+    RaPage *pg = c->zombies.back().get();
+    if (pg->state != RaPage::State::kInFlight || pg->pins != 0) {
+      // In another thread's hands (not expected at release): it notifies.
+      c->cv.wait_for(lk, std::chrono::milliseconds(100));
+      continue;
+    }
+    pg->state = RaPage::State::kWaiting;
+    lk.unlock();
+    int rc = 0;
+    const bool done = RaAwaitFetch(h, pg, kRaReleaseWaitSlices, &rc);
+    lk.lock();
+    if (done) {
+      pg->state = RaPage::State::kReady;
+      continue;
+    }
+    HLOG(kError, "clio_cte_fuse: read-ahead of tag {}.{} page {} never "
+         "completed; abandoning its {} byte buffer", h->tag.major_,
+         h->tag.minor_, pg->page, clio::cte::filesystem::kFsPageSize);
+    for (auto &z : c->zombies) {
+      if (z.get() == pg) {
+        (void)z.release();
+        z = std::move(c->zombies.back());
+        c->zombies.pop_back();
+        break;
+      }
+    }
+  }
+  lk.unlock();
+  delete c;
+}
+
+/**
+ * Read CLIO_FUSE_READAHEAD_PAGES at mount (after the file attribute TTL is
+ * known): read-ahead needs that TTL, which bounds how stale a cached page
+ * can be against writes on other nodes.
+ */
+static void RaInit() {
+  g_ra_pages = RaParsePages(getenv("CLIO_FUSE_READAHEAD_PAGES"));
+  if (g_ra_pages == 0) return;
+  if (g_file_attr_ttl_s <= 0.0) {
+    HLOG(kWarning, "clio_cte_fuse: CLIO_FUSE_READAHEAD_PAGES={} ignored: the "
+         "file attribute TTL is 0 (CLIO_FUSE_ATTR_CACHE_S; the default on a "
+         "multi-node mount), and a read-ahead page is only served while "
+         "younger than that TTL", g_ra_pages);
+    g_ra_pages = 0;
+    return;
+  }
+  HLOG(kInfo, "clio_cte_fuse: sequential read-ahead on: {} page(s) of {} "
+       "bytes ahead per open handle (at most {} buffered), each served for "
+       "at most {} ms after its fetch", g_ra_pages,
+       clio::cte::filesystem::kFsPageSize, g_ra_pages + 1,
+       g_file_attr_ttl_s * 1000.0);
+}
+
 static std::mutex g_unmerged_mu;  ///< guards g_unmerged_appends
 /** Files with deferred appends this node accepted that may be unmerged. */
 static std::set<clio::run::u64> g_unmerged_appends;
@@ -3727,6 +4381,7 @@ static std::set<clio::run::u64> g_unmerged_appends;
 static int FlushAppends(CfsHandle *handle, const std::string &hp) {
   if (!handle->appended.exchange(false)) return 0;
   const clio::run::u64 packed = PackTag(handle->tag);
+  const clio::run::u64 ra_mark = RaAppendMark(handle->tag);
   {
     // The flush merges every append accepted before it, from any handle;
     // one accepted later registers again once its write returns.
@@ -3741,6 +4396,7 @@ static int FlushAppends(CfsHandle *handle, const std::string &hp) {
     g_unmerged_appends.insert(packed);
     return -EIO;
   }
+  RaAppendsFlushed(handle->tag, ra_mark);  // the merge changed the file
   if (handle->fh == 0) EnsureCreated(hp);
   auto t = CLIO_CFS_CLIENT->AsyncAdvanceSize(packed, f->size_);
   t.Wait();
@@ -3760,6 +4416,7 @@ static int DeferredAppend(CfsHandle *handle, const char *buf, size_t size) {
   const clio::run::u32 rc = StreamClient().Append(
       handle->tag, clio::cte::filesystem::FsIdHome(packed), buf, size);
   if (rc != 0) return -EIO;
+  RaAppendAccepted(handle->tag);  // reads bypass read-ahead until flushed
   handle->appended.store(true);
   {
     std::lock_guard<std::mutex> g(g_unmerged_mu);
@@ -3782,10 +4439,14 @@ static int MergeAppendsBeforeTruncate(const clio::cte::core::TagId &tag) {
     std::lock_guard<std::mutex> g(g_unmerged_mu);
     if (g_unmerged_appends.erase(packed) == 0) return 0;
   }
+  const clio::run::u64 ra_mark = RaAppendMark(tag);
   auto f = StreamClient().AsyncFlush(tag,
                                      clio::cte::filesystem::FsIdHome(packed));
   f.Wait();
-  if (f->GetReturnCode() == 0) return 0;
+  if (f->GetReturnCode() == 0) {
+    RaAppendsFlushed(tag, ra_mark);  // the merge changed the file
+    return 0;
+  }
   HLOG(kError, "clio_cte_fuse: appends to {}.{} could not be merged before "
        "a truncate (rc {})", tag.major_, tag.minor_, f->GetReturnCode());
   std::lock_guard<std::mutex> g(g_unmerged_mu);
@@ -4077,6 +4738,7 @@ int cte_fuse_release(const char *path, struct fuse_file_info *fi) {
     }
   }
   UnregisterOpenFile(handle);
+  RaRelease(handle);  // waits out read-ahead fetches still in flight
   delete handle;
   fi->fh = 0;
   return rc;
@@ -4195,6 +4857,9 @@ int cte_fuse_read(const char *path, char *buf, size_t size,
     if (off >= fsize) return 0;
     clio::run::u64 want = std::min<clio::run::u64>(size, fsize - off);
     std::memset(buf, 0, want);  // holes / short pages read as zeros
+    // Sequential read-ahead (CLIO_FUSE_READAHEAD_PAGES; off: one check).
+    RaCache *ra = g_ra_pages != 0 ? RaPrepare(handle, off, want, fsize)
+                                  : nullptr;
     clio::run::u64 done = 0;
     clio::run::u64 ev_pages = 0;
     while (done < want) {
@@ -4202,6 +4867,10 @@ int cte_fuse_read(const char *path, char *buf, size_t size,
       clio::run::u64 page_off = cur % clio::cte::filesystem::kFsPageSize;
       clio::run::u64 n = std::min<clio::run::u64>(
           clio::cte::filesystem::kFsPageSize - page_off, want - done);
+      if (ra != nullptr && RaServe(ra, handle, cur, page_off, n, buf + done)) {
+        done += n;  // answered from the handle's read-ahead cache
+        continue;
+      }
       const unsigned long long ev_pg0 = ev::Now();
       ++ev_pages;
       // A page sent to its owner just before the owner was declared dead
@@ -4318,6 +4987,9 @@ int cte_fuse_write(const char *path, const char *buf, size_t size,
   if (size > static_cast<size_t>(INT_MAX))
     size = static_cast<size_t>(INT_MAX);
   if (size == 0) return 0;
+  // Read-ahead pages of this file (any handle) are dropped when this write
+  // is done, on every return path below, before it is acknowledged.
+  RaTagGuard ra_guard(handle->tag);
   handle->wrote.store(true, std::memory_order_relaxed);
   handle->open_attr_ok.store(false, std::memory_order_relaxed);
   {
@@ -4430,6 +5102,7 @@ int cte_fuse_unlink(const char *path) {
 int cte_fuse_truncate(const char *path_in, cte_off_t size,
                              struct fuse_file_info *fi) {
   g_setattr_epoch.fetch_add(1);  // attributes kept from a create are stale
+  RaAllGuard ra_guard;  // read-ahead pages are dropped again once it is done
   // ftruncate of an open file with no name left (hard_remove) truncates it
   // by its inode key -- common for unlinked temp files (databases).
   const std::string path_s = OpPath(path_in, fi);
@@ -4563,6 +5236,7 @@ static clio::run::u64 StoreRemainingBytes() {
 static int cte_fuse_fallocate(const char *path, int mode, cte_off_t offset,
                               cte_off_t length, struct fuse_file_info *fi) {
   g_setattr_epoch.fetch_add(1);  // attributes kept from a create are stale
+  RaAllGuard ra_guard;  // read-ahead pages are dropped again once it is done
   const int kSupportedModes = FALLOC_FL_KEEP_SIZE | FALLOC_FL_ZERO_RANGE;
   if (mode & ~kSupportedModes) {
     return -EOPNOTSUPP;  // punch/collapse/insert: layout-changing
