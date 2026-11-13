@@ -320,3 +320,25 @@ again.
 - Fill default: `on_read_miss`. `on_hit_count:N` is implemented for large
   one-pass scans.
 - Replication stays under `next_persistent` only.
+
+### 6.5 The cores are disconnected; the cache module does everything
+- The volatile and persistent cores never reference each other. Neither has
+  a next pool, and neither flushes, fills or falls back on its own.
+- The volatile core answers only for what it holds: a get or size query for
+  a blob it does not have fails, and the cache then goes to the persistent
+  chain.
+- The cache module owns all policy state:
+  - the dirty map (which volatile copies are newer than persistent), with a
+    write generation per copy so a flush racing a write never marks newer
+    bytes clean;
+  - eviction: it picks victims (LRU/LFU) and removes them with an ordinary
+    `DelBlob` on the volatile core, flushing a dirty victim first;
+  - flushing (periodic, `SyncTag`, `FlushData`, stop, before evict) and the
+    volatile-full fallback of 6.3.
+- The cache reaches the volatile core only through the normal core client
+  (`AsyncPutBlob` / `AsyncGetBlob` / `AsyncDelBlob` with
+  `PoolQuery::Local()`), never by running tasks inline on its container.
+  The persistent side stays the interposer's single next pool, so every verb
+  the cache does not handle is forwarded there unchanged.
+- The core's `FlushData` keeps the meaning of 6.2: sync devices and the
+  WAL. It does not move data to any other pool.
