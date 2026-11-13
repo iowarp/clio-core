@@ -1940,6 +1940,25 @@ static void *cte_fuse_init(struct fuse_conn_info *conn,
   if (conn->max_write < (1u << 20)) {
     conn->max_write = 1u << 20;
   }
+  // Read-ahead concurrency. The kernel sends read-ahead as "background"
+  // requests and allows only max_background of them in flight per mount
+  // (libfuse default 12), so with many readers each read is effectively one
+  // synchronous round trip. CLIO_FUSE_MAX_BACKGROUND raises that limit (the
+  // congestion threshold follows at 3/4). Unset: the libfuse default, as
+  // before. Measured with 256, DRAM only, ior-easy-read: 2 nodes 9.0 -> 12.0
+  // GiB/s, 8 nodes 24.3 -> 32.2 GiB/s; reads arrive as full 512 KiB requests
+  // instead of ~280 KiB fragments. Asking for a larger read-ahead window
+  // (conn->max_readahead) has no effect: the kernel keeps its own 512 KiB.
+  if (const char *bg = getenv("CLIO_FUSE_MAX_BACKGROUND")) {
+    const int v = atoi(bg);
+    if (v > 0) {
+      conn->max_background = static_cast<unsigned>(v);
+      conn->congestion_threshold = static_cast<unsigned>(v * 3 / 4);
+    }
+  }
+  HLOG(kInfo, "clio_cte_fuse: max_write {} max_readahead {} max_background {} "
+       "congestion_threshold {}", conn->max_write, conn->max_readahead,
+       conn->max_background, conn->congestion_threshold);
 
   // This adapter always creates directories explicitly (mkdir plants the
   // marker), so the chimod's implicit-dir child scan — the costliest part
