@@ -71,10 +71,12 @@ class DfsFile;
  * owns. Underneath, a DFS file IS a DAOS array with 1-byte cells and the
  * configured chunk size, so the data path is the same.
  *
- * I/O never blocks a runtime worker: each request is submitted with a DAOS
- * event on the calling worker's event queue and the task coroutine yields
- * until a non-blocking daos_eq_poll reports the event complete -- the same
- * shape as FsBdevTransport's AsyncIO submit / IsComplete / yield loop.
+ * I/O never blocks a runtime worker, and a worker never calls DAOS: the task
+ * coroutine hands each request to one of the process's dedicated DAOS I/O
+ * threads (daosio::IoThread; io_threads option / CLIO_DAOS_IO_THREADS) and
+ * yields until the request's done flag is set. Each I/O thread owns one DAOS
+ * event queue, issues the dfs_write / dfs_read on it and reaps it. When every
+ * I/O thread is at its bound the coroutine yields until there is room.
  *
  * Capacity is the configured size (capacity_limit); DAOS allocates space as
  * data is written, so nothing is preallocated. A DAOS update is durable when
@@ -127,7 +129,8 @@ class DaosBdevTransport : public BdevTransport {
 
   /**
    * Write the task's data to its blocks (one asynchronous dfs_write per
-   * block, awaited without blocking the worker).
+   * block, issued by a DAOS I/O thread and awaited without blocking the
+   * worker).
    * @param task the write task
    * @return coroutine handle
    */
@@ -135,8 +138,9 @@ class DaosBdevTransport : public BdevTransport {
       ctp::ipc::FullPtr<WriteTask> task) override;
 
   /**
-   * Read the task's blocks (one asynchronous dfs_read per block, awaited
-   * without blocking the worker). Blocks that were allocated but never
+   * Read the task's blocks (one asynchronous dfs_read per block, issued by
+   * a DAOS I/O thread and awaited without blocking the worker). Blocks that
+   * were allocated but never
    * written read as zeros: the destination is zeroed before the read unless
    * the path says prezero=0, and bytes past the end of the file are zeroed
    * after it.
@@ -167,8 +171,9 @@ class DaosBdevTransport : public BdevTransport {
  private:
   /** Allocator-log flush period of the sync thread, in milliseconds. */
   static constexpr int kAllocLogSyncPeriodMs = 50;
-  /** How long a waiting task sleeps between completion polls, in
-   *  microseconds (the value FsBdevTransport uses). */
+  /** How long a waiting task sleeps between checks of its request's done
+   *  flag (and between attempts to queue it when the I/O threads are full),
+   *  in microseconds (the value FsBdevTransport uses). */
   static constexpr double kPollYieldUs = 10.0;
 
   /**

@@ -62,6 +62,10 @@ namespace clio::run::bdev {
  *               zeros whether or not the DAOS client fills holes itself.
  *               0 skips that pass over the buffer; use it only on a DAOS
  *               version known to return zeros for holes.
+ *   io_threads  Number of dedicated DAOS I/O threads of the process, 1..64.
+ *               Default: CLIO_DAOS_IO_THREADS, else 4. The threads are shared
+ *               by all DAOS devices of a process, so only the first device
+ *               opened decides the count.
  */
 struct DaosBdevPath {
   std::string pool_;       /**< Pool label or UUID string. */
@@ -72,11 +76,14 @@ struct DaosBdevPath {
   std::string oclass_;     /**< Object class name; empty = container default. */
   std::string alloc_log_;  /**< Local allocator-log path; empty = none. */
   bool prezero_ = true;    /**< Zero the destination before each read. */
+  uint32_t io_threads_ = 0; /**< DAOS I/O threads; 0 = environment/default. */
 
   /** Default DFS chunk size: 1 MiB. */
   static constexpr uint64_t kDefaultChunkSize = uint64_t(1) << 20;
   /** URI scheme of a DAOS bdev pool name. */
   static constexpr const char *kScheme = "daos://";
+  /** Largest accepted io_threads value. */
+  static constexpr uint32_t kMaxIoThreads = 64;
 
   /**
    * The file's path inside the container, for messages.
@@ -170,11 +177,36 @@ struct DaosBdevPath {
         return false;
       }
       prezero_ = (value == "1");
+    } else if (key == "io_threads") {
+      return ApplyIoThreads(value, error);
     } else {
       *error = "unknown option '" + key +
-               "' (expected chunk_size, oclass, alloc_log or prezero)";
+               "' (expected chunk_size, oclass, alloc_log, prezero or "
+               "io_threads)";
       return false;
     }
+    return true;
+  }
+
+  /**
+   * Apply the io_threads option.
+   * @param value the option value
+   * @param error out: why the value was rejected
+   * @return false unless the value is an integer in 1..kMaxIoThreads
+   */
+  bool ApplyIoThreads(const std::string &value, std::string *error) {
+    uint32_t n = 0;
+    bool ok = !value.empty() && value.size() <= 2;
+    for (size_t i = 0; ok && i < value.size(); ++i) {
+      ok = value[i] >= '0' && value[i] <= '9';
+      n = n * 10 + static_cast<uint32_t>(value[i] - '0');
+    }
+    if (!ok || n == 0 || n > kMaxIoThreads) {
+      *error = "io_threads '" + value + "' must be an integer from 1 to " +
+               std::to_string(kMaxIoThreads);
+      return false;
+    }
+    io_threads_ = n;
     return true;
   }
 

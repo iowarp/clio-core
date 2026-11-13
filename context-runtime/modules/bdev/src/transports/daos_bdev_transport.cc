@@ -36,6 +36,7 @@
 
 #include <clio_ctp/io/io_error.h>
 #include <clio_runtime/clio_runtime.h>
+#include <clio_runtime/evlat.h>
 #include <clio_runtime/manager.h>
 #include <clio_runtime/work_orchestrator.h>
 #include <clio_runtime/worker.h>
@@ -44,9 +45,30 @@
 #include <cerrno>
 #include <chrono>
 #include <cstring>
+#include <memory>
 #include <utility>
 
 namespace clio::run::bdev {
+
+namespace {
+
+/**
+ * Record the three stages of a finished request on the CLIO_EVLAT channels:
+ * daos_q (handed to the DAOS layer -> dfs call issued; includes waiting for
+ * room on the I/O threads), daos_io (dfs call issued -> completion reaped)
+ * and daos_done (completion reaped -> the coroutine saw the done flag). A
+ * request that failed before it was issued records nothing.
+ * @param req the finished request
+ */
+void RecordStages(const daosio::IoRequest &req) {
+  const unsigned long long now = clio::run::evlat::Now();
+  clio::run::evlat::Span(clio::run::evlat::kDaosQ, req.t_enq_, req.t_issue_);
+  clio::run::evlat::Span(clio::run::evlat::kDaosIo, req.t_issue_,
+                         req.t_reap_);
+  clio::run::evlat::Span(clio::run::evlat::kDaosDone, req.t_reap_, now);
+}
+
+}  // namespace
 
 DaosBdevTransport::DaosBdevTransport() = default;
 
@@ -73,13 +95,14 @@ bool DaosBdevTransport::Init(const CreateParams &params,
   spec.file_ = path_.file_;
   spec.chunk_size_ = path_.chunk_size_;
   spec.oclass_ = path_.oclass_;
-  // One event-queue slot per worker id the orchestrator can hand out (same
-  // elastic headroom as FsBdevTransport::io_contexts_); queues themselves are
-  // created on a worker's first I/O.
+  // Request stages are stamped with the CLIO_EVLAT clock (0 when off).
+  daosio::SetStampFn(&clio::run::evlat::Now);
+  // The first DAOS device of the process starts the I/O threads, each with
+  // its own event queue; a process that cannot create them (network contexts
+  // exhausted, fabric unreachable) would fail every I/O later, so Open fails
+  // and the device is refused instead.
   file_ = std::make_unique<daosio::DfsFile>();
-  if (!file_->Open(spec,
-                   num_workers + clio::run::WorkOrchestrator::ElasticHeadroom(),
-                   &error)) {
+  if (!file_->Open(spec, path_.io_threads_, &error)) {
     HLOG(kError, "DAOS bdev '{}': {}; refusing the device", name_, error);
     file_.reset();
     return false;
@@ -91,21 +114,13 @@ bool DaosBdevTransport::Init(const CreateParams &params,
     return false;
   }
 
-  // Create this worker's event queue now: a process that cannot create one
-  // (network contexts exhausted, fabric unreachable) would fail every I/O
-  // later, so refuse the device instead.
-  clio::run::Worker *worker = CLIO_CUR_WORKER;
-  const size_t worker_id = worker ? worker->GetId() : 0;
   daosio::DaosProcess *process = daosio::DaosProcess::GetInstance();
-  daos_handle_t eqh{};
-  const int eq_rc = process->GetWorkerEq(worker_id, &eqh);
-  if (eq_rc != 0) {
-    HLOG(kError,
-         "DAOS bdev '{}': daos_eq_create failed for worker {} (pool '{}' "
-         "container '{}'): {}; refusing the device",
-         name_, worker_id, path_.pool_, path_.cont_, daosio::DerText(eq_rc));
-    Destroy();
-    return false;
+  const size_t io_threads = process->NumIoThreads();
+  if (path_.io_threads_ != 0 && path_.io_threads_ != io_threads) {
+    HLOG(kWarning,
+         "DAOS bdev '{}': io_threads={} ignored; the process already runs {} "
+         "DAOS I/O thread(s), started by the first DAOS device",
+         name_, path_.io_threads_, io_threads);
   }
 
   allocator_.Init(num_workers, capacity, params.alignment_);
@@ -115,10 +130,15 @@ bool DaosBdevTransport::Init(const CreateParams &params,
   }
   HLOG(kInfo,
        "DAOS bdev ready: pool='{}' container='{}' file='{}' chunk_size={} "
-       "oclass='{}' prezero={} capacity={} bytes",
+       "oclass='{}' prezero={} capacity={} bytes io_threads={} (shared by "
+       "the process; <= {} in flight and <= {} queued+in flight per thread, "
+       "poll timeout {} us)",
        path_.pool_, path_.cont_, path_.FilePath(), path_.chunk_size_,
        path_.oclass_.empty() ? "<container default>" : path_.oclass_.c_str(),
-       path_.prezero_ ? 1 : 0, capacity);
+       path_.prezero_ ? 1 : 0, capacity, io_threads,
+       static_cast<size_t>(daosio::IoThread::kMaxInFlight),
+       static_cast<size_t>(daosio::IoThread::kMaxOutstanding),
+       daosio::ResolvePollUs());
   return true;
 }
 
@@ -295,32 +315,24 @@ void DaosBdevTransport::LogIoFailure(const char *op, int raw_rc,
 clio::run::TaskResume DaosBdevTransport::WriteBlocks(
     ctp::ipc::FullPtr<WriteTask> task) {
   CLIO_TASK_BODY_BEGIN
-  clio::run::Worker *worker = CLIO_CUR_WORKER;
-  const size_t worker_id = worker ? worker->GetId() : 0;
-
   auto *ipc_mgr = CLIO_IPC;
   ctp::ipc::FullPtr<char> data_ptr =
       ipc_mgr->ToFullPtr(task->data_).Cast<char>();
 
+  // Host copy of device data; shared with the requests (see keepalive_).
   const bool data_on_device = ctp::IsDevicePointer(data_ptr.ptr_);
-  std::vector<char> staging;
+  std::shared_ptr<std::vector<char>> staging;
   if (data_on_device) {
-    staging.resize(task->length_);
-    ctp::DeviceAwareMemcpy(staging.data(), data_ptr.ptr_, task->length_);
+    staging = std::make_shared<std::vector<char>>(task->length_);
+    ctp::DeviceAwareMemcpy(staging->data(), data_ptr.ptr_, task->length_);
   }
-  char *data = data_on_device ? staging.data() : data_ptr.ptr_;
+  char *data = data_on_device ? staging->data() : data_ptr.ptr_;
 
   task->io_error_ = static_cast<clio::run::u32>(ctp::IoError::kOk);
   task->bytes_written_ = 0;
 
-  // This worker's event queue (created on its first I/O).
-  daosio::DaosProcess *process = daosio::DaosProcess::GetInstance();
-  daos_handle_t eqh{};
-  const int eq_rc = (file_ && file_->IsOpen())
-                        ? process->GetWorkerEq(worker_id, &eqh)
-                        : -DER_NO_HDL;
-  if (eq_rc != 0) {
-    LogIoFailure("write (event queue)", eq_rc, 0, task->length_);
+  if (!file_ || !file_->IsOpen()) {
+    LogIoFailure("write (device closed)", -DER_NO_HDL, 0, task->length_);
     task->return_code_ = 1;
     CLIO_CO_RETURN;
   }
@@ -333,20 +345,21 @@ clio::run::TaskResume DaosBdevTransport::WriteBlocks(
     const clio::run::u64 size = std::min(remaining, block.size_);
     if (size == 0) continue;
 
-    // Submit with an event on this worker's queue, then yield until a
-    // non-blocking poll of the queue reports the event complete.
+    // Hand the request to a DAOS I/O thread (yielding while they are all
+    // at their bound), then yield until that thread marks it done. The
+    // thread holds its own reference, so a coroutine destroyed while waiting
+    // leaves the request (and the staging buffer) alive until DAOS is done.
     daosio::IoRequestPtr req = daosio::NewRequest();
-    daosio::SubmitWrite(*file_, eqh, req.get(), data + total_bytes_written,
-                        static_cast<size_t>(size), block.offset_);
-    while (!req->IsDone()) {
-      const int polled = daosio::PollEq(eqh);
-      if (polled < 0) {
-        daosio::FailLostRequest(req.get(), polled);
-        break;
-      }
-      if (req->IsDone()) break;
+    req->keepalive_ = staging;
+    while (!daosio::SubmitWrite(*file_, req.get(),
+                                data + total_bytes_written,
+                                static_cast<size_t>(size), block.offset_)) {
       CLIO_CO_AWAIT(clio::run::yield(kPollYieldUs));
     }
+    while (!req->IsDone()) {
+      CLIO_CO_AWAIT(clio::run::yield(kPollYieldUs));
+    }
+    RecordStages(*req);
 
     if (req->rc_ != 0) {
       LogIoFailure("write", req->raw_rc_, block.offset_, size);
@@ -368,31 +381,23 @@ clio::run::TaskResume DaosBdevTransport::WriteBlocks(
 clio::run::TaskResume DaosBdevTransport::ReadBlocks(
     ctp::ipc::FullPtr<ReadTask> task) {
   CLIO_TASK_BODY_BEGIN
-  clio::run::Worker *worker = CLIO_CUR_WORKER;
-  const size_t worker_id = worker ? worker->GetId() : 0;
-
   auto *ipc_mgr = CLIO_IPC;
   ctp::ipc::FullPtr<char> data_ptr =
       ipc_mgr->ToFullPtr(task->data_).Cast<char>();
 
+  // Host buffer for device data; shared with the requests (see keepalive_).
   const bool data_on_device = ctp::IsDevicePointer(data_ptr.ptr_);
-  std::vector<char> staging;
+  std::shared_ptr<std::vector<char>> staging;
   if (data_on_device) {
-    staging.resize(task->length_);
+    staging = std::make_shared<std::vector<char>>(task->length_);
   }
-  char *data = data_on_device ? staging.data() : data_ptr.ptr_;
+  char *data = data_on_device ? staging->data() : data_ptr.ptr_;
 
   task->io_error_ = static_cast<clio::run::u32>(ctp::IoError::kOk);
   task->bytes_read_ = 0;
 
-  // This worker's event queue (created on its first I/O).
-  daosio::DaosProcess *process = daosio::DaosProcess::GetInstance();
-  daos_handle_t eqh{};
-  const int eq_rc = (file_ && file_->IsOpen())
-                        ? process->GetWorkerEq(worker_id, &eqh)
-                        : -DER_NO_HDL;
-  if (eq_rc != 0) {
-    LogIoFailure("read (event queue)", eq_rc, 0, task->length_);
+  if (!file_ || !file_->IsOpen()) {
+    LogIoFailure("read (device closed)", -DER_NO_HDL, 0, task->length_);
     task->return_code_ = 1;
     CLIO_CO_RETURN;
   }
@@ -411,20 +416,20 @@ clio::run::TaskResume DaosBdevTransport::ReadBlocks(
       std::memset(dst, 0, static_cast<size_t>(size));
     }
 
-    // Submit with an event on this worker's queue, then yield until a
-    // non-blocking poll of the queue reports the event complete.
+    // Hand the request to a DAOS I/O thread (yielding while they are all
+    // at their bound), then yield until that thread marks it done. The
+    // thread holds its own reference, so a coroutine destroyed while waiting
+    // leaves the request (and the staging buffer) alive until DAOS is done.
     daosio::IoRequestPtr req = daosio::NewRequest();
-    daosio::SubmitRead(*file_, eqh, req.get(), dst, static_cast<size_t>(size),
-                       block.offset_);
-    while (!req->IsDone()) {
-      const int polled = daosio::PollEq(eqh);
-      if (polled < 0) {
-        daosio::FailLostRequest(req.get(), polled);
-        break;
-      }
-      if (req->IsDone()) break;
+    req->keepalive_ = staging;
+    while (!daosio::SubmitRead(*file_, req.get(), dst,
+                               static_cast<size_t>(size), block.offset_)) {
       CLIO_CO_AWAIT(clio::run::yield(kPollYieldUs));
     }
+    while (!req->IsDone()) {
+      CLIO_CO_AWAIT(clio::run::yield(kPollYieldUs));
+    }
+    RecordStages(*req);
 
     if (req->rc_ != 0) {
       LogIoFailure("read", req->raw_rc_, block.offset_, size);
@@ -449,7 +454,7 @@ clio::run::TaskResume DaosBdevTransport::ReadBlocks(
   }
 
   if (data_on_device && total_bytes_read > 0) {
-    ctp::DeviceAwareMemcpy(data_ptr.ptr_, staging.data(), total_bytes_read);
+    ctp::DeviceAwareMemcpy(data_ptr.ptr_, staging->data(), total_bytes_read);
   }
 
   task->return_code_ = 0;

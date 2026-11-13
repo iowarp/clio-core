@@ -173,7 +173,22 @@ enum Chan : int {
   kPbDrain = 74,
   kPbAlloc = 75,
   kPbBdev = 76,
-  kNumChan = 77,
+  // 77-79: one block I/O of a native DAOS bdev (bdev_type: daos), recorded by
+  // the transport's task coroutine when it sees the request finished. The
+  // three are consecutive, so per block they add up to the coroutine's wait,
+  // i.e. to what pb_bdev (writes) / read_await (reads) show for a DAOS tier
+  // minus the bdev task dispatch around it:
+  //   daos_q    request handed to the DAOS layer -> an I/O thread issues the
+  //             dfs_write / dfs_read (wait for room on the I/O threads when
+  //             they are all at their bound + wait in the thread's queue)
+  //   daos_io   dfs call issued -> the I/O thread reaps the completion event
+  //             (the call itself, DAOS + network, wait for the next poll)
+  //   daos_done completion reaped -> the coroutine observes the done flag
+  //             (its 10 us yield period + worker scheduling)
+  kDaosQ = 77,
+  kDaosIo = 78,
+  kDaosDone = 79,
+  kNumChan = 80,
 };
 
 enum Busy : int { kBusyPeerRecv = 0, kBusyNetSend = 1, kNumBusy = 2 };
