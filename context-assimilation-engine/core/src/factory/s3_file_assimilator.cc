@@ -603,20 +603,23 @@ clio::run::TaskResume S3FileAssimilator::Schedule(const AssimilationCtx& ctx,
     // a clio-fs task sent ahead of its pool was observed never to complete
     // (the CAE pool is composed first, the filesystem last). Wait for the pool
     // here -- bounded -- instead of hanging the import.
+    // Found by NAME: clio-fs has no fixed pool id.
     _t_phase = SteadyClock::now();
-    while (!CLIO_POOL_MANAGER->HasPool(clio::cte::filesystem::kCfsPoolId)) {
+    clio::run::PoolId cfs_pool;
+    while ((cfs_pool = CLIO_POOL_MANAGER->FindPoolByName(
+                clio::cte::filesystem::kCfsPoolName))
+               .IsNull()) {
       if (UsSince(_t_phase) > 120ull * 1000 * 1000) {
         HLOG(kError,
-             "S3FileAssimilator: no clio_cte_filesystem pool ({}) after 120 s; "
+             "S3FileAssimilator: no filesystem pool named '{}' after 120 s; "
              "compose it to use cfs:: destinations",
-             clio::cte::filesystem::kCfsPoolId);
+             clio::cte::filesystem::kCfsPoolName);
         error_code = -3;
         CLIO_CO_RETURN;
       }
       CLIO_CO_AWAIT(clio::run::yield(10000.0));
     }
-    cfs = std::make_unique<clio::cte::filesystem::Client>(
-        clio::cte::filesystem::kCfsPoolId);
+    cfs = std::make_unique<clio::cte::filesystem::Client>(cfs_pool);
     for (size_t slash = tag_name.find('/', 1); slash != std::string::npos;
          slash = tag_name.find('/', slash + 1)) {
       auto mk = cfs->AsyncMkdir(tag_name.substr(0, slash));

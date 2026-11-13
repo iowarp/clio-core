@@ -63,6 +63,7 @@
 
 #include "clio_cte/core/core_client.h"
 #include "clio_cte/core/core_tasks.h"
+#include "clio_cte/filesystem/filesystem_client.h"
 
 namespace clio::cae::fuse {
 
@@ -130,7 +131,7 @@ struct FuseFileHandle {
 
 /** Query CTE for the authoritative tag size */
 static inline size_t CteGetTagSize(const clio::cte::core::TagId &tag_id) {
-  auto *cte_client = CLIO_CTE_CLIENT;
+  auto *cte_client = CLIO_CFS_CLIENT->Cte();
   auto task = cte_client->AsyncGetTagSize(tag_id, clio::run::PoolQuery::Local());
   task.Wait();
   if (task->GetReturnCode() != 0) return 0;
@@ -139,14 +140,14 @@ static inline size_t CteGetTagSize(const clio::cte::core::TagId &tag_id) {
 
 /** Delete a CTE tag by name */
 static inline void CteDelTag(const std::string &tag_name) {
-  auto *cte_client = CLIO_CTE_CLIENT;
+  auto *cte_client = CLIO_CFS_CLIENT->Cte();
   auto task = cte_client->AsyncDelTag(tag_name, clio::run::PoolQuery::Local());
   task.Wait();
 }
 
 /** Get or create a CTE tag, returning its TagId. Returns null id on failure. */
 static inline clio::cte::core::TagId CteGetOrCreateTag(const std::string &name) {
-  auto *cte_client = CLIO_CTE_CLIENT;
+  auto *cte_client = CLIO_CFS_CLIENT->Cte();
   // pool_query=Local overrides ScheduleTask's default DirectHash routing for
   // new tags — without it the tag is hashed to a peer node and a subsequent
   // CteTagExists(Local) from the same FUSE adapter won't find it.
@@ -159,7 +160,7 @@ static inline clio::cte::core::TagId CteGetOrCreateTag(const std::string &name) 
 
 /** Check if a tag exists by name using TagQuery with exact match */
 static inline bool CteTagExists(const std::string &tag_name) {
-  auto *cte_client = CLIO_CTE_CLIENT;
+  auto *cte_client = CLIO_CFS_CLIENT->Cte();
   // Escape regex special chars and do exact match
   std::string escaped;
   for (char c : tag_name) {
@@ -197,7 +198,7 @@ static inline bool CteTagExists(const std::string &tag_name) {
  */
 static inline std::vector<std::string>
 CteListDirectChildren(const std::string &dir_path) {
-  auto *cte_client = CLIO_CTE_CLIENT;
+  auto *cte_client = CLIO_CFS_CLIENT->Cte();
 
   // Build regex: escape dir_path, then match the subtree (one-or-more chars
   // after the trailing slash, at any depth).
@@ -262,7 +263,7 @@ CteListDirectChildren(const std::string &dir_path) {
  */
 static inline std::vector<std::string>
 CteListSubdirs(const std::string &dir_path) {
-  auto *cte_client = CLIO_CTE_CLIENT;
+  auto *cte_client = CLIO_CFS_CLIENT->Cte();
 
   // Match any tag that has at least two more path components after dir_path
   std::string escaped;
@@ -306,7 +307,7 @@ CteListSubdirs(const std::string &dir_path) {
  * A directory exists if any tag starts with "dir_path/".
  */
 static inline bool CteDirExists(const std::string &dir_path) {
-  auto *cte_client = CLIO_CTE_CLIENT;
+  auto *cte_client = CLIO_CFS_CLIENT->Cte();
   std::string escaped;
   for (char c : dir_path) {
     if (c == '.' || c == '[' || c == ']' || c == '(' || c == ')' ||
@@ -334,7 +335,7 @@ static inline bool CtePutBlob(const clio::cte::core::TagId &tag_id,
                               const std::string &blob_name, const char *data,
                               size_t data_size, size_t blob_off) {
   auto *ipc_manager = CLIO_IPC;
-  auto *cte_client = CLIO_CTE_CLIENT;
+  auto *cte_client = CLIO_CFS_CLIENT->Cte();
   ctp::ipc::FullPtr<char> shm_buf = ipc_manager->AllocateBuffer(data_size);
   if (shm_buf.IsNull()) return false;
   memcpy(shm_buf.ptr_, data, data_size);
@@ -369,7 +370,7 @@ static inline bool CtePutBlobAsync(struct FuseFileHandle *handle,
                                    const char *data, size_t data_size,
                                    size_t blob_off) {
   auto *ipc_manager = CLIO_IPC;
-  auto *cte_client = CLIO_CTE_CLIENT;
+  auto *cte_client = CLIO_CFS_CLIENT->Cte();
   ctp::ipc::FullPtr<char> shm_buf = ipc_manager->AllocateBuffer(data_size);
   if (shm_buf.IsNull()) return false;
   memcpy(shm_buf.ptr_, data, data_size);
@@ -445,7 +446,7 @@ static inline bool CteGetBlob(const clio::cte::core::TagId &tag_id,
                               const std::string &blob_name, char *data,
                               size_t data_size, size_t blob_off) {
   auto *ipc_manager = CLIO_IPC;
-  auto *cte_client = CLIO_CTE_CLIENT;
+  auto *cte_client = CLIO_CFS_CLIENT->Cte();
   ctp::ipc::FullPtr<char> shm_buf = ipc_manager->AllocateBuffer(data_size);
   if (shm_buf.IsNull()) return false;
   ctp::ipc::ShmPtr<> shm_ptr(shm_buf.shm_);

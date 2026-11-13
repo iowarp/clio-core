@@ -22,8 +22,8 @@ using Context = clio::cte::core::Context;
 using TagId = clio::cte::core::TagId;
 
 /**
- * Well-known default pool id/name, following the filesystem chimod's
- * kCfsPoolId(560,0) convention (the CTE core is 512.0).
+ * Default pool id/name used by the stock compose (deployments may choose
+ * any id; nothing in clio-fs assumes this one).
  */
 static constexpr clio::run::PoolId kReplicationPoolId(561, 0);
 static constexpr const char *kReplicationPoolName = "clio_cte_replication";

@@ -360,6 +360,11 @@ class ClioCte(Service):
 
     def _build_compose_config(self, devices):
         storage_config = []
+        # A CTE core is either entirely volatile or entirely persistent
+        # (design/volatile_persistent_split.md); a mixed core fails to start.
+        # With any RAM tier the whole core is volatile scratch (no WAL);
+        # file-only cores are persistent.
+        any_ram = any(str(d[0]).startswith('ram::') for d in devices)
         for path, capacity, score in devices:
             is_ram = path.startswith('ram::')
             if is_ram:
@@ -370,14 +375,7 @@ class ClioCte(Service):
                 bdev_type = 'gcs'
             else:
                 bdev_type = 'file'
-            # CTE FlushData ranks targets by `persistence_level_` (string
-            # in StorageDeviceConfig, mapped to enum kVolatile / kTemporary
-            # / kLongTerm). The default is "volatile" for every device type
-            # — so a file-backed bdev on PFS gets registered as volatile
-            # and FlushData with min_persistence_level >= 1 finds no
-            # target and the gray-scott write path blocks. Tag file bdevs
-            # as "long_term" by default so the tier is correctly chosen.
-            persistence_level = 'volatile' if is_ram else 'long_term'
+            persistence_level = 'volatile' if any_ram else 'long_term'
             storage_config.append({
                 'path': path, 'bdev_type': bdev_type,
                 'capacity_limit': capacity, 'score': score,

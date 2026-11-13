@@ -54,12 +54,10 @@ inline std::string PageName(clio::run::u64 off) {
 }
 
 /**
- * Well-known default pool id/name for the filesystem chimod, used by the
- * interceptor adapters (libfuse, POSIX, ...) to create-or-bind a single
- * shared filesystem pool over the default CTE core pool — exactly the way
- * clio::cte::core uses kCtePoolId/kCtePoolName.
+ * Default NAME of the filesystem pool. clio-fs assumes no pool id: clients
+ * find the composed filesystem pool by name (CLIO_CFS_POOL overrides it),
+ * and the filesystem learns every other pool it uses from its config.
  */
-static constexpr clio::run::PoolId kCfsPoolId(560, 0);
 static constexpr const char *kCfsPoolName = "clio_cte_filesystem";
 
 /**
@@ -69,7 +67,7 @@ static constexpr const char *kCfsPoolName = "clio_cte_filesystem";
 struct FilesystemConfig {
   static constexpr const char* chimod_lib_name = "clio_cte_filesystem";
 
-  clio::run::PoolId next_pool_id_;  ///< CTE core pool id (e.g. 512.0)
+  clio::run::PoolId next_pool_id_;  ///< data chain pool (required)
   /**
    * Node-local file persisting this container's slice of the namespace
    * (its inode-table blocks and the inodes it is home for). Empty =
@@ -79,8 +77,9 @@ struct FilesystemConfig {
   std::string metadata_log_path_;
   /**
    * Stream pool that owns every file's logical size and merges deferred
-   * appends (clio::cte::stream). Created with defaults (over next_pool_id_,
-   * logging next to metadata_log_path_) if the deployment did not compose it.
+   * appends (clio::cte::stream). Unset: the filesystem creates its own,
+   * named "<filesystem pool name>_stream", at the id one minor above its own
+   * pool id, over next_pool_id_ and logging next to metadata_log_path_.
    */
   clio::run::PoolId stream_pool_id_;
   /**
@@ -99,7 +98,7 @@ struct FilesystemConfig {
 
   FilesystemConfig()
       : next_pool_id_(clio::run::PoolId::GetNull()),
-        stream_pool_id_(565, 0),
+        stream_pool_id_(clio::run::PoolId::GetNull()),
         dir_split_entries_(1024),
         case_insensitive_(false) {}
   FilesystemConfig(const clio::run::PoolId &pool_id, const FilesystemConfig &other)

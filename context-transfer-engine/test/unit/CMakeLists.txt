@@ -2413,6 +2413,8 @@ add_dependencies(test_cfs_fsync_durable
     clio_run
     clio_cte_core_runtime
     clio_cte_filesystem_runtime
+    clio_cte_stream_runtime
+    clio_cte_write_back_cache_runtime
     clio_bdev_runtime
     clio_admin_runtime)
 add_test(NAME cfs_fsync_durable

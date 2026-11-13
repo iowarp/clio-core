@@ -121,11 +121,7 @@ compose:
       poll_period_ms: 5000
 
     storage:
-      - path: "ram::cache_stack_dram"
-        bdev_type: "ram"
-        capacity_limit: "128MB"
-        score: 1.0
-
+      # A core is uniform in durability: the persistent tier only.
       - path: ")" << file_storage_path_ << R"("
         bdev_type: "file"
         capacity_limit: "64MB"

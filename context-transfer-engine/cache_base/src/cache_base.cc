@@ -137,7 +137,15 @@ clio::run::TaskResume CacheBase::Destroy(
 clio::run::TaskResume CacheBase::Monitor(
     clio::run::shared_ptr<clio::run::admin::MonitorTask> &task) {
   CLIO_TASK_BODY_BEGIN
-  task->return_code_ = 0;
+  if (task->query_ == "dirty_count") {
+    task->results_[container_id_] = std::to_string(DirtyCount());
+    task->SetReturnCode(0);
+    CLIO_CO_RETURN;
+  }
+  // Every other query describes the chain below (e.g. replication's
+  // "replicate_period_ms"): answer it as the persistent side would.
+  CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kMonitor,
+                              task.template Cast<clio::run::Task>()));
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }

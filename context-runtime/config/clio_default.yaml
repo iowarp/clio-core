@@ -651,6 +651,9 @@ compose:
     pool_name: clio_cte_filesystem
     pool_query: local
     pool_id: "560.0"
+    # REQUIRED: the pool its pages go through (no default). Clients find
+    # this filesystem by pool_name (CLIO_CFS_POOL overrides) and learn this
+    # chain and the stream pool from it.
     next_pool_id: "564.0"               # chain top (indexer) — see entries above
     # No metadata server. Names live in the inode table: each directory's
     # rows (name -> inode) are split into table blocks, each block has one
@@ -675,5 +678,7 @@ compose:
     # is created; a runtime configured the other way refuses the volume.
     # case_insensitive: false
     # Stream pool holding every file's logical size and merging deferred
-    # O_APPEND writes (see the clio_cte_stream entry). Default: "565.0".
-    # stream_pool_id: "565.0"
+    # O_APPEND writes (see the clio_cte_stream entry). clio-fs assumes no
+    # pool id: unset, the filesystem creates its own stream pool, named
+    # "<pool_name>_stream", one minor above its own pool id.
+    stream_pool_id: "565.0"

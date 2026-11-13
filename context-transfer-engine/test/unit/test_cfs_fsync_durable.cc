@@ -35,11 +35,13 @@
  * fsync through the descriptor layer (the POSIX/STDIO/MPI-IO interceptors)
  * must put a file's bytes on a persistent device (issue #1188).
  *
- * Before the fix SyncFd only drained write-behind: with a RAM tier the
- * file's pages stayed in RAM, and were lost on a crash, while the same
- * file fsynced through the FUSE mount was durable. The observable here is
- * the persistent tier's free space: the pages land in RAM (it scores
- * higher), so the file tier fills only if fsync moved them there.
+ * Layout (design/volatile_persistent_split.md): a persistent core (file
+ * tier) and a volatile core (RAM) behind a write-back cache, with the
+ * filesystem over the cache. Writes are acked from the volatile core, so the
+ * persistent file tier fills only once fsync makes the cache flush the
+ * file's dirty copies -- which also proves fsync takes the filesystem's own
+ * chain (learned from its config, no fixed pool id) rather than a guessed
+ * core pool. The observable is the persistent tier's free space.
  */
 
 #include <fcntl.h>
@@ -122,7 +124,7 @@ std::string FindTarget(clio::cte::core::Client *cte,
 
 }  // namespace
 
-TEST_CASE("cfs fsync moves a file's pages to a persistent tier",
+TEST_CASE("cfs fsync flushes a file's pages to the persistent core",
           "[cfs][fsync][durable]") {
   std::string user = ctp::SystemInfo::Getenv("USER");
   if (user.empty()) user = "user";
@@ -133,20 +135,14 @@ TEST_CASE("cfs fsync moves a file's pages to a persistent tier",
   const std::string file_dev = (work / "file_dev.dat").string();
   const std::string yaml = (work / "compose.yaml").string();
   {
-    // RAM scores above the file tier, so writes land in RAM; the file tier
-    // is declared the only persistent level, so it is where fsync must move
-    // them. (With no persistent tier, fsync has nothing to move them to.)
     std::ofstream f(yaml);
     f << "compose:\n"
          "  - mod_name: clio_cte_core\n"
-         "    pool_name: \"cfs_fsync_cte\"\n"
+         "    pool_name: \"cfs_fsync_persistent\"\n"
          "    pool_query: local\n"
          "    pool_id: \"512.0\"\n"
+         "    durability: persistent\n"
          "    storage:\n"
-         "      - path: \"ram::cfs_fsync_ram\"\n"
-         "        bdev_type: ram\n"
-         "        capacity_limit: 64mb\n"
-         "        score: 1.0\n"
          "      - path: \"" << file_dev << "\"\n"
          "        bdev_type: file\n"
          "        capacity_limit: 64mb\n"
@@ -154,11 +150,28 @@ TEST_CASE("cfs fsync moves a file's pages to a persistent tier",
          "        persistence_level: long_term\n"
          "    dpe:\n"
          "      dpe_type: max_bw\n"
+         "  - mod_name: clio_cte_core\n"
+         "    pool_name: \"cfs_fsync_volatile\"\n"
+         "    pool_query: local\n"
+         "    pool_id: \"540.0\"\n"
+         "    durability: volatile\n"
+         "    storage:\n"
+         "      - path: \"ram::cfs_fsync_ram\"\n"
+         "        bdev_type: ram\n"
+         "        capacity_limit: 64mb\n"
+         "        score: 1.0\n"
+         "  - mod_name: clio_cte_write_back_cache\n"
+         "    pool_name: \"cfs_fsync_cache\"\n"
+         "    pool_query: local\n"
+         "    pool_id: \"567.0\"\n"
+         "    next_volatile: \"540.0\"\n"
+         "    next_persistent: \"512.0\"\n"
+         "    flush_period_ms: 0\n"
          "  - mod_name: clio_cte_filesystem\n"
          "    pool_name: \"clio_cte_filesystem\"\n"
          "    pool_query: local\n"
          "    pool_id: \"560.0\"\n"
-         "    next_pool_id: \"512.0\"\n";
+         "    next_pool_id: \"567.0\"\n";
   }
   ctp::SystemInfo::Setenv("CLIO_WAIT_SERVER", "15", 1);
   ctp::SystemInfo::Setenv("CLIO_BIND_ADDR", "127.0.0.1", 1);
@@ -168,10 +181,14 @@ TEST_CASE("cfs fsync moves a file's pages to a persistent tier",
   REQUIRE(server.WaitForReady());
   REQUIRE(RunCli({"compose", "start", yaml}, 60) == 0);
   REQUIRE(clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, false));
-  REQUIRE(clio::cte::core::CLIO_CTE_CLIENT_INIT());
-  auto *cte = CLIO_CTE_CLIENT;
+  REQUIRE(clio::cte::filesystem::CLIO_CFS_CLIENT_INIT());
   auto *cfs = CLIO_CFS_CLIENT;
   REQUIRE(cfs != nullptr);
+  // The filesystem's chain is the cache, learned from its config.
+  REQUIRE(cfs->Cte()->pool_id_ == clio::run::PoolId(567, 0));
+  // Inspect the persistent core's file tier directly.
+  clio::cte::core::Client persistent(clio::run::PoolId(512, 0));
+  auto *cte = &persistent;
 
   const std::string file_target = FindTarget(cte, "file_dev.dat");
   REQUIRE(!file_target.empty());
@@ -188,9 +205,8 @@ TEST_CASE("cfs fsync moves a file's pages to a persistent tier",
   REQUIRE(cfs->WriteFd(fd, data.data(), data.size()) ==
           static_cast<clio::cte::filesystem::FsSsize>(data.size()));
 
-  // Drain only: the pages are in RAM and the file tier has not seen them.
-  // (This also proves the RAM tier took the writes, so the check below is
-  // about fsync and not about placement.)
+  // Drain only: the pages are dirty in the volatile core and the persistent
+  // file tier has not seen them (so the check below is about fsync).
   REQUIRE(cfs->Flush(path.substr(6)) == 0);
   const clio::run::u64 drained = TargetFreeBytes(cte, file_target);
   INFO("file tier free: before=" << before << " after drain=" << drained);
