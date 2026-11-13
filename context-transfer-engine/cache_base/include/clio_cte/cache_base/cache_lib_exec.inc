@@ -33,7 +33,7 @@
 
 /**
  * Container dispatch shared by the policy cache modules (hand-maintained,
- * like the other interposers' autogen/*_lib_exec.cc). Include it inside the
+ * like the other interposers' autogen/<module>_lib_exec.cc). Include it inside the
  * module's namespace, after declaring `Runtime` (derived from
  * clio::cte::cache_base::CacheBase) and `CreateTask`.
  *

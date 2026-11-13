@@ -430,7 +430,7 @@ class Cluster:
                f'      default_target_timeout_ms: 30000\n'
                f'      poll_period_ms: 5000\n'
                f'      failover_to_successor: true\n')
-    # A core is either volatile or persistent (no mixing). With a persistent
+    # Each core states its role with `durability`. With a persistent
     # tier: a persistent core (512.0) and a volatile RAM core (540.0) behind
     # a write-back cache (567.0), which owns flushing. RAM only: one volatile
     # core under the node-local cache, as before.

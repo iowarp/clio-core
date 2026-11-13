@@ -824,7 +824,7 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
        "CTE Create: GetParams() returned, storage devices in config: {}",
        config_.storage_.devices_.size());
   if (!ApplyDurability()) {
-    task->return_code_ = kCteMixedDurabilityRc;
+    task->return_code_ = kCteInvalidDurabilityRc;
     CLIO_CO_RETURN;
   }
 
@@ -1094,22 +1094,25 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
     tag_txn_logs_.resize(num_workers);
     for (clio::run::u32 i = 0; i < num_workers; ++i) {
       blob_txn_logs_[i] = std::make_unique<TransactionLog>();
-      blob_txn_logs_[i]->Open(config_.performance_.metadata_log_path_ +
-                                  ".blob." + std::to_string(i),
-                              per_worker_capacity);
+      blob_txn_logs_[i]->Configure(config_.performance_.metadata_log_path_ +
+                                       ".blob." + std::to_string(i),
+                                   per_worker_capacity);
       // Every shard of this container draws its per-record seq from the SAME
       // atomic (next_wal_seq_), so ReplayTransactionLogs can merge shards
       // back into true write order regardless of which worker's shard a
       // record landed in (see TransactionLog::SetSeqCounter docstring).
       blob_txn_logs_[i]->SetSeqCounter(&next_wal_seq_);
       tag_txn_logs_[i] = std::make_unique<TransactionLog>();
-      tag_txn_logs_[i]->Open(
+      tag_txn_logs_[i]->Configure(
           config_.performance_.metadata_log_path_ + ".tag." + std::to_string(i),
           per_worker_capacity);
       tag_txn_logs_[i]->SetSeqCounter(&next_wal_seq_);
     }
-    HLOG(kInfo, "WAL: Opened {} blob and {} tag transaction logs", num_workers,
-         num_workers);
+    // The shards exist for the container's whole life (writers index them
+    // without a lock); only whether they write changes with the class.
+    if (!IsVolatileCore()) ActivateWal();
+    HLOG(kInfo, "WAL: {} blob and {} tag transaction logs ({})", num_workers,
+         num_workers, IsVolatileCore() ? "closed while volatile" : "open");
   }
 
   // Start periodic StatTargets task to keep target stats updated
@@ -1176,27 +1179,140 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
 
 bool Runtime::ApplyDurability() {
   std::string error;
-  if (!config_.ResolveDurability(&durability_class_, &error)) {
-    HLOG(kError, "cte_core Create ({}): invalid storage configuration: {}",
-         pool_name_, error);
+  CoreDurability cls = CoreDurability::kVolatile;
+  if (!config_.ResolveDurability(&cls, &error)) {
+    HLOG(kError, "cte_core Create ({}): invalid durability: {}", pool_name_,
+         error);
     return false;
   }
-  if (IsVolatileCore()) {
-    // Logging metadata for bytes that cannot survive a restart only costs
-    // put latency, and its replay would have to throw the blocks away.
-    if (!config_.performance_.metadata_log_path_.empty()) {
-      HLOG(kWarning,
-           "cte_core Create ({}): volatile core ignores metadata_log_path "
-           "'{}'; it runs without a WAL and starts empty",
-           pool_name_, config_.performance_.metadata_log_path_);
-      config_.performance_.metadata_log_path_.clear();
-    }
-    is_restart_ = false;
-  }
-  HLOG(kInfo, "cte_core Create ({}): {} core, WAL {}", pool_name_,
+  durability_class_.store(cls, std::memory_order_release);
+  // A volatile core starts empty: nothing is restored, and its WAL shards
+  // stay closed (records are dropped) unless SetDurability makes it
+  // persistent.
+  if (IsVolatileCore()) is_restart_ = false;
+  const bool has_log = !config_.performance_.metadata_log_path_.empty();
+  HLOG(kInfo, "cte_core Create ({}): {} core ({}), WAL {}", pool_name_,
        IsVolatileCore() ? "volatile" : "persistent",
-       config_.performance_.metadata_log_path_.empty() ? "off" : "on");
+       config_.durability_.empty() ? "inferred from its bdevs" : "stated",
+       !has_log ? "off (no metadata_log_path)"
+                : (IsVolatileCore() ? "off while volatile" : "on"));
   return true;
+}
+
+clio::run::bdev::PersistenceLevel Runtime::RegisteringTargetLevel(
+    RegisterTargetTask &task) {
+  using clio::run::bdev::PersistenceLevel;
+  if (task.persistence_level_ >= 0) {
+    return task.persistence_level_ >= static_cast<int>(PersistenceLevel::kLongTerm)
+               ? PersistenceLevel::kLongTerm
+               : static_cast<PersistenceLevel>(task.persistence_level_);
+  }
+  const int configured = ConfiguredPersistenceLevel(task.target_name_.str());
+  return configured >= 0 ? static_cast<PersistenceLevel>(configured)
+                         : PersistenceLevel::kVolatile;
+}
+
+clio::run::u32 Runtime::CheckTargetDurability(
+    const std::string &target_name, clio::run::bdev::PersistenceLevel level) {
+  const bool volatile_bdev =
+      level == clio::run::bdev::PersistenceLevel::kVolatile;
+  if (!IsVolatileCore() && volatile_bdev) {
+    HLOG(kError,
+         "cte_core ({}): refusing volatile bdev '{}': this core is "
+         "persistent (set persistence_level on the bdev, or make the core "
+         "volatile)",
+         pool_name_, target_name);
+    return kCteVolatileTargetRc;
+  }
+  if (IsVolatileCore() && !volatile_bdev) {
+    HLOG(kWarning,
+         "cte_core ({}): persistent bdev '{}' registered in a volatile core; "
+         "its data will not survive a restart",
+         pool_name_, target_name);
+  }
+  return 0;
+}
+
+bool Runtime::HasVolatileTarget() {
+  for (const auto &t : target_list_) {
+    if (t.persistence_level_ == clio::run::bdev::PersistenceLevel::kVolatile) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void Runtime::ActivateWal() {
+  for (auto &log : blob_txn_logs_) {
+    if (log) log->Activate();
+  }
+  for (auto &log : tag_txn_logs_) {
+    if (log) log->Activate();
+  }
+}
+
+void Runtime::DeactivateWal() {
+  for (auto &log : blob_txn_logs_) {
+    if (log) log->Deactivate();
+  }
+  for (auto &log : tag_txn_logs_) {
+    if (log) log->Deactivate();
+  }
+}
+
+clio::run::TaskResume Runtime::SetDurability(
+    clio::run::shared_ptr<SetDurabilityTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  const clio::run::u32 want = task->durability_;
+  task->previous_ =
+      IsVolatileCore() ? kCteDurabilityVolatile : kCteDurabilityPersistent;
+  if (want != kCteDurabilityVolatile && want != kCteDurabilityPersistent) {
+    task->return_code_ = kCteInvalidDurabilityRc;
+    CLIO_CO_RETURN;
+  }
+  if (want == task->previous_) {
+    task->return_code_ = 0;
+    CLIO_CO_RETURN;
+  }
+  if (want == kCteDurabilityVolatile) {
+    durability_class_.store(CoreDurability::kVolatile,
+                            std::memory_order_release);
+    DeactivateWal();
+    HLOG(kInfo, "cte_core ({}): now volatile; WAL off", pool_name_);
+    task->return_code_ = 0;
+    CLIO_CO_RETURN;
+  }
+  // To persistent. Holding the target write lock makes the check and the
+  // switch atomic with respect to RegisterTarget's insert.
+  {
+    clio::run::ScopedCoRwWriteLock write_lock(target_lock_);
+    if (HasVolatileTarget()) {
+      HLOG(kWarning,
+           "cte_core ({}): stays volatile: a volatile bdev is registered",
+           pool_name_);
+      task->return_code_ = kCteVolatileTargetRc;
+      CLIO_CO_RETURN;
+    }
+    durability_class_.store(CoreDurability::kPersistent,
+                            std::memory_order_release);
+  }
+  if (!config_.performance_.metadata_log_path_.empty()) {
+    // Open the WAL first, then snapshot: a record logged in between is in
+    // both, and replay applies only records newer than the snapshot.
+    ActivateWal();
+    auto snap = client_.AsyncFlushMetadata(clio::run::PoolQuery::Local(), 0);
+    CLIO_CO_AWAIT(snap);
+    if (snap->GetReturnCode() != 0) {
+      HLOG(kError, "cte_core ({}): snapshot after becoming persistent failed "
+           "(rc {})", pool_name_, snap->GetReturnCode());
+    }
+  }
+  HLOG(kInfo, "cte_core ({}): now persistent; WAL {}", pool_name_,
+       config_.performance_.metadata_log_path_.empty() ? "off (no path)"
+                                                       : "on");
+  task->return_code_ = 0;
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
 }
 
 void Runtime::RegisterStopHook() {
@@ -1445,6 +1561,17 @@ clio::run::TaskResume Runtime::RegisterTarget(clio::run::shared_ptr<RegisterTarg
          client_.pool_id_, target_name, total_size, bdev_pool_id.major_,
          bdev_pool_id.minor_);
 
+    // Durability rule, before any bdev is created: a persistent core
+    // refuses a volatile bdev; a volatile core warns about a persistent one.
+    const clio::run::bdev::PersistenceLevel target_level =
+        RegisteringTargetLevel(*task);
+    const clio::run::u32 durability_rc =
+        CheckTargetDurability(target_name, target_level);
+    if (durability_rc != 0) {
+      task->return_code_ = durability_rc;
+      CLIO_CO_RETURN;
+    }
+
     // Create bdev client and container first to get the TargetId (pool_id)
     clio::run::bdev::Client bdev_client;
     std::string bdev_pool_name =
@@ -1629,7 +1756,7 @@ clio::run::TaskResume Runtime::RegisterTarget(clio::run::shared_ptr<RegisterTarg
     target_info.perf_metrics_ =
         perf_metrics;  // Store the entire PerfMetrics structure
     target_info.expected_ttl_days_ = stats_task->predicted_ttl_days_;
-    target_info.persistence_level_ = GetPersistenceLevelForTarget(target_name);
+    target_info.persistence_level_ = target_level;
     target_info.bdev_type_ = task->bdev_type_;
 
     // Register the target using TargetId as key. Mirror into target_list_ so
@@ -1637,6 +1764,17 @@ clio::run::TaskResume Runtime::RegisterTarget(clio::run::shared_ptr<RegisterTarg
     // walk live entries directly without scanning empty map slots.
     {
       clio::run::ScopedCoRwWriteLock write_lock(target_lock_);
+      // SetDurability may have made the core persistent while the bdev was
+      // being created; it checks for volatile targets under this same lock.
+      if (!IsVolatileCore() &&
+          target_level == clio::run::bdev::PersistenceLevel::kVolatile) {
+        HLOG(kError,
+             "cte_core ({}): refusing volatile bdev '{}': the core became "
+             "persistent during registration (bdev pool left in place)",
+             pool_name_, target_name);
+        task->return_code_ = kCteVolatileTargetRc;
+        CLIO_CO_RETURN;
+      }
       registered_targets_.insert_or_assign(target_id, target_info);
       target_name_to_id_.insert_or_assign(
           target_name,
@@ -7297,7 +7435,7 @@ clio::run::TaskResume Runtime::FlushMetadata(clio::run::shared_ptr<FlushMetadata
   task->entries_flushed_ = 0;
 
   const std::string &log_path = config_.performance_.metadata_log_path_;
-  if (log_path.empty()) {
+  if (log_path.empty() || IsVolatileCore()) {
     task->return_code_ = 0;
     CLIO_CO_RETURN;
   }

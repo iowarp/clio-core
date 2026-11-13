@@ -329,14 +329,21 @@ compose:
   #       num_predict: 256
 
   # === Context Transfer Engine (CTE) ===
-  # Two DISCONNECTED cores (design/volatile_persistent_split.md): every core
-  # is either entirely volatile or entirely persistent, and moving data
-  # between them is the job of the write-back cache further down.
+  # Two DISCONNECTED cores (design/volatile_persistent_split.md): each core
+  # is either volatile or persistent, and moving data between them is the
+  # job of the write-back cache further down.
   #
-  # durability: "persistent" | "volatile". Optional; inferred from the
-  #   devices when omitted. A core whose devices mix "volatile" with
-  #   "temporary"/"long_term" fails to start, naming the offending device;
-  #   ram/hbm/pinned bdevs can only be "volatile".
+  # durability: "persistent" | "volatile". Optional. When omitted it is
+  #   inferred at Create: persistent if every storage device has
+  #   persistence_level "temporary" or "long_term", else volatile (a device
+  #   without persistence_level is volatile). Devices are checked as they
+  #   register: a volatile device in a persistent core is refused; a
+  #   persistent device in a volatile core is accepted with a warning.
+  #   A volatile core writes no WAL (metadata_log_path is unused while
+  #   volatile) and starts empty; a persistent core logs metadata to
+  #   metadata_log_path when set and restores it on restart. The class can
+  #   be changed at runtime with Client::AsyncSetDurability until the next
+  #   restart.
   #
   # The PERSISTENT core sits at the canonical CTE entrypoint 512.0
   # (clio::cte::core::kCtePoolId): a client that addresses the core directly

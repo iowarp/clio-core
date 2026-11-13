@@ -73,6 +73,13 @@ static const clio::run::PoolId kVolatilePool(540, 0);
 static const clio::run::PoolId kThruPool(566, 0);
 static const clio::run::PoolId kBackPool(567, 0);
 static const clio::run::PoolId kStrictPool(568, 0);
+// Durability cores (majors spaced: bdev ids are core major + device index).
+/** Unstated durability, persistent bdev only: inferred persistent. */
+static const clio::run::PoolId kInferPersPool(580, 0);
+/** Unstated durability, persistent + volatile bdevs: inferred volatile. */
+static const clio::run::PoolId kInferVolPool(585, 0);
+/** durability: volatile stated over a persistent bdev; switched at runtime. */
+static const clio::run::PoolId kSwitchPool(590, 0);
 /** Volatile RAM tier: small, so eviction and fallback are reachable. */
 static constexpr clio::run::u64 kVolatileBytes = 8ULL << 20;
 static constexpr clio::run::u64 kMiB = 1ULL << 20;
@@ -85,6 +92,13 @@ struct Paths {
   std::string pers_log = dir + "/policy_cache_pers_log";
   std::string vol_log = dir + "/policy_cache_vol_log";
   std::string restart = dir + "/policy_cache_restart.bin";
+  std::string dur_file = dir + "/policy_cache_dur_file.dat";
+  std::string dur_mixed_file = dir + "/policy_cache_dur_mixed.dat";
+  std::string dur_switch_file = dir + "/policy_cache_dur_switch.dat";
+  std::string dur_extra_file = dir + "/policy_cache_dur_extra.dat";
+  std::string dur_pers_log = dir + "/policy_cache_dur_pers_log";
+  std::string dur_mixed_log = dir + "/policy_cache_dur_mixed_log";
+  std::string dur_switch_log = dir + "/policy_cache_dur_switch_log";
 };
 
 /** Remove every file under the test dir whose name starts with `prefix`. */
@@ -146,6 +160,52 @@ compose:
         score: 1.0
     performance:
       metadata_log_path: ")" << p.vol_log << R"("
+
+  - mod_name: clio_cte_core
+    pool_name: cte_dur_inferred_persistent
+    pool_query: local
+    pool_id: 580.0
+    targets:
+      neighborhood: 1
+    storage:
+      - path: ")" << p.dur_file << R"("
+        bdev_type: "file"
+        capacity_limit: "16MB"
+        persistence_level: "temporary"
+    performance:
+      metadata_log_path: ")" << p.dur_pers_log << R"("
+
+  - mod_name: clio_cte_core
+    pool_name: cte_dur_inferred_volatile
+    pool_query: local
+    pool_id: 585.0
+    targets:
+      neighborhood: 1
+    storage:
+      - path: ")" << p.dur_mixed_file << R"("
+        bdev_type: "file"
+        capacity_limit: "16MB"
+        persistence_level: "temporary"
+      - path: "ram::policy_cache_dur_mixed_ram"
+        bdev_type: "ram"
+        capacity_limit: "8MB"
+    performance:
+      metadata_log_path: ")" << p.dur_mixed_log << R"("
+
+  - mod_name: clio_cte_core
+    pool_name: cte_dur_switch
+    pool_query: local
+    pool_id: 590.0
+    durability: volatile
+    targets:
+      neighborhood: 1
+    storage:
+      - path: ")" << p.dur_switch_file << R"("
+        bdev_type: "file"
+        capacity_limit: "16MB"
+        persistence_level: "temporary"
+    performance:
+      metadata_log_path: ")" << p.dur_switch_log << R"("
 )";
 }
 
@@ -252,43 +312,48 @@ static clio::run::u32 FlushCache(const clio::run::PoolId &pool) {
   return f->GetReturnCode();
 }
 
-TEST_CASE("Config - mixed volatile/persistent core is rejected",
+TEST_CASE("Config - durability: stated wins, else inferred from bdevs",
           "[cte][policy_cache][config]") {
-  clio::cte::core::Config cfg;
-  REQUIRE(cfg.LoadFromString(R"(
-storage:
-  - path: "ram::mixed"
-    bdev_type: "ram"
-    capacity_limit: "1MB"
-  - path: "/tmp/mixed.dat"
+  const std::string pers_file = R"(
+  - path: "/tmp/dur.dat"
     bdev_type: "file"
     capacity_limit: "1MB"
     persistence_level: "long_term"
-)"));
+)";
+  const std::string vol_ram = R"(
+  - path: "ram::dur"
+    bdev_type: "ram"
+    capacity_limit: "1MB"
+)";
   clio::cte::core::CoreDurability d;
   std::string err;
-  REQUIRE_FALSE(cfg.ResolveDurability(&d, &err));
-  REQUIRE(err.find("/tmp/mixed.dat") != std::string::npos);
-
-  clio::cte::core::Config ram_marked_durable;
-  REQUIRE(ram_marked_durable.LoadFromString(R"(
-storage:
-  - path: "ram::x"
-    bdev_type: "ram"
+  auto resolve = [&](const std::string &yaml) {
+    clio::cte::core::Config c;
+    REQUIRE(c.LoadFromString(yaml));
+    REQUIRE(c.ResolveDurability(&d, &err));
+    return d;
+  };
+  using clio::cte::core::CoreDurability;
+  // Unstated: persistent only when every bdev is persistent.
+  REQUIRE(resolve("storage:" + pers_file) == CoreDurability::kPersistent);
+  REQUIRE(resolve("storage:" + vol_ram) == CoreDurability::kVolatile);
+  REQUIRE(resolve("storage:" + pers_file + vol_ram) ==
+          CoreDurability::kVolatile);
+  // A file bdev with no persistence_level is volatile.
+  REQUIRE(resolve(R"(storage:
+  - path: "/tmp/dur2.dat"
+    bdev_type: "file"
     capacity_limit: "1MB"
-    persistence_level: "temporary"
-)"));
-  REQUIRE_FALSE(ram_marked_durable.ResolveDurability(&d, &err));
-
-  clio::cte::core::Config vol;
-  REQUIRE(vol.LoadFromString(R"(
-storage:
-  - path: "ram::y"
-    bdev_type: "ram"
-    capacity_limit: "1MB"
-)"));
-  REQUIRE(vol.ResolveDurability(&d, &err));
-  REQUIRE(d == clio::cte::core::CoreDurability::kVolatile);
+)") == CoreDurability::kVolatile);
+  REQUIRE(resolve("dpe:\n  dpe_type: random\n") == CoreDurability::kVolatile);
+  // Stated wins over the bdevs (they are checked as they register).
+  REQUIRE(resolve("durability: volatile\nstorage:" + pers_file) ==
+          CoreDurability::kVolatile);
+  REQUIRE(resolve("durability: persistent\nstorage:" + vol_ram) ==
+          CoreDurability::kPersistent);
+  // An unknown class is a config error.
+  clio::cte::core::Config bad;
+  REQUIRE_FALSE(bad.LoadFromString("durability: sometimes\nstorage:" + vol_ram));
 }
 
 TEST_CASE("Volatile core runs without a WAL", "[cte][policy_cache][wal]") {
@@ -417,6 +482,102 @@ TEST_CASE("Write-back: volatile-full fallback to persistent",
   const clio::run::u32 rc = Put(kStrictPool, tag, "big_strict", 0, big);
   REQUIRE(rc == clio::cte::core::kPutNoSpaceRc);
   REQUIRE(SizeOn(kPersistentPool, tag, "big_strict") == -1);
+}
+
+/** SetDurability on one core; returns rc and stores the previous class. */
+static clio::run::u32 SetDur(const clio::run::PoolId &pool, clio::run::u32 want,
+                             clio::run::u32 *previous = nullptr) {
+  clio::cte::core::Client c(pool);
+  auto f = c.AsyncSetDurability(want);
+  f.Wait();
+  if (previous != nullptr) *previous = f->previous_;
+  return f->GetReturnCode();
+}
+
+/** Register a target on `pool` at runtime with an explicit level. */
+static clio::run::u32 RegisterAt(const clio::run::PoolId &pool,
+                                 const std::string &path,
+                                 clio::run::bdev::BdevType type,
+                                 const clio::run::PoolId &bdev_id,
+                                 clio::run::i32 level) {
+  clio::cte::core::Client c(pool);
+  auto f = c.AsyncRegisterTarget(path, type, 4 * kMiB,
+                                 clio::run::PoolQuery::Local(), bdev_id,
+                                 clio::run::PoolQuery::Local(), 0,
+                                 clio::run::u64(1) << 30, level);
+  f.Wait();
+  return f->GetReturnCode();
+}
+
+TEST_CASE("Durability - inferred at Create from the bdevs",
+          "[cte][policy_cache][durability]") {
+  auto *fx = Fixture();
+  using namespace clio::cte::core;
+  clio::run::u32 prev = 99;
+  // All bdevs persistent: persistent (asking again changes nothing).
+  REQUIRE(SetDur(kInferPersPool, kCteDurabilityPersistent, &prev) == 0);
+  REQUIRE(prev == kCteDurabilityPersistent);
+  REQUIRE(CountPrefixed(fx->p_.dir, "policy_cache_dur_pers_log") > 0);
+  // A volatile bdev among them: volatile, no WAL written, and it cannot be
+  // made persistent while that bdev is registered.
+  REQUIRE(CountPrefixed(fx->p_.dir, "policy_cache_dur_mixed_log") == 0);
+  REQUIRE(SetDur(kInferVolPool, kCteDurabilityPersistent, &prev) ==
+          kCteVolatileTargetRc);
+  REQUIRE(prev == kCteDurabilityVolatile);
+  REQUIRE(CountPrefixed(fx->p_.dir, "policy_cache_dur_mixed_log") == 0);
+}
+
+TEST_CASE("Durability - RegisterTarget checks the bdev against the core",
+          "[cte][policy_cache][durability]") {
+  auto *fx = Fixture();
+  using namespace clio::cte::core;
+  using clio::run::bdev::BdevType;
+  // A persistent core refuses a volatile bdev, whether the level is given
+  // or defaulted (an unlisted target is volatile).
+  REQUIRE(RegisterAt(kInferPersPool, "ram::policy_cache_dur_reject", BdevType::kRam,
+                     clio::run::PoolId(580, 50), -1) == kCteVolatileTargetRc);
+  REQUIRE(RegisterAt(kInferPersPool, "ram::policy_cache_dur_reject2",
+                     BdevType::kRam, clio::run::PoolId(580, 51),
+                     0) == kCteVolatileTargetRc);
+  // A volatile core accepts a persistent bdev (with a warning).
+  REQUIRE(RegisterAt(kSwitchPool, fx->p_.dur_extra_file, BdevType::kFile,
+                     clio::run::PoolId(590, 50), 1) == 0);
+}
+
+TEST_CASE("Durability - SetDurability switches the WAL at runtime",
+          "[cte][policy_cache][durability]") {
+  auto *fx = Fixture();
+  using namespace clio::cte::core;
+  clio::cte::core::Client sw(kSwitchPool);
+  auto tf = sw.AsyncGetOrCreateTag("dur_switch_tag");
+  tf.Wait();
+  REQUIRE(tf->GetReturnCode() == 0);
+  const TagId tag = tf->tag_id_;
+  const std::string a = Payload(64 * 1024, 'a');
+  // Volatile (stated): puts work and no WAL is written.
+  REQUIRE(Put(kSwitchPool, tag, "while_volatile", 0, a) == 0);
+  REQUIRE(CountPrefixed(fx->p_.dir, "policy_cache_dur_switch_log") == 0);
+  // To persistent: the WAL opens and a snapshot is written.
+  clio::run::u32 prev = 99;
+  REQUIRE(SetDur(kSwitchPool, kCteDurabilityPersistent, &prev) == 0);
+  REQUIRE(prev == kCteDurabilityVolatile);
+  REQUIRE(CountPrefixed(fx->p_.dir, "policy_cache_dur_switch_log") > 0);
+  REQUIRE(Put(kSwitchPool, tag, "while_persistent", 0, a) == 0);
+  REQUIRE(Get(kSwitchPool, tag, "while_volatile", 0, a.size()) == a);
+  // A persistent core refuses an unknown class and volatile bdevs.
+  REQUIRE(SetDur(kSwitchPool, 7) == kCteInvalidDurabilityRc);
+  REQUIRE(RegisterAt(kSwitchPool, "ram::policy_cache_dur_sw_ram",
+                     clio::run::bdev::BdevType::kRam, clio::run::PoolId(590, 51),
+                     -1) == kCteVolatileTargetRc);
+  // Back to volatile; then a volatile bdev registers, after which the core
+  // cannot become persistent again.
+  REQUIRE(SetDur(kSwitchPool, kCteDurabilityVolatile, &prev) == 0);
+  REQUIRE(prev == kCteDurabilityPersistent);
+  REQUIRE(RegisterAt(kSwitchPool, "ram::policy_cache_dur_sw_ram",
+                     clio::run::bdev::BdevType::kRam, clio::run::PoolId(590, 52),
+                     -1) == 0);
+  REQUIRE(SetDur(kSwitchPool, kCteDurabilityPersistent) == kCteVolatileTargetRc);
+  REQUIRE(Get(kSwitchPool, tag, "while_persistent", 0, a.size()) == a);
 }
 
 SIMPLE_TEST_MAIN()

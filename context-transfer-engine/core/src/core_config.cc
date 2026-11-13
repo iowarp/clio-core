@@ -197,87 +197,28 @@ bool Config::Validate() const {
   return true;
 }
 
-/**
- * Whether a device is a memory bdev (volatile by nature).
- * @param device the device
- * @return true for ram/hbm/pinned
- */
-static bool IsMemoryBdev(const StorageDeviceConfig &device) {
-  return device.bdev_type_ == "ram" || device.bdev_type_ == "hbm" ||
-         device.bdev_type_ == "pinned";
-}
-
-/**
- * Infer the class of a core whose durability key is unset.
- * @param devices the core's devices (memory bdevs already validated)
- * @param has_wal whether metadata_log_path is set
- * @return the inferred class
- */
-static CoreDurability InferDurability(
-    const std::vector<StorageDeviceConfig> &devices, bool has_wal) {
-  bool any_volatile = false;
-  bool any_persistent = false;
-  for (const auto &d : devices) {
-    if (IsMemoryBdev(d) ||
-        (d.persistence_explicit_ && d.persistence_level_ == "volatile")) {
-      any_volatile = true;
-    } else if (d.persistence_explicit_) {
-      any_persistent = true;
-    }
+bool Config::ResolveDurability(CoreDurability *out, std::string *error) const {
+  if (durability_ == "persistent") {
+    *out = CoreDurability::kPersistent;
+    return true;
   }
-  if (any_volatile) return CoreDurability::kVolatile;
-  if (any_persistent) return CoreDurability::kPersistent;
-  return has_wal ? CoreDurability::kPersistent : CoreDurability::kVolatile;
-}
-
-bool Config::ResolveDurability(CoreDurability *out, std::string *error) {
-  for (const auto &device : storage_.devices_) {
-    if (IsMemoryBdev(device) && device.persistence_level_ != "volatile") {
-      *error = "device '" + device.path_ + "' is a " + device.bdev_type_ +
-               " bdev but has persistence_level '" +
-               device.persistence_level_ +
-               "'; memory tiers can only be 'volatile'";
-      return false;
-    }
-  }
-  CoreDurability resolved;
   if (durability_ == "volatile") {
-    resolved = CoreDurability::kVolatile;
-  } else if (durability_ == "persistent") {
-    resolved = CoreDurability::kPersistent;
-  } else if (!durability_.empty()) {
+    *out = CoreDurability::kVolatile;
+    return true;
+  }
+  if (!durability_.empty()) {
     *error = "durability '" + durability_ +
              "' must be 'volatile' or 'persistent'";
     return false;
-  } else {
-    resolved = InferDurability(storage_.devices_,
-                               !performance_.metadata_log_path_.empty());
   }
-  // Unlabeled disk/object devices take the class; then every device must
-  // match it.
-  for (auto &device : storage_.devices_) {
-    if (!device.persistence_explicit_ && !IsMemoryBdev(device)) {
-      device.persistence_level_ =
-          resolved == CoreDurability::kPersistent ? "temporary" : "volatile";
-    }
-    const bool is_volatile = device.persistence_level_ == "volatile";
-    if (resolved == CoreDurability::kVolatile && !is_volatile) {
-      *error = "core mixes volatile and persistent storage devices: '" +
-               device.path_ + "' has persistence_level '" +
-               device.persistence_level_ +
-               "' in a volatile core. Split them into a volatile and a "
-               "persistent core behind a clio_cte_write_back_cache or "
-               "clio_cte_write_thru_cache";
-      return false;
-    }
-    if (resolved == CoreDurability::kPersistent && is_volatile) {
-      *error = "device '" + device.path_ +
-               "' is volatile in a persistent core (memory tiers belong in "
-               "a separate volatile core)";
-      return false;
-    }
+  // Not stated: persistent only when the core has devices and every one is
+  // labeled persistent (persistence_level temporary or long_term).
+  bool all_persistent = !storage_.devices_.empty();
+  for (const auto &device : storage_.devices_) {
+    if (device.persistence_level_ == "volatile") all_persistent = false;
   }
-  *out = resolved;
+  *out = all_persistent ? CoreDurability::kPersistent
+                        : CoreDurability::kVolatile;
   return true;
 }
 
@@ -402,7 +343,7 @@ bool Config::ParseYamlNode(const YAML::Node &node) {
     organizer_.period_ms_ = node["organizer_period_ms"].as<clio::run::u32>();
   }
 
-  // Durability class (volatile | persistent); empty = infer from devices.
+  // Durability class (volatile | persistent); empty = infer at Create.
   if (node["durability"]) {
     durability_ = node["durability"].as<std::string>();
     if (durability_ != "volatile" && durability_ != "persistent") {

@@ -69,15 +69,9 @@ module above them, never of a core.**
     and produces a log whose replay must then throw the blocks away.
 - **`cte_persistent`:** file, object and long-term NVMe targets. Metadata
   log on. A blob it accepts is durable.
-- **Config validation:** a core whose targets mix volatile and `long_term`
-  persistence levels is a config error. This replaces the runtime durability
-  rules.
-  - A core states its class with `durability: volatile | persistent`. When
-    the key is absent the class is inferred from the devices (all
-    `volatile` -> volatile, none `volatile` -> persistent).
-  - Errors, each naming the offending device: a `volatile` device in a
-    persistent core, a `temporary`/`long_term` device in a volatile core,
-    and a `ram`/`hbm`/`pinned` bdev marked anything but `volatile`.
+- **Durability** (amendment 6.6). A core states its class with
+  `durability: volatile | persistent`, or it is inferred from the devices'
+  `persistence_level` at Create. Devices are checked as they register.
   - `temporary` counts as persistent: it survives a process restart, which
     is the boundary the WAL protects.
 
@@ -175,8 +169,8 @@ everything (`AGENTS.md`).
      - read fill on miss
      - stale copy never served after a write
      - eviction under a small volatile core
-3. **Config validation.** Reject cores that mix volatile and persistent
-   targets; give a clear error naming the offending device. Update
+3. **Config.** Add the core's `durability: volatile | persistent` key
+   (inferred from the devices when omitted, see 6.6). Update
    `context-runtime/config/clio_default.yaml` and
    `docs/docs/deployment/configuration.md` (AGENTS.md rule).
 4. **Move fsync.** Route `SyncTag` and the filesystem's fsync through the
@@ -238,7 +232,7 @@ again.
 ## 6. Amendments (2026-11-12)
 
 ### 6.1 A volatile core has no WAL
-- `durability: volatile` (stated or inferred) clears `metadata_log_path`
+- `durability: volatile` clears `metadata_log_path`
   at config load and logs a warning when it was set. Every WAL path in the
   core already keys off that path being non-empty, so this one decision
   turns off: the per-worker transaction-log shards, the snapshot, the
@@ -342,3 +336,23 @@ again.
   the cache does not handle is forwarded there unchanged.
 - The core's `FlushData` keeps the meaning of 6.2: sync devices and the
   WAL. It does not move data to any other pool.
+
+### 6.6 Durability: stated, or inferred from the bdevs; switchable (2026-11-13)
+- `durability: volatile | persistent` states the class. When it is
+  omitted, Create infers it: persistent if every device's
+  `persistence_level` is `temporary` or `long_term`, else volatile. A
+  device without `persistence_level` is volatile; `bdev_type` is never
+  consulted.
+- Every registration (compose devices at Create, and `RegisterTarget` at
+  runtime, which now carries the bdev's `persistence_level`) is checked:
+  a volatile bdev in a persistent core is refused with
+  `kCteVolatileTargetRc` (16); a persistent bdev in a volatile core is
+  accepted with a warning.
+- `SetDurability` (method 59, `Client::AsyncSetDurability`) switches a
+  running core. To persistent it is refused while a volatile bdev is
+  registered; otherwise the WAL shards open and a full snapshot is written
+  so state built while volatile becomes durable. To volatile the shards
+  close and later records are dropped. The shards are allocated once at
+  Create whenever `metadata_log_path` is set, so writers never see them
+  resized; only whether they write changes. A restart goes back to the
+  config.

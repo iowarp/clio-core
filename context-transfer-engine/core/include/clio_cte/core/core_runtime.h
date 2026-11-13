@@ -549,6 +549,17 @@ public:
   clio::run::TaskResume TagXattr(clio::run::shared_ptr<TagXattrTask> &task);
 
   /**
+   * SetDurability (Method::kSetDurability) - switch this core between
+   * volatile and persistent. To persistent: refused with
+   * kCteVolatileTargetRc while a volatile target is registered; else the
+   * WAL shards open and a full metadata snapshot is written so the state
+   * built while volatile is durable. To volatile: the WAL shards close.
+   * @param task the SetDurabilityTask; previous_ receives the old class
+   */
+  clio::run::TaskResume SetDurability(
+      clio::run::shared_ptr<SetDurabilityTask> &task);
+
+  /**
    * Get tag size operation - returns total size of all blobs in tag
    */
   clio::run::TaskResume GetTagSize(clio::run::shared_ptr<GetTagSizeTask> &task);
@@ -801,23 +812,58 @@ private:
   // CTE configuration (replaces ConfigManager singleton)
   Config config_;
 
-  // Durability class resolved from config_ in Create (ApplyDurability).
-  CoreDurability durability_class_ = CoreDurability::kPersistent;
+  // Durability class: resolved from config_ in Create (ApplyDurability),
+  // changed at runtime by SetDurability. Atomic: every worker reads it.
+  std::atomic<CoreDurability> durability_class_{CoreDurability::kVolatile};
 
  public:
   /** Whether this core is volatile (no WAL, empty after every start). */
   bool IsVolatileCore() const {
-    return durability_class_ == CoreDurability::kVolatile;
+    return durability_class_.load(std::memory_order_acquire) ==
+           CoreDurability::kVolatile;
   }
 
  private:
   /**
-   * Resolve the durability class from config_ and apply what it implies.
-   * A volatile core runs without a WAL: metadata_log_path_ is cleared (with
-   * a warning if it was set) and a restart is treated as a fresh start.
-   * @return true on success; false (logged) when the devices mix classes
+   * Resolve the durability class from config_ (Config::ResolveDurability)
+   * and apply what it implies. A volatile core keeps its WAL shards closed
+   * (records are dropped) and treats a restart as a fresh start.
+   * @return true on success; false (logged) for an unknown durability value
    */
   bool ApplyDurability();
+
+  /**
+   * Durability label of a target being registered: the task's
+   * persistence_level_ when given (>= 0), else the core's storage config
+   * entry for the target, else volatile.
+   * @param task the RegisterTargetTask
+   * @return the bdev's persistence level
+   */
+  clio::run::bdev::PersistenceLevel RegisteringTargetLevel(
+      RegisterTargetTask &task);
+
+  /**
+   * Apply the durability rule to one bdev registration: a volatile bdev in
+   * a persistent core is refused; a persistent bdev in a volatile core is
+   * accepted with a warning.
+   * @param target_name the target being registered
+   * @param level its durability label
+   * @return 0 to proceed, or kCteVolatileTargetRc
+   */
+  clio::run::u32 CheckTargetDurability(const std::string &target_name,
+                                       clio::run::bdev::PersistenceLevel level);
+
+  /**
+   * @return true when any registered target is volatile. The caller holds
+   *         target_lock_ (SetDurability holds it for writing).
+   */
+  bool HasVolatileTarget();
+
+  /** Open every WAL shard (the core is becoming persistent). */
+  void ActivateWal();
+
+  /** Close every WAL shard; later records are dropped (now volatile). */
+  void DeactivateWal();
 
   // Cached Data Placement Engine — built once from config_ in Create() so
   // ExtendBlob does not allocate a fresh DPE on every PutBlob.

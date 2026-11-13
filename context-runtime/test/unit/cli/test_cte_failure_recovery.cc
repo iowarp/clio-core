@@ -210,11 +210,11 @@ TEST_CASE("CorruptRestore - corrupt snapshot and WAL do not kill the daemon",
          "    pool_id: \"701.0\"\n"
          "    restart: true\n"
          "    storage:\n"
-         // A disk tier: a RAM-only core is volatile and runs without the
-         // WAL this test corrupts.
+         // A persistent bdev, so the core is persistent and keeps a WAL.
          "      - path: " << (work_dir / "disk_dev.bin").string() << "\n"
          "        bdev_type: file\n"
          "        capacity_limit: 64mb\n"
+         "        persistence_level: temporary\n"
          "    dpe:\n"
          "      dpe_type: random\n"
          "    performance:\n"
@@ -397,6 +397,7 @@ TEST_CASE("BlobTimes - restored blobs keep their write times",
          "      - path: " << (work_dir / "disk.bin").string() << "\n"
          "        bdev_type: file\n"
          "        capacity_limit: 64mb\n"
+         "        persistence_level: temporary\n"
          "    dpe:\n"
          "      dpe_type: random\n"
          "    performance:\n"

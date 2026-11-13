@@ -198,13 +198,14 @@ struct OrganizerConfig {
 };
 
 /**
- * Durability class of one CTE core. A core is EITHER entirely volatile OR
- * entirely persistent (design/volatile_persistent_split.md): moving data
- * between the two is the job of a cache module above the cores.
+ * Durability class of one CTE core, stated by its `durability` key
+ * (design/volatile_persistent_split.md). It is the core's role, not a
+ * property of its storage: moving data between a volatile and a persistent
+ * core is the job of a cache module above them.
  */
 enum class CoreDurability {
-  kVolatile,    ///< hbm/ram/scratch tiers; no WAL; empty after every start
-  kPersistent,  ///< file/object/long-term tiers; WAL on; accepted = durable
+  kVolatile,    ///< no WAL; empty after every start
+  kPersistent,  ///< WAL on when metadata_log_path is set; rejects volatile bdevs
 };
 
 /**
@@ -239,9 +240,9 @@ class Config {
   OrganizerConfig organizer_;
 
   /**
-   * Stated durability class (YAML key `durability`): "volatile",
-   * "persistent", or empty to infer it from the storage devices. Read it
-   * through ResolveDurability, which also validates the devices.
+   * Durability class (YAML key `durability`): "volatile", "persistent",
+   * or empty to infer it from the devices' persistence_level at Create.
+   * Read it through ResolveDurability.
    */
   std::string durability_;
 
@@ -292,26 +293,18 @@ class Config {
   bool Validate() const;
 
   /**
-   * Resolve and validate this core's durability class, and give every
-   * device without an explicit persistence_level the class's level.
+   * Resolve this core's durability class.
    *
-   * Memory bdevs (ram/hbm/pinned) are always volatile. Devices with an
-   * explicit persistence_level count as labeled. The class is durability_
-   * when stated; else volatile if any device is volatile (memory or
-   * labeled), persistent if any labeled device is temporary/long_term, and
-   * for a core of only unlabeled disk/object devices, persistent iff
-   * metadata_log_path_ is set (a WAL means the deployment wants it kept).
-   * Unlabeled disk/object devices then take "temporary" (persistent) or
-   * "volatile". Errors, each naming the offending device: a volatile
-   * device in a persistent core, a temporary/long_term device in a
-   * volatile core, a memory bdev marked anything but volatile, and an
-   * unknown durability_ value.
+   * A stated durability_ wins. Unstated: persistent when the core has
+   * devices and every one has persistence_level temporary or long_term,
+   * else volatile (including no devices). Devices are checked against the
+   * class one at a time when they register (Runtime::RegisterTarget).
    *
    * @param out receives the resolved class on success
    * @param error receives a human-readable reason on failure
-   * @return true when the configuration is uniform and valid
+   * @return false only for an unknown durability_ value
    */
-  bool ResolveDurability(CoreDurability *out, std::string *error);
+  bool ResolveDurability(CoreDurability *out, std::string *error) const;
 
   /**
    * Get configuration parameter as string for debugging
