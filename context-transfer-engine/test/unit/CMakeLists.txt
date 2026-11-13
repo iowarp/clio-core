@@ -1474,8 +1474,7 @@ set_tests_properties(
 )
 endif()  # full 4-layer cache stack
 
-# Policy caches over disconnected volatile/persistent cores
-# (design/volatile_persistent_split.md).
+# Policy caches over disconnected volatile/persistent cores.
 if(CLIO_CTE_ENABLE_POLICY_CACHES)
 add_executable(test_policy_cache test_policy_cache.cc)
 target_include_directories(test_policy_cache PRIVATE

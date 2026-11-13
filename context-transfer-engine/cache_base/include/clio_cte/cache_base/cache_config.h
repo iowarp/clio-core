@@ -76,8 +76,7 @@ inline bool ParsePoolIdString(const std::string &s, clio::run::PoolId *out) {
 }
 
 /**
- * Configuration shared by the policy cache modules
- * (design/volatile_persistent_split.md, sections 2.2 and 6). Compose keys:
+ * Configuration shared by the policy cache modules. Compose keys:
  *
  *   next_volatile: "540.0"         # volatile core (required)
  *   next_persistent: "561.0"       # persistent chain (omit: volatile only)

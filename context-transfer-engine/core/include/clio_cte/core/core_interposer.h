@@ -238,7 +238,7 @@ class CoreInterposer : public clio::run::Container {
 };
 
 /**
- * Interposer with TWO next pools (design/volatile_persistent_split.md): a
+ * Interposer with TWO next pools: a
  * volatile core and a persistent chain. The persistent chain is the base's
  * single next pool, so every forwarded verb, the wire serialization defaults
  * and owner routing (ScheduleTask) all keep going to the authoritative side.

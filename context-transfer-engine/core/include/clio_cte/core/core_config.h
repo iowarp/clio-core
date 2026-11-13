@@ -198,9 +198,9 @@ struct OrganizerConfig {
 };
 
 /**
- * Durability class of one CTE core, stated by its `durability` key
- * (design/volatile_persistent_split.md). It is the core's role, not a
- * property of its storage: moving data between a volatile and a persistent
+ * Durability class of one CTE core: stated by its `durability` key, or
+ * inferred from its devices' persistence_level at Create. Moving data
+ * between a volatile and a persistent
  * core is the job of a cache module above them.
  */
 enum class CoreDurability {

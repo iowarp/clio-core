@@ -1,4 +1,4 @@
-# Write-back policy cache (design/volatile_persistent_split.md).
+# Write-back policy cache.
 # Sits above two disconnected CTE cores: a volatile core (next_volatile) and
 # a persistent chain (next_persistent), and is a put is acked after the volatile write; dirty copies are flushed periodically, on SyncTag/FlushData, before eviction, and at stop.
 # Speaks the CTE core's task interface: point a clio::cte::core::Client at it.

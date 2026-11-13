@@ -92,7 +92,7 @@ enum class PinState {
 
 /**
  * Shared runtime of the policy-named caches (clio_cte_write_thru_cache and
- * clio_cte_write_back_cache; design/volatile_persistent_split.md).
+ * clio_cte_write_back_cache).
  *
  * The cache sits above two DISCONNECTED cores: a volatile core reached with
  * an ordinary client at PoolQuery::Local(), and a persistent chain that is

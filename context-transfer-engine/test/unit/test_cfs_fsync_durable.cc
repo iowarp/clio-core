@@ -35,7 +35,7 @@
  * fsync through the descriptor layer (the POSIX/STDIO/MPI-IO interceptors)
  * must put a file's bytes on a persistent device (issue #1188).
  *
- * Layout (design/volatile_persistent_split.md): a persistent core (file
+ * Layout: a persistent core (file
  * tier) and a volatile core (RAM) behind a write-back cache, with the
  * filesystem over the cache. Writes are acked from the volatile core, so the
  * persistent file tier fills only once fsync makes the cache flush the

@@ -329,7 +329,7 @@ compose:
   #       num_predict: 256
 
   # === Context Transfer Engine (CTE) ===
-  # Two DISCONNECTED cores (design/volatile_persistent_split.md): each core
+  # Two DISCONNECTED cores: each core
   # is either volatile or persistent, and moving data between them is the
   # job of the write-back cache further down.
   #
@@ -527,7 +527,7 @@ compose:
     # owner returns. Default: "" (kept in memory only).
     # handoff_log_path: "/var/lib/clio/cte_handoff_log"
 
-  # === Write-back cache (design/volatile_persistent_split.md) ===
+  # === Write-back cache ===
   # Sits over the two disconnected cores and owns every durability
   # decision: a put lands in the volatile core and is acked; dirty copies
   # are flushed to the persistent chain periodically, on fsync (SyncTag) and

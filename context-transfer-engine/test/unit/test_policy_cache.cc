@@ -32,8 +32,7 @@
  */
 
 /**
- * Policy caches over a volatile and a persistent core
- * (design/volatile_persistent_split.md).
+ * Policy caches over a volatile and a persistent core.
  *
  * One runtime composes two DISCONNECTED cores -- persistent 512.0 (file tier,
  * WAL on) and volatile 540.0 (a small RAM tier, given a metadata_log_path it

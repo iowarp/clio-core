@@ -108,8 +108,8 @@ else()
     message(STATUS "CTE: cache chimod disabled (use -DCLIO_CTE_ENABLE_CACHE=ON)")
 endif()
 
-# Policy-named caches over a volatile and a persistent CTE core
-# (design/volatile_persistent_split.md). Both share cache_base/.
+# Policy-named caches over a volatile and a persistent CTE core.
+# Both share cache_base/.
 option(CLIO_CTE_ENABLE_POLICY_CACHES
        "Build the write-through and write-back cache chimods" ON)
 if(CLIO_CTE_ENABLE_POLICY_CACHES)

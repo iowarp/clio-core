@@ -1,4 +1,4 @@
-# Write-through policy cache (design/volatile_persistent_split.md).
+# Write-through policy cache.
 # Sits above two disconnected CTE cores: a volatile core (next_volatile) and
 # a persistent chain (next_persistent), and is strongly consistent: a put is acked after the persistent write; the volatile copy is optional and never dirty.
 # Speaks the CTE core's task interface: point a clio::cte::core::Client at it.
