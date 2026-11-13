@@ -27,6 +27,9 @@ static constexpr const char *kLz4PoolName = "clio_cte_lz4";
 /** Context::compress_lib_ value that asks this module to compress a put
  *  (clio-infer: --codec 25). Any other value forwards untouched. */
 static constexpr int kGpuLz4Lib = 25;
+/** Context::compress_lib_ for interleaved rANS pages ("gpu-ans", ~1.48x on
+ *  BF16 esm pages against LZ4's ~1.28x). Same container, same GPU decode. */
+static constexpr int kGpuAnsLib = 26;
 
 /**
  * Container creation params.

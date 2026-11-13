@@ -478,8 +478,10 @@ compose:
     # handoff_log_path: "/var/lib/clio/cte_handoff_log"
 
   # === GPU-portable page compression (optional) ===
-  # LZ4 pages in the ctp gpu_lz4 format: encoded on the host when a put asks
-  # for codec 25 ("gpu-lz4"), decoded on the GPU -- one shared decoder for
+  # Pages in the ctp gpu_lz4 container: encoded on the host when a put asks
+  # for codec 25 ("gpu-lz4", LZ4 blocks) or 26 ("gpu-ans", interleaved rANS:
+  # ~1.48x on BF16 esm weights vs LZ4's ~1.28x, and faster to decode),
+  # decoded on the GPU -- one shared decoder for
   # CUDA, ROCm and SYCL (Intel), no nvCOMP -- straight into a device reader's
   # memory (gpu_vector page faults). A page on a device (hbm) tier decodes in
   # place; a page on a host or file tier is staged into device memory first.

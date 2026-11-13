@@ -50,7 +50,7 @@
 #include <vector>
 
 #include "compress.h"
-#include "gpu_lz4.h"
+#include "gpu_ans.h"
 
 namespace ctp {
 
@@ -85,12 +85,33 @@ class GpuLz4 : public Compressor {
     const uint64_t raw =
         gpu_lz4::RawSizeOf(static_cast<const uint8_t *>(input), input_size);
     if (raw == 0 || raw > output_size) return false;
-    if (!gpu_lz4::DecodePage(input, input_size, output, output_size)) {
+    if (!gpu_lz4::DecodePageAny(input, input_size, output, output_size)) {
       return false;
     }
     output_size = static_cast<size_t>(raw);
     return true;
   }
+};
+
+/**
+ * Host compressor for the gpu_ans page format (interleaved rANS, gpu_ans.h):
+ * registered as "gpu-ans" (wire id 26). Same split as GpuLz4: this is the
+ * host half; the LZ4 ChiMod decodes it on the GPU.
+ */
+class GpuAns : public GpuLz4 {
+ public:
+  /** Encode `input` as one gpu_ans page (see GpuLz4::Compress). */
+  bool Compress(void *output, size_t &output_size, void *input,
+                size_t input_size) override {
+    if (input_size == 0) return false;
+    std::vector<uint8_t> enc;
+    gpu_lz4::EncodePageAns(input, input_size, enc);
+    if (enc.size() > output_size) return false;
+    std::memcpy(output, enc.data(), enc.size());
+    output_size = enc.size();
+    return true;
+  }
+  // Decompress is GpuLz4's: DecodePageAny dispatches on the page's magic.
 };
 
 }  // namespace ctp

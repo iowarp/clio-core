@@ -41,7 +41,7 @@
 
 #include <clio_cte/core/blob_transform.h>
 #include <clio_cte/lz4/lz4_runtime.h>
-#include <clio_ctp/compress/gpu_lz4.h>
+#include <clio_ctp/compress/gpu_ans.h>
 #include <clio_ctp/util/gpu_api.h>
 
 // In-process locators (defined in the runtime core library): a blob's
@@ -152,7 +152,8 @@ clio::cte::core::Client *Runtime::GetNextClient() {
 }
 
 bool Runtime::WantsLz4(const Context &ctx) {
-  return ctx.compress_lib_ == kGpuLz4Lib && ctx.replica_ == 0 && !ctx.emulate_;
+  return (ctx.compress_lib_ == kGpuLz4Lib || ctx.compress_lib_ == kGpuAnsLib) &&
+         ctx.replica_ == 0 && !ctx.emulate_;
 }
 
 // ------------------------------------------------------------ resources
@@ -211,7 +212,11 @@ clio::run::TaskResume Runtime::EncodeAndPut(
     clio::run::u32 &rc, Context &out_ctx) {
   CLIO_TASK_BODY_BEGIN
   std::vector<uint8_t> enc;
-  glz::EncodePage(src, n, enc, static_cast<int>(config_.depth_));
+  if (ctx.compress_lib_ == kGpuAnsLib) {
+    glz::EncodePageAns(src, n, enc);
+  } else {
+    glz::EncodePage(src, n, enc, static_cast<int>(config_.depth_));
+  }
   const bool shrank = enc.size() < n;
   // A page that does not shrink is stored raw, recorded as untransformed.
   const char *bytes = shrank ? reinterpret_cast<const char *>(enc.data()) : src;
@@ -251,7 +256,9 @@ clio::run::TaskResume Runtime::PutBlob(
   if (!WantsLz4(ctx) || !whole || task->size_ == 0 || src.ptr_ == nullptr) {
     // A partial write cannot patch an encoded page: such a put stores raw
     // bytes and must never be recorded as carrying the codec.
-    if (ctx.compress_lib_ == kGpuLz4Lib) ctx.compress_lib_ = 0;
+    if (ctx.compress_lib_ == kGpuLz4Lib || ctx.compress_lib_ == kGpuAnsLib) {
+      ctx.compress_lib_ = 0;
+    }
     CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kPutBlob,
                                 task.template Cast<clio::run::Task>()));
     CLIO_CO_RETURN;
@@ -285,7 +292,9 @@ clio::run::TaskResume Runtime::PodPutBlob(
   auto src = CLIO_IPC->ToFullPtr<char>(task->blob_data_.template Cast<char>());
   if (!WantsLz4(ctx) || task->offset_ != 0 || task->size_ == 0 ||
       src.ptr_ == nullptr) {
-    if (ctx.compress_lib_ == kGpuLz4Lib) ctx.compress_lib_ = 0;
+    if (ctx.compress_lib_ == kGpuLz4Lib || ctx.compress_lib_ == kGpuAnsLib) {
+      ctx.compress_lib_ = 0;
+    }
     CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kPodPutBlob,
                                 task.template Cast<clio::run::Task>()));
     CLIO_CO_RETURN;
@@ -384,7 +393,8 @@ clio::run::TaskResume Runtime::ReadViaHost(const TagId &tag_id,
   if (rec.rc == 0 && StoredCompressed(get->context_)) {
     const auto *p = reinterpret_cast<const uint8_t *>(buf.ptr_);
     raw.resize(static_cast<size_t>(glz::RawSizeOf(p, stored)));
-    if (raw.empty() || !glz::DecodePage(p, stored, raw.data(), raw.size())) {
+    if (raw.empty() ||
+        !glz::DecodePageAny(p, stored, raw.data(), raw.size())) {
       HLOG(kError, "lz4: page '{}' failed to decode", rec.name);
       rec.rc = 1;
     }

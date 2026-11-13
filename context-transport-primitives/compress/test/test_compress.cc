@@ -356,10 +356,11 @@ TEST_CASE("CompressorRegistryMappings") {
     REQUIRE(CompressionFactory::NameForWireId(23) == "sycl-ans");
     REQUIRE(CompressionFactory::NameForWireId(24) == "sycl-zstd");
     REQUIRE(CompressionFactory::NameForWireId(25) == "gpu-lz4");
+    REQUIRE(CompressionFactory::NameForWireId(26) == "gpu-ans");
     // Out-of-range falls back to the historical default. (Registry rows are
     // build-independent, so the GPU names above resolve even without nvcomp.)
     REQUIRE(CompressionFactory::NameForWireId(-1) == "zstd");
-    REQUIRE(CompressionFactory::NameForWireId(26) == "zstd");
+    REQUIRE(CompressionFactory::NameForWireId(27) == "zstd");
     REQUIRE(CompressionFactory::NameForWireId(9999) == "zstd");
   }
 
@@ -430,6 +431,7 @@ TEST_CASE("CompressorRegistryMappings") {
     REQUIRE(CompressionFactory::GetLibraryId("sycl-ans", BEST) == 252);
     REQUIRE(CompressionFactory::GetLibraryId("sycl-zstd", BEST) == 262);
     REQUIRE(CompressionFactory::GetLibraryId("gpu-lz4", BEST) == 272);
+    REQUIRE(CompressionFactory::GetLibraryId("gpu-ans", BEST) == 282);
   }
 
   PAGE_DIVIDE("ML library id -> name + preset (reverse)") {
@@ -465,6 +467,7 @@ TEST_CASE("CompressorRegistryMappings") {
     REQUIRE(CompressionFactory::GetLibraryInfo(252).first == "sycl-ans");
     REQUIRE(CompressionFactory::GetLibraryInfo(262).first == "sycl-zstd");
     REQUIRE(CompressionFactory::GetLibraryInfo(272).first == "gpu-lz4");
+    REQUIRE(CompressionFactory::GetLibraryInfo(282).first == "gpu-ans");
   }
 
   PAGE_DIVIDE("GetPreset constructs the CPU compressors this build HAS") {

@@ -52,7 +52,8 @@ namespace clio::cte::lz4 {
 /**
  * LZ4 page compressor in front of the CTE core (see clio_mod.yaml).
  *
- * PUT: a whole-blob put whose Context asks for kGpuLz4Lib is encoded on the
+ * PUT: a whole-blob put whose Context asks for kGpuLz4Lib (LZ4) or kGpuAnsLib
+ * (interleaved rANS) is encoded on the
  * host (ctp::gpu_lz4::EncodePage) and stored marked kBlobTransformCompressed.
  *
  * GET into DEVICE memory (gpu_vector faults, PodGetBlob/PodMultiGetBlob): every

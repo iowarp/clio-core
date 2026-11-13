@@ -574,6 +574,10 @@ class CompressionFactory {
   static std::unique_ptr<Compressor> MakeGpuLz4(CompressionPreset) {
     return std::make_unique<GpuLz4>();
   }
+  // gpu_ans page format, host side (always available: no dependency).
+  static std::unique_ptr<Compressor> MakeGpuAns(CompressionPreset) {
+    return std::make_unique<GpuAns>();
+  }
   static std::unique_ptr<Compressor> MakeSyclZstd(CompressionPreset) {
 #if CTP_ENABLE_SYCL_ZSTD
     return std::make_unique<SyclZstd>();
@@ -669,6 +673,8 @@ class CompressionFactory {
         // Host codec for the portable gpu_lz4 page format; the LZ4 ChiMod
         // decodes it on CUDA/ROCm/SYCL itself, so device=false here.
         CompressorInfo{"gpu-lz4",         25, 27, true,  &MakeGpuLz4, false},
+        // Same container, interleaved rANS chunks (gpu_ans.h); same split.
+        CompressorInfo{"gpu-ans",         26, 28, true,  &MakeGpuAns, false},
     };
     return kRegistry;
   }

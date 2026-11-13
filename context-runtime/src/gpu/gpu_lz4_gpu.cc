@@ -40,18 +40,24 @@
 
 #if (CTP_ENABLE_CUDA || CTP_ENABLE_ROCM) && !CTP_ENABLE_SYCL
 
-#include "clio_ctp/compress/gpu_lz4.h"
+#include "clio_ctp/compress/gpu_ans.h"
 
 namespace {
 
-/** One block per page; each warp decodes whole chunks cooperatively. */
+/** One block per page; each warp decodes whole chunks cooperatively, LZ4
+ *  or ANS by the page's magic. Each warp owns kDecodeScratch bytes of shared
+ *  memory for the rANS tables. */
 CTP_GPU_KERNEL void GpuLz4DecodeKernel(ctp::gpu_lz4::DecodeJob *jobs,
                                        uint32_t njobs) {
-  if (blockIdx.x >= njobs) return;
   constexpr uint32_t kWarp = 32;
-  ctp::gpu_lz4::DecodeJobWarp(&jobs[blockIdx.x], threadIdx.x % kWarp, kWarp,
-                              threadIdx.x / kWarp, blockDim.x / kWarp,
-                              []() { __syncwarp(); });
+  constexpr uint32_t kWarps = ctp::gpu_lz4::kDecodeGroup / kWarp;
+  __shared__ alignas(16) uint8_t scratch[kWarps * ctp::gpu_lz4::kDecodeScratch];
+  if (blockIdx.x >= njobs) return;
+  const uint32_t warp = threadIdx.x / kWarp;
+  ctp::gpu_lz4::DecodeJobWarpAny(&jobs[blockIdx.x], threadIdx.x % kWarp, kWarp,
+                                 warp, blockDim.x / kWarp,
+                                 []() { __syncwarp(); },
+                                 scratch + warp * ctp::gpu_lz4::kDecodeScratch);
 }
 
 }  // namespace

@@ -4,7 +4,8 @@
 # GPU -- CUDA, ROCm or SYCL, one shared decoder -- when a device reader such
 # as gpu_vector faults them in. No nvCOMP. Speaks the core's task interface:
 # point a clio::cte::core::Client at this pool. A put is compressed only when
-# its Context asks for codec kGpuLz4Lib (25, "gpu-lz4" in the ctp codec registry); everything else forwards as is.
+# its Context asks for codec 25 ("gpu-lz4") or 26 ("gpu-ans", interleaved
+# rANS); everything else forwards as is.
 module_name: lz4
 namespace: clio::cte
 version: 1.0.0

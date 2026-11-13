@@ -68,6 +68,13 @@ namespace ctp::gpu_lz4 {
 
 /** "GLZ4", little-endian. */
 inline constexpr uint32_t kMagic = 0x345A4C47u;
+/** "GANS": the same container holding rANS chunks (gpu_ans.h). */
+inline constexpr uint32_t kMagicAns = 0x534E4147u;
+
+/** @return true for a magic this container format uses. */
+CTP_CROSS_FUN inline bool IsPageMagic(uint32_t m) {
+  return m == kMagic || m == kMagicAns;
+}
 inline constexpr uint32_t kVersion = 1;
 /** Raw bytes per chunk. 64 KiB: a 960 KiB page is 15 chunks, and an LZ4
  *  offset (16 bits) can reach anywhere in a chunk. */
@@ -156,6 +163,7 @@ struct ChunkSpan {
   uint8_t *out;        /**< destination of the chunk's raw bytes */
   uint32_t want;       /**< raw length of the chunk */
   bool raw;            /**< stored uncompressed */
+  uint32_t magic;      /**< the page's codec (kMagic / kMagicAns) */
 };
 
 /**
@@ -180,7 +188,8 @@ CTP_CROSS_FUN inline bool LocateChunk(const uint8_t *page, uint64_t page_n,
            static_cast<uint32_t>(p[at + 2]) << 16 |
            static_cast<uint32_t>(p[at + 3]) << 24;
   };
-  if (rd32(0) != kMagic) return false;
+  const uint32_t magic = rd32(0);
+  if (!IsPageMagic(magic)) return false;
   uint64_t raw = 0;
   for (int i = 7; i >= 0; --i) raw = (raw << 8) | p[8 + i];
   const uint32_t chunk_raw = rd32(16);
@@ -202,6 +211,7 @@ CTP_CROSS_FUN inline bool LocateChunk(const uint8_t *page, uint64_t page_n,
   span->out = dst + at;
   span->want = static_cast<uint32_t>(raw - at < chunk_raw ? raw - at : chunk_raw);
   span->raw = (o0 & kRawBit) != 0;
+  span->magic = magic;
   return !span->raw || span->sn == span->want;
 }
 
@@ -219,6 +229,7 @@ CTP_CROSS_FUN inline bool DecodeChunk(const uint8_t *page, uint64_t page_n,
     for (uint32_t k = 0; k < sp.want; ++k) sp.out[k] = sp.src[k];
     return true;
   }
+  if (sp.magic != kMagic) return false;  // an ANS page: see gpu_ans.h
   return DecodeBlock(sp.src, sp.sn, sp.out, sp.want) ==
          static_cast<int64_t>(sp.want);
 }
@@ -230,7 +241,7 @@ CTP_CROSS_FUN inline uint64_t RawSizeOf(const uint8_t *page, uint64_t page_n) {
                      static_cast<uint32_t>(page[1]) << 8 |
                      static_cast<uint32_t>(page[2]) << 16 |
                      static_cast<uint32_t>(page[3]) << 24;
-  if (m != kMagic) return 0;
+  if (!IsPageMagic(m)) return 0;
   uint64_t raw = 0;
   for (int i = 7; i >= 0; --i) raw = (raw << 8) | page[8 + i];
   return raw;
@@ -261,9 +272,10 @@ struct DecodeJob {
 };
 
 /** Work-items per page in the decode launch. Each sub-group (CUDA warp)
- *  decodes whole chunks cooperatively; 512 = 16 warps of 32, so a 15-chunk
- *  page decodes all its chunks at once. */
-inline constexpr uint32_t kDecodeGroup = 512;
+ *  decodes whole chunks cooperatively. 256 = 8 warps of 32: every sub-group
+ *  also owns a kDecodeScratch slice of local memory for the rANS tables
+ *  (gpu_ans.h), and 8 x 5 KiB stays inside CUDA's 48 KiB static limit. */
+inline constexpr uint32_t kDecodeGroup = 256;
 
 /** Read an LZ4 length extension (the 255-continuation bytes). */
 CTP_CROSS_FUN inline bool ReadLenExt(const uint8_t *src, uint32_t sn,
@@ -357,6 +369,8 @@ CTP_CROSS_FUN inline void DecodeJobWarp(DecodeJob *job, uint32_t lane,
                           &sp);
     if (ok && sp.raw) {
       for (uint32_t k = lane; k < sp.want; k += nl) sp.out[k] = sp.src[k];
+    } else if (ok && sp.magic != kMagic) {
+      ok = false;  // an ANS page: DecodeJobWarpAny (gpu_ans.h) handles it
     } else if (ok) {
       ok = DecodeBlockCoop(sp.src, sp.sn, sp.out, sp.want, lane, nl, sync) ==
            static_cast<int64_t>(sp.want);

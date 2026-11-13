@@ -46,7 +46,7 @@
 
 #include <sycl/sycl.hpp>
 
-#include "clio_ctp/compress/gpu_lz4.h"
+#include "clio_ctp/compress/gpu_ans.h"
 
 extern "C" int ctp_gpu_lz4_decode_launch(ctp::gpu_lz4::DecodeJob *jobs,
                                          uint32_t njobs, void *stream) {
@@ -54,8 +54,20 @@ extern "C" int ctp_gpu_lz4_decode_launch(ctp::gpu_lz4::DecodeJob *jobs,
   if (stream == nullptr) return 1;
   auto *q = static_cast<sycl::queue *>(stream);
   constexpr uint32_t kGroup = ctp::gpu_lz4::kDecodeGroup;
+  constexpr uint32_t kScratch = ctp::gpu_lz4::kDecodeScratch;
+  // Local memory for one rANS table set per SUB-GROUP; the count depends on
+  // the device's sub-group width, so size for the narrowest one it offers.
+  size_t min_sg = 32;
+  for (size_t w :
+       q->get_device().get_info<sycl::info::device::sub_group_sizes>()) {
+    if (w != 0 && w < min_sg) min_sg = w;
+  }
+  const size_t nsg = (kGroup + min_sg - 1) / min_sg;
   try {
-    q->parallel_for(
+    q->submit([&](sycl::handler &h) {
+      sycl::local_accessor<uint8_t, 1> scratch(sycl::range<1>(nsg * kScratch),
+                                               h);
+      h.parallel_for(
         sycl::nd_range<1>(sycl::range<1>(static_cast<size_t>(njobs) * kGroup),
                           sycl::range<1>(kGroup)),
         [=](sycl::nd_item<1> it) {
@@ -64,13 +76,15 @@ extern "C" int ctp_gpu_lz4_decode_launch(ctp::gpu_lz4::DecodeJob *jobs,
           // Intel Max GPUs) -- the decoder takes the width as a parameter.
           const uint32_t job = static_cast<uint32_t>(it.get_group(0));
           auto sg = it.get_sub_group();
-          ctp::gpu_lz4::DecodeJobWarp(
+          const uint32_t sgi = static_cast<uint32_t>(sg.get_group_linear_id());
+          ctp::gpu_lz4::DecodeJobWarpAny(
               &jobs[job], static_cast<uint32_t>(sg.get_local_linear_id()),
-              static_cast<uint32_t>(sg.get_local_linear_range()),
-              static_cast<uint32_t>(sg.get_group_linear_id()),
+              static_cast<uint32_t>(sg.get_local_linear_range()), sgi,
               static_cast<uint32_t>(sg.get_group_linear_range()),
-              [&]() { sycl::group_barrier(sg); });
+              [&]() { sycl::group_barrier(sg); },
+              &scratch[static_cast<size_t>(sgi) * kScratch]);
         });
+    });
   } catch (const sycl::exception &) {
     return 1;
   }
