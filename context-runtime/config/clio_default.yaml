@@ -692,6 +692,20 @@ compose:
   #                               one getattr per path component per syscall;
   #                               a directory changed through another node can
   #                               then read stale for up to that long.
+  # Read path (not seconds):
+  #   CLIO_FUSE_MAX_BACKGROUND    read-ahead requests the kernel may have in
+  #                               flight on the mount. Default: unset (the
+  #                               libfuse default, 12). 256 suits parallel
+  #                               sequential reads.
+  #   CLIO_FUSE_READAHEAD_PAGES   pages (1 MiB) the adapter keeps fetched ahead
+  #                               of each sequentially read open handle.
+  #                               Default: unset / 0 (off); capped at 64.
+  #                               Needs CLIO_FUSE_ATTR_CACHE_S > 0: a fetched
+  #                               page is served for at most that long, so a
+  #                               write through another node can read stale
+  #                               for up to it (writes through this mount
+  #                               never do). Costs up to N+1 MiB per open
+  #                               handle being read sequentially.
   - mod_name: clio_cte_filesystem
     pool_name: clio_cte_filesystem
     pool_query: local

@@ -144,6 +144,7 @@ enum Chan : int {
   //     wr_total  whole cte_fuse_write
   //     wr_page   one AsyncPutBlobDefer call (pacing wall, overlap drain,
   //               staging copy, submit -- the put itself is NOT awaited)
+  //     (read-ahead, CLIO_FUSE_READAHEAD_PAGES; channels 77-79 below)
   //   originating container (cache module, where the client's task runs):
   //     gb_local  GetBlob served by this node's core, inline
   //     gb_fwd    GetBlob sent to the blob's owner, send -> reply
@@ -173,7 +174,17 @@ enum Chan : int {
   kPbDrain = 74,
   kPbAlloc = 75,
   kPbBdev = 76,
-  kNumChan = 77,
+  // 77-79: the FUSE adapter's sequential read-ahead
+  // (CLIO_FUSE_READAHEAD_PAGES), in the adapter process:
+  //     ra_hit   1 per page part of a read answered from the handle's
+  //              read-ahead cache (a value channel: n = hits)
+  //     ra_wait  time a read waited for a prefetch still in flight
+  //     ra_miss  1 per page part fetched the normal way while read-ahead
+  //              was active for the handle (n = misses)
+  kRaHit = 77,
+  kRaWait = 78,
+  kRaMiss = 79,
+  kNumChan = 80,
 };
 
 enum Busy : int { kBusyPeerRecv = 0, kBusyNetSend = 1, kNumBusy = 2 };
