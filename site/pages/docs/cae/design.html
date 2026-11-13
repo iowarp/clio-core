@@ -4,7 +4,7 @@ heading: Inside the <em>assimilation engine.</em>
 description: How the CAE is built: the clio_cae tool and OMNI loader, the core module, the assimilator factory and its per-source assimilators, ingest on fault with its off-worker I/O pool, pagify and page maps, and the summarizer interposer.
 eyebrow: Docs · Context Assimilation Engine
 lede: The CAE is a runtime module that copies, or lazily maps, outside data into CTE tags. Its work is done by assimilators, one class per kind of source, chosen by the source URL. This page names the pieces and follows a transfer through them.
-facts: Module | clio_cae_core (pool 400.0) ; Methods | ParseOmni, ImportData, ExportData, plus CTE forwarding ; Fault I/O threads | CLIO_CAE_REF_IO_THREADS (32)
+facts: Module | clio_cae_core (pool 400.0) ; Methods | ParseOmni, ImportData (HDF5), ExportData, ProcessHdf5Dataset, plus CTE forwarding ; Fault I/O threads | CLIO_CAE_REF_IO_THREADS (32)
 -->
 <h2 id="pieces">The pieces</h2>
 <figure class="diagram">
@@ -19,7 +19,7 @@ facts: Module | clio_cae_core (pool 400.0) ; Methods | ParseOmni, ImportData, Ex
     <rect class="box" x="580" y="106" width="260" height="62" rx="8"/><text class="title" x="592" y="130">Reference I/O pool</text><text class="muted" x="592" y="150">blocking source reads off workers</text>
     <path class="edge" d="M550,137 L578,137" marker-end="url(#ca0)"/>
     <rect class="box" x="580" y="198" width="260" height="62" rx="8"/><text class="title" x="592" y="222">Summarizer (optional)</text><text class="muted" x="592" y="242">labels blobs via a model</text>
-    <rect class="box hl" x="20" y="290" width="820" height="50" rx="8"/><text class="title" x="32" y="320">CTE chain (next_pool_id, default the cache at 563.0)</text>
+    <rect class="box hl" x="20" y="290" width="820" height="50" rx="8"/><text class="title" x="32" y="320">CTE chain (next_pool_id: the cache, 563.0, in the shipped config)</text>
     <path class="edge hl" d="M285,260 L285,288" marker-end="url(#ca0)"/><path class="edge" d="M710,260 L710,288" marker-end="url(#ca0)"/>
   </svg>
   <figcaption>Transfers arrive as one task. The core picks an assimilator
@@ -39,13 +39,13 @@ facts: Module | clio_cae_core (pool 400.0) ; Methods | ParseOmni, ImportData, Ex
 <p>An assimilator is a C++ class implementing a small base interface. Besides scheduling a whole transfer, it can optionally produce the bytes of one destination blob on request (for ingest on fault) and describe the source's page layout (for pagify). The shipped ones cover local files, inline strings, HDF5, HTTP and HTTPS, S3 (with a pooled keep-alive connection set and forwarded credentials, since the daemon does not inherit the client's environment), Google Cloud Storage and Globus. <a href="/docs/cae/extend.html">Extending the CAE</a> adds a new one.</p>
 
 <h2 id="fault">Ingest on fault</h2>
-<p>With <code>on_fault</code> set, a transfer copies nothing. The core records the context in a registry under a hashed id, and the destination carries that id as its fault parameters. When a read misses a blob, the CTE sends the CAE a fault task carrying the id; the core looks up the context and asks the source's assimilator for exactly that blob, stores it, and lets the read continue. Source reads can take seconds on a parallel filesystem, so they run on a separate pool of threads (32 by default, <code>CLIO_CAE_REF_IO_THREADS</code>) while the fault task yields, keeping runtime workers free. <code>CLIO_CAE_FAULT_STATS=1</code> logs per-stage counters every five seconds.</p>
+<p>With <code>on_fault</code> set, a transfer copies nothing. The core records the context in a registry under a hashed id, and the destination carries that id as its fault parameters. When a read misses a blob, the CTE sends a get for that blob to the tag's fault pool, the CAE, carrying the id; the core looks up the context and asks the source's assimilator for exactly that blob, stores it, and lets the read continue. Source reads can take seconds on a parallel filesystem, so they run on a separate pool of threads (32 by default, <code>CLIO_CAE_REF_IO_THREADS</code>) while the fault task yields, keeping runtime workers free. <code>CLIO_CAE_FAULT_STATS=1</code> logs per-stage counters every five seconds.</p>
 
 <h2 id="pagify">Pagify and page maps</h2>
 <p>Paged consumers such as memory expansion and clio-ml address data only as page 0, 1, 2 and so on. A <strong>page map</strong>, produced by the assimilator that knows the source layout, is an ordered list of extents saying which bytes of which blob occupy which range of page space. <strong>Pagify</strong> uses it to build a page: it fetches the slices, composes pages made of several blobs, and zero-fills uncovered ranges. The split keeps the arithmetic pure and testable and the I/O injectable.</p>
 
 <h2 id="summarizer">The summarizer</h2>
-<p>The optional summarizer module is a CTE interposer: it forwards every operation, and after a matching put sends the content to a language model endpoint (by default a local Ollama server) and stores the label as a sibling blob. The model call runs inline on the put's task, so every matching put waits for the model. Enable it only for data you want described.</p>
+<p>The optional summarizer module is a CTE interposer: it forwards every operation, and after a matching put sends the content to the configured language model endpoint (it speaks the Ollama protocol by default) and stores the label as a sibling blob. The model call runs inline on the put's task, so every matching put waits for the model. Enable it only for data you want described.</p>
 
 <h2 id="tradeoffs">Costs of this design</h2>
 <table class="tradeoffs">

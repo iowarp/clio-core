@@ -25,13 +25,13 @@ facts: Core class | ContextInterface ; Operations | bundle, query, retrieve, des
 </figure>
 
 <h2 id="interface">The context interface</h2>
-<p>All logic lives in one C++ class in the caller's process. Constructing it does nothing; the first operation initializes the runtime client, then the CAE client (which brings up the CTE client), and checks that the runtime is reachable. A failed initialization is remembered rather than retried in a loop, because repeatedly creating and destroying the messaging context corrupted the allocator state of Python 3.13.</p>
+<p>All logic lives in one C++ class in the caller's process. Constructing it does nothing; the first operation initializes the runtime client, then the CAE client (which brings up the CTE client), and checks that the runtime client is up. A failed runtime initialization is remembered rather than retried in a loop, because repeatedly creating the messaging context corrupted the allocator under Python 3.13.</p>
 
 <h2 id="ops">Operations</h2>
 <dl class="notes">
   <div><dt>Bundle</dt><dd>Builds assimilation contexts from the caller's list and sends them to the CAE core as one <code>ParseOmni</code> task, then waits. Everything the CAE can import, the CEE can bundle.</dd></div>
   <div><dt>Query</dt><dd>Returns matching blob names in one of three modes. With a time bound it runs a temporal query. With a text query it runs the CTE's BM25 semantic search, served by the indexer, with a positive top-<em>k</em> (10 if none is given). Otherwise it runs a regular-expression query over tag and blob names.</dd></div>
-  <div><dt>Retrieve</dt><dd>Resolves names with the same three modes, then fetches the blobs in batches: it looks up each size, allocates one shared buffer, issues the gets of a batch asynchronously and waits for them together, and returns the packed bytes. Retrieval stops at the first blob that would overflow the buffer.</dd></div>
+  <div><dt>Retrieve</dt><dd>Resolves names with the same three modes, then fetches the blobs in batches: it looks up each size, allocates one shared buffer, issues the gets of a batch asynchronously and waits for them together, and returns the packed bytes. A blob that would overflow the buffer ends its batch; later batches still add blobs that fit. Missing and empty blobs are skipped.</dd></div>
   <div><dt>Destroy</dt><dd>Deletes each named context's tag through the CTE.</dd></div>
 </dl>
 <p>A splice operation is declared but not yet implemented.</p>
