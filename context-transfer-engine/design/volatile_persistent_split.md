@@ -172,7 +172,7 @@ everything (`AGENTS.md`).
 3. **Config.** Add the core's `durability: volatile | persistent` key
    (inferred from the devices when omitted, see 6.6). Update
    `context-runtime/config/clio_default.yaml` and
-   `docs/docs/deployment/configuration.md` (AGENTS.md rule).
+   `docs/deployment/configuration.md` in the iowarp/docs repo (AGENTS.md rule).
 4. **Move fsync.** Route `SyncTag` and the filesystem's fsync through the
    cache module. `write_thru_cache` needs nothing; prepare the hook for
    write-back.
