@@ -15,6 +15,7 @@ target_include_directories(test_fuse_adapter PRIVATE
 )
 
 target_link_libraries(test_fuse_adapter
+    clio_cte_filesystem_client  # fuse_cte.h reaches CTE via CLIO_CFS_CLIENT
     clio_cte_core_runtime
     clio_cte_core_client
     clio::run::admin_runtime
@@ -83,6 +84,7 @@ target_include_directories(test_fuse_copy_workspace PRIVATE
 )
 
 target_link_libraries(test_fuse_copy_workspace
+    clio_cte_filesystem_client  # fuse_cte.h reaches CTE via CLIO_CFS_CLIENT
     clio_cte_core_runtime
     clio_cte_core_client
     clio::run::admin_runtime

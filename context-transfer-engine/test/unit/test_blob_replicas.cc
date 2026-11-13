@@ -51,17 +51,22 @@ static std::string chi_test_data_dir() {
 }
 
 static constexpr clio::run::u64 kValSize = 4096;
+/** A volatile core (RAM + a small persistent file tier): the only kind of
+ *  core that holds both, so the one where REPLICA_PERSISTENT has a choice. */
+static const clio::run::PoolId kMixedPool(530, 0);
 
 class BlobReplicasFixture {
  public:
   std::string config_path_;
   std::string file_storage_path_;
   std::string metadata_log_path_;
+  std::string mixed_storage_path_;
 
   BlobReplicasFixture() {
     config_path_ = chi_test_data_dir() + "/blob_replicas_config.yaml";
     file_storage_path_ = chi_test_data_dir() + "/blob_replicas_file.dat";
     metadata_log_path_ = chi_test_data_dir() + "/blob_replicas_meta.log";
+    mixed_storage_path_ = chi_test_data_dir() + "/blob_replicas_mixed.dat";
     Cleanup();
     CreateConfigFile();
     ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", config_path_.c_str(), 1);
@@ -88,7 +93,8 @@ class BlobReplicasFixture {
       CTP_MSAN_UNPOISON_OBJ(entry);
       std::string name = entry.path().filename().string();
       CTP_MSAN_UNPOISON_STRING(name);
-      if (name.rfind("blob_replicas_meta.log", 0) == 0) {
+      if (name.rfind("blob_replicas_meta.log", 0) == 0 ||
+          name.rfind("blob_replicas_mixed.dat", 0) == 0) {
         fs::remove(entry.path(), ec);
       }
     }
@@ -139,7 +145,26 @@ compose:
       metadata_log_path: )" << metadata_log_path_ << R"(
       transaction_log_capacity: 4MB
       flush_metadata_period_ms: 0
-      flush_data_period_ms: 0
+
+  # Volatile (RAM + persistent file): REPLICA_PERSISTENT must pick the file.
+  - mod_name: clio_cte_core
+    pool_name: clio_cte_mixed
+    pool_query: local
+    pool_id: 530.0
+    targets:
+      neighborhood: 1
+    storage:
+      - path: "ram::blob_replicas_mixed_dram"
+        bdev_type: "ram"
+        capacity_limit: "64MB"
+        score: 1.0
+      - path: ")" << mixed_storage_path_ << R"("
+        bdev_type: "file"
+        capacity_limit: "1MB"
+        score: 0.2
+        persistence_level: "temporary"
+    dpe:
+      dpe_type: "max_bw"
 )";
     config_file.close();
   }
@@ -334,19 +359,30 @@ TEST_CASE("BlobReplicas - REPLICA_FIXED pins a replica against the organizer",
   REQUIRE(std::memcmp(got.data(), replica_val.data(), kValSize) == 0);
 }
 
-TEST_CASE("BlobReplicas - REPLICA_PERSISTENT on a persistent core",
+TEST_CASE("BlobReplicas - REPLICA_PERSISTENT excludes volatile tiers",
           "[cte][replicas][persistence][886]") {
-  auto *client = CLIO_CTE_CLIENT;
-  REQUIRE(client != nullptr);
+  // On the volatile core that holds both a RAM tier and a persistent file
+  // tier: a persistent core refuses volatile bdevs, so only a core like
+  // this one gives REPLICA_PERSISTENT a volatile tier to keep off.
+  clio::cte::core::Client mixed(kMixedPool);
+  auto *client = &mixed;
+  auto tf = client->AsyncGetOrCreateTag("replica_persist_tag");
+  tf.Wait();
+  REQUIRE(tf->GetReturnCode() == 0);
+  const clio::cte::core::TagId tag_id = tf->tag_id_;
 
-  clio::cte::core::Tag tag("replica_persist_tag");
-  const clio::cte::core::TagId tag_id = tag.GetTagId();
-
-  // A core is uniform in durability, so there is no volatile tier for a
-  // PERSISTENT replica to be kept off. A payload bigger than the core's
-  // only tier (1MB file) has nowhere to go and the put must fail cleanly.
+  // A payload bigger than the ONLY persistent tier (1MB file): as a plain
+  // replica it lands in RAM; as a PERSISTENT replica it has nowhere legal
+  // to go and the put must fail -- proof the flag really excludes the
+  // volatile tier rather than merely preferring the file one.
   const clio::run::u64 kBig = 4ULL * 1024 * 1024;
   const std::string big(kBig, 'B');
+  {
+    auto fut = client->AsyncPutBlob(tag_id, "persist_blob", 0, kBig,
+                                    big.data(), -1.0f, ReplicaCtx(1));
+    fut.Wait();
+    REQUIRE(fut->GetReturnCode() == 0);
+  }
   {
     clio::cte::core::Context ctx = ReplicaCtx(2);
     ctx.replica_flags_ = clio::cte::core::REPLICA_PERSISTENT;
@@ -754,6 +790,8 @@ TEST_CASE("BlobReplicas - snapshot replica layouts restore into a fresh pool",
     y << "targets:\n"
       << "  neighborhood: 1\n"
       << "storage:\n"
+      // Same storage as the source core: its persistent file tier only, so
+      // this core is persistent and replays the log.
       << "  - path: \"" << chi_test_data_dir() + "/blob_replicas_file.dat" << "\"\n"
       << "    bdev_type: \"file\"\n"
       << "    capacity_limit: \"1MB\"\n"

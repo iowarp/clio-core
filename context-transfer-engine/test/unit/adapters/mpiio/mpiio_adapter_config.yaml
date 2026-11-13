@@ -1,0 +1,25 @@
+# Compose for the MPI-IO adapter tests. Like ../cfs_adapter_config.yaml, but
+# the core's only device is a FILE bdev: "a failed write is reported at sync"
+# caps the process's file size so the storage write fails with EFBIG, which
+# only a file-backed tier can do. clio-fs creates no pools and assumes no pool
+# ids: the interceptor finds the filesystem pool by name (clio_cte_filesystem).
+compose:
+  - mod_name: clio_cte_core
+    pool_name: cte_mpiio_test
+    pool_query: local
+    pool_id: 512.0
+    targets:
+      neighborhood: 1
+    storage:
+      - path: "${CLIO_MPIIO_TEST_DIR}/mpiio_adapter_test.dat"
+        bdev_type: "file"
+        capacity_limit: "256MB"
+        score: 1.0
+    dpe:
+      dpe_type: "max_bw"
+
+  - mod_name: clio_cte_filesystem
+    pool_name: clio_cte_filesystem
+    pool_query: local
+    pool_id: 560.0
+    next_pool_id: 512.0
