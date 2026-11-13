@@ -650,7 +650,8 @@ clio::run::TaskResume Runtime::InodeTruncate(const FsReq &req, FsResp &resp) {
     }
     std::memset(zbuf.ptr_, 0, zlen);
     auto zp = cte_.AsyncPutBlob(tag, std::to_string(boundary_page), zoff, zlen,
-                                zbuf.shm_.template Cast<void>(), -1.0f,
+                                zbuf.shm_.template Cast<void>(),
+                                page_score_.ScoreOf(boundary_page),
                                 clio::cte::core::Context(), 0u,
                                 clio::run::PoolQuery::Dynamic());
     CLIO_CO_AWAIT(zp);

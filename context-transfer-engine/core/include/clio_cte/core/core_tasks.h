@@ -3278,10 +3278,43 @@ struct MultiPutDesc {
   clio::run::u64 offset_ = 0;
   clio::run::u64 size_ = 0;
   clio::run::u64 payload_off_ = 0;
+  /** Placement score of this record's nested put, with PutBlob's meaning:
+   *  -1 (default) = the blob's existing score, or 1.0 for a new blob. */
+  float score_ = -1.0f;
 
+  /** Serialize every field (the wire format of MultiPutBlobTask::descs_). */
   template <typename Ar>
   void serialize(Ar &ar) {
-    ar(tag_id_, blob_name_, offset_, size_, payload_off_);
+    ar(tag_id_, blob_name_, offset_, size_, payload_off_, score_);
+  }
+};
+
+/**
+ * Placement-score rule for the page blobs of a paged file (the filesystem
+ * module's `data_score` / `data_score_head_pages` settings).
+ *
+ * File data is stored as fixed-size page blobs named by page index. With the
+ * rule off (the default) every page is put with score -1, exactly as before
+ * the rule existed. With it on, pages at or past `head_pages_` are put with
+ * `data_score_`, while the first `head_pages_` pages of every file keep -1 so
+ * small files and file heads stay on the fastest tier next to the metadata.
+ */
+struct PageScorePolicy {
+  /** Score for file data pages; anything outside (0, 1] turns the rule off. */
+  float data_score_ = -1.0f;
+  /** Leading pages of each file that keep the default score. */
+  clio::run::u32 head_pages_ = 1;
+
+  /** @return true when data_score_ is a usable score, i.e. in (0, 1]. */
+  bool Enabled() const { return data_score_ > 0.0f && data_score_ <= 1.0f; }
+
+  /**
+   * Score to pass to PutBlob for one page of a file.
+   * @param page_index index of the page blob (byte offset / page size)
+   * @return data_score_ for a data page under an enabled rule, else -1
+   */
+  float ScoreOf(clio::run::u64 page_index) const {
+    return (Enabled() && page_index >= head_pages_) ? data_score_ : -1.0f;
   }
 };
 

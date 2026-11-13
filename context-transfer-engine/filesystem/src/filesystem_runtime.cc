@@ -155,6 +155,15 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
                      : ctp::ConfigParse::ExpandPath(cfg.metadata_log_path_) +
                            ".dirs." + std::to_string(container_id_));
   next_pool_id_ = cfg.next_pool_id_;
+  page_score_ = cfg.PageScore();
+  if (page_score_.Enabled()) {
+    HLOG(kInfo, "filesystem: file data pages are placed with score {} (the "
+         "first {} page(s) of each file keep the default score)",
+         page_score_.data_score_, page_score_.head_pages_);
+  } else if (cfg.data_score_ != -1.0f) {
+    HLOG(kWarning, "filesystem: data_score {} is not in (0, 1]; ignored "
+         "(file data keeps the default score)", cfg.data_score_);
+  }
   if (!next_pool_id_.IsNull()) {
     cte_ = clio::cte::core::Client(next_pool_id_);
     cte_ready_.store(true, std::memory_order_release);
@@ -188,6 +197,12 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
         pm->GetRealOrStaticContainer(cfg.stream_pool_id_).get();
     if (h && dynamic_cast<clio::cte::stream::Runtime *>(&*h) != nullptr) {
       stream_hold_ = h;
+      // Deferred appends are merged into the same page blobs by the stream
+      // container: it scores them by the rule this pool was configured with.
+      if (page_score_.Enabled()) {
+        static_cast<clio::cte::stream::Runtime &>(*h).SetPageScorePolicy(
+            page_score_);
+      }
     } else {
       HLOG(kError, "filesystem: no local stream container for pool {}",
            cfg.stream_pool_id_);
@@ -327,6 +342,12 @@ clio::run::TaskResume Runtime::Monitor(clio::run::shared_ptr<MonitorTask> &task)
     task->results_[container_id_] =
         std::to_string(next_pool_id_.major_) + "." +
         std::to_string(next_pool_id_.minor_);
+  }
+  // "data_score": the score rule for file data pages, for the same clients
+  // (they put pages themselves, so they must apply it themselves). Encoded
+  // by EncodePageScore; decoded by Client::GetPageScorePolicy.
+  if (task->query_ == "data_score") {
+    task->results_[container_id_] = EncodePageScore(page_score_);
   }
   task->SetReturnCode(0);
   CLIO_CO_RETURN;
@@ -972,7 +993,8 @@ clio::run::TaskResume Runtime::Write(clio::run::shared_ptr<WriteTask> &task) {
                   kFsPreallocCap,
                   std::max<clio::run::u64>(2 * (page_off + to_write), 8192));
     auto p = cte_.AsyncPutBlob(tag_id, PageName(cur), page_off, to_write,
-                               src + done, /*score*/ -1.0f,
+                               src + done,
+                               page_score_.ScoreOf(cur / kFsPageSize),
                                clio::cte::core::Context::Preallocate(prealloc),
                                /*flags*/ 0u, clio::run::PoolQuery::Dynamic());
     CLIO_CO_AWAIT(p);

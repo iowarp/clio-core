@@ -672,6 +672,40 @@ compose:
     # (default false): Foo.TXT and foo.txt are one file. Fixed when the volume
     # is created; a runtime configured the other way refuses the volume.
     # case_insensitive: false
+    # Placement score for file DATA pages (float, default -1.0 = off: file
+    # data is placed with the same default score as metadata, so bulk data
+    # fills the fastest tier first and later directory blocks and small files
+    # land on a slower one). A value in (0, 1] places file data pages with
+    # that score; directory blocks, xattrs and the first
+    # data_score_head_pages pages of every file keep the default (1.0 for a
+    # new blob) and so stay on the highest-scored tier. Any other value is
+    # ignored. Clients that write pages themselves (the FUSE adapter) fetch
+    # the setting from this pool at mount.
+    # data_score_head_pages: leading 1 MiB pages of each file that keep the
+    # default score (unsigned, default 1; 0 = every page uses data_score).
+    # Only read when data_score is set.
+    # Example -- a small DRAM target reserved for metadata and file heads,
+    # bulk data in a second DRAM target, a slow tier below both. In the
+    # clio_cte_core storage list:
+    #   - path: "ram::cte_ram_meta"      # metadata + first MiB of each file
+    #     bdev_type: "ram"
+    #     capacity_limit: "2GB"
+    #     score: 1.0
+    #   - path: "ram::cte_ram_data"      # bulk file data
+    #     bdev_type: "ram"
+    #     capacity_limit: "32GB"
+    #     score: 0.9
+    #   - path: "${CLIO_STORAGE_ROOT}/cte_slow_tier.dat"
+    #     bdev_type: "file"
+    #     capacity_limit: "500GB"
+    #     score: 0.6
+    # and here:
+    #   data_score: 0.9
+    #   data_score_head_pages: 1
+    # When the small target fills, metadata and file heads spill to the next
+    # tier down, as all data does without this setting.
+    # data_score: -1.0
+    # data_score_head_pages: 1
     # Stream pool holding every file's logical size and merging deferred
     # O_APPEND writes (see the clio_cte_stream entry). Default: "565.0".
     # stream_pool_id: "565.0"

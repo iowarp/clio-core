@@ -5620,11 +5620,14 @@ clio::run::TaskResume Runtime::MultiPutBlob(
     // segments applied in list order — the same last-writer-wins the scalar
     // sequence gave. Same-key streams and sieve sweeps (#1007) produce
     // exactly these runs; distinct-key batches degrade to runs of one and
-    // keep the scalar sub-put unchanged.
+    // keep the scalar sub-put unchanged. A run also shares ONE placement
+    // score (the nested put carries a single score), so a score change ends
+    // it; records default to -1, which leaves the runs as they always were.
     size_t re = bi + 1;
     while (re < batch.size() &&
            batch.descs_[re].tag_id_ == batch.descs_[bi].tag_id_ &&
-           batch.descs_[re].blob_name_ == batch.descs_[bi].blob_name_) {
+           batch.descs_[re].blob_name_ == batch.descs_[bi].blob_name_ &&
+           batch.descs_[re].score_ == batch.descs_[bi].score_) {
       ++re;
     }
     // Collect the run's valid records. Null-allocator ShmPtr = absolute
@@ -5654,13 +5657,13 @@ clio::run::TaskResume Runtime::MultiPutBlob(
           clio::run::CreateTaskId(), task->pool_id_,
           clio::run::PoolQuery::Local(), d0.tag_id_, d0.blob_name_,
           d0.offset_, d0.size_, batch.RecordSlice(valid.front()),
-          /*score=*/-1.0f, task->context_, /*flags=*/0);
+          d0.score_, task->context_, /*flags=*/0);
     } else {
       sub = ipc_manager->NewTask<PutBlobTask>(
           clio::run::CreateTaskId(), task->pool_id_,
           clio::run::PoolQuery::Local(), d0.tag_id_, d0.blob_name_,
           static_cast<clio::run::u64>(0), static_cast<clio::run::u64>(0),
-          ctp::ipc::ShmPtr<>::GetNull(), /*score=*/-1.0f, task->context_,
+          ctp::ipc::ShmPtr<>::GetNull(), d0.score_, task->context_,
           /*flags=*/0);
       auto *t = sub.get();
       for (size_t i : valid) {
@@ -5700,7 +5703,7 @@ clio::run::TaskResume Runtime::MultiPutBlob(
           break;
         }
         auto fut = client_.AsyncPutBlob(d.tag_id_, d.blob_name_, d.offset_,
-                                        d.size_, src, /*score=*/-1.0f,
+                                        d.size_, src, d.score_,
                                         task->context_, /*flags=*/0, owner);
         CLIO_CO_AWAIT(fut);
         rc = fut->GetReturnCode();
@@ -5714,7 +5717,7 @@ clio::run::TaskResume Runtime::MultiPutBlob(
           CLIO_CO_AWAIT(clio::run::yield(kForwardRetryUs));
           fut = client_.AsyncPutBlob(
               d.tag_id_, d.blob_name_, d.offset_, d.size_, src,
-              /*score=*/-1.0f, task->context_, /*flags=*/0,
+              d.score_, task->context_, /*flags=*/0,
               HashBlobToContainer(d.tag_id_, d.blob_name_));
           CLIO_CO_AWAIT(fut);
           rc = fut->GetReturnCode();

@@ -22,6 +22,8 @@
 #ifndef CLIO_CTE_FILESYSTEM_FILESYSTEM_TASKS_H_
 #define CLIO_CTE_FILESYSTEM_FILESYSTEM_TASKS_H_
 
+#include <cstdlib>
+#include <cstring>
 #include <string>
 #include <clio_ctp/util/msan.h>
 #include <vector>
@@ -52,6 +54,40 @@ GLOBAL_CROSS_CONST clio::run::u64 kFsPageSize = 1024 * 1024;
  */
 inline std::string PageName(clio::run::u64 off) {
   return std::to_string(off / kFsPageSize);
+}
+
+/**
+ * Text form of a page-score rule, as the Monitor query "data_score" returns
+ * it: "<bit pattern of data_score as a decimal u32> <head pages>". The bit
+ * pattern keeps the float exact and independent of the process locale.
+ * @param policy rule to encode
+ * @return the encoded rule (inverse of DecodePageScore)
+ */
+inline std::string EncodePageScore(
+    const clio::cte::core::PageScorePolicy &policy) {
+  clio::run::u32 bits = 0;
+  std::memcpy(&bits, &policy.data_score_, sizeof(bits));
+  return std::to_string(bits) + " " + std::to_string(policy.head_pages_);
+}
+
+/**
+ * Parse EncodePageScore's text form.
+ * @param text encoded rule
+ * @param out receives the rule on success (untouched otherwise)
+ * @return true when both fields were present
+ */
+inline bool DecodePageScore(const std::string &text,
+                            clio::cte::core::PageScorePolicy *out) {
+  const size_t sp = text.find(' ');
+  if (sp == std::string::npos || sp == 0 || sp + 1 >= text.size()) {
+    return false;
+  }
+  const clio::run::u32 bits =
+      static_cast<clio::run::u32>(std::strtoul(text.c_str(), nullptr, 10));
+  std::memcpy(&out->data_score_, &bits, sizeof(bits));
+  out->head_pages_ = static_cast<clio::run::u32>(
+      std::strtoul(text.c_str() + sp + 1, nullptr, 10));
+  return true;
 }
 
 /**
@@ -104,27 +140,58 @@ struct FilesystemConfig {
    * refused.
    */
   bool case_insensitive_;
+  /**
+   * Placement score file DATA pages are written with (YAML `data_score`,
+   * default -1 = off: every page is put with the core's default score, as
+   * metadata is). A value in (0, 1] steers bulk file data to the tier of
+   * that score, leaving the highest-scored tier to directory blocks and to
+   * the first `data_score_head_pages` pages of each file. Any other value
+   * is treated as off.
+   */
+  float data_score_;
+  /**
+   * Leading 1 MiB pages of every file that keep the default score when
+   * `data_score` is set (YAML `data_score_head_pages`, default 1; 0 = every
+   * page uses `data_score`). Ignored while `data_score` is off.
+   */
+  clio::run::u32 data_score_head_pages_;
 
   FilesystemConfig()
       : next_pool_id_(clio::run::PoolId::GetNull()),
         stream_pool_id_(565, 0),
         dir_split_entries_(1024),
         dir_log_compact_bytes_(256ull << 10),
-        case_insensitive_(false) {}
+        case_insensitive_(false),
+        data_score_(-1.0f),
+        data_score_head_pages_(1) {}
   FilesystemConfig(const clio::run::PoolId &pool_id, const FilesystemConfig &other)
       : next_pool_id_(other.next_pool_id_),
         metadata_log_path_(other.metadata_log_path_),
         stream_pool_id_(other.stream_pool_id_),
         dir_split_entries_(other.dir_split_entries_),
         dir_log_compact_bytes_(other.dir_log_compact_bytes_),
-        case_insensitive_(other.case_insensitive_) {
+        case_insensitive_(other.case_insensitive_),
+        data_score_(other.data_score_),
+        data_score_head_pages_(other.data_score_head_pages_) {
     (void)pool_id;
   }
 
   template <class Archive>
   void serialize(Archive &ar) {
     ar(next_pool_id_, metadata_log_path_, stream_pool_id_, dir_split_entries_,
-       case_insensitive_, dir_log_compact_bytes_);
+       case_insensitive_, dir_log_compact_bytes_, data_score_,
+       data_score_head_pages_);
+  }
+
+  /**
+   * The page-score rule these settings describe.
+   * @return policy whose ScoreOf(page index) is the score to put a page with
+   */
+  clio::cte::core::PageScorePolicy PageScore() const {
+    clio::cte::core::PageScorePolicy policy;
+    policy.data_score_ = data_score_;
+    policy.head_pages_ = data_score_head_pages_;
+    return policy;
   }
 
   void LoadConfig(const clio::run::PoolConfig &pool_config) {
@@ -158,6 +225,13 @@ struct FilesystemConfig {
       }
       if (node["case_insensitive"]) {
         case_insensitive_ = node["case_insensitive"].as<bool>();
+      }
+      if (node["data_score"]) {
+        data_score_ = node["data_score"].as<float>();
+      }
+      if (node["data_score_head_pages"]) {
+        data_score_head_pages_ =
+            node["data_score_head_pages"].as<clio::run::u32>();
       }
     } catch (...) {
       // best-effort

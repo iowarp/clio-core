@@ -485,6 +485,14 @@ clio::run::u64 WriteInflightBytes() {
 }
 
 /**
+ * Score rule for the file data pages this adapter puts itself (the
+ * filesystem module's `data_score` / `data_score_head_pages`). Fetched from
+ * the filesystem container once at mount, before any write is served; off
+ * (every page put with -1) when the module does not set `data_score`.
+ */
+clio::cte::core::PageScorePolicy g_page_score;
+
+/**
  * True when this mount is one of several nodes sharing a namespace.
  *
  * Several fast paths here are sound only when this process sees every
@@ -1933,6 +1941,20 @@ static void *cte_fuse_init(struct fuse_conn_info *conn,
       fprintf(stderr, "clio_cte_fuse: data pool %u.%u (filesystem chain)\n",
               data_pool.major_, data_pool.minor_);
       cte_c->pool_id_ = data_pool;
+    }
+  }
+  // The sieve write path puts page blobs itself, so it applies the
+  // filesystem module's data-score rule itself; the module's yaml is the one
+  // source of the setting.
+  {
+    clio::cte::core::PageScorePolicy policy;
+    if (CLIO_CFS_CLIENT->GetPageScorePolicy(&policy)) {
+      g_page_score = policy;
+      if (policy.Enabled()) {
+        fprintf(stderr, "clio_cte_fuse: file data score %.3f past the first "
+                "%u page(s) of each file\n",
+                static_cast<double>(policy.data_score_), policy.head_pages_);
+      }
     }
   }
   ApplyVolumeCasePolicy(conn, cfg);
@@ -4128,7 +4150,9 @@ int cte_fuse_write(const char *path, const char *buf, size_t size,
           clio::cte::filesystem::kFsPageSize - page_off, size - done);
       int rc = cte->AsyncPutBlobDefer(
           handle->tag, clio::cte::filesystem::PageName(cur), page_off, n,
-          buf + done, -1.0f, clio::cte::core::Context(), 0,
+          buf + done,
+          g_page_score.ScoreOf(cur / clio::cte::filesystem::kFsPageSize),
+          clio::cte::core::Context(), 0,
           clio::run::PoolQuery::Dynamic(), WriteInflightBytes());
       if (rc != 0) {
         // A full store is ENOSPC (as on ext4); anything else is EIO.

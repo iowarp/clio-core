@@ -326,6 +326,10 @@ class Runtime : public clio::run::Container {
    */
   clio::run::TaskResume AwaitCteReady(bool &ok);
   clio::run::PoolId next_pool_id_ = clio::run::PoolId::GetNull();
+  /** Score rule for file data pages (YAML `data_score` /
+   *  `data_score_head_pages`), fixed at Create. Off by default: every page
+   *  put then carries -1. Metadata puts never consult it. */
+  clio::cte::core::PageScorePolicy page_score_;
   // Client bound to THIS filesystem pool, for self-submitted tasks (the
   // append pipeline, and ShardOps to the owners of other namespace state).
   Client self_;

@@ -255,6 +255,27 @@ class Client : public clio::cte::core::Client {
     return !out->IsNull();
   }
 
+  /**
+   * Ask the local filesystem container for its file-data score rule (YAML
+   * `data_score` / `data_score_head_pages`). A client that puts page blobs
+   * itself applies it the way the container's own Write does:
+   * `policy.ScoreOf(offset / kFsPageSize)` is the score of that page's put.
+   * @param out receives the rule on success (untouched otherwise)
+   * @return true when the home answered with a well-formed rule
+   */
+  bool GetPageScorePolicy(clio::cte::core::PageScorePolicy *out) {
+    auto *ipc = CLIO_CPU_IPC;
+    auto task = ipc->NewTask<MonitorTask>(clio::run::CreateTaskId(), pool_id_,
+                                          clio::run::PoolQuery::Local(),
+                                          std::string("data_score"));
+    auto fut = ipc->Send(task);
+    fut.Wait();
+    if (fut->GetReturnCode() != 0 || fut->results_.empty()) {
+      return false;
+    }
+    return DecodePageScore(fut->results_.begin()->second, out);
+  }
+
   /** Create/initialize the filesystem container over a CTE core pool. */  /** Create/initialize the filesystem container over a CTE core pool. */
   clio::run::Future<CreateTask> AsyncCreate(const clio::run::PoolQuery &pool_query,
                                       const std::string &pool_name,

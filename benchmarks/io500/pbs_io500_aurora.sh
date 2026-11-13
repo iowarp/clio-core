@@ -32,6 +32,12 @@
 # caches directory attributes; passed through to clio_cte_fuse unchanged.
 # DAOS_API (MODE=daos; dfuse): dfs runs IO500 on libdfs directly, no FUSE.
 # NO_FLARE (0): 1 drops the Flare tier; tiers are then DRAM + DAOS only.
+# META_RAM_MB (unset = off): MB of an extra DRAM target per node,
+# ram::clio_fs_meta (score 1.0), reserved for filesystem metadata and the
+# first MiB of each file. The bulk DRAM target (still RAM_PCT% of D) drops to
+# score 0.9 and the filesystem module gets data_score: 0.9, so file data
+# beyond a file's first MiB no longer competes with directory blocks and
+# small files for the fastest target. Works with every other knob.
 # HANG_DUMP_S (unset = off): seconds after IO500 starts at which a still-running
 # job dumps every node's runtime and adapter stacks (hang diagnosis).
 # PFIND_HASH (unset/0 = off): 1 adds
@@ -146,10 +152,26 @@ compose:
     pool_query: local
     pool_id: "512.0"
     storage:
+EOF
+  # META_RAM_MB: a small DRAM target above the bulk one, for metadata and
+  # file heads (see the header). Its name differs from the bulk target's, so
+  # the two are separate bdev pools.
+  RAM_SCORE=1.0
+  if [ -n "${META_RAM_MB:-}" ]; then
+    RAM_SCORE=0.9
+    echo "=== metadata DRAM target ${META_RAM_MB}MB per node (score 1.0); bulk DRAM score $RAM_SCORE; data_score 0.9"
+    cat >> clio_server.yaml <<EOF
+      - path: "ram::clio_fs_meta"
+        bdev_type: "ram"
+        capacity_limit: "${META_RAM_MB}MB"
+        score: 1.0
+EOF
+  fi
+  cat >> clio_server.yaml <<EOF
       - path: "ram::clio_fs_ram"
         bdev_type: "ram"
         capacity_limit: "${RAM_GB}MB"
-        score: 1.0
+        score: $RAM_SCORE
 EOF
   # PERSIST=volatile turns off the file tiers' allocator write-ahead log
   # (a synchronous append to the network filesystem per allocate/free).
@@ -219,6 +241,7 @@ EOF
     next_pool_id: "$NEXT"
 $( [ "${META_LOG:-0}" = 1 ] && echo "    metadata_log_path: \"$LR/meta/cfs_namespace_log\"" )
 $( [ -n "${DIR_LOG_COMPACT:-}" ] && echo "    dir_log_compact_bytes: \"$DIR_LOG_COMPACT\"" )
+$( [ -n "${META_RAM_MB:-}" ] && echo "    data_score: 0.9" )
 EOF
   # Per-node bring-up runs for the whole job in the background; it writes
   # $OUT/ready/<host> once the mount answers and tears down on $OUT/stop.
