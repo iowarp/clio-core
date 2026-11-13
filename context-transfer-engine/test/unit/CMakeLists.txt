@@ -940,9 +940,12 @@ set_tests_properties(
 # of the merge path was ~0. Reusing this test means the merged path is checked
 # by the strongest correctness assertion there is (each thread's disjoint region
 # must survive intact), not a bespoke smoke test.
-# Same-blob writes racing the periodic FlushData move to a persistent tier
-# (RELIABILITY.md defect 14): the flush must hold the write token across its
-# place-and-swap and size the move under it.
+# Same-blob writes racing the write-back cache's periodic flush to the
+# persistent core (successor of RELIABILITY.md defect 14, which raced the
+# core's own flush): no writer's region may be lost.
+if(CLIO_CTE_ENABLE_POLICY_CACHES)
+  add_dependencies(test_concurrent_same_blob clio_cte_write_back_cache_runtime)
+endif()
 add_test(NAME cte_concurrent_same_blob_flush
     COMMAND test_concurrent_same_blob)
 

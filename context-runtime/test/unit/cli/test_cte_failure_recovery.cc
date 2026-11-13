@@ -210,8 +210,10 @@ TEST_CASE("CorruptRestore - corrupt snapshot and WAL do not kill the daemon",
          "    pool_id: \"701.0\"\n"
          "    restart: true\n"
          "    storage:\n"
-         "      - path: " << (work_dir / "ram_dev").string() << "\n"
-         "        bdev_type: ram\n"
+         // A disk tier: a RAM-only core is volatile and runs without the
+         // WAL this test corrupts.
+         "      - path: " << (work_dir / "disk_dev.bin").string() << "\n"
+         "        bdev_type: file\n"
          "        capacity_limit: 64mb\n"
          "    dpe:\n"
          "      dpe_type: random\n"
