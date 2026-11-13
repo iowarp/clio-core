@@ -1471,6 +1471,35 @@ set_tests_properties(
 )
 endif()  # full 4-layer cache stack
 
+# Policy caches over disconnected volatile/persistent cores
+# (design/volatile_persistent_split.md).
+if(CLIO_CTE_ENABLE_POLICY_CACHES)
+add_executable(test_policy_cache test_policy_cache.cc)
+target_include_directories(test_policy_cache PRIVATE
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+)
+target_link_libraries(test_policy_cache
+    clio_cte_core_runtime
+    clio_cte_core_client
+    clio_cte_write_thru_cache_runtime
+    clio_cte_write_thru_cache_client
+    clio_cte_write_back_cache_runtime
+    clio_cte_write_back_cache_client
+    clio::run::admin_runtime
+    clio::run::admin_client
+    clio::run::bdev_runtime
+    clio::run::bdev_client
+)
+add_test(NAME cte_policy_cache COMMAND test_policy_cache)
+set_tests_properties(
+    cte_policy_cache
+    PROPERTIES
+        TIMEOUT 300
+        LABELS "unit;cache;cte"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
+)
+endif()  # policy caches
+
 # Add score-driven eviction tests (Method::kEvict)
 add_test(NAME cte_evict
     COMMAND test_evict)

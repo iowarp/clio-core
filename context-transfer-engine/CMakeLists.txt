@@ -108,6 +108,18 @@ else()
     message(STATUS "CTE: cache chimod disabled (use -DCLIO_CTE_ENABLE_CACHE=ON)")
 endif()
 
+# Policy-named caches over a volatile and a persistent CTE core
+# (design/volatile_persistent_split.md). Both share cache_base/.
+option(CLIO_CTE_ENABLE_POLICY_CACHES
+       "Build the write-through and write-back cache chimods" ON)
+if(CLIO_CTE_ENABLE_POLICY_CACHES)
+    message(STATUS "CTE: building write_thru_cache and write_back_cache chimods")
+    add_subdirectory(write_thru_cache)
+    add_subdirectory(write_back_cache)
+else()
+    message(STATUS "CTE: policy cache chimods disabled")
+endif()
+
 # Checkpoint chimod -- the fault handler behind vector.Copy's lazy copies.
 option(CLIO_CTE_ENABLE_CHECKPOINT "Build the checkpoint chimod" ON)
 if(CLIO_CTE_ENABLE_CHECKPOINT)

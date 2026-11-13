@@ -221,48 +221,6 @@ public:
    * slot's metadata (flags, min_score) survives so the next cache write
    * refills it. freed_bytes reports the physical footprint returned.
    */
-  /** MoveBlobToPersistent outcomes. */
-  static constexpr clio::run::u32 kMoveDone = 0;         ///< moved, or nothing to move
-  static constexpr clio::run::u32 kMoveNoRoom = 1;       ///< persistent budget too small
-  static constexpr clio::run::u32 kMovePlaceFailed = 2;  ///< placement/write failed
-  static constexpr clio::run::u32 kMoveSkipped = 3;      ///< could not read the blob
-
-  /**
-   * Move one blob whose blocks sit below `target_level` onto tiers at or above
-   * it, atomically under its write token (the FlushData / SyncTag move).
-   * @param composite_key "major.minor.name" key of the blob
-   * @param tag_id the blob's tag
-   * @param blob_name the blob's name
-   * @param score placement score for the new layout
-   * @param target_level minimum persistence level to move to
-   * @param budget free bytes on qualifying tiers; debited by the move
-   * @param size OUT bytes moved (kMoveDone) or needed (kMoveNoRoom)
-   * @param rc OUT one of the kMove* outcomes
-   * @param replicas_current the caller vouches that the blob's durable
-   *        replicas are up to date (kSyncReplicasCurrent): one of the
-   *        blob's full size at target_level makes the move unnecessary
-   */
-  clio::run::TaskResume MoveBlobToPersistent(const std::string &composite_key,
-                                             const TagId &tag_id,
-                                             const std::string &blob_name,
-                                             float score, int target_level,
-                                             clio::run::u64 &budget,
-                                             clio::run::u64 &size,
-                                             clio::run::u32 &rc,
-                                             bool replicas_current = false);
-
-  /**
-   * Whether a blob has a durable (non-cache) replica holding all of its
-   * bytes on tiers at or above a persistence level. The caller holds the
-   * blob's write token.
-   * @param blob_info the blob
-   * @param size the blob's current size
-   * @param level the persistence level the replica must reach
-   * @return true when such a replica exists
-   */
-  bool HasDurableReplica(const BlobInfo &blob_info, clio::run::u64 size,
-                         int level);
-
   /** Blobs FlushMetadata serializes between yields to its worker. */
   static constexpr size_t kSnapshotYieldEvery = 256;
 
@@ -324,71 +282,19 @@ public:
   clio::run::u64 NoteReorgNoRoom(float score);
 
   /**
-   * Place `total_size` bytes of `data` on tiers at or above `target_level`
-   * and swap them in as the blob's layout (caller holds the write token and
-   * the reader drain), then free the old layout and WAL the new one.
-   * @param blob_info blob being moved
-   * @param composite_key its "major.minor.name" key (SHM mirror)
-   * @param tag_id its tag
-   * @param blob_name its name
-   * @param score placement score
-   * @param data buffer holding the blob's current bytes
-   * @param total_size bytes in `data`
-   * @param target_level minimum persistence level
-   * @param rc OUT kMoveDone or kMovePlaceFailed
-   */
-  clio::run::TaskResume RelocateBlob(BlobInfo &blob_info,
-                                     const std::string &composite_key,
-                                     const TagId &tag_id,
-                                     const std::string &blob_name, float score,
-                                     ctp::ipc::ShmPtr<> data,
-                                     clio::run::u64 total_size,
-                                     int target_level, clio::run::u32 &rc);
-
-  /**
    * Append a full-replacement kExtendBlob WAL record of the blob's layout.
    * @param tag_id the blob's tag
    * @param blob_name the blob's name
    * @param blob_info the blob (its blocks_ are recorded)
    */
-  /**
-   * The least durable persistence level among a blob's blocks: a move or
-   * re-placement must not put the blob below it.
-   * @param blocks the blob's current layout
-   * @return the minimum PersistenceLevel (as int); 0 for an empty layout
-   */
-  int DurabilityFloor(const clio::run::priv::vector<BlobBlock> &blocks);
-
   void LogBlobLayout(const TagId &tag_id, const std::string &blob_name,
                      const BlobInfo &blob_info);
 
   /**
-   * Whether any block sits on a target below persistence `level`. Caller
-   * holds target_lock_ (read).
-   * @param blocks blocks to check
-   * @param level persistence level
-   * @return true if at least one block is below `level`
-   */
-  bool HasBlocksBelowLevelLocked(const clio::run::priv::vector<BlobBlock> &blocks,
-                                 int level);
-
-  /**
-   * Whether any registered target is at or above a persistence level.
-   * @param level persistence level
-   * @return true if such a tier exists (full or not)
-   */
-  bool HasTierAtLevel(int level);
-
-  /**
-   * Free bytes on every target at or above persistence `level`.
-   * @param level persistence level
-   * @return summed remaining space
-   */
-  clio::run::u64 PersistentBudget(int level);
-
-  /**
-   * fsync(2) for one tag on this container (Method::kSyncTag): move the
-   * tag's blobs to a persistent tier, sync their devices, then the WAL.
+   * fsync(2) for one tag on this container (Method::kSyncTag): sync the
+   * devices holding the tag's blocks, then the WAL. A core is uniform in
+   * durability, so there is nothing to move first; dirty volatile copies
+   * are the write-back cache's to flush before it forwards this verb.
    * @param task sync task (see SyncTagTask)
    */
   clio::run::TaskResume SyncTag(clio::run::shared_ptr<SyncTagTask> &task);
@@ -894,6 +800,24 @@ private:
 
   // CTE configuration (replaces ConfigManager singleton)
   Config config_;
+
+  // Durability class resolved from config_ in Create (ApplyDurability).
+  CoreDurability durability_class_ = CoreDurability::kPersistent;
+
+ public:
+  /** Whether this core is volatile (no WAL, empty after every start). */
+  bool IsVolatileCore() const {
+    return durability_class_ == CoreDurability::kVolatile;
+  }
+
+ private:
+  /**
+   * Resolve the durability class from config_ and apply what it implies.
+   * A volatile core runs without a WAL: metadata_log_path_ is cleared (with
+   * a warning if it was set) and a restart is treated as a fresh start.
+   * @return true on success; false (logged) when the devices mix classes
+   */
+  bool ApplyDurability();
 
   // Cached Data Placement Engine — built once from config_ in Create() so
   // ExtendBlob does not allocate a fresh DPE on every PutBlob.
@@ -1502,10 +1426,13 @@ private:
   void ReserveRestoredBlockSpace();
 
   /**
-   * Register the graceful-stop hook that moves RAM-tier data to a persistent
-   * tier (FlushData) before the runtime exits. Removed again by Destroy.
+   * Register the graceful-stop hook that marks this core as stopping
+   * (stopping_), so the organizer starts no new tier moves while the stop
+   * drain finishes the ones in flight. Removed again by Destroy. The core
+   * moves no data at stop: flushing dirty volatile data is the write-back
+   * cache's stop hook.
    */
-  void RegisterStopFlush();
+  void RegisterStopHook();
 
   /** fsync, close and drop every WAL shard (teardown). */
   void SyncAndCloseLogs();
@@ -1635,7 +1562,10 @@ private:
   clio::run::TaskResume FlushMetadata(clio::run::shared_ptr<FlushMetadataTask> &task);
 
   /**
-   * Flush data from volatile to non-volatile targets (Method::kFlushData)
+   * Make everything this core accepted durable (Method::kFlushData): sync
+   * every non-volatile device and the WAL. A no-op on a volatile core. The
+   * core never moves data between durability classes; the write-back cache
+   * interposes this verb to flush its dirty copies first.
    */
   clio::run::TaskResume FlushData(clio::run::shared_ptr<FlushDataTask> &task);
 

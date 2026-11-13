@@ -2279,6 +2279,9 @@ GLOBAL_CROSS_CONST clio::run::u32 kCtePutDroppable = 0x2u;
  * this put would take ownership of bytes the tier may discard.
  */
 GLOBAL_CROSS_CONST clio::run::u32 kCteDroppabilityConflictRc = 14;
+/** Create return code: the core's storage devices mix durability classes
+ *  (volatile with temporary/long_term) or contradict `durability:`. */
+GLOBAL_CROSS_CONST clio::run::u32 kCteMixedDurabilityRc = 15;
 
 /**
  * CTE Telemetry data structure for performance monitoring

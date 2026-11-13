@@ -58,17 +58,15 @@ struct PerformanceConfig {
 
   clio::run::u32 flush_metadata_period_ms_;  // Period for periodic metadata flush
                                        // (default 5s)
-  std::string metadata_log_path_;   // Path for metadata log (empty = disabled)
-  clio::run::u32 flush_data_period_ms_;   // Period for data flush (default 10s)
-  int flush_data_min_persistence_;  // Min persistence level to flush to
-                                    // (1=temp-nonvolatile)
+  std::string metadata_log_path_;   // Path for metadata log (empty = disabled;
+                                    // always cleared on a volatile core)
   clio::run::u64
       transaction_log_capacity_bytes_;  // Total WAL capacity (default 32MB)
   /** fsync(2) through clio-fs: false ("durable", the default) returns only
-   *  once the file's bytes sit on a tier at flush_data_min_persistence or
-   *  above and are synced to the device, with the metadata WAL that locates
-   *  them; true ("deferred") returns at once and leaves durability to the
-   *  periodic flush_data / flush_metadata tasks. */
+   *  once the devices holding the file's bytes are synced, with the metadata
+   *  WAL that locates them (the write-back cache flushes dirty volatile
+   *  copies first); true ("deferred") returns at once and leaves durability
+   *  to the periodic cache flush and flush_metadata tasks. */
   bool fsync_deferred_;
 
   PerformanceConfig()
@@ -83,8 +81,6 @@ struct PerformanceConfig {
         score_difference_threshold_(0.05f),
         flush_metadata_period_ms_(5000),
         metadata_log_path_(""),
-        flush_data_period_ms_(10000),
-        flush_data_min_persistence_(1),
         transaction_log_capacity_bytes_(32ULL * 1024ULL * 1024ULL),
         fsync_deferred_(false) {}
 };
@@ -198,6 +194,16 @@ struct OrganizerConfig {
 };
 
 /**
+ * Durability class of one CTE core. A core is EITHER entirely volatile OR
+ * entirely persistent (design/volatile_persistent_split.md): moving data
+ * between the two is the job of a cache module above the cores.
+ */
+enum class CoreDurability {
+  kVolatile,    ///< hbm/ram/scratch tiers; no WAL; empty after every start
+  kPersistent,  ///< file/object/long-term tiers; WAL on; accepted = durable
+};
+
+/**
  * CTE Core Configuration Manager
  * Provides YAML parsing and validation for CTE Core configuration
  */
@@ -227,6 +233,13 @@ class Config {
    * Data organizer configuration (periodic reorganization; off by default)
    */
   OrganizerConfig organizer_;
+
+  /**
+   * Stated durability class (YAML key `durability`): "volatile",
+   * "persistent", or empty to infer it from the storage devices. Read it
+   * through ResolveDurability, which also validates the devices.
+   */
+  std::string durability_;
 
   /**
    * Default constructor
@@ -273,6 +286,22 @@ class Config {
    * @return true if configuration is valid, false otherwise
    */
   bool Validate() const;
+
+  /**
+   * Resolve and validate this core's durability class.
+   *
+   * The class is durability_ when stated, else inferred from the devices:
+   * every device "volatile" -> volatile, none -> persistent. With no devices
+   * the class follows metadata_log_path_ (set -> persistent). Errors, each
+   * naming the offending device: a "volatile" device in a persistent core, a
+   * "temporary"/"long_term" device in a volatile core, a ram/hbm/pinned bdev
+   * marked anything but "volatile", and an unknown durability_ value.
+   *
+   * @param out receives the resolved class on success
+   * @param error receives a human-readable reason on failure
+   * @return true when the configuration is uniform and valid
+   */
+  bool ResolveDurability(CoreDurability *out, std::string *error) const;
 
   /**
    * Get configuration parameter as string for debugging
