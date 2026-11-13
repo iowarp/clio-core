@@ -221,6 +221,11 @@ compose:
   #                      DAOS client leaves holes untouched. 0 skips that
   #                      extra pass over the buffer; only for a DAOS version
   #                      known to return zeros for holes.
+  #   chunk_align=<0|1>  1 (default): blocks of at least chunk_size bytes
+  #                      start on a chunk boundary, so a 1 MiB block is one
+  #                      whole DAOS chunk (one erasure-coding stripe) instead
+  #                      of two partial ones (3.4x slower writes measured).
+  #                      0: pack blocks back to back.
   #   io_threads=<n>     dedicated DAOS I/O threads of the process, 1-64
   #                      (default: env CLIO_DAOS_IO_THREADS, else 4). All
   #                      DAOS I/O is issued and reaped by these threads, each

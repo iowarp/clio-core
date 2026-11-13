@@ -124,6 +124,9 @@ bool DaosBdevTransport::Init(const CreateParams &params,
   }
 
   allocator_.Init(num_workers, capacity, params.alignment_);
+  // A block as long as a chunk starts on a chunk boundary, so it is written
+  // as whole chunks (whole erasure-coding stripes), never as two partial ones.
+  allocator_.SetLargeBlockAlign(path_.chunk_align_ ? path_.chunk_size_ : 0);
   if (!OpenAllocLog(params)) {
     Destroy();
     return false;
