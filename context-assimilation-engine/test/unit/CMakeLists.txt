@@ -375,6 +375,16 @@ if(HDF5_ENABLED)
 
   # Set test labels
   set_tests_properties(cae_hdf5_assim PROPERTIES LABELS "format;cae;hdf5;msan_skip")
+
+  # dataset_filter round trip on a generated file: one transfer per glob
+  # feature of MatchGlobPattern (fnmatch on POSIX, the portable matcher on
+  # Windows), each verified byte-for-byte through CTE.
+  add_cae_unit_test(cae_hdf5_dataset_filter
+    ${CMAKE_CURRENT_SOURCE_DIR}/hdf5_filter/test_hdf5_dataset_filter.cc
+    EXTRA_LIBS ${HDF5_LIBRARIES}
+    EXTRA_INCLUDES ${HDF5_INCLUDE_DIRS}
+  )
+  set_tests_properties(cae_hdf5_dataset_filter PROPERTIES LABELS "format;cae;hdf5;msan_skip")
 endif()
 
 #------------------------------------------------------------------------------
