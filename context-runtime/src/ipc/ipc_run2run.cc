@@ -1900,6 +1900,12 @@ void IpcManagerRun2Run::FlushStaleStateForNode(clio::run::u64 node_id) {
 // message-delivery latency. Mirrors the established RecvZmqClientThread wait.
 static constexpr int kRecvWaitTimeoutUs = 100;
 
+// Client recv thread's wait once it has been idle for ~100ms. Bounds the
+// added first-request latency of a TCP client after an idle period (IPC
+// clients wake the EventManager directly) while keeping an idle daemon at
+// ~100 wakes/s on this thread instead of ~1000.
+static constexpr int kRecvIdleWaitUs = 10000;
+
 // Milliseconds a blocking zmq_poll (Transport::PollRecv) waits before returning
 // to re-check recv_shutdown_. zmq_poll wakes immediately on data, so this only
 // bounds idle re-poll + shutdown latency. ZMQ transports use this instead of an
@@ -2089,9 +2095,15 @@ void IpcManagerRun2Run::StartRecvThreads() {
         if (ipc_transport) {
           // issue #1339: back off to 1ms after ~100 empty waits (~10ms idle);
           // reset on work. Bounds idle CPU while keeping the TCP re-poll fast
-          // under load.
-          int wait_us = (idle_waits < 100) ? kRecvWaitTimeoutUs : 1000;
-          ++idle_waits;
+          // under load. After ~100 more (~100ms idle) settle at
+          // kRecvIdleWaitUs: IPC traffic still wakes the EventManager at once,
+          // and only the TCP re-poll (remote / CLIO_IPC_MODE=tcp clients) waits
+          // for the timeout, so a fixed 1ms here cost ~1000 wakes/s, each with a
+          // zmq recv + poll syscall, on every idle daemon.
+          int wait_us = (idle_waits < 100)   ? kRecvWaitTimeoutUs
+                        : (idle_waits < 200) ? 1000
+                                             : kRecvIdleWaitUs;
+          if (idle_waits < 200) ++idle_waits;
           client_recv_em_.Wait(wait_us);
         } else if (tcp_transport) {
           tcp_transport->PollRecv(kZmqPollTimeoutMs);
