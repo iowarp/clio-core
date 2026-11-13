@@ -127,6 +127,38 @@ bool GlobalBlockMap::AllocateBlock(int /*worker*/, size_t footprint,
   return true;
 }
 
+bool GlobalBlockMap::AllocateAlignedBlock(size_t footprint,
+                                          clio::run::u64 align, Block &block) {
+  if (footprint == 0 || align == 0) return false;
+  clio::run::ScopedCoMutex lock(mu_);
+  // Best fit first: a few of the smallest extents that could hold the run.
+  // An extent of footprint + align - 1 bytes always holds one, so if none of
+  // those is positioned right, go straight to the first that large.
+  constexpr int kBestFitTries = 16;
+  auto fit = by_size_.lower_bound({static_cast<clio::run::u64>(footprint), 0});
+  auto holds = [&](decltype(fit) it) {
+    const clio::run::u64 start = (it->second + align - 1) / align * align;
+    return start + footprint <= it->second + it->first;
+  };
+  int tries = 0;
+  while (fit != by_size_.end() && !holds(fit) && ++tries < kBestFitTries) {
+    ++fit;
+  }
+  if (fit != by_size_.end() && !holds(fit)) {
+    fit = by_size_.lower_bound({footprint + align - 1, 0});
+  }
+  if (fit == by_size_.end()) return false;
+  const clio::run::u64 len = fit->first;
+  const clio::run::u64 off = fit->second;
+  const clio::run::u64 start = (off + align - 1) / align * align;
+  EraseLocked(by_off_.find(off));
+  if (start > off) AddLocked(off, start - off);
+  const clio::run::u64 end = start + footprint;
+  if (off + len > end) AddLocked(end, off + len - end);
+  block = Block(start, footprint, TypeOf(footprint));
+  return true;
+}
+
 bool GlobalBlockMap::AllocateAnyUpTo(int /*worker*/, size_t max_bytes,
                                      Block &block) {
   if (max_bytes == 0) return false;
@@ -187,6 +219,27 @@ bool Heap::Allocate(size_t block_size, int block_type, Block &block) {
   block.size_ = static_cast<clio::run::u64>(block_size);
   block.block_type_ = static_cast<clio::run::u32>(block_type);
   return true;
+}
+
+bool Heap::AllocateAligned(size_t block_size, int block_type,
+                           clio::run::u64 align, Block &block,
+                           clio::run::u64 *gap_off, clio::run::u64 *gap_len) {
+  const clio::run::u32 alignment = (alignment_ == 0) ? 4096 : alignment_;
+  const clio::run::u64 aligned_size =
+      ((block_size + alignment - 1) / alignment) * alignment;
+  clio::run::u64 old_heap = heap_.load();
+  for (;;) {
+    const clio::run::u64 start = (old_heap + align - 1) / align * align;
+    if (total_size_ > 0 && start + aligned_size > total_size_) return false;
+    if (heap_.compare_exchange_weak(old_heap, start + aligned_size)) {
+      *gap_off = old_heap;
+      *gap_len = start - old_heap;
+      block.offset_ = start;
+      block.size_ = static_cast<clio::run::u64>(block_size);
+      block.block_type_ = static_cast<clio::run::u32>(block_type);
+      return true;
+    }
+  }
 }
 
 clio::run::u64 Heap::GetRemainingSize() const {
@@ -264,6 +317,23 @@ bool StandardBlockAllocator::AllocateBlocks(size_t size, int worker_id, std::vec
   return ok;
 }
 
+bool StandardBlockAllocator::AllocateLargeAligned(clio::run::u64 footprint,
+                                                  int type, Block &block) {
+  if (global_block_map_.AllocateAlignedBlock(static_cast<size_t>(footprint),
+                                             large_align_, block)) {
+    block.block_type_ = static_cast<clio::run::u32>(type);
+    return true;
+  }
+  clio::run::u64 gap_off = 0, gap_len = 0;
+  if (!heap_.AllocateAligned(static_cast<size_t>(footprint), type,
+                             large_align_, block, &gap_off, &gap_len)) {
+    return false;
+  }
+  // The bytes skipped to reach the boundary stay usable by smaller blocks.
+  if (gap_len != 0) global_block_map_.SeedFreeRange(gap_off, gap_len);
+  return true;
+}
+
 bool StandardBlockAllocator::AllocateBlocksImpl(size_t size, int worker_id,
                                                 std::vector<Block>& blocks) {
   clio::run::u64 total_size = size;
@@ -274,6 +344,19 @@ bool StandardBlockAllocator::AllocateBlocksImpl(size_t size, int worker_id,
   const clio::run::u64 footprint = AlignSize(total_size);
   int type = GlobalBlockMap::FindBlockType(static_cast<size_t>(total_size));
   if (type == -1) type = static_cast<int>(BlockSizeCategory::kMaxCategories) - 1;
+
+  // 0. A block at least one backend unit long starts on a unit boundary
+  //    (SetLargeBlockAlign); when no aligned run exists, fall through to the
+  //    unaligned paths rather than fail.
+  if (large_align_ != 0 && footprint >= large_align_) {
+    Block aligned;
+    if (AllocateLargeAligned(footprint, type, aligned)) {
+      aligned.size_ = total_size;
+      blocks.push_back(aligned);
+      allocated_bytes_.fetch_add(footprint, std::memory_order_relaxed);
+      return true;
+    }
+  }
 
   // 1. Best fit from the coalescing free index: freed space is reused first,
   //    and because frees merge, a large request finds a large extent whenever

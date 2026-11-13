@@ -65,6 +65,17 @@ class GlobalBlockMap {
   /** Best fit: take the smallest free extent >= footprint, split off the
    *  rest. On success block = {offset, footprint, type of footprint}. */
   bool AllocateBlock(int worker, size_t footprint, Block& block);
+  /**
+   * Like AllocateBlock, but the block starts on a multiple of `align`.
+   * Takes the smallest free extent that holds an aligned run of `footprint`
+   * bytes; the unaligned head and the tail of that extent stay free.
+   * @param footprint physical bytes wanted
+   * @param align required alignment of the block's offset in bytes (> 0)
+   * @param block out: {aligned offset, footprint, type of footprint}
+   * @return false if no free extent holds such a run
+   */
+  bool AllocateAlignedBlock(size_t footprint, clio::run::u64 align,
+                            Block& block);
   /** Take the LARGEST free extent, clipped to max_bytes (the remainder stays
    *  free), so a request assembled from pieces uses as few as possible. */
   bool AllocateAnyUpTo(int worker, size_t max_bytes, Block& block);
@@ -119,6 +130,21 @@ class Heap {
 
   void Init(clio::run::u64 total_size, clio::run::u32 alignment = 4096);
   bool Allocate(size_t block_size, int block_type, Block& block);
+  /**
+   * Like Allocate, but the block starts on a multiple of `align`. The bytes
+   * skipped to reach that boundary are reported so the caller can return
+   * them to the free index.
+   * @param block_size bytes wanted (rounded up to the heap alignment)
+   * @param block_type size category recorded in the block
+   * @param align required alignment of the block's offset in bytes (> 0)
+   * @param block out: the block, at an aligned offset
+   * @param gap_off out: start of the skipped range
+   * @param gap_len out: length of the skipped range (0 = none)
+   * @return false if the heap has no room
+   */
+  bool AllocateAligned(size_t block_size, int block_type, clio::run::u64 align,
+                       Block& block, clio::run::u64* gap_off,
+                       clio::run::u64* gap_len);
   clio::run::u64 GetRemainingSize() const;
 
   /**
@@ -162,6 +188,17 @@ class StandardBlockAllocator {
   bool AllocateBlocks(size_t size, int worker_id, std::vector<Block>& blocks);
 
   /**
+   * Start every block of at least `align` bytes on a multiple of `align`.
+   *
+   * For devices whose backend stores data in fixed units (a DAOS file's
+   * chunks, which are also its erasure-coding stripes): a block that
+   * straddles two units costs two partial-unit writes instead of one whole
+   * one. Smaller blocks are placed as before and fill the gaps this leaves.
+   * @param align unit size in bytes; 0 (default) turns the rule off
+   */
+  void SetLargeBlockAlign(clio::run::u64 align) { large_align_ = align; }
+
+  /**
    * Rebuild the allocator from a recovered set of live extents (after Init).
    * The heap cursor moves past the highest live byte, every gap below it is
    * returned to the free list, and the live bytes are charged as allocated,
@@ -199,6 +236,15 @@ class StandardBlockAllocator {
   /** AllocateBlocks without the checker. */
   bool AllocateBlocksImpl(size_t size, int worker_id,
                           std::vector<Block> &blocks);
+  /**
+   * One block starting on a multiple of large_align_, from the free index or
+   * else the heap (SetLargeBlockAlign).
+   * @param footprint physical bytes wanted
+   * @param type size category recorded in the block
+   * @param block out: the block (size_ = footprint)
+   * @return false if neither has an aligned run of that size
+   */
+  bool AllocateLargeAligned(clio::run::u64 footprint, int type, Block &block);
   /** Hand free extents at the top of the used range back to the heap. */
   void RetractHeapTail();
   std::mutex check_mu_;
@@ -209,6 +255,8 @@ class StandardBlockAllocator {
   Heap heap_;
   clio::run::u32 alignment_;
   clio::run::u64 capacity_;
+  /** Blocks >= this start on a multiple of it; 0 = off. */
+  clio::run::u64 large_align_ = 0;
   std::atomic<clio::run::u64> allocated_bytes_{0};
 
   clio::run::u64 AlignSize(clio::run::u64 size) {
