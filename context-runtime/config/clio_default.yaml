@@ -42,6 +42,50 @@ networking:
   #                                    # port equals its own networking.port.
   wait_for_restart: 30                 # Seconds to wait for peer nodes on startup
   wait_for_restart_poll_period: 1      # Seconds between connection retries
+  # Peer (node-to-node) transport knobs (environment only):
+  #   CLIO_PEER_TRANSPORT      default zmq -- zmq (ZeroMQ over TCP), socket
+  #                            (plain TCP), or thallium (Mercury RPC + bulk
+  #                            transfer on the fabric below; needs a build with
+  #                            CLIO_CORE_ENABLE_THALLIUM=ON / Spack +mochi, else
+  #                            the runtime logs an error and uses zmq). All
+  #                            nodes must use the same value.
+  #   With thallium each listener keeps its TCP port (port, and the size-tier
+  #   ports), which then only answers peers asking for this node's Mercury
+  #   address; task traffic uses the fabric.
+  #   CLIO_LBM_THALLIUM_PROTOCOL  default "ofi+tcp;ofi_rxm" -- Mercury protocol.
+  #                            "ofi+cxi" = HPE Slingshot, "ofi+verbs;ofi_rxm" =
+  #                            InfiniBand/RoCE, "na+sm" = one node only.
+  #   CLIO_LBM_THALLIUM_LISTEN default unset -- device/interface after "://" in
+  #                            the listen address: "cxi0" (Slingshot NIC),
+  #                            "hsn0" or an IP (IP protocols). Unset: IP
+  #                            protocols use this node's hostfile address,
+  #                            others whichever device the provider lists
+  #                            first (set cxi0 on multi-NIC Slingshot nodes).
+  #   CLIO_LBM_THALLIUM_AUTH_KEY  default unset -- Mercury NA authorization key
+  #                            (Slingshot: "svc_id:vni") when the job's default
+  #                            credentials are not the ones to use.
+  #   CLIO_LBM_THALLIUM_BULK_THRESHOLD  default 64k -- payload segments of at
+  #                            least this size are pulled by Mercury bulk
+  #                            transfer (RDMA read); smaller ones travel inside
+  #                            the RPC message.
+  #   CLIO_LBM_THALLIUM_RPC_THREADS  default 4 -- Argobots execution streams
+  #                            running RPC handlers (each pulls one message's
+  #                            payload at a time).
+  #   CLIO_LBM_THALLIUM_PROGRESS_THREADS  default 1 -- 1 = dedicated Mercury
+  #                            progress thread; 0 = progress loop and handlers
+  #                            share one thread (RPC_THREADS ignored). Margo
+  #                            runs one progress loop, so more is not possible.
+  #   CLIO_LBM_THALLIUM_TIMEOUT_MS  default 10000 -- a send whose peer has not
+  #                            answered for this long fails (peer treated as
+  #                            down, send retried); 0 waits forever.
+  #   CLIO_LBM_THALLIUM_RECV_QUEUE_MSGS  default 1024, and
+  #   CLIO_LBM_THALLIUM_RECV_QUEUE_BYTES default 1g -- bound on received
+  #                            messages waiting for the runtime, per listener.
+  #   CLIO_LBM_THALLIUM_RECV_QUEUE_WAIT_MS  default 1000 -- how long a sender
+  #                            is held when that queue is full before its send
+  #                            is refused for a later retry.
+  #   CLIO_LBM_THALLIUM_RESOLVE_TIMEOUT_MS  default 5000 -- wait for a peer's
+  #                            reply to the address request.
 
 # -- Logging ------------------------------------------------------------------
 # Logging is controlled by environment variables, not this file.

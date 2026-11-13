@@ -506,9 +506,40 @@ endif()
 
 # Thallium (conditional)
 if(CLIO_CORE_ENABLE_THALLIUM)
+    # thallium's package config resolves margo -> mercury through pkg-config.
+    # Some Mercury packages (e.g. the mercury-devel RPM shipped with DAOS on
+    # Cray systems) install mercury.pc next to libmercury.so instead of in a
+    # pkgconfig/ directory, where pkg-config never looks. When pkg-config
+    # cannot see mercury, locate the library through the normal CMake search
+    # and add the directory holding its .pc file to PKG_CONFIG_PATH.
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(CLIO_MERCURY_PC QUIET mercury)
+    if(NOT CLIO_MERCURY_PC_FOUND)
+        find_library(CLIO_MERCURY_LIBRARY NAMES mercury)
+        if(CLIO_MERCURY_LIBRARY)
+            get_filename_component(CLIO_MERCURY_LIBDIR "${CLIO_MERCURY_LIBRARY}" DIRECTORY)
+            foreach(_clio_pc_dir "${CLIO_MERCURY_LIBDIR}/pkgconfig" "${CLIO_MERCURY_LIBDIR}")
+                if(EXISTS "${_clio_pc_dir}/mercury.pc")
+                    set(ENV{PKG_CONFIG_PATH} "${_clio_pc_dir}:$ENV{PKG_CONFIG_PATH}")
+                    message(STATUS "mercury.pc found at ${_clio_pc_dir} (added to PKG_CONFIG_PATH)")
+                    break()
+                endif()
+            endforeach()
+        endif()
+    endif()
     find_package(thallium CONFIG REQUIRED)
     if(thallium_FOUND)
         message(STATUS "found thallium at ${thallium_DIR}")
+    endif()
+    # A Mercury built with its system-Boost option (HG_HAS_BOOST in
+    # mercury_config.h) includes <boost/preprocessor.hpp> from mercury_macros.h,
+    # which margo.h and so thallium.hpp pull in, but neither mercury.pc nor the
+    # thallium package config exports the Boost include directory. Attach the
+    # Boost headers to the imported thallium target so every consumer sees them.
+    find_package(Boost QUIET)
+    if(Boost_FOUND AND TARGET Boost::headers)
+        target_link_libraries(thallium INTERFACE Boost::headers)
+        message(STATUS "thallium: using Boost headers ${Boost_INCLUDE_DIRS} for mercury_macros.h")
     endif()
     set(SERIALIZATION_LIBS thallium ${SERIALIZATION_LIBS})
     set(CLIO_CORE_ENABLE_CEREAL ON)

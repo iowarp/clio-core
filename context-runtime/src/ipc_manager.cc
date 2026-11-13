@@ -845,8 +845,15 @@ void IpcManager::ClearTransports() {
 
   local_transport_.reset();
   main_transport_.reset();
+  tier_transports_.clear();
   client_tcp_transport_.reset();
   client_ipc_transport_.reset();
+#if CTP_ENABLE_THALLIUM
+  // Every Thallium listener and connection is gone (peer pool, main and tier
+  // listeners above), so Margo can stop its progress and handler threads.
+  // No-op when the Thallium peer transport was never used.
+  ctp::lbm::ThalliumEngine::Finalize();
+#endif
 }
 
 void IpcManager::ServerFinalize() {
@@ -2390,7 +2397,7 @@ bool IpcManager::IdentifyThisHost() {
          host.ip_address, local_host, bind_target);
 
     try {
-      if (TryStartMainServer(bind_target)) {
+      if (TryStartMainServer(bind_target, host.ip_address)) {
         HLOG(kInfo,
              "SUCCESS: Main server started on {}:{} "
              "(advertised as {}, node={})",
@@ -2444,19 +2451,56 @@ namespace {
 // SocketTransport (one sendmsg per message, TCP_NODELAY, no I/O threads).
 // Measured on ares: a raw libzmq DEALER->ROUTER 64 B round trip is 253 us vs
 // 79 us for blocking TCP between the same two nodes.
+//
+// CLIO_PEER_TRANSPORT=thallium (builds with CLIO_CORE_ENABLE_THALLIUM=ON)
+// runs the same listeners and connections over Mercury on the fabric named
+// by CLIO_LBM_THALLIUM_PROTOCOL (e.g. ofi+cxi on Slingshot); see
+// clio_ctp/lightbeam/thallium_transport.h. Each listener keeps its TCP port,
+// which then only answers the address exchange.
 ctp::lbm::TransportType PeerTransportType() {
   static const ctp::lbm::TransportType t = [] {
     const char *e = std::getenv("CLIO_PEER_TRANSPORT");
     if (e != nullptr && std::string(e) == "socket") {
       return ctp::lbm::TransportType::kSocket;
     }
+    if (e != nullptr && std::string(e) == "thallium") {
+#if CTP_ENABLE_THALLIUM
+      return ctp::lbm::TransportType::kThallium;
+#else
+      HLOG(kError,
+           "CLIO_PEER_TRANSPORT=thallium needs a build with "
+           "CLIO_CORE_ENABLE_THALLIUM=ON; using ZeroMQ");
+#endif
+    }
     return ctp::lbm::TransportType::kZeroMq;
   }();
   return t;
 }
+
+/**
+ * Address handed to a peer listener of the given transport type.
+ * ZeroMQ and socket listeners bind `bind_addr`. A Thallium listener's TCP
+ * port binds every interface regardless; its address only tells Mercury
+ * which interface an IP protocol should use, so it gets the address this
+ * node advertises in the hostfile (the one peers dial) when that is known.
+ *
+ * @param type Transport type of the listener.
+ * @param bind_addr Address ZeroMQ would bind (often 0.0.0.0).
+ * @param advertise_addr Hostfile address of this node ("" if unknown).
+ * @return The address to construct the listener with.
+ */
+const std::string &PeerListenAddr(ctp::lbm::TransportType type,
+                                  const std::string &bind_addr,
+                                  const std::string &advertise_addr) {
+  if (type == ctp::lbm::TransportType::kThallium && !advertise_addr.empty()) {
+    return advertise_addr;
+  }
+  return bind_addr;
+}
 }  // namespace
 
-bool IpcManager::TryStartMainServer(const std::string &hostname) {
+bool IpcManager::TryStartMainServer(const std::string &hostname,
+                                    const std::string &advertise_addr) {
   ConfigManager *config = CLIO_CONFIG_MANAGER;
 
   try {
@@ -2471,10 +2515,11 @@ bool IpcManager::TryStartMainServer(const std::string &hostname) {
     tier_transports_.clear();
     for (int i = 0; i < NetTierSlots(); ++i) {
       u32 tport = port + kNetTierPortOffset + static_cast<u32>(i);
-      ctp::lbm::TransportPtr t = ctp::lbm::TransportFactory::Get(
-          hostname,
+      const ctp::lbm::TransportType ttype =
           NetTierUsesZmq(i) ? ctp::lbm::TransportType::kZeroMq
-                            : PeerTransportType(),
+                            : PeerTransportType();
+      ctp::lbm::TransportPtr t = ctp::lbm::TransportFactory::Get(
+          PeerListenAddr(ttype, hostname, advertise_addr), ttype,
           ctp::lbm::TransportMode::kServer, protocol, tport);
       if (!t) {
         HLOG(kError, "Failed to bind size-tier peer port {}:{}", hostname,
@@ -2491,8 +2536,8 @@ bool IpcManager::TryStartMainServer(const std::string &hostname) {
     }
 
     main_transport_ = ctp::lbm::TransportFactory::Get(
-        hostname, PeerTransportType(),
-        ctp::lbm::TransportMode::kServer, protocol, port);
+        PeerListenAddr(PeerTransportType(), hostname, advertise_addr),
+        PeerTransportType(), ctp::lbm::TransportMode::kServer, protocol, port);
 
     if (!main_transport_) {
       HLOG(kDebug,
