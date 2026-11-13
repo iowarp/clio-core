@@ -212,6 +212,7 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
     if (st->GetReturnCode() == 0) sys_tag_id_ = st->tag_id_;
   }
   split_entries_ = std::max<clio::run::u32>(cfg.dir_split_entries_, 16);
+  dir_log_compact_bytes_ = cfg.dir_log_compact_bytes_;
   case_insensitive_ = cfg.case_insensitive_;
   // Inode records live in CTE blobs and load on demand; only this
   // container's id reservation and orphan list are read up front.
@@ -227,9 +228,11 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
       CLIO_CO_RETURN;
     }
   }
-  // Mirror the namespace into CTE tag names (async). The root first; on a
-  // restart this node missed broadcasts while down, so drop its published
-  // names, re-add the ones this container owns, and pull the rest from peers.
+  // Mirror the namespace into CTE tag names (async). The root first. On a
+  // restart this node's CTE still holds the names published before it went
+  // down, so drop them and re-add the ones this container owns. Names owned
+  // by other containers are published by those containers into their own
+  // nodes' CTE, so nothing is pulled from peers.
   PublishName(clio::cte::core::TagNameOp::kSetRoot, FsRootId(), "/");
   if (is_restart_) {
     std::string reset;
@@ -246,11 +249,6 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
     }
     auto u = cte_.AsyncUpdateTagNames(reset, clio::run::PoolQuery::Local());
     CLIO_CO_AWAIT(u);
-    const clio::run::u32 n = NumContainers();
-    for (clio::run::u32 c = 0; c < n; ++c) {
-      if (c != container_id_) catchup_missing_.insert(c);
-    }
-    catchup_pending_ = !catchup_missing_.empty();
   }
 
   // issue #817: shared-memory attribute mirror. Node-local derived state that
@@ -283,7 +281,7 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   // Never claim the root complete: after a restart it has children the
   // mirror has never seen.
   MirrorDir("/", FsRootId(), /*complete=*/false);
-  EnsurePurgeDrain();  // also broadcasts the queued tag names
+  EnsurePurgeDrain();  // also publishes the queued tag names
   fields->return_code_ = 0;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -853,7 +851,7 @@ clio::run::TaskResume Runtime::Close(clio::run::shared_ptr<CloseTask> &task) {
     if (fi->open_count_ > 0) fi->open_count_--;
     if (task->advance_size_ != 0) fi->dirty_ = true;
     if (fi->orphan_ && fi->open_count_ == 0) {
-      DropInodeLocked(fi);
+      DropInodeLocked(fi, /*size_trusted=*/true);
     } else if (fi->dirty_) {
       fi->dirty_ = false;
       LogInode(*fi);
@@ -1697,6 +1695,7 @@ clio::run::TaskResume Runtime::Readdir(clio::run::shared_ptr<ReaddirTask> &task)
   const std::string dir = FsNormPath(task->path_.str());
   task->entries_ = clio::run::priv::vector<clio::run::priv::string>(CTP_MALLOC);
   task->inos_ = clio::run::priv::vector<clio::run::u64>(CTP_MALLOC);
+  task->types_ = clio::run::priv::vector<clio::run::u32>(CTP_MALLOC);
   CLIO_FS_RESOLVE(dir, de, dpar, rc);
   (void)dpar;
   if (rc == 0 && de.type_ != kFsTypeDir) rc = ENOTDIR;
@@ -1705,11 +1704,53 @@ clio::run::TaskResume Runtime::Readdir(clio::run::shared_ptr<ReaddirTask> &task)
   if (rc == 0) CLIO_CO_AWAIT(CollectDir(de.id_, &listing, &newest, rc));
   task->entries_.reserve(listing.size());
   task->inos_.reserve(listing.size());
+  task->types_.reserve(listing.size());
   for (const auto &kv : listing) {
     task->entries_.push_back(
         clio::run::priv::string(CTP_MALLOC, FsJoin(dir, kv.first)));
     task->inos_.push_back(InoFromPacked(kv.second.id_));
+    task->types_.push_back(kv.second.type_);
   }
+  task->return_code_ = rc;
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::ReaddirRange(
+    clio::run::shared_ptr<ReaddirRangeTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  const std::string dir = FsNormPath(task->path_.str());
+  task->entries_ = clio::run::priv::vector<clio::run::priv::string>(CTP_MALLOC);
+  task->inos_ = clio::run::priv::vector<clio::run::u64>(CTP_MALLOC);
+  task->types_ = clio::run::priv::vector<clio::run::u32>(CTP_MALLOC);
+  task->offs_ = clio::run::priv::vector<clio::run::u64>(CTP_MALLOC);
+  task->next_off_ = kDirOffEnd;
+  CLIO_FS_RESOLVE(dir, de, dpar, rc);
+  (void)dpar;
+  if (rc == 0 && de.type_ != kFsTypeDir) rc = ENOTDIR;
+  std::vector<DirRangeEntry> chunk;
+  clio::run::u64 next_off = kDirOffEnd;
+  if (rc == 0) {
+    CLIO_CO_AWAIT(CollectDirRange(de.id_, task->start_off_,
+                                  task->max_entries_, &chunk, &next_off, rc));
+  }
+  if (rc != 0) {
+    // A failed chunk carries nothing: never half a listing that looks whole.
+    chunk.clear();
+    next_off = kDirOffEnd;
+  }
+  task->entries_.reserve(chunk.size());
+  task->inos_.reserve(chunk.size());
+  task->types_.reserve(chunk.size());
+  task->offs_.reserve(chunk.size());
+  for (const DirRangeEntry &e : chunk) {
+    task->entries_.push_back(
+        clio::run::priv::string(CTP_MALLOC, FsJoin(dir, e.name_)));
+    task->inos_.push_back(InoFromPacked(e.id_));
+    task->types_.push_back(e.type_);
+    task->offs_.push_back(e.off_);
+  }
+  task->next_off_ = next_off;
   task->return_code_ = rc;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -1813,13 +1854,15 @@ clio::run::TaskResume Runtime::InodeXattr(const FsReq &req, FsResp &resp) {
         // in RAM, and a crash of its node lost every xattr of the file.
         clio::cte::core::Context xctx;
         xctx.op_flags_ |= clio::cte::core::Context::kMetaBlob;
-        xctx.min_persistence_level_ = inode_volatile_only_ ? 0 : 1;
+        // Decided once, before the await (see PutBlockCte).
+        const bool asked_volatile = inode_volatile_only_;
+        xctx.min_persistence_level_ = asked_volatile ? 0 : 1;
         auto p = cte_.AsyncPutBlob(xattr_tag_id_, key, 0, payload.size(),
                                    buf.shm_.template Cast<void>(), -1.0f,
                                    xctx, clio::cte::core::kCtePutReplace,
                                    clio::run::PoolQuery::Dynamic());
         CLIO_CO_AWAIT(p);
-        if (p->GetReturnCode() != 0 && !inode_volatile_only_) {
+        if (p->GetReturnCode() != 0 && !asked_volatile) {
           // No non-volatile tier takes it: keep it in RAM rather than fail.
           xctx.min_persistence_level_ = 0;
           p = cte_.AsyncPutBlob(xattr_tag_id_, key, 0, payload.size(),

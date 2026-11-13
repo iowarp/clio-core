@@ -580,6 +580,25 @@ class Client : public clio::cte::core::Client {
     return ipc->Send(task);
   }
 
+  /**
+   * List one chunk of a directory in offset order (Method::kReaddirRange).
+   * @param path directory path
+   * @param start_off first offset wanted: 0 for the start, else a previous
+   *        chunk's next_off_ or any offset to seek to
+   * @param max_entries entries after which the chunk ends (it may run a
+   *        little over: chunks are never cut inside a table block)
+   * @return future of the chunk; next_off_ is kDirOffEnd at the end
+   */
+  clio::run::Future<ReaddirRangeTask> AsyncReaddirRange(
+      const std::string &path, clio::run::u64 start_off,
+      clio::run::u32 max_entries = 8192) {
+    auto *ipc = CLIO_CPU_IPC;
+    auto task = ipc->NewTask<ReaddirRangeTask>(
+        clio::run::CreateTaskId(), pool_id_, FsPathQuery(), path, start_off,
+        max_entries);
+    return ipc->Send(task);
+  }
+
   clio::run::Future<StatSizeTask> AsyncStatSize(const std::string &path) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<StatSizeTask>(clio::run::CreateTaskId(), pool_id_,

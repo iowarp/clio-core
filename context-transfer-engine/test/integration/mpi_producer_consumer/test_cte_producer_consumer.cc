@@ -135,7 +135,7 @@ int RunProducer() {
 
   // Own-node sanity: the producer must see its own tag/blob sizes.
   if (!failed) {
-    auto ts = core.AsyncGetTagSize(tag_id, clio::run::PoolQuery::Dynamic());
+    auto ts = core.AsyncGetTagSize(tag_id, clio::run::PoolQuery::Broadcast(0.0f));
     ts.Wait();
     auto bs = core.AsyncGetBlobSize(tag_id, kBlobName,
                                     clio::run::PoolQuery::Dynamic());
@@ -176,7 +176,7 @@ int RunConsumer() {
   clio::cte::core::TagId tag_id = clio::cte::core::TagId::FromU64(tag_u64);
 
   // Tag metadata must be visible cross-node (this already works post-#685).
-  auto ts = core.AsyncGetTagSize(tag_id, clio::run::PoolQuery::Dynamic());
+  auto ts = core.AsyncGetTagSize(tag_id, clio::run::PoolQuery::Broadcast(0.0f));
   ts.Wait();
   auto bs = core.AsyncGetBlobSize(tag_id, kBlobName,
                                   clio::run::PoolQuery::Dynamic());

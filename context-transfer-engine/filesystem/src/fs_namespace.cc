@@ -299,6 +299,10 @@ clio::run::TaskResume Runtime::ExecShardOp(clio::run::u32 op, const FsReq &req,
       break;
     case kTablePush: rc = ApplyTablePush(req); break;
     case kTableStandInFetch: rc = ServeStandInFetch(req, resp); break;
+    case kTableLoadBlocks:
+      CLIO_CO_AWAIT(LoadBlockGroup(req, resp));
+      rc = static_cast<int>(resp.rc_);
+      break;
     case kTableInstall:
       CLIO_CO_AWAIT(InstallBlock(req, resp));
       rc = static_cast<int>(resp.rc_);
@@ -311,19 +315,6 @@ clio::run::TaskResume Runtime::ExecShardOp(clio::run::u32 op, const FsReq &req,
     case kShardPurgeLocal:
       CLIO_CO_AWAIT(PurgeLocal(req));
       break;
-    case kShardRepublish: {
-      // A restarted node asks for this container's names (it reset its own).
-      std::string batch;
-      CLIO_CO_AWAIT(EncodeHomeNames(&batch));
-      if (!batch.empty()) {
-        auto u = cte_.AsyncUpdateTagNames(
-            batch, clio::run::PoolQuery::DirectId(
-                       static_cast<clio::run::ContainerId>(req.a_)));
-        CLIO_CO_AWAIT(u);
-        rc = static_cast<int>(u->GetReturnCode());
-      }
-      break;
-    }
     default:
       if (op >= kShardInodeStat && op <= kShardInodeXattr) {
         CLIO_CO_AWAIT(ExecInodeOp(op, req, resp, rc));
@@ -338,7 +329,8 @@ clio::run::TaskResume Runtime::ExecShardOp(clio::run::u32 op, const FsReq &req,
   // back to the sender, whose handler waits the same way -- deadlocked two
   // nodes storing inodes cached on each other.
   if (op != kTablePush && op != kShardInodePush &&
-      op != kTableFetch && op != kTableStandInFetch) {
+      op != kTableFetch && op != kTableStandInFetch &&
+      op != kTableLoadBlocks) {
     int ferr = 0;
     CLIO_CO_AWAIT(FlushInodes(&ferr, since));
     // The change could not be made durable (a full store): say so rather
@@ -485,7 +477,8 @@ int Runtime::InodeOpenLocal(const FsReq &req, FsResp &resp) {
   return 0;
 }
 
-void Runtime::DropInodeLocked(const std::shared_ptr<InodeState> &fi) {
+void Runtime::DropInodeLocked(const std::shared_ptr<InodeState> &fi,
+                              bool size_trusted) {
   if (fi->open_count_ > 0) {
     // POSIX: an unlinked file lives until its last descriptor closes.
     fi->orphan_ = true;
@@ -505,7 +498,20 @@ void Runtime::DropInodeLocked(const std::shared_ptr<InodeState> &fi) {
   item.id_ = fi->tag_id_;
   item.data_ = true;  // pages and the inode record (symlinks have one too)
   item.xattr_ = fi->has_xattr_;
+  RecordPurgeExtent(*fi, size_trusted, &item);
   QueuePurge(item);
+}
+
+void Runtime::RecordPurgeExtent(const InodeState &fi, bool size_trusted,
+                                PurgeItem *item) {
+  // The size is the stream's, read from the co-located stream: that exists
+  // only where this container is the inode's home. A stand-in (failover)
+  // holds no stream, and reading one would report a false zero.
+  if (!size_trusted || fi.type_ != kFsTypeFile || stream_hold_ == nullptr) {
+    return;  // extent unknown
+  }
+  item->size_ = FileSize(fi);
+  item->extent_known_ = true;
 }
 
 int Runtime::InodeNlink(const FsReq &req, FsResp &resp) {
@@ -528,7 +534,7 @@ int Runtime::InodeNlink(const FsReq &req, FsResp &resp) {
   }
   InodeAttrLocked(*fi, &resp.attr_);
   if (fi->nlink_ == 0) {
-    DropInodeLocked(fi);
+    DropInodeLocked(fi, /*size_trusted=*/true);
   } else {
     LogInode(*fi);
   }
@@ -685,7 +691,6 @@ clio::run::TaskResume Runtime::PurgeDrain() {
   // then the page purge.
   CLIO_CO_AWAIT(FlushNames());
   CLIO_CO_AWAIT(FlushInodes());  // anything a handler left dirty
-  if (catchup_pending_) CLIO_CO_AWAIT(CatchUpNames());
   // Bound what a power loss can take from the directory journal.
   SyncDirJournalIfDue();
   std::vector<PurgeItem> work;
@@ -693,18 +698,14 @@ clio::run::TaskResume Runtime::PurgeDrain() {
     std::lock_guard<std::mutex> g(purge_mu_);
     work.swap(purge_pending_);
   }
-  // Pages are hash-spread over every node. Ship each node ONE request per
-  // batch of dead ids (it deletes its own pages locally) instead of one
-  // cluster-wide broadcast per file: 10k unlinks were 10k broadcasts that
-  // saturated the network worker and stalled every other remote request.
+  // Pages are hash-spread over the containers. Each container gets ONE
+  // request per batch of dead ids, listing only the ids whose pages it may
+  // hold (see PurgeOwners), and deletes its own pages locally.
   constexpr size_t kPurgeBatch = 512;
   for (size_t i = 0; i < work.size(); i += kPurgeBatch) {
-    FsReq batch;
-    FsEnc enc(&batch.str_);
     const size_t end = std::min(work.size(), i + kPurgeBatch);
     for (size_t j = i; j < end; ++j) {
       if (!work[j].data_) continue;
-      enc.U64(FsPack(work[j].id_));
       // Forget the stream first: a deferred append still in flight is then
       // discarded instead of re-creating pages after the purge below.
       clio::run::u32 rc = 0;
@@ -712,13 +713,8 @@ clio::run::TaskResume Runtime::PurgeDrain() {
                                clio::cte::stream::StreamSizeOp::kDrop, 0,
                                nullptr, nullptr, &rc));
     }
-    if (!batch.str_.empty()) {
-      const clio::run::u32 n = NumContainers();
-      for (clio::run::u32 c = 0; c < n; ++c) {
-        FsResp ignored;  // an unreachable node keeps its pages (a leak)
-        CLIO_CO_AWAIT(CallShard(c, kShardPurgeLocal, batch, ignored));
-      }
-    }
+    std::vector<FsReq> requests = BuildPurgeRequests(work, i, end);
+    CLIO_CO_AWAIT(SendPurgeRequests(requests));
     for (size_t j = i; j < end; ++j) {
       // The inode record: a key on this home's CTE container, which the
       // per-node page purge above does not reach when no page lives here.
@@ -758,6 +754,80 @@ clio::run::TaskResume Runtime::PurgeLocal(const FsReq &req) {
   CLIO_TASK_BODY_END
 }
 
+std::vector<clio::run::u32> Runtime::PurgeOwners(const PurgeItem &item) {
+  const clio::run::u32 n = NumContainers();
+  // Page placement is the CTE core's (DirectHash of BlobHash, failover to a
+  // successor), so the owner count is the core pool's, not this pool's.
+  const clio::run::u32 core_n =
+      clio::cte::core::PoolContainers(clio::cte::core::kCtePoolId);
+  if (!item.extent_known_ || core_n != n || core_n == 0) {
+    std::vector<clio::run::u32> all(n);
+    for (clio::run::u32 c = 0; c < n; ++c) all[c] = c;
+    return all;
+  }
+  const clio::run::u64 pages = (item.size_ + kFsPageSize - 1) / kFsPageSize;
+  if (pages > n) {
+    std::vector<clio::run::u32> all(n);
+    for (clio::run::u32 c = 0; c < n; ++c) all[c] = c;
+    return all;
+  }
+  std::vector<bool> hit(n, false);
+  for (clio::run::u64 pg = 0; pg < pages; ++pg) {
+    const clio::run::u32 owner =
+        clio::cte::core::BlobHash(item.id_, PageName(pg * kFsPageSize)) %
+        core_n;
+    hit[clio::cte::core::FailoverContainer(clio::cte::core::kCtePoolId,
+                                           owner)] = true;
+  }
+  std::vector<clio::run::u32> owners;
+  for (clio::run::u32 c = 0; c < n; ++c) {
+    if (hit[c]) owners.push_back(c);
+  }
+  return owners;
+}
+
+std::vector<Runtime::FsReq> Runtime::BuildPurgeRequests(
+    const std::vector<PurgeItem> &work, size_t begin, size_t end) {
+  std::vector<FsReq> requests(NumContainers());
+  for (size_t j = begin; j < end; ++j) {
+    if (!work[j].data_) continue;
+    const clio::run::u64 packed = FsPack(work[j].id_);
+    // This container always purges too (no network): it is the inode's
+    // home and may hold the tag's local share even when no page hashes here.
+    bool home_listed = false;
+    for (clio::run::u32 c : PurgeOwners(work[j])) {
+      FsEnc(&requests[c].str_).U64(packed);
+      home_listed = home_listed || c == container_id_;
+    }
+    if (!home_listed && container_id_ < requests.size()) {
+      FsEnc(&requests[container_id_].str_).U64(packed);
+    }
+  }
+  return requests;
+}
+
+clio::run::TaskResume Runtime::SendPurgeRequests(const std::vector<FsReq> &reqs) {
+  CLIO_TASK_BODY_BEGIN
+  // Every remote request is in flight before any reply is awaited, so the
+  // containers purge in parallel. A purge that fails or times out leaves its
+  // pages in place (a leak), as before: the reply is not needed.
+  std::vector<clio::run::Future<ShardOpTask>> inflight;
+  for (clio::run::u32 c = 0; c < reqs.size(); ++c) {
+    if (reqs[c].str_.empty()) continue;
+    if (c == container_id_) {
+      FsResp ignored;
+      CLIO_CO_AWAIT(ExecShardOp(kShardPurgeLocal, reqs[c], ignored));
+      continue;
+    }
+    inflight.push_back(SendShard(c, kShardPurgeLocal, reqs[c]));
+  }
+  for (auto &f : inflight) {
+    CLIO_CO_AWAIT(f);
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 // ===========================================================================
 // CTE tag-name publisher
 // ===========================================================================
@@ -777,17 +847,18 @@ clio::run::TaskResume Runtime::FlushNames() {
     batch.swap(tn_batch_);
   }
   if (!batch.empty()) {
-    // One broadcast per drain tick carries every change since the last one.
-    // A node that is down misses it and resyncs when it restarts. A
-    // broadcast that fails outright is retried on the next ticks (#1182:
-    // a node's index missed a directory rename and nothing said why); the
-    // records carry their own stamps, so re-sending them is harmless.
-    auto u = cte_.AsyncUpdateTagNames(batch,
-                                      clio::run::PoolQuery::Broadcast(0.0f));
+    // One publish per drain tick carries every change since the last one.
+    // It goes to this node's CTE only: each filesystem container mirrors the
+    // names of the directory blocks it is home for into its own node's CTE,
+    // so no broadcast is needed. A publish that fails outright is retried on
+    // the next ticks (#1182: a node's index missed a directory rename and
+    // nothing said why); the records carry their own stamps, so re-sending
+    // them is harmless.
+    auto u = cte_.AsyncUpdateTagNames(batch, clio::run::PoolQuery::Local());
     CLIO_CO_AWAIT(u);
     if (u->GetReturnCode() != 0) {
       ++tn_flush_failures_;
-      HLOG(kWarning, "filesystem: tag-name broadcast of {} byte(s) failed "
+      HLOG(kWarning, "filesystem: tag-name publish of {} byte(s) failed "
            "(rc {}); {} failure(s) so far, re-queued", batch.size(),
            u->GetReturnCode(), tn_flush_failures_);
       if (tn_flush_failures_ <= kNameFlushRetries) {
@@ -797,32 +868,6 @@ clio::run::TaskResume Runtime::FlushNames() {
     } else {
       tn_flush_failures_ = 0;
     }
-  }
-  CLIO_CO_RETURN;
-  CLIO_TASK_BODY_END
-}
-
-clio::run::TaskResume Runtime::CatchUpNames() {
-  CLIO_TASK_BODY_BEGIN
-  // Every peer re-sends the names it owns to this node. Peers still coming
-  // up are retried on later ticks (about 1 s apart, up to ~2 minutes).
-  if (++catchup_attempts_ % 50 != 1) CLIO_CO_RETURN;
-  std::vector<clio::run::u32> peers(catchup_missing_.begin(),
-                                    catchup_missing_.end());
-  for (clio::run::u32 c : peers) {
-    FsReq r;
-    r.a_ = container_id_;
-    FsResp resp;
-    CLIO_CO_AWAIT(CallShard(c, kShardRepublish, r, resp));
-    if (resp.rc_ == 0) catchup_missing_.erase(c);
-  }
-  if (catchup_missing_.empty() || catchup_attempts_ > 50 * 120) {
-    if (!catchup_missing_.empty()) {
-      HLOG(kWarning, "filesystem: {} peers never re-sent their names; CTE "
-           "search on this node misses their part of the namespace",
-           catchup_missing_.size());
-    }
-    catchup_pending_ = false;
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -1012,7 +1057,9 @@ clio::run::TaskResume Runtime::LoadSysRecords() {
     std::shared_ptr<InodeState> fi = it->second;
     fi->open_count_ = 0;
     fi->orphan_ = false;
-    DropInodeLocked(fi);
+    // Recovered after a restart: its stream may not be restored yet, so its
+    // size is not trusted and its purge reaches every container.
+    DropInodeLocked(fi, /*size_trusted=*/false);
   }
   if (!orphans.empty()) {
     {

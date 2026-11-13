@@ -39,6 +39,7 @@
 
 /** Latency-report channel hook (defined in ipc_gpu2cpu.cc). */
 extern "C" void clio_evlat_add(int which, unsigned long long cycles);
+#include "clio_runtime/evlat.h"
 #include <clio_runtime/pool_manager.h>
 #include <clio_runtime/config_manager.h>
 #include <clio_runtime/worker.h>
@@ -51,6 +52,7 @@ extern "C" void clio_evlat_add(int which, unsigned long long cycles);
 #include <clio_ctp/thread/thread_model_manager.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <unordered_set>
 #include <mutex>
@@ -221,6 +223,21 @@ void IpcManagerRun2Run::SendInTransmitReplica(
   const uint64_t nt0 = nettrace::On() ? nettrace::NowNs() : 0;
   container->SaveTask(task_copy->method_, archive, task_copy);
   const uint64_t nt1 = nettrace::On() ? nettrace::NowNs() : 0;
+  // Size-tiered peer ports: send on the tier listener for this message's
+  // payload size (archive.send is complete once SaveTask returns; ZMQ Expose
+  // is a pass-through, so the archive built against the base DEALER is valid
+  // on any ZMQ DEALER).
+  if (clio::run::IpcManager::NetTierSlots() > 0) {
+    size_t bytes = 0;
+    for (const auto &b : archive.send) bytes += b.size;
+    int tport = port +
+                static_cast<int>(clio::run::IpcManager::kNetTierPortOffset) +
+                clio::run::IpcManager::NetTierSlot(bytes);
+    if (ctp::lbm::Transport *t =
+            ipc_manager->GetOrCreateClient(target_host->ip_address, tport)) {
+      lbm_transport = t;
+    }
+  }
 
   ctp::lbm::LbmContext ctx(ctp::lbm::LBM_SYNC);
   int rc = lbm_transport->Send(archive, ctx);
@@ -256,6 +273,8 @@ void IpcManagerRun2Run::SendInTransmitReplica(
 // =============================================================================
 
 void IpcManagerRun2Run::SendIn(clio::run::shared_ptr<clio::run::Task> origin_task) {
+  clio::run::evlat::ScopedSpan ev_span(clio::run::evlat::kOriginSend,
+                                       clio::run::evlat::kBusyNetSend);
   auto *ipc_manager = CLIO_IPC;
   auto *pool_manager = CLIO_POOL_MANAGER;
 
@@ -463,6 +482,7 @@ int IpcManagerRun2Run::SendOutTransmit(
       lbm_transport = fshm->response_transport_;
     }
   }
+  const bool used_fshm_transport = lbm_transport != nullptr;
   if (lbm_transport == nullptr) {
     // Responses ride a DEDICATED connection (lane "resp"), never the bulk
     // SendIn DEALER: a metadata-only ack queuing behind a 1 MiB task frame
@@ -487,6 +507,17 @@ int IpcManagerRun2Run::SendOutTransmit(
   const uint64_t nt0 = nettrace::On() ? nettrace::NowNs() : 0;
   container->SaveTask(origin_task->method_, archive, origin_task);
   const uint64_t nt1 = nettrace::On() ? nettrace::NowNs() : 0;
+  if (clio::run::IpcManager::NetTierSlots() > 0 && !used_fshm_transport) {
+    size_t bytes = 0;
+    for (const auto &b : archive.send) bytes += b.size;
+    int tport = port +
+                static_cast<int>(clio::run::IpcManager::kNetTierPortOffset) +
+                clio::run::IpcManager::NetTierSlot(bytes);
+    if (ctp::lbm::Transport *t = ipc_manager->GetOrCreateClient(
+            target_host->ip_address, tport, "resp")) {
+      lbm_transport = t;
+    }
+  }
 
   ctp::lbm::LbmContext ctx(ctp::lbm::LBM_SYNC);
   int rc = lbm_transport->Send(archive, ctx);
@@ -516,6 +547,8 @@ int IpcManagerRun2Run::SendOutTransmit(
 // =============================================================================
 
 void IpcManagerRun2Run::SendOut(clio::run::shared_ptr<clio::run::Task> origin_task) {
+  clio::run::evlat::ScopedSpan ev_span(clio::run::evlat::kRemoteSend,
+                                       clio::run::evlat::kBusyNetSend);
   auto *ipc_manager = CLIO_IPC;
 
   if (origin_task.IsNull()) {
@@ -567,6 +600,11 @@ void IpcManagerRun2Run::SendOut(clio::run::shared_ptr<clio::run::Task> origin_ta
   // actually left. Erasing before the send made a response parked in
   // send_out_retry_ look Gone to the origin, which then failed the task.
   if (rc == 0) {
+    if (clio::run::RunContext *ev_rc = origin_task->RunCtxPtr()) {
+      clio::run::evlat::Span(clio::run::evlat::kRemoteResid,
+                             ev_rc->remote_arrive_cyc_, clio::run::evlat::Now());
+      ev_rc->remote_arrive_cyc_ = 0;
+    }
     EraseRecvEntry(origin_task);
   }
   // Task frees via RAII when its shared_ptr owners drop (the by-value
@@ -584,6 +622,7 @@ bool IpcManagerRun2Run::RecvInHandleOne(
     const clio::run::TaskInfo &task_info,
     clio::run::LoadTaskArchive &archive,
     ctp::lbm::Transport *lbm_transport) {
+  const unsigned long long ev_arrive = clio::run::evlat::Now();
   // Receipt is proof of life (issue #774): a task arriving from a node we had
   // SWIM-marked dead proves it is alive NOW. Without this, a one-sided death
   // verdict is TERMINAL: our revival probes to the "dead" node are themselves
@@ -697,6 +736,11 @@ bool IpcManagerRun2Run::RecvInHandleOne(
   // Allocate the task's RunContext (and resolve its container) now that it is
   // deserialized, so RouteTask / the worker have an active RunContext.
   future.GetTaskPtr()->BeginRunContext();
+  if (ev_arrive != 0) {
+    if (clio::run::RunContext *ev_rc = task_ptr->RunCtxPtr()) {
+      ev_rc->remote_arrive_cyc_ = ev_arrive;
+    }
+  }
   ipc_manager->NetProfMarkRecvIn(task_ptr);
   task_ptr->SetRouted();
 
@@ -704,6 +748,27 @@ bool IpcManagerRun2Run::RecvInHandleOne(
     // issue #781: ClientMapTask removed. Deposit on the shared ingress lane (0);
     // the runtime maps to a worker via RuntimeMapTask.
     clio::run::u32 lane_id = 0;
+    // CLIO_NET_DIRECT (default on in this branch; =0 restores lane 0): place
+    // the task on its worker HERE, on the recv thread, instead of pushing it
+    // to the shared ingress lane 0. Lane 0 is drained only by worker 0, which
+    // also owns client SHM shard 0 and drains up to 256 client requests
+    // inline per pass, so with the hand-off done there (CLIO_NET_SPREAD) a
+    // remote task still waited ~2 ms (r_lane) under a 4-node 16x16 4 KB load
+    // once the send queues were emptied by dedicated send threads. Same
+    // least-loaded choice (RuntimeMapTask with no submitting worker); marked
+    // net-placed so the destination's RouteTask runs it without re-placing.
+    static const bool kNetDirect = [] {
+      const char *e = std::getenv("CLIO_NET_DIRECT");
+      return !(e != nullptr && e[0] == '0');
+    }();
+    if (kNetDirect && task_ptr->IsRemote()) {
+      clio::run::ContainerHold exec = task_ptr->ExecContainer().get();
+      if (exec) {
+        task_ptr->SetNetPlaced();
+        lane_id = ipc_manager->GetScheduler()->RuntimeMapTask(nullptr, future,
+                                                              exec);
+      }
+    }
     auto *worker_queues = ipc_manager->GetTaskQueue();
     if (worker_queues) {
       auto &dest_lane = worker_queues->GetLane(lane_id, 0);
@@ -977,6 +1042,18 @@ int IpcManagerRun2Run::RecvOutDeserialize(
   return 0;
 }
 
+namespace {
+/**
+ * Lock that serializes reply aggregation into one origin task.
+ * @param net_key the origin's key in the send map
+ * @return one of a fixed set of mutexes, the same for equal keys
+ */
+std::mutex &AggregateLock(size_t net_key) {
+  static std::array<std::mutex, 256> locks;
+  return locks[(net_key * 0x9E3779B97F4A7C15ull >> 32) % locks.size()];
+}
+}  // namespace
+
 int IpcManagerRun2Run::RecvOutAggregate(
     const std::vector<clio::run::TaskInfo> &task_infos) {
   auto *ipc_manager = CLIO_IPC;
@@ -1033,6 +1110,14 @@ int IpcManagerRun2Run::RecvOutAggregate(
     //
     // pool_query_ has no operator== and is deliberately trivially copyable and
     // raw-byte compared elsewhere in the tree, so memcmp is the right test.
+    //
+    // One reply at a time per origin: with several peer receive threads
+    // (CLIO_NET_TIER_LANES) the replies of a broadcast arrive on different
+    // threads, and AggregateOut implementations that copy the replica and
+    // then restore the origin's identity are not safe to run concurrently on
+    // one origin (a second thread saw, and completed on, the half-copied
+    // task). A lock striped by net_key serializes them.
+    std::unique_lock<std::mutex> agg_lk(AggregateLock(net_key));
     const clio::run::TaskId id_before = origin_task->task_id_;
     const clio::run::PoolQuery query_before = origin_task->pool_query_;
     const clio::run::u32 method_before = origin_task->method_;
@@ -1055,6 +1140,7 @@ int IpcManagerRun2Run::RecvOutAggregate(
       origin_task->pool_query_ = query_before;
       origin_task->method_ = method_before;
     }
+    agg_lk.unlock();
 
     HLOG(kDebug, "[RecvOut] Task {}", origin_task->task_id_);
 
@@ -1823,30 +1909,17 @@ static constexpr int kZmqPollTimeoutMs = 1;
 void IpcManagerRun2Run::StartRecvThreads() {
   // Dedicated single peer recv thread: polls the main p2p transport
   // (port 9413 by default) and dispatches inbound task forwards/responses.
-  peer_recv_thread_ = std::thread([this]() {
-    ctp::SystemInfo::SetCurrentThreadName("chi-peer-recv");
-    auto *ipc_manager = CLIO_IPC;
-    ctp::lbm::Transport *lbm_transport = nullptr;
-    for (int spin = 0; spin < 1000 && !recv_shutdown_.load(); ++spin) {
-      lbm_transport = ipc_manager->GetMainTransport();
-      if (lbm_transport) break;
-      CTP_THREAD_MODEL->SleepForUs(1000);
-    }
-    if (!lbm_transport) {
-      HLOG(kError, "[PeerRecvThread] main transport never appeared");
-      return;
-    }
-    // Block on transport readability instead of spin-polling. main_transport_
-    // is a ZMQ transport, so we use its native zmq_poll (Transport::PollRecv)
-    // rather than an EventManager: ZMQ_FD can't be registered with
-    // WSAEventSelect on Windows. Each wake drains every pending message before
-    // blocking again.
+  // The drain/dispatch loop for one peer listener. Runs on the main
+  // listener's thread and, with size-tiered ports (CLIO_NET_TIERS), on one
+  // thread per tier listener.
+  auto peer_loop = [this](ctp::lbm::Transport *lbm_transport) {
     HLOG(kInfo, "[PeerRecvThread] started");
     while (!recv_shutdown_.load(std::memory_order_acquire)) {
       bool drained_any = false;
       while (!recv_shutdown_.load(std::memory_order_acquire)) {
         clio::run::LoadTaskArchive archive;
         const uint64_t nt0 = nettrace::On() ? nettrace::NowNs() : 0;
+        const unsigned long long ev_r0 = clio::run::evlat::Now();
         auto info = lbm_transport->Recv(archive);
         int rc = info.rc;
         if (rc != 0) {
@@ -1861,6 +1934,7 @@ void IpcManagerRun2Run::StartRecvThreads() {
         const uint64_t nt1 = nettrace::On() ? nettrace::NowNs() : 0;
         if (nettrace::On()) nettrace::recv_ns += nt1 - nt0;
         drained_any = true;
+        const unsigned long long ev_r1 = clio::run::evlat::Now();
         CheckPeerIncarnation(archive);
         clio::run::MsgType msg_type = archive.GetMsgType();
         switch (msg_type) {
@@ -1885,14 +1959,98 @@ void IpcManagerRun2Run::StartRecvThreads() {
                  static_cast<int>(msg_type));
             break;
         }
+        if (ev_r0 != 0) {
+          namespace ev = clio::run::evlat;
+          const unsigned long long ev_r2 = clio::run::CycleNow();
+          if (msg_type == clio::run::MsgType::kSerializeIn) {
+            ev::Span(ev::kRemoteRead, ev_r0, ev_r1);
+            ev::Span(ev::kRemoteRecvIn, ev_r1, ev_r2);
+          } else if (msg_type == clio::run::MsgType::kSerializeOut) {
+            ev::Span(ev::kOriginRead, ev_r0, ev_r1);
+            ev::Span(ev::kOriginRecvOut, ev_r1, ev_r2);
+          }
+          clio_evlat_busy(ev::kBusyPeerRecv, ev_r0, ev_r2);
+        }
         lbm_transport->ClearRecvHandles(archive);
       }
       if (!drained_any && !recv_shutdown_.load(std::memory_order_acquire)) {
+        const unsigned long long ev_p0 = clio::run::evlat::Now();
         lbm_transport->PollRecv(kZmqPollTimeoutMs);
+        clio::run::evlat::Span(clio::run::evlat::kPeerRecvPoll, ev_p0,
+                               clio::run::evlat::Now());
       }
     }
+  };
+  peer_recv_thread_ = std::thread([this, peer_loop]() {
+    ctp::SystemInfo::SetCurrentThreadName("chi-peer-recv");
+    auto *ipc_manager = CLIO_IPC;
+    ctp::lbm::Transport *lbm_transport = nullptr;
+    for (int spin = 0; spin < 1000 && !recv_shutdown_.load(); ++spin) {
+      lbm_transport = ipc_manager->GetMainTransport();
+      if (lbm_transport) break;
+      CTP_THREAD_MODEL->SleepForUs(1000);
+    }
+    if (!lbm_transport) {
+      HLOG(kError, "[PeerRecvThread] main transport never appeared");
+      return;
+    }
+    // Block on transport readability instead of spin-polling. main_transport_
+    // is a ZMQ transport, so we use its native zmq_poll (Transport::PollRecv)
+    // rather than an EventManager: ZMQ_FD can't be registered with
+    // WSAEventSelect on Windows. Each wake drains every pending message before
+    // blocking again.
+    for (const auto &t : ipc_manager->GetTierTransports()) {
+      ctp::lbm::Transport *tt = t.get();
+      tier_recv_threads_.emplace_back([peer_loop, tt]() {
+        ctp::SystemInfo::SetCurrentThreadName("chi-peer-tier");
+        peer_loop(tt);
+      });
+    }
+    peer_loop(lbm_transport);
     HLOG(kInfo, "[PeerRecvThread] shutting down");
   });
+
+  // Dedicated network send threads (CLIO_NET_SEND_THREADS, see
+  // IpcManager::NetSendThreads). Replies first: they are small and complete
+  // a waiting origin; then requests. Bounded batches per priority so neither
+  // starves. Idle: spin ~200 us, then 20 us naps (the admin Send periodic
+  // still drains the same queues, so a napping thread delays nothing).
+  for (int slot = 0; slot < clio::run::IpcManager::NetSendThreads(); ++slot) {
+    send_threads_.emplace_back([this, slot]() {
+      ctp::SystemInfo::SetCurrentThreadName("chi-net-send");
+      clio::run::IpcManager::SetSendSlot(slot);
+      auto *ipc = CLIO_IPC;
+      using P = clio::run::NetQueuePriority;
+      const P order[] = {P::kSendOutLatency, P::kSendOutIO, P::kSendInLatency,
+                         P::kSendInIO};
+      auto idle_since = std::chrono::steady_clock::now();
+      while (!recv_shutdown_.load(std::memory_order_acquire)) {
+        bool did = false;
+        for (P p : order) {
+          for (int k = 0; k < 32; ++k) {
+            clio::run::Future<clio::run::Task> fut;
+            if (!ipc->TryPopNetTask(p, fut)) break;
+            auto t = fut.GetTaskPtr();
+            if (t.IsNull()) continue;
+            if (p == P::kSendOutLatency || p == P::kSendOutIO) {
+              SendOut(t);
+            } else {
+              SendIn(t);
+            }
+            did = true;
+          }
+        }
+        if (did) {
+          idle_since = std::chrono::steady_clock::now();
+        } else if (std::chrono::steady_clock::now() - idle_since <
+                   std::chrono::microseconds(200)) {
+          std::this_thread::yield();
+        } else {
+          CTP_THREAD_MODEL->SleepForUs(20);
+        }
+      }
+    });
+  }
 
   // Dedicated single client recv thread: drains TCP (port 9416) and IPC
   // (unix socket) client transports via IpcCpu2CpuZmq::RecvIn.
@@ -1947,7 +2105,15 @@ void IpcManagerRun2Run::StartRecvThreads() {
 
 void IpcManagerRun2Run::StopRecvThreads() {
   recv_shutdown_.store(true, std::memory_order_release);
+  for (auto &t : send_threads_) {
+    if (t.joinable()) t.join();
+  }
+  send_threads_.clear();
   if (peer_recv_thread_.joinable()) peer_recv_thread_.join();
+  for (auto &t : tier_recv_threads_) {
+    if (t.joinable()) t.join();
+  }
+  tier_recv_threads_.clear();
   if (client_recv_thread_.joinable()) client_recv_thread_.join();
   // Requests still held for a pool that never appeared: release their
   // transport-owned frames before the transports go away.

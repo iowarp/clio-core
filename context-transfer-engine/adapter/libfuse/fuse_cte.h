@@ -553,9 +553,18 @@ int cte_fuse_chown(const char *path, uid_t uid, gid_t gid,
 int cte_fuse_symlink(const char *target, const char *path);
 int cte_fuse_readlink(const char *path, char *buf, size_t size);
 int cte_fuse_statfs(const char *path, cte_statvfs_t *stbuf);
+/**
+ * List a directory from `offset` on. Entries carry stable, name-derived
+ * offsets; every fill call gets the (non-zero) offset to resume at, and the
+ * listing is fetched in chunks. With `fi` null (or fh 0) no state is kept:
+ * a filler that never returns non-zero receives the whole directory.
+ */
 int cte_fuse_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
                      cte_off_t offset, struct fuse_file_info *fi,
                      enum fuse_readdir_flags flags);
+/** Allocate / free the per-open listing state readdir uses (fi->fh). */
+int cte_fuse_opendir(const char *path, struct fuse_file_info *fi);
+int cte_fuse_releasedir(const char *path, struct fuse_file_info *fi);
 int cte_fuse_link(const char *from, const char *to);
 #endif  // !_WIN32
 

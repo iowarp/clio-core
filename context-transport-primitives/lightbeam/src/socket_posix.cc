@@ -35,6 +35,8 @@
 
 #include "clio_ctp/lightbeam/posix_socket.h"
 
+#include <netdb.h>
+
 #include <cerrno>
 #include <cstring>
 
@@ -278,8 +280,22 @@ socket_t Connect(const std::string& addr, int port,
   sin.sin_family = AF_INET;
   sin.sin_port = htons(static_cast<uint16_t>(port));
   if (::inet_pton(AF_INET, addr.c_str(), &sin.sin_addr) <= 0) {
-    Close(fd);
-    return kInvalidSocket;
+    // Not a dotted IPv4 literal: resolve it. Hostfiles name hosts (e.g.
+    // ares-comp-31-40g), and ZeroMQ resolves names, so a peer path switched
+    // to this transport could otherwise never connect.
+    struct addrinfo hints;
+    std::memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo *res = nullptr;
+    if (::getaddrinfo(addr.c_str(), nullptr, &hints, &res) != 0 ||
+        res == nullptr) {
+      Close(fd);
+      return kInvalidSocket;
+    }
+    sin.sin_addr =
+        reinterpret_cast<struct sockaddr_in *>(res->ai_addr)->sin_addr;
+    ::freeaddrinfo(res);
   }
   if (::connect(fd, reinterpret_cast<struct sockaddr*>(&sin),
                 sizeof(sin)) < 0) {
