@@ -14,6 +14,8 @@ namespace clio::cte::cache {
 
 /** Chunk size for chain -> cache re-population copies. */
 static constexpr clio::run::u64 kCacheChunkBytes = 4ULL * 1024 * 1024;
+/** Poll interval while another task holds a blob's copy lock (us). */
+static constexpr double kCopyLockPollUs = 20.0;
 
 clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   CLIO_TASK_BODY_BEGIN
@@ -346,6 +348,26 @@ clio::run::TaskResume Runtime::DelTag(
   CLIO_TASK_BODY_END
 }
 
+clio::run::TaskResume Runtime::LockCopy(const std::string &key) {
+  CLIO_TASK_BODY_BEGIN
+  while (true) {
+    {
+      std::lock_guard<std::mutex> g(copy_busy_mu_);
+      if (copy_busy_.insert(key).second) {
+        break;
+      }
+    }
+    CLIO_CO_AWAIT(clio::run::yield(kCopyLockPollUs));
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+void Runtime::UnlockCopy(const std::string &key) {
+  std::lock_guard<std::mutex> g(copy_busy_mu_);
+  copy_busy_.erase(key);
+}
+
 bool Runtime::IsBlobOwnerLocal(const TagId &tag_id,
                                const std::string &blob_name) {
   // Same hash as the core's HashBlobToContainer (owner routing), resolved
@@ -522,6 +544,11 @@ clio::run::TaskResume Runtime::PutBlob(
       task->context_.origin_node_ = Context::kNoOriginNode;
       CLIO_CO_RETURN;
     }
+
+    // Steps 1-2 are one unit against this node's readers of the copy.
+    const std::string ckey = CopyKey(task->tag_id_, blob_name);
+    CLIO_CO_AWAIT(LockCopy(ckey));
+    CopyUnlocker copy_unlock{this, ckey};
 
     // 1. ONE fused local task: apply the put to the local raw copy iff it
     //    exists (UPDATE_ONLY; kReplicaAbsentRc = it doesn't). No probes.
@@ -758,6 +785,11 @@ clio::run::TaskResume Runtime::GetBlob(
                                   task.template Cast<clio::run::Task>()));
       CLIO_CO_RETURN;
     }
+    // Copy read, owner fetch, populate and registration are one unit
+    // against this node's puts of the blob (see LockCopy).
+    const std::string ckey = CopyKey(task->tag_id_, blob_name);
+    CLIO_CO_AWAIT(LockCopy(ckey));
+    CopyUnlocker copy_unlock{this, ckey};
     {
       task->context_.replica_ = clio::cte::core::kCacheReplica;
       CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kGetBlob,

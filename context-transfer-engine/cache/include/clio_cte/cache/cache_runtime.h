@@ -200,6 +200,30 @@ class Runtime : public clio::cte::core::CoreInterposer {
   clio::run::TaskResume PopulateLocal(const TagId &tag_id,
                                       const std::string &blob_name);
 
+  /**
+   * Take THIS node's copy lock for one blob, yielding while another task
+   * holds it. A non-owner put (local copy update + authoritative put) and a
+   * non-owner read (copy read, owner fetch, populate, registration) of the
+   * same blob hold it, so a populate can never install bytes older than a
+   * put on this node already wrote into the copy, and no read is served the
+   * copy while a populate that may be rejected is still in flight.
+   * @param key CopyKey of the blob
+   */
+  clio::run::TaskResume LockCopy(const std::string &key);
+  /** Release a lock taken with LockCopy. */
+  void UnlockCopy(const std::string &key);
+  /** Copy-lock key of a blob. */
+  static std::string CopyKey(const TagId &tag_id, const std::string &name) {
+    return std::to_string(tag_id.major_) + "." +
+           std::to_string(tag_id.minor_) + "/" + name;
+  }
+  /** Releases a copy lock when the holding scope ends. */
+  struct CopyUnlocker {
+    Runtime *rt_;
+    std::string key_;
+    ~CopyUnlocker() { rt_->UnlockCopy(key_); }
+  };
+
   /** Lazily bind the next-pool client (compose next_pool_id). */
   clio::cte::core::Client *GetNextClient();
   /** Lazily bind a direct core client for node-LOCAL copy access. */
@@ -211,6 +235,8 @@ class Runtime : public clio::cte::core::CoreInterposer {
   CacheConfig config_;
   std::unique_ptr<clio::cte::core::Client> next_client_;
   std::unique_ptr<clio::cte::core::Client> local_client_;
+  std::mutex copy_busy_mu_;                  /**< guards copy_busy_ */
+  std::unordered_set<std::string> copy_busy_; /**< blobs whose copy is locked */
 };
 
 }  // namespace clio::cte::cache
