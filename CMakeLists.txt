@@ -2421,6 +2421,15 @@ endif()
 if(TARGET clio_cte_replication_client)
   list(APPEND PIP_LIB_TARGETS clio_cte_replication_client clio_cte_replication_runtime)
 endif()
+# Policy caches over a volatile and a persistent core: the default config
+# composes the write-back cache (567.0), so a wheel without it fails to
+# create that pool. cache_base is compiled into each module.
+if(TARGET clio_cte_write_back_cache_client)
+  list(APPEND PIP_LIB_TARGETS clio_cte_write_back_cache_client clio_cte_write_back_cache_runtime)
+endif()
+if(TARGET clio_cte_write_thru_cache_client)
+  list(APPEND PIP_LIB_TARGETS clio_cte_write_thru_cache_client clio_cte_write_thru_cache_runtime)
+endif()
 # Indexer chimod (#905): the default config composes it into the filesystem
 # chain (cache -> indexer -> replication), so without it the wheel's
 # `clio_run start` fails to create pool 564.0 and the runtime exits (#1240).

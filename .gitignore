@@ -90,8 +90,6 @@ nanobind.egg-info
 .*cache*/
 
 # Documentation build
-/docs/.build
-/docs/_build/*
 
 # Environment files
 /*env*/

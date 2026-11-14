@@ -58,17 +58,15 @@ struct PerformanceConfig {
 
   clio::run::u32 flush_metadata_period_ms_;  // Period for periodic metadata flush
                                        // (default 5s)
-  std::string metadata_log_path_;   // Path for metadata log (empty = disabled)
-  clio::run::u32 flush_data_period_ms_;   // Period for data flush (default 10s)
-  int flush_data_min_persistence_;  // Min persistence level to flush to
-                                    // (1=temp-nonvolatile)
+  std::string metadata_log_path_;   // Path for metadata log (empty = disabled;
+                                    // always cleared on a volatile core)
   clio::run::u64
       transaction_log_capacity_bytes_;  // Total WAL capacity (default 32MB)
   /** fsync(2) through clio-fs: false ("durable", the default) returns only
-   *  once the file's bytes sit on a tier at flush_data_min_persistence or
-   *  above and are synced to the device, with the metadata WAL that locates
-   *  them; true ("deferred") returns at once and leaves durability to the
-   *  periodic flush_data / flush_metadata tasks. */
+   *  once the devices holding the file's bytes are synced, with the metadata
+   *  WAL that locates them (the write-back cache flushes dirty volatile
+   *  copies first); true ("deferred") returns at once and leaves durability
+   *  to the periodic cache flush and flush_metadata tasks. */
   bool fsync_deferred_;
 
   PerformanceConfig()
@@ -83,8 +81,6 @@ struct PerformanceConfig {
         score_difference_threshold_(0.05f),
         flush_metadata_period_ms_(5000),
         metadata_log_path_(""),
-        flush_data_period_ms_(10000),
-        flush_data_min_persistence_(1),
         transaction_log_capacity_bytes_(32ULL * 1024ULL * 1024ULL),
         fsync_deferred_(false) {}
 };
@@ -119,6 +115,9 @@ struct StorageDeviceConfig {
   float score_;  // Optional manual score (0.0-1.0), -1.0 means use automatic
                  // scoring
   std::string persistence_level_;  // "volatile", "temporary", "long_term"
+  // Whether persistence_level_ came from the config. An unlabeled disk or
+  // object device inherits its core's durability class (ResolveDurability).
+  bool persistence_explicit_ = false;
 
   // When set (major_ != 0), this storage target binds to an ALREADY-EXISTING
   // pool (e.g. a safe-bdev pool composed elsewhere) instead of having CTE
@@ -149,6 +148,7 @@ struct StorageDeviceConfig {
         capacity_limit_(capacity),
         score_(score),
         persistence_level_(persistence_level),
+        persistence_explicit_(persistence_level != "volatile"),
         existing_pool_id_(clio::run::PoolId::GetNull()),
         growth_unit_(clio::run::u64(1) << 30) {}
 
@@ -198,6 +198,17 @@ struct OrganizerConfig {
 };
 
 /**
+ * Durability class of one CTE core: stated by its `durability` key, or
+ * inferred from its devices' persistence_level at Create. Moving data
+ * between a volatile and a persistent
+ * core is the job of a cache module above them.
+ */
+enum class CoreDurability {
+  kVolatile,    ///< no WAL; empty after every start
+  kPersistent,  ///< WAL on when metadata_log_path is set; rejects volatile bdevs
+};
+
+/**
  * CTE Core Configuration Manager
  * Provides YAML parsing and validation for CTE Core configuration
  */
@@ -227,6 +238,13 @@ class Config {
    * Data organizer configuration (periodic reorganization; off by default)
    */
   OrganizerConfig organizer_;
+
+  /**
+   * Durability class (YAML key `durability`): "volatile", "persistent",
+   * or empty to infer it from the devices' persistence_level at Create.
+   * Read it through ResolveDurability.
+   */
+  std::string durability_;
 
   /**
    * Default constructor
@@ -273,6 +291,20 @@ class Config {
    * @return true if configuration is valid, false otherwise
    */
   bool Validate() const;
+
+  /**
+   * Resolve this core's durability class.
+   *
+   * A stated durability_ wins. Unstated: persistent when the core has
+   * devices and every one has persistence_level temporary or long_term,
+   * else volatile (including no devices). Devices are checked against the
+   * class one at a time when they register (Runtime::RegisterTarget).
+   *
+   * @param out receives the resolved class on success
+   * @param error receives a human-readable reason on failure
+   * @return false only for an unknown durability_ value
+   */
+  bool ResolveDurability(CoreDurability *out, std::string *error) const;
 
   /**
    * Get configuration parameter as string for debugging

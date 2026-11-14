@@ -120,7 +120,10 @@ GLOBAL_CROSS_CONST clio::run::u32 kListLocalBlobs = 57;
 // memory on the container that owns it and logged per key in the WAL.
 GLOBAL_CROSS_CONST clio::run::u32 kTagXattr = 58;
 
-GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 59;
+// Switch the core between volatile and persistent at runtime.
+GLOBAL_CROSS_CONST clio::run::u32 kSetDurability = 59;
+
+GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 60;
 
 inline const std::vector<std::string>& GetMethodNames() {
   static const std::vector<std::string> names = [] {
@@ -159,6 +162,7 @@ inline const std::vector<std::string>& GetMethodNames() {
     v[56] = "SyncTag";
     v[57] = "ListLocalBlobs";
     v[58] = "TagXattr";
+    v[59] = "SetDurability";
     v[41] = "GetCapacity";
     v[42] = "GetNumAliases";
     v[43] = "PodPutBlob";

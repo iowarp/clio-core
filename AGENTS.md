@@ -12,7 +12,7 @@ Whenever you modify the configurations for context-runtime, context-transfer-eng
 First, we should update context-runtime/config/clio_default.yaml to have the default parameters -- even just as comments. We should document the parameter options here as well.
 
 After this, we need to update the following doc:
-docs/docs/deployment/configuration.md
+docs/deployment/configuration.md in the iowarp/docs repo (https://github.com/iowarp/docs)
 
 ## Testing Updates
 
@@ -373,7 +373,7 @@ cmake --preset=debug -DCLIO_CORE_ENABLE_CTE=ON -DCLIO_CORE_ENABLE_CAE=OFF
 - Always use the debug CMakePreset when compiling code in this repo
 - Never hardcode paths in CMakeLists.txt files
 - Use find_package() for all dependencies
-- Follow Module build patterns from the module development guide (docs/docs/sdk/context-runtime/2.module_dev_guide.md)
+- Follow Module build patterns from the module development guide (https://core.iowarp.ai/develop/)
 - All compilation warnings have been resolved as of the current state
 
 ### RPATH Configuration
@@ -390,7 +390,7 @@ Always use CTP_MCTX macro unless we are writing GPU code, which necessitates a s
 
 ### Module Build Patterns
 
-This project follows the CLIO Runtime module development guide (docs/docs/sdk/context-runtime/2.module_dev_guide.md) patterns for proper Module development:
+This project follows the CLIO Runtime module development guide (https://core.iowarp.ai/develop/) patterns for proper Module development:
 
 **Required Packages for Module Development:**
 ```cmake
@@ -1093,7 +1093,7 @@ This documentation covers:
 ### External Integration Test
 A standalone external integration test is available at: `context-transfer-engine/test/unit/external/`
 
-This test demonstrates patterns compliant with the module development guide (docs/docs/sdk/context-runtime/2.module_dev_guide.md):
+This test demonstrates patterns compliant with the module development guide (https://core.iowarp.ai/develop/):
 - Modern find_package() usage for Module discovery
 - Proper target linking with namespace::module_type aliases
 - Automatic dependency resolution through Module targets
@@ -1147,7 +1147,7 @@ echo "CMake cleanup completed!"
 
 When creating or modifying Modules (CLIO Runtime modules), refer to the comprehensive module development guide:
 
-**📖 See [docs/docs/sdk/context-runtime/2.module_dev_guide.md](docs/docs/sdk/context-runtime/2.module_dev_guide.md) for complete Module development documentation**
+**📖 See [https://core.iowarp.ai/develop/](https://core.iowarp.ai/develop/) for complete Module development documentation**
 
 This guide covers:
 - Module structure and architecture

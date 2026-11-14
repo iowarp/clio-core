@@ -559,7 +559,9 @@ class ClioGvWorkload(Application):
             lines += [
                 '      - path: "%s"' % c['nvme_path'],
                 '        bdev_type: "file"',
-                '        persistence_level: "temporary"',
+                # Volatile scratch: this core also holds hbm and ram, and a
+                # core may not mix durability classes.
+                '        persistence_level: "volatile"',
                 '        capacity_limit: "%dMB"' % nvme_mb,
                 '        score: 0.0',
             ]

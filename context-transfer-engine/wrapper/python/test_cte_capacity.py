@@ -503,6 +503,7 @@ def assert_registration_idempotent(
             pool_query=cte.PoolQuery.Local(),
             attach_existing=0,
             growth_unit=1 << 30,
+            persistence_level=1,
         )
         attempt: dict[str, Any] = {"register_rc": future.wait(max_sec=10.0)}
         receipt["attempts"].append(attempt)
@@ -539,6 +540,9 @@ def initial_phase(
         pool_query=cte.PoolQuery.Local(),
         attach_existing=0,
         growth_unit=1 << 30,
+        # The core is persistent and the running core does not re-read its
+        # config: label the new bdev, or it registers as volatile (refused).
+        persistence_level=1,
     )
     assert future.wait(max_sec=10.0) == 0
     capacity = client.AsyncGetCapacity().result(max_sec=10.0)

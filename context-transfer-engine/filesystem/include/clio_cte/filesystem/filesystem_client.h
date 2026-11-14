@@ -25,6 +25,7 @@
 #include <vector>
 #include <mutex>
 #include <clio_cte/filesystem/filesystem_tasks.h>
+#include <clio_cte/stream/stream_client.h>
 #include <clio_cte/filesystem/fs_shard.h>
 #include <clio_cte/filesystem/shm_fs_cache.h>
 
@@ -99,7 +100,10 @@ class Client : public clio::cte::core::Client {
   // The lock is on the SOURCE: we are reading its table. Our own mutex is
   // freshly constructed -- a lock is not state worth copying, and copying one
   // would be undefined anyway.
-  Client(const Client &other) : clio::cte::core::Client(other) {
+  Client(const Client &other)
+      : clio::cte::core::Client(other),
+        data_cte_(other.data_cte_),
+        stream_(other.stream_) {
     std::lock_guard<std::mutex> g(other.fd_mu_);
     shm_fs_root_ = other.shm_fs_root_;
     fds_ = other.fds_;
@@ -111,6 +115,8 @@ class Client : public clio::cte::core::Client {
       return *this;
     }
     clio::cte::core::Client::operator=(other);
+    data_cte_ = other.data_cte_;
+    stream_ = other.stream_;
     // Both tables are touched, so both locks are taken -- ordered by address
     // so two threads assigning A=B and B=A cannot deadlock.
     std::mutex *first = &fd_mu_;
@@ -228,16 +234,17 @@ class Client : public clio::cte::core::Client {
 
 #if CTP_IS_HOST
   /**
-   * Ask the local filesystem container which pool it stores its page blobs
-   * through (the top of its interposition chain, e.g. replication).
+   * Ask the local filesystem container for one of the pools it uses
+   * (Monitor query; the filesystem's config is the only source of pool ids).
+   * @param key "next_pool" (the data chain its pages go through) or
+   *        "stream_pool" (where file sizes live)
    * @param out receives the pool id on success
-   * @return true when the home answered with a valid pool id
+   * @return true when the container answered with a valid pool id
    */
-  bool GetDataPoolId(clio::run::PoolId *out) {
+  bool QueryPoolId(const std::string &key, clio::run::PoolId *out) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<MonitorTask>(clio::run::CreateTaskId(), pool_id_,
-                                          clio::run::PoolQuery::Local(),
-                                          std::string("next_pool"));
+                                          clio::run::PoolQuery::Local(), key);
     auto fut = ipc->Send(task);
     fut.Wait();
     if (fut->GetReturnCode() != 0 || fut->results_.empty()) {
@@ -254,6 +261,44 @@ class Client : public clio::cte::core::Client {
             std::strtoul(v.c_str() + dot + 1, nullptr, 10)));
     return !out->IsNull();
   }
+
+  /**
+   * The pool this filesystem stores page blobs through (the top of its
+   * interposition chain).
+   * @param out receives the pool id on success
+   * @return true when the filesystem answered
+   */
+  bool GetDataPoolId(clio::run::PoolId *out) {
+    return QueryPoolId("next_pool", out);
+  }
+
+  /**
+   * Bind the data-path and stream clients to the pools this filesystem
+   * pool is configured with. Every CTE call a clio-fs client makes (page
+   * I/O, fsync, capacity) must take the same chain the filesystem does, or
+   * it bypasses the caches and replication above the cores.
+   * @return true when both pools were learned
+   */
+  bool BindPools() {
+    clio::run::PoolId data_pool;
+    clio::run::PoolId stream_pool;
+    if (!QueryPoolId("next_pool", &data_pool) ||
+        !QueryPoolId("stream_pool", &stream_pool)) {
+      return false;
+    }
+    data_cte_.Init(data_pool);
+    // Zero-IPC reads only through a mirror the data pool itself publishes;
+    // never a guessed core pool's (stale under a write-back cache).
+    data_cte_.AttachShmCache();
+    stream_.Init(stream_pool);
+    return true;
+  }
+
+  /** CTE client bound to this filesystem's data chain (see BindPools). */
+  clio::cte::core::Client *Cte() { return &data_cte_; }
+
+  /** Stream client bound to this filesystem's stream pool. */
+  clio::cte::stream::Client *Stream() { return &stream_; }
 
   /** Create/initialize the filesystem container over a CTE core pool. */  /** Create/initialize the filesystem container over a CTE core pool. */
   clio::run::Future<CreateTask> AsyncCreate(const clio::run::PoolQuery &pool_query,
@@ -1306,8 +1351,9 @@ class Client : public clio::cte::core::Client {
       ShmReadMisses().fetch_add(1, std::memory_order_relaxed);
       return -1;
     }
-    auto *cte = CLIO_CTE_CLIENT;
-    if (cte == nullptr || (!cte->HasShmCache() && !cte->AttachShmCache())) {
+    auto *cte = Cte();
+    if (cte->pool_id_.IsNull() ||
+        (!cte->HasShmCache() && !cte->AttachShmCache())) {
       // Page payloads come from the core cache; both are required.
       ShmReadMisses().fetch_add(1, std::memory_order_relaxed);
       return -1;
@@ -1508,6 +1554,10 @@ class Client : public clio::cte::core::Client {
   // may drop the cache at any time, which is why every read is validated.
   ShmFsCacheRoot *shm_fs_root_ = nullptr;
 
+  // Bound by BindPools from the filesystem pool's own config.
+  clio::cte::core::Client data_cte_;
+  clio::cte::stream::Client stream_;
+
   // ---- POSIX descriptor table ----
   // Guarded by fd_mu_. Held only around map lookups and insertions -- never
   // across a task Wait, so a slow chimod call cannot block an unrelated
@@ -1525,7 +1575,12 @@ class Client : public clio::cte::core::Client {
 // filesystem_client.cc), exactly like core's g_cte_client.
 CLIO_CTE_FS_DEFINE_GLOBAL_PTR_VAR_H(clio::cte::filesystem::Client, g_fs_client);
 
-/** Initialize the filesystem client singleton (creates/binds the pool). */
+/**
+ * Initialize the filesystem client singleton: find the composed filesystem
+ * pool by name (CLIO_CFS_POOL, default kCfsPoolName; a "major.minor" value
+ * names the id directly) and bind the pools it is configured with. Creates
+ * nothing and assumes no pool id.
+ */
 bool CLIO_CFS_CLIENT_INIT(const std::string &config_path = "",
                           const clio::run::PoolQuery &pool_query =
                               clio::run::PoolQuery::Dynamic());

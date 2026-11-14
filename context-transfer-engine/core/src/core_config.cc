@@ -197,6 +197,31 @@ bool Config::Validate() const {
   return true;
 }
 
+bool Config::ResolveDurability(CoreDurability *out, std::string *error) const {
+  if (durability_ == "persistent") {
+    *out = CoreDurability::kPersistent;
+    return true;
+  }
+  if (durability_ == "volatile") {
+    *out = CoreDurability::kVolatile;
+    return true;
+  }
+  if (!durability_.empty()) {
+    *error = "durability '" + durability_ +
+             "' must be 'volatile' or 'persistent'";
+    return false;
+  }
+  // Not stated: persistent only when the core has devices and every one is
+  // labeled persistent (persistence_level temporary or long_term).
+  bool all_persistent = !storage_.devices_.empty();
+  for (const auto &device : storage_.devices_) {
+    if (device.persistence_level_ == "volatile") all_persistent = false;
+  }
+  *out = all_persistent ? CoreDurability::kPersistent
+                        : CoreDurability::kVolatile;
+  return true;
+}
+
 std::string Config::GetParameterString(const std::string &param_name) const {
   if (param_name == "target_stat_interval_ms") {
     return std::to_string(performance_.target_stat_interval_ms_);
@@ -318,6 +343,17 @@ bool Config::ParseYamlNode(const YAML::Node &node) {
     organizer_.period_ms_ = node["organizer_period_ms"].as<clio::run::u32>();
   }
 
+  // Durability class (volatile | persistent); empty = infer at Create.
+  if (node["durability"]) {
+    durability_ = node["durability"].as<std::string>();
+    if (durability_ != "volatile" && durability_ != "persistent") {
+      HLOG(kError,
+           "Config error: durability '{}' must be 'volatile' or 'persistent'",
+           durability_);
+      return false;
+    }
+  }
+
   // Parse environment variable configuration
   if (node["config_env_var"]) {
     config_env_var_ = node["config_env_var"].as<std::string>();
@@ -331,6 +367,9 @@ void Config::EmitYaml(YAML::Emitter &emitter) const {
 
   // Emit general configuration
   emitter << YAML::Key << "config_env_var" << YAML::Value << config_env_var_.c_str();
+  if (!durability_.empty()) {
+    emitter << YAML::Key << "durability" << YAML::Value << durability_;
+  }
 
   // Emit performance configuration
   emitter << YAML::Key << "performance" << YAML::Value << YAML::BeginMap;
@@ -344,8 +383,6 @@ void Config::EmitYaml(YAML::Emitter &emitter) const {
   }
   emitter << YAML::Key << "transaction_log_capacity"
           << YAML::Value << FormatSizeBytes(performance_.transaction_log_capacity_bytes_);
-  emitter << YAML::Key << "flush_data_period_ms" << YAML::Value << performance_.flush_data_period_ms_;
-  emitter << YAML::Key << "flush_data_min_persistence" << YAML::Value << performance_.flush_data_min_persistence_;
   emitter << YAML::Key << "fsync_mode" << YAML::Value
           << (performance_.fsync_deferred_ ? "deferred" : "durable");
   emitter << YAML::EndMap;
@@ -434,12 +471,13 @@ bool Config::ParsePerformanceConfig(const YAML::Node &node) {
     performance_.metadata_log_path_ = ctp::ConfigParse::ExpandPath(path);
   }
 
-  if (node["flush_data_period_ms"]) {
-    performance_.flush_data_period_ms_ = node["flush_data_period_ms"].as<clio::run::u32>();
-  }
-
-  if (node["flush_data_min_persistence"]) {
-    performance_.flush_data_min_persistence_ = node["flush_data_min_persistence"].as<int>();
+  // The core no longer flushes data between tiers (a core is uniform in
+  // durability). Old configs still load: the keys are ignored with a hint.
+  if (node["flush_data_period_ms"] || node["flush_data_min_persistence"]) {
+    HLOG(kWarning,
+         "Config: performance.flush_data_period_ms / "
+         "flush_data_min_persistence are no longer CTE core keys and are "
+         "ignored; set flush_period_ms on a clio_cte_write_back_cache entry");
   }
 
   if (node["transaction_log_capacity"]) {
@@ -604,6 +642,7 @@ bool Config::ParseStorageConfig(const YAML::Node &node) {
         return false;
       }
       device_config.persistence_level_ = level;
+      device_config.persistence_explicit_ = true;
     }
 
     if (device_node["score"]) {

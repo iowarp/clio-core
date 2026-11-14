@@ -54,7 +54,7 @@ namespace clio::cte::stream {
  */
 class Client : public clio::run::ContainerClient {
  public:
-  Client() { pool_id_ = kStreamPoolId; }
+  Client() { pool_id_ = clio::run::PoolId::GetNull(); }
   explicit Client(const clio::run::PoolId &pool_id) { pool_id_ = pool_id; }
 
   /** @return the bound pool id. */
@@ -91,7 +91,7 @@ class Client : public clio::run::ContainerClient {
    * Create the stream pool.
    * @param pool_query where to create (use Dynamic)
    * @param pool_name pool name
-   * @param custom_pool_id pool id (kStreamPoolId)
+   * @param custom_pool_id pool id to create
    * @param params configuration
    * @return creation future
    */

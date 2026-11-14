@@ -68,7 +68,7 @@
 
 #include "clio_runtime/clio_runtime.h"
 #include "clio_cte/core/content_transfer_engine.h"
-#include "clio_cte/core/core_client.h"  // CLIO_CTE_CLIENT + GetCapacity
+#include "clio_cte/core/core_client.h"  // CLIO_CFS_CLIENT->Cte() + GetCapacity
 #include "clio_cte/filesystem/filesystem_client.h"
 #include "clio_cte/filesystem/fs_inode.h"
 #include "clio_cte/filesystem/fs_inode_table.h"  // directory offsets
@@ -561,7 +561,7 @@ bool MultiNode() {
  * told the caller were safe.
  *
  * Decided ONCE, at mount time, with a single Monitor round trip to the data
- * pool (CLIO_CTE_CLIENT's pool_id_, the top of the write chain): asks the
+ * pool (CLIO_CFS_CLIENT->Cte()'s pool_id_, the top of the write chain): asks the
  * pool whether it understands "replicate_period_ms" (only the replication
  * chimod does) and, if so, whether that period is nonzero. A bare core pool
  * (or any future chain module that does not recognise the query) leaves
@@ -572,7 +572,7 @@ bool MultiNode() {
  */
 static bool NeedsReplicationFlushBarrier() {
   static const bool v = [] {
-    auto *cte_c = CLIO_CTE_CLIENT;
+    auto *cte_c = CLIO_CFS_CLIENT->Cte();
     if (cte_c == nullptr) return false;
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<clio::cte::core::MonitorTask>(
@@ -597,7 +597,7 @@ static bool NeedsReplicationFlushBarrier() {
  */
 static int FlushReplicationBarrier(const clio::cte::core::TagId &tag) {
   if (tag.IsNull() || !NeedsReplicationFlushBarrier()) return 0;
-  auto *cte_c = CLIO_CTE_CLIENT;
+  auto *cte_c = CLIO_CFS_CLIENT->Cte();
   auto *ipc = CLIO_CPU_IPC;
   auto task = ipc->NewTask<clio::cte::replication::FlushTagTask>(
       clio::run::CreateTaskId(), cte_c->pool_id_, clio::run::PoolQuery::Dynamic(),
@@ -668,7 +668,7 @@ static bool UnsyncedTake(const clio::cte::core::TagId &tag,
 static int SyncOneTag(const clio::cte::core::TagId &tag) {
   using clio::cte::filesystem::Client;
   if (Client::FsyncDeferred()) return 0;
-  if (CLIO_CTE_CLIENT == nullptr || tag.IsNull()) return 0;
+  if (CLIO_CFS_CLIENT->Cte() == nullptr || tag.IsNull()) return 0;
   clio::run::u64 opened_ns = 0;
   const bool unsynced = UnsyncedTake(tag, &opened_ns);
   bool lost_node = false;
@@ -1742,6 +1742,34 @@ void cte_fuse_mark_session_live() {
   g_fuse_session_live.store(true, std::memory_order_release);
 }
 
+namespace {
+/** Set when cte_fuse_init could not bind the CLIO clients. */
+std::atomic<bool> g_fuse_init_failed{false};
+
+/**
+ * Give up the mount after the clients failed to initialize. A FUSE init
+ * callback cannot refuse a mount, so without this the mount stays live with
+ * unbound clients and every request goes to pool 0.0, which the runtime holds
+ * forever (a hang, not an error). Ending the session unmounts and makes
+ * clio_cte_fuse exit non-zero (cte_fuse_init_failed()). Only a real mount has
+ * a FUSE context; a direct call (test_fuse_ops) just records the failure.
+ */
+void FailMountInit() {
+  g_fuse_init_failed.store(true, std::memory_order_release);
+  if (!g_fuse_session_live.load(std::memory_order_acquire)) {
+    return;
+  }
+  struct fuse_context *cx = fuse_get_context();
+  if (cx != nullptr && cx->fuse != nullptr) {
+    fuse_exit(cx->fuse);
+  }
+}
+}  // namespace
+
+bool cte_fuse_init_failed() {
+  return g_fuse_init_failed.load(std::memory_order_acquire);
+}
+
 // ============================================================================
 // FUSE lifecycle
 // ============================================================================
@@ -1906,34 +1934,25 @@ static void *cte_fuse_init(struct fuse_conn_info *conn,
 
   bool success = clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
   if (!success) {
-    fprintf(stderr, "ERROR: CLIO_INIT failed\n");
+    fprintf(stderr, "ERROR: CLIO_INIT failed; giving up the mount\n");
+    FailMountInit();
     return nullptr;
   }
-  // Create-or-bind the filesystem chimod pool (which also brings up the CTE
-  // core pool it sits over). Every FUSE op below routes through CLIO_CFS_CLIENT.
+  // Bind the composed filesystem pool (found by name) and the pools it is
+  // configured with. Every FUSE op below routes through CLIO_CFS_CLIENT.
   if (!clio::cte::filesystem::CLIO_CFS_CLIENT_INIT()) {
-    fprintf(stderr, "ERROR: filesystem client init failed\n");
+    fprintf(stderr, "ERROR: filesystem client init failed; giving up the "
+            "mount\n");
+    FailMountInit();
     return nullptr;
   }
-  // Bind the CTE core client to the same clio_cte_core pool (idempotent) so
-  // statfs can query real capacity via GetCapacity.
-  if (!clio::cte::core::CLIO_CTE_CLIENT_INIT()) {
-    fprintf(stderr, "WARNING: CTE core client init failed; statfs capacity=0\n");
-  }
-  // Store page blobs through the SAME pool the filesystem chimod uses (the
-  // top of its chain -- replication in a persistent deployment), not the
-  // bare core pool CLIO_CTE_CLIENT_INIT binds: sieve writes went straight to
-  // 512.0 and so never got a persistent replica -- every fsync'd byte sat in
-  // the RAM tier and a restart brought files back with size 0.
+  // Every CTE call below (page blobs, capacity, fsync) goes through the
+  // filesystem pool's own data chain, which CLIO_CFS_CLIENT_INIT bound from
+  // the filesystem's config (CLIO_CFS_CLIENT->Cte()): no pool id is assumed.
   {
-    clio::run::PoolId data_pool;
-    auto *cte_c = CLIO_CTE_CLIENT;
-    if (cte_c != nullptr && CLIO_CFS_CLIENT->GetDataPoolId(&data_pool) &&
-        !(data_pool == cte_c->pool_id_)) {
-      fprintf(stderr, "clio_cte_fuse: data pool %u.%u (filesystem chain)\n",
-              data_pool.major_, data_pool.minor_);
-      cte_c->pool_id_ = data_pool;
-    }
+    const clio::run::PoolId data_pool = CLIO_CFS_CLIENT->Cte()->pool_id_;
+    fprintf(stderr, "clio_cte_fuse: data pool %u.%u (filesystem chain)\n",
+            data_pool.major_, data_pool.minor_);
   }
   ApplyVolumeCasePolicy(conn, cfg);
   return nullptr;
@@ -1953,9 +1972,6 @@ int cte_fuse_bootstrap_clients() {
   if (!clio::cte::filesystem::CLIO_CFS_CLIENT_INIT()) {
     fprintf(stderr, "ERROR: filesystem client init failed\n");
     return -1;
-  }
-  if (!clio::cte::core::CLIO_CTE_CLIENT_INIT()) {
-    fprintf(stderr, "WARNING: CTE core client init failed; statfs capacity=0\n");
   }
   if (QueryVolumeCasePolicy()) {
     fprintf(stderr, "clio_cte_fuse: case-insensitive volume\n");
@@ -2228,7 +2244,7 @@ static int cte_fuse_getattr_stat_inner(const char *path, cte_stat_t *stbuf,
   // through to the chimod task; a tombstone answers ENOENT immediately.
   auto *cfs = CLIO_CFS_CLIENT;
   {
-    auto *cte0 = CLIO_CTE_CLIENT;
+    auto *cte0 = CLIO_CFS_CLIENT->Cte();
     clio::cte::filesystem::ShmFileRecord mrec;
     // TryGetFileRecordShm does NOT self-attach: without this the whole
     // mirror-first path silently returns false on every call until some
@@ -2307,7 +2323,7 @@ static int cte_fuse_getattr_stat_inner(const char *path, cte_stat_t *stbuf,
   // (kShmFileNoFastPath, pending appends) means the file exists and needs
   // the task path.
   {
-    auto *cte1 = CLIO_CTE_CLIENT;
+    auto *cte1 = CLIO_CFS_CLIENT->Cte();
     clio::cte::filesystem::ShmFileRecord self;
     bool self_absent = false;
     // Only a PROVEN absence counts: a torn read of a record being rewritten
@@ -3300,7 +3316,7 @@ int cte_fuse_create(const char *path, cte_mode_t mode,
   // CREATE, and the kernel serializes same-path creation, so exclusivity
   // holds without asking the chimod.
   if (SieveCreateEnabled() && (fi->flags & O_EXCL) &&
-      CLIO_CTE_CLIENT != nullptr) {
+      CLIO_CFS_CLIENT->Cte() != nullptr) {
 #ifdef _WIN32
     {
       // WinFsp sends an exclusive create without looking the name up first
@@ -3478,8 +3494,8 @@ static AppendMode AppendModeOf() {
 
 /** @return the stream pool client (file sizes and deferred appends). */
 static clio::cte::stream::Client &StreamClient() {
-  static clio::cte::stream::Client client;
-  return client;
+  // The stream pool the filesystem is configured with (no fixed id).
+  return *CLIO_CFS_CLIENT->Stream();
 }
 
 /**
@@ -3923,7 +3939,7 @@ int cte_fuse_read(const char *path, char *buf, size_t size,
   // mirror (zero IPC), RPC as the fallback. EOF clamps against the chimod
   // size raised by the local hiwater (bytes acknowledged to write(2) but
   // not yet carried to the chimod by close).
-  auto *cte = CLIO_CTE_CLIENT;
+  auto *cte = CLIO_CFS_CLIENT->Cte();
   auto *cfs = CLIO_CFS_CLIENT;
   if (SieveDataEnabled() && cte != nullptr && !handle->tag.IsNull()) {
     clio::run::u64 fsize = 0;
@@ -4118,7 +4134,7 @@ int cte_fuse_write(const char *path, const char *buf, size_t size,
     if (r->GetReturnCode() != 0) return -EIO;
     offset = static_cast<cte_off_t>(r->old_size_);
   }
-  auto *cte = CLIO_CTE_CLIENT;
+  auto *cte = CLIO_CFS_CLIENT->Cte();
   if (SieveDataEnabled() && cte != nullptr && !handle->tag.IsNull()) {
     size_t done = 0;
     while (done < size) {
@@ -4312,7 +4328,7 @@ static int cte_fuse_write_zeros(const char *path, struct fuse_file_info *fi,
  * @return remaining capacity, or ~0 when it cannot be determined
  */
 static clio::run::u64 StoreRemainingBytes() {
-  auto *cte = CLIO_CTE_CLIENT;
+  auto *cte = CLIO_CFS_CLIENT->Cte();
   if (cte == nullptr) return ~0ULL;
   auto t = cte->AsyncGetCapacity(clio::run::PoolQuery::Broadcast());
   t.Wait();
@@ -4747,7 +4763,7 @@ void StatfsCapacity(clio::run::u64 *total, clio::run::u64 *remaining) {
   }
   clio::run::u64 t_bytes = 0, r_bytes = 0;
   bool ok = false;
-  auto *cte = CLIO_CTE_CLIENT;
+  auto *cte = CLIO_CFS_CLIENT->Cte();
   if (cte != nullptr) {
     // Broadcast: total + remaining capacity across the whole cluster.
     auto t = cte->AsyncGetCapacity(clio::run::PoolQuery::Broadcast());

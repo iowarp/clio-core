@@ -232,6 +232,10 @@ class CopyWorkspaceFixture {
           clio::cte::core::kCtePoolId, params);
       create_task.Wait();
       REQUIRE(create_task->GetReturnCode() == 0);
+      // fuse_cte.h's helpers go through the filesystem client's data
+      // chain. No filesystem pool is composed here, so that chain is
+      // just the core created above.
+      CLIO_CFS_CLIENT->Cte()->Init(clio::cte::core::kCtePoolId);
 
       clio::run::PoolId bdev_pool_id(951, 0);
       std::string target_name = "cte_fuse_copy_workspace_ram";
