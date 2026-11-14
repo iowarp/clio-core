@@ -604,6 +604,7 @@ compose:
     flush_batch_bytes: "16M"            # max payload per MultiPutBlob batch
     flush_period_us: 50                 # flusher cadence (it drains fully)
     flush_retries: 3                    # per-record retries before an error sticks
+    flush_shards: 8                     # parallel MultiPutBlob tasks for this node's own blobs
     max_tags: 4096                      # tags tracked (new-tag completeness)
     max_blobs: 65536                    # blob entries (metadata + buffers)
     max_fill: "16M"                     # larger blobs are read, not cached

@@ -184,6 +184,33 @@ class Runtime : public clio::cte::core::CoreInterposer {
   void CopyRecords(std::vector<FlushRecord> &recs,
                    std::map<clio::run::u32, ctp::ipc::FullPtr<char>> &staging,
                    std::map<clio::run::u32, clio::run::u64> *staged);
+  /**
+   * Split one home's descriptors into at most flush_shards shards by blob,
+   * so a home's batch lands on several workers at once; one blob never
+   * spans two shards, which keeps its ranges in log order.
+   */
+  void ShardDescs(const std::vector<clio::cte::core::MultiPutDesc> &descs,
+                  std::vector<std::vector<clio::cte::core::MultiPutDesc>> *shards);
+  /**
+   * Send every home's staged records as sharded MultiPutBlob (local home)
+   * or HomeFlush (remote home) tasks.
+   * @return payload bytes sent
+   */
+  clio::run::u64 SendGroups(
+      const std::vector<FlushRecord> &recs,
+      std::map<clio::run::u32, ctp::ipc::FullPtr<char>> &staging,
+      std::map<clio::run::u32, clio::run::u64> &staged,
+      std::vector<clio::run::u32> *homes,
+      std::vector<clio::run::Future<clio::cte::core::MultiPutBlobTask>> *futs);
+  /**
+   * Await every sent group; replay a home whose shards reported a failure,
+   * and invalidate other sharers of the local home's blobs once.
+   */
+  clio::run::TaskResume LandGroups(
+      const std::vector<FlushRecord> &recs,
+      std::map<clio::run::u32, ctp::ipc::FullPtr<char>> &staging,
+      const std::vector<clio::run::u32> &homes,
+      std::vector<clio::run::Future<clio::cte::core::MultiPutBlobTask>> &futs);
   /** Descriptors of one home group. */
   static std::vector<clio::cte::core::MultiPutDesc> GroupDescs(
       const std::vector<FlushRecord> &recs, clio::run::u32 home);
@@ -219,6 +246,16 @@ class Runtime : public clio::cte::core::CoreInterposer {
                                        const std::string &name);
   /** Leave a chain read entered with BeginChainRead. */
   void EndChainRead() { chain_reads_.fetch_sub(1); }
+  /**
+   * Enter a task-path write of the chain (explicit-score / flagged put,
+   * delete): waits for in-flight chain reads and keeps new ones out until
+   * EndChainWrite. Without it a miss could snapshot the entry after this
+   * write's invalidation, fetch the chain BEFORE the write lands, and
+   * install the older bytes as complete.
+   */
+  clio::run::TaskResume BeginChainWrite();
+  /** Leave a chain write entered with BeginChainWrite. */
+  void EndChainWrite() { chain_writes_.fetch_sub(1); }
   /** Fetch the whole blob from the chain into the segment. */
   clio::run::TaskResume FillFromChain(const TagId &tag, const std::string &name,
                                       bool *filled);
@@ -229,6 +266,8 @@ class Runtime : public clio::cte::core::CoreInterposer {
   std::atomic<bool> flushing_{false};
   /** Chain reads in flight (BeginChainRead); FlushLog waits for zero. */
   std::atomic<int> chain_reads_{0};
+  /** Task-path chain writes in flight (BeginChainWrite). */
+  std::atomic<int> chain_writes_{0};
   std::mutex sharers_mtx_;
   std::map<std::string, SharerSet> sharers_;
 };

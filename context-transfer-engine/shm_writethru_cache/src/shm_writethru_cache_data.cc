@@ -81,12 +81,23 @@ clio::run::TaskResume Runtime::BeginChainRead(const TagId &tag,
   CLIO_TASK_BODY_BEGIN
   while (true) {
     chain_reads_.fetch_add(1);
-    if (!flushing_.load() &&
+    if (!flushing_.load() && chain_writes_.load() == 0 &&
         (!view_.Ready() || view_.BlobPending(tag.major_, tag.minor_,
                                              name.c_str(), name.size()) == 0)) {
       break;  // held: no batch is landing and none can start
     }
     chain_reads_.fetch_sub(1);
+    CLIO_CO_AWAIT(clio::run::yield(kBarrierPollUs));
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::BeginChainWrite() {
+  CLIO_TASK_BODY_BEGIN
+  // seq_cst pairs with BeginChainRead (increment, then check the other).
+  chain_writes_.fetch_add(1);
+  while (chain_reads_.load() != 0) {
     CLIO_CO_AWAIT(clio::run::yield(kBarrierPollUs));
   }
   CLIO_CO_RETURN;
@@ -160,8 +171,10 @@ clio::run::TaskResume Runtime::PutBlob(
       }
     }
     // Not expressible in the segment: drain this blob's buffered ranges so
-    // the chain orders this write after them, then drop the local copy.
+    // the chain orders this write after them, then drop the local copy. No
+    // miss may fill from the chain until this write has landed.
     CLIO_CO_AWAIT(WaitBlobFlushed(task->tag_id_, name));
+    CLIO_CO_AWAIT(BeginChainWrite());
     if (view_.Ready()) {
       view_.Invalidate(task->tag_id_.major_, task->tag_id_.minor_,
                        name.c_str(), name.size());
@@ -178,6 +191,7 @@ clio::run::TaskResume Runtime::PutBlob(
       CLIO_CO_AWAIT(ForwardToCore(Method::kPutBlob,
                                   task.template Cast<clio::run::Task>()));
     }
+    EndChainWrite();
     CLIO_CO_AWAIT(FanoutInvalidate(task->tag_id_, name));
   }
   CLIO_CO_RETURN;
@@ -229,6 +243,7 @@ clio::run::TaskResume Runtime::DelBlob(
   {
     const std::string name = task->blob_name_.str();
     CLIO_CO_AWAIT(WaitBlobFlushed(task->tag_id_, name));
+    CLIO_CO_AWAIT(BeginChainWrite());
     if (view_.Ready()) {
       view_.DropBlob(task->tag_id_.major_, task->tag_id_.minor_, name.c_str(),
                      name.size());
@@ -237,6 +252,7 @@ clio::run::TaskResume Runtime::DelBlob(
                                   clio::run::PoolQuery::Dynamic(),
                                   task->del_flags_);
     CLIO_CO_AWAIT(f);
+    EndChainWrite();
     task->SetReturnCode(f->GetReturnCode());
     CLIO_CO_AWAIT(FanoutInvalidate(task->tag_id_, name));
   }

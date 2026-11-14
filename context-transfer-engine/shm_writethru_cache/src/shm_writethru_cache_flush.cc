@@ -46,7 +46,9 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <map>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -241,6 +243,104 @@ clio::run::TaskResume Runtime::RetryGroup(const std::vector<FlushRecord> &recs,
   CLIO_TASK_BODY_END
 }
 
+void Runtime::ShardDescs(const std::vector<MultiPutDesc> &descs,
+                         std::vector<std::vector<MultiPutDesc>> *shards) {
+  const size_t k = std::max<size_t>(
+      1, std::min<size_t>(config_.flush_shards_, descs.size()));
+  shards->assign(k, {});
+  std::hash<std::string> h;
+  for (const MultiPutDesc &d : descs) {
+    // By blob: one blob's records always share a shard, so its ranges land
+    // in log order even with the shards in flight together.
+    const size_t i = (h(d.blob_name_) ^ (static_cast<size_t>(d.tag_id_.major_) << 32 |
+                                         d.tag_id_.minor_)) % k;
+    (*shards)[i].push_back(d);
+  }
+}
+
+clio::run::u64 Runtime::SendGroups(
+    const std::vector<FlushRecord> &recs,
+    std::map<clio::run::u32, ctp::ipc::FullPtr<char>> &staging,
+    std::map<clio::run::u32, clio::run::u64> &staged,
+    std::vector<clio::run::u32> *homes,
+    std::vector<clio::run::Future<MultiPutBlobTask>> *futs) {
+  auto *ipc = CLIO_IPC;
+  clio::run::u64 bytes = 0;
+  for (const auto &g : staging) {
+    if (g.second.IsNull()) continue;
+    std::vector<MultiPutDesc> descs = GroupDescs(recs, g.first);
+    if (descs.empty()) continue;
+    const bool local = g.first == container_id_;
+    std::vector<std::vector<MultiPutDesc>> shards;
+    if (local) {
+      ShardDescs(descs, &shards);
+    } else {
+      // A HomeFlush ships its whole staging buffer: one per remote home.
+      shards.push_back(std::move(descs));
+    }
+    for (const auto &sh : shards) {
+      if (sh.empty()) continue;
+      // Every shard shares the home's staging buffer: payload_off_ indexes it.
+      auto t = ipc->NewTask<MultiPutBlobTask>(
+          clio::run::CreateTaskId(), local ? CorePoolId() : pool_id_,
+          local ? clio::run::PoolQuery::Local()
+                : clio::run::PoolQuery::DirectId(g.first),
+          local ? sh.front().tag_id_ : TagId(container_id_, kWriterMarker),
+          sh.front().blob_name_, ctp::ipc::ShmPtr<>(g.second.shm_),
+          staged[g.first], clio::cte::core::EncodeMultiPutDescs(sh),
+          Context());
+      if (!local) t->method_ = Method::kHomeFlush;
+      if (WtcTrace()) {
+        HLOG(kInfo, "[WTC-TRACE] t={} flush from={} home={} recs={} bytes={} "
+             "first={}.{}/{}", WallMs(), container_id_, g.first, sh.size(),
+             staged[g.first], sh.front().tag_id_.major_,
+             sh.front().tag_id_.minor_, sh.front().blob_name_);
+      }
+      homes->push_back(g.first);
+      futs->push_back(ipc->Send(t));
+    }
+    bytes += staged[g.first];
+  }
+  return bytes;
+}
+
+clio::run::TaskResume Runtime::LandGroups(
+    const std::vector<FlushRecord> &recs,
+    std::map<clio::run::u32, ctp::ipc::FullPtr<char>> &staging,
+    const std::vector<clio::run::u32> &homes,
+    std::vector<clio::run::Future<MultiPutBlobTask>> &futs) {
+  CLIO_TASK_BODY_BEGIN
+  {
+    std::set<clio::run::u32> failed;
+    std::set<clio::run::u32> seen;
+    for (size_t i = 0; i < futs.size(); ++i) {
+      CLIO_CO_AWAIT(futs[i]);
+      if (WtcTrace()) {
+        HLOG(kInfo, "[WTC-TRACE] t={} flush-done from={} home={} rc={} "
+             "first_rc={}", WallMs(), container_id_, homes[i],
+             futs[i]->GetReturnCode(), futs[i]->first_rc_);
+      }
+      if (futs[i]->GetReturnCode() != 0 || futs[i]->first_rc_ != 0) {
+        failed.insert(homes[i]);
+      }
+      seen.insert(homes[i]);
+    }
+    for (clio::run::u32 home : failed) {
+      // Replays every record of the home (puts are idempotent).
+      CLIO_CO_AWAIT(RetryGroup(recs, home, staging[home]));
+    }
+    if (seen.count(container_id_) != 0) {
+      std::vector<BlobKey> keys;
+      for (const FlushRecord &fr : recs) {
+        if (fr.home_ == container_id_ && fr.size_ > 0) keys.push_back(fr.key_);
+      }
+      CLIO_CO_AWAIT(SendInvalidations(HomeApply(keys, container_id_)));
+    }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 clio::run::TaskResume Runtime::FlushLog(clio::run::shared_ptr<FlushLogTask> &task) {
   CLIO_TASK_BODY_BEGIN
   task->ranges_ = 0;
@@ -266,54 +366,8 @@ clio::run::TaskResume Runtime::FlushLog(clio::run::shared_ptr<FlushLogTask> &tas
     auto *ipc = CLIO_IPC;
     std::vector<clio::run::u32> homes;
     std::vector<clio::run::Future<MultiPutBlobTask>> futs;
-    for (const auto &g : staging) {
-      if (g.second.IsNull()) {
-        continue;
-      }
-      std::vector<MultiPutDesc> descs = GroupDescs(recs, g.first);
-      if (descs.empty()) {
-        continue;
-      }
-      const bool local = g.first == container_id_;
-      auto t = ipc->NewTask<MultiPutBlobTask>(
-          clio::run::CreateTaskId(), local ? CorePoolId() : pool_id_,
-          local ? clio::run::PoolQuery::Local()
-                : clio::run::PoolQuery::DirectId(g.first),
-          local ? descs.front().tag_id_ : TagId(container_id_, kWriterMarker),
-          descs.front().blob_name_, ctp::ipc::ShmPtr<>(g.second.shm_),
-          staged[g.first], clio::cte::core::EncodeMultiPutDescs(descs),
-          Context());
-      if (!local) {
-        t->method_ = Method::kHomeFlush;
-      }
-      if (WtcTrace()) {
-        HLOG(kInfo, "[WTC-TRACE] t={} flush from={} home={} recs={} bytes={} "
-             "first={}.{}/{}", WallMs(), container_id_, g.first, descs.size(),
-             staged[g.first], descs.front().tag_id_.major_,
-             descs.front().tag_id_.minor_, descs.front().blob_name_);
-      }
-      task->bytes_ += staged[g.first];
-      homes.push_back(g.first);
-      futs.push_back(ipc->Send(t));
-    }
-    for (size_t i = 0; i < futs.size(); ++i) {
-      CLIO_CO_AWAIT(futs[i]);
-      if (WtcTrace()) {
-        HLOG(kInfo, "[WTC-TRACE] t={} flush-done from={} home={} rc={} first_rc={}", WallMs(),
-             container_id_, homes[i], futs[i]->GetReturnCode(),
-             futs[i]->first_rc_);
-      }
-      if (futs[i]->GetReturnCode() != 0 || futs[i]->first_rc_ != 0) {
-        CLIO_CO_AWAIT(RetryGroup(recs, homes[i], staging[homes[i]]));
-      }
-      if (homes[i] == container_id_) {
-        std::vector<BlobKey> keys;
-        for (const FlushRecord &fr : recs) {
-          if (fr.home_ == homes[i] && fr.size_ > 0) keys.push_back(fr.key_);
-        }
-        CLIO_CO_AWAIT(SendInvalidations(HomeApply(keys, container_id_)));
-      }
-    }
+    task->bytes_ = SendGroups(recs, staging, staged, &homes, &futs);
+    CLIO_CO_AWAIT(LandGroups(recs, staging, homes, futs));
     for (auto &g : staging) {
       if (!g.second.IsNull()) ipc->FreeBuffer(g.second);
     }

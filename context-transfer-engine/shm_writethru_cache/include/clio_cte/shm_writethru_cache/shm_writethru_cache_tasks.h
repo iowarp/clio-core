@@ -70,6 +70,7 @@ struct WtcConfig {
   clio::run::u64 half_life_ms_ = 10000;         ///< [half_life_ms]
   double flush_period_us_ = 50.0;               ///< [flush_period_us]
   clio::run::u32 flush_retries_ = 3;            ///< [flush_retries]
+  clio::run::u32 flush_shards_ = 8;             ///< [flush_shards] parallel tasks per home
   clio::run::u32 max_sharer_entries_ = 65536;   ///< [max_sharer_entries]
 
   WtcConfig() : next_pool_id_(clio::run::PoolId::GetNull()) {}
@@ -82,7 +83,7 @@ struct WtcConfig {
   void serialize(Archive &ar) {
     ar(next_pool_id_, capacity_, log_depth_, flush_batch_bytes_, max_tags_,
        max_blobs_, max_fill_, evict_sample_, half_life_ms_, flush_period_us_,
-       flush_retries_, max_sharer_entries_);
+       flush_retries_, max_sharer_entries_, flush_shards_);
   }
 
   /** Parse "major.minor". */
@@ -126,6 +127,9 @@ struct WtcConfig {
       }
       if (node["flush_period_us"]) {
         flush_period_us_ = node["flush_period_us"].as<double>();
+      }
+      if (node["flush_shards"]) {
+        flush_shards_ = node["flush_shards"].as<clio::run::u32>();
       }
       if (node["flush_retries"]) {
         flush_retries_ = node["flush_retries"].as<clio::run::u32>();

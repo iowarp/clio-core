@@ -233,6 +233,7 @@ clio::run::TaskResume Runtime::DelTag(
       CLIO_CO_AWAIT(clio::run::yield(kBarrierPollUs));
     }
   }
+  CLIO_CO_AWAIT(BeginChainWrite());
   {
     const std::string name = task->tag_name_.str();
     clio::run::Future<clio::cte::core::DelTagTask> f =
@@ -245,6 +246,7 @@ clio::run::TaskResume Runtime::DelTag(
     }
     task->SetReturnCode(f->GetReturnCode());
   }
+  EndChainWrite();
   if (!task->tag_id_.IsNull()) {
     // Every node drops its copies of the tag's blobs (and its own, here).
     BlobKey k{task->tag_id_.major_, task->tag_id_.minor_, std::string()};
