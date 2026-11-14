@@ -137,8 +137,11 @@ class Cluster:
                extra_env=None, replicate_period_ms=0, fsync_mode=None,
                ram_mb=512, fast_mb=2048, organizer='frecency',
                organizer_period_ms=2000, neighborhood=1, ssd_mb=4096,
-               ssd_root=None, hdd_root=None):
+               ssd_root=None, hdd_root=None, cache='write_thru'):
     self.hosts = list(hosts)
+    # Policy cache over the volatile and persistent cores: 'write_thru'
+    # (default, as in clio_default.yaml) or 'write_back'.
+    self.cache = cache
     self.bin_dir = bin_dir
     self.run_dir = run_dir            # shared (NFS): configs, logs, results
     self.profile = profile
@@ -395,7 +398,8 @@ class Cluster:
       # the file sizes / pending appends of the streams it homes.
       fs_extra = f'    metadata_log_path: "{lr}/data/cfs_namespace_log"\n'
       stream_extra = f'    log_path: "{lr}/data/cte_stream_log"\n'
-    # The write-back cache (not the core) flushes dirty RAM copies to disk.
+    # Write-back only: the cache (not the core) flushes dirty RAM copies to
+    # disk every flush_period_ms; write-through ignores it.
     flush_period_ms = 10000
     if self.profile == 'persistent_norepl':
       # Nothing but fsync may move bytes off the RAM tier: no replica on the
@@ -432,7 +436,8 @@ class Cluster:
                f'      failover_to_successor: true\n')
     # Each core states its role with `durability`. With a persistent
     # tier: a persistent core (512.0) and a volatile RAM core (540.0) behind
-    # a write-back cache (567.0), which owns flushing. RAM only: one volatile
+    # a policy cache (567.0; write-through by default, --cache write_back for
+    # the write-back module, which owns flushing). RAM only: one volatile
     # core under the node-local cache, as before.
     if storage:
       cores = ('  - mod_name: clio_cte_core\n'
@@ -457,8 +462,9 @@ class Cluster:
                   '      dpe_type: "max_bw"\n'
                   '    targets:\n'
                   '      neighborhood: 1\n')
-        top = ('  - mod_name: clio_cte_write_back_cache\n'
-               '    pool_name: clio_cte_write_back_cache\n'
+        cache_mod = f'clio_cte_{self.cache}_cache'
+        top = (f'  - mod_name: {cache_mod}\n'
+               f'    pool_name: {cache_mod}\n'
                '    pool_query: local\n'
                '    pool_id: "567.0"\n'
                '    next_volatile: "540.0"\n'

@@ -316,6 +316,11 @@ def main():
   ap.add_argument('--groups', default='posix,dist,dirs,apps,perf,fault')
   ap.add_argument('--only', default='')
   ap.add_argument('--skip', default='')
+  ap.add_argument('--cache', default='write_thru',
+                  choices=['write_thru', 'write_back'],
+                  help='policy cache over the volatile and persistent cores '
+                       '(layouts with a persistent tier); default as in '
+                       'clio_default.yaml')
   ap.add_argument('--profile', default='persistent',
                   choices=['persistent', 'persistent_norepl', 'ram',
                            'tiered', 'safe', 'ares_tiers'],
@@ -399,7 +404,7 @@ def main():
                disk_gb=args.disk_gb, ram_gb=args.ram_gb, ram_mb=args.ram_mb,
                fast_mb=args.fast_mb, organizer=args.organizer,
                neighborhood=args.neighborhood, local_root=args.local_root,
-               ssd_mb=args.ssd_mb)
+               ssd_mb=args.ssd_mb, cache=args.cache)
   cl.working_set_mb = args.working_set_mb
   cl.probe_silence_s = args.probe_silence_s
   log(f'hosts={hosts} profile={args.profile} '

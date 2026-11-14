@@ -331,7 +331,7 @@ compose:
   # === Context Transfer Engine (CTE) ===
   # Two DISCONNECTED cores: each core
   # is either volatile or persistent, and moving data between them is the
-  # job of the write-back cache further down.
+  # job of the policy cache (write-through by default) further down.
   #
   # durability: "persistent" | "volatile". Optional. When omitted it is
   #   inferred at Create: persistent if every storage device has
@@ -438,8 +438,9 @@ compose:
     #                                    # once a minute to persist blob score
     #                                    # changes the WAL does not record.
     #   fsync_mode: "durable"            # fsync(2) on clio-fs. "durable": returns
-    #                                    # once the write-back cache has flushed
-    #                                    # the file's dirty copies and the devices
+    #                                    # once the policy cache has flushed any
+    #                                    # dirty copies (none under the default
+    #                                    # write-through cache) and the devices
     #                                    # holding its bytes are synced, along with
     #                                    # the WAL and namespace log. "deferred":
     #                                    # returns at once; the cache's periodic
@@ -447,14 +448,16 @@ compose:
     #                                    # can lose up to its flush_period_ms).
     # The core no longer flushes data itself: flush_data_period_ms and
     # flush_data_min_persistence are ignored (with a warning). Use the
-    # write-back cache's flush_period_ms.
+    # write-back cache's flush_period_ms (the default write-through cache
+    # writes persistent on every put and needs no flush).
     #   transaction_log_capacity: "32MB" # Write-ahead log capacity
 
   # === Volatile CTE core ==================================================
   # DRAM (and optionally hbm, or NVMe scratch files marked "volatile").
   # Runs without a WAL and is empty after every start; it may refuse a put
-  # when full, which the write-back cache handles (evict, then fall back to
-  # persistent). Clients should not address it directly.
+  # when full, which the policy cache handles (write-through: evict or drop
+  # the optional copy; write-back: evict, then fall back to persistent).
+  # Clients should not address it directly.
   - mod_name: clio_cte_core
     pool_name: cte_volatile
     pool_query: local
@@ -475,15 +478,15 @@ compose:
   # and stack via next_pool_id, separating RELIABILITY (replication) from
   # LOCALITY (cache) from ENCODING (compression). The canonical full chain:
   #
-  #   indexer(564.0) -> [compressor(562.0) ->] write_back_cache(567.0)
+  #   indexer(564.0) -> [compressor(562.0) ->] write_thru_cache(567.0)
   #     -> volatile core(540.0)
   #     -> replication(561.0) -> persistent core(512.0)
   #
   # Point any clio::cte::core::Client (or the filesystem chimod below) at
   # the TOP pool and the whole chain is transparent: the indexer notes the
-  # write, the optional compressor encodes it, and the write-back cache
-  # lands it in the volatile core and acks; the cache later flushes it
-  # through replication to the persistent core. A read is served from the
+  # write, the optional compressor encodes it, and the write-through cache
+  # writes it through replication to the persistent core, updates the
+  # volatile core's copy, and acks. A read is served from the
   # volatile copy when there is one, else from persistent. Order in this
   # file matters: each entry must come AFTER every pool it names.
 
@@ -491,7 +494,8 @@ compose:
   # Reliability layer. replication_factor is the total number of durable
   # copies of every blob:
   #   1 (default): the blob's own copy only, made durable by fsync and the
-  #     write-back cache's periodic flush -- the ext4 contract and a
+  #     write path (write-through) or the write-back cache's periodic
+  #     flush -- the ext4 contract and a
   #     single-copy disk footprint. A node's blobs are unavailable while it is down.
   #   N > 1: plus N-1 copies on the next nodes by hash, written before a put
   #     is acknowledged; with the core's failover_to_successor a blob stays
@@ -527,18 +531,23 @@ compose:
     # owner returns. Default: "" (kept in memory only).
     # handoff_log_path: "/var/lib/clio/cte_handoff_log"
 
-  # === Write-back cache ===
+  # === Write-through cache (default) ===
   # Sits over the two disconnected cores and owns every durability
-  # decision: a put lands in the volatile core and is acked; dirty copies
-  # are flushed to the persistent chain periodically, on fsync (SyncTag) and
-  # FlushData, before they are evicted, and at `clio_run stop` (bounded by
-  # --grace-period). A read miss is served from persistent and, per `fill`,
-  # copied into the volatile core. Eviction is a DelBlob on the volatile
-  # core. clio_cte_write_thru_cache takes the same keys (flush_period_ms and
-  # fallback_to_persistent are ignored there) and acks only after the
-  # persistent write.
-  - mod_name: clio_cte_write_back_cache
-    pool_name: clio_cte_write_back_cache
+  # decision. Write-through: a put lands on the persistent chain first and
+  # is acked only then; the volatile core's copy is updated with it (and
+  # filled on a read miss, per `fill`), so fsync only syncs devices and the
+  # metadata log. Eviction is a DelBlob on the volatile core.
+  #
+  # clio_cte_write_back_cache takes the same keys and acks from the volatile
+  # core instead, flushing dirty copies periodically (flush_period_ms), on
+  # fsync (SyncTag) and FlushData, before eviction, and at `clio_run stop`.
+  # It is NOT the default: it currently buffers only puts that cover a blob
+  # from offset 0 (partial writes still go synchronously to persistent) and
+  # flushes serially, which measured slower than write-through on fsync-heavy
+  # and random-write workloads. To use it, change mod_name/pool_name below
+  # and uncomment flush_period_ms / fallback_to_persistent.
+  - mod_name: clio_cte_write_thru_cache
+    pool_name: clio_cte_write_thru_cache
     pool_query: local
     pool_id: "567.0"
     next_volatile: "540.0"              # volatile core (required)
@@ -546,12 +555,13 @@ compose:
                                         #   omit for a volatile-only cache
     fill: on_read_miss                  # on_read_miss | on_hit_count:N | none
     evict: lru                          # lru | lfu
-    flush_period_ms: 10000              # dirty-copy flush period; 0 = off
+    # Write-back only:
+    # flush_period_ms: 10000            # dirty-copy flush period; 0 = off
     # When the volatile core cannot hold a put even after eviction: true
     # writes it straight to persistent (default); false fails the put with
     # ENOSPC (kPutNoSpaceRc) so a deployment never silently drops to disk
     # speed.
-    fallback_to_persistent: true
+    # fallback_to_persistent: true
 
   # === Compression (optional, issue #886) ===
   # Encoding layer: transparently compresses on the way down and
@@ -562,7 +572,7 @@ compose:
   #   pool_name: clio_cte_compressor
   #   pool_query: local
   #   pool_id: "562.0"
-  #   next_pool_id: "567.0"             # write-back cache — see entry above
+  #   next_pool_id: "567.0"             # policy cache — see entry above
   #   # Steer each tag's compressed copy toward the node that last read it
   #   # (consumer tracking). false = always place by hash of the tag id.
   #   tracking_enabled: true            # default: true
@@ -600,7 +610,7 @@ compose:
     pool_name: clio_cte_indexer
     pool_query: local
     pool_id: "564.0"
-    next_pool_id: "567.0"               # write-back cache (562.0 with compressor)
+    next_pool_id: "567.0"               # policy cache (562.0 with compressor)
     index_log_path: "${CLIO_STORAGE_ROOT}/cte_indexer_index"
     # index_sweep_period_ms: 100        # async drain cadence (0 = lazy)
     # index_wal_compact_bytes: "8MB"    # WAL size that triggers compaction
