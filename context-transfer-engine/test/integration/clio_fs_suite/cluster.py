@@ -137,10 +137,10 @@ class Cluster:
                extra_env=None, replicate_period_ms=0, fsync_mode=None,
                ram_mb=512, fast_mb=2048, organizer='frecency',
                organizer_period_ms=2000, neighborhood=1, ssd_mb=4096,
-               ssd_root=None, hdd_root=None, cache='write_thru'):
+               ssd_root=None, hdd_root=None, cache='write_back'):
     self.hosts = list(hosts)
-    # Policy cache over the volatile and persistent cores: 'write_thru'
-    # (default, as in clio_default.yaml) or 'write_back'.
+    # Policy cache over the volatile and persistent cores: 'write_back'
+    # (default, as in clio_default.yaml) or 'write_thru'.
     self.cache = cache
     self.bin_dir = bin_dir
     self.run_dir = run_dir            # shared (NFS): configs, logs, results
@@ -436,8 +436,8 @@ class Cluster:
                f'      failover_to_successor: true\n')
     # Each core states its role with `durability`. With a persistent
     # tier: a persistent core (512.0) and a volatile RAM core (540.0) behind
-    # a policy cache (567.0; write-through by default, --cache write_back for
-    # the write-back module, which owns flushing). RAM only: one volatile
+    # a policy cache (567.0; write-back by default, which owns flushing;
+    # --cache write_thru for the write-through module). RAM only: one volatile
     # core under the node-local cache, as before.
     if storage:
       cores = ('  - mod_name: clio_cte_core\n'

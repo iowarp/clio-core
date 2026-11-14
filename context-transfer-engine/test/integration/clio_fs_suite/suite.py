@@ -316,7 +316,7 @@ def main():
   ap.add_argument('--groups', default='posix,dist,dirs,apps,perf,fault')
   ap.add_argument('--only', default='')
   ap.add_argument('--skip', default='')
-  ap.add_argument('--cache', default='write_thru',
+  ap.add_argument('--cache', default='write_back',
                   choices=['write_thru', 'write_back'],
                   help='policy cache over the volatile and persistent cores '
                        '(layouts with a persistent tier); default as in '
