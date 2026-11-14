@@ -33,7 +33,7 @@
 
 /**
  * Multi-node stress for the shm write-through cache. Every node runs this
- * binary bound to the cache pool (CLIO_CTE_POOL=567.0). The scenarios are
+ * binary bound to the cache pool (CLIO_CTE_POOL=568.0). The scenarios are
  * collective and self-verifying: every byte read is checked against the
  * pattern its writer must have produced.
  *

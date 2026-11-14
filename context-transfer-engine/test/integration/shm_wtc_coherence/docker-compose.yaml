@@ -26,7 +26,7 @@ x-coh-env: &coh-env
   CLIO_WITH_RUNTIME: "0"
   # The test client binds the chain top (the runtime ignores this env; its
   # module-internal clients bind pools explicitly).
-  CLIO_CTE_POOL: "567.0"
+  CLIO_CTE_POOL: "568.0"
   # Hermetic per-container state: no restart-log replay, no persisted bdev
   # perf profiles leaking between runs.
   HOME: /tmp/clio_home

@@ -81,7 +81,7 @@ using u64 = clio::run::u64;
 using WtcAlloc = CLIO_TASK_ALLOC_T;
 
 /** Pool id of the default-compose shm write-through cache. */
-inline const clio::run::PoolId kDefaultPoolId(567, 0);
+inline const clio::run::PoolId kDefaultPoolId(568, 0);
 
 /** Longest blob name the segment can hold; longer names take the task path. */
 static constexpr u32 kMaxBlobName = 200;

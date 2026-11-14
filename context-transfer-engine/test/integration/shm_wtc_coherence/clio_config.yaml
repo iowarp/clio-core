@@ -1,7 +1,7 @@
 ---
 # 4-node shm write-through cache coherence cluster (shm_writethru_cache/DESIGN.md).
-# Chain on every node: shm_writethru_cache(567) -> cache(563) ->
-# replication(561) -> core(512). Clients bind via CLIO_CTE_POOL=567.0.
+# Chain on every node: shm_writethru_cache(568) -> cache(563) ->
+# replication(561) -> core(512). Clients bind via CLIO_CTE_POOL=568.0.
 
 memory:
   main_segment_size: auto
@@ -73,7 +73,7 @@ compose:
   - mod_name: clio_cte_shm_writethru_cache
     pool_name: clio_cte_shm_writethru_cache
     pool_query: local
-    pool_id: "567.0"
+    pool_id: "568.0"
     next_pool_id: "563.0"
     capacity: "128M"
     log_depth: 16384

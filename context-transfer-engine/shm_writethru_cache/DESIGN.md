@@ -352,7 +352,7 @@ phase 2 lands, not off.
 - mod_name: clio_cte_shm_writethru_cache
   pool_name: clio_cte_shm_writethru_cache
   pool_query: local
-  pool_id: "567.0"
+  pool_id: "568.0"
   next_pool_id: "563.0"        # existing cache chimod
   capacity: 256M               # segment bytes (buffers + tables + log)
   log_depth: 65536             # DirtyRange entries
@@ -404,7 +404,7 @@ Where the code settled details the sections above left open.
   stripe -> tag table -> allocator.
 - **Discovery.** The chimod publishes a `Locator` in the runtime metadata
   segment under its pool id; the segment name is derived from the runtime
-  pid and pool id. `CLIO_CTE_CLIENT_INIT` binds a process to pool 567.0
+  pid and pool id. `CLIO_CTE_CLIENT_INIT` binds a process to pool 568.0
   when it can map that segment (`CLIO_CTE_SHM_CACHE=0` opts out).
 - **What the cache absorbs.** Puts with auto score (`score < 0`), a plain
   `Context`, and flags limited to `kCtePutDroppable`. Droppability is a
@@ -437,7 +437,7 @@ Where the code settled details the sections above left open.
     `PoolQuery::Dynamic` (per blob, or batched by asking the chain's routing).
     Tracked in iowarp/clio-core#1372.
   - A process that cannot map the segment (TCP client, remote node) stays
-    bound to the core pool unless `CLIO_CTE_POOL=567.0`; writes through the
+    bound to the core pool unless `CLIO_CTE_POOL=568.0`; writes through the
     core directly bypass invalidation.
   - A `MultiPutBlob` record whose flags conflict with the cached blob's is
     reported as failed rather than forwarded.

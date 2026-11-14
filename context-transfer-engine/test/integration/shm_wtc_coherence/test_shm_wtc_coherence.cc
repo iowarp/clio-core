@@ -33,7 +33,7 @@
 
 /**
  * Cross-node coherence of the shm write-through cache. Every node runs this
- * binary with its client bound to the cache pool (CLIO_CTE_POOL=567.0), so
+ * binary with its client bound to the cache pool (CLIO_CTE_POOL=568.0), so
  * puts and covered gets complete in each node's own segment; the scenarios
  * check that what one node writes is what every other node reads once the
  * writer has synced, including after other nodes cached the old bytes.

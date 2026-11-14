@@ -35,7 +35,7 @@
  * Unit tests for the shm_writethru_cache chimod and the core client's cache
  * path (context-transfer-engine/shm_writethru_cache/DESIGN.md).
  *
- * Chain under test: shm_writethru_cache (567.0) -> core (512.0). `io` is a
+ * Chain under test: shm_writethru_cache (568.0) -> core (512.0). `io` is a
  * core client bound to the cache pool (SHM path); `core` reads the chain
  * directly to check what actually landed.
  */
@@ -174,7 +174,7 @@ static TagId MakeTag(clio::cte::core::Client &c, const std::string &name) {
   return t->tag_id_;
 }
 
-static const clio::run::PoolId kPool(567, 0);
+static const clio::run::PoolId kPool(568, 0);
 
 TEST_CASE("ShmWtc - writes and reads complete in shared memory",
           "[cte][shm_wtc]") {
@@ -350,7 +350,7 @@ TEST_CASE("ShmWtc - writes and reads complete in shared memory",
 TEST_CASE("ShmWtc - eviction keeps a small cache writable",
           "[cte][shm_wtc][evict]") {
   WtcFixture fx;
-  const clio::run::PoolId pool(568, 0);
+  const clio::run::PoolId pool(569, 0);
   CreateCache(pool, "shm_wtc_small", 8ull << 20);  // 8 MB segment
   clio::cte::core::Client io(pool);
   REQUIRE(io.HasWtc());
