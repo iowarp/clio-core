@@ -54,6 +54,7 @@
 #include <cstring>
 #include <deque>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
@@ -3074,14 +3075,16 @@ class Client : public clio::run::ContainerClient {
     return v;
   }
 
-  /** Process-wide segment views, one per cache pool (never freed: clients
-   *  cache raw pointers to them). */
+  /** Process-wide segment views, one per cache pool. The map owns them
+   *  for the life of the process (clients cache raw pointers to them), so
+   *  they are released at exit rather than leaked. */
   static std::mutex &WtcMutex() {
     static std::mutex mu;
     return mu;
   }
-  static std::unordered_map<clio::run::u64, wtc::View *> &WtcViews() {
-    static std::unordered_map<clio::run::u64, wtc::View *> views;
+  static std::unordered_map<clio::run::u64, std::unique_ptr<wtc::View>> &
+  WtcViews() {
+    static std::unordered_map<clio::run::u64, std::unique_ptr<wtc::View>> views;
     return views;
   }
 
@@ -3107,7 +3110,7 @@ class Client : public clio::run::ContainerClient {
     auto &views = WtcViews();
     auto it = views.find(pool_id_.ToU64());
     if (it != views.end()) {
-      wtc_ = it->second;
+      wtc_ = it->second.get();
       return wtc_->Ready() ? wtc_ : nullptr;
     }
     auto *ipc = CLIO_CPU_IPC;
@@ -3129,14 +3132,13 @@ class Client : public clio::run::ContainerClient {
         loc->ready_.load(std::memory_order_acquire) != 1) {
       return nullptr;
     }
-    auto *view = new wtc::View();
+    auto view = std::make_unique<wtc::View>();
     if (!view->Attach(wtc::SegmentName(loc->runtime_pid_, pool_id_),
                       loc->root_off_)) {
-      delete view;
       return nullptr;
     }
-    views[pool_id_.ToU64()] = view;
-    wtc_ = view;
+    wtc_ = view.get();
+    views[pool_id_.ToU64()] = std::move(view);
     return wtc_;
   }
 
@@ -3827,6 +3829,50 @@ class Client : public clio::run::ContainerClient {
     auto task = ipc_manager->NewTask<DelTagTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, tag_id);
 
+    return ipc_manager->Send(task);
+  }
+
+  /**
+   * Delete a set of blobs in ONE task. The core splits the set by owner:
+   * each owner deletes its subset as one plan (one FreeBlocks per pool for
+   * the whole subset), all owners concurrently.
+   * @param keys       (tag, blob) pairs to delete
+   * @param pool_query routing (default Dynamic: the first blob's owner,
+   *                   which forwards the other owners' subsets)
+   * @param del_flags  kDelCacheCopyOnly to drop only cache copies, else 0
+   * @return future; num_ok_ = blobs deleted, first_rc_ = first failure
+   *         (1 = a blob was not found)
+   */
+  clio::run::Future<MultiDelBlobTask> AsyncMultiDelBlob(
+      const std::vector<MultiDelKey> &keys,
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic(),
+      clio::run::u32 del_flags = 0) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    const TagId route_tag = keys.empty() ? TagId() : keys.front().tag_id_;
+    const std::string route_blob =
+        keys.empty() ? std::string() : keys.front().blob_name_;
+    auto task = ipc_manager->NewTask<MultiDelBlobTask>(
+        clio::run::CreateTaskId(), pool_id_, pool_query, route_tag, route_blob,
+        EncodeMultiDelKeys(keys), del_flags);
+    return ipc_manager->Send(task);
+  }
+
+  /**
+   * Delete a set of tags (by id) in ONE task per container. Like DelTag by
+   * id, a container removes its own share of each tag, so the default
+   * Broadcast deletes the set cluster-wide.
+   * @param tags       tag ids to delete
+   * @param pool_query routing (default Broadcast)
+   * @return future; num_ok_ = tags deleted (summed over containers)
+   */
+  clio::run::Future<MultiDelTagTask> AsyncMultiDelTag(
+      const std::vector<TagId> &tags,
+      const clio::run::PoolQuery &pool_query =
+          clio::run::PoolQuery::Broadcast()) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    auto task = ipc_manager->NewTask<MultiDelTagTask>(
+        clio::run::CreateTaskId(), pool_id_, pool_query,
+        EncodeMultiDelTags(tags));
     return ipc_manager->Send(task);
   }
 
