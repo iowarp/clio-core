@@ -62,6 +62,9 @@ using clio::cte::core::BlobRegion;
 
 static constexpr double kBarrierPollUs = 10.0;
 static constexpr double kNoSpacePollUs = 50.0;
+/** Waits for segment room before a put writes around the cache (~1 ms). A
+ *  segment full of clean small buffers may never yield a large one. */
+static constexpr int kNoSpaceRetries = 20;
 
 clio::run::TaskResume Runtime::WaitBlobFlushed(const TagId &tag,
                                                const std::string &name) {
@@ -166,16 +169,20 @@ clio::run::TaskResume Runtime::PutBlob(
           CLIO_CO_RETURN;
         }
         wtc::Status st = wtc::Status::kNoSpace;
-        while ((st = view_.TryPut(task->tag_id_.major_, task->tag_id_.minor_,
-                                  name.c_str(), name.size(),
-                                  regions[i].blob_off_, regions[i].size_, src,
-                                  task->flags_, /*may_block=*/false)) ==
-               wtc::Status::kNoSpace) {
+        for (int tries = 0;
+             (st = view_.TryPut(task->tag_id_.major_, task->tag_id_.minor_,
+                                name.c_str(), name.size(),
+                                regions[i].blob_off_, regions[i].size_, src,
+                                task->flags_, /*may_block=*/false)) ==
+                 wtc::Status::kNoSpace &&
+             tries < kNoSpaceRetries;
+             ++tries) {
           view_.GetRoot()->stats_.waits_.fetch_add(1);
           CLIO_CO_AWAIT(clio::run::yield(kNoSpacePollUs));
         }
-        // kMiss only on the FIRST region (a flags conflict is per blob), so
-        // nothing was absorbed when we fall through to the chain below.
+        // Not absorbed (a flags conflict, or still no room): the whole put
+        // goes down the chain below, ordered after this blob's logged
+        // ranges -- an earlier absorbed region lands again, unchanged.
         absorbed = st == wtc::Status::kOk;
       }
       if (absorbed) {
@@ -211,6 +218,31 @@ clio::run::TaskResume Runtime::PutBlob(
   CLIO_TASK_BODY_END
 }
 
+clio::run::TaskResume Runtime::WriteAroundRecord(
+    const TagId &tag, const std::string &name, clio::run::u64 off,
+    clio::run::u64 size, const char *src, clio::run::u32 flags,
+    clio::run::u32 *rc) {
+  CLIO_TASK_BODY_BEGIN
+  // Same order as a task-path put: this blob's logged ranges land first,
+  // no fill may race the write, and the stale local copy is dropped.
+  CLIO_CO_AWAIT(WaitBlobFlushed(tag, name));
+  CLIO_CO_AWAIT(BeginChainWrite());
+  if (view_.Ready()) {
+    view_.Invalidate(tag.major_, tag.minor_, name.c_str(), name.size());
+  }
+  {
+    auto f = Next()->AsyncPutBlob(tag, name, off, size, src, -1.0f,
+                                  clio::cte::core::Context(), flags,
+                                  clio::run::PoolQuery::Dynamic());
+    CLIO_CO_AWAIT(f);
+    *rc = f.get() == nullptr ? 1u : f->GetReturnCode();
+  }
+  EndChainWrite();
+  CLIO_CO_AWAIT(FanoutInvalidate(tag, name));
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 clio::run::TaskResume Runtime::MultiPutBlob(
     clio::run::shared_ptr<clio::cte::core::MultiPutBlobTask> &task) {
   CLIO_TASK_BODY_BEGIN
@@ -227,13 +259,22 @@ clio::run::TaskResume Runtime::MultiPutBlob(
           continue;
         }
         wtc::Status st = wtc::Status::kNoSpace;
-        while ((st = view_.TryPut(d.tag_id_.major_, d.tag_id_.minor_,
-                                  d.blob_name_.c_str(), d.blob_name_.size(),
-                                  d.offset_, d.size_,
-                                  batch.base_ + d.payload_off_, d.flags_,
-                                  /*may_block=*/false)) ==
-               wtc::Status::kNoSpace) {
+        for (int tries = 0;
+             (st = view_.TryPut(d.tag_id_.major_, d.tag_id_.minor_,
+                                d.blob_name_.c_str(), d.blob_name_.size(),
+                                d.offset_, d.size_,
+                                batch.base_ + d.payload_off_, d.flags_,
+                                /*may_block=*/false)) == wtc::Status::kNoSpace &&
+             tries < kNoSpaceRetries;
+             ++tries) {
           CLIO_CO_AWAIT(clio::run::yield(kNoSpacePollUs));
+        }
+        if (st == wtc::Status::kNoSpace) {
+          clio::run::u32 rc = 0;
+          CLIO_CO_AWAIT(WriteAroundRecord(d.tag_id_, d.blob_name_, d.offset_,
+                                          d.size_, batch.base_ + d.payload_off_,
+                                          d.flags_, &rc));
+          st = rc == 0 ? wtc::Status::kOk : wtc::Status::kMiss;
         }
         if (st != wtc::Status::kOk) {
           if (task->first_rc_ == 0) task->first_rc_ = 1;

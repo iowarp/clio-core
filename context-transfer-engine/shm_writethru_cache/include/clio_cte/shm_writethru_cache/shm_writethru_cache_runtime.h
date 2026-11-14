@@ -282,6 +282,18 @@ class Runtime : public clio::cte::core::CoreInterposer {
    * install the older bytes as complete.
    */
   clio::run::TaskResume BeginChainWrite();
+  /**
+   * Write one record around the cache (segment full): drain the blob's
+   * logged ranges, fence chain reads, drop the local copy, put down the
+   * chain, then invalidate other nodes' copies.
+   * @param rc out: the chain put's return code
+   */
+  clio::run::TaskResume WriteAroundRecord(const TagId &tag,
+                                          const std::string &name,
+                                          clio::run::u64 off,
+                                          clio::run::u64 size, const char *src,
+                                          clio::run::u32 flags,
+                                          clio::run::u32 *rc);
   /** Leave a chain write entered with BeginChainWrite. */
   void EndChainWrite() { chain_writes_.fetch_sub(1); }
   /** Fetch the whole blob from the chain into the segment. */
