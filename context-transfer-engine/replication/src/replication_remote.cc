@@ -411,7 +411,8 @@ clio::run::TaskResume Runtime::MultiPutBlob(
       Context ctx = task->context_;
       auto p = Self()->AsyncPutBlob(desc.tag_id_, desc.blob_name_,
                                     desc.offset_, desc.size_,
-                                    batch.RecordSlice(d), -1.0f, ctx, 0u,
+                                    batch.RecordSlice(d), -1.0f, ctx,
+                                    desc.flags_,
                                     clio::run::PoolQuery::Dynamic());
       CLIO_CO_AWAIT(p);
       // The owner died with this put in flight: re-resolve it (failover now

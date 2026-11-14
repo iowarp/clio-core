@@ -5654,14 +5654,14 @@ clio::run::TaskResume Runtime::MultiPutBlob(
           clio::run::CreateTaskId(), task->pool_id_,
           clio::run::PoolQuery::Local(), d0.tag_id_, d0.blob_name_,
           d0.offset_, d0.size_, batch.RecordSlice(valid.front()),
-          /*score=*/-1.0f, task->context_, /*flags=*/0);
+          /*score=*/-1.0f, task->context_, d0.flags_);
     } else {
       sub = ipc_manager->NewTask<PutBlobTask>(
           clio::run::CreateTaskId(), task->pool_id_,
           clio::run::PoolQuery::Local(), d0.tag_id_, d0.blob_name_,
           static_cast<clio::run::u64>(0), static_cast<clio::run::u64>(0),
           ctp::ipc::ShmPtr<>::GetNull(), /*score=*/-1.0f, task->context_,
-          /*flags=*/0);
+          d0.flags_);
       auto *t = sub.get();
       for (size_t i : valid) {
         const auto &d = batch.descs_[i];
