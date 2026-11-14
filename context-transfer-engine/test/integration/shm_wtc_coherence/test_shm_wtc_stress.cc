@@ -321,8 +321,9 @@ TEST_CASE("ShmWtc stress - rotating writers, all nodes verify every round",
     }
     REQUIRE(Sync(tag));
     REQUIRE(Barrier(BarrierTag()));
-    REQUIRE(VerifyRotating(tag, blobs, round, threads) == 0);
+    const int stale = VerifyRotating(tag, blobs, round, threads);
     REQUIRE(Barrier(BarrierTag()));
+    REQUIRE(stale == 0);
   }
   fprintf(stderr, "[ROTATE] rank=%d rounds=%d blobs=%d %.1f ms\n", Rank(),
           rounds, blobs, Ms(t0));
@@ -417,11 +418,14 @@ TEST_CASE("ShmWtc stress - same-node readers never see a torn write",
           Rank(), (unsigned long long)writes.load(),
           (unsigned long long)reads.load(), (unsigned long long)torn.load(),
           (unsigned long long)backwards.load());
+  // Reach the scenario's last barrier BEFORE asserting, so a failing node
+  // does not strand every other rank in it.
+  const bool synced = Sync(tag);
+  REQUIRE(Barrier(BarrierTag()));
+  REQUIRE(synced);
   REQUIRE(reads.load() > 0);
   REQUIRE(torn.load() == 0);
   REQUIRE(backwards.load() == 0);
-  REQUIRE(Sync(tag));
-  REQUIRE(Barrier(BarrierTag()));
 }
 
 TEST_CASE("ShmWtc stress - working set larger than the cache",
@@ -470,8 +474,8 @@ TEST_CASE("ShmWtc stress - working set larger than the cache",
   fprintf(stderr, "[EVICT] rank=%d blobs=%zu %.1f ms\n", Rank(), keys.size(),
           Ms(t0));
   PrintStats("evict");
-  REQUIRE(bad == 0);
   REQUIRE(Barrier(BarrierTag()));
+  REQUIRE(bad == 0);
 }
 
 TEST_CASE("ShmWtc stress - delete and recreate a tag every node cached",
