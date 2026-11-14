@@ -256,17 +256,14 @@ TEST_CASE("ShmWtc coherence - a delete is seen everywhere",
 
 int main(int argc, char *argv[]) {
   if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, false)) {
-    fprintf(stderr, "CLIO_INIT failed
-");
+    fprintf(stderr, "CLIO_INIT failed\n");
     return 2;
   }
   if (!clio::cte::core::CLIO_CTE_CLIENT_INIT()) {
-    fprintf(stderr, "CTE client init failed
-");
+    fprintf(stderr, "CTE client init failed\n");
     return 2;
   }
-  fprintf(stderr, "shm_wtc coherence: rank %d ready (cache %s)
-", Rank(),
+  fprintf(stderr, "shm_wtc coherence: rank %d ready (cache %s)\n", Rank(),
           Io()->HasWtc() ? "attached" : "NOT attached");
   std::string filter = argc > 1 ? argv[1] : "";
   int result = SimpleTest::run_all_tests(filter);
