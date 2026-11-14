@@ -19,3 +19,11 @@ compose:
 
     dpe:
       dpe_type: "max_bw"
+
+  # clio-fs assumes no pool id: the filesystem pool is found by name and
+  # names its own data chain.
+  - mod_name: clio_cte_filesystem
+    pool_name: clio_cte_filesystem
+    pool_query: local
+    pool_id: 560.0
+    next_pool_id: 512.0

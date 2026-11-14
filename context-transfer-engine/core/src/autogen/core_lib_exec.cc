@@ -208,6 +208,11 @@ clio::run::TaskResume Runtime::Run(clio::run::u32 method, clio::run::shared_ptr<
       CLIO_CO_AWAIT(TagXattr(typed_task));
       break;
     }
+    case Method::kSetDurability: {
+      auto& typed_task = task_ptr.template Cast<SetDurabilityTask>();
+      CLIO_CO_AWAIT(SetDurability(typed_task));
+      break;
+    }
     case Method::kGetTagSize: {
       // Cast task FullPtr to specific type
       auto& typed_task = task_ptr.template Cast<GetTagSizeTask>();
@@ -494,6 +499,11 @@ void Runtime::SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive& archiv
       archive << *typed_task;
       break;
     }
+    case Method::kSetDurability: {
+      auto& typed_task = task_ptr.template Cast<SetDurabilityTask>();
+      archive << *typed_task;
+      break;
+    }
     case Method::kGetTagSize: {
       auto& typed_task = task_ptr.template Cast<GetTagSizeTask>();
       archive << *typed_task;
@@ -751,6 +761,11 @@ void Runtime::LoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archiv
     }
     case Method::kTagXattr: {
       auto& typed_task = task_ptr.template Cast<TagXattrTask>();
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kSetDurability: {
+      auto& typed_task = task_ptr.template Cast<SetDurabilityTask>();
       archive >> *typed_task;
       break;
     }
@@ -1039,6 +1054,12 @@ void Runtime::LocalLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive
     }
     case Method::kTagXattr: {
       auto& typed_task = task_ptr.template Cast<TagXattrTask>();
+      // Use archive operator which respects msg_type
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kSetDurability: {
+      auto& typed_task = task_ptr.template Cast<SetDurabilityTask>();
       // Use archive operator which respects msg_type
       archive >> *typed_task;
       break;
@@ -1346,6 +1367,12 @@ void Runtime::LocalSaveTask(clio::run::u32 method, clio::run::DefaultSaveArchive
     }
     case Method::kTagXattr: {
       auto& typed_task = task_ptr.template Cast<TagXattrTask>();
+      // Use archive operator which respects msg_type
+      archive << *typed_task;
+      break;
+    }
+    case Method::kSetDurability: {
+      auto& typed_task = task_ptr.template Cast<SetDurabilityTask>();
       // Use archive operator which respects msg_type
       archive << *typed_task;
       break;
@@ -1782,6 +1809,15 @@ clio::run::shared_ptr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 metho
       }
       break;
     }
+    case Method::kSetDurability: {
+      auto new_task_ptr = ipc_manager->NewTask<SetDurabilityTask>();
+      if (!new_task_ptr.IsNull()) {
+        auto& task_typed = orig_task_ptr.template Cast<SetDurabilityTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<SetDurabilityTask>(task_typed.get()));
+        return new_task_ptr.template Cast<clio::run::Task>();
+      }
+      break;
+    }
     case Method::kGetTagSize: {
       // Allocate new task
       auto new_task_ptr = ipc_manager->NewTask<GetTagSizeTask>();
@@ -2133,6 +2169,10 @@ clio::run::shared_ptr<clio::run::Task> Runtime::NewTask(clio::run::u32 method) {
       auto new_task_ptr = ipc_manager->NewTask<TagXattrTask>();
       return new_task_ptr.template Cast<clio::run::Task>();
     }
+    case Method::kSetDurability: {
+      auto new_task_ptr = ipc_manager->NewTask<SetDurabilityTask>();
+      return new_task_ptr.template Cast<clio::run::Task>();
+    }
     case Method::kGetTagSize: {
       auto new_task_ptr = ipc_manager->NewTask<GetTagSizeTask>();
       return new_task_ptr.template Cast<clio::run::Task>();
@@ -2371,6 +2411,11 @@ void Runtime::AggregateOut(clio::run::u32 method, clio::run::shared_ptr<clio::ru
     }
     case Method::kTagXattr: {
       auto& typed_task = orig_task.template Cast<TagXattrTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
+      break;
+    }
+    case Method::kSetDurability: {
+      auto& typed_task = orig_task.template Cast<SetDurabilityTask>();
       typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }

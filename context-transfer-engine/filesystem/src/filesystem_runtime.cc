@@ -155,17 +155,31 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
                      : ctp::ConfigParse::ExpandPath(cfg.metadata_log_path_) +
                            ".dirs." + std::to_string(container_id_));
   next_pool_id_ = cfg.next_pool_id_;
-  if (!next_pool_id_.IsNull()) {
-    cte_ = clio::cte::core::Client(next_pool_id_);
-    cte_ready_.store(true, std::memory_order_release);
+  if (next_pool_id_.IsNull()) {
+    // clio-fs assumes no pool id: the data chain must be configured.
+    HLOG(kError, "clio_cte_filesystem {}: next_pool_id is required (the "
+         "CTE pool its pages are stored through)", fields->new_pool_id_);
+    fields->SetReturnCode(1);
+    CLIO_CO_RETURN;
   }
+  cte_ = clio::cte::core::Client(next_pool_id_);
+  cte_ready_.store(true, std::memory_order_release);
   // Bind a client to our own pool for self-submitted tasks. Use the
   // assigned pool id from the CreateTask (pool_id_ isn't reliable yet here).
   self_.Init(fields->new_pool_id_);
 
   // Every file's logical size and deferred appends belong to the stream
-  // pool. Deployments compose it before this pool; create it with defaults
-  // (over the same chain, logging next to the namespace log) otherwise.
+  // pool. Deployments compose it before this pool and name it in
+  // stream_pool_id; otherwise this filesystem creates its own, at the id
+  // one minor above its own (no fixed id), over the same chain.
+  stream_pool_id_ = cfg.stream_pool_id_;
+  std::string stream_pool_name = clio::cte::stream::kStreamPoolName;
+  if (stream_pool_id_.IsNull()) {
+    stream_pool_id_ = clio::run::PoolId(fields->new_pool_id_.major_,
+                                        fields->new_pool_id_.minor_ + 1);
+    stream_pool_name = fields->pool_name_.str() + "_stream";
+  }
+  cfg.stream_pool_id_ = stream_pool_id_;
   stream_.Init(cfg.stream_pool_id_);
   {
     clio::cte::stream::StreamConfig sc;
@@ -175,8 +189,7 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
           ctp::ConfigParse::ExpandPath(cfg.metadata_log_path_) + ".stream";
     }
     auto sp = stream_.AsyncCreate(clio::run::PoolQuery::Dynamic(),
-                                  clio::cte::stream::kStreamPoolName,
-                                  cfg.stream_pool_id_, sc);
+                                  stream_pool_name, cfg.stream_pool_id_, sc);
     CLIO_CO_AWAIT(sp);
     if (sp->GetReturnCode() != 0) {
       HLOG(kError, "filesystem: stream pool {} unavailable (rc {}); file "
@@ -327,6 +340,12 @@ clio::run::TaskResume Runtime::Monitor(clio::run::shared_ptr<MonitorTask> &task)
     task->results_[container_id_] =
         std::to_string(next_pool_id_.major_) + "." +
         std::to_string(next_pool_id_.minor_);
+  } else if (task->query_ == "stream_pool") {
+    // The stream pool this filesystem keeps file sizes in (clients that
+    // talk to it directly, e.g. fsync's size sync, must use the same one).
+    task->results_[container_id_] =
+        std::to_string(stream_pool_id_.major_) + "." +
+        std::to_string(stream_pool_id_.minor_);
   }
   task->SetReturnCode(0);
   CLIO_CO_RETURN;

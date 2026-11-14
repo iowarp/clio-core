@@ -46,8 +46,8 @@
 
 namespace clio::cte::stream {
 
-/** Canonical stream pool id and name. */
-static constexpr clio::run::PoolId kStreamPoolId(565, 0);
+/** Default stream pool name. There is no fixed stream pool id: owners
+ *  (e.g. clio-fs) name the pool they use in their own config. */
 inline constexpr const char *kStreamPoolName = "clio_cte_stream";
 
 /** Page size of a stream: data lives in page blobs of this size. */

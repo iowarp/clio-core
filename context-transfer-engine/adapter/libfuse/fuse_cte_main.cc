@@ -216,7 +216,8 @@ int main(int argc, char *argv[]) {
   // the FUSE protocol. The callbacks and the entire CTE data path below them
   // are identical to the Linux build.
   cte_fuse_mark_session_live();
-  return fuse_main(argc, argv, &cte_fuse_ops, nullptr);
+  const int rc = fuse_main(argc, argv, &cte_fuse_ops, nullptr);
+  return cte_fuse_init_failed() ? 1 : rc;
 #else
   // Apptainer's --fusemount opens /dev/fuse on the host, performs the
   // kernel mount, and passes the fd to the FUSE binary as the last
@@ -244,8 +245,9 @@ int main(int argc, char *argv[]) {
   if (prefd == -1) {
     cte_fuse_mark_session_live();
     std::vector<char *> mount_argv = MountArgv(argc, argv);
-    return fuse_main(static_cast<int>(mount_argv.size()) - 1,
-                     mount_argv.data(), &cte_fuse_ops, nullptr);
+    const int rc = fuse_main(static_cast<int>(mount_argv.size()) - 1,
+                             mount_argv.data(), &cte_fuse_ops, nullptr);
+    return cte_fuse_init_failed() ? 1 : rc;
   }
 
 #if FUSE_VERSION < FUSE_MAKE_VERSION(3, 14)

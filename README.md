@@ -108,7 +108,7 @@ sudo cmake --install build
 For the per-feature apt / dnf dependency list and the complete
 `CLIO_*_ENABLE_*` flag checklist, see [INSTALL.md](INSTALL.md). Other install
 methods (Conda, Docker, Spack) are documented in
-[docs/getting-started/installation](docs/docs/getting-started/installation.mdx).
+[docs/getting-started/installation](https://github.com/iowarp/docs/blob/main/docs/getting-started/installation.mdx).
 
 ## Components
 

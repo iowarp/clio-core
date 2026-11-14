@@ -51,18 +51,29 @@ static std::string chi_test_data_dir() {
 }
 
 static constexpr clio::run::u64 kValSize = 4096;
+/** A volatile core (RAM + a small persistent file tier): the only kind of
+ *  core that holds both, so the one where REPLICA_PERSISTENT has a choice. */
+static const clio::run::PoolId kMixedPool(530, 0);
 
 class BlobReplicasFixture {
  public:
   std::string config_path_;
   std::string file_storage_path_;
   std::string metadata_log_path_;
+  std::string mixed_storage_path_;
 
   BlobReplicasFixture() {
     config_path_ = chi_test_data_dir() + "/blob_replicas_config.yaml";
     file_storage_path_ = chi_test_data_dir() + "/blob_replicas_file.dat";
     metadata_log_path_ = chi_test_data_dir() + "/blob_replicas_meta.log";
+    mixed_storage_path_ = chi_test_data_dir() + "/blob_replicas_mixed.dat";
     Cleanup();
+    // The mixed core's backing file (<path>_node0) is removed only HERE,
+    // before the runtime starts: the fixture is destroyed at the end of the
+    // first test case while the runtime and its cores keep running, so
+    // removing it in Cleanup() deleted a live bdev's file (later reads
+    // failed: "cannot open a worker I/O context").
+    RemovePrefixed(mixed_storage_path_);
     CreateConfigFile();
     ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", config_path_.c_str(), 1);
 
@@ -75,6 +86,20 @@ class BlobReplicasFixture {
   }
 
   ~BlobReplicasFixture() { Cleanup(); }
+
+  /** Remove every file in the test data dir whose name starts with the
+   *  basename of `path_prefix`. */
+  static void RemovePrefixed(const std::string &path_prefix) {
+    const fs::path base(path_prefix);
+    const std::string stem = base.filename().string();
+    std::error_code ec;
+    for (const auto &entry : fs::directory_iterator(base.parent_path(), ec)) {
+      CTP_MSAN_UNPOISON_OBJ(entry);
+      std::string name = entry.path().filename().string();
+      CTP_MSAN_UNPOISON_STRING(name);
+      if (name.rfind(stem, 0) == 0) fs::remove(entry.path(), ec);
+    }
+  }
 
   void Cleanup() {
     if (fs::exists(config_path_)) fs::remove(config_path_);
@@ -122,11 +147,7 @@ compose:
       poll_period_ms: 5000
 
     storage:
-      - path: "ram::blob_replicas_dram"
-        bdev_type: "ram"
-        capacity_limit: "64MB"
-        score: 1.0
-
+      # A core is uniform in durability: the persistent tier only.
       - path: ")" << file_storage_path_ << R"("
         bdev_type: "file"
         capacity_limit: "1MB"
@@ -143,7 +164,26 @@ compose:
       metadata_log_path: )" << metadata_log_path_ << R"(
       transaction_log_capacity: 4MB
       flush_metadata_period_ms: 0
-      flush_data_period_ms: 0
+
+  # Volatile (RAM + persistent file): REPLICA_PERSISTENT must pick the file.
+  - mod_name: clio_cte_core
+    pool_name: clio_cte_mixed
+    pool_query: local
+    pool_id: 530.0
+    targets:
+      neighborhood: 1
+    storage:
+      - path: "ram::blob_replicas_mixed_dram"
+        bdev_type: "ram"
+        capacity_limit: "64MB"
+        score: 1.0
+      - path: ")" << mixed_storage_path_ << R"("
+        bdev_type: "file"
+        capacity_limit: "1MB"
+        score: 0.2
+        persistence_level: "temporary"
+    dpe:
+      dpe_type: "max_bw"
 )";
     config_file.close();
   }
@@ -340,15 +380,19 @@ TEST_CASE("BlobReplicas - REPLICA_FIXED pins a replica against the organizer",
 
 TEST_CASE("BlobReplicas - REPLICA_PERSISTENT excludes volatile tiers",
           "[cte][replicas][persistence][886]") {
-  auto *client = CLIO_CTE_CLIENT;
-  REQUIRE(client != nullptr);
+  // On the volatile core that holds both a RAM tier and a persistent file
+  // tier: a persistent core refuses volatile bdevs, so only a core like
+  // this one gives REPLICA_PERSISTENT a volatile tier to keep off.
+  clio::cte::core::Client mixed(kMixedPool);
+  auto *client = &mixed;
+  auto tf = client->AsyncGetOrCreateTag("replica_persist_tag");
+  tf.Wait();
+  REQUIRE(tf->GetReturnCode() == 0);
+  const clio::cte::core::TagId tag_id = tf->tag_id_;
 
-  clio::cte::core::Tag tag("replica_persist_tag");
-  const clio::cte::core::TagId tag_id = tag.GetTagId();
-
-  // A payload bigger than the ONLY non-volatile tier (1MB file): as a plain
+  // A payload bigger than the ONLY persistent tier (1MB file): as a plain
   // replica it lands in RAM; as a PERSISTENT replica it has nowhere legal
-  // to go and the put must fail — proof the flag really excludes the
+  // to go and the put must fail -- proof the flag really excludes the
   // volatile tier rather than merely preferring the file one.
   const clio::run::u64 kBig = 4ULL * 1024 * 1024;
   const std::string big(kBig, 'B');
@@ -368,8 +412,8 @@ TEST_CASE("BlobReplicas - REPLICA_PERSISTENT excludes volatile tiers",
   }
 
   // A small PERSISTENT replica fits the file tier; seed it with a LOW score,
-  // then reorganize it toward the volatile tier's score — the move must
-  // succeed while staying on non-volatile storage (rc 0, bytes intact).
+  // then reorganize it to a high score -- the move must succeed with its
+  // bytes intact.
   const clio::run::u64 kSmall = 64 * 1024;
   const std::string small_val(kSmall, 'S');
   PutTo(client, tag_id, "persist_small", std::string(kSmall, 'p'), 0);
@@ -765,10 +809,8 @@ TEST_CASE("BlobReplicas - snapshot replica layouts restore into a fresh pool",
     y << "targets:\n"
       << "  neighborhood: 1\n"
       << "storage:\n"
-      << "  - path: \"ram::blob_replicas_dram\"\n"
-      << "    bdev_type: \"ram\"\n"
-      << "    capacity_limit: \"64MB\"\n"
-      << "    score: 1.0\n"
+      // Same storage as the source core: its persistent file tier only, so
+      // this core is persistent and replays the log.
       << "  - path: \"" << chi_test_data_dir() + "/blob_replicas_file.dat" << "\"\n"
       << "    bdev_type: \"file\"\n"
       << "    capacity_limit: \"1MB\"\n"
@@ -851,10 +893,12 @@ TEST_CASE("BlobReplicas - legacy type-0 tag snapshot restores into a new pool",
     y << "targets:\n"
       << "  neighborhood: 1\n"
       << "storage:\n"
-      << "  - path: \"ram::legacy_tag_dram\"\n"
-      << "    bdev_type: \"ram\"\n"
+      // A persistent core: a RAM-only core is volatile, runs without a
+      // WAL, and would (correctly) restore nothing.
+      << "  - path: \"" << log_path + ".dat" << "\"\n"
+      << "    bdev_type: \"file\"\n"
       << "    capacity_limit: \"16MB\"\n"
-      << "    score: 1.0\n"
+      << "    persistence_level: \"temporary\"\n"
       << "performance:\n"
       << "  metadata_log_path: " << log_path << "\n";
     cfg.config_ = y.str();

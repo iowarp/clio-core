@@ -1,0 +1,29 @@
+# Write-back policy cache.
+# Sits above two disconnected CTE cores: a volatile core (next_volatile) and
+# a persistent chain (next_persistent), and is a put is acked after the volatile write; dirty copies are flushed periodically, on SyncTag/FlushData, before eviction, and at stop.
+# Speaks the CTE core's task interface: point a clio::cte::core::Client at it.
+# Dispatch is hand-maintained (cache_base/.../cache_lib_exec.inc), like the
+# other interposers.
+module_name: write_back_cache
+namespace: clio::cte
+version: 1.0.0
+
+kCreate: 0
+kDestroy: 1
+kMonitor: 9
+
+# Interposed core verbs (MUST equal the core's ids)
+kPutBlob: 15
+kGetBlob: 16
+kDelBlob: 18
+kDelTag: 19
+kGetBlobSize: 23
+kFlushData: 34
+kTruncateBlob: 37
+kMultiPutBlob: 48
+kSyncTag: 56
+
+# Module verbs (above the core's id space)
+kDropTagCopies: 100
+kFlushTagCopies: 101
+kSettleTagCopies: 102
