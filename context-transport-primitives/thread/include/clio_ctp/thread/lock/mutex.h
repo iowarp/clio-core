@@ -275,6 +275,9 @@ struct Mutex {
       return false;
     }
     Lock(owner);
+    // Release the try-lock gate too. Leaving it raised made every LATER
+    // TryLock on this mutex fail forever after its first success.
+    try_lock_.fetch_sub(1);
     return true;
   }
 
