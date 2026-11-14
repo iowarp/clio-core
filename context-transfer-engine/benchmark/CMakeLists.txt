@@ -36,6 +36,20 @@ install(TARGETS clio_cte_shm_read_bench
   RUNTIME DESTINATION bin
 )
 
+# clio_cte_shm_wtc_bench: task path vs shm write-through cache path per op
+# (run against a runtime composed with cte_config_shm_wtc.yaml).
+add_executable(clio_cte_shm_wtc_bench
+  clio_cte_shm_wtc_bench.cc
+)
+target_link_libraries(clio_cte_shm_wtc_bench
+  clio::cte::core_client
+  clio::run::cxx
+  ${CMAKE_THREAD_LIBS_INIT}
+)
+install(TARGETS clio_cte_shm_wtc_bench
+  RUNTIME DESTINATION bin
+)
+
 # Create clio_cte_semantic_bench executable — ingests N keyword blobs under a
 # single tag, then runs one broadcast SemanticSearch over them.
 # Vector-shaped stress: the CTE driven the way the gpu_vector adapter's host

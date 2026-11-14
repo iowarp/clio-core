@@ -1,0 +1,127 @@
+# 4-node shm write-through cache coherence cluster (shm_writethru_cache/DESIGN.md).
+#
+# Unlike the sibling distributed suite (tests on node 1 only), EVERY node
+# runs the coherence binary — the scenarios are collective (each rank puts,
+# every rank reads). A node's container exits with its test binary's code;
+# run_tests.sh requires 0 from all four.
+
+x-wtc-node: &wtc-node
+  image: ${IOWARP_DOCKER_IMAGE:-iowarp/deps-cpu:latest}
+  security_opt:
+    - seccomp:unconfined
+  user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+  volumes:
+    - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
+  tmpfs:
+    - /mnt:mode=1777
+    - /tmp/clio_home:mode=1777
+  mem_limit: 8g
+  working_dir: /workspace
+  entrypoint: [ "/bin/bash", "-c" ]
+
+x-coh-env: &coh-env
+  CLIO_SERVER_CONF: /workspace/context-transfer-engine/test/integration/shm_wtc_coherence/clio_config.yaml
+  CONTAINER_HOSTFILE: /workspace/context-transfer-engine/test/integration/shm_wtc_coherence/hostfile
+  CTE_NUM_NODES: "4"
+  CLIO_WITH_RUNTIME: "0"
+  # The test client binds the chain top (the runtime ignores this env; its
+  # module-internal clients bind pools explicitly).
+  CLIO_CTE_POOL: "565.0"
+  # Hermetic per-container state: no restart-log replay, no persisted bdev
+  # perf profiles leaking between runs.
+  HOME: /tmp/clio_home
+  PATH: /workspace/build/bin:/usr/local/bin:/usr/bin:/bin
+  LD_LIBRARY_PATH: /workspace/build/bin:/usr/local/cuda/lib64:/usr/local/lib
+
+# Teardown note (cluster coherence regression, bisected to ddeb20d0):
+# each node kills ITS OWN runtime the instant its local client exits. Barrier()
+# guarantees every rank has PUBLISHED its blob, not that peers have finished
+# READING it -- so a rank that finishes first used to tear its node down while
+# slower peers were still fetching from it, and their Barrier() timed out.
+#
+# That never showed because ClientFinalize sat through up to a full second of
+# the heartbeat probe's nap, so the runtime outlived the client by roughly that
+# margin. ddeb20d0 made client exit prompt (correctly -- it was costing every
+# short-lived process ~1s) and the accidental grace disappeared, turning the
+# 4-node coherence step into a 20-minute timeout on every dev push since.
+#
+# Proven by experiment: f8f6fad9 fails, f8f6fad9 minus ddeb20d0 passes, and
+# f8f6fad9 WITH ddeb20d0 plus only that ~1s restored also passes -- so the
+# differentiator is the wall-clock grace, not the condition variable.
+#
+# Make the grace explicit and generous rather than incidental. Overridable via
+# COH_TEARDOWN_LINGER for anyone tightening the loop locally.
+x-coh-cmd: &coh-cmd >
+  "
+    echo \"Node $$NODE_ID: starting runtime\" &&
+    /workspace/build/bin/clio_run runtime start --fresh &
+    RUNTIME_PID=$$! &&
+    sleep 5 &&
+    echo \"Node $$NODE_ID: running shm_wtc coherence suite\" &&
+    /workspace/build/bin/test_shm_wtc_coherence 2>&1;
+    TEST_EXIT_CODE=$$?;
+    echo \"Node $$NODE_ID: suite exit $$TEST_EXIT_CODE\";
+    sleep $${COH_TEARDOWN_LINGER:-10};
+    kill $$RUNTIME_PID 2>/dev/null;
+    exit $$TEST_EXIT_CODE
+  "
+
+services:
+  wtc-node1:
+    <<: *wtc-node
+    container_name: wtc-node1
+    hostname: wtc-node1
+    networks:
+      wtc-cluster:
+        ipv4_address: 172.31.0.10
+    environment:
+      <<: *coh-env
+      NODE_ID: "1"
+      NODE_IP: 172.31.0.10
+    command: *coh-cmd
+
+  wtc-node2:
+    <<: *wtc-node
+    container_name: wtc-node2
+    hostname: wtc-node2
+    networks:
+      wtc-cluster:
+        ipv4_address: 172.31.0.11
+    environment:
+      <<: *coh-env
+      NODE_ID: "2"
+      NODE_IP: 172.31.0.11
+    command: *coh-cmd
+
+  wtc-node3:
+    <<: *wtc-node
+    container_name: wtc-node3
+    hostname: wtc-node3
+    networks:
+      wtc-cluster:
+        ipv4_address: 172.31.0.12
+    environment:
+      <<: *coh-env
+      NODE_ID: "3"
+      NODE_IP: 172.31.0.12
+    command: *coh-cmd
+
+  wtc-node4:
+    <<: *wtc-node
+    container_name: wtc-node4
+    hostname: wtc-node4
+    networks:
+      wtc-cluster:
+        ipv4_address: 172.31.0.13
+    environment:
+      <<: *coh-env
+      NODE_ID: "4"
+      NODE_IP: 172.31.0.13
+    command: *coh-cmd
+
+networks:
+  wtc-cluster:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.31.0.0/24

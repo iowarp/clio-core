@@ -8,3 +8,4 @@ modules:
   - core
   - compressor
   - stream
+  - shm_writethru_cache

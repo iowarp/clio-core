@@ -40,6 +40,7 @@
 #include <clio_cte/core/core_tasks.h>
 #include <clio_cte/core/blob_batch.h>
 #include <clio_cte/core/shm_metadata_cache.h>
+#include <clio_cte/core/shm_wtc.h>
 #include <clio_cte/core/shm_read_stats.h>
 #include <clio_runtime/bdev/transports/mem_bdev_transport.h>
 #include <clio_ctp/data_structures/priv/unordered_map_ll.h>
@@ -683,6 +684,16 @@ class Client : public clio::run::ContainerClient {
       const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
     auto *ipc_manager = CLIO_CPU_IPC;
 
+    if (!blob_data.IsNull()) {
+      const char *src =
+          ipc_manager->ToFullPtr<char>(blob_data.template Cast<char>()).ptr_;
+      const std::string name(blob_name);
+      if (WtcTryPut(tag_id, name, offset, size, src, score, context, flags)) {
+        return WtcDonePut(tag_id, name, offset, size, score, context, flags,
+                          pool_query);
+      }
+    }
+
     auto task = ipc_manager->NewTask<PutBlobTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, tag_id,
         blob_name, offset, size, blob_data, score, context, flags);
@@ -892,6 +903,12 @@ class Client : public clio::run::ContainerClient {
     // "rejects degenerate requests").
     if (size == 0 || priv_data == nullptr) {
       return clio::run::Future<PutBlobTask>();
+    }
+
+    if (WtcTryPut(tag_id, blob_name, offset, size, priv_data, score, context,
+                  flags)) {
+      return WtcDonePut(tag_id, blob_name, offset, size, score, context, flags,
+                        pool_query);
     }
 
     if (CLIO_RUNTIME_MANAGER->IsRuntime() && !NoPrivPutEnv()) {
@@ -3013,6 +3030,188 @@ class Client : public clio::run::ContainerClient {
     return v;
   }
 
+  // ==== Shared-memory write-through cache (shm_writethru_cache) ============
+  //
+  // When this client's pool is a shm_writethru_cache pool, puts, covered gets
+  // and known sizes complete in that pool's segment with no task. Anything
+  // the segment cannot express takes the ordinary task path to the SAME pool,
+  // whose handlers order it against the buffered writes. See
+  // context-transfer-engine/shm_writethru_cache/DESIGN.md.
+
+  /**
+   * Whether a put/get context is one the cache serves directly: no codec,
+   * replica, emulation, generation, versioning, persistence target or fault
+   * handler. Shared with the chimod so both sides agree.
+   * @param ctx operation context
+   * @return true for a plain context
+   */
+  static bool WtcPlainContext(const Context &ctx) {
+    static const Context kDef;
+    return ctx.persistence_target_ == kDef.persistence_target_ &&
+           ctx.min_persistence_level_ == kDef.min_persistence_level_ &&
+           ctx.preallocate_ == 0 && !ctx.emulate_ &&
+           ctx.transform_flags_ == 0 && ctx.replica_ == 0 &&
+           ctx.replica_flags_ == 0 && ctx.version_ == kDef.version_ &&
+           !ctx.create_on_get_ && ctx.op_flags_ == 0 &&
+           ctx.fault_params_[0] == '\0' &&
+           ctx.generation_ == kDef.generation_ &&
+           ctx.dynamic_compress_ == kDef.dynamic_compress_ &&
+           ctx.compress_lib_ == kDef.compress_lib_;
+  }
+
+  /** Put flags the cache can carry to the chain (per-blob properties only;
+   *  replace/append depend on the chain's state and take the task path). */
+  static bool WtcAbsorbableFlags(clio::run::u32 flags) {
+    return (flags & ~kCtePutDroppable) == 0;
+  }
+
+  /** CLIO_CTE_SHM_CACHE=0 turns the client cache path off. Read once. */
+  static bool WtcDisabledEnv() {
+    static const bool v = [] {
+      const char *e = std::getenv("CLIO_CTE_SHM_CACHE");
+      return e != nullptr && e[0] == '0' && e[1] == '\0';
+    }();
+    return v;
+  }
+
+  /** Process-wide segment views, one per cache pool (never freed: clients
+   *  cache raw pointers to them). */
+  static std::mutex &WtcMutex() {
+    static std::mutex mu;
+    return mu;
+  }
+  static std::unordered_map<clio::run::u64, wtc::View *> &WtcViews() {
+    static std::unordered_map<clio::run::u64, wtc::View *> views;
+    return views;
+  }
+
+  /**
+   * The cache segment of this client's pool, attaching on first use; nullptr
+   * when the pool is not a shm write-through cache (or this process cannot
+   * map it: TCP client, remote node). A failed attach is retried at most
+   * once per second.
+   */
+  wtc::View *Wtc() {
+    if (wtc_ != nullptr) {
+      return wtc_->Ready() ? wtc_ : nullptr;
+    }
+    if (WtcDisabledEnv() || ForceNetEnv()) {
+      return nullptr;
+    }
+    const clio::run::u64 now = wtc::NowNs();
+    if (now < wtc_retry_ns_) {
+      return nullptr;
+    }
+    wtc_retry_ns_ = now + 1000ull * 1000ull * 1000ull;
+    std::lock_guard<std::mutex> lk(WtcMutex());
+    auto &views = WtcViews();
+    auto it = views.find(pool_id_.ToU64());
+    if (it != views.end()) {
+      wtc_ = it->second;
+      return wtc_->Ready() ? wtc_ : nullptr;
+    }
+    auto *ipc = CLIO_CPU_IPC;
+    if (ipc == nullptr) {
+      return nullptr;
+    }
+    auto *meta = ipc->GetMetadataAllocator();
+    auto *dir = ipc->GetMetadataDirectory();
+    if (meta == nullptr || dir == nullptr) {
+      return nullptr;
+    }
+    const clio::run::u64 off = dir->FindRoot(pool_id_.ToU64());
+    if (off == 0) {
+      return nullptr;
+    }
+    auto *loc = reinterpret_cast<wtc::Locator *>(
+        reinterpret_cast<char *>(meta) + off);
+    if (loc->magic_ != wtc::Locator::kMagic ||
+        loc->ready_.load(std::memory_order_acquire) != 1) {
+      return nullptr;
+    }
+    auto *view = new wtc::View();
+    if (!view->Attach(wtc::SegmentName(loc->runtime_pid_, pool_id_),
+                      loc->root_off_)) {
+      delete view;
+      return nullptr;
+    }
+    views[pool_id_.ToU64()] = view;
+    wtc_ = view;
+    return wtc_;
+  }
+
+  /** True when this client is bound to a shm write-through cache. */
+  bool HasWtc() { return Wtc() != nullptr; }
+
+  /** An already-complete future over a put the cache absorbed. */
+  clio::run::Future<PutBlobTask> WtcDonePut(
+      const TagId &tag_id, const std::string &blob_name, clio::run::u64 offset,
+      clio::run::u64 size, float score, const Context &context,
+      clio::run::u32 flags, const clio::run::PoolQuery &pool_query) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    auto task = ipc_manager->NewTask<PutBlobTask>(
+        clio::run::CreateTaskId(), pool_id_, pool_query, tag_id, blob_name,
+        offset, size, ctp::ipc::ShmPtr<>::GetNull(), score, context, flags);
+    clio::run::Future<PutBlobTask> fut(task->pool_id_, task->method_, task);
+    fut.GetFutureShm()->origin_ = clio::run::ClientOrigin::kClientShm;
+    task->return_code_ = 0;
+    task->SetComplete();
+    return fut;
+  }
+
+  /**
+   * Try the cache for a put. kOk means it was absorbed; anything else means
+   * the caller takes the task path (to this same pool).
+   */
+  bool WtcTryPut(const TagId &tag_id, const std::string &blob_name,
+                 clio::run::u64 offset, clio::run::u64 size, const char *src,
+                 float score, const Context &context, clio::run::u32 flags) {
+    if (src == nullptr || size == 0 || !WtcAbsorbableFlags(flags) ||
+        score >= 0.0f || !WtcPlainContext(context)) {
+      return false;
+    }
+    wtc::View *w = Wtc();
+    return w != nullptr &&
+           w->TryPut(tag_id.major_, tag_id.minor_, blob_name.data(),
+                     blob_name.size(), offset, size, src,
+                     flags) == wtc::Status::kOk;
+  }
+
+  /** Try the cache for a get into `dst`; on success set *fut complete. */
+  bool WtcTryGet(const TagId &tag_id, const char *blob_name,
+                 clio::run::u64 offset, clio::run::u64 size,
+                 clio::run::u32 flags, char *dst,
+                 ctp::ipc::ShmPtr<> task_blob_data,
+                 const clio::run::PoolQuery &pool_query,
+                 const Context &context,
+                 clio::run::Future<GetBlobTask> *fut) {
+    if (dst == nullptr || size == 0 || flags != 0 ||
+        !WtcPlainContext(context)) {
+      return false;
+    }
+    wtc::View *w = Wtc();
+    if (w == nullptr ||
+        w->TryGet(tag_id.major_, tag_id.minor_, blob_name, std::strlen(blob_name),
+                  offset, size, dst) != wtc::Status::kOk) {
+      return false;
+    }
+    auto *ipc_manager = CLIO_CPU_IPC;
+    auto task = ipc_manager->NewTask<GetBlobTask>(
+        clio::run::CreateTaskId(), pool_id_, pool_query, tag_id, blob_name,
+        offset, size, flags, task_blob_data, context);
+    *fut = clio::run::Future<GetBlobTask>(task->pool_id_, task->method_, task);
+    fut->GetFutureShm()->origin_ = clio::run::ClientOrigin::kClientShm;
+    task->return_code_ = 0;
+    task->SetComplete();
+    return true;
+  }
+
+  /** Cache statistics of this client's pool, or nullptr. */
+  const wtc::Stats *WtcStats() {
+    wtc::View *w = Wtc();
+    return w == nullptr ? nullptr : &w->GetRoot()->stats_;
+  }
+
   bool TryShmGet(const TagId &tag_id, const char *blob_name,
                  clio::run::u64 offset, clio::run::u64 size,
                  clio::run::u32 flags, char *dst,
@@ -3046,6 +3245,9 @@ class Client : public clio::run::ContainerClient {
         context.replica_ != 0 || context.compress_lib_ != 0 ||
         (context.op_flags_ & Context::kGenerational) || ForceNetEnv()) {
       return false;
+    }
+    if (Wtc() != nullptr) {
+      return false;  // the write-through cache is authoritative for reads
     }
     if (!HasShmCache() && !AttachShmCache()) {
       return false;
@@ -3081,6 +3283,10 @@ class Client : public clio::run::ContainerClient {
                       : ipc_manager->ToFullPtr<char>(
                             blob_data.template Cast<char>()).ptr_;
       clio::run::Future<GetBlobTask> fut;
+      if (WtcTryGet(tag_id, blob_name, offset, size, flags, dst, blob_data,
+                    pool_query, context, &fut)) {
+        return fut;
+      }
       if (TryShmGet(tag_id, blob_name, offset, size, flags, dst, blob_data,
                     pool_query, context, &fut)) {
         return fut;
@@ -3148,6 +3354,11 @@ class Client : public clio::run::ContainerClient {
     // no-ops — the bytes are already in the caller's buffer.
     {
       clio::run::Future<GetBlobTask> fut;
+      if (WtcTryGet(tag_id, blob_name.c_str(), offset, size, flags, priv_data,
+                    ctp::ipc::ShmPtr<>::GetNull(), pool_query, context,
+                    &fut)) {
+        return fut;
+      }
       if (TryShmGet(tag_id, blob_name.c_str(), offset, size, flags, priv_data,
                     ctp::ipc::ShmPtr<>::GetNull(), pool_query, context,
                     &fut)) {
@@ -3844,6 +4055,20 @@ class Client : public clio::run::ContainerClient {
         clio::run::CreateTaskId(), pool_id_, pool_query, tag_id,
         blob_name, replica);
 
+    clio::run::u64 cached = 0;
+    wtc::View *w = replica == 0 ? Wtc() : nullptr;
+    if (w != nullptr &&
+        w->TryGetSize(tag_id.major_, tag_id.minor_, blob_name.data(),
+                      blob_name.size(), &cached) == wtc::Status::kOk) {
+      clio::run::Future<GetBlobSizeTask> fut(task->pool_id_, task->method_,
+                                             task);
+      fut.GetFutureShm()->origin_ = clio::run::ClientOrigin::kClientShm;
+      task->size_ = cached;
+      task->return_code_ = 0;
+      task->SetComplete();
+      return fut;
+    }
+
     return ipc_manager->Send(task);
   }
 
@@ -4187,6 +4412,10 @@ class Client : public clio::run::ContainerClient {
   // owns the segment and may drop the cache at any time, which is why every
   // read is validated rather than trusted.
   ShmMetadataCacheRoot *shm_root_ = nullptr;
+  // shm write-through cache segment of pool_id_ (process-wide, never freed),
+  // and the earliest time to retry a failed attach.
+  wtc::View *wtc_ = nullptr;
+  clio::run::u64 wtc_retry_ns_ = 0;
   // True only when the mirror was attached via AttachShmCacheOf for a pool
   // OTHER than this client's own (interposition binding): gates the
   // serving-replica fast path (see AttachShmCacheOf).

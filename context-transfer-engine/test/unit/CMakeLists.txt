@@ -2395,3 +2395,32 @@ set_tests_properties(cfs_fsync_durable PROPERTIES
     ENVIRONMENT "${_cfs_shm_read_env}"
     LABELS "unit;cte;cfs;msan_skip")
 endif()  # UNIX
+
+#------------------------------------------------------------------------------
+# shm_writethru_cache: client SHM path + chimod flusher (DESIGN.md)
+#------------------------------------------------------------------------------
+if(CLIO_CTE_ENABLE_SHM_WTC)
+  add_executable(test_shm_wtc test_shm_wtc.cc)
+  target_include_directories(test_shm_wtc PRIVATE
+      ${CMAKE_SOURCE_DIR}/context-runtime/test
+      ${CMAKE_SOURCE_DIR}/context-transfer-engine/shm_writethru_cache/include
+  )
+  target_link_libraries(test_shm_wtc
+      clio_cte_core_runtime
+      clio_cte_core_client
+      clio_cte_shm_writethru_cache_runtime
+      clio_cte_shm_writethru_cache_client
+      clio::run::admin_runtime
+      clio::run::admin_client
+      clio::run::bdev_runtime
+      clio::run::bdev_client
+      ctp::cxx
+      ${CMAKE_THREAD_LIBS_INIT}
+  )
+  add_test(NAME cte_shm_wtc COMMAND test_shm_wtc)
+  set_tests_properties(cte_shm_wtc PROPERTIES
+      TIMEOUT 300
+      LABELS "unit;shm_wtc;cte"
+      ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
+  )
+endif()

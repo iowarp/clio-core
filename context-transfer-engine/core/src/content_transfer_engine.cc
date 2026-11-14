@@ -151,6 +151,22 @@ bool ContentTransferEngine::ClientInit(const clio::run::PoolQuery &pool_query) {
     HLOG(kDebug, "CTE ClientInit: SHM metadata cache unavailable; using RPC");
   }
 
+  // shm write-through cache (shm_writethru_cache/DESIGN.md): when the compose
+  // publishes one at its well-known pool, bind this process's client to it so
+  // puts, covered gets and known sizes complete in shared memory. Only a
+  // process that can MAP the segment detects it; others (TCP clients, remote
+  // nodes) keep the core pool unless CLIO_CTE_POOL names the cache.
+  {
+    const clio::run::PoolId core_pool = cte_client->pool_id_;
+    cte_client->pool_id_ = clio::cte::core::wtc::kDefaultPoolId;
+    if (cte_client->HasWtc()) {
+      HLOG(kInfo, "CTE ClientInit: bound to shm write-through cache {}.{}",
+           cte_client->pool_id_.major_, cte_client->pool_id_.minor_);
+    } else {
+      cte_client->pool_id_ = core_pool;
+    }
+  }
+
   // Mark as successfully initialized
   is_initialized_ = true;
   is_initializing_ = false;

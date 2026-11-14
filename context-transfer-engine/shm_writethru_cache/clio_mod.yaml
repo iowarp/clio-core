@@ -1,0 +1,28 @@
+# Shared-memory write-through cache ChiMod — the TOP of the CTE chain.
+# Clients map this pool's segment and create blobs, write and read them with
+# no task; the FlushLog task drains the segment's dirty-range log into
+# MultiPutBlob tasks down `next_pool_id`. Speaks the core's task interface for
+# everything else (a clio::cte::core::Client bound to this pool works).
+# See DESIGN.md.
+module_name: shm_writethru_cache
+namespace: clio::cte
+version: 1.0.0
+
+kCreate: 0
+kDestroy: 1
+kMonitor: 9
+
+# Interposed core verbs (MUST equal the core's ids)
+kGetOrCreateTag: 14
+kPutBlob: 15
+kGetBlob: 16
+kDelBlob: 18
+kDelTag: 19
+kGetBlobSize: 23
+kMultiPutBlob: 48
+kSyncTag: 56
+
+# Module verbs
+kFlushLog: 100      # periodic: drain the dirty-range log down the chain
+kInvalidate: 101    # drop cached copies of blobs another node wrote
+kHomeFlush: 102     # a batch of ranges landing at the blobs' home cache
