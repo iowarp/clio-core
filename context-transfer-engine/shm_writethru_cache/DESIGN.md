@@ -435,6 +435,7 @@ Where the code settled details the sections above left open.
     migration or a different placement policy). Chimods should not assume a
     hashing layout; the intended fix routes these tasks with
     `PoolQuery::Dynamic` (per blob, or batched by asking the chain's routing).
+    Tracked in iowarp/clio-core#1372.
   - A process that cannot map the segment (TCP client, remote node) stays
     bound to the core pool unless `CLIO_CTE_POOL=567.0`; writes through the
     core directly bypass invalidation.
