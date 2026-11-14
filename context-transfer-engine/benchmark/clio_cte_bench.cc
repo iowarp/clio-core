@@ -135,6 +135,20 @@ class CTEBenchmark {
     HLOG(kInfo, "===========================");
   }
 
+  /**
+   * Placement score every (non-defer) bench put carries. CLIO_BENCH_PUT_SCORE
+   * overrides the historical 0.8; -1 (auto) is what the shm write-through
+   * cache absorbs, an explicit score takes its task path.
+   * @return the score, read once per process
+   */
+  static float PutScore() {
+    static const float v = [] {
+      const char *e = std::getenv("CLIO_BENCH_PUT_SCORE");
+      return (e != nullptr && *e) ? std::strtof(e, nullptr) : 0.8f;
+    }();
+    return v;
+  }
+
   // PoolQuery flavor each AsyncPutBlob/AsyncGetBlob is issued with.
   // Read once per worker thread; constant for the duration of the run.
   clio::run::PoolQuery MakeQuery() const {
@@ -185,7 +199,7 @@ class CTEBenchmark {
     if (mode == Mode::kGet) {
       for (long k = 0; k < KeyspaceSize(); ++k) {
         auto t = cte->AsyncPutBlob(tag_id, blob_name(k), 0, a_.io_size,
-                                   put_ptr, 0.8f,
+                                   put_ptr, PutScore(),
                                    clio::cte::core::Context(), 0, pq);
         t.Wait();
         if (t->return_code_.load() != 0) {
@@ -213,7 +227,7 @@ class CTEBenchmark {
         for (long j = 0; j < batch; ++j) {
           pts.push_back(cte->AsyncPutBlob(
               tag_id, blob_name(KeyIndex(i + j, per_thread_blobs_)), 0,
-              a_.io_size, put_ptr, 0.8f,
+              a_.io_size, put_ptr, PutScore(),
               clio::cte::core::Context(), 0, pq));
         }
         for (auto &t : pts) {
