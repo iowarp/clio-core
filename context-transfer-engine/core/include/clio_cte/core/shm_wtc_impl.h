@@ -282,7 +282,7 @@ inline void View::FreeBuffer(u64 off) {
   }
 }
 
-inline bool View::EvictOne(u32 held_stripe) {
+inline bool View::EvictOne(u32 held_stripe, u64 want_bytes) {
   u32 n = NumSlots();
   u32 sps = root_->slots_per_stripe_;
   u32 want = root_->evict_sample_;
@@ -293,6 +293,8 @@ inline bool View::EvictOne(u32 held_stripe) {
   u64 cursor = root_->evict_cursor_.fetch_add(scan) % n;
   long best = -1;
   double best_f = 0.0;
+  long fit = -1;  // best candidate whose buffer alone can hold want_bytes
+  double fit_f = 0.0;
   u32 seen = 0;
   // Approximate frecency: sample clean resident entries from a rotating
   // cursor (reads here are unlocked hints, re-verified under the lock).
@@ -312,6 +314,15 @@ inline bool View::EvictOne(u32 held_stripe) {
       best = static_cast<long>(slot);
       best_f = f;
     }
+    if (e->cap_ >= want_bytes && (fit < 0 || f < fit_f)) {
+      fit = static_cast<long>(slot);
+      fit_f = f;
+    }
+  }
+  // Prefer a victim whose buffer covers the request: freeing small buffers
+  // one by one need not make room for a large one.
+  if (fit >= 0) {
+    best = fit;
   }
   if (best < 0) {
     return false;
@@ -320,7 +331,7 @@ inline bool View::EvictOne(u32 held_stripe) {
   ctp::Mutex &m = root_->stripes_[stripe];
   bool own = stripe == held_stripe;
   if (!own && !m.TryLock(0)) {
-    return true;  // contended: report progress so the caller re-samples
+    return false;  // contended: no progress; the caller yields and retries
   }
   BlobEntry *e = Slot(static_cast<u32>(best));
   bool evicted = false;
@@ -333,8 +344,7 @@ inline bool View::EvictOne(u32 held_stripe) {
   if (!own) {
     m.Unlock();
   }
-  (void)evicted;
-  return true;
+  return evicted;  // only real progress keeps the caller trying
 }
 
 inline u64 View::AllocBuffer(u64 bytes, u32 held_stripe) {
@@ -343,7 +353,7 @@ inline u64 View::AllocBuffer(u64 bytes, u32 held_stripe) {
     if (!o.IsNull()) {
       return o.load();
     }
-    if (!EvictOne(held_stripe)) {
+    if (!EvictOne(held_stripe, bytes)) {
       return 0;
     }
   }

@@ -444,8 +444,14 @@ class View {
   u64 AllocBuffer(u64 bytes, u32 held_stripe);
   /** Free a buffer. */
   void FreeBuffer(u64 off);
-  /** Evict the lowest-frecency clean buffer from a sample. */
-  bool EvictOne(u32 held_stripe);
+  /**
+   * Evict one clean buffer from a bounded sample: the lowest-frecency one
+   * whose capacity covers want_bytes, else the lowest-frecency overall.
+   * @param held_stripe stripe the caller already holds (no relock)
+   * @param want_bytes  size of the allocation the eviction makes room for
+   * @return true only if a buffer was actually freed
+   */
+  bool EvictOne(u32 held_stripe, u64 want_bytes);
   /** Release an entry's buffer (lock held, unpinned, nothing pending). */
   void ReleaseBufferLocked(BlobEntry *e);
   /** Grow (or create) an entry's buffer to `need` bytes (lock held). */
