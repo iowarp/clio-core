@@ -337,12 +337,19 @@ clio::run::TaskResume CacheBase::DelTag(
     const clio::run::u32 rc = task->GetReturnCode();
     const TagId tag = task->tag_id_;
     if (!tag.IsNull()) {
+      // A by-name DelTag reaches only the name's owner core container;
+      // every other container still holds its share of the tag (the blobs
+      // it owns, its name copy). One broadcast MultiDelTag removes them all,
+      // while every cache container drops its copies.
+      auto shares = pers_client_.AsyncMultiDelTag(
+          {tag}, clio::run::PoolQuery::Broadcast());
       auto *ipc = CLIO_IPC;
       auto drop = ipc->NewTask<clio::cte::core::DelTagTask>(
           clio::run::CreateTaskId(), pool_id_,
           clio::run::PoolQuery::Broadcast(), tag);
       drop->method_ = kDropTagCopies;
       auto fut = ipc->Send(drop);
+      CLIO_CO_AWAIT(shares);
       CLIO_CO_AWAIT(fut);
     }
     task->SetReturnCode(rc);
