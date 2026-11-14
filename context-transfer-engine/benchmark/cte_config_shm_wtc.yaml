@@ -1,0 +1,33 @@
+# Runtime configuration for clio_cte_shm_wtc_bench: core 512.0 plus the shm
+# write-through cache 565.0 over it.
+#
+# CTE core alone at the entrypoint pool with a single RAM tier, so every
+# blob is RAM-resident and the client's zero-IPC read path can serve it.
+# Anything else in front of CTE (CAE at 512.0, as in cte_config_ram.yaml)
+# or a slower tier underneath would make the bench measure the wrong path.
+
+runtime:
+  num_threads: 4
+  queue_depth: 1024
+
+compose:
+  - mod_name: clio_cte_core
+    pool_name: clio_cte
+    pool_query: local
+    pool_id: 512.0
+    targets:
+      neighborhood: 1
+    storage:
+      - path: "ram::shm_wtc_bench"
+        bdev_type: "ram"
+        capacity_limit: "2GB"
+        score: 1.0
+    dpe:
+      dpe_type: "max_bw"
+
+  - mod_name: clio_cte_shm_writethru_cache
+    pool_name: clio_cte_shm_writethru_cache
+    pool_query: local
+    pool_id: 565.0
+    next_pool_id: 512.0
+    capacity: "1G"

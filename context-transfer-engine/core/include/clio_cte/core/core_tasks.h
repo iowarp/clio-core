@@ -3278,10 +3278,13 @@ struct MultiPutDesc {
   clio::run::u64 offset_ = 0;
   clio::run::u64 size_ = 0;
   clio::run::u64 payload_off_ = 0;
+  /** Per-record put flags (kCtePutDroppable). Records needing replace or
+   *  append semantics are not batched. */
+  clio::run::u32 flags_ = 0;
 
   template <typename Ar>
   void serialize(Ar &ar) {
-    ar(tag_id_, blob_name_, offset_, size_, payload_off_);
+    ar(tag_id_, blob_name_, offset_, size_, payload_off_, flags_);
   }
 };
 

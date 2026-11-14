@@ -30,6 +30,10 @@ if(CLIO_CORE_ENABLE_DOCKER_CI)
     if(TARGET clio_cte_cache_client AND TARGET clio_cte_replication_client)
         add_subdirectory(coherence)
     endif()
+    # shm write-through cache: 4-node cross-node coherence
+    if(TARGET clio_cte_shm_writethru_cache_client)
+        add_subdirectory(shm_wtc_coherence)
+    endif()
     add_subdirectory(cfs_distributed)  # #685: cross-node CFS namespace test
     add_subdirectory(mpi_producer_consumer)  # #714: cross-node blob data (MPI)
     add_subdirectory(client_crash)  # #722: client dies mid-PutBlob (runtime robustness)

@@ -580,6 +580,37 @@ compose:
     min_score: 0.5                      # cache copies' score floor
     md_only: false                      # true: metadata-only, no data copies
 
+  # === Shared-memory write-through cache (shm_writethru_cache/DESIGN.md) ===
+  # The TOP of the CTE chain for application clients. It owns one shared-memory
+  # segment per node that client processes map: a put copies into a contiguous
+  # per-blob buffer and logs the exact byte range on one MPSC queue, and
+  # returns -- no task. A covered get or a known blob size is a memcpy. The
+  # FlushLog task drains the log continuously, coalescing ranges into
+  # MultiPutBlob tasks down next_pool_id. Reads it cannot serve fill from the
+  # chain. Clean buffers are evicted by frecency when the segment is full.
+  # Coherence across nodes: each blob's home cache tracks which nodes cache it
+  # and invalidates them when a write lands. Durability: SyncTag (fsync /
+  # H5Fflush) waits for the log and returns any earlier write's error.
+  # CLIO_CTE_CLIENT_INIT binds a process to this pool when it can map the
+  # segment; CLIO_CTE_SHM_CACHE=0 opts a process out. clio-fs does not use it
+  # (it has its own cache and talks to the pool below).
+  - mod_name: clio_cte_shm_writethru_cache
+    pool_name: clio_cte_shm_writethru_cache
+    pool_query: local
+    pool_id: "565.0"
+    next_pool_id: "563.0"               # cache -- see entry above
+    capacity: "256M"                    # segment bytes: buffers + tables + log
+    log_depth: 65536                    # dirty-range log entries
+    flush_batch_bytes: "16M"            # max payload per MultiPutBlob batch
+    flush_period_us: 50                 # flusher cadence (it drains fully)
+    flush_retries: 3                    # per-record retries before an error sticks
+    max_tags: 4096                      # tags tracked (new-tag completeness)
+    max_blobs: 65536                    # blob entries (metadata + buffers)
+    max_fill: "16M"                     # larger blobs are read, not cached
+    evict_sample: 16                    # clean entries sampled per eviction
+    half_life_ms: 10000                 # frecency decay half-life
+    max_sharer_entries: 65536           # blobs homed here that nodes cache
+
   # === Context Assimilation Engine (CAE) ===
   # Assimilation / discovery entrypoint at its own pool 400.0
   # (clio::cae::core::kCaePoolId). CEE calls ParseOmni here; CAE forwards

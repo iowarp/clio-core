@@ -108,6 +108,17 @@ else()
     message(STATUS "CTE: cache chimod disabled (use -DCLIO_CTE_ENABLE_CACHE=ON)")
 endif()
 
+# Shared-memory write-through cache: the top of the CTE chain. Clients write
+# and read blobs in its segment directly; it aggregates the logged ranges
+# into MultiPutBlob tasks down the chain (shm_writethru_cache/DESIGN.md).
+option(CLIO_CTE_ENABLE_SHM_WTC "Build the shm write-through cache chimod" ON)
+if(CLIO_CTE_ENABLE_SHM_WTC)
+    message(STATUS "CTE: building shm_writethru_cache chimod")
+    add_subdirectory(shm_writethru_cache)
+else()
+    message(STATUS "CTE: shm_writethru_cache chimod disabled")
+endif()
+
 # Checkpoint chimod -- the fault handler behind vector.Copy's lazy copies.
 option(CLIO_CTE_ENABLE_CHECKPOINT "Build the checkpoint chimod" ON)
 if(CLIO_CTE_ENABLE_CHECKPOINT)

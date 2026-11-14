@@ -4145,7 +4145,7 @@ clio::run::TaskResume Runtime::MultiPutBlob(
           clio::run::CreateTaskId(), task->pool_id_,
           clio::run::PoolQuery::Local(), d.tag_id_, d.blob_name_, d.offset_,
           d.size_, batch.RecordSlice(bi), /*score=*/-1.0f, task->context_,
-          /*flags=*/0);
+          d.flags_);
       sub.get()->BeginRunContext();
       CLIO_CO_AWAIT(PutBlob(sub));
       int rc = sub->GetReturnCode();
