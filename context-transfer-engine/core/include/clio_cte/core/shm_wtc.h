@@ -92,6 +92,9 @@ static constexpr u32 kMaxProbe = 64;
 /** Reader attempts while a writer is mid-copy before falling back to the
  *  task path. */
 static constexpr u32 kTornRetries = 256;
+/** Free log entries a non-blocking (runtime) put leaves for concurrent
+ *  producers, so its Push does not spin on a worker. */
+static constexpr u64 kLogHeadroom = 1024;
 /** Smallest buffer allocated for a blob. */
 static constexpr u64 kMinBuffer = 4096;
 
@@ -325,11 +328,16 @@ class View {
    * @param src bytes to write
    * @param put_flags put flags (only kCtePutDroppable-style per-blob flags;
    *        a write whose flags differ from the blob's returns kMiss)
+   * @param may_block true (clients): a full log blocks in Push until the
+   *        flusher drains it. false (runtime workers, which must never spin:
+   *        the flusher needs a worker to drain the log): return kNoSpace
+   *        instead when the log is within kLogHeadroom of full.
    * @return kOk, kMiss (use the task path), kTooLong, or kNoSpace (nothing
    *         written; caller waits)
    */
   Status TryPut(u32 tag_major, u32 tag_minor, const char *name, size_t name_len,
-                u64 off, u64 size, const char *src, u32 put_flags = 0);
+                u64 off, u64 size, const char *src, u32 put_flags = 0,
+                bool may_block = true);
 
   /**
    * Serve a read from a complete buffer.

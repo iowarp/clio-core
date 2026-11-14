@@ -157,7 +157,8 @@ clio::run::TaskResume Runtime::PutBlob(
         while ((st = view_.TryPut(task->tag_id_.major_, task->tag_id_.minor_,
                                   name.c_str(), name.size(),
                                   regions[i].blob_off_, regions[i].size_, src,
-                                  task->flags_)) == wtc::Status::kNoSpace) {
+                                  task->flags_, /*may_block=*/false)) ==
+               wtc::Status::kNoSpace) {
           view_.GetRoot()->stats_.waits_.fetch_add(1);
           CLIO_CO_AWAIT(clio::run::yield(kNoSpacePollUs));
         }
@@ -217,7 +218,8 @@ clio::run::TaskResume Runtime::MultiPutBlob(
         while ((st = view_.TryPut(d.tag_id_.major_, d.tag_id_.minor_,
                                   d.blob_name_.c_str(), d.blob_name_.size(),
                                   d.offset_, d.size_,
-                                  batch.base_ + d.payload_off_, d.flags_)) ==
+                                  batch.base_ + d.payload_off_, d.flags_,
+                                  /*may_block=*/false)) ==
                wtc::Status::kNoSpace) {
           CLIO_CO_AWAIT(clio::run::yield(kNoSpacePollUs));
         }

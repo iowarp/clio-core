@@ -377,9 +377,16 @@ inline bool View::EnsureCapacityLocked(BlobEntry *e, u64 need, u32 stripe) {
 
 inline Status View::TryPut(u32 tag_major, u32 tag_minor, const char *name,
                            size_t name_len, u64 off, u64 size,
-                           const char *src, u32 put_flags) {
+                           const char *src, u32 put_flags, bool may_block) {
   if (name_len > kMaxBlobName) {
     return Status::kTooLong;
+  }
+  if (!may_block) {
+    const u64 cap = log_->Capacity();
+    const u64 room = kLogHeadroom < cap / 4 ? kLogHeadroom : cap / 4;
+    if (log_->Size() + room >= cap) {
+      return Status::kNoSpace;  // nothing touched; caller yields and retries
+    }
   }
   u64 h = KeyHash(tag_major, tag_minor, name, name_len);
   u32 stripe = StripeOf(h);
