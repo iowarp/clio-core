@@ -8,7 +8,7 @@ facts: Command | clio_run ; Headers | clio_runtime/clio_runtime.h, pool_query.h,
 -->
 <h2>clio_run</h2>
 <pre data-label="usage">
-clio_run &lt;command&gt; [options]
+clio_run <command> [options]
 </pre>
 <ul>
   <li><code>start</code>: start the runtime in the foreground, recover every piece of persistent state it finds, and compose the pools in the configuration.</li>
@@ -23,8 +23,8 @@ clio_run &lt;command&gt; [options]
 <p>The nested forms <code>clio_run runtime start|stop|status</code> and <code>clio_run repo refresh</code> still work. <code>clio_run restart</code> was removed: <code>start</code> always recovers state, and <code>start --fresh</code> discards it.</p>
 <h3>start</h3>
 <pre data-label="usage">
-clio_run start [--fresh] [--induct] [--ephemeral] [--disk &lt;path&gt;]
-               [--viz | --no-viz] [--viz-port &lt;port&gt;] [--viz-bind &lt;addr&gt;]
+clio_run start [--fresh] [--induct] [--ephemeral] [--disk <path>]
+               [--viz | --no-viz] [--viz-port <port>] [--viz-bind <addr>]
 </pre>
 <ul>
   <li><code>--fresh</code>: discard this node's persistent state (pools, metadata logs, allocator logs, data) and start empty.</li>
@@ -36,7 +36,7 @@ clio_run start [--fresh] [--induct] [--ephemeral] [--disk &lt;path&gt;]
 </ul>
 <h3>stop</h3>
 <pre data-label="usage">
-clio_run stop [--force] [--grace-period &lt;ms&gt;]
+clio_run stop [--force] [--grace-period <ms>]
 </pre>
 <ul>
   <li><code>--grace-period &lt;ms&gt;</code>: drain budget for in-flight work (default 5000; 0 means the default). A graceful stop also moves RAM-tier data to disk within this budget.</li>
@@ -53,9 +53,9 @@ clio_run stop [--force] [--grace-period &lt;ms&gt;]
 <p>The probe waits up to 2 s unless <code>CLIO_WAIT_SERVER</code> is set.</p>
 <h3 id="compose">compose</h3>
 <pre data-label="usage">
-clio_run compose start &lt;config.yaml&gt;
-clio_run compose stop  &lt;config.yaml&gt;
-clio_run compose rm    &lt;config.yaml&gt;
+clio_run compose start <config.yaml>
+clio_run compose stop  <config.yaml>
+clio_run compose rm    <config.yaml>
 clio_run compose list  [--restartable]
 </pre>
 <ul>
@@ -151,12 +151,12 @@ void CLIO_RUNTIME_FINALIZE();
 <p>Provided by <code>ClioCoreCommon.cmake</code>, loaded by <code>find_package(clio-core CONFIG)</code>. Both read <code>clio_mod.yaml</code> in the current source directory and search upward for <code>clio_repo.yaml</code>.</p>
 <pre data-label="cmake">
 add_clio_module_client(
-  [LIB_NAME &lt;name&gt;]
-  SOURCES &lt;files&gt;...
+  [LIB_NAME <name>]
+  SOURCES <files>...
   [COMPILE_DEFINITIONS ...] [LINK_LIBRARIES ...] [LINK_DIRECTORIES ...]
   [INCLUDE_LIBRARIES ...] [INCLUDE_DIRECTORIES ...])
 
-add_clio_module_runtime(&lt;same arguments&gt;)
+add_clio_module_runtime(<same arguments>)
 </pre>
 <ul>
   <li>Targets are <code>&lt;LIB_NAME&gt;_client</code> and <code>&lt;LIB_NAME&gt;_runtime</code>, or <code>&lt;package&gt;_&lt;module&gt;_client</code> and <code>_runtime</code> without <code>LIB_NAME</code>. The output file name follows the target, so <code>LIB_NAME</code> must equal the module's <code>chimod_lib_name</code>.</li>

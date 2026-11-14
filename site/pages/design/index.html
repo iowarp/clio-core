@@ -3,59 +3,204 @@ title: Design overview
 heading: How CLIO Core <em>is built.</em>
 description: How the composable stack (the runtime, the Context Transfer Engine, its ChiMods and the products built on them) is designed, and the performance and reliability tradeoffs behind them.
 eyebrow: Design
-lede: How the storage side of CLIO Core is built: the Context Transfer Engine (CTE), the ChiMods stacked on it, the clio-fs filesystem, and the runtime underneath. These pages describe mechanisms and the reasons behind them, with the costs stated alongside the benefits. There is no code here; for APIs, see the <a href="/docs/index.html">Docs</a>.
+lede: A complete introduction to CLIO Core: what each piece of the stack is, how the pieces connect, and what each one costs. Start here; the other Design pages each take one piece apart. There is no code here; for APIs, see the <a href="/docs/index.html">Docs</a>.
 -->
-<h2 id="pages">Pages</h2>
-<div class="card-grid">
-  <div class="card"><span class="tag">Foundation</span><h3><a href="runtime.html">Runtime and block devices</a></h3><p>Tasks and coroutines, transports, workers, routing, and the block-device module every tier sits on.</p></div>
-  <div class="card"><span class="tag">CTE core</span><h3><a href="cte-core.html">Data model and data path</a></h3><p>Tags, blobs and targets; hash ownership; the put and get paths; concurrency control.</p></div>
-  <div class="card"><span class="tag">CTE core</span><h3><a href="placement.html">Placement, tiering and eviction</a></h3><p>Scores, the placement engine, reorganization, the organizer, flushing and eviction.</p></div>
-  <div class="card"><span class="tag">Reliability</span><h3><a href="durability.html">Durability and recovery</a></h3><p>What is persisted, the ordering rules, what survives what, and how a restart recovers.</p></div>
-  <div class="card"><span class="tag">ChiMods</span><h3><a href="chain.html">The interposition chain</a></h3><p>Replication, cache, indexer, compressor, stream and checkpoint, and why they stack in that order.</p></div>
-  <div class="card"><span class="tag">Filesystem</span><h3><a href="filesystem.html">clio-fs and FUSE</a></h3><p>A distributed POSIX namespace made of blobs: directory blocks, inode homes, leases, rename, and the FUSE daemon.</p></div>
-  <div class="card"><span class="tag">Adapters</span><h3><a href="adapters.html">I/O adapters</a></h3><p>POSIX, STDIO and MPI-IO interception; the HDF5 VOL connector and VFD; ADIOS2; the GPU paths.</p></div>
-</div>
-
 <h2 id="stack">The stack</h2>
 <figure class="diagram">
-  <svg viewBox="0 0 860 470" role="img" aria-label="Full storage stack">
+  <svg viewBox="0 0 860 560" role="img" aria-label="The CLIO Core stack: front ends, interceptors, namespace, ChiMod chain, CTE core, runtime and storage devices">
     <defs><marker id="ah0" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10 z"/></marker></defs>
-    <text class="muted" x="20" y="22">FRONT ENDS</text>
-    <rect class="box alt" x="20" y="32" width="190" height="50" rx="8"/><text class="title" x="34" y="62">FUSE mount</text>
-    <rect class="box alt" x="225" y="32" width="190" height="50" rx="8"/><text class="title" x="239" y="54">Interceptors</text><text class="muted" x="239" y="72">POSIX, STDIO, MPI-IO</text>
-    <rect class="box alt" x="430" y="32" width="190" height="50" rx="8"/><text class="title" x="444" y="54">HDF5 / ADIOS2</text><text class="muted" x="444" y="72">VOL, VFD, engine</text>
-    <rect class="box alt" x="635" y="32" width="205" height="50" rx="8"/><text class="title" x="649" y="54">C++ / Python / GPU</text><text class="muted" x="649" y="72">core client API</text>
+    <text class="muted" x="20" y="22">FRONT ENDS (what you use)</text>
+    <rect class="box alt" x="20" y="32" width="152" height="50" rx="8"/><text class="title" x="32" y="54">Context FS</text><text class="muted" x="32" y="72">a mounted folder</text>
+    <rect class="box alt" x="184" y="32" width="152" height="50" rx="8"/><text class="title" x="196" y="54">Memory exp.</text><text class="muted" x="196" y="72">paged GPU/CPU vectors</text>
+    <rect class="box alt" x="348" y="32" width="152" height="50" rx="8"/><text class="title" x="360" y="54">Machine learning</text><text class="muted" x="360" y="72">clio-ml, out of core</text>
+    <rect class="box alt" x="512" y="32" width="152" height="50" rx="8"/><text class="title" x="524" y="54">CAE · CEE</text><text class="muted" x="524" y="72">import, search, retrieve</text>
+    <rect class="box alt" x="676" y="32" width="164" height="50" rx="8"/><text class="title" x="688" y="54">Key-value API</text><text class="muted" x="688" y="72">C++, Python, GPU</text>
 
-    <text class="muted" x="20" y="112">NAMESPACE AND STREAMS</text>
-    <rect class="box hl" x="20" y="122" width="395" height="50" rx="8"/><text class="title" x="34" y="144">Filesystem ChiMod (clio-fs)</text><text class="muted" x="34" y="162">directory blocks, inodes, handles</text>
-    <rect class="box hl" x="430" y="122" width="190" height="50" rx="8"/><text class="title" x="444" y="144">Stream</text><text class="muted" x="444" y="162">sizes, ordered appends</text>
+    <text class="muted" x="20" y="112">INTERCEPTORS (unmodified applications)</text>
+    <rect class="box alt" x="20" y="122" width="260" height="46" rx="8"/><text class="title" x="32" y="144">FUSE mount</text><text class="muted" x="32" y="160">Linux, macOS, Windows</text>
+    <rect class="box alt" x="296" y="122" width="260" height="46" rx="8"/><text class="title" x="308" y="144">POSIX · STDIO · MPI-IO</text><text class="muted" x="308" y="160">preloaded interceptors</text>
+    <rect class="box alt" x="572" y="122" width="268" height="46" rx="8"/><text class="title" x="584" y="144">HDF5 · ADIOS2</text><text class="muted" x="584" y="160">VOL, VFD, engine plugins</text>
 
-    <text class="muted" x="20" y="202">INTERPOSITION CHAIN</text>
-    <rect class="box hl" x="20" y="212" width="190" height="44" rx="8"/><text class="title" x="34" y="239">Cache</text>
-    <rect class="box hl" x="225" y="212" width="190" height="44" rx="8"/><text class="title" x="239" y="239">Indexer</text>
-    <rect class="box" x="430" y="212" width="190" height="44" rx="8" stroke-dasharray="5 4"/><text class="title" x="444" y="239">Compressor</text>
-    <rect class="box hl" x="635" y="212" width="205" height="44" rx="8"/><text class="title" x="649" y="239">Replication</text>
-    <path class="edge hl" d="M210,234 L223,234" marker-end="url(#ah0)"/>
-    <path class="edge hl" d="M415,234 L428,234" marker-end="url(#ah0)"/>
-    <path class="edge hl" d="M620,234 L633,234" marker-end="url(#ah0)"/>
+    <text class="muted" x="20" y="198">NAMESPACE AND STREAMS</text>
+    <rect class="box hl" x="20" y="208" width="536" height="46" rx="8"/><text class="title" x="32" y="230">Filesystem ChiMod (clio-fs)</text><text class="muted" x="32" y="246">directories, inodes and file handles, stored as blobs</text>
+    <rect class="box hl" x="572" y="208" width="268" height="46" rx="8"/><text class="title" x="584" y="230">Stream</text><text class="muted" x="584" y="246">file sizes, ordered appends</text>
 
-    <text class="muted" x="20" y="286">STORAGE ENGINE</text>
-    <rect class="box hl" x="20" y="296" width="820" height="54" rx="8"/><text class="title" x="34" y="320">CTE core</text><text class="muted" x="34" y="338">hash-owned blob metadata · placement engine · write-ahead log · reorganize / flush / evict</text>
+    <text class="muted" x="20" y="284">CHIMOD CHAIN (optional data operators)</text>
+    <rect class="box hl" x="20" y="294" width="152" height="44" rx="8"/><text class="title" x="32" y="321">Cache</text>
+    <rect class="box hl" x="192" y="294" width="152" height="44" rx="8"/><text class="title" x="204" y="321">Indexer</text>
+    <rect class="box" x="364" y="294" width="152" height="44" rx="8" stroke-dasharray="5 4"/><text class="title" x="376" y="321">Compressor</text>
+    <rect class="box hl" x="536" y="294" width="152" height="44" rx="8"/><text class="title" x="548" y="321">Replication</text>
+    <rect class="box" x="708" y="294" width="132" height="44" rx="8" stroke-dasharray="5 4"/><text class="title" x="720" y="321">Your module</text>
+    <path class="edge hl" d="M172,316 L190,316" marker-end="url(#ah0)"/>
+    <path class="edge hl" d="M344,316 L362,316" marker-end="url(#ah0)"/>
+    <path class="edge hl" d="M516,316 L534,316" marker-end="url(#ah0)"/>
 
-    <text class="muted" x="20" y="380">DEVICES (bdev pools)</text>
-    <rect class="box" x="20" y="390" width="190" height="44" rx="8"/><text x="34" y="417">RAM / HBM / pinned</text>
-    <rect class="box" x="225" y="390" width="190" height="44" rx="8"/><text x="239" y="417">NVMe / SSD file</text>
-    <rect class="box" x="430" y="390" width="190" height="44" rx="8"/><text x="444" y="417">HDD / PFS file</text>
-    <rect class="box" x="635" y="390" width="205" height="44" rx="8"/><text x="649" y="417">S3 / GCS</text>
-    <text class="muted" x="20" y="460">All of it runs as tasks inside the CLIO runtime: one process per node, coroutines on a few worker threads.</text>
+    <text class="muted" x="20" y="368">CONTEXT TRANSFER ENGINE (CTE core)</text>
+    <rect class="box hl" x="20" y="378" width="820" height="50" rx="8"/><text class="title" x="32" y="400">Tags and blobs, placed by score</text><text class="muted" x="32" y="418">hash-owned metadata · placement engine · metadata log · reorganize, flush, evict</text>
+
+    <text class="muted" x="20" y="458">STORAGE (block-device pools)</text>
+    <rect class="box" x="20" y="468" width="194" height="40" rx="8"/><text x="32" y="493">RAM / HBM</text>
+    <rect class="box" x="228" y="468" width="194" height="40" rx="8"/><text x="240" y="493">NVMe / SSD</text>
+    <rect class="box" x="436" y="468" width="194" height="40" rx="8"/><text x="448" y="493">HDD / parallel FS</text>
+    <rect class="box" x="644" y="468" width="196" height="40" rx="8"/><text x="656" y="493">S3 / GCS buckets</text>
+    <text class="muted" x="20" y="540">CONTEXT RUNTIME: every box above is a module running as tasks in one process per node.</text>
   </svg>
-  <figcaption>Front ends reach the CTE through the namespace layer
-  (FUSE, interceptors) or directly (HDF5, ADIOS2, the API). Every layer
-  below the front ends is a ChiMod pool, and every arrow between them is a
-  task.</figcaption>
+  <figcaption>Front ends on top reach the storage engine through the
+  interceptors and the filesystem, or call it directly. Every box below the
+  front ends is a module running inside the runtime, and every arrow
+  between modules is a task.</figcaption>
 </figure>
+<p>The picture has many names in it. The rest of this page introduces
+them one at a time, from the bottom up, so each piece is explained in
+terms of the pieces under it.</p>
 
-<h2 id="principles">Design principles</h2>
+<h2 id="pieces">The pieces, one at a time</h2>
+
+<h3 id="runtime">1. The runtime: one process per node</h3>
+<p>The <strong>Context Runtime</strong> is a single long-running process
+on each machine, started with <code>clio_run start</code>. By itself it
+stores nothing. It is a host for <em>modules</em>: it loads them, gives
+them worker threads, carries requests to them, and connects to the
+runtimes on the other machines of a cluster. Everything else on this page
+runs inside it.</p>
+<dl class="notes">
+  <div><dt>Module (ChiMod)</dt><dd>A plug-in: a shared library that adds
+  one capability to the runtime, such as "store bytes on an NVMe drive" or
+  "keep cached copies". Every box in the stack diagram is one.</dd></div>
+  <div><dt>Pool</dt><dd>A running instance of a module, with a name and a
+  numeric id such as <code>512.0</code>. Two pools of the same module can
+  run side by side with different settings, for example two caches.</dd></div>
+  <div><dt>Container</dt><dd>The part of a pool that lives on one node.
+  A pool has one container on every node, so its work and data spread over
+  the whole cluster instead of one server.</dd></div>
+  <div><dt>Task</dt><dd>One request to a pool: "write these bytes", "look
+  up this name". Applications and modules talk to each other only by
+  sending tasks. The runtime runs each task as a lightweight coroutine, so
+  a task waiting on a disk or another node lets its thread run other
+  tasks.</dd></div>
+</dl>
+<p>Because every feature is a module and every interaction is a task, the
+rest of the stack is a choice of which modules to start and in which order
+to connect them. That choice is the <code>compose</code> list in the
+configuration file.</p>
+
+<h3 id="bdev">2. Storage: block devices</h3>
+<p>At the bottom, a <strong>block-device module</strong> (bdev) turns one
+piece of hardware into a uniform pool of space: a region of RAM, a file on
+an NVMe drive or disk, an erasure-coded array, or an S3 or Google Cloud
+bucket. It hands out and frees blocks, and reads and writes them. It knows
+nothing about files or names. Each configured bdev is a <strong>storage
+tier</strong>, with a capacity and a <strong>score</strong> from 0 to 1
+that ranks how fast it is.</p>
+
+<h3 id="cte">3. The Context Transfer Engine: tags and blobs</h3>
+<p>The <strong>Context Transfer Engine (CTE)</strong> is the storage
+engine. It stores data as <strong>blobs</strong> grouped into
+<strong>tags</strong>, and decides which tier each blob lives on.</p>
+<dl class="notes">
+  <div><dt>Blob</dt><dd>A named run of bytes, typically up to a few
+  megabytes: one page of a file, one chunk of a dataset, one value in a
+  key-value store. The blob is the unit the engine places, moves, copies
+  and logs.</dd></div>
+  <div><dt>Tag</dt><dd>A named group of blobs, like a folder or a bucket.
+  A file in Context FS is one tag whose blobs are its pages; a dataset or
+  a model checkpoint can be one tag.</dd></div>
+  <div><dt>Blob score</dt><dd>A number from 0 to 1 saying how important a
+  blob is. The placement engine puts a blob on the tier whose score best
+  matches it, so hot data lands in RAM and cold data on disk. Changing a
+  blob's score moves it.</dd></div>
+  <div><dt>Home</dt><dd>Each blob and tag is assigned to one node by
+  hashing its name. That node keeps its metadata and orders its updates,
+  so there is no central metadata server.</dd></div>
+</dl>
+<p>The CTE also keeps a metadata log on persistent storage, so blob
+locations survive a restart, and runs background work that reorganizes,
+flushes and evicts blobs between tiers. <a href="cte-core.html">Data model
+and data path</a> and <a href="placement.html">Placement and tiering</a>
+go into detail.</p>
+
+<h3 id="chain">4. The chain: optional data operators</h3>
+<p>Between the applications and the CTE sits a <strong>chain</strong> of
+optional modules, each doing one job. Each speaks the same interface as
+the CTE itself, so it can stand in front of the CTE (or in front of
+another chain module), handle the requests it cares about, and forward
+everything else to the next pool. This is <strong>interposition</strong>;
+the link to the next pool is the module's <code>next_pool_id</code>.</p>
+<ul>
+  <li><strong>Cache</strong> keeps a copy of hot blobs on the node that
+  reads them, so repeat reads skip the network.</li>
+  <li><strong>Indexer</strong> keeps term counts for what is written, so
+  blobs can later be searched by their contents.</li>
+  <li><strong>Compressor</strong> encodes blobs on the way down and
+  decodes them on the way up.</li>
+  <li><strong>Replication</strong> keeps extra copies on other nodes or a
+  persistent tier, so data survives a node loss or a restart.</li>
+</ul>
+<p>Because each operator only knows "the next pool", any of them can be
+left out and the chain closes around the gap. Your own modules plug in the
+same way. <a href="chain.html">The interposition chain</a> explains each
+operator and why they stack in the order they do.</p>
+
+<h3 id="namespace">5. Namespace and streams: files on top of blobs</h3>
+<p>Blobs and tags have no directories, permissions or file sizes. The
+<strong>filesystem module (clio-fs)</strong> adds them, storing
+directories, inodes (the record of a file's size, owner and permissions)
+and extended attributes as ordinary blobs. The <strong>stream</strong>
+module tracks file sizes and puts concurrent appends from many nodes into
+one order. <a href="filesystem.html">Filesystem and FUSE</a> describes
+both.</p>
+
+<h3 id="interceptors">6. Interceptors: applications unchanged</h3>
+<p>Most applications already read and write files. Interceptors let them
+use CLIO Core without changes. The <strong>FUSE mount</strong> makes
+Context FS appear as a normal folder on Linux, macOS and Windows.
+<strong>POSIX, STDIO and MPI-IO interceptors</strong> are preloaded into a
+program and redirect its file calls. <strong>HDF5 and ADIOS2</strong>
+plugins route those libraries' I/O. <a href="adapters.html">I/O
+adapters</a> covers what each one gives up for speed.</p>
+
+<h3 id="frontends">7. Front ends: the products</h3>
+<p>The products are what people use, and each one is a combination of the
+pieces above.</p>
+<ul>
+  <li><strong>Context FS</strong>: the filesystem module behind the FUSE
+  mount, over the CTE.</li>
+  <li><strong>Key-value API</strong>: tags and blobs directly from C++,
+  Python or GPU code.</li>
+  <li><strong>Memory expansion</strong>: vectors larger than GPU or CPU
+  memory, paged in and out as CTE blobs.</li>
+  <li><strong>Machine learning</strong> (clio-ml): training algorithms
+  that run over those paged vectors, out of core.</li>
+  <li><strong>CAE and CEE</strong>: the assimilation engine imports
+  outside data (files, HDF5, S3) into tags; the exploration engine finds
+  and retrieves it.</li>
+</ul>
+
+<h2 id="costs">Every module has a cost</h2>
+<p>Each module buys a capability with time, memory or space. CLIO Core is
+built so that you pay only for what you compose, which leaves one rule in
+your hands: <strong>if you use a module, or plan to, enable it; if you do
+not, keep it off the path.</strong> A module that is not composed costs
+nothing. One that is composed is paid for on every request that passes
+through it, whether you use its feature or not.</p>
+<table class="tradeoffs">
+  <tr><th>Module</th><th>Buys</th><th>Costs</th><th>Enable it when</th></tr>
+  <tr><td><a href="chain.html#cache">Cache</a></td><td class="good">Local reads of data whose home is another node</td><td class="cost">An extra local write per remote-owned put; a remote read, local write and registration round trip per miss; invalidation messages</td><td>Data is read again on nodes other than its home</td></tr>
+  <tr><td><a href="chain.html#indexer">Indexer</a></td><td class="good">Content search without rescanning storage</td><td class="cost">Background re-reads of written data; an in-memory index; searches drain the backlog first. Measured: 4 KiB puts at 31.7k IOPS, against 38.2k without it</td><td>You, an agent or the CEE will search by content</td></tr>
+  <tr><td><a href="chain.html#compressor">Compressor</a></td><td class="good">Less space and less traffic to slow tiers</td><td class="cost">CPU or GPU time per write; small reads decode the whole blob</td><td>Data compresses well and the lower tiers are the bottleneck</td></tr>
+  <tr><td><a href="chain.html#replication">Replication</a></td><td class="good">Data that outlives a node or a restart</td><td class="cost">Put latency grows with each synchronous copy; space for every copy</td><td>Losing a node must not lose data</td></tr>
+  <tr><td><a href="filesystem.html">Filesystem</a></td><td class="good">A POSIX namespace over blobs</td><td class="cost">Directory and inode blobs; lease and coherence traffic</td><td>Applications use files</td></tr>
+  <tr><td><a href="placement.html">More tiers</a></td><td class="good">Capacity at a lower cost per byte</td><td class="cost">Moves copy whole blobs; slower tiers serve some reads</td><td>The working set does not fit the fast tier</td></tr>
+</table>
+<p>The same holds below the chain: a RAM-only stack is the fastest and
+loses its data on restart, and a persistent tier with <code>fsync</code>
+is durable and slower. The choice is always explicit, in the compose
+file.</p>
+
+<h2 id="principles">Design principles of the CTE</h2>
+<p>The storage engine follows a short list of rules. Most behavior on the
+other Design pages follows from one of them.</p>
+
 <ol>
   <li><strong>No central metadata service.</strong> Every blob, tag,
   directory block and inode has exactly one home container chosen by
@@ -160,6 +305,20 @@ B's current version.</p>
   <tr><td>POSIX, STDIO and MPI-IO interceptors</td><td>Source build, with ELF interception</td><td>Usable, with the semantic limits described on the adapters page</td></tr>
   <tr><td>GPU vector, UVM, LLM hooks</td><td>GPU / LLM build options</td><td>Research and prototype stage</td></tr>
 </table>
+
+<h2 id="next">Where to read next</h2>
+<p>Each of the other Design pages takes one layer apart.
+<a href="runtime.html">Runtime and block devices</a> covers tasks,
+transports, workers and the block-device allocator.
+<a href="cte-core.html">Data model and data path</a> follows a put and a
+get through the CTE, and <a href="placement.html">Placement and
+tiering</a> explains scores, the organizer, flushing and eviction.
+<a href="durability.html">Durability and recovery</a> says exactly what
+survives a crash. <a href="chain.html">The interposition chain</a>,
+<a href="filesystem.html">Filesystem and FUSE</a> and
+<a href="adapters.html">I/O adapters</a> cover the layers above the
+engine. To write your own module, see <a href="/develop/index.html">Develop</a>
+and <a href="/docs/runtime/extend.html">Extending the runtime</a>.</p>
 
 <p class="lede">These pages describe the
 <code>dev</code> branch as of October 2026. When the design changes,

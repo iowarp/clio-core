@@ -121,7 +121,7 @@ kbd { border: 1px solid var(--line-control); border-bottom-width: 2px; border-ra
   margin: 0 0 var(--space-3);
 }
 .eyebrow .chapter { color: var(--muted); }
-.lede { font-size: clamp(1.1rem, 1rem + 0.45vw, 1.3rem); color: var(--ink-soft); line-height: 1.55; max-width: 62ch; }
+.lede { font-size: clamp(1.1rem, 1rem + 0.45vw, 1.3rem); color: var(--ink-soft); line-height: 1.55; max-width: 62ch; overflow-wrap: break-word; }
 .muted { color: var(--muted); }
 .tag {
   display: inline-block;
@@ -355,6 +355,13 @@ figure { margin: var(--space-6) 0; }
 figcaption { color: var(--muted); font-size: 0.9rem; margin-top: var(--space-3); }
 figure.diagram { border: 1px solid var(--line); border-radius: var(--radius); padding: var(--space-4); background: var(--paper-raised); }
 figure.diagram svg { width: 100%; display: block; }
+/* On phones a full-width 860-unit diagram renders its labels at ~4px. Keep a
+   readable minimum width and let the diagram scroll inside its frame. */
+@media (max-width: 720px) {
+  figure.diagram { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  figure.diagram svg { min-width: 680px; }
+  figure.diagram figcaption { position: sticky; left: 0; }
+}
 .diagram .box { fill: var(--paper); stroke: var(--line-control); stroke-width: 1.3; }
 .diagram .box.hl { stroke: var(--accent); }
 .diagram .box.alt { stroke: var(--secondary); }
@@ -545,9 +552,18 @@ dl.notes dd { margin: 0; color: var(--ink-soft); }
   .primary-nav.open { display: flex; }
   .primary-nav a { padding: 0.75rem 0.5rem; min-height: 44px; }
   .primary-nav a[aria-current="page"] { box-shadow: inset 2px 0 0 var(--accent); padding-inline-start: 0.9rem; }
-  .nav-drop { flex-direction: column; align-items: stretch; }
-  .nav-drop-toggle { display: none; }
-  .nav-drop-menu { position: static; opacity: 1; visibility: visible; transform: none; box-shadow: none; border: 0; padding: 0 0 0 var(--space-4); background: transparent; min-width: 0; }
+  .primary-nav { max-height: calc(100dvh - var(--header-h)); overflow-y: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; }
+  .nav-drop { flex-wrap: wrap; align-items: center; }
+  .nav-drop > a { flex: 1 1 auto; }
+  .nav-drop-toggle { display: inline-grid; place-items: center; min-width: 44px; min-height: 44px; }
+  .nav-drop-menu, .nav-drop:hover .nav-drop-menu, .nav-drop:focus-within .nav-drop-menu {
+    display: none; flex-basis: 100%; position: static; opacity: 1; visibility: visible; transform: none;
+    box-shadow: none; border: 0; padding: 0 0 0 var(--space-4); background: transparent; min-width: 0;
+  }
+  .nav-drop.open .nav-drop-menu { display: block; }
+  .nav-drop:hover .nav-drop-toggle svg { transform: none; }
+  .nav-drop.open .nav-drop-toggle svg { transform: rotate(180deg); }
+  .nav-drop-menu a { white-space: normal; }
   .header-inner { padding: 0 var(--space-4); gap: var(--space-3); }
   .header-tools { margin-inline-start: auto; }
   .page, .guide { padding-inline: var(--space-4); }
@@ -608,3 +624,15 @@ dl.notes dd { margin: 0; color: var(--ink-soft); }
 .install-intro { color: var(--ink-soft); margin: var(--space-4) 0 0; max-width: 40rem; }
 .tabs.hero-install { margin: var(--space-3) 0 var(--space-4); max-width: 40rem; }
 .tabs.hero-install pre { margin: 0; }
+
+/* ---------- Where a technology sits in the stack ---------- */
+.stack-position { margin: var(--space-5) 0; padding: 0; list-style: none; display: grid; gap: 4px; max-width: 640px; }
+.stack-position li {
+  display: grid; grid-template-columns: 9.5rem minmax(0, 1fr); gap: var(--space-3); align-items: baseline;
+  padding: 0.55rem 0.9rem; border: 1px solid var(--line); border-radius: var(--radius);
+  background: var(--paper-raised); color: var(--muted); font-size: 0.92rem;
+}
+.stack-position li b { font-family: var(--font-mono); font-weight: 500; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.05em; }
+.stack-position li.here { border-color: var(--accent); color: var(--ink); box-shadow: inset 3px 0 0 var(--accent); }
+.stack-position li.here b { color: var(--accent); }
+@media (max-width: 720px) { .stack-position li { grid-template-columns: minmax(0, 1fr); gap: 2px; } }

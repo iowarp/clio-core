@@ -22,7 +22,19 @@ facts: Daemon | clio_run start ; Unit of code | Module (ChiMod), run as a pool ;
 </ul>
 
 <h2>Scheduling</h2>
-<p>The runtime starts a fixed number of worker threads (<code>runtime.num_threads</code>, four by default) with roles: a scheduler, network send and receive workers, a GPU-queue worker, and I/O workers in cost classes. Tasks are mapped by predicted cost, learned from observed run times per module and method. A monitor moves the queue of a worker stuck on one task to a fresh worker, grows a saturated class, and retires idle extra workers. <a href="/design/runtime.html">Runtime and block devices</a> describes the mechanism and its tradeoffs.</p>
+<p>The runtime starts <code>runtime.num_threads</code> worker threads (four by default). Worker 0 is the scheduler worker; with four or more threads the last two are a network send worker and a network receive worker,, and a GPU-polling worker is carved out when there are enough threads. The rest form one pool of general workers. The default scheduler books every task at the time it is predicted to hold a worker, learned per module and method from observed run times. A task stays on the worker that submitted it if that worker has room, otherwise it goes to the least-loaded worker, and when no worker has room the pool grows by one. A monitor thread, every 500 ms, rescues the backlog of a worker stuck on one task, lets idle workers steal work, and retires idle extra workers. The scheduler is a replaceable component; see <a href="/docs/runtime/extend.html#scheduler">Write a scheduler</a> and <a href="/docs/runtime/design.html">Design</a>.</p>
+
+<h2 id="modularity">Modularity and extensibility</h2>
+<p>The runtime itself does no storage, search or computation. Everything it serves comes from modules, including the block devices and the admin module that creates other pools. Writing a <strong>custom ChiMod</strong> is how you add a capability, and a custom module is a peer of the built-in ones: it runs on every node, takes part in scheduling and failure handling, and can sit in the storage chain.</p>
+<ul class="checks">
+  <li><strong>A runtime half and a client half.</strong> A module builds two shared libraries. The runtime library, which the daemon loads, holds the <em>container</em> class whose coroutine handlers run each method. The client library, which applications link, gives them a typed call per method that builds a task and submits it.</li>
+  <li><strong>Declared, then generated.</strong> A <code>clio_mod.yaml</code> names the module and lists its methods with their numbers. <code>clio_run refresh</code> regenerates the dispatch code that maps method numbers to handlers.</li>
+  <li><strong>Built outside the tree.</strong> Modules build against an installed CLIO Core with its CMake package; no fork is needed.</li>
+  <li><strong>Found at startup.</strong> The runtime scans its own library directory, <code>CLIO_REPO_PATH</code>, <code>LD_LIBRARY_PATH</code> and a few defaults for libraries whose names contain <code>_runtime</code>, and loads them.</li>
+  <li><strong>Composed at run time.</strong> Pools of a loaded module are created and destroyed while the runtime serves, from a client, the compose file or <code>clio_run compose start</code>/<code>stop</code>. A new module library, or a new version of one, is picked up by restarting the runtime; clients reconnect on their own and durable pools are recreated.</li>
+  <li><strong>Hooks beyond methods.</strong> Optional callbacks let a module migrate, recover and re-partition its data, predict its own task costs, aggregate collective requests, add pages and endpoints to the dashboard, and run on GPUs.</li>
+</ul>
+<p><a href="/docs/runtime/usage.html">Usage</a> builds a module step by step, and <a href="/docs/runtime/extend.html">Extending the runtime</a> covers schedulers, monitoring and the other extension points.</p>
 
 <h2>Elasticity and failure handling</h2>
 <ul>
@@ -36,6 +48,15 @@ facts: Daemon | clio_run start ; Unit of code | Module (ChiMod), run as a pool ;
 </ul>
 
 <h2>How it relates to the other technologies</h2>
+<ol class="stack-position" aria-label="Where the Context Runtime sits in the CLIO Core stack">
+  <li><b>Front ends</b><span>Context FS, memory expansion, machine learning, CAE, CEE</span></li>
+  <li><b>Interceptors</b><span>POSIX, STDIO, MPI-IO and HDF5 adapters; FUSE mount</span></li>
+  <li><b>ChiMod chain</b><span>Cache, replication, compressor, indexer, summarizer</span></li>
+  <li><b>CTE core</b><span>Tags, blobs, placement across tiers</span></li>
+  <li class="here"><b>Context Runtime</b><span><strong>Modules, pools, tasks, scheduling, transports</strong></span></li>
+  <li><b>Storage</b><span>Block devices: RAM, NVMe, SSD, HDD, S3/GCS</span></li>
+</ol>
+<p>The runtime is the floor that every other layer stands on: each box above it, and the block devices below it, is a module running inside it. It relies only on the operating system, shared memory and the network.</p>
 <ul>
   <li><a href="/docs/cte/index.html">Context Transfer Engine</a>: the core, cache, indexer, replication, compressor and block-device modules. The runtime's block-device module, <code>clio_bdev</code>, is what every storage tier is built on.</li>
   <li><a href="/docs/context-fs/index.html">Context FS</a>: the filesystem and stream modules, plus the FUSE daemon, which is a runtime client.</li>
@@ -47,6 +68,8 @@ facts: Daemon | clio_run start ; Unit of code | Module (ChiMod), run as a pool ;
 <h2>Where to go next</h2>
 <ul>
   <li><a href="/docs/runtime/install.html">Install</a>: the runtime is in every install; building a module needs the headers and CMake package.</li>
+  <li><a href="/docs/runtime/design.html">Design</a>: how the runtime is built inside: managers, queues, workers, transports and the dashboard.</li>
+  <li><a href="/docs/runtime/extend.html">Extending the runtime</a>: custom schedulers, performance monitoring, dashboard pages and module hooks.</li>
   <li><a href="/docs/runtime/usage.html">Usage</a>: write, build, load and compose a ChiMod.</li>
   <li><a href="/docs/runtime/api.html">API reference</a>: <code>clio_run</code>, client initialisation, <code>PoolQuery</code>, the task and coroutine macros, the container callbacks, the CMake functions, the configuration file and environment variables.</li>
   <li><a href="/develop/operator.html">Write a chain operator</a>: a complete module in the storage chain, built and run end to end.</li>

@@ -46,9 +46,9 @@ target_link_libraries(cte_check clio::cte::core_client)
 </pre>
 <p>The umbrella package includes the <code>clio_cte_core</code> module package, which defines <code>clio::cte::core_client</code> and <code>clio::cte::core_runtime</code>. The historical names <code>clio_cte::core_client</code> and <code>wrp_cte::core_client</code> are emitted as aliases. The client header is <code>clio_cte/core/core_client.h</code>; the runtime entry points are in <code>clio_runtime/clio_runtime.h</code>.</p>
 <pre data-label="cpp · cte_check.cc">
-#include &lt;clio_runtime/clio_runtime.h&gt;
-#include &lt;clio_cte/core/core_client.h&gt;
-#include &lt;string&gt;
+#include <clio_runtime/clio_runtime.h>
+#include <clio_cte/core/core_client.h>
+#include <string>
 
 int main() {
   if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient)) return 1;

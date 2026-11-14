@@ -14,7 +14,7 @@ facts: Runtime | clio_run start ; Mount | clio_cte_fuse &lt;mountpoint&gt; -f ; 
 <div class="tabs" data-platform data-label="Platform">
   <section class="tab-panel" data-tab="Linux"><p class="tab-title">Linux</p>
 <pre data-label="shell">
-$ clio_run start &amp;
+$ clio_run start &
 $ mkdir -p ~/clio-mnt
 $ CLIO_WITH_RUNTIME=0 clio_cte_fuse ~/clio-mnt -f
 </pre>
@@ -27,7 +27,7 @@ $ clio_run stop
   <section class="tab-panel" data-tab="macOS"><p class="tab-title">macOS</p>
 <p>The pip wheel does not include the macOS adapter, so build it once against macFUSE as described in <a href="/docs/context-fs/install.html">Install</a>. Then:</p>
 <pre data-label="shell">
-$ clio_run start &amp;
+$ clio_run start &
 $ mkdir -p ~/clio-mnt
 $ CLIO_WITH_RUNTIME=0 clio_cte_fuse ~/clio-mnt -f
 </pre>
@@ -35,20 +35,20 @@ $ CLIO_WITH_RUNTIME=0 clio_cte_fuse ~/clio-mnt -f
   <section class="tab-panel" data-tab="Windows"><p class="tab-title">Windows</p>
 <p>Windows uses WinFsp, and the mountpoint is a drive letter or an empty folder path whose parent exists. Use two PowerShell windows. In the first:</p>
 <pre data-label="powershell">
-PS&gt;$env:CLIO_BIND_ADDR = "127.0.0.1"
-PS&gt;$env:CLIO_SERVER_ADDR = "127.0.0.1"
-PS&gt;clio_run start
+PS>$env:CLIO_BIND_ADDR = "127.0.0.1"
+PS>$env:CLIO_SERVER_ADDR = "127.0.0.1"
+PS>clio_run start
 </pre>
 <p>In the second:</p>
 <pre data-label="powershell">
-PS&gt;$env:CLIO_WITH_RUNTIME = "0"
-PS&gt;$env:CLIO_SERVER_ADDR = "127.0.0.1"
-PS&gt;clio_cte_fuse Z: -f
+PS>$env:CLIO_WITH_RUNTIME = "0"
+PS>$env:CLIO_SERVER_ADDR = "127.0.0.1"
+PS>clio_cte_fuse Z: -f
 </pre>
 <p>To unmount, stop the daemon, then the runtime:</p>
 <pre data-label="powershell">
-PS&gt;Stop-Process -Name clio_cte_fuse -Force
-PS&gt;clio_run stop
+PS>Stop-Process -Name clio_cte_fuse -Force
+PS>clio_run stop
 </pre>
 <p>The default configuration binds the dashboard to 127.0.0.1, and networking examples on Windows should do the same. Installing WinFsp, the Microsoft Defender note and the <code>-o uid=-1,gid=-1</code> option for git are in <a href="/tutorials/fuse-windows.html">FUSE on Windows</a>.</p></section>
 </div>
@@ -100,8 +100,8 @@ PS&gt;clio_run stop
 <pre data-label="shell">
 $ clio_run stop
 $ export CLIO_SERVER_CONF=~/clio-tiers.yaml
-$ clio_run start &amp;
-$ CLIO_WITH_RUNTIME=0 clio_cte_fuse ~/clio-mnt -f &amp;
+$ clio_run start &
+$ CLIO_WITH_RUNTIME=0 clio_cte_fuse ~/clio-mnt -f &
 </pre>
 <p>Three rules when editing:</p>
 <ul>

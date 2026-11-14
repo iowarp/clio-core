@@ -96,7 +96,7 @@ using u64 = clio::run::u64;
 
 class Dataset {
  public:
-  Dataset(const std::string &amp;tag_name, const std::vector&lt;int&gt; &amp;gpu_ids,
+  Dataset(const std::string &tag_name, const std::vector<int> &gpu_ids,
           u64 page_bytes, u32 nblocks, u32 set_size, u64 n_samples,
           u32 n_features,
           clio::run::PoolId storage_pool_id = clio::run::PoolId::GetNull(),
@@ -112,8 +112,8 @@ class Dataset {
   u32 NumBlocks() const;     // drivers must launch exactly this many blocks
   u64 RowOffset(u64 r) const;
 
-  PagedVec &amp;Vec();           // cpu_vector::Vector&lt;float&gt; or gpu_vector::Vector&lt;float&gt;
-  clio::cte::gpu_vector::DeviceVector&lt;float&gt; GetDevice(int gpu_id);  // GPU builds only
+  PagedVec &Vec();           // cpu_vector::Vector<float> or gpu_vector::Vector<float>
+  clio::cte::gpu_vector::DeviceVector<float> GetDevice(int gpu_id);  // GPU builds only
 };
 }
 </pre>
@@ -129,8 +129,8 @@ class Dataset {
 namespace clio_ml {
 inline bool HasCae();   // true when built with CLIO_ML_CAE
 
-inline void AssimilateFloat32File(const std::string &amp;tag,
-                                  const std::string &amp;path,
+inline void AssimilateFloat32File(const std::string &tag,
+                                  const std::string &path,
                                   std::uint64_t num_pages,
                                   std::uint64_t page_bytes,
                                   bool on_fault);

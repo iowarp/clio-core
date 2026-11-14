@@ -1,0 +1,125 @@
+<!--
+title: Design
+heading: Inside <em>Context FS.</em>
+description: How Context FS is built: the shared filesystem client library, the FUSE daemon and interceptors, the filesystem and stream modules, directory blocks and inode records stored as blobs, local path resolution, and the record logs that make it crash-safe.
+eyebrow: Docs · Context FS
+lede: Context FS is three layers of code: a client library shared by the FUSE daemon and the interceptors, the filesystem and stream modules in the runtime, and the CTE underneath. This page names the pieces and what each owns. The Filesystem and FUSE design page covers every operation and the consistency model in depth.
+facts: Modules | filesystem, stream ; Daemon | clio_cte_fuse ; Page size | 1 MiB blobs ; Directory block split | 1024 entries
+-->
+<h2 id="pieces">The pieces</h2>
+<figure class="diagram">
+  <svg viewBox="0 0 860 380" role="img" aria-label="Context FS layers: entry points, the shared client library, the filesystem and stream modules, and the CTE chain">
+    <defs><marker id="fs0" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+    <rect class="box alt" x="20" y="20" width="260" height="50" rx="8"/><text class="title" x="32" y="42">FUSE daemon</text><text class="muted" x="32" y="60">libfuse3, macFUSE, WinFsp</text>
+    <rect class="box alt" x="300" y="20" width="260" height="50" rx="8"/><text class="title" x="312" y="42">Interceptors</text><text class="muted" x="312" y="60">POSIX, STDIO, MPI-IO, HDF5 VFD</text>
+    <rect class="box alt" x="580" y="20" width="260" height="50" rx="8"/><text class="title" x="592" y="42">C++ API</text><text class="muted" x="592" y="60">filesystem client directly</text>
+    <rect class="box hl" x="20" y="100" width="820" height="62" rx="8"/><text class="title" x="32" y="124">Filesystem client library</text><text class="muted" x="32" y="144">descriptor table · write sieve and write-behind · zero-IPC read and stat mirrors</text>
+    <path class="edge hl" d="M150,70 L150,98" marker-end="url(#fs0)"/><path class="edge hl" d="M430,70 L430,98" marker-end="url(#fs0)"/><path class="edge hl" d="M710,70 L710,98" marker-end="url(#fs0)"/>
+    <rect class="box hl" x="20" y="192" width="400" height="62" rx="8"/><text class="title" x="32" y="216">Filesystem module</text><text class="muted" x="32" y="236">directory blocks, inodes, handles, leases</text>
+    <rect class="box hl" x="440" y="192" width="190" height="62" rx="8"/><text class="title" x="452" y="216">Stream module</text><text class="muted" x="452" y="236">sizes, appends</text>
+    <rect class="box" x="650" y="192" width="190" height="62" rx="8"/><text class="title" x="662" y="216">File pages</text><text class="muted" x="662" y="236">go straight down</text>
+    <path class="edge hl" d="M220,162 L220,190" marker-end="url(#fs0)"/><path class="edge hl" d="M535,162 L535,190" marker-end="url(#fs0)"/><path class="edge" d="M745,162 L745,190" marker-end="url(#fs0)"/>
+    <rect class="box hl" x="20" y="284" width="820" height="56" rx="8"/><text class="title" x="32" y="308">CTE chain (cache → … → core)</text><text class="muted" x="32" y="326">page blobs and directory-block blobs, tiered and replicated alike; inode records as tag attributes</text>
+    <path class="edge" d="M220,254 L220,282" marker-end="url(#fs0)"/><path class="edge" d="M535,254 L535,282" marker-end="url(#fs0)"/><path class="edge" d="M745,254 L745,282" marker-end="url(#fs0)"/>
+  </svg>
+  <figcaption>Namespace operations go to the filesystem module, sizes and
+  appends to the stream module, and file pages straight to the CTE
+  chain.</figcaption>
+</figure>
+
+<h2 id="layout">How the namespace is stored</h2>
+<figure class="diagram">
+  <svg viewBox="0 0 860 492" role="img" aria-label="Storage layout: a directory's tag holds its inode record and its inode-table blocks; a file's tag holds its inode record and 1 MiB page blobs; extended attributes live in one global tag">
+    <defs><marker id="fs1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+    <rect class="box" x="20" y="20" width="400" height="380" rx="10" stroke-dasharray="6 5"/>
+    <text class="title" x="32" y="44">Tag of directory /a</text><text class="muted" x="32" y="62">tag id = inode number; it names the home node</text>
+    <rect class="box alt" x="36" y="76" width="368" height="56" rx="8"/><text class="title" x="48" y="98">~i · inode record (tag attribute)</text><text class="muted" x="48" y="118">type, mode, owner, times, link count, parent</text>
+    <text class="muted" x="36" y="156">INODE-TABLE BLOCKS (one blob each)</text>
+    <rect class="box hl" x="36" y="166" width="368" height="92" rx="8"/><text class="title" x="48" y="188">d.0 · depth 2</text>
+    <text class="muted" x="48" y="208">x → #17 · file · live</text><text class="muted" x="48" y="224">y → #23 · directory · live</text><text class="muted" x="48" y="240">x2 → #17 · file · live (a hard link: same id)</text>
+    <rect class="box hl" x="36" y="268" width="176" height="50" rx="8"/><text class="title" x="48" y="290">d.1 · depth 1</text><text class="muted" x="48" y="308">keys with bit 0 set</text>
+    <rect class="box hl" x="228" y="268" width="176" height="50" rx="8"/><text class="title" x="240" y="290">d.2 · born at 2</text><text class="muted" x="240" y="308">split off d.0 by bit 1</text>
+    <text class="muted" x="36" y="342">At 1024 rows a block splits by the next hash bit;</text><text class="muted" x="36" y="358">blocks never merge. Home of block k: hash(dir, "d.k").</text><text class="muted" x="36" y="380">Row states: live, pending (invisible), leaving (frozen).</text>
+    <path class="edge hl" d="M404,208 L438,208" marker-end="url(#fs1)"/>
+    <rect class="box" x="440" y="20" width="400" height="380" rx="10" stroke-dasharray="6 5"/>
+    <text class="title" x="452" y="44">Tag of file /a/x (#17)</text><text class="muted" x="452" y="62">home: the node its id names</text>
+    <rect class="box alt" x="456" y="76" width="368" height="56" rx="8"/><text class="title" x="468" y="98">~i · inode record (tag attribute)</text><text class="muted" x="468" y="118">type, mode, owner, times, link count, size snapshot</text>
+    <text class="muted" x="456" y="156">PAGE BLOBS (1 MiB each, named by index)</text>
+    <rect class="box hl" x="456" y="166" width="86" height="50" rx="8"/><text class="title" x="468" y="196">0</text>
+    <rect class="box hl" x="550" y="166" width="86" height="50" rx="8"/><text class="title" x="562" y="196">1</text>
+    <rect class="box" x="644" y="166" width="86" height="50" rx="8" stroke-dasharray="4 4"/><text class="muted" x="656" y="196">2 · hole</text>
+    <rect class="box hl" x="738" y="166" width="86" height="50" rx="8"/><text class="title" x="750" y="196">3</text>
+    <text class="muted" x="456" y="242">A missing page is a hole and reads as zeros. Each page</text><text class="muted" x="456" y="258">is placed by the CTE's per-blob hash, so one large</text><text class="muted" x="456" y="274">file spreads over every node.</text>
+    <rect class="box alt" x="456" y="296" width="368" height="56" rx="8"/><text class="title" x="468" y="318">Logical size and append order</text><text class="muted" x="468" y="338">owned by the stream module, not by the pages</text>
+    <rect class="box hl" x="20" y="420" width="820" height="56" rx="8"/><text class="title" x="32" y="442">Extended-attribute tag (one per volume)</text><text class="muted" x="32" y="462">one blob per inode, named by its id, holding all of its xattrs; kept out of the file's tag so st_size stays exact</text>
+  </svg>
+  <figcaption>Every file, directory and symbolic link is a CTE tag. Names live
+  in the parent directory's inode-table blocks, which are blobs; attributes
+  live in the inode's own record, a tag attribute. Because a name row only
+  points at an id, a hard link is simply a second row.</figcaption>
+</figure>
+
+<h2 id="caches">Caches and homes</h2>
+<figure class="diagram">
+  <svg viewBox="0 0 860 540" role="img" aria-label="Who holds what on each node: the client's descriptor table and write sieve, the shared-memory mirror, the filesystem container's table blocks, inodes and journal, the stream container, and pushes from a block's home on another node">
+    <defs><marker id="fs2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+    <rect class="box" x="20" y="20" width="600" height="432" rx="10" stroke-dasharray="6 5"/><text class="muted" x="32" y="38">NODE A</text>
+    <rect class="box alt" x="36" y="48" width="568" height="104" rx="8"/><text class="title" x="48" y="68">Client process</text><text class="muted" x="160" y="68">FUSE daemon, interceptor or C++ API</text>
+    <rect class="box" x="48" y="80" width="270" height="60" rx="6"/><text class="title" x="60" y="100">Descriptor table</text><text class="muted" x="60" y="118">open file → handle from its home</text><text class="muted" x="60" y="132">reads, writes and close go there</text>
+    <rect class="box" x="330" y="80" width="262" height="60" rx="6"/><text class="title" x="342" y="100">Write sieve</text><text class="muted" x="342" y="118">small writes gather in 64 KiB pages</text><text class="muted" x="342" y="132">flushed every ~500 µs, close, fsync</text>
+    <rect class="box" x="36" y="168" width="440" height="58" rx="8"/><text class="title" x="48" y="188">Shared-memory mirror</text><text class="muted" x="48" y="206">path → tag id, logical size, mode, owner</text><text class="muted" x="48" y="220">complete directory: a miss is ENOENT, no task</text>
+    <path class="edge" d="M150,152 L150,166" marker-end="url(#fs2)"/><path class="edge" d="M300,240 L300,228" marker-end="url(#fs2)"/>
+    <path class="edge hl" d="M560,152 L560,238" marker-end="url(#fs2)"/><text class="muted" x="490" y="186">path</text><text class="muted" x="490" y="200">operations</text>
+    <rect class="box hl" x="36" y="240" width="568" height="140" rx="8"/><text class="title" x="48" y="262">Filesystem container</text>
+    <rect class="box" x="48" y="272" width="180" height="50" rx="6"/><text class="title" x="60" y="292">Inodes it homes</text><text class="muted" x="60" y="310">attributes, who caches</text>
+    <rect class="box" x="48" y="330" width="180" height="42" rx="6"/><text class="title" x="60" y="348">Directory journal</text><text class="muted" x="60" y="364">block images + deltas</text>
+    <rect class="box" x="240" y="272" width="352" height="100" rx="6"/><text class="title" x="252" y="292">Inode-table blocks</text><text class="muted" x="252" y="312">home blocks: the one writable copy, journaled</text><text class="muted" x="252" y="328">other blocks: copies served under a 10 s lease,</text><text class="muted" x="252" y="344">kept current by the home's pushes</text><text class="muted" x="252" y="360">every path walk resolves here</text>
+    <rect class="box hl" x="36" y="392" width="568" height="46" rx="8"/><text class="title" x="48" y="420">Stream container</text><text class="muted" x="190" y="420">logical sizes, append order (home) · staged appends (origin)</text>
+    <rect class="box" x="640" y="20" width="200" height="432" rx="10" stroke-dasharray="6 5"/><text class="muted" x="652" y="38">NODE B</text>
+    <rect class="box alt" x="656" y="48" width="168" height="104" rx="8"/><text class="title" x="668" y="68">Clients</text><text class="muted" x="668" y="88">same pieces</text><text class="muted" x="668" y="104">as on node A</text>
+    <rect class="box hl" x="656" y="240" width="168" height="140" rx="8"/><text class="title" x="668" y="262">Filesystem container</text><text class="muted" x="668" y="284">home of block d.1 of /a,</text><text class="muted" x="668" y="300">its only writer; sends</text><text class="muted" x="668" y="316">each change to every</text><text class="muted" x="668" y="332">copy before it</text><text class="muted" x="668" y="348">acknowledges it</text>
+    <path class="edge hl" d="M656,322 L594,322" marker-end="url(#fs2)"/>
+    <path class="edge" d="M320,452 L320,474" marker-end="url(#fs2)"/><path class="edge" d="M740,452 L740,474" marker-end="url(#fs2)"/>
+    <rect class="box hl" x="20" y="476" width="820" height="50" rx="8"/><text class="title" x="32" y="498">CTE chain (cache → … → core)</text><text class="muted" x="32" y="516">file pages, table blocks and xattr blobs: tiered, logged, replicated · inode records: tag attributes</text>
+  </svg>
+  <figcaption>There is no metadata server. Path operations go to the local
+  filesystem container, which walks the path through its copies of the
+  directory blocks; a block's home pushes every change to the nodes holding a
+  copy before it acknowledges, so a warm walk needs no network round trip.
+  Clients skip the runtime entirely for a warm <code>stat</code> or a miss in
+  a complete directory, and batch small writes before sending them.</figcaption>
+</figure>
+
+<h2 id="client">The client library</h2>
+<p>The FUSE daemon, the preloaded interceptors and the C++ API share one client library, so they behave the same. It keeps:</p>
+<ul>
+  <li><strong>A descriptor table</strong> mapping open files to the handle the inode's home node issued, so reads, writes and close go straight to that node.</li>
+  <li><strong>A write sieve</strong>: small writes are gathered in 64 KiB shared-memory pages (the CTE client's write sieve) and shipped as one put within about a millisecond, or at close and <code>fsync</code>. Errors therefore surface at close or <code>fsync</code>.</li>
+  <li><strong>Read and stat mirrors</strong> in shared memory, published by the runtime, so a warm <code>stat</code> or a read of a local RAM page needs no task at all.</li>
+</ul>
+
+<h2 id="modules">The filesystem and stream modules</h2>
+<dl class="notes">
+  <div><dt>Every object is a tag</dt><dd>Each file, directory and symbolic link is a CTE tag. The tag id is the inode number and encodes the node that serves it, its home.</dd></div>
+  <div><dt>Files</dt><dd>Data lives in the file's tag as 1 MiB page blobs named by index; a missing page is a hole. A small inode record, stored as an attribute of the file's own tag, holds type, mode, owner, times, link count and a size snapshot. Extended attributes live in one global tag.</dd></div>
+  <div><dt>Directories</dt><dd>Entries live in directory-block blobs placed by name hash. A block over 1024 entries splits by the next hash bit; blocks never merge. Each entry is live, pending or leaving, which lets multi-step operations abort cleanly after a crash.</dd></div>
+  <div><dt>Sizes and appends</dt><dd>The stream module holds each file's logical size and orders concurrent appends from many nodes by staging them, then merging them in one order.</dd></div>
+  <div><dt>Local path resolution</dt><dd>Every path request goes to the local filesystem container, which walks the path from its cache of directory blocks. Blocks it does not own are fetched once, and the owner pushes later changes to it, so a warm walk costs no network round trip.</dd></div>
+  <div><dt>Leases</dt><dd>Cached namespace state is valid only under a lease, so a partitioned node can delay mutations but cannot serve stale names.</dd></div>
+</dl>
+
+<h2 id="durability">Crash safety</h2>
+<p>The filesystem and stream modules keep their node-local metadata in an append-only, self-checking record log: one <code>write</code> per mutation, replayed at startup with a torn tail cut off, then compacted. Operations are ordered so a crash leaks space rather than corrupting: the inode record is stored before its name appears, and link counts rise before links do. Directory blocks are ordinary CTE blobs, so the CTE's metadata log and replication protect them like file data. Inode records are tag attributes, which the replication module does not copy; instead the filesystem module mirrors each record, best effort, to the node that takes over the inode when its home is down.</p>
+
+<h2 id="fuse">The FUSE daemon</h2>
+<p><code>clio_cte_fuse</code> is a runtime client. It translates kernel requests into client-library calls, configures the kernel's attribute and entry caches (see <a href="/design/filesystem.html#fuse">the FUSE daemon</a>), and takes the sieve and mirror fast paths. Those fast paths are single-node: on a multi-node mount, appends are staged and merged through the stream module.</p>
+
+<h2 id="tradeoffs">Costs of this design</h2>
+<table class="tradeoffs">
+  <tr><th>Decision</th><th>Buys</th><th>Costs</th></tr>
+  <tr><td>Everything is a blob</td><td class="good">One tiering, replication and durability mechanism for data and metadata</td><td class="cost">Metadata blobs consume tier space and logging like data</td></tr>
+  <tr><td>Write-behind sieve</td><td class="good">Microsecond writes</td><td class="cost">Errors appear at close or <code>fsync</code></td></tr>
+  <tr><td>Multi-step rename</td><td class="good">No distributed transactions</td><td class="cost">Intermediate states exist, though invisible or harmless</td></tr>
+  <tr><td>Leases</td><td class="good">Never stale</td><td class="cost">Mutations can stall behind a partitioned holder</td></tr>
+</table>
+<p>See <a href="/design/filesystem.html">Filesystem and FUSE</a> for each operation step by step.</p>

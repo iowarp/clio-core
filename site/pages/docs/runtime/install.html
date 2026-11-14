@@ -42,11 +42,11 @@ $ cmake --install build --prefix $HOME/clio-inst
 </pre></section>
   <section class="tab-panel" data-tab="Windows"><p class="tab-title">Windows</p>
 <pre data-label="powershell">
-PS&gt;git clone --recurse-submodules https://github.com/iowarp/clio-core.git
-PS&gt;cd clio-core
-PS&gt;cmake --preset windows-release
-PS&gt;cmake --build build --config Release
-PS&gt;cmake --install build --config Release --prefix $HOME\clio-inst
+PS>git clone --recurse-submodules https://github.com/iowarp/clio-core.git
+PS>cd clio-core
+PS>cmake --preset windows-release
+PS>cmake --build build --config Release
+PS>cmake --install build --config Release --prefix $HOME\clio-inst
 </pre>
 <p>Dependencies come from vcpkg; set <code>VCPKG_ROOT</code> first. Module libraries end in <code>_runtime.dll</code> and <code>CLIO_REPO_PATH</code> entries are separated by <code>;</code>.</p></section>
 </div>
