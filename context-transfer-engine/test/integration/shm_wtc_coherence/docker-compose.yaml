@@ -73,11 +73,11 @@ services:
     hostname: wtc-node1
     networks:
       wtc-cluster:
-        ipv4_address: 172.31.0.10
+        ipv4_address: 172.31.9.10
     environment:
       <<: *coh-env
       NODE_ID: "1"
-      NODE_IP: 172.31.0.10
+      NODE_IP: 172.31.9.10
     command: *coh-cmd
 
   wtc-node2:
@@ -86,11 +86,11 @@ services:
     hostname: wtc-node2
     networks:
       wtc-cluster:
-        ipv4_address: 172.31.0.11
+        ipv4_address: 172.31.9.11
     environment:
       <<: *coh-env
       NODE_ID: "2"
-      NODE_IP: 172.31.0.11
+      NODE_IP: 172.31.9.11
     command: *coh-cmd
 
   wtc-node3:
@@ -99,11 +99,11 @@ services:
     hostname: wtc-node3
     networks:
       wtc-cluster:
-        ipv4_address: 172.31.0.12
+        ipv4_address: 172.31.9.12
     environment:
       <<: *coh-env
       NODE_ID: "3"
-      NODE_IP: 172.31.0.12
+      NODE_IP: 172.31.9.12
     command: *coh-cmd
 
   wtc-node4:
@@ -112,11 +112,11 @@ services:
     hostname: wtc-node4
     networks:
       wtc-cluster:
-        ipv4_address: 172.31.0.13
+        ipv4_address: 172.31.9.13
     environment:
       <<: *coh-env
       NODE_ID: "4"
-      NODE_IP: 172.31.0.13
+      NODE_IP: 172.31.9.13
     command: *coh-cmd
 
 networks:
@@ -124,4 +124,4 @@ networks:
     driver: bridge
     ipam:
       config:
-        - subnet: 172.31.0.0/24
+        - subnet: 172.31.9.0/24
