@@ -26,10 +26,10 @@ vectors = np.asarray(r.model.params)[:5000 * 64].reshape(5000, 64)
 
 <h2>C++</h2>
 <pre data-label="cpp">
-Word2VecResult FitWord2Vec(Dataset &amp;ds, const Word2VecOptions &amp;opt);
+Word2VecResult FitWord2Vec(Dataset &ds, const Word2VecOptions &opt);
 Word2VecResult FitWord2VecPlain(const float *data, u64 n_pairs, u64 elems_per_page,
-                                u32 nblocks, const Word2VecOptions &amp;opt);
-u32 Word2VecNearest(const Word2VecModel &amp;m, u32 w);  // nearest word by cosine
+                                u32 nblocks, const Word2VecOptions &opt);
+u32 Word2VecNearest(const Word2VecModel &m, u32 w);  // nearest word by cosine
 </pre>
 <p>The paged call needs the runtime; the <code>Plain</code> call runs the same kernel over a plain copy of the data without one.</p>
 

@@ -10,6 +10,7 @@
 
 #include "clio_runtime/ipc/ipc_cpu2cpu.h"
 #include "clio_runtime/ipc/ipc_cpu2cpu_zmq.h"
+#include "clio_runtime/evlat.h"
 
 #include <unordered_map>
 
@@ -91,7 +92,8 @@ Future<TaskT> IpcCpu2Cpu::SendIn(IpcManager *ipc,
   // returned Future (or a copy) is alive — the client holds it until Recv.
   {
     std::lock_guard<std::mutex> lock(ipc->pending_futures_mutex_);
-    ipc->pending_zmq_futures_[net_key] = {task_ptr.get()};
+    ipc->pending_zmq_futures_[net_key] = {task_ptr.get(),
+                                          clio::run::evlat::Now()};
   }
 
   // issue #807: shard across the runtime's S inbound rings. Key by this client

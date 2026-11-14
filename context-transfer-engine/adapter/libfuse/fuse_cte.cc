@@ -71,6 +71,7 @@
 #include "clio_cte/core/core_client.h"  // CLIO_CTE_CLIENT + GetCapacity
 #include "clio_cte/filesystem/filesystem_client.h"
 #include "clio_cte/filesystem/fs_inode.h"
+#include "clio_cte/filesystem/fs_inode_table.h"  // directory offsets
 #include "clio_cte/filesystem/fs_shard.h"
 #include "clio_cte/stream/stream_client.h"  // deferred O_APPEND
 #include "clio_cte/replication/replication_tasks.h"  // FlushTagTask (fsync barrier)
@@ -770,8 +771,9 @@ void TimesOverlayDropMtime(const std::string &p);
 // 400k Getattr tasks of a 16k-file checkout). Directory attributes from the
 // runtime are kept for the mount's attribute TTL, the staleness the kernel
 // attribute cache already allows here, and dropped on every change this
-// mount makes to the directory or its entries. Single-node mounts only:
-// there every change passes through this mount.
+// mount makes to the directory or its entries. On by default on single-node
+// mounts only (there every change passes through this mount); multi-node
+// mounts opt in with CLIO_FUSE_DIR_ATTR_CACHE_S and accept that staleness.
 struct DirAttrEntry {
   cte_stat_t st;
   std::chrono::steady_clock::time_point expiry;
@@ -787,6 +789,55 @@ double g_entry_ttl_s = 0.0;  ///< kernel entry TTL, set at init (#1323)
  * @param stbuf receives the attributes on a hit
  * @return true on a fresh hit
  */
+// READDIR PREFETCH (opt-in, CLIO_FUSE_READDIR_PREFETCH=<window>): a listing
+// of a large directory issues its children's getattrs concurrently, `window`
+// in flight, and parks the results here. find/ls -l then stat every entry;
+// without this each stat was its own serial round trip to the entry's owner
+// node (IO500 find at 16 nodes: one pfind rank stat'ing 512k entries of
+// mdtest-hard one by one took >12 min). Each result is consumed by the
+// first getattr of that path and expires after kPrefetchTtlNs, so staleness
+// is bounded by that window. Off by default: multi-node mounts otherwise
+// keep exact close-to-open attributes.
+// pfind/ls read the WHOLE listing before stat'ing anything, so the TTL must
+// cover the full stat pass over a large directory (a 2 s TTL expired most of
+// a 512k-entry prefetch before its first stat). CLIO_FUSE_READDIR_PREFETCH_TTL_S.
+static int64_t PrefetchTtlNs() {
+  static const int64_t ttl = [] {
+    const char *e = getenv("CLIO_FUSE_READDIR_PREFETCH_TTL_S");
+    const double s = (e != nullptr && *e != '\0') ? atof(e) : 60.0;
+    return static_cast<int64_t>(s * 1e9);
+  }();
+  return ttl;
+}
+static std::mutex g_pf_mtx;
+static std::unordered_map<std::string, std::pair<cte_stat_t, int64_t>> g_pf;
+static int64_t PfNowNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+static int PrefetchWindow() {
+  static const int w = [] {
+    const char *e = getenv("CLIO_FUSE_READDIR_PREFETCH");
+    return (e != nullptr && *e != '\0') ? atoi(e) : 0;
+  }();
+  return w;
+}
+static bool PrefetchTake(const std::string &p, cte_stat_t *st) {
+  if (PrefetchWindow() <= 0) return false;
+  std::lock_guard<std::mutex> lk(g_pf_mtx);
+  auto it = g_pf.find(p);
+  if (it == g_pf.end()) return false;
+  const bool fresh = PfNowNs() - it->second.second < PrefetchTtlNs();
+  if (fresh) *st = it->second.first;
+  g_pf.erase(it);
+  return fresh;
+}
+static void PrefetchDrop(const std::string &p) {
+  if (PrefetchWindow() <= 0) return;
+  std::lock_guard<std::mutex> lk(g_pf_mtx);
+  g_pf.erase(p);
+}
+
 static bool DirAttrLookup(const std::string &p, cte_stat_t *stbuf) {
   if (g_dir_attr_ttl_s <= 0.0) return false;
   std::lock_guard<std::mutex> lk(g_dir_attr_mtx);
@@ -826,6 +877,7 @@ static void DirAttrClear() {
  * @param p the path being created, removed, renamed or changed
  */
 static void DirAttrInvalidate(const std::string &p) {
+  PrefetchDrop(p);
   if (g_dir_attr_ttl_s <= 0.0) return;
   std::lock_guard<std::mutex> lk(g_dir_attr_mtx);
   g_dir_attr.erase(p);
@@ -1793,7 +1845,23 @@ static void *cte_fuse_init(struct fuse_conn_info *conn,
   cfg->attr_timeout = attr_ttl;
   cfg->entry_timeout = entry_ttl;
   g_entry_ttl_s = entry_ttl;
+  // Directory attribute cache (see DirAttrEntry). Single-node: on for
+  // attr_ttl. Multi-node: off by default, opt in with
+  // CLIO_FUSE_DIR_ATTR_CACHE_S. Why it is worth opting in: with attr_timeout
+  // 0 and default_permissions the kernel re-fetches the attributes of every
+  // ancestor directory on each path walk, so each syscall costs one getattr
+  // per path component; this cache answers those from the adapter. Trade:
+  // this mount's own changes invalidate the entry, but a change made through
+  // another node (chmod/chown of a directory, entries added/removed changing
+  // nlink/mtime, rmdir) can be seen stale for up to the TTL. File attributes
+  // are never cached here. A set value applies on any mount; 0 disables and
+  // negative values clamp to 0.
   g_dir_attr_ttl_s = MultiNode() ? 0.0 : attr_ttl;
+  if (const char *dir_ttl_env = getenv("CLIO_FUSE_DIR_ATTR_CACHE_S")) {
+    if (*dir_ttl_env != '\0') {
+      g_dir_attr_ttl_s = std::max(0.0, atof(dir_ttl_env));
+    }
+  }
   cfg->negative_timeout = attr_ttl;
   // Writeback cache: OFF by default. Enabling it batches write()s in the
   // kernel page cache, but the kernel then requires the filesystem to be a
@@ -2264,6 +2332,7 @@ static int cte_fuse_getattr_stat_inner(const char *path, cte_stat_t *stbuf,
     }
   }
 
+  if (PrefetchTake(p, stbuf)) return 0;
   // Delegate to the filesystem chimod: it owns exists/is-dir/logical-size.
   auto t = cfs->AsyncGetattr(p);
   t.Wait();
@@ -2721,37 +2790,156 @@ int cte_fuse_readdir_flush_guard() {
   return 0;
 }
 
-int cte_fuse_readdir(const char *path, void *buf,
-                            ClioFuseFillDirT filler, cte_off_t offset,
-                            struct fuse_file_info *fi,
-                            enum fuse_readdir_flags flags) {
-  cte_fuse_readdir_flush_guard();
-  (void)offset;
-  (void)fi;
-  (void)flags;
+/**
+ * File-type bits (S_IFMT) for a directory entry of the given filesystem type.
+ * @param fs_type kFsType* as stored in the directory row
+ * @return S_IFREG, S_IFDIR or S_IFLNK; 0 (DT_UNKNOWN) for anything else
+ */
+static cte_mode_t DirentMode(clio::run::u32 fs_type) {
+  switch (fs_type) {
+    case clio::cte::filesystem::kFsTypeFile: return S_IFREG;
+    case clio::cte::filesystem::kFsTypeDir: return S_IFDIR;
+    case clio::cte::filesystem::kFsTypeSymlink: return S_IFLNK;
+    default: return 0;
+  }
+}
 
-  filler(buf, ".", nullptr, 0, static_cast<fuse_fill_dir_flags>(0));
-  filler(buf, "..", nullptr, 0, static_cast<fuse_fill_dir_flags>(0));
-  // hard_remove: a directory removed while open has no path; it is empty.
-  if (path == nullptr) return 0;
-  std::string p(path);
+// ---------------------------------------------------------------------------
+// Seekable, chunked listings.
+//
+// Every entry has a stable offset derived from its name (DirEntryOff in
+// fs_inode_table.h): the same in every process and across opens, so
+// telldir/seekdir work and a walker may hand a range of one directory to
+// another process. The listing is ascending by offset and is fetched from
+// the chimod in chunks of about kDirChunkEntries entries (ReaddirRange)
+// instead of one reply holding the whole directory.
+//
+// Offsets the kernel sees: 0 = start, 1 after ".", 2 after "..", then for
+// every entry the offset OF THE ENTRY THAT FOLLOWS IT (what telldir returns
+// after reading it, and where a later readdir resumes), INT64_MAX after the
+// last one.
+// ---------------------------------------------------------------------------
 
-  // Delegate listing to the filesystem chimod. It returns the full tag paths
-  // of the directory's children; strip the directory prefix to get basenames.
+namespace {
+/** Entries asked for per ReaddirRange task. */
+constexpr clio::run::u32 kDirChunkEntries = 8192;
+
+/** One listed entry of a fetched chunk. */
+struct DirChunkEntry {
+  std::string name;         ///< basename as listed
+  clio::run::u64 off = 0;   ///< the entry's own offset
+  clio::run::u64 ino = 0;   ///< d_ino (never 0)
+  clio::run::u32 type = 0;  ///< kFsType*
+};
+
+/** One fetched chunk: every listed entry with offset in [start, next). */
+struct DirChunk {
+  bool valid = false;
+  clio::run::u64 start = 0;  ///< offset the chunk was fetched from
+  clio::run::u64 next = clio::cte::filesystem::kDirOffEnd;  ///< next chunk
+  std::vector<DirChunkEntry> entries;  ///< ascending by (off, name)
+};
+
+/**
+ * Per-opendir state, kept in fuse_file_info::fh of a DIRECTORY handle.
+ * The kernel keeps directory and file handles apart (opendir/readdir/
+ * releasedir/fsyncdir versus open/read/.../release, and it sends no handle
+ * with a directory's getattr or setattr), so this is never reached through
+ * the CfsHandle casts of the file paths (GetHandle, OpPath).
+ */
+struct DirHandle {
+  std::mutex mu;   ///< guards everything below
+  DirChunk chunk;  ///< the chunk fetched last
+  /** Equal offsets: the last entry emitted is followed by one with the SAME
+   *  offset, so the kernel resumes at `resume_off` and `skip_count` entries
+   *  of that offset are already out. 0 = no such resume pending. */
+  clio::run::u64 resume_off = 0;
+  size_t skip_count = 0;
+};
+}  // namespace
+
+/**
+ * Warm the stat cache for the entries of one fetched chunk (opt-in:
+ * CLIO_FUSE_READDIR_PREFETCH sets the window of getattrs in flight).
+ * @param dir the directory, for the slow-prefetch report
+ * @param raw_entries entries the chunk held before filtering
+ * @param fulls full path of every listed entry of the chunk
+ */
+static void PrefetchChunkStats(const std::string &dir, size_t raw_entries,
+                               const std::vector<std::string> &fulls) {
+  // Only chunks too large for the caller's own parallelism, and one
+  // prefetch per mount at a time: pfind lists hundreds of directories at
+  // once, and prefetching all of them (2000-entry mdtest-easy dirs too)
+  // put ~65k getattrs in flight per node, saturated every runtime worker
+  // and made a stat of the mount root take 61 s.
+  static const size_t pf_min = [] {
+    const char *e = getenv("CLIO_FUSE_READDIR_PREFETCH_MIN");
+    return (e != nullptr && *e != '\0') ? static_cast<size_t>(atoll(e))
+                                         : static_cast<size_t>(8192);
+  }();
+  static std::mutex pf_one;
+  const int win = PrefetchWindow();
+  if (win <= 0 || raw_entries < pf_min) return;
+  std::unique_lock<std::mutex> pf_lk(pf_one, std::try_to_lock);
+  if (!pf_lk.owns_lock()) return;
   auto *cfs = CLIO_CFS_CLIENT;
-  auto t = cfs->AsyncReaddir(p);
+  using GetattrFuture = decltype(cfs->AsyncGetattr(dir));
+  std::vector<std::pair<std::string, GetattrFuture>> inflight;
+  inflight.reserve(static_cast<size_t>(win));
+  auto drain = [&]() {
+    for (auto &kv : inflight) {
+      kv.second.Wait();
+      if (kv.second->GetReturnCode() != 0 || kv.second->exists_ == 0) continue;
+      cte_stat_t pst;
+      memset(&pst, 0, sizeof(pst));
+      FillStatFromGetattr(kv.second.get(), kv.first, &pst);
+      std::lock_guard<std::mutex> lk(g_pf_mtx);
+      g_pf[kv.first] = {pst, PfNowNs()};
+    }
+    inflight.clear();
+  };
+  const int64_t pf_t0 = PfNowNs();
+  for (const std::string &full : fulls) {
+    auto f = cfs->AsyncGetattr(full);
+    inflight.emplace_back(full, std::move(f));
+    if (inflight.size() >= static_cast<size_t>(win)) drain();
+  }
+  drain();
+  if (raw_entries >= 4096) {
+    HLOG(kWarning, "clio_cte_fuse: readdir prefetch of {} ({} entries) took {} ms",
+         dir, raw_entries, (PfNowNs() - pf_t0) / 1000000);
+  }
+}
+
+/**
+ * Fetch the chunk of directory `p` that starts at offset `start`.
+ * @param p directory path
+ * @param start first offset wanted
+ * @param c receives the chunk (invalid on failure)
+ * @return 0 or a negative errno -- a failed listing is never an empty one
+ */
+static int FetchDirChunk(const std::string &p, clio::run::u64 start,
+                         DirChunk *c) {
+  c->valid = false;
+  c->entries.clear();
+  auto *cfs = CLIO_CFS_CLIENT;
+  auto t = cfs->AsyncReaddirRange(p, start, kDirChunkEntries);
   t.Wait();
   if (t->GetReturnCode() != 0) {
     // Never report a listing that failed as an empty directory: rm -r
     // would unlink nothing and its rmdir would then fail ENOTEMPTY (#1029).
-    HLOG(kError, "clio_cte_fuse: readdir of {} failed (rc {})", p,
-         t->GetReturnCode());
+    HLOG(kError, "clio_cte_fuse: readdir of {} at offset {} failed (rc {})", p,
+         start, t->GetReturnCode());
     return FsErrno(t->GetReturnCode());
   }
+  const size_t n = t->entries_.size();
+  if (t->offs_.size() != n) return -EIO;  // offsets are per entry
+  // The chimod returns full paths; strip the directory prefix.
   size_t prefix_len = p.size();
   if (!p.empty() && p.back() != '/') prefix_len++;
-  // entries_ and inos_ are index-aligned (the chimod builds them together).
-  for (size_t i = 0; i < t->entries_.size(); ++i) {
+  std::vector<std::string> fulls;
+  c->entries.reserve(n);
+  for (size_t i = 0; i < n; ++i) {
     std::string full = t->entries_[i].str();
     std::string name = full.size() > prefix_len ? full.substr(prefix_len) : full;
     // A child sentinel directory may come back as "<dir>/<name>/"; drop the
@@ -2764,34 +2952,209 @@ int cte_fuse_readdir(const char *path, void *buf,
     // as POSIX is concerned: listing it made `ls` show debris and let rm -r
     // trip over it.
     if (name.rfind(".fuse_hidden", 0) == 0) continue;
-    // Supply only d_ino (the child's tag-derived inode) so getdents agrees with
-    // a subsequent stat (generic/637). Leave st_mode = 0 (DT_UNKNOWN): the entry
-    // type is not reliably known here, so the kernel issues a getattr to resolve
-    // it — setting a wrong d_type would mislead `rm -rf`/`find`.
-    cte_stat_t st;
-    memset(&st, 0, sizeof(st));
-    st.st_ino = i < t->inos_.size() ? static_cast<ino_t>(t->inos_[i]) : 0;
+    DirChunkEntry e;
+    e.off = t->offs_[i];
+    e.type = i < t->types_.size() ? t->types_[i] : 0;
+    e.ino = i < t->inos_.size() ? t->inos_[i] : 0;
     // d_ino = 0 means "deleted" to glibc's readdir(3), which silently DROPS
     // the entry — children whose ino lookup missed became invisible to ls
     // and rm -r while the server still listed them (generic/070's
     // undeletable "non-empty" dirs). Any nonzero value keeps the entry
     // visible; a name hash stays stable across listings.
-    if (st.st_ino == 0) {
+    if (e.ino == 0) {
       clio::run::u64 h = 1469598103934665603ull;
-      for (unsigned char c : full) h = (h ^ c) * 1099511628211ull;
-      st.st_ino = static_cast<ino_t>(h | 1);
+      for (unsigned char ch : full) h = (h ^ ch) * 1099511628211ull;
+      e.ino = h | 1;
     }
+    e.name = std::move(name);
+    c->entries.push_back(std::move(e));
+    if (PrefetchWindow() > 0) {
+      if (!full.empty() && full.back() == '/') full.pop_back();
+      fulls.push_back(std::move(full));
+    }
+  }
+  c->start = start;
+  c->next = t->next_off_;
+  c->valid = true;
+  PrefetchChunkStats(p, n, fulls);
+  return 0;
+}
+
+/**
+ * Hand one entry to the kernel's fill callback.
+ * @param buf the callback's buffer
+ * @param filler the fill callback
+ * @param e the entry
+ * @param next_off offset to resume at after this entry (never 0)
+ * @return the callback's result: non-zero when the reply buffer is full
+ */
+static int EmitDirent(void *buf, ClioFuseFillDirT filler,
+                      const DirChunkEntry &e, clio::run::u64 next_off) {
+  // Supply d_ino (the child's tag-derived inode) so getdents agrees with a
+  // subsequent stat (generic/637), and d_type from the type stored in the
+  // directory row (immutable for an inode). Without d_type a walker stats
+  // every entry just to tell files from directories: pfind did 128,000
+  // serial stats on one rank for one shared directory. An entry whose type
+  // the chimod did not report stays DT_UNKNOWN (st_mode = 0).
+  cte_stat_t st;
+  memset(&st, 0, sizeof(st));
+  st.st_mode = DirentMode(e.type);
+  st.st_ino = static_cast<ino_t>(e.ino);
+  const cte_off_t off = static_cast<cte_off_t>(next_off);
 #ifdef __APPLE__
-    // macFUSE's fill-dir callback consumes a fuse_darwin_attr, not a
-    // struct stat — translate (same mapping getattr uses).
-    struct fuse_darwin_attr attr;
-    CopyStatToDarwinAttr(st, &attr);
-    filler(buf, name.c_str(), &attr, 0, static_cast<fuse_fill_dir_flags>(0));
+  // macFUSE's fill-dir callback consumes a fuse_darwin_attr, not a
+  // struct stat — translate (same mapping getattr uses).
+  struct fuse_darwin_attr attr;
+  CopyStatToDarwinAttr(st, &attr);
+  return filler(buf, e.name.c_str(), &attr, off,
+                static_cast<fuse_fill_dir_flags>(0));
 #else
-    filler(buf, name.c_str(), &st, 0, static_cast<fuse_fill_dir_flags>(0));
+  return filler(buf, e.name.c_str(), &st, off,
+                static_cast<fuse_fill_dir_flags>(0));
 #endif
+}
+
+/**
+ * Emit the entries of `p` from offset `pos` on until the reply buffer is
+ * full or the directory ends, fetching chunks as needed.
+ * @param p directory path
+ * @param dh listing state (its mutex held): an opendir handle, or a
+ *        throwaway for a caller without one
+ * @param pos first offset wanted (>= kDirOffFirst)
+ * @param skip entries of offset `pos` to pass over: the ones this handle
+ *        already emitted before the kernel resumed at `pos`
+ * @param buf the fill callback's buffer
+ * @param filler the fill callback
+ * @return 0 or a negative errno
+ */
+static int EmitDirFrom(const std::string &p, DirHandle *dh,
+                       clio::run::u64 pos, size_t skip, void *buf,
+                       ClioFuseFillDirT filler) {
+  using clio::cte::filesystem::kDirOffEnd;
+  DirChunk &c = dh->chunk;
+  for (;;) {
+    if (!c.valid || pos < c.start || pos >= c.next) {
+      if (const int rc = FetchDirChunk(p, pos, &c)) return rc;
+    }
+    const std::vector<DirChunkEntry> &v = c.entries;
+    size_t i = static_cast<size_t>(
+        std::lower_bound(v.begin(), v.end(), pos,
+                         [](const DirChunkEntry &e, clio::run::u64 o) {
+                           return e.off < o;
+                         }) - v.begin());
+    for (; skip > 0 && i < v.size() && v[i].off == pos; --skip) ++i;
+    skip = 0;
+    for (; i < v.size(); ++i) {
+      // What the kernel resumes at after this entry: the NEXT entry's own
+      // offset (a walker ends its range once telldir reaches the range's
+      // end, so this must not be "own offset + 1").
+      const clio::run::u64 next = i + 1 < v.size() ? v[i + 1].off : c.next;
+      if (EmitDirent(buf, filler, v[i], next) != 0) return 0;  // buffer full
+      if (next == v[i].off) {
+        // The next entry collides with this one: the resume offset alone
+        // cannot say how many of them are out.
+        size_t first = i;
+        while (first > 0 && v[first - 1].off == next) --first;
+        dh->resume_off = next;
+        dh->skip_count = i - first + 1;
+      } else {
+        dh->resume_off = 0;
+        dh->skip_count = 0;
+      }
+    }
+    if (c.next >= kDirOffEnd) return 0;  // end of directory
+    if (c.next <= pos) {
+      HLOG(kError, "clio_cte_fuse: readdir of {}: chunk at offset {} does "
+           "not advance (next {})", p, pos, c.next);
+      return -EIO;
+    }
+    pos = c.next;
+  }
+}
+
+/**
+ * opendir: allocate the listing state readdir keeps between calls.
+ * @param path directory path (unused: the kernel resolved it)
+ * @param fi receives the handle in fh
+ * @return 0
+ */
+int cte_fuse_opendir(const char * /*path*/, struct fuse_file_info *fi) {
+  fi->fh = reinterpret_cast<uint64_t>(new DirHandle());
+  return 0;
+}
+
+/**
+ * releasedir: free the state opendir allocated.
+ * @param path directory path (unused)
+ * @param fi the handle
+ * @return 0
+ */
+int cte_fuse_releasedir(const char * /*path*/, struct fuse_file_info *fi) {
+  if (fi != nullptr && fi->fh != 0) {
+    delete reinterpret_cast<DirHandle *>(fi->fh);
+    fi->fh = 0;
   }
   return 0;
+}
+
+/**
+ * readdir: list a directory from `offset` on (see "Seekable, chunked
+ * listings" above). Every fill call carries a non-zero offset, so libfuse
+ * replies with what fits and calls again with the offset of the last entry
+ * it took.
+ * @param path directory path (null: removed while open -- it is empty)
+ * @param buf the fill callback's buffer
+ * @param filler the fill callback
+ * @param offset 0 to start (and re-read) the listing, else an offset a fill
+ *        call handed out, or any offset to seek to
+ * @param fi the opendir handle (null or fh 0: no state is kept, every call
+ *        fetches)
+ * @param flags unused
+ * @return 0 or a negative errno
+ */
+int cte_fuse_readdir(const char *path, void *buf,
+                            ClioFuseFillDirT filler, cte_off_t offset,
+                            struct fuse_file_info *fi,
+                            enum fuse_readdir_flags flags) {
+  using clio::cte::filesystem::kDirOffEnd;
+  using clio::cte::filesystem::kDirOffFirst;
+  cte_fuse_readdir_flush_guard();
+  (void)flags;
+  const clio::run::u64 off =
+      offset < 0 ? 0 : static_cast<clio::run::u64>(offset);
+  if (off == 0 && filler(buf, ".", nullptr, 1,
+                         static_cast<fuse_fill_dir_flags>(0)) != 0) {
+    return 0;
+  }
+  if (off <= 1 && filler(buf, "..", nullptr, 2,
+                         static_cast<fuse_fill_dir_flags>(0)) != 0) {
+    return 0;
+  }
+  // hard_remove: a directory removed while open has no path; it is empty.
+  if (path == nullptr || off >= kDirOffEnd) return 0;
+  const std::string p(path);
+  // A caller without a handle keeps nothing between calls: each call
+  // fetches, and one that stops inside a run of equal offsets cannot resume
+  // past it (its filler must take the whole run; the collectors that call
+  // this without a handle take the whole directory in one call).
+  DirHandle local;
+  DirHandle *dh = (fi != nullptr && fi->fh != 0)
+                      ? reinterpret_cast<DirHandle *>(fi->fh)
+                      : &local;
+  std::lock_guard<std::mutex> lk(dh->mu);
+  if (off == 0) {
+    // A (re)start re-reads the directory (rewinddir must show changes).
+    dh->chunk.valid = false;
+    dh->resume_off = 0;
+    dh->skip_count = 0;
+  }
+  // Equal offsets: resuming exactly where this handle stopped inside a run
+  // of entries that share an offset passes over the ones already out. Any
+  // other arrival at that offset (a seek, another handle) gets them all.
+  const size_t skip = (off >= kDirOffFirst && off == dh->resume_off)
+                          ? dh->skip_count
+                          : 0;
+  return EmitDirFrom(p, dh, std::max(off, kDirOffFirst), skip, buf, filler);
 }
 
 /**
@@ -4482,11 +4845,13 @@ const struct fuse_operations cte_fuse_ops = {
 #endif
     .listxattr = CLIO_FUSE_TIMED(listxattr, cte_fuse_listxattr),
     .removexattr = CLIO_FUSE_TIMED(removexattr, cte_fuse_removexattr),
+    .opendir = CLIO_FUSE_TIMED(opendir, cte_fuse_opendir),
 #ifdef __APPLE__
     .readdir = CLIO_FUSE_TIMED(readdir, cte_fuse_readdir_darwin),
 #else
     .readdir = CLIO_FUSE_TIMED(readdir, cte_fuse_readdir),
 #endif
+    .releasedir = CLIO_FUSE_TIMED(releasedir, cte_fuse_releasedir),
     .fsyncdir = CLIO_FUSE_TIMED(fsyncdir, cte_fuse_fsyncdir),
     .init = cte_fuse_init,
     .destroy = cte_fuse_destroy,

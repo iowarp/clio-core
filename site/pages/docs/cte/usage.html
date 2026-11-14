@@ -9,8 +9,8 @@ facts: C++ | clio::cte::core::Tag, Client ; Python | clio_cte_core_ext ; Default
 <h2>Connect a client</h2>
 <p>Every program first initializes the runtime client, then the CTE client. The CTE client binds to the core pool 512.0 by default. The environment variable <code>CLIO_CTE_POOL</code>, as <code>major.minor</code>, binds it to another pool that speaks the core interface, such as the indexer at 564.0 or the cache at 563.0. Set it before initialization.</p>
 <pre data-label="cpp">
-#include &lt;clio_runtime/clio_runtime.h&gt;
-#include &lt;clio_cte/core/core_client.h&gt;
+#include <clio_runtime/clio_runtime.h>
+#include <clio_cte/core/core_client.h>
 
 clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient);   // attach to a running clio_run
 clio::cte::core::CLIO_CTE_CLIENT_INIT();                  // bind the shared client
@@ -50,17 +50,17 @@ data = tag.GetBlob("note0", tag.GetBlobSize("note0"), 0)      # bytes
 <h2>Work with tags</h2>
 <pre data-label="cpp">
 auto *client = CLIO_CTE_CLIENT;
-const auto &amp;id = tag.GetTagId();
+const auto &id = tag.GetTagId();
 
-std::vector&lt;std::string&gt; names = tag.GetContainedBlobs();
+std::vector<std::string> names = tag.GetContainedBlobs();
 
-auto rn = client-&gt;AsyncRenameTag("experiment/run1", "experiment/run1-final", id);
+auto rn = client->AsyncRenameTag("experiment/run1", "experiment/run1-final", id);
 rn.Wait();
 
-auto sync = client-&gt;AsyncSyncTag(id);        // flush to a persistent tier, like fsync
+auto sync = client->AsyncSyncTag(id);        // flush to a persistent tier, like fsync
 sync.Wait();
 
-auto del = client-&gt;AsyncDelTag("experiment/run1-final");
+auto del = client->AsyncDelTag("experiment/run1-final");
 del.Wait();
 </pre>
 <pre data-label="python">
@@ -75,14 +75,14 @@ run2 = cte.Tag(fut.result())
 <h2>Query by name</h2>
 <p><code>TagQuery</code> and <code>BlobQuery</code> match whole names with <code>std::regex_match</code>: <code>"doc.*"</code> matches <code>doc7</code>, <code>"doc"</code> does not, and <code>".*ice.*"</code> matches a substring. Both default to <code>PoolQuery::Broadcast()</code>, so every node answers for its own blobs and the results are merged. A <code>max</code> of 0 means no limit.</p>
 <pre data-label="cpp">
-auto tq = client-&gt;AsyncTagQuery("experiment/.*");
+auto tq = client->AsyncTagQuery("experiment/.*");
 tq.Wait();
-for (const auto &amp;name : tq-&gt;results_) { /* tag names */ }
+for (const auto &name : tq->results_) { /* tag names */ }
 
-auto bq = client-&gt;AsyncBlobQuery("experiment/.*", "note.*");
+auto bq = client->AsyncBlobQuery("experiment/.*", "note.*");
 bq.Wait();
-for (size_t i = 0; i &lt; bq-&gt;blob_names_.size(); ++i) {
-  // bq-&gt;tag_names_[i], bq-&gt;blob_names_[i]
+for (size_t i = 0; i < bq->blob_names_.size(); ++i) {
+  // bq->tag_names_[i], bq->blob_names_[i]
 }
 </pre>
 <pre data-label="python">
@@ -97,7 +97,7 @@ for tag_name, blob_name in client.BlobQuery("experiment/.*", "note.*"):
 clio::cte::core::Client indexer(clio::run::PoolId(564, 0));
 auto hits = indexer.AsyncSemanticSearch("experiment/.*", ".*", "sea ice", 5);
 hits.Wait();
-for (const auto &amp;r : hits-&gt;results_) {
+for (const auto &r : hits->results_) {
   // r.tag_id_, r.blob_name_, r.score_
 }
 </pre>
@@ -124,7 +124,7 @@ for r in client.TemporalSearch("experiment/.*", ".*", time_begin=0, time_end=0, 
 tag.ReorganizeBlob("note0", 0.2f);                 // demote
 float s = tag.GetBlobScore("note0");               // 0.2
 
-auto ev = client-&gt;AsyncEvict(/*min_tier_score=*/0.9f, /*bytes=*/64 &lt;&lt; 20);
+auto ev = client->AsyncEvict(/*min_tier_score=*/0.9f, /*bytes=*/64 << 20);
 ev.Wait();
 </pre>
 <pre data-label="python">
@@ -136,12 +136,12 @@ ok = client.ReorganizeBlob(tag.GetTagId(), "note1", 1.0)   # True on success
 <h2>Run operations asynchronously</h2>
 <p>Every <code>Client</code> method is asynchronous and returns a <code>clio::run::Future</code> over the task. Submit several, then <code>Wait()</code> on each and read the task's fields. The <code>Tag</code> wrapper adds <code>AsyncPutBlob</code> and <code>AsyncGetBlob</code> from private buffers. The buffer must stay valid until <code>Wait()</code> returns.</p>
 <pre data-label="cpp">
-std::vector&lt;std::string&gt; bufs(4, std::string(4096, '\0'));
-std::vector&lt;clio::run::Future&lt;clio::cte::core::GetBlobTask&gt;&gt; futs;
-for (int i = 0; i &lt; 4; ++i) {
+std::vector<std::string> bufs(4, std::string(4096, '\0'));
+std::vector<clio::run::Future<clio::cte::core::GetBlobTask>> futs;
+for (int i = 0; i < 4; ++i) {
   futs.push_back(tag.AsyncGetBlob("page" + std::to_string(i), bufs[i].data(), bufs[i].size()));
 }
-for (auto &amp;f : futs) f.Wait();   // served from the shared-memory cache: the future is empty, do not dereference it
+for (auto &f : futs) f.Wait();   // served from the shared-memory cache: the future is empty, do not dereference it
 </pre>
 <p>In Python every <code>Async*</code> method returns a <code>Future</code> with <code>wait(max_sec=-1)</code>, <code>done()</code> and <code>result(max_sec=-1)</code>. The value of <code>result()</code> depends on the call: <code>bytes</code> for a get, a list for a query, a dict for the conditional puts, <code>None</code> for status-only operations.</p>
 <pre data-label="python">
@@ -157,7 +157,7 @@ pages = [f.result() for f in gets]
 <p>A deferred put stages a copy of the data in shared memory and returns a submission code immediately, without a future. The put is tracked in a process-wide registry. When shared memory is exhausted the next submission waits for the oldest puts to finish; <code>max_inflight_bytes</code> adds an explicit ceiling. Drain with <code>AwaitPutsUntilSpace(0)</code> and check <code>DeferErrorCount()</code> for puts that failed after submission. <code>AsyncGetBlobDefer</code> completes any pending deferred put for the blob before reading it.</p>
 <pre data-label="python">
 for i in range(1000):
-    rc = client.AsyncPutBlobDefer(tid, f"rec{i}", record(i), 0, max_inflight_bytes=256 &lt;&lt; 20)
+    rc = client.AsyncPutBlobDefer(tid, f"rec{i}", record(i), 0, max_inflight_bytes=256 << 20)
     assert rc == 0
 client.AwaitPutsUntilSpace(0)
 assert client.DeferErrorCount() == 0
@@ -168,9 +168,9 @@ assert client.DeferErrorCount() == 0
 
 <h2>Delete</h2>
 <pre data-label="cpp">
-auto del = client-&gt;AsyncDelBlob(tag.GetTagId(), "note0");
+auto del = client->AsyncDelBlob(tag.GetTagId(), "note0");
 del.Wait();
-int rc = del-&gt;return_code_;        // 0 on success
+int rc = del->return_code_;        // 0 on success
 </pre>
 <pre data-label="python">
 assert client.DelBlob(tag.GetTagId(), "note0")

@@ -1023,6 +1023,33 @@ class IpcManager {
   ctp::lbm::Transport *GetMainTransport() const;
 
   /**
+   * Size-tiered peer ports (experiment, CLIO_NET_TIERS / CLIO_NET_TIER_LANES).
+   * CLIO_NET_TIERS="16k,256k" splits peer messages into tiers by payload
+   * bytes (< 16k, < 256k, the rest); CLIO_NET_TIER_LANES=N gives each tier N
+   * ports, used round-robin. Tier slot i listens on base port +
+   * kNetTierPortOffset + i with its own ROUTER and recv thread, and peers
+   * send each message to the slot for its size, so small messages never
+   * queue behind bulk ones on one socket or one recv thread. Off (0 slots)
+   * when neither variable is set.
+   */
+  static constexpr u32 kNetTierPortOffset = 16;
+  /** @return number of tier slots (0 = tiers off) */
+  static int NetTierSlots();
+  /** @return tier slot for a message of `bytes` payload bytes */
+  static int NetTierSlot(size_t bytes);
+  /** CLIO_NET_TIER_ZMQ_FROM=k: tiers >= k (the larger messages) listen and
+   *  dial with ZeroMQ even when CLIO_PEER_TRANSPORT=socket. Plain sockets win
+   *  on small-message latency (4 KB 1x1 1.6x) but lose on loaded 1 MB
+   *  transfers (0.73-0.85x: one recv thread per port reads each message
+   *  synchronously, where ZeroMQ spreads it over its I/O threads).
+   *  @return true if tier slot `slot` uses ZeroMQ */
+  static bool NetTierUsesZmq(int slot);
+  /** @return the tier listener transports (empty when tiers are off) */
+  const std::vector<ctp::lbm::TransportPtr> &GetTierTransports() const {
+    return tier_transports_;
+  }
+
+  /**
    * Get this host identified during host identification
    * @return Const reference to this Host struct
    */
@@ -1264,6 +1291,23 @@ class IpcManager {
    *  inflating every cross-node round trip. */
   ctp::lbm::Transport *GetOrCreateClient(const std::string &addr, int port,
                                          const char *lane = "");
+
+  /**
+   * Dedicated network send threads (experiment, CLIO_NET_SEND_THREADS=N).
+   * Every cross-node request (SendIn) and reply (SendOut) used to be sent by
+   * ONE worker (the admin Send periodic on net_send_worker_), so a node's
+   * whole outbound path serialized there; under a 4-node 16x16 load tasks
+   * waited 0.4-1.6 ms on its queues, and a 1 MB request blocked small
+   * replies for ~0.5 s on the socket transport. With N > 0, N extra threads
+   * also drain the net queues. Each uses its own peer connections (the
+   * thread's slot is appended to the GetOrCreateClient key), because neither
+   * ZeroMQ sockets nor plain-socket writes may be shared across threads.
+   */
+  static int NetSendThreads();
+  /** Mark the calling thread as send slot `slot` (-1 = shared connections). */
+  static void SetSendSlot(int slot);
+  /** Number of inbound client SHM shards (worker w < this drains shard w). */
+  u32 GetShmInShards() const { return shm_in_shards_; }
 
   /**
    * Get or create a dial-back connection for returning a response to a client.
@@ -1822,6 +1866,12 @@ class IpcManager {
   std::unordered_map<std::string, std::unique_ptr<ShmSendQueue>>
       shm_send_queues_;
   std::mutex shm_send_queues_mutex_;   // guards the MAP (not the per-queue FIFOs)
+  // Futures queued across all ShmSendQueues. DrainShmSends runs on every
+  // worker loop pass; with the default inline send the queues are always
+  // empty, yet each pass took shm_send_queues_mutex_ -- ~20 workers contending
+  // on one mutex (1 in 6 gdb worker samples under a 4-node 16x16 load). This
+  // lets an empty drain return without touching any lock.
+  std::atomic<u64> shm_send_pending_{0};
   std::atomic<bool> shm_send_running_{false};  // #807: SHM-mode gate for flush
 
  public:
@@ -1846,6 +1896,7 @@ class IpcManager {
 
   // Network queue for send operations (one lane, two priorities)
   ctp::ipc::FullPtr<NetQueue> net_queue_;
+  std::mutex net_pop_mu_;  // net_queue_ lanes are single-consumer rings
 
   /**
    * Spill-over for net_queue_ when a priority's ring is full.
@@ -1878,6 +1929,7 @@ class IpcManager {
 
   // Main ZeroMQ transport (server mode) for distributed communication
   ctp::lbm::TransportPtr main_transport_;
+  std::vector<ctp::lbm::TransportPtr> tier_transports_;  // size-tier listeners
 
   // Callbacks run at the start of ClearTransports() to stop module-owned
   // threads that hold raw transport pointers. See RegisterTransportShutdownHook.
@@ -1955,6 +2007,7 @@ class IpcManager {
   // while the client's Future (which owns them) is alive.
   struct PendingClientFuture {
     Task *task = nullptr;  // waiter (task->fut_) + SetComplete()/SetNewData()
+    unsigned long long submit_cyc = 0;  // CLIO_EVLAT c_e2e start (0 = off)
   };
   // Pending futures (client-side, keyed by net_key)
   std::unordered_map<size_t, PendingClientFuture> pending_zmq_futures_;

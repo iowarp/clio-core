@@ -33,7 +33,7 @@ concurrency:
 jobs:
   # ---- Matrix tier selection (issue #921) -----------------------------------
   # A pull request builds ONE representative macOS runner; the full arm64 +
-  # Intel, macOS 14 -> 26 sweep runs on push to main/dev. Breadth on every PR
+  # Intel, macOS sweep (including xcode-27) runs on push to main/dev. Breadth on every PR
   # commit bought little: the five runners fail together on real breakage, so
   # what the extra four mostly added was more chances to hit a flake, more
   # queue time, and more reruns. The sweep still gates what lands, just at the
@@ -53,10 +53,10 @@ jobs:
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             echo 'os=["macos-15"]' >> "$GITHUB_OUTPUT"
           else
-            echo 'os=["macos-15","macos-15-intel","macos-26","macos-26-intel"]' >> "$GITHUB_OUTPUT"
+            echo 'os=["macos-15","macos-15-intel","macos-26","macos-26-intel","xcode-27"]' >> "$GITHUB_OUTPUT"
           fi
 
-  # ---- Standard build + ctest (arm64 + Intel, macOS 14 -> 26) ---------------
+  # ---- Standard build + ctest (arm64 + Intel, macOS 15 -> 26, xcode-27) ------
   build-test:
     name: build-test (${{ matrix.os }})
     needs: matrix-tier
@@ -204,7 +204,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-15]
+        os: [macos-15, xcode-27]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5

@@ -247,7 +247,19 @@ u32 DefaultScheduler::RuntimeMapTask(Worker *worker, const Future<Task> &task,
       selected = worker;
       map_here_.fetch_add(1, std::memory_order_relaxed);
     } else {
-      selected = PickPoolWorker(now_us);
+      // CLIO_NET_AVOID_SHARDS=1 (experiment): a peer task placed with no
+      // submitting worker (recv-thread or lane-0 hand-off) skips the workers
+      // that own client SHM shards (ids below the shard count), which run up
+      // to kShardDrainBudget client requests inline before reading their lane.
+      static const bool kAvoidShards = [] {
+        const char *e = std::getenv("CLIO_NET_AVOID_SHARDS");
+        return e != nullptr && e[0] == '1';
+      }();
+      const u32 min_id = (kAvoidShards && worker == nullptr)
+                             ? CLIO_IPC->GetShmInShards()
+                             : 0;
+      selected = PickPoolWorker(now_us, min_id);
+      if (selected == nullptr && min_id != 0) selected = PickPoolWorker(now_us);
       if (selected != nullptr && !HasRoom(selected, hold_us, now_us)) {
         // Even the least-loaded worker would exceed its share. Grow the pool
         // (the monitor thread spawns at once); this task takes the
@@ -315,7 +327,7 @@ double DefaultScheduler::PredictHold(Task *task, Container &container) {
                                            : 0.0;
 }
 
-Worker *DefaultScheduler::PickPoolWorker(double now_us) const {
+Worker *DefaultScheduler::PickPoolWorker(double now_us, u32 min_id) const {
   std::lock_guard<std::mutex> g(pool_mu_);
   const size_t n = pool_.size();
   if (n == 0) return nullptr;
@@ -324,7 +336,7 @@ Worker *DefaultScheduler::PickPoolWorker(double now_us) const {
   double best_load = 0.0;
   for (size_t k = 0; k < n; ++k) {
     Worker *w = pool_[(start + k) % n];
-    if (w == nullptr) continue;
+    if (w == nullptr || w->GetId() < min_id) continue;
     const double load = w->RealtimeLoad(now_us);
     if (best == nullptr || load < best_load) {
       best = w;

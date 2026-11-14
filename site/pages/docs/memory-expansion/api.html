@@ -19,15 +19,15 @@ facts: cpu_vector | clio::cte::cpu_vector::Vector&lt;T&gt; ; gpu_vector | clio::
 <p>Header <code>clio_cte/cpu_vector/cpu_vector.h</code>, namespace <code>clio::cte::cpu_vector</code>, header-only. The verbs block, every verb is thread-safe, and a caller error throws <code>std::runtime_error</code>.</p>
 <h3>Constructor</h3>
 <pre data-label="cpp">
-template &lt;typename T&gt;
+template <typename T>
 class Vector {
  public:
-  Vector(const std::string &amp;tag_name, u64 page_bytes, u64 num_elems,
+  Vector(const std::string &tag_name, u64 page_bytes, u64 num_elems,
          u32 nsets, u32 set_size,
          clio::run::PoolId storage_pool_id = clio::run::PoolId::GetNull(),
          int compress_lib = 0, int compress_preset = 1,
          u32 capacity_pages = 0);
-  Vector(const Vector &amp;) = delete;
+  Vector(const Vector &) = delete;
 };
 </pre>
 <ul>
@@ -41,10 +41,10 @@ class Vector {
 </ul>
 <h3>Verbs</h3>
 <pre data-label="cpp">
-template &lt;typename... Args&gt; void Fetch(u64 generation, Args... off_count_pairs);
-Held&lt;T&gt; HoldPage(u64 off, u64 count, bool write = false);
-Held&lt;T&gt; UpdateRange(u64 off, u64 count, bool write = false, u64 generation = 0);
-template &lt;typename... Args&gt; void Flush(u64 generation, Args... off_count_pairs);
+template <typename... Args> void Fetch(u64 generation, Args... off_count_pairs);
+Held<T> HoldPage(u64 off, u64 count, bool write = false);
+Held<T> UpdateRange(u64 off, u64 count, bool write = false, u64 generation = 0);
+template <typename... Args> void Flush(u64 generation, Args... off_count_pairs);
 void UnpinRange(u64 off, u64 count);
 void UnpinRange2(u64 off0, u64 count0, u64 off1, u64 count1);
 </pre>
@@ -57,22 +57,22 @@ void UnpinRange2(u64 off0, u64 count0, u64 off1, u64 count1);
 </ul>
 <h3>Held&lt;T&gt;</h3>
 <pre data-label="cpp">
-template &lt;typename T&gt; class Held {
+template <typename T> class Held {
  public:
   T *ptr() const;                 // first element of the run
   u64 run() const;                // elements on this page
   u64 begin_off() const;          // absolute offset of ptr()[0]
   explicit operator bool() const; // false when empty
-  T &amp;operator[](u64 off) const;   // absolute element offset
+  T &operator[](u64 off) const;   // absolute element offset
   void Rescore(float rank) const; // eviction rank of the frame; lowest is evicted first
 };
 </pre>
 <p>Move-only. A hold returned by <code>HoldPage</code> does not own the pin; <code>UnpinRange</code> releases it.</p>
 <h3>Host data movement and cache control</h3>
 <pre data-label="cpp">
-template &lt;typename FillFn&gt; void PreloadPages(u64 pg_lo, u64 pg_hi, FillFn fill);   // fill(pg, char *buf)
+template <typename FillFn> void PreloadPages(u64 pg_lo, u64 pg_hi, FillFn fill);   // fill(pg, char *buf)
 void Preload(const T *src, u64 n);
-template &lt;typename SinkFn&gt; u64 DownloadPages(u64 pg_lo, u64 pg_hi, SinkFn sink);  // sink(pg, const char *bytes); returns pages read
+template <typename SinkFn> u64 DownloadPages(u64 pg_lo, u64 pg_hi, SinkFn sink);  // sink(pg, const char *bytes); returns pages read
 u64 Download(T *dst, u64 n);                                                        // returns elements read
 void Prefetch(u64 pg_lo, u64 pg_hi);        // best effort, leaves pages unpinned
 void FlushResidentToCte();                  // every resident frame's valid elements
@@ -81,7 +81,7 @@ void ClearCache();                          // drops resident pages, discards un
 <p><code>PreloadPages</code> and <code>Preload</code> write straight to the CTE and throw if a put fails; resident copies are not updated, so call <code>ClearCache</code> first if those pages may be resident. <code>DownloadPages</code> and <code>Download</code> read straight from the CTE; flush first.</p>
 <h3>Copies</h3>
 <pre data-label="cpp">
-std::unique_ptr&lt;Vector&lt;T&gt;&gt; Copy(const std::string &amp;new_name, bool sync = false);
+std::unique_ptr<Vector<T>> Copy(const std::string &new_name, bool sync = false);
 u64 MaterializeAll(u32 inflight = 32);      // pages materialized; 0 on the first failure or when not a copy
 void ScoreAllPages(float score);
 </pre>
@@ -89,13 +89,13 @@ void ScoreAllPages(float score);
 <h3>Tier hints and diagnostics</h3>
 <pre data-label="cpp">
 struct PrefetchHint { u64 page_; float score_; };
-void PrefetchNow(const std::vector&lt;PrefetchHint&gt; &amp;hints);   // non-blocking, deduplicated
+void PrefetchNow(const std::vector<PrefetchHint> &hints);   // non-blocking, deduplicated
 void DrainPrefetch();                                       // wait for outstanding rescores
 void ResetPrefetchHistory();                                // per run, not per phase
 PrefetchStats ReadPrefetchStats() const;  void ResetPrefetchStats();
 
 void EnableStats();  void ResetStats();  Stats ReadStats() const;  Stats ReadStats(int gpu_id) const;
-std::vector&lt;Page&gt; ReadTable() const;  u32 Occupied() const;  u32 MaxPageCopies() const;
+std::vector<Page> ReadTable() const;  u32 Occupied() const;  u32 MaxPageCopies() const;
 </pre>
 <p><code>Stats</code> counts <code>faults</code>, <code>puts</code>, <code>evicts</code>, <code>get_errors</code>, <code>gen_ok</code>, <code>gen_stale</code>, <code>gen_busy</code>, <code>flush_skipped</code>, <code>put_errors</code> and <code>alloc_waits</code>, and is populated only after <code>EnableStats()</code>. <code>Page</code> is a snapshot of one frame: <code>page_num</code>, <code>data</code>, <code>last_access</code>, <code>generation</code>, <code>score</code>, <code>pins</code>, <code>flushing</code>, <code>fetching</code>, <code>valid_lo</code>, <code>valid_hi</code>.</p>
 <h3>Geometry</h3>
@@ -105,16 +105,16 @@ std::vector&lt;Page&gt; ReadTable() const;  u32 Occupied() const;  u32 MaxPageCo
 <p>Header <code>clio_cte/gpu_vector/gpu_vector.h</code>, namespace <code>clio::cte::gpu_vector</code>, header-only. The host <code>Vector&lt;T&gt;</code> owns the device allocations and never pages itself.</p>
 <h3>Constructor</h3>
 <pre data-label="cpp">
-template &lt;typename T&gt;
+template <typename T>
 class Vector {
  public:
-  Vector(const std::string &amp;tag_name, const std::vector&lt;int&gt; &amp;gpu_ids,
+  Vector(const std::string &tag_name, const std::vector<int> &gpu_ids,
          u64 page_bytes, u32 nblocks, u32 set_size, u64 num_elems,
          clio::run::PoolId storage_pool_id = clio::run::PoolId::GetNull(),
          int compress_lib = 0, int compress_preset = 1,
          u32 nsets = 0, u32 capacity_pages = 0);
-  Vector(const Vector &amp;) = delete;
-  DeviceVector&lt;T&gt; GetDevice(int gpu_id) const;
+  Vector(const Vector &) = delete;
+  DeviceVector<T> GetDevice(int gpu_id) const;
   static clio::run::PoolId DefaultStoragePool();
 };
 </pre>
@@ -127,29 +127,29 @@ class Vector {
 </ul>
 <h3>Host methods</h3>
 <pre data-label="cpp">
-template &lt;typename FillFn&gt; void PreloadPages(u64 pg_lo, u64 pg_hi, FillFn fill);
+template <typename FillFn> void PreloadPages(u64 pg_lo, u64 pg_hi, FillFn fill);
 void Preload(const T *src, u64 n);
-template &lt;typename SinkFn&gt; u64 DownloadPages(u64 pg_lo, u64 pg_hi, SinkFn sink);
+template <typename SinkFn> u64 DownloadPages(u64 pg_lo, u64 pg_hi, SinkFn sink);
 u64 Download(T *dst, u64 n);
 void Prefetch(u64 pg_lo, u64 pg_hi, int gpu_id = 0, u32 tables = 0);   // tables is ignored
 void ClearCache(int gpu_id = 0);
 void FlushResidentToCte();                 // on every GPU this vector has views for
 
-std::unique_ptr&lt;Vector&lt;T&gt;&gt; Copy(const std::string &amp;new_name, bool sync = false);
+std::unique_ptr<Vector<T>> Copy(const std::string &new_name, bool sync = false);
 u64 MaterializeAll(u32 inflight = 32);
 void ScoreAllPages(float score);
 
-void RegisterPrefetcher(std::shared_ptr&lt;Prefetcher&gt; p);
-void SetPrefetchPolicy(const PrefetchPolicy &amp;p);  const PrefetchPolicy &amp;GetPrefetchPolicy() const;
+void RegisterPrefetcher(std::shared_ptr<Prefetcher> p);
+void SetPrefetchPolicy(const PrefetchPolicy &p);  const PrefetchPolicy &GetPrefetchPolicy() const;
 bool HasPrefetchers() const;  std::string PrefetcherNames() const;
 clio::run::gpu::YieldObserverFn YieldObserver();   // drv.SetYieldObserver(vec.YieldObserver())
 void PrefetchRunBegin();
-void PrefetchNow(const std::vector&lt;PrefetchHint&gt; &amp;hints);
+void PrefetchNow(const std::vector<PrefetchHint> &hints);
 void DrainPrefetch();  void ResetPrefetchHistory();
 PrefetchStats ReadPrefetchStats() const;  void ResetPrefetchStats();
 
 void EnableStats();  void ResetStats();  Stats ReadStats(int gpu_id) const;
-std::vector&lt;Page&gt; ReadTable(int gpu_id) const;  u32 Occupied(int gpu_id) const;  u32 MaxPageCopies(int gpu_id) const;
+std::vector<Page> ReadTable(int gpu_id) const;  u32 Occupied(int gpu_id) const;  u32 MaxPageCopies(int gpu_id) const;
 clio::cte::core::TagId TagId() const;  u64 PageBytes() const;  u64 ElemsPerPage() const;  u64 NumPages() const;
 </pre>
 <ul>
@@ -166,8 +166,8 @@ void Init(u32 block);                                             // once, with 
 __device__ YCoroTask Fetch(u64 generation, Args... off_count_pairs);       // BeginFetch + AwaitFetch
 __device__ YCoroTask BeginFetch(u64 generation, Args... off_count_pairs);  // submit, then compute
 __device__ YCoroTask AwaitFetch();                                         // then wait
-__device__ YCoroTaskT&lt;Held&lt;T&gt;&gt; HoldPage(u64 off, u64 count, bool write = false);
-__device__ YCoroTaskT&lt;Held&lt;T&gt;&gt; UpdateRange(u64 off, u64 count, u32 from, bool write = false, u64 generation = 0);
+__device__ YCoroTaskT<Held<T>> HoldPage(u64 off, u64 count, bool write = false);
+__device__ YCoroTaskT<Held<T>> UpdateRange(u64 off, u64 count, u32 from, bool write = false, u64 generation = 0);
 __device__ YCoroTask Flush(u64 generation, u64 off, u64 count, Rest... more_pairs);       // BeginFlush + EndFlush
 __device__ YCoroTask BeginFlush(u64 generation, u64 off, u64 count, Rest... more_pairs);
 __device__ YCoroTask EndFlush();

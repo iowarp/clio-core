@@ -30,6 +30,16 @@ facts: C++ | iowarp::ContextInterface in clio_cee/api/context_interface.h ; Pyth
 </ul>
 
 <h2>How it relates to the other technologies</h2>
+
+<ol class="stack-position" aria-label="Where the CEE sits in the CLIO Core stack">
+  <li class="here"><b>Front ends</b><span>Context FS, memory expansion, machine learning, CAE, CEE</span></li>
+  <li><b>Interceptors</b><span>POSIX, STDIO, MPI-IO and HDF5 adapters; FUSE mount</span></li>
+  <li><b>ChiMod chain</b><span>Cache, replication, compressor, indexer, summarizer</span></li>
+  <li><b>CTE core</b><span>Tags, blobs, placement across tiers</span></li>
+  <li><b>Context Runtime</b><span>Modules, pools, tasks, scheduling, transports</span></li>
+  <li><b>Storage</b><span>Block devices: RAM, NVMe, SSD, HDD, S3/GCS</span></li>
+</ol>
+<p>The CEE is a client-side front end with no runtime piece. It composes CAE and CTE calls, so it costs nothing unless you call it. See <a href="/docs/cee/design.html">the CEE design</a>.</p>
 <ul>
   <li><a href="/docs/cae/index.html">Context Assimilation Engine</a>: <code>context_bundle</code> is a <code>ParseOmni</code> task on the CAE pool at 400.0. Everything the CAE can import, CEE can import, with the fields the binding exposes.</li>
   <li><a href="/docs/cte/index.html">Context Transfer Engine</a>: query, retrieve and destroy are the CTE client's <code>BlobQuery</code>, <code>SemanticSearch</code>, <code>TemporalSearch</code>, <code>GetBlob</code> and <code>DelTag</code>. Keyword search is answered by the CTE indexer module, so the client must be bound to a pool that reaches it.</li>

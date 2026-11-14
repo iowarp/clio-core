@@ -630,7 +630,7 @@ TEST_CASE("BlobReplicas - transparent interposition on the core Put/Get",
   // 6. Metadata ops forward untouched: a tag op through the interposer
   //    behaves exactly like the core pool's.
   {
-    auto sz = repl_io.AsyncGetTagSize(tag_id);
+    auto sz = repl_io.AsyncGetTagSize(tag_id, clio::run::PoolQuery::Broadcast(0.0f));
     sz.Wait();
     REQUIRE(sz->GetReturnCode() == 0);
   }

@@ -39,6 +39,7 @@
  * threshold -- then checks that every name is reachable by walking from
  * block 0 and that each lives in exactly one block.
  */
+#include <cstdint>
 #include <map>
 #include <set>
 #include <string>
@@ -285,6 +286,337 @@ TEST_CASE("inode_table_split_tree", "[fs][inodetable]") {
     }
     REQUIRE(seen.size() == blocks.size());
   }
+}
+
+namespace {
+
+/**
+ * Grow a directory of `count` names, splitting past `limit`.
+ * @param count number of names
+ * @param limit split threshold
+ * @return the directory's blocks
+ */
+Blocks GrowDir(size_t count, size_t limit) {
+  Blocks blocks;
+  blocks[0].dir_ = 1;
+  for (size_t i = 0; i < count; ++i) {
+    Insert(blocks, "f." + std::to_string(i * 2654435761ULL), false, limit);
+  }
+  return blocks;
+}
+
+/**
+ * Every visible entry of a directory in listing order (the reference a
+ * ranged read is checked against).
+ * @param blocks the directory
+ * @return entries sorted by (offset, name)
+ */
+std::vector<DirRangeEntry> ListAll(const Blocks &blocks) {
+  std::vector<DirRangeEntry> all;
+  for (const auto &kv : blocks) {
+    for (const auto &e : kv.second.rows_) {
+      if (e.second.state_ == kRowPending) continue;
+      all.push_back(DirRangeEntry{DirEntryOff(e.first),
+                                  RowName(e.first, e.second), e.second.id_,
+                                  e.second.type_});
+    }
+  }
+  SortDirRange(&all);
+  return all;
+}
+
+/**
+ * One ranged read, driven the way Runtime::CollectDirRange drives it.
+ * @param blocks the directory
+ * @param start first offset wanted
+ * @param max entries after which the chunk stops taking blocks
+ * @param next receives the offset the next chunk starts at
+ * @param loaded receives the number of blocks the read loaded (may be null)
+ * @return the chunk
+ */
+std::vector<DirRangeEntry> ReadRange(const Blocks &blocks,
+                                     clio::run::u64 start, size_t max,
+                                     clio::run::u64 *next,
+                                     size_t *loaded = nullptr) {
+  DirRangeScan scan(start, max);
+  TableSubtree sub;
+  size_t n = 0;
+  while (scan.Next(&sub)) {
+    ++n;
+    REQUIRE(scan.Take(sub, blocks.at(sub.index_)));
+  }
+  scan.Finish();
+  *next = scan.next_off();
+  if (loaded != nullptr) *loaded = n;
+  return scan.entries();
+}
+
+/**
+ * Blocks of a directory in listing order: a block, then what it split off,
+ * deepest split first.
+ * @param blocks the directory
+ * @param sub subtree to walk
+ * @param out receives the block indices
+ */
+void WalkByOffset(const Blocks &blocks, const TableSubtree &sub,
+                  std::vector<clio::run::u32> *out) {
+  const InodeTableBlock &b = blocks.at(sub.index_);
+  REQUIRE(b.born_ == sub.born_);
+  out->push_back(sub.index_);
+  for (const TableSubtree &c : ChildSubtreesByOffset(b)) {
+    WalkByOffset(blocks, c, out);
+  }
+}
+
+}  // namespace
+
+TEST_CASE("dir_offset_mapping", "[fs][inodetable][diroff]") {
+  REQUIRE(BitReverse64(0) == 0);
+  REQUIRE(BitReverse64(1) == 0x8000000000000000ULL);
+  REQUIRE(BitReverse64(0x8000000000000000ULL) == 1);
+  REQUIRE(BitReverse64(0x00000000000000F0ULL) == 0x0F00000000000000ULL);
+  for (clio::run::u64 x : {0x0123456789ABCDEFULL, 0xDEADBEEFCAFEF00DULL}) {
+    REQUIRE(BitReverse64(BitReverse64(x)) == x);
+  }
+  // The reserved offsets at both ends are never an entry's.
+  REQUIRE(kDirOffEnd == static_cast<clio::run::u64>(INT64_MAX));
+  REQUIRE(DirOffOfHash(0) == kDirOffFirst);
+  REQUIRE(DirOffOfHash(1ULL << 62) == kDirOffFirst);       // raw offset 1
+  REQUIRE(DirOffOfHash(1ULL << 61) == kDirOffFirst);       // raw offset 2
+  REQUIRE(DirOffOfHash(3ULL << 61) == kDirOffFirst);       // raw offset 3
+  REQUIRE(DirOffOfHash(1ULL << 60) == 4);                  // raw offset 4
+  REQUIRE(DirOffOfHash(~0ULL) == kDirOffEnd - 1);          // raw INT64_MAX
+  REQUIRE(DirOffOfHash(~0ULL >> 1) == kDirOffEnd - 1);     // bit 63 is dropped
+  REQUIRE(DirOffOfHash(~0ULL & ~(1ULL << 62)) == kDirOffEnd - 1);  // raw End-1
+  REQUIRE(DirOffOfHash(~0ULL & ~(1ULL << 61)) == kDirOffEnd - 2);
+  // Hash bit i lands on offset bit 62 - i: low hash bits order the listing.
+  REQUIRE(DirOffOfHash(1) == 1ULL << 62);
+  REQUIRE(DirOffOfHash(2) == 1ULL << 61);
+  REQUIRE(DirEntryOff("name") == DirOffOfHash(TableHash("name")));
+
+  // The interval of (index, depth): the keys whose low `depth` bits match.
+  clio::run::u64 lo = 0, hi = 0;
+  DirOffRange(0, 0, &lo, &hi);
+  REQUIRE(lo == 0);
+  REQUIRE(hi == 1ULL << 63);
+  DirOffRange(1, 1, &lo, &hi);
+  REQUIRE(lo == 1ULL << 62);
+  REQUIRE(hi == 1ULL << 63);
+  DirOffRange(0, 1, &lo, &hi);
+  REQUIRE(lo == 0);
+  REQUIRE(hi == 1ULL << 62);
+  DirOffRange(2, 2, &lo, &hi);  // bits "10": reversed "01"
+  REQUIRE(lo == 1ULL << 61);
+  REQUIRE(hi == 1ULL << 62);
+  DirOffRange((1u << kTableMaxDepth) - 1, kTableMaxDepth, &lo, &hi);
+  REQUIRE(hi == 1ULL << 63);
+  REQUIRE(hi - lo == 1ULL << (63 - kTableMaxDepth));
+}
+
+TEST_CASE("dir_offset_blocks_tile", "[fs][inodetable][diroff]") {
+  const Blocks blocks = GrowDir(20000, 64);
+  REQUIRE(blocks.size() > 100);
+  // Every row's offset lies in its block's interval.
+  for (const auto &kv : blocks) {
+    clio::run::u64 lo = 0, hi = 0;
+    DirOffRange(kv.second.index_, kv.second.depth_, &lo, &hi);
+    for (const auto &e : kv.second.rows_) {
+      const clio::run::u64 off = DirEntryOff(e.first);
+      REQUIRE(off >= lo);
+      REQUIRE(off < hi);
+    }
+  }
+  // In listing order the blocks' intervals follow one another with no gap
+  // and no overlap, from 0 to 2^63.
+  std::vector<clio::run::u32> order;
+  WalkByOffset(blocks, TableSubtree{0, 0}, &order);
+  REQUIRE(order.size() == blocks.size());
+  clio::run::u64 expect = 0;
+  for (clio::run::u32 k : order) {
+    clio::run::u64 lo = 0, hi = 0;
+    DirOffRange(k, blocks.at(k).depth_, &lo, &hi);
+    REQUIRE(lo == expect);
+    expect = hi;
+  }
+  REQUIRE(expect == 1ULL << 63);
+  // A subtree's interval is its block's plus everything it split off.
+  for (const auto &kv : blocks) {
+    clio::run::u64 lo = 0, hi = 0, slo = 0, shi = 0;
+    DirOffRange(kv.second.index_, kv.second.depth_, &lo, &hi);
+    DirOffRange(kv.second.index_, kv.second.born_, &slo, &shi);
+    REQUIRE(slo == lo);
+    clio::run::u64 end = hi;
+    for (const TableSubtree &c : ChildSubtreesByOffset(kv.second)) {
+      clio::run::u64 clo = 0, chi = 0;
+      DirOffRange(c.index_, c.born_, &clo, &chi);
+      REQUIRE(clo == end);
+      end = chi;
+    }
+    REQUIRE(end == shi);
+  }
+}
+
+TEST_CASE("dir_range_chunks", "[fs][inodetable][diroff]") {
+  const Blocks blocks = GrowDir(20000, 64);
+  const std::vector<DirRangeEntry> all = ListAll(blocks);
+  REQUIRE(all.size() == 20000);
+  // Chunk after chunk from the start: every entry once, in order, and each
+  // chunk says exactly where the next one begins.
+  for (size_t max : {size_t{1}, size_t{100}, size_t{8192}, size_t{50000}}) {
+    size_t at = 0, chunks = 0;
+    clio::run::u64 start = 0;
+    while (start != kDirOffEnd) {
+      clio::run::u64 next = 0;
+      const std::vector<DirRangeEntry> c = ReadRange(blocks, start, max, &next);
+      REQUIRE(!c.empty());
+      // Whole blocks: at least `max` unless the directory ended, and never
+      // more than one block over.
+      REQUIRE((c.size() >= max || next == kDirOffEnd));
+      REQUIRE(c.size() < max + 2 * 64);
+      for (const DirRangeEntry &e : c) {
+        REQUIRE(at < all.size());
+        REQUIRE(e.off_ == all[at].off_);
+        REQUIRE(e.name_ == all[at].name_);
+        REQUIRE(e.id_ == all[at].id_);
+        ++at;
+      }
+      REQUIRE(next > c.back().off_);
+      REQUIRE(next == (at < all.size() ? all[at].off_ : kDirOffEnd));
+      start = next;
+      ++chunks;
+    }
+    REQUIRE(at == all.size());
+    if (max >= all.size()) REQUIRE(chunks == 1);
+  }
+}
+
+TEST_CASE("dir_range_seek", "[fs][inodetable][diroff]") {
+  const Blocks blocks = GrowDir(20000, 64);
+  const std::vector<DirRangeEntry> all = ListAll(blocks);
+  // A read from any offset returns the entries at or after it, in order,
+  // starting with the first such entry -- an entry's own offset, one past
+  // it (inside a block), the reserved low offsets, and arbitrary cuts of
+  // the offset space, as a walker splitting the directory would pick.
+  std::vector<clio::run::u64> starts{0, 1, 2, 3, 4, kDirOffEnd - 1,
+                                     kDirOffEnd};
+  for (size_t i = 0; i < all.size(); i += 997) {
+    starts.push_back(all[i].off_);
+    starts.push_back(all[i].off_ + 1);
+    starts.push_back(all[i].off_ - 1);
+  }
+  for (clio::run::u64 r = 1; r < 16; ++r) starts.push_back(r * (kDirOffEnd / 16));
+  for (clio::run::u64 start : starts) {
+    size_t at = 0;
+    while (at < all.size() && all[at].off_ < start) ++at;
+    clio::run::u64 next = 0;
+    size_t loaded = 0;
+    const std::vector<DirRangeEntry> c =
+        ReadRange(blocks, start, 200, &next, &loaded);
+    REQUIRE(c.size() <= all.size() - at);
+    REQUIRE((c.size() >= 200 || next == kDirOffEnd));
+    for (size_t i = 0; i < c.size(); ++i) {
+      REQUIRE(c[i].off_ == all[at + i].off_);
+      REQUIRE(c[i].name_ == all[at + i].name_);
+    }
+    const size_t after = at + c.size();
+    REQUIRE(next == (after < all.size() ? all[after].off_ : kDirOffEnd));
+    // Only the blocks from the start on are loaded, plus the path down to
+    // them: far fewer than the directory holds.
+    REQUIRE(loaded <= 200 / 16 + 2 * kTableMaxDepth);
+  }
+  // Ranges cut at arbitrary offsets partition the directory: what pfind's
+  // ranks see when they split one directory by offset.
+  size_t total = 0;
+  for (clio::run::u64 r = 0; r < 16; ++r) {
+    const clio::run::u64 lo = r * (kDirOffEnd / 16);
+    const clio::run::u64 hi = r == 15 ? kDirOffEnd : (r + 1) * (kDirOffEnd / 16);
+    clio::run::u64 start = lo;
+    while (start < hi) {
+      clio::run::u64 next = 0;
+      const std::vector<DirRangeEntry> c = ReadRange(blocks, start, 300, &next);
+      for (size_t i = 0; i < c.size(); ++i) {
+        // The offset a reader is told after entry i is the next entry's: it
+        // stops once that reaches its range's end.
+        if (c[i].off_ >= hi) break;
+        REQUIRE(c[i].off_ >= lo);
+        ++total;
+      }
+      start = next;
+    }
+  }
+  REQUIRE(total == all.size());
+}
+
+TEST_CASE("dir_range_edges", "[fs][inodetable][diroff]") {
+  // An empty directory: no entries, and nothing after them.
+  Blocks empty;
+  empty[0].dir_ = 1;
+  clio::run::u64 next = 0;
+  REQUIRE(ReadRange(empty, 0, 8192, &next).empty());
+  REQUIRE(next == kDirOffEnd);
+  REQUIRE(ReadRange(empty, kDirOffEnd, 8192, &next).empty());
+  REQUIRE(next == kDirOffEnd);
+
+  // One unsplit block: everything in one chunk whatever the limit.
+  Blocks one = GrowDir(50, 64);
+  REQUIRE(one.size() == 1);
+  REQUIRE(ReadRange(one, 0, 1, &next).size() == 50);
+  REQUIRE(next == kDirOffEnd);
+
+  // Pending rows are hidden, leaving rows listed. Blocks with no visible
+  // row in the middle are passed over when looking for the next chunk's
+  // start, and a chunk that ends before them still reaches the end of the
+  // directory when nothing visible follows.
+  Blocks blocks = GrowDir(2000, 64);
+  std::vector<clio::run::u32> order;
+  WalkByOffset(blocks, TableSubtree{0, 0}, &order);
+  REQUIRE(order.size() > 8);
+  for (size_t i = 2; i < 5; ++i) {
+    for (auto &e : blocks.at(order[i]).rows_) e.second.state_ = kRowPending;
+  }
+  blocks.at(order[5]).rows_.begin()->second.state_ = kRowLeaving;
+  const std::vector<DirRangeEntry> all = ListAll(blocks);
+  const size_t head =
+      blocks.at(order[0]).rows_.size() + blocks.at(order[1]).rows_.size();
+  std::vector<DirRangeEntry> c = ReadRange(blocks, 0, head, &next);
+  REQUIRE(c.size() == head);
+  REQUIRE(next == all[head].off_);
+  clio::run::u64 lo = 0, hi = 0;
+  DirOffRange(order[5], blocks.at(order[5]).depth_, &lo, &hi);
+  REQUIRE(next >= lo);  // the three hidden blocks were skipped
+  REQUIRE(next < hi);
+  size_t seen = c.size();
+  while (next != kDirOffEnd) {
+    c = ReadRange(blocks, next, 100, &next);
+    seen += c.size();
+  }
+  REQUIRE(seen == all.size());
+  for (size_t i = 5; i < order.size(); ++i) {
+    for (auto &e : blocks.at(order[i]).rows_) e.second.state_ = kRowPending;
+  }
+  c = ReadRange(blocks, 0, head, &next);
+  REQUIRE(c.size() == head);
+  REQUIRE(next == kDirOffEnd);
+
+  // A block that is not the one its parent split off is refused.
+  DirRangeScan scan(0, 10);
+  TableSubtree sub;
+  REQUIRE(scan.Next(&sub));
+  InodeTableBlock wrong;
+  wrong.index_ = 1;
+  wrong.born_ = wrong.depth_ = 1;
+  REQUIRE_FALSE(scan.Take(sub, wrong));
+}
+
+TEST_CASE("dir_range_equal_offsets", "[fs][inodetable][diroff]") {
+  // Names whose offsets are equal (here: clamped together at the low end)
+  // stay in one block and list in name order, all of them from that offset.
+  REQUIRE(DirOffOfHash(0) == DirOffOfHash(1ULL << 62));
+  std::vector<DirRangeEntry> v{{7, "b", 1, 0}, {7, "a", 2, 0}, {5, "z", 3, 0}};
+  SortDirRange(&v);
+  REQUIRE(v[0].name_ == "z");
+  REQUIRE(v[1].name_ == "a");
+  REQUIRE(v[2].name_ == "b");
 }
 
 TEST_CASE("canonical_fold", "[fs][canonical]") {

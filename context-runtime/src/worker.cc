@@ -40,9 +40,12 @@
 
 #include "clio_runtime/worker.h"
 #include "clio_runtime/cycle_counter.h"
+#include "clio_runtime/evlat.h"
 
 /** Latency-report channel hook (defined in ipc_gpu2cpu.cc). */
 extern "C" void clio_evlat_add(int which, unsigned long long cycles);
+/** Measured TSC rate for the report (defined in ipc_gpu2cpu.cc). */
+extern "C" double clio_evlat_cycles_per_us();
 
 namespace {
 
@@ -73,7 +76,7 @@ struct EvqWaitByWorker {
     if (worker >= static_cast<unsigned>(kMax)) return;
     n[worker].fetch_add(1, std::memory_order_relaxed);
     sum[worker].fetch_add(cycles, std::memory_order_relaxed);
-    if (cycles > 5000ull * 2995ull) {
+    if (cycles > static_cast<unsigned long long>(5000.0 * clio_evlat_cycles_per_us())) {
       slow[worker].fetch_add(1, std::memory_order_relaxed);
     }
   }
@@ -82,7 +85,7 @@ struct EvqWaitByWorker {
       const unsigned long long c = n[w].load();
       if (c == 0) continue;
       std::fprintf(stderr, "clio-evqw worker=%d n=%llu avg=%.0fus slow(>5ms)=%llu\n",
-                   w, c, static_cast<double>(sum[w].load()) / 2995.0 /
+                   w, c, static_cast<double>(sum[w].load()) / clio_evlat_cycles_per_us() /
                              static_cast<double>(c),
                    slow[w].load());
     }
@@ -95,6 +98,44 @@ std::atomic<unsigned long long> EvqWaitByWorker::n[EvqWaitByWorker::kMax];
 std::atomic<unsigned long long> EvqWaitByWorker::sum[EvqWaitByWorker::kMax];
 std::atomic<unsigned long long> EvqWaitByWorker::slow[EvqWaitByWorker::kMax];
 EvqWaitByWorker g_evqw_init;
+
+/**
+ * Which workers run peers' tasks (CLIO_EVLAT): per worker, how many remote
+ * tasks it first-ran and their summed r_exec (first run -> EndTask). If one
+ * worker runs nearly all of them, remote throughput per node is capped at
+ * 1 / r_exec no matter how many workers the pool has.
+ * Printed at exit as "clio-evremote worker=N n=.. exec_sum=..ms".
+ */
+struct RemoteExecByWorker {
+  static constexpr int kMax = 64;
+  static std::atomic<unsigned long long> n[kMax], cyc[kMax];
+  static void Start(unsigned worker) {
+    if (worker < static_cast<unsigned>(kMax)) {
+      n[worker].fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+  static void Exec(unsigned worker, unsigned long long cycles) {
+    if (worker < static_cast<unsigned>(kMax)) {
+      cyc[worker].fetch_add(cycles, std::memory_order_relaxed);
+    }
+  }
+  static void Report() {
+    for (int w = 0; w < kMax; ++w) {
+      const unsigned long long c = n[w].load();
+      if (c == 0) continue;
+      std::fprintf(stderr, "clio-evremote worker=%d n=%llu exec_sum=%.0fms\n",
+                   w, c,
+                   static_cast<double>(cyc[w].load()) /
+                       clio_evlat_cycles_per_us() / 1000.0);
+    }
+  }
+  RemoteExecByWorker() {
+    if (clio::run::evlat::On()) std::atexit(Report);
+  }
+};
+std::atomic<unsigned long long> RemoteExecByWorker::n[RemoteExecByWorker::kMax];
+std::atomic<unsigned long long> RemoteExecByWorker::cyc[RemoteExecByWorker::kMax];
+RemoteExecByWorker g_remote_exec_init;
 }  // namespace
 
 // <coroutine> only for the C++20 stackless backend, not the Boost stackful one.
@@ -1058,7 +1099,14 @@ u32 Worker::DrainMyShard() {
   // ingested task, a larger quantum amortizes the drain loop; fairness to the
   // lane is preserved because each ingested task still runs to completion (or
   // routes away) before the next pop.
-  constexpr u32 kShardDrainBudget = 256;
+  // CLIO_SHARD_DRAIN_BUDGET overrides (experiment): a worker runs up to this
+  // many client requests inline per pass before it looks at its lane, which
+  // is where peer tasks wait (r_lane ~1.5 ms at 4-node 16x16 4 KB).
+  static const u32 kShardDrainBudget = [] {
+    const char *e = std::getenv("CLIO_SHARD_DRAIN_BUDGET");
+    const long v = e != nullptr ? std::atol(e) : 0;
+    return v > 0 ? static_cast<u32>(v) : 256u;
+  }();
   TaskLane *my_lane = assigned_lane_.load(std::memory_order_acquire);
   if (!BatchingEnabled()) {
     u32 n = 0;
@@ -1220,12 +1268,26 @@ void Worker::SuspendMe() {
     // already spun ~1ms with no work, and every producer that feeds a
     // sub-millisecond periodic (EnqueueNetTask, SHM shard, lanes) wakes the
     // worker explicitly, so the fast period only matters while busy.
+    //
+    // Idle backoff: a fixed 1ms floor still woke the worker hosting the admin
+    // SendPoll/ClientSend periodics ~1000 times/s forever, each wake running
+    // ContinueBlockedTasks twice plus the due periodics (two thread-CPU-time
+    // syscalls per ExecTask). On an idle macOS desktop that one worker was
+    // ~10-15% of a core. Every consecutive park that times out with no work
+    // doubles the floor (1, 2, 4 ... ms) up to max_sleep; any work resets
+    // sleep_count_ in Run(). Producers still wake the worker explicitly, and
+    // max_sleep remains the bound on a missed wakeup, exactly as for a worker
+    // with no periodic task, so this only stretches polling nobody is waiting on.
     constexpr int kMinParkUs = 1000;
+    constexpr u64 kMaxParkBackoffShift = 6;
+    const int park_floor_us =
+        kMinParkUs
+        << static_cast<int>(std::min<u64>(sleep_count_, kMaxParkBackoffShift));
     double suspend_period_us = GetSuspendPeriod();
     int timeout_us = (suspend_period_us < 0)
                          ? static_cast<int>(max_sleep)
                          : std::min(std::max(static_cast<int>(suspend_period_us),
-                                             kMinParkUs),
+                                             park_floor_us),
                                     static_cast<int>(max_sleep));
 
     // issue #807: park protocol for the inbound SHM shard. The ORDER is
@@ -1419,6 +1481,15 @@ void Worker::ExecTask(clio::run::shared_ptr<Task> &task_ptr, bool is_started) {
     BookHold(task_ptr.get());
     task_ptr->ResumeCoroutine(task_ptr);
   } else {
+    if (evlat::On() && task_ptr->IsRemote()) {
+      // Serving node, first run of a peer's task: close r_lane, open r_exec.
+      if (RunContext *ev_rc = task_ptr->RunCtxPtr()) {
+        const unsigned long long now = CycleNow();
+        evlat::Span(evlat::kRemoteLane, ev_rc->remote_arrive_cyc_, now);
+        ev_rc->remote_start_cyc_ = now;
+        RemoteExecByWorker::Start(GetId());
+      }
+    }
     task_ptr->StartCoroutine(task_ptr);
     task_ptr->SetStarted();
 
@@ -1639,6 +1710,16 @@ void Worker::EndTask(clio::run::shared_ptr<Task> &task_ptr, bool can_resched) {
   // small ACK / heartbeat reply doesn't queue behind a 1 MiB GetBlob
   // response on the wire.
   if (is_remote) {
+    if (evlat::On()) {
+      if (RunContext *ev_rc = task_ptr->RunCtxPtr()) {
+        if (ev_rc->remote_start_cyc_ != 0) {
+          const unsigned long long now = CycleNow();
+          evlat::Span(evlat::kRemoteExec, ev_rc->remote_start_cyc_, now);
+          RemoteExecByWorker::Exec(GetId(), now - ev_rc->remote_start_cyc_);
+        }
+        ev_rc->remote_start_cyc_ = 0;
+      }
+    }
     CLIO_IPC->GetRun2Run()->NoteResponseAge(task_ptr, "end-task");
     size_t io_size = task_ptr->PredictedStat().io_size_;
     NetQueuePriority prio = (io_size >= kNetQueueIoThreshold)

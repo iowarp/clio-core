@@ -986,6 +986,10 @@ inline constexpr bool PutRcIsNoSpace(clio::run::u32 rc) {
          (rc >= kReplicaPutRcBase + 11 &&
           rc <= kReplicaPutRcBase + kPutNoSpaceRc);
 }
+/** PutBlob refused: kCtePutAppend was combined with a shape the append path
+ *  cannot honour (with kCtePutReplace, on a replica-targeted put, or vectored).
+ *  See kCtePutAppend. */
+static constexpr clio::run::u32 kCtePutAppendInvalidRc = 15;
 /** PutBlob with Context::kPutIfAbsent found the blob already there. */
 static constexpr clio::run::u32 kPutExistsRc = 60;
 /** PutBlob with Context::kPutIfVersion found a different version. */
@@ -2275,6 +2279,29 @@ GLOBAL_CROSS_CONST clio::run::u32 kCtePrefetchHint = 0x80000000u;
 GLOBAL_CROSS_CONST clio::run::u32 kCtePutDroppable = 0x2u;
 
 /**
+ * kCtePutAppend: write the put's bytes at the blob's CURRENT end, like a
+ * journal append, without the caller knowing the size.
+ *
+ * The task's offset_ input is IGNORED. Under the blob's write token the put
+ * writes its size_ bytes at the blob's logical size as it stands then (0 for a
+ * blob the put creates). Concurrent appenders are ordered by write-token
+ * acquisition, first come first served, and nothing more. An append never
+ * shrinks the blob and never zero-fills: it is exactly a modify of
+ * [old_size, old_size + size).
+ *
+ * Output: the offset the bytes landed at is written back into the task's
+ * offset_ field, which is serialized OUT (PutBlobTask and PodPutBlobTask).
+ * Read it after Wait() as task->offset_. The landed offset is only valid when
+ * the return code is 0.
+ *
+ * Not supported, rejected with kCtePutAppendInvalidRc:
+ *  - combined with kCtePutReplace (an append cannot also replace);
+ *  - on a replica-targeted put (Context::replica_ != 0);
+ *  - on a vectored put (non-empty segments_).
+ */
+GLOBAL_CROSS_CONST clio::run::u32 kCtePutAppend = 0x4u;
+
+/**
  * PutBlob refused: the blob is an expendable cache copy (kCtePutDroppable) and
  * this put would take ownership of bytes the tier may discard.
  */
@@ -2508,7 +2535,9 @@ struct PutBlobTask : public clio::run::Task {
     context_.op_flags_ &= ~Context::kBlobNameRawInt32;
     blob_name_ = dec.c_str();
   }
-  IN clio::run::u64 offset_;                 // Offset within blob
+  // Offset within blob. IN for ordinary puts. For kCtePutAppend it is ignored
+  // on input and OUT on completion: the offset the bytes landed at.
+  INOUT clio::run::u64 offset_;
   IN clio::run::u64 size_;                   // Size of blob data
   IN ctp::ipc::ShmPtr<> blob_data_;        // Blob data (shared memory pointer)
   /**
@@ -2688,7 +2717,9 @@ struct PutBlobTask : public clio::run::Task {
     // FreeBuffer(task->blob_data_) frees a foreign/already-freed buffer and
     // corrupts the allocator — observed as a hang in CAE assimilators under
     // CLIO_FORCE_NET (issue #500).
-    ar(blob_name_, context_);
+    // offset_ travels back as well: it is the landed offset of a kCtePutAppend
+    // put. It is a plain integer, so echoing its input value is harmless.
+    ar(offset_, blob_name_, context_);
     ar.PopPod();
   }
 
@@ -2725,8 +2756,10 @@ struct PutBlobTask : public clio::run::Task {
     // never modifies it, so the origin's copy is already correct. Do NOT assign
     // it: it is the CLIENT's shm string, and taking the replica's would free
     // the client's buffer through the runtime's allocator (the #500 class of
-    // corruption). context_ is the only field carrying real OUT state.
+    // corruption). context_ is the only field carrying real OUT state, plus
+    // the landed offset of a kCtePutAppend put (a plain integer, safe to copy).
     context_.AggregateOut(replica->context_);
+    offset_ = replica->offset_;
   }
 };
 
@@ -3394,7 +3427,7 @@ struct PodPutBlobTask : public clio::run::Task {
     context_.op_flags_ &= ~Context::kBlobNameRawInt32;
     blob_name_ = dec.c_str();
   }
-  IN clio::run::u64 offset_;
+  INOUT clio::run::u64 offset_;  // IN; OUT landed offset for kCtePutAppend
   IN clio::run::u64 size_;
   IN ctp::ipc::ShmPtr<> blob_data_;
   IN float score_;
@@ -3485,8 +3518,9 @@ struct PodPutBlobTask : public clio::run::Task {
   CTP_CROSS_FUN void SerializeOut(Archive &ar) {
     Task::SerializeOut(ar);
     // Only INOUT fields travel back (see PutBlobTask::SerializeOut for why
-    // blob_data_ must NOT be echoed).
-    ar(blob_name_, context_);
+    // blob_data_ must NOT be echoed). offset_ carries the landed offset of a
+    // kCtePutAppend put.
+    ar(offset_, blob_name_, context_);
   }
 
   void Copy(const ctp::ipc::FullPtr<PodPutBlobTask> &other) {

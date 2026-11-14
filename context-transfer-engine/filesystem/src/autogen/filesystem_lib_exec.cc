@@ -28,6 +28,7 @@ namespace clio::cte::filesystem {
   X(kGetattr, GetattrTask, Getattr)       \
   X(kTruncate, TruncateTask, Truncate)    \
   X(kReaddir, ReaddirTask, Readdir)       \
+  X(kReaddirRange, ReaddirRangeTask, ReaddirRange) \
   X(kMkdir, MkdirTask, Mkdir)             \
   X(kRmdir, RmdirTask, Rmdir)             \
   X(kUnlink, UnlinkTask, Unlink)          \

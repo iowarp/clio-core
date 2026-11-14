@@ -17,7 +17,7 @@ transfers:
     format: binary
 </pre>
 <pre data-label="shell">
-$ clio_run start &amp;
+$ clio_run start &
 $ clio_cae transfers.yaml
 </pre>
 <p>The file becomes the tag <code>run42_field</code> holding blobs <code>chunk_0</code>, <code>chunk_1</code>, and so on, 1 MiB each. Top-level keys other than <code>transfers</code>, such as <code>name</code>, are ignored. A per-transfer key the loader does not know is logged as a warning and ignored.</p>
@@ -70,7 +70,7 @@ transfers:
   - src: file::/data/A46_xx.csv
     dst: iowarp::a46_parquet
     format: binary
-    run: ./to_parquet.sh           # called as: to_parquet.sh &lt;src&gt; &lt;run_out&gt;
+    run: ./to_parquet.sh           # called as: to_parquet.sh <src> <run_out>
     run_out: /scratch/a46.parquet  # the file the script must write
 </pre>
 <p>Both paths are environment-expanded, and relative paths resolve against the OMNI file's directory. <code>run_out</code> without <code>run</code>, or the reverse, is an error.</p>

@@ -1,0 +1,427 @@
+#!/usr/bin/env bash
+#PBS -l select=16
+#PBS -l place=scatter
+#PBS -l walltime=01:00:00
+#PBS -l filesystems=home:flare:daos_user
+#PBS -l daos=daos_user
+#PBS -q debug-scaling
+#PBS -A IOWarp
+#PBS -j oe
+#
+# IO500 on Aurora: clio-fs (tiered DRAM / DAOS / Flare) vs plain Flare.
+#
+#   qsub -l select=16 -v MODE=cliofs benchmarks/io500/pbs_io500_aurora.sh
+#   qsub -l select=16 -v MODE=flare  benchmarks/io500/pbs_io500_aurora.sh
+#   qsub -l select=16 -v MODE=daos   benchmarks/io500/pbs_io500_aurora.sh
+#
+# MODE=daos  : IO500 datadir on a dfuse mount of DAOS pool $DAOS_POOL.
+# MODE=flare : IO500 datadir on Lustre (Flare) directly.
+# MODE=cliofs: one clio_run + clio_cte_fuse per node; the CTE has three tiers
+#              per node, sized from the node's share of the dataset D:
+#                ram::            RAM_PCT% of D  (score 1.0)
+#                file on dfuse    DAOS_PCT% of D (DAOS pool $DAOS_POOL, score 0.6)
+#                file on Flare    FLARE_X x D    (score 0.2, overflow tier)
+#              With the defaults (25 + 50) 75% of the data fits in DRAM+DAOS
+#              and the remaining 25% has to spill to Flare.
+#              IO500 datadir is the clio-fs mount (same path on every node).
+#
+# Knobs (qsub -v): MODE, PPN (IO500 ranks per node, 16), STONEWALL (300 s,
+# the IO500 rule), RAM_PCT (25), DAOS_PCT (50), FLARE_X (4), BUILD_DIR
+# (build/fs), IO500 (binary), DAOS_POOL (IOWarp), DAOS_CONT (io500_<nodes>n).
+# CLIO_FUSE_DIR_ATTR_CACHE_S (unset = off on multi-node): seconds the adapter
+# caches directory attributes; passed through to clio_cte_fuse unchanged.
+# DAOS_API (MODE=daos; dfuse): dfs runs IO500 on libdfs directly, no FUSE.
+# NO_FLARE (0): 1 drops the Flare tier; tiers are then DRAM + DAOS only.
+# HANG_DUMP_S (unset = off): seconds after IO500 starts at which a still-running
+# job dumps every node's runtime and adapter stacks (hang diagnosis).
+# PFIND_HASH (unset/0 = off): 1 adds
+# pfind-parallelize-single-dir-access-using-hashing = TRUE to io500.ini's
+# [find] section, so pfind splits one large directory across ranks by
+# telldir/seekdir offset. Needs directory offsets that are stable across
+# processes (clio-fs's are; see docs/docs/deployment/adapter.md).
+set -u
+MODE=${MODE:-cliofs}
+PPN=${PPN:-16}
+STONEWALL=${STONEWALL:-300}
+# Weak scaling: a fixed amount of work PER RANK (the IOWarp Flare project
+# quota is 1 TiB, so it is small: 128 nodes x 16 ranks writes ~230 GB).
+# Scores are therefore not valid IO500 submissions.
+EASY_MB=${EASY_MB:-96}          # ior-easy bytes per rank (multiple of 2m)
+HARD_SEG=${HARD_SEG:-400}       # ior-hard 47008-byte segments per rank (~18 MB)
+MD_N=${MD_N:-2000}              # mdtest-easy/hard files per rank
+BUILD_DIR=${BUILD_DIR:-/home/llogan/clio-core/build/fs}
+IO500=${IO500:-/lus/flare/projects/IOWarp/llogan/io500/src/io500}
+DAOS_POOL=${DAOS_POOL:-IOWarp}
+FLARE=${FLARE:-/lus/flare/projects/IOWarp/llogan/io500}
+HERE=/home/llogan/clio-core/benchmarks/io500
+
+# Ask the per-node scripts to tear down and wait at most DOWN_WAIT seconds:
+# at 256 nodes a teardown that never finished held the whole allocation
+# for ten minutes after the benchmark had already failed.
+stop_nodes() {
+  touch stop
+  for _ in $(seq 1 "${DOWN_WAIT:-180}"); do
+    kill -0 "$NODES_PID" 2>/dev/null || return 0
+    sleep 1
+  done
+  echo "=== teardown still running after ${DOWN_WAIT:-180} s; ending the job"
+  kill "$NODES_PID" 2>/dev/null
+}
+NN=$(sort -u "$PBS_NODEFILE" | wc -l)
+NP=$(( NN * PPN ))
+# Per-node share of the dataset in MB: ior-easy + ior-hard + mdtest-hard
+# (3901-byte files). Blobs land on the node that wrote them (pool_query
+# local, neighborhood 1), so this is what each node's tiers must hold.
+DATA_MB=$(( PPN * (EASY_MB + HARD_SEG * 47008 / 1048576) + PPN * MD_N * 3901 / 1048576 + 1 ))
+RAM_PCT=${RAM_PCT:-25}
+DAOS_PCT=${DAOS_PCT:-50}
+# The Flare tier is the overflow: it only has to take the remaining
+# (100 - RAM_PCT - DAOS_PCT)% but is sized FLARE_X x the dataset so the
+# filesystem never runs out of space. It grows lazily, so the Flare quota
+# only pays for what actually spills.
+FLARE_X=${FLARE_X:-4}
+# RUN_TAG distinguishes several runs inside one job (pbs_ior_sweep.sh).
+JOB=${PBS_JOBID%%.*}${RUN_TAG:+_$RUN_TAG}
+OUT=$FLARE/runs/${MODE}_${NN}n_${JOB}
+mkdir -p "$OUT"; cd "$OUT"
+sort -u "$PBS_NODEFILE" > hostfile
+echo "=== IO500 mode=$MODE nodes=$NN ppn=$PPN stonewall=$STONEWALL out=$OUT"
+echo "=== commit $(git -C /home/llogan/clio-core rev-parse --short HEAD) $(git -C /home/llogan/clio-core status --porcelain -uno | wc -l) dirty files"
+
+# The launcher pings every node and aborts the job when one does not answer.
+# Under the dfuse mdtest load at 64 and 256 nodes a node stayed silent for
+# ~100 s and both DAOS runs were killed in mdtest-easy-write.
+export PALS_PING_PERIOD=${PALS_PING_PERIOD:-120} PALS_RPC_TIMEOUT=${PALS_RPC_TIMEOUT:-900}
+export PATH=/soft/daos/bin:$PATH DAOS_AGENT_DRPC_DIR=/run/daos_agent_oneScratch
+# Same fabric settings as `module load daos` (without them dfuse failed DER_HG).
+export FI_CXI_RX_MATCH_MODE=hybrid FI_MR_CACHE_MONITOR=kdreg2 \
+  FI_MR_CACHE_MAX_COUNT=2000000 FI_CXI_DEFAULT_CQ_SIZE=131072 NA_OFI_CXI_PROTO_RNR=0
+
+# One DAOS container per node count, so jobs at different scales (different
+# queues, possibly concurrent) never share one. DAOS_RESET=1 destroys it at
+# the start: failed runs leave millions of mdtest files behind, deleting
+# them through dfuse takes hours, and they filled the pool's metadata tier
+# (mdtest-hard-write hit ENOSPC at 64 nodes). DAOS_DESTROY lists other
+# containers to drop first (the old shared io500_cliofs).
+DAOS_CONT=${DAOS_CONT:-io500_${NN}n}
+if [ "$MODE" != flare ]; then
+  for c in ${DAOS_DESTROY:-}; do
+    daos cont destroy "$DAOS_POOL" "$c" --force 2>&1 | grep -v ' ERR ' | tail -1
+  done
+  if [ "${DAOS_RESET:-1}" = 1 ]; then
+    daos cont destroy "$DAOS_POOL" "$DAOS_CONT" --force 2>&1 | grep -v ' ERR ' | tail -1
+  fi
+  daos pool query "$DAOS_POOL" 2>&1 | grep -i -E 'total size|free' | head -4
+fi
+
+if [ "$MODE" = cliofs ]; then
+  test -x "$BUILD_DIR/bin/clio_cte_fuse" || { echo "NO $BUILD_DIR/bin/clio_cte_fuse"; exit 2; }
+  RAM_GB=$(( DATA_MB * RAM_PCT / 100 )); DAOS_GB=$(( DATA_MB * DAOS_PCT / 100 )); FL_GB=$(( DATA_MB * FLARE_X ))
+  # NO_FLARE=1: DRAM + DAOS only (the configuration to compare against DAOS).
+  # The DAOS tier becomes the overflow tier, sized DAOS_X (2) x the dataset.
+  if [ "${NO_FLARE:-0}" = 1 ]; then DAOS_GB=$(( DATA_MB * ${DAOS_X:-2} )); FL_GB=0; fi
+  echo "=== cache module ${CACHE:-1}; data per node ${DATA_MB}MB; tiers per node: DRAM ${RAM_GB}MB (${RAM_PCT}%)  DAOS ${DAOS_GB}MB (${DAOS_PCT}%)  Flare ${FL_GB}MB (overflow)"
+  daos pool query "$DAOS_POOL" 2>&1 | grep -i -E 'total size|free' | head -4
+  daos cont query "$DAOS_POOL" "$DAOS_CONT" > /dev/null 2>&1 \
+    || daos cont create "$DAOS_POOL" "$DAOS_CONT" --type POSIX 2>&1 | grep -v ' ERR '
+  mkdir -p "$FLARE/tiers/$JOB"
+  find "$FLARE/tiers" -mindepth 1 -maxdepth 1 -mmin +120 ! -name "$JOB" -exec rm -rf {} + 2>/dev/null
+  LR=/tmp/$USER/cliofs
+  cat > clio_server.yaml <<EOF
+# Generated by pbs_io500_aurora.sh (job $JOB)
+memory:
+  main_segment_size: auto
+  client_data_segment_size: 4GB
+networking:
+  port: 9519
+  hostfile: $OUT/hostfile
+  neighborhood_size: 1024
+runtime:
+  num_threads: ${NUM_THREADS:-16}
+  queue_depth: 4096
+  conf_dir: $LR/conf
+compose:
+  - mod_name: clio_cte_core
+    pool_name: cte_main
+    pool_query: local
+    pool_id: "512.0"
+    storage:
+      - path: "ram::clio_fs_ram"
+        bdev_type: "ram"
+        capacity_limit: "${RAM_GB}MB"
+        score: 1.0
+EOF
+  # PERSIST=volatile turns off the file tiers' allocator write-ahead log
+  # (a synchronous append to the network filesystem per allocate/free).
+  # RAM_ONLY=1 leaves out the DAOS and Flare file tiers: a software-stack
+  # ceiling with no storage I/O at all (diagnostic, not a real deployment).
+  if [ "${RAM_ONLY:-0}" != 1 ]; then
+    cat >> clio_server.yaml <<EOF
+      - path: "/tmp/$USER/daos_io500/tiers/$JOB/__HOST__.dat"
+        bdev_type: "file"
+        capacity_limit: "${DAOS_GB}MB"
+        score: 0.6
+        persistence_level: "${PERSIST:-temporary}"
+EOF
+    [ "${NO_FLARE:-0}" = 1 ] || cat >> clio_server.yaml <<EOF
+      - path: "$FLARE/tiers/$JOB/__HOST__.dat"
+        bdev_type: "file"
+        capacity_limit: "${FL_GB}MB"
+        score: 0.2
+        persistence_level: "${PERSIST:-temporary}"
+EOF
+  fi
+  cat >> clio_server.yaml <<EOF
+    dpe:
+      dpe_type: "max_bw"
+    targets:
+      neighborhood: 1
+      default_target_timeout_ms: 30000
+      poll_period_ms: 5000
+EOF
+  # DIR_LOG_COMPACT sets dir_log_compact_bytes: how much a directory block's
+  # blob may grow by appended deltas before it is rewritten as one image
+  # (unset = the module default; 0 = rewrite the whole block every commit).
+  # META_LOG=1 gives the filesystem module a node-local directory journal
+  # (metadata_log_path). Without it every create and delete rewrites its
+  # whole directory block as a CTE blob before it is acknowledged.
+  # CACHE=1 (default): filesystem -> stream -> cache -> core. The cache
+  # module keeps a node-local raw copy (tiers scoring >= min_score) next to
+  # the authoritative copy on the blob's hash-owner node, so every byte is
+  # stored twice. CACHE_MD_ONLY=true keeps the module for its metadata role
+  # (tag write-through) but stores no node-local data copies. CACHE=0 drops it: stream and filesystem chain straight to
+  # the core and each byte is stored once, on its owner node.
+  if [ "${CACHE:-1}" = 1 ]; then
+    cat >> clio_server.yaml <<EOF
+  - mod_name: clio_cte_cache
+    pool_name: clio_cte_cache
+    pool_query: local
+    pool_id: "563.0"
+    next_pool_id: "512.0"
+    min_score: 0.5
+    md_only: ${CACHE_MD_ONLY:-false}
+EOF
+    NEXT=563.0
+  else
+    NEXT=512.0
+  fi
+  cat >> clio_server.yaml <<EOF
+  - mod_name: clio_cte_stream
+    pool_name: clio_cte_stream
+    pool_query: local
+    pool_id: "565.0"
+    next_pool_id: "$NEXT"
+    staging_pool_id: "512.0"
+  - mod_name: clio_cte_filesystem
+    pool_name: clio_cte_filesystem
+    pool_query: local
+    pool_id: "560.0"
+    next_pool_id: "$NEXT"
+$( [ "${META_LOG:-0}" = 1 ] && echo "    metadata_log_path: \"$LR/meta/cfs_namespace_log\"" )
+$( [ -n "${DIR_LOG_COMPACT:-}" ] && echo "    dir_log_compact_bytes: \"$DIR_LOG_COMPACT\"" )
+EOF
+  # Per-node bring-up runs for the whole job in the background; it writes
+  # $OUT/ready/<host> once the mount answers and tears down on $OUT/stop.
+  mkdir -p ready logs
+  mpiexec -n "$NN" -ppn 1 --no-vni --cpu-bind none --envall \
+    env OUT="$OUT" BUILD_DIR="$BUILD_DIR" LR="$LR" JOB="$JOB" FLARE="$FLARE" \
+        DAOS_POOL="$DAOS_POOL" DAOS_CONT="$DAOS_CONT" \
+    bash "$HERE/cliofs_node.sh" > logs/node_up.log 2>&1 &
+  NODES_PID=$!
+  for _ in $(seq 1 "${UP_WAIT:-240}"); do
+    [ "$(ls ready 2>/dev/null | wc -l)" -ge "$NN" ] && break
+    kill -0 $NODES_PID 2>/dev/null || break
+    sleep 1
+  done
+  up=$(ls ready 2>/dev/null | wc -l)
+  echo "=== clio-fs up on $up/$NN nodes"
+  if [ "$up" -lt "$NN" ]; then
+    echo "clio-fs bring-up FAILED"; tail -40 logs/node_up.log
+    stop_nodes; exit 3
+  fi
+  # SETTLE: seconds to wait after every mount answers. At 64 nodes pool
+  # creation was still in progress on some nodes when IO500 started.
+  sleep "${SETTLE:-0}"
+  DATADIR=$LR/mnt/io500_$JOB
+elif [ "$MODE" = daos ]; then
+  daos cont query "$DAOS_POOL" "$DAOS_CONT" > /dev/null 2>&1 \
+    || daos cont create "$DAOS_POOL" "$DAOS_CONT" --type POSIX 2>&1 | grep -v ' ERR '
+  mkdir -p ready logs
+  mpiexec -n "$NN" -ppn 1 --no-vni --cpu-bind none --envall \
+    env OUT="$OUT" DAOS_POOL="$DAOS_POOL" DAOS_CONT="$DAOS_CONT" \
+    bash "$HERE/daos_node.sh" > logs/node_up.log 2>&1 &
+  NODES_PID=$!
+  for _ in $(seq 1 "${UP_WAIT:-240}"); do
+    [ "$(ls ready 2>/dev/null | wc -l)" -ge "$NN" ] && break
+    kill -0 $NODES_PID 2>/dev/null || break
+    sleep 1
+  done
+  up=$(ls ready 2>/dev/null | wc -l)
+  echo "=== dfuse up on $up/$NN nodes"
+  if [ "$up" -lt "$NN" ]; then
+    echo "dfuse bring-up FAILED"; tail -40 logs/node_up.log
+    stop_nodes; exit 3
+  fi
+  DATADIR=/tmp/$USER/daos_io500/data/daos_${NN}n_$JOB
+  # DAOS_API=dfs: IO500 talks to the container through libdfs instead of the
+  # dfuse mount (the mount stays up but carries no benchmark I/O).
+  if [ "${DAOS_API:-dfuse}" = dfs ]; then
+    DATADIR=/io500_${NN}n_$JOB
+    DFS_API="DFS --dfs.pool=$DAOS_POOL --dfs.cont=$DAOS_CONT"
+  fi
+else
+  DATADIR=$FLARE/data/flare_${NN}n_$JOB
+  mkdir -p "$DATADIR"
+fi
+
+DFS_API=${DFS_API:-}
+API_LINE=""
+[ -n "$DFS_API" ] && API_LINE="API = $DFS_API"
+cat > io500.ini <<EOF
+[global]
+datadir = $DATADIR
+${DFS_API:+api = $DFS_API}
+resultdir = $OUT/results
+timestamp-resultdir = FALSE
+drop-caches = FALSE
+
+[debug]
+stonewall-time = $STONEWALL
+
+[ior-easy]
+blockSize = ${EASY_MB}m
+$API_LINE
+
+[ior-hard]
+segmentCount = $HARD_SEG
+$API_LINE
+
+[mdtest-easy]
+n = $MD_N
+$API_LINE
+
+[mdtest-hard]
+n = $MD_N
+$API_LINE
+
+# Not part of the score; random 4 KiB reads ran for 20 minutes at 64 nodes.
+[ior-rnd4K-easy-read]
+run = FALSE
+EOF
+if [ -n "$DFS_API" ]; then
+  # IO500's built-in pfind walks a POSIX path; a libdfs datadir has none.
+  printf '\n[find]\nrun = FALSE\n' >> io500.ini
+  echo "=== find skipped: no POSIX path in DAOS_API=dfs mode"
+elif [ "${PFIND_HASH:-0}" = 1 ]; then
+  cat >> io500.ini <<EOF
+
+[find]
+pfind-parallelize-single-dir-access-using-hashing = TRUE
+EOF
+  echo "=== pfind: single-directory access parallelized by hashing"
+fi
+echo "=== caps: ior-easy ${EASY_MB}MB/rank, ior-hard $HARD_SEG seg/rank, mdtest $MD_N files/rank"
+mkdir -p results
+if [ "${BENCH:-io500}" = ior ]; then
+  # BENCH=ior: only the two ior-easy phases, with IO500's own arguments
+  # (file per process, 2 MiB transfers, fsync before close). Minutes
+  # instead of the half hour the metadata phases take.
+  IOR=${IOR:-$(dirname "$IO500")/bin/ior}
+  mkdir -p "$DATADIR/ior-easy" 2>/dev/null
+  for ph in write read; do
+    [ $ph = write ] && fl="-w" || fl="-r"
+    # PROFILE=1: sample thread CPU and stacks on this node during the phase.
+    [ "${PROFILE:-0}" = 1 ] && bash "$HERE/sample_stacks.sh" "$OUT/prof_$ph" \
+      "${PROFILE_DELAY:-1}" > /dev/null 2>&1 &
+    mpiexec -n $(( NN * PPN )) -ppn "$PPN" --cpu-bind depth -d 4 --envall \
+      "$IOR" -g -G 271828 -k -e -o "$DATADIR/ior-easy/ior_file_easy" -C -Q 1 \
+      -t 2m -b "${EASY_MB}m" -F $fl -a POSIX ${IOR_EXTRA:-} > "ior-easy-$ph.txt" 2>&1
+    rc=$?
+    echo "IORCELL tag=${RUN_TAG:-none} nodes=$NN phase=$ph rc=$rc $(grep -E '^(write|read) ' "ior-easy-$ph.txt" | awk '{print "MiB/s=" $2, "open_s=" $7, "io_s=" $8, "close_s=" $9}')"
+  done
+elif [ "${BENCH:-io500}" = mdtest ]; then
+  # BENCH=mdtest: create then delete, for the per-rank-directory layout
+  # (IO500 mdtest-easy) and the single shared directory (mdtest-hard).
+  # PROFILE=1 samples thread CPU and stacks on this node during each delete.
+  MDT=${MDT:-$(dirname "$IO500")/bin/mdtest}
+  run_md() {  # <tag> <phase flag> <layout args...>
+    local tag=$1 fl=$2; shift 2
+    mpiexec -n $(( NN * PPN )) -ppn "$PPN" --cpu-bind depth -d 4 --envall \
+      "$MDT" -n "$MD_N" -F -N 1 -P "$fl" "$@" -a POSIX > "mdtest-$tag.txt" 2>&1
+    echo "MDCELL tag=${RUN_TAG:-none} nodes=$NN phase=$tag rc=$? $(grep -E 'File (creation|removal)' "mdtest-$tag.txt" | awk '{print $1 "_" $2 "_per_s=" $4}' | tr '\n' ' ')"
+  }
+  mkdir -p "$DATADIR/md-easy" "$DATADIR/md-hard" 2>/dev/null
+  run_md easy-create -C -u -L -d "$DATADIR/md-easy"
+  SP=
+  [ "${PROFILE:-0}" = 1 ] && { bash "$HERE/sample_stacks.sh" "$OUT/prof_easy_delete" \
+    "${PROFILE_DELAY:-2}" "${PROFILE_N:-12}" > /dev/null 2>&1 & SP=$!; }
+  run_md easy-delete -r -u -L -d "$DATADIR/md-easy"
+  # Only the sampler: a bare `wait` would also wait for the node scripts,
+  # which run until the job tears down (this hung two jobs).
+  [ -n "$SP" ] && wait "$SP"
+  run_md hard-create -C -t -w 3901 -e 3901 -d "$DATADIR/md-hard"
+  SP=
+  [ "${PROFILE:-0}" = 1 ] && { bash "$HERE/sample_stacks.sh" "$OUT/prof_hard_delete" \
+    "${PROFILE_DELAY:-2}" "${PROFILE_N:-12}" > /dev/null 2>&1 & SP=$!; }
+  run_md hard-delete -r -t -w 3901 -e 3901 -d "$DATADIR/md-hard"
+  [ -n "$SP" ] && wait "$SP"
+  rc=0
+else
+echo "=== IO500 start $(date)"
+# HANG_DUMP_S: if IO500 is still running after this many seconds, ask every
+# node for the stacks of its runtime and adapter (logs/<host>.*.stacks).
+HD=""
+[ -n "${HANG_DUMP_S:-}" ] && { ( sleep "$HANG_DUMP_S"; touch dump; echo "=== hang dump requested $(date)" ) & HD=$!; }
+# SYNC_FS_ONLY=1: mdtest ends each phase with system("sync"), a whole-node
+# flush. On Aurora that blocked in the kernel on some nodes (16 sync processes
+# per node in D state for 10+ minutes with the filesystem under test idle),
+# hanging the run. This puts a `sync` first in PATH that flushes only the
+# filesystem under test (sync -f). It changes what the benchmark flushes, so
+# use the same setting for every system being compared.
+if [ "${SYNC_FS_ONLY:-0}" = 1 ]; then
+  case "$MODE" in
+    cliofs) SYNC_DIR=$LR/mnt ;;
+    daos)   SYNC_DIR=/tmp/$USER/daos_io500 ;;
+    *)      SYNC_DIR=$DATADIR ;;
+  esac
+  mkdir -p "$OUT/bin"
+  printf '#!/bin/sh\nexec /usr/bin/sync -f %s\n' "$SYNC_DIR" > "$OUT/bin/sync"
+  chmod +x "$OUT/bin/sync"
+  export PATH=$OUT/bin:$PATH
+  echo "=== sync limited to $SYNC_DIR"
+fi
+# libdfs clients reach the DAOS servers over the fabric themselves, which the
+# launcher's per-job VNI blocks (NA_HOSTUNREACH); --no-vni as for dfuse.
+NOVNI=""
+[ -n "$DFS_API" ] && NOVNI="--no-vni"
+mpiexec -n $(( NN * PPN )) -ppn "$PPN" $NOVNI --cpu-bind depth -d 4 --envall \
+  "$IO500" io500.ini > io500.log 2>&1 &
+MPI_PID=$!
+if [ -n "$DFS_API" ]; then
+  # With libdfs the ranks never exited after IO500 wrote its results (a
+  # 2-node run sat until walltime). Once the summary line is out, give them
+  # a minute and end the launcher.
+  ( while kill -0 $MPI_PID 2>/dev/null; do
+      if grep -q 'result files are stored' io500.log 2>/dev/null; then
+        sleep 60; kill $MPI_PID 2>/dev/null; break
+      fi
+      sleep 5
+    done ) &
+fi
+wait $MPI_PID
+rc=$?
+[ -n "$HD" ] && kill "$HD" 2>/dev/null
+echo "=== IO500 rc=$rc end $(date)"
+grep -E '^\[RESULT|^\[SCORE' io500.log results/result_summary.txt 2>/dev/null | sort -u
+echo "IO500CELL mode=$MODE nodes=$NN ppn=$PPN rc=$rc $(grep -h '^\[SCORE' results/result_summary.txt io500.log 2>/dev/null | head -1)"
+fi
+
+if [ "$MODE" = cliofs ]; then
+  stop_nodes
+  rm -rf "$FLARE/tiers/$JOB"
+elif [ "$MODE" = daos ]; then
+  stop_nodes
+else
+  rm -rf "$DATADIR"
+fi
+exit $rc

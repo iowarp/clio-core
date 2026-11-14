@@ -1,0 +1,131 @@
+<!--
+title: Design
+heading: Inside the <em>exploration engine.</em>
+description: How the CEE is built: a client-side context interface with lazy runtime initialization, its bundle, query, retrieve and destroy operations over the CAE and CTE, the three query modes, batched retrieval, the Python bindings and the MCP server.
+eyebrow: Docs · Context Exploration Engine
+lede: The CEE is not a runtime module. It is a client library, with Python bindings over it, that composes calls to the CAE and the CTE into four operations. This page shows how each operation maps onto the pieces below it.
+facts: Core class | ContextInterface ; Operations | bundle, query, retrieve, destroy ; Agents | iowarp-cei-mcp (MCP server)
+-->
+<h2 id="pieces">The pieces</h2>
+<figure class="diagram">
+  <svg viewBox="0 0 860 330" role="img" aria-label="CEE layers: MCP server and Python bindings over the context interface, which calls the CAE core and the CTE chain inside the runtime">
+    <defs><marker id="cx0" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+    <rect class="box alt" x="20" y="20" width="400" height="50" rx="8"/><text class="title" x="32" y="42">Python bindings</text><text class="muted" x="32" y="60">nanobind module over the interface</text>
+    <rect class="box alt" x="440" y="20" width="400" height="50" rx="8"/><text class="title" x="452" y="42">C++ applications</text><text class="muted" x="452" y="60">link the interface directly</text>
+    <rect class="box hl" x="20" y="100" width="820" height="62" rx="8"/><text class="title" x="32" y="124">Context interface (in the client process)</text><text class="muted" x="32" y="144">lazy runtime init · bundle · query · retrieve · destroy</text>
+    <path class="edge hl" d="M220,70 L220,98" marker-end="url(#cx0)"/><path class="edge hl" d="M640,70 L640,98" marker-end="url(#cx0)"/>
+    <text class="muted" x="20" y="190">INSIDE THE RUNTIME</text>
+    <rect class="box hl" x="20" y="200" width="260" height="56" rx="8"/><text class="title" x="32" y="224">CAE core</text><text class="muted" x="32" y="242">bundle = ParseOmni</text>
+    <rect class="box hl" x="300" y="200" width="540" height="56" rx="8"/><text class="title" x="312" y="224">CTE chain (indexer → core)</text><text class="muted" x="312" y="242">temporal query · BM25 search · regex query · GetBlob · DelTag</text>
+    <path class="edge hl" d="M150,162 L150,198" marker-end="url(#cx0)"/><path class="edge hl" d="M570,162 L570,198" marker-end="url(#cx0)"/>
+    <rect class="box" x="20" y="276" width="820" height="40" rx="8"/><text x="32" y="301">Tiers: RAM, NVMe, disk, buckets</text>
+  </svg>
+  <figcaption>Every CEE operation becomes one or more ordinary CAE or CTE
+  tasks. There is no CEE state in the runtime.</figcaption>
+</figure>
+
+<h2 id="interface">The context interface</h2>
+<p>All logic lives in one C++ class in the caller's process. Constructing it does nothing; the first operation initializes the runtime client, then the CAE client (which brings up the CTE client), and checks that the runtime client is up. A failed runtime initialization is remembered rather than retried in a loop, because repeatedly creating the messaging context corrupted the allocator under Python 3.13.</p>
+
+<h2 id="ops">Operations</h2>
+<dl class="notes">
+  <div><dt>Bundle</dt><dd>Builds assimilation contexts from the caller's list and sends them to the CAE core as one <code>ParseOmni</code> task, then waits. Everything the CAE can import, the CEE can bundle.</dd></div>
+  <div><dt>Query</dt><dd>Returns matching blob names in one of three modes. With a time bound it runs a temporal query. With a text query it runs the CTE's BM25 semantic search, served by the indexer, with a positive top-<em>k</em> (10 if none is given). Otherwise it runs a regular-expression query over tag and blob names.</dd></div>
+  <div><dt>Retrieve</dt><dd>Resolves names with the same three modes, then fetches the blobs in batches into one shared buffer: for each name it looks up the tag and the size (each a waited round trip), issues the get asynchronously, and waits for a batch's gets together. It returns the packed bytes. A blob that would overflow the buffer ends its batch; later batches still add blobs that fit. Missing and empty blobs are skipped.</dd></div>
+  <div><dt>Destroy</dt><dd>Deletes each named context's tag through the CTE.</dd></div>
+</dl>
+<p>A splice operation is declared but not yet implemented.</p>
+
+<h2 id="query-path">How a query finds blobs</h2>
+<figure class="diagram">
+  <svg viewBox="0 0 860 584" role="img" aria-label="Query path: the Python and C++ front ends pick one of three modes in order; each is one broadcast task into the CTE chain on every node, where the indexer answers BM25 searches from its forward index and the core answers regex and temporal queries; the MCP server calls the CTE directly">
+    <defs><marker id="cee1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+    <rect class="box alt" x="20" y="20" width="140" height="66" rx="8"/><text class="title" x="32" y="44">Python</text><text class="muted" x="32" y="62">clio_cee module</text><text class="muted" x="32" y="78">context_query()</text>
+    <rect class="box alt" x="176" y="20" width="144" height="66" rx="8"/><text class="title" x="188" y="44">C++</text><text class="muted" x="188" y="62">ContextInterface</text><text class="muted" x="188" y="78">ContextQuery()</text>
+    <rect class="box alt" x="340" y="20" width="500" height="66" rx="8"/><text class="title" x="352" y="44">MCP server (iowarp-cei-mcp)</text><text class="muted" x="352" y="62">calls the CTE Python bindings, not the CEE: tag and blob</text><text class="muted" x="352" y="78">regex query, put, get, size, delete; no BM25 search</text>
+    <path class="edge hl" d="M90,86 L90,120" marker-end="url(#cee1)"/><path class="edge hl" d="M248,86 L248,120" marker-end="url(#cee1)"/>
+    <path class="edge" d="M780,86 L780,108" marker-end="url(#cee1)"/>
+    <rect class="box hl" x="20" y="122" width="300" height="60" rx="8"/><text class="title" x="32" y="146">1 · time_begin or time_end ≠ 0</text><text class="muted" x="32" y="166">TemporalSearch, capped at max_results</text>
+    <rect class="box hl" x="20" y="198" width="300" height="60" rx="8"/><text class="title" x="32" y="222">2 · prompt not empty</text><text class="muted" x="32" y="242">SemanticSearch, k = max_results or 10</text>
+    <rect class="box hl" x="20" y="274" width="300" height="60" rx="8"/><text class="title" x="32" y="298">3 · otherwise</text><text class="muted" x="32" y="318">BlobQuery, capped at max_results (0 = all)</text>
+    <text class="muted" x="20" y="362">The first test that holds picks the mode.</text>
+    <text class="muted" x="20" y="380">Each mode is one task sent with</text><text class="muted" x="20" y="396">PoolQuery::Broadcast, so every node</text><text class="muted" x="20" y="412">answers from the blobs it holds. BM25</text><text class="muted" x="20" y="428">statistics are therefore per node.</text>
+    <path class="edge" d="M320,152 L330,152 L330,304 L320,304"/>
+    <path class="edge hl" d="M320,228 L354,228" marker-end="url(#cee1)"/>
+    <rect class="box" x="342" y="110" width="498" height="372" rx="10" stroke-dasharray="6 5"/>
+    <text class="muted" x="356" y="128">EACH NODE · CTE CHAIN: cache → indexer → … → core</text>
+    <rect class="box hl" x="356" y="138" width="470" height="172" rx="8"/><text class="title" x="368" y="160">Indexer container</text><text class="muted" x="368" y="178">SemanticSearch ends here; every other verb passes down</text>
+    <rect class="box" x="368" y="190" width="210" height="62" rx="6"/><text class="title" x="380" y="210">Pending keys</text><text class="muted" x="380" y="228">a put goes down first,</text><text class="muted" x="380" y="244">then marks its blob dirty</text>
+    <rect class="box" x="604" y="190" width="210" height="62" rx="6"/><text class="title" x="616" y="210">Forward index</text><text class="muted" x="616" y="228">per blob: term counts, length</text><text class="muted" x="616" y="244">terms: a-z 0-9 runs of 2+</text>
+    <path class="edge" d="M578,221 L602,221" marker-end="url(#cee1)"/>
+    <text class="muted" x="368" y="276">A search first drains pending: re-read each dirty blob, tokenize.</text>
+    <text class="muted" x="368" y="294">Then match names, score BM25 (k1 1.5, b 0.75) over the matches.</text>
+    <path class="edge" d="M590,310 L590,344" marker-end="url(#cee1)"/><text class="muted" x="602" y="332">TemporalSearch, BlobQuery, GetBlob</text>
+    <rect class="box hl" x="356" y="346" width="470" height="120" rx="8"/><text class="title" x="368" y="368">CTE core container</text>
+    <text class="muted" x="368" y="388">BlobQuery: tag_re via the trigram tag index (^exact$: hash),</text><text class="muted" x="368" y="404">then blob_re over each matched tag's own blob-name list</text>
+    <text class="muted" x="368" y="428">TemporalSearch: tag_re over every tag name, then keep blobs</text><text class="muted" x="368" y="444">whose last_modified falls inside [time_begin, time_end]</text>
+    <path class="edge hl" d="M590,482 L590,502" marker-end="url(#cee1)"/>
+    <rect class="box alt" x="20" y="504" width="820" height="66" rx="8"/><text class="title" x="32" y="526">Back in the client: one merged answer</text>
+    <text class="muted" x="32" y="544">temporal: oldest first, cut to max_results · BM25: highest score first, cut to k · BlobQuery: appended up to max_results</text>
+    <text class="muted" x="32" y="560">context_query returns the blob names; context_retrieve goes on to fetch the bytes (next figure)</text>
+  </svg>
+  <figcaption>A query is one broadcast task, not a scan from the client. BM25
+  search ends at the indexer, which scores a forward index it keeps current
+  from the puts passing through it, including the puts a bundle's
+  assimilators make. Regex and temporal queries pass the indexer and are
+  answered from the core's tag and blob metadata.</figcaption>
+</figure>
+
+<h2 id="retrieve-path">How retrieve packs its buffer</h2>
+<figure class="diagram">
+  <svg viewBox="0 0 860 470" role="img" aria-label="Retrieve: one buffer of max_context_size; per name, synchronous tag and size lookups then an asynchronous get at the next offset; a blob that would overflow ends its batch; worked example with batch size 3 and an 8 MiB buffer">
+    <defs><marker id="cee2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+    <rect class="box alt" x="20" y="20" width="330" height="56" rx="8"/><text class="title" x="32" y="42">One buffer, allocated once</text><text class="muted" x="32" y="62">AllocateBuffer(max_context_size)</text>
+    <path class="edge" d="M185,76 L185,94" marker-end="url(#cee2)"/>
+    <rect class="box hl" x="20" y="96" width="330" height="196" rx="8"/><text class="title" x="32" y="118">For each name in the batch</text>
+    <text class="muted" x="32" y="140">1 GetOrCreateTag and wait; null id: skip</text>
+    <text class="muted" x="32" y="162">2 GetBlobSize and wait; 0 bytes: skip</text>
+    <text class="muted" x="32" y="184">3 offset + size &gt; max_context_size:</text><text class="muted" x="46" y="200">end this batch here</text>
+    <text class="muted" x="32" y="222">4 AsyncGetBlob into buffer + offset,</text><text class="muted" x="46" y="238">not waited yet; offset += size</text>
+    <text class="muted" x="32" y="266">Steps 1 and 2 are round trips per name;</text><text class="muted" x="32" y="282">only the gets overlap.</text>
+    <path class="edge" d="M185,292 L185,310" marker-end="url(#cee2)"/>
+    <rect class="box alt" x="20" y="312" width="330" height="56" rx="8"/><text class="title" x="32" y="334">End of the batch</text><text class="muted" x="32" y="354">wait on every get; a failure is only logged</text>
+    <rect class="box" x="370" y="20" width="470" height="348" rx="10" stroke-dasharray="6 5"/>
+    <text class="title" x="382" y="44">Example: batch_size 3, max_context_size 8 MiB</text>
+    <text class="muted" x="382" y="64">matches in query order: a 3 MiB, b 2, c 4, d 1, e 0, f 2</text>
+    <text class="muted" x="382" y="90">BATCH 1</text>
+    <rect class="box hl" x="382" y="98" width="105" height="46" rx="6"/><text class="title" x="394" y="118">a · 3 MiB</text><text class="muted" x="394" y="136">offset 0</text>
+    <rect class="box hl" x="497" y="98" width="105" height="46" rx="6"/><text class="title" x="509" y="118">b · 2 MiB</text><text class="muted" x="509" y="136">offset 3</text>
+    <rect class="box" x="612" y="98" width="214" height="46" rx="6" stroke-dasharray="4 4"/><text class="title" x="624" y="118">c · 4 MiB</text><text class="muted" x="624" y="136">5 + 4 &gt; 8: ends batch 1</text>
+    <text class="muted" x="382" y="170">BATCH 2 (starts with the next name)</text>
+    <rect class="box hl" x="382" y="178" width="105" height="46" rx="6"/><text class="title" x="394" y="198">d · 1 MiB</text><text class="muted" x="394" y="216">offset 5</text>
+    <rect class="box" x="497" y="178" width="105" height="46" rx="6" stroke-dasharray="4 4"/><text class="title" x="509" y="198">e · 0 B</text><text class="muted" x="509" y="216">skipped</text>
+    <rect class="box hl" x="612" y="178" width="214" height="46" rx="6"/><text class="title" x="624" y="198">f · 2 MiB</text><text class="muted" x="624" y="216">offset 6, fills the buffer</text>
+    <text class="muted" x="382" y="256">THE BUFFER AFTERWARDS</text>
+    <rect class="box hl" x="382" y="266" width="165" height="44" rx="0"/><text class="title" x="394" y="293">a</text>
+    <rect class="box hl" x="547" y="266" width="110" height="44" rx="0"/><text class="title" x="559" y="293">b</text>
+    <rect class="box hl" x="657" y="266" width="55" height="44" rx="0"/><text class="title" x="669" y="293">d</text>
+    <rect class="box hl" x="712" y="266" width="110" height="44" rx="0"/><text class="title" x="724" y="293">f</text>
+    <text class="muted" x="382" y="328">0</text><text class="muted" x="543" y="328">3</text><text class="muted" x="653" y="328">5</text><text class="muted" x="708" y="328">6</text><text class="muted" x="790" y="328">8 MiB</text>
+    <text class="muted" x="382" y="352">c is never fetched; nothing in the bytes marks a boundary</text>
+    <rect class="box hl" x="20" y="388" width="820" height="66" rx="8"/><text class="title" x="32" y="410">Result</text>
+    <text class="muted" x="32" y="428">copy the used bytes into one string, free the buffer, return a one-element list (empty if nothing was read)</text>
+    <text class="muted" x="32" y="444">defaults: max_results 1024 · max_context_size 256 MiB · batch_size 32</text>
+  </svg>
+  <figcaption>Retrieve first resolves names with the same three modes as
+  query, then fills one buffer in batches. A blob that would overflow the
+  buffer ends its batch, but the next batch still adds blobs that fit, so
+  the result is not a prefix of the match list. The blobs are packed back to
+  back with no sizes or separators.</figcaption>
+</figure>
+
+<h2 id="mcp">The MCP server</h2>
+<p><code>iowarp-cei-mcp</code> is a Python server (FastMCP) that gives AI agents tools over the Model Context Protocol. It wraps the CTE's Python bindings (<code>clio_cte_core_ext</code>), not the context interface: its tools query tags and blobs by regular expression, put, get, size and delete blobs, rescore a blob, and poll the telemetry log.</p>
+
+<h2 id="tradeoffs">Costs of this design</h2>
+<table class="tradeoffs">
+  <tr><th>Decision</th><th>Buys</th><th>Costs</th></tr>
+  <tr><td>Client-side composition</td><td class="good">No extra module to compose or operate</td><td class="cost">Each call pays client round trips to the CAE and CTE</td></tr>
+  <tr><td>Search via the indexer</td><td class="good">Fast keyword search without rescans</td><td class="cost">Needs the indexer in the chain; lexical matching only</td></tr>
+  <tr><td>Packed retrieval buffer</td><td class="good">One buffer, batched gets</td><td class="cost">Results are bounded by the buffer size</td></tr>
+</table>

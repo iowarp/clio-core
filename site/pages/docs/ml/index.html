@@ -24,6 +24,16 @@ facts: Source | external/clio-ml ; Backends | CPU, CUDA, SYCL ; Python | clio_ml
 </ul>
 
 <h2>How it relates to the other technologies</h2>
+
+<ol class="stack-position" aria-label="Where clio-ml sits in the CLIO Core stack">
+  <li class="here"><b>Front ends</b><span>Context FS, memory expansion, machine learning, CAE, CEE</span></li>
+  <li><b>Interceptors</b><span>POSIX, STDIO, MPI-IO and HDF5 adapters; FUSE mount</span></li>
+  <li><b>ChiMod chain</b><span>Cache, replication, compressor, indexer, summarizer</span></li>
+  <li><b>CTE core</b><span>Tags, blobs, placement across tiers</span></li>
+  <li><b>Context Runtime</b><span>Modules, pools, tasks, scheduling, transports</span></li>
+  <li><b>Storage</b><span>Block devices: RAM, NVMe, SSD, HDD, S3/GCS</span></li>
+</ol>
+<p>clio-ml is a front end whose algorithms are runtime modules. It reads datasets through memory expansion, which stores pages in the CTE. See <a href="/docs/ml/design.html">the clio-ml design</a>.</p>
 <ul>
   <li><a href="/docs/memory-expansion/index.html">Memory expansion</a> provides the paged vectors (<code>gpu_vector</code> and <code>cpu_vector</code>) that a <code>Dataset</code> wraps. Cache, tiering and coherence rules are the same.</li>
   <li><a href="/docs/cte/index.html">Context Transfer Engine</a> holds every page as a blob in a tag. The pool's storage tiers decide where pages live when they are not in the cache.</li>

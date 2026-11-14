@@ -21,6 +21,16 @@ facts: Headers | clio_cte/cpu_vector/cpu_vector.h, clio_cte/gpu_vector/gpu_vecto
 </ul>
 
 <h2>How it relates to the other technologies</h2>
+
+<ol class="stack-position" aria-label="Where memory expansion sits in the CLIO Core stack">
+  <li class="here"><b>Front ends</b><span>Context FS, memory expansion, machine learning, CAE, CEE</span></li>
+  <li><b>Interceptors</b><span>POSIX, STDIO, MPI-IO and HDF5 adapters; FUSE mount</span></li>
+  <li><b>ChiMod chain</b><span>Cache, replication, compressor, indexer, summarizer</span></li>
+  <li><b>CTE core</b><span>Tags, blobs, placement across tiers</span></li>
+  <li><b>Context Runtime</b><span>Modules, pools, tasks, scheduling, transports</span></li>
+  <li><b>Storage</b><span>Block devices: RAM, NVMe, SSD, HDD, S3/GCS</span></li>
+</ol>
+<p>Memory expansion is a front end for GPU and CPU kernels. Its pages are CTE blobs, and missing pages fault in through the CAE. See <a href="/docs/memory-expansion/design.html">the memory expansion design</a>.</p>
 <ul>
   <li>The <a href="/docs/cte/index.html">Context Transfer Engine</a> stores the pages, places them by score and serves fetches and flushes. The vector constructors take the CTE pool to use; <code>gpu_vector</code> also reads <code>CLIO_GV_STORAGE_POOL</code>, so pages can go through the cache module at 563.0 for node-local caching of remote pages.</li>
   <li>The <a href="/docs/cae/index.html">Context Assimilation Engine</a> uses the same fault-handler mechanism as <code>Copy</code> to ingest a file on first access. With an empty <code>blob_prefix</code> it names the ingested blobs <code>0</code>, <code>1</code>, and so on, which are exactly the page names a vector faults on, so a vector can be opened over a file the CAE has not read yet.</li>

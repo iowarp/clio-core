@@ -3087,8 +3087,13 @@ clio::run::TaskResume Runtime::PutBlob(
     // Compression is defined for WHOLE-BLOB writes only: a partial or
     // vectored write cannot patch a compressed stream, so those (and
     // replica-addressed or emulated puts) forward with the codec request
-    // cleared — raw bytes, never a recorded codec (issue #818 rule).
-    const bool whole_blob = task->segments_.empty() && task->offset_ == 0;
+    // cleared — raw bytes, never a recorded codec (issue #818 rule). An
+    // append is never whole-blob: its offset_ is ignored by the core, so the
+    // input offset says nothing about where the bytes go.
+    const bool is_append =
+        (task->flags_ & clio::cte::core::kCtePutAppend) != 0;
+    const bool whole_blob =
+        task->segments_.empty() && task->offset_ == 0 && !is_append;
     auto src_full =
         CLIO_IPC->ToFullPtr<char>(task->blob_data_.template Cast<char>());
     // kCompressDynamic asks the models to choose the codec. Only
@@ -3160,6 +3165,11 @@ clio::run::TaskResume Runtime::CompressPodPutBlob(
   tier_write_gen_.fetch_add(1, std::memory_order_release);
   {
     clio::cte::core::Context &ctx = task->context_;
+    // An append goes raw: its position is decided by the core, and a
+    // compressed stream cannot take an append (see PutBlob).
+    if (task->flags_ & clio::cte::core::kCtePutAppend) {
+      ctx.compress_lib_ = 0;
+    }
     if (ctx.compress_lib_ <= 0 || ctx.replica_ != 0 || task->offset_ != 0 ||
         task->size_ == 0) {
       CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kPodPutBlob,

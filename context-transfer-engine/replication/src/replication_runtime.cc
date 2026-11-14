@@ -457,7 +457,11 @@ clio::run::TaskResume Runtime::PutBlobLocal(
           lowest = std::min(lowest, r.blob_off_);
           return true;
         });
-    if (lowest != ~0ULL && lowest > 0) {
+    // An append has no write offset of its own: the primary places it at
+    // its current end, so the refill (which restores bytes BELOW the write)
+    // has nothing to do for it.
+    if (lowest != ~0ULL && lowest > 0 &&
+        !(task->flags_ & clio::cte::core::kCtePutAppend)) {
       bool refilled = true;
       CLIO_CO_AWAIT(RefillPrimaryBeforeWrite(
           task->tag_id_, task->blob_name_.str(), lowest, refilled));
@@ -516,11 +520,18 @@ clio::run::TaskResume Runtime::PutBlobLocal(
             regions.push_back(r);
             return true;
           });
+      // An append's replica copies go where the primary put LANDED, which
+      // the primary wrote back into task->offset_ (ForwardToCore runs the
+      // core on this same task object).
+      const bool is_append =
+          (task->flags_ & clio::cte::core::kCtePutAppend) != 0;
       for (size_t ri = 0; ri < regions.size(); ++ri) {
+        const clio::run::u64 rep_off =
+            is_append ? task->offset_ : regions[ri].blob_off_;
         // Local: this container holds the blob (its owner, or the shadow
         // copy it keeps for a successor role).
         auto put = cte->AsyncPutBlob(task->tag_id_, blob_name,
-                                     regions[ri].blob_off_, regions[ri].size_,
+                                     rep_off, regions[ri].size_,
                                      regions[ri].data_,
                                      config_.replica_score_, rep_ctx, 0u,
                                      clio::run::PoolQuery::Local());
