@@ -384,6 +384,63 @@ TEST_CASE("Write-back: put acks from volatile, flush makes it durable",
   REQUIRE(Get(kPersistentPool, tag, "b0", 0, v.size()) == want);
 }
 
+TEST_CASE("Write-back: a partial write to a new blob is absorbed",
+          "[cte][policy_cache][write_back]") {
+  Fixture();
+  const TagId tag = MakeTag("pc_wb_partial_new");
+  // Not from offset 0: before, this went synchronously to persistent.
+  const std::string data = Payload(4096, 'n');
+  REQUIRE(Put(kBackPool, tag, "p0", 4096, data) == 0);
+  REQUIRE(SizeOn(kVolatilePool, tag, "p0") == 8192);
+  REQUIRE(SizeOn(kPersistentPool, tag, "p0") == -1);  // dirty, not flushed
+  std::string want(4096, '\0');
+  want += data;  // the gap before the write reads as zeros
+  REQUIRE(Get(kBackPool, tag, "p0", 0, want.size()) == want);
+
+  REQUIRE(FlushCache(kBackPool) == 0);
+  REQUIRE(SizeOn(kPersistentPool, tag, "p0") == (long long)want.size());
+  REQUIRE(Get(kPersistentPool, tag, "p0", 0, want.size()) == want);
+}
+
+TEST_CASE("Write-back: a partial overwrite of a persistent blob is absorbed",
+          "[cte][policy_cache][write_back]") {
+  Fixture();
+  const TagId tag = MakeTag("pc_wb_partial_old");
+  // The blob exists only on persistent (written below the cache).
+  const std::string base = Payload(64 * 1024, 'b');
+  REQUIRE(Put(kPersistentPool, tag, "o0", 0, base) == 0);
+  REQUIRE(SizeOn(kVolatilePool, tag, "o0") == -1);
+  const std::string patch = Payload(500, 'x');
+  REQUIRE(Put(kBackPool, tag, "o0", 1000, patch) == 0);
+  // Fetch-on-write: the copy holds the whole blob with the patch applied,
+  // and persistent is untouched until the flush.
+  std::string want = base;
+  want.replace(1000, patch.size(), patch);
+  REQUIRE(SizeOn(kVolatilePool, tag, "o0") == (long long)base.size());
+  REQUIRE(Get(kBackPool, tag, "o0", 0, base.size()) == want);
+  REQUIRE(Get(kPersistentPool, tag, "o0", 0, base.size()) == base);
+
+  REQUIRE(FlushCache(kBackPool) == 0);
+  REQUIRE(Get(kPersistentPool, tag, "o0", 0, base.size()) == want);
+}
+
+TEST_CASE("Write-back: a partial write past a persistent blob's end",
+          "[cte][policy_cache][write_back]") {
+  Fixture();
+  const TagId tag = MakeTag("pc_wb_partial_grow");
+  const std::string base = Payload(16 * 1024, 'g');
+  REQUIRE(Put(kPersistentPool, tag, "g0", 0, base) == 0);
+  const std::string tail = Payload(8192, 't');
+  REQUIRE(Put(kBackPool, tag, "g0", 12 * 1024, tail) == 0);
+  std::string want = base.substr(0, 12 * 1024) + tail;
+  REQUIRE(SizeOn(kVolatilePool, tag, "g0") == (long long)want.size());
+  REQUIRE(Get(kBackPool, tag, "g0", 0, want.size()) == want);
+
+  REQUIRE(FlushCache(kBackPool) == 0);
+  REQUIRE(SizeOn(kPersistentPool, tag, "g0") == (long long)want.size());
+  REQUIRE(Get(kPersistentPool, tag, "g0", 0, want.size()) == want);
+}
+
 TEST_CASE("Write-back: SyncTag flushes the tag's dirty copies",
           "[cte][policy_cache][write_back]") {
   Fixture();
