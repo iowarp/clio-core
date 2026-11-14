@@ -426,6 +426,15 @@ Where the code settled details the sections above left open.
   therefore exchange invalidation messages per flush; their writes are not
   blocked (buffers with pending ranges keep their bytes).
 - **Known gaps.**
+  - **Placement is assumed, not asked (to revisit).** The cache computes a
+    blob's home as `BlobHash(tag, blob) % containers` (`Runtime::HomeOf`) and
+    addresses it with `PoolQuery::DirectId`: flush groups (`HomeFlush`),
+    sharer registration, invalidation fan-out. That duplicates the core's
+    placement instead of letting `PoolQuery::Dynamic` decide, so it is only
+    right while placement is plain hash-mod-N (no successor failover,
+    migration or a different placement policy). Chimods should not assume a
+    hashing layout; the intended fix routes these tasks with
+    `PoolQuery::Dynamic` (per blob, or batched by asking the chain's routing).
   - A process that cannot map the segment (TCP client, remote node) stays
     bound to the core pool unless `CLIO_CTE_POOL=567.0`; writes through the
     core directly bypass invalidation.
