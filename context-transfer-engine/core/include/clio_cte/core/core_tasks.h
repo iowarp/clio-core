@@ -3385,6 +3385,145 @@ struct MultiPutBlobTask : public clio::run::Task {
   }
 };
 
+/** One blob a MultiDelBlob deletes. */
+struct MultiDelKey {
+  TagId tag_id_;
+  std::string blob_name_;
+
+  template <typename Ar>
+  void serialize(Ar &ar) {
+    ar(tag_id_, blob_name_);
+  }
+};
+
+/**
+ * Delete a set of blobs in ONE task. The core splits the set by owner: the
+ * blobs this container owns are deleted as one plan (each locked and
+ * invalidated, then all their blocks freed with one FreeBlocks per pool);
+ * every other owner's subset goes out as one MultiDelBlob, all concurrently.
+ * Routed by its first key (Dynamic), like MultiPutBlob.
+ */
+struct MultiDelBlobTask : public clio::run::Task {
+  IN TagId route_tag_id_;                  // routing key (first blob)
+  IN clio::run::priv::string route_blob_;  // routing key (first blob)
+  IN clio::run::priv::string keys_;        // serialized vector<MultiDelKey>
+  IN clio::run::u32 del_flags_;            // kDelCacheCopyOnly, or 0
+  OUT clio::run::u32 num_ok_;              // blobs deleted
+  OUT int first_rc_;                       // first nonzero rc (1 = not found)
+
+  MultiDelBlobTask()
+      : clio::run::Task(),
+        route_blob_(CLIO_PRIV_ALLOC),
+        keys_(CLIO_PRIV_ALLOC),
+        del_flags_(0),
+        num_ok_(0),
+        first_rc_(0) {}
+
+  CTP_CROSS_FUN explicit MultiDelBlobTask(
+      const clio::run::TaskId &task_id, const clio::run::PoolId &pool_id,
+      const clio::run::PoolQuery &pool_query, const TagId &route_tag_id,
+      const std::string &route_blob, const std::string &keys,
+      clio::run::u32 del_flags = 0)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kMultiDelBlob),
+        route_tag_id_(route_tag_id),
+        route_blob_(CLIO_PRIV_ALLOC, route_blob),
+        keys_(CLIO_PRIV_ALLOC, keys),
+        del_flags_(del_flags),
+        num_ok_(0),
+        first_rc_(0) {
+    task_id_ = task_id;
+    pool_id_ = pool_id;
+    method_ = Method::kMultiDelBlob;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(route_tag_id_, route_blob_, keys_, del_flags_);
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    ar(num_ok_, first_rc_);
+  }
+
+  void Copy(const ctp::ipc::FullPtr<MultiDelBlobTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    route_tag_id_ = other->route_tag_id_;
+    route_blob_ = other->route_blob_;
+    keys_ = other->keys_;
+    del_flags_ = other->del_flags_;
+    num_ok_ = other->num_ok_;
+    first_rc_ = other->first_rc_;
+  }
+
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    auto other = other_base.template Cast<MultiDelBlobTask>();
+    num_ok_ += other->num_ok_;
+    if (first_rc_ == 0) first_rc_ = other->first_rc_;
+  }
+};
+
+/**
+ * Delete a set of tags (by id) in ONE task. Like DelTag by id, each
+ * container that runs it removes ITS share of every listed tag (TagInfo,
+ * aliases, descendants and the blobs it holds, deleted as one plan per
+ * tag); broadcast it once to delete the set cluster-wide.
+ */
+struct MultiDelTagTask : public clio::run::Task {
+  IN clio::run::priv::string tags_;  // serialized vector<TagId>
+  OUT clio::run::u32 num_ok_;        // tags this container deleted
+  OUT int first_rc_;                 // first nonzero per-tag rc
+
+  MultiDelTagTask()
+      : clio::run::Task(), tags_(CLIO_PRIV_ALLOC), num_ok_(0), first_rc_(0) {}
+
+  CTP_CROSS_FUN explicit MultiDelTagTask(const clio::run::TaskId &task_id,
+                                         const clio::run::PoolId &pool_id,
+                                         const clio::run::PoolQuery &pool_query,
+                                         const std::string &tags)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kMultiDelTag),
+        tags_(CLIO_PRIV_ALLOC, tags),
+        num_ok_(0),
+        first_rc_(0) {
+    task_id_ = task_id;
+    pool_id_ = pool_id;
+    method_ = Method::kMultiDelTag;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(tags_);
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    ar(num_ok_, first_rc_);
+  }
+
+  void Copy(const ctp::ipc::FullPtr<MultiDelTagTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    tags_ = other->tags_;
+    num_ok_ = other->num_ok_;
+    first_rc_ = other->first_rc_;
+  }
+
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    auto other = other_base.template Cast<MultiDelTagTask>();
+    num_ok_ += other->num_ok_;
+    if (first_rc_ == 0) first_rc_ = other->first_rc_;
+  }
+};
+
 
 // ===========================================================================
 // Fully-POD, GPU-compatible blob tasks (issue #556).

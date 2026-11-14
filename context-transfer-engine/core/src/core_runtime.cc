@@ -1413,6 +1413,13 @@ clio::run::PoolQuery Runtime::ScheduleTask(const clio::run::shared_ptr<clio::run
       return HashBlobToContainer(typed->route_tag_id_,
                                  typed->route_blob_.str());
     }
+    case Method::kMultiDelBlob: {
+      // Route by the first blob, like MultiPutBlob; the handler splits the
+      // rest by owner.
+      auto typed = task.template Cast<MultiDelBlobTask>();
+      return HashBlobToContainer(typed->route_tag_id_,
+                                 typed->route_blob_.str());
+    }
     case Method::kGetBlobInfo: {
       auto typed = task.template Cast<GetBlobInfoTask>();
       return HashBlobToContainer(typed->tag_id_, typed->blob_name_.str());
@@ -5148,6 +5155,230 @@ void Runtime::CollectOrganizerBlobStats(clio::run::u32 replica_id,
       });
 }
 
+clio::run::TaskResume Runtime::MultiDelBlob(
+    clio::run::shared_ptr<MultiDelBlobTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  task->num_ok_ = 0;
+  task->first_rc_ = 0;
+  {
+    std::vector<MultiDelKey> keys = DecodeMultiDelKeys(task->keys_);
+    if (task->del_flags_ & kDelCacheCopyOnly) {
+      // Coherence invalidations touch only this node's cache copies.
+      for (const MultiDelKey &k : keys) {
+        clio::run::u64 freed = 0;
+        clio::run::u32 rrc = 0;
+        CLIO_CO_AWAIT(ReclaimCacheReplica(k.tag_id_, k.blob_name_, freed, rrc));
+        if (rrc == 0) {
+          ++task->num_ok_;
+        } else if (task->first_rc_ == 0) {
+          task->first_rc_ = static_cast<int>(rrc);
+        }
+      }
+    } else {
+      // Split by owner, as the core's own routing names it.
+      std::vector<std::pair<TagId, std::string>> local;
+      std::vector<std::pair<clio::run::PoolQuery, std::vector<MultiDelKey>>> remote;
+      for (MultiDelKey &k : keys) {
+        const clio::run::PoolQuery q = HashBlobToContainer(k.tag_id_, k.blob_name_);
+        if (TargetIsNodeLocal(q, pool_id_)) {
+          local.emplace_back(k.tag_id_, std::move(k.blob_name_));
+          continue;
+        }
+        size_t g = 0;
+        for (; g < remote.size(); ++g) {
+          const clio::run::PoolQuery &o = remote[g].first;
+          if (o.GetRoutingMode() == q.GetRoutingMode() &&
+              o.GetHash() == q.GetHash() &&
+              o.GetContainerId() == q.GetContainerId()) {
+            break;
+          }
+        }
+        if (g == remote.size()) remote.emplace_back(q, std::vector<MultiDelKey>());
+        remote[g].second.push_back(std::move(k));
+      }
+      // Every remote owner's subset at once, while this container deletes
+      // its own as one plan.
+      std::vector<clio::run::Future<MultiDelBlobTask>> futs;
+      for (auto &grp : remote) {
+        futs.push_back(client_.AsyncMultiDelBlob(grp.second, grp.first,
+                                                 task->del_flags_));
+      }
+      clio::run::u32 deleted = 0;
+      const clio::run::u32 local_n = static_cast<clio::run::u32>(local.size());
+      if (!local.empty()) {
+        CLIO_CO_AWAIT(DeleteBlobsPlanned(std::move(local), &deleted));
+      }
+      task->num_ok_ += deleted;
+      if (deleted < local_n && task->first_rc_ == 0) task->first_rc_ = 1;
+      for (auto &f : futs) {
+        CLIO_CO_AWAIT(f);
+        task->num_ok_ += f->num_ok_;
+        if (task->first_rc_ == 0) {
+          task->first_rc_ = f->GetReturnCode() != 0
+                                ? static_cast<int>(f->GetReturnCode())
+                                : f->first_rc_;
+        }
+      }
+    }
+  }
+  task->SetReturnCode(static_cast<clio::run::u32>(task->first_rc_));
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::MultiDelTag(
+    clio::run::shared_ptr<MultiDelTagTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  task->num_ok_ = 0;
+  task->first_rc_ = 0;
+  {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    std::vector<TagId> tags = DecodeMultiDelTags(task->tags_);
+    for (const TagId &tag : tags) {
+      // DelTag's own logic on this fiber, nested like MultiPutBlob's puts:
+      // one scheduled task for the whole set.
+      auto sub = ipc_manager->NewTask<DelTagTask>(
+          clio::run::CreateTaskId(), task->pool_id_,
+          clio::run::PoolQuery::Local(), tag);
+      sub.get()->BeginRunContext();
+      CLIO_CO_AWAIT(DelTag(sub));
+      const clio::run::u32 rc = sub->GetReturnCode();
+      if (rc == 0) {
+        ++task->num_ok_;
+      } else if (task->first_rc_ == 0) {
+        task->first_rc_ = static_cast<int>(rc);
+      }
+    }
+  }
+  // Like DelTag by id: a container with no share of a tag is not an error
+  // for the set; the per-tag outcome is in num_ok_ / first_rc_.
+  task->SetReturnCode(0);
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::DeleteBlobsPlanned(
+    std::vector<std::pair<TagId, std::string>> blobs,
+    clio::run::u32 *deleted) {
+#ifdef CLIO_ENABLE_BOOST_COROUTINES
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
+#endif
+  CLIO_TASK_BODY_BEGIN
+  {
+    // Lock in one global order, so two plans over the same blobs (or a plan
+    // and a DelBlob) can never wait on each other in a cycle.
+    std::sort(blobs.begin(), blobs.end(),
+              [](const std::pair<TagId, std::string> &a,
+                 const std::pair<TagId, std::string> &b) {
+                if (a.first.major_ != b.first.major_)
+                  return a.first.major_ < b.first.major_;
+                if (a.first.minor_ != b.first.minor_)
+                  return a.first.minor_ < b.first.minor_;
+                return a.second < b.second;
+              });
+    struct Entry {
+      TagId tag_;
+      std::string name_;
+      std::shared_ptr<BlobInfo> info_;
+      clio::run::u64 size_ = 0;
+    };
+    std::vector<Entry> plan;
+    plan.reserve(blobs.size());  // stable addresses: they are the lock tokens
+    std::vector<std::unique_ptr<BlobWriteLockGuard>> write_guards;
+    std::vector<std::unique_ptr<BlobReaderDrainGuard>> drain_guards;
+    PoolBlocks free_plan;
+    for (auto &tb : blobs) {
+      std::shared_ptr<BlobInfo> info = CheckBlobExists(tb.second, tb.first);
+      if (info == nullptr) continue;  // raced away: nothing to free
+      plan.push_back(Entry{tb.first, std::move(tb.second), info, 0});
+      Entry &e = plan.back();
+      const clio::run::u64 tok = reinterpret_cast<clio::run::u64>(&e);
+      while (!info->TryLockWrite(tok, "DelTag", GetCurrentTimeNs())) {
+        CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
+      }
+      write_guards.push_back(std::make_unique<BlobWriteLockGuard>(info.get(), tok));
+      // Same per-blob steps as DelBlob, up to (not including) the free.
+      CLIO_CO_AWAIT(InvalidateCachedCopies(e.tag_, e.name_, *info, ~0ULL));
+      e.size_ = info->GetTotalSize();
+      info->BeginDrainReaders();
+      drain_guards.push_back(std::make_unique<BlobReaderDrainGuard>(info.get()));
+      while (info->HasReadPins()) {
+        CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
+      }
+      for (size_t r = 0; r < info->replicas_.size(); ++r) {
+        auto &rep = info->replicas_[r];
+        for (size_t k = 0; k < rep.blocks_.size(); ++k) {
+          info->blocks_.push_back(rep.blocks_[k]);
+        }
+        rep.blocks_.clear();
+        rep.total_size_cache_ = 0;
+      }
+      WithdrawBlobMirror(e.tag_, e.name_);
+      CollectBlobBlocks(*info, &free_plan);
+    }
+    // ONE FreeBlocks per pool for every blob of the plan.
+    CLIO_CO_AWAIT(FreeBlocksByPool(free_plan));
+    for (Entry &e : plan) {
+      e.info_->blocks_.clear();
+      e.info_->total_size_cache_ = 0;
+      e.info_->BumpPlacementGen();
+      FinishBlobDelete(e.tag_, e.name_, *e.info_, e.size_);
+    }
+    if (deleted != nullptr) *deleted = static_cast<clio::run::u32>(plan.size());
+    // Guards release (drain, then write tokens) as the scope ends.
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+void Runtime::FinishBlobDelete(const TagId &tag_id, const std::string &blob_name,
+                               const BlobInfo &blob_info,
+                               clio::run::u64 blob_size) {
+  // Step 3: Update tag's total_size_ (shadow copies never entered it)
+  if (!blob_info.shadow_) {
+    std::shared_ptr<TagInfo> tag_info_ptr = tag_id_to_info_.get(tag_id);
+    if (tag_info_ptr != nullptr) {
+      if (blob_size <= tag_info_ptr->total_size_) {
+        tag_info_ptr->total_size_ -= blob_size;
+      } else {
+        tag_info_ptr->total_size_ = 0;
+      }
+      // Deleting page-blobs is part of a truncate-down: bump BOTH mtime
+      // (content shrank) and ctime (metadata changed).
+      auto now = GetCurrentTimeNs();
+      tag_info_ptr->last_modified_ = GetWallTimeNs();
+      tag_info_ptr->last_changed_ = tag_info_ptr->last_modified_;
+      MirrorTagShm(tag_id, *tag_info_ptr);
+    }
+  }
+
+  // Step 5: Remove blob from tag_blob_name_to_info_ map
+  {
+    std::string compound_key = std::to_string(tag_id.major_) + "." +
+                               std::to_string(tag_id.minor_) + "." +
+                               blob_name;
+    tag_blob_name_to_info_.erase(compound_key);
+    BlobIndexErase(compound_key);
+    // Mirror the erase too. A stale cache entry for a deleted blob is worse
+    // than a miss: a client would read metadata for something gone.
+    shm_cache_.EraseBlob(compound_key);
+  }
+
+  // Step 6: Log telemetry for DelBlob operation
+  auto now = GetCurrentTimeNs();
+  LogTelemetry(CteOp::kDelBlob, 0, blob_size, tag_id, now, now);
+
+  // WAL: log blob deletion
+  if (!blob_txn_logs_.empty()) {
+    clio::run::u32 wid = CLIO_CUR_WORKER->GetWorkerStats().worker_id_;
+    TxnDelBlob txn;
+    txn.tag_major_ = tag_id.major_;
+    txn.tag_minor_ = tag_id.minor_;
+    txn.blob_name_ = blob_name;
+    blob_txn_logs_[wid % blob_txn_logs_.size()]->Log(TxnType::kDelBlob, txn);
+  }
+}
+
 clio::run::TaskResume Runtime::DelBlob(clio::run::shared_ptr<DelBlobTask> &task) {
   CLIO_TASK_BODY_BEGIN
   try {
@@ -5243,49 +5474,7 @@ clio::run::TaskResume Runtime::DelBlob(clio::run::shared_ptr<DelBlobTask> &task)
       // entries
     }
 
-    // Step 3: Update tag's total_size_ (shadow copies never entered it)
-    if (!blob_info_ptr->shadow_) {
-      std::shared_ptr<TagInfo> tag_info_ptr = tag_id_to_info_.get(tag_id);
-      if (tag_info_ptr != nullptr) {
-        if (blob_size <= tag_info_ptr->total_size_) {
-          tag_info_ptr->total_size_ -= blob_size;
-        } else {
-          tag_info_ptr->total_size_ = 0;
-        }
-        // Deleting page-blobs is part of a truncate-down: bump BOTH mtime
-        // (content shrank) and ctime (metadata changed).
-        auto now = GetCurrentTimeNs();
-        tag_info_ptr->last_modified_ = GetWallTimeNs();
-        tag_info_ptr->last_changed_ = tag_info_ptr->last_modified_;
-        MirrorTagShm(tag_id, *tag_info_ptr);
-      }
-    }
-
-    // Step 5: Remove blob from tag_blob_name_to_info_ map
-    {
-      std::string compound_key = std::to_string(tag_id.major_) + "." +
-                                 std::to_string(tag_id.minor_) + "." +
-                                 blob_name;
-      tag_blob_name_to_info_.erase(compound_key);
-      BlobIndexErase(compound_key);
-      // Mirror the erase too. A stale cache entry for a deleted blob is worse
-      // than a miss: a client would read metadata for something gone.
-      shm_cache_.EraseBlob(compound_key);
-    }
-
-    // Step 6: Log telemetry for DelBlob operation
-    auto now = GetCurrentTimeNs();
-    LogTelemetry(CteOp::kDelBlob, 0, blob_size, tag_id, now, now);
-
-    // WAL: log blob deletion
-    if (!blob_txn_logs_.empty()) {
-      clio::run::u32 wid = CLIO_CUR_WORKER->GetWorkerStats().worker_id_;
-      TxnDelBlob txn;
-      txn.tag_major_ = tag_id.major_;
-      txn.tag_minor_ = tag_id.minor_;
-      txn.blob_name_ = blob_name;
-      blob_txn_logs_[wid % blob_txn_logs_.size()]->Log(TxnType::kDelBlob, txn);
-    }
+    FinishBlobDelete(tag_id, blob_name, *blob_info_ptr, blob_size);
 
     // Success
     task->return_code_ = 0;
@@ -6327,33 +6516,13 @@ clio::run::TaskResume Runtime::DelTag(clio::run::shared_ptr<DelTagTask> &task) {
         blobs_to_delete.emplace_back(del_id, std::move(name));
       }
     }
-    // Step 5: delete blobs in bounded-concurrency batches.
-    constexpr size_t kMaxConcurrentDelBlobTasks = 32;
-    std::vector<clio::run::Future<DelBlobTask>> async_tasks;
-    size_t processed_blobs = 0;
-    for (size_t i = 0; i < blobs_to_delete.size();
-         i += kMaxConcurrentDelBlobTasks) {
-      async_tasks.clear();
-      size_t batch_end =
-          std::min(i + kMaxConcurrentDelBlobTasks, blobs_to_delete.size());
-      for (size_t j = i; j < batch_end; ++j) {
-        // LOCAL: DelTag runs on every container, and each deletes the copies
-        // IT holds -- its own blobs and the shadow copies it keeps for other
-        // containers. Routed by hash, a shadow's delete went to the owner
-        // (which had deleted its own already), failed, and the shadow's
-        // blocks were never freed: space leaked on every file delete.
-        async_tasks.push_back(client_.AsyncDelBlob(
-            blobs_to_delete[j].first, blobs_to_delete[j].second,
-            clio::run::PoolQuery::Local()));
-      }
-      for (auto t : async_tasks) {
-        CLIO_CO_AWAIT(t);
-        if (t->return_code_ != 0) {
-          HLOG(kWarning, "DelBlob failed during tag deletion, continuing");
-        }
-        ++processed_blobs;
-      }
-    }
+    // Step 5: delete them as ONE plan (lock + invalidate each, then one
+    // FreeBlocks per pool for all of them), not one DelBlob task per blob.
+    // LOCAL by construction: DelTag runs on every container, and each
+    // deletes the copies IT holds -- its own blobs and the shadow copies it
+    // keeps for other containers.
+    const size_t processed_blobs = blobs_to_delete.size();
+    CLIO_CO_AWAIT(DeleteBlobsPlanned(blobs_to_delete));
 
     // Step 6: erase blob-name mappings for all deleted tags (a DelBlob
     // above that failed or raced still leaves its key here).
@@ -11303,17 +11472,7 @@ clio::run::TaskResume Runtime::ClearBlob(BlobInfo &blob_info, float blob_score,
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::FreeAllBlobBlocks(BlobInfo &blob_info,
-                                           clio::run::u32 &error_code) {
-#ifdef CLIO_ENABLE_BOOST_COROUTINES
-  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
-#endif
-  CLIO_TASK_BODY_BEGIN
-  // Map: PoolId -> (target_query, vector<Block>)
-  std::unordered_map<clio::run::PoolId, std::pair<clio::run::PoolQuery,
-                                            std::vector<clio::run::bdev::Block>>>
-      blocks_by_pool;
-
+void Runtime::CollectBlobBlocks(const BlobInfo &blob_info, PoolBlocks *plan) {
   // Group blocks by PoolId
   for (const auto &blob_block : blob_info.blocks_) {
     clio::run::PoolId pool_id = blob_block.bdev_client_.pool_id_;
@@ -11326,15 +11485,21 @@ clio::run::TaskResume Runtime::FreeAllBlobBlocks(BlobInfo &blob_info,
     block.block_type_ = 0;
 
     // Store target_query with blocks for this pool
-    if (blocks_by_pool.find(pool_id) == blocks_by_pool.end()) {
-      blocks_by_pool[pool_id] = std::make_pair(
+    if (plan->find(pool_id) == plan->end()) {
+      (*plan)[pool_id] = std::make_pair(
           blob_block.target_query_, std::vector<clio::run::bdev::Block>());
     }
-    blocks_by_pool[pool_id].second.push_back(block);
+    (*plan)[pool_id].second.push_back(block);
   }
+}
 
+clio::run::TaskResume Runtime::FreeBlocksByPool(const PoolBlocks &plan) {
+#ifdef CLIO_ENABLE_BOOST_COROUTINES
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
+#endif
+  CLIO_TASK_BODY_BEGIN
   // Call FreeBlocks once per PoolId and update target capacities
-  for (const auto &pool_entry : blocks_by_pool) {
+  for (const auto &pool_entry : plan) {
     const clio::run::PoolId &pool_id = pool_entry.first;
     const clio::run::PoolQuery &target_query = pool_entry.second.first;
     const std::vector<clio::run::bdev::Block> &blocks = pool_entry.second.second;
@@ -11355,7 +11520,7 @@ clio::run::TaskResume Runtime::FreeAllBlobBlocks(BlobInfo &blob_info,
                   " ";
       }
       HLOG(kWarning, "[extent-free] all blob={} blocks=[{}]",
-           blob_info.blob_name_.str(), layout);
+           "(plan)", layout);
     }
     auto free_task = bdev_client.AsyncFreeBlocks(target_query, blocks);
     CLIO_CO_AWAIT(free_task);
@@ -11382,6 +11547,21 @@ clio::run::TaskResume Runtime::FreeAllBlobBlocks(BlobInfo &blob_info,
     }
   }
 
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::FreeAllBlobBlocks(BlobInfo &blob_info,
+                                           clio::run::u32 &error_code) {
+#ifdef CLIO_ENABLE_BOOST_COROUTINES
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
+#endif
+  CLIO_TASK_BODY_BEGIN
+  {
+    PoolBlocks plan;
+    CollectBlobBlocks(blob_info, &plan);
+    CLIO_CO_AWAIT(FreeBlocksByPool(plan));
+  }
   // Clear all blocks
   blob_info.blocks_.clear();
   blob_info.total_size_cache_ = 0;  // blocks_ emptied: size cache is now 0

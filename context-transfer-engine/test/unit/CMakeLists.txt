@@ -875,6 +875,27 @@ set_tests_properties(
         ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1;STRESS_THREADS=8;STRESS_ITERS=1500"
 )
 
+# MultiDelBlob / MultiDelTag: delete a set of blobs or tags in one task.
+add_executable(test_multi_del test_multi_del.cc)
+target_link_libraries(test_multi_del
+    clio_cte_core_runtime
+    clio_cte_core_client
+    clio::run::admin_runtime
+    clio::run::admin_client
+    clio::run::bdev_runtime
+    clio::run::bdev_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+add_test(NAME cte_multi_del COMMAND test_multi_del)
+set_tests_properties(
+    cte_multi_del
+    PROPERTIES
+        TIMEOUT 300
+        LABELS "unit;cte"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
+)
+
 # Regression: blocks freed by DelBlob return to their bdev partition.
 add_test(NAME cte_block_reuse_all
     COMMAND test_blob_block_reuse)

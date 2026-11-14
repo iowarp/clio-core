@@ -333,10 +333,17 @@ clio::run::TaskResume Runtime::DelTag(
       if (rc == 0 && !id.IsNull() && CLIO_IPC->GetNumHosts() > 1) {
         // By name: remove the copies GetOrCreateTag's write-through installed
         // on every other container (name, handler, its local blobs).
+        // All containers at once: the deletes are independent, so N serial
+        // round trips per unlink become one wave.
         const clio::run::u32 nc = NumCoreContainers();
+        std::vector<clio::run::Future<clio::cte::core::DelTagTask>> dels;
+        dels.reserve(nc);
         for (clio::run::u32 c = 0; c < nc; ++c) {
-          auto d = core->AsyncDelTag(id, clio::run::PoolQuery::DirectId(
-                                             static_cast<clio::run::ContainerId>(c)));
+          dels.push_back(core->AsyncDelTag(
+              id, clio::run::PoolQuery::DirectId(
+                      static_cast<clio::run::ContainerId>(c))));
+        }
+        for (auto &d : dels) {
           CLIO_CO_AWAIT(d);  // rc 1 = that node had no copy: fine
         }
       }

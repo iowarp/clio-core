@@ -120,7 +120,11 @@ GLOBAL_CROSS_CONST clio::run::u32 kListLocalBlobs = 57;
 // memory on the container that owns it and logged per key in the WAL.
 GLOBAL_CROSS_CONST clio::run::u32 kTagXattr = 58;
 
-GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 59;
+/** Delete a set of blobs in one task (split by owner, one plan per owner). */
+GLOBAL_CROSS_CONST clio::run::u32 kMultiDelBlob = 59;
+/** Delete a set of tags (by id) in one task (each container its share). */
+GLOBAL_CROSS_CONST clio::run::u32 kMultiDelTag = 60;
+GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 61;
 
 inline const std::vector<std::string>& GetMethodNames() {
   static const std::vector<std::string> names = [] {
@@ -167,6 +171,8 @@ inline const std::vector<std::string>& GetMethodNames() {
     v[46] = "DynamicReorganize";
     v[47] = "Evict";
     v[48] = "MultiPutBlob";
+    v[59] = "MultiDelBlob";
+    v[60] = "MultiDelTag";
     v[49] = "RegisterReplicaContainer";
     v[50] = "GetResidency";
     v[51] = "PodMultiPutBlob";

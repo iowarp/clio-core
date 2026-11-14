@@ -1147,6 +1147,61 @@ private:
    */
   clio::run::TaskResume FreeAllBlobBlocks(BlobInfo &blob_info, clio::run::u32 &error_code);
 
+  /** Blocks to free, grouped by bdev pool (with the pool's target query). */
+  using PoolBlocks = std::unordered_map<
+      clio::run::PoolId,
+      std::pair<clio::run::PoolQuery, std::vector<clio::run::bdev::Block>>>;
+
+  /**
+   * Add every block of a blob to a per-pool free plan.
+   * @param blob_info blob whose blocks_ are collected
+   * @param plan      out: blocks grouped by pool
+   */
+  void CollectBlobBlocks(const BlobInfo &blob_info, PoolBlocks *plan);
+
+  /**
+   * Free a per-pool plan: ONE FreeBlocks task per pool, crediting each
+   * target's remaining space.
+   * @param plan blocks grouped by pool
+   */
+  clio::run::TaskResume FreeBlocksByPool(const PoolBlocks &plan);
+
+  /**
+   * After a blob's blocks are freed: tag size, maps, mirror, telemetry and
+   * the WAL record -- the tail DelBlob and planned tag deletion share.
+   * @param tag_id    the blob's tag
+   * @param blob_name the blob's name
+   * @param blob_info the blob (still alive through the caller's shared_ptr)
+   * @param blob_size its logical size, captured before its blocks moved
+   */
+  void FinishBlobDelete(const TagId &tag_id, const std::string &blob_name,
+                        const BlobInfo &blob_info, clio::run::u64 blob_size);
+
+  /**
+   * Delete many blobs of this container as one plan (DelTag): lock and
+   * invalidate every blob, collect all their blocks, free them with one
+   * FreeBlocks per pool, then finish each blob. Replaces one DelBlob task
+   * per blob.
+   * @param blobs (tag, blob name) pairs held by this container
+   */
+  clio::run::TaskResume DeleteBlobsPlanned(
+      std::vector<std::pair<TagId, std::string>> blobs,
+      clio::run::u32 *deleted = nullptr);
+
+  /**
+   * Delete a set of blobs in one task: this container's blobs as one plan,
+   * every other owner's subset as one MultiDelBlob, all concurrently.
+   */
+  clio::run::TaskResume MultiDelBlob(
+      clio::run::shared_ptr<MultiDelBlobTask> &task);
+
+  /**
+   * Delete a set of tags (by id) in one task: this container's share of
+   * each, through DelTag's own logic on this fiber (no task per tag).
+   */
+  clio::run::TaskResume MultiDelTag(
+      clio::run::shared_ptr<MultiDelTagTask> &task);
+
   /**
    * Check if blob exists and return pointer to BlobInfo if found
    * @param blob_name Blob name to search for (required)
