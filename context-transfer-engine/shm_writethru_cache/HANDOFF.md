@@ -16,7 +16,7 @@ most metadata ops, correct across nodes.
 
 ## Decisions the user made (do not re-litigate)
 
-- New chimod ON TOP of the existing `cache` chimod (565.0 -> 563.0).
+- New chimod ON TOP of the existing `cache` chimod (567.0 -> 563.0).
 - Data lives in chimod-owned, contiguous SHM buffers; metadata (blobs, tags)
   also in SHM. No WAL, no tiering.
 - Writes log the EXACT modified byte ranges on ONE SHM MPSC queue; one
@@ -56,7 +56,7 @@ Code map:
   `AsyncGetBlob` (both), `AsyncGetBlobSize`. `TryShmGet` stands down when
   bound to the cache.
 - `core/src/content_transfer_engine.cc`: `CLIO_CTE_CLIENT_INIT` auto-binds to
-  565.0 when the segment is mappable; `CLIO_CTE_SHM_CACHE=0` opts out.
+  567.0 when the segment is mappable; `CLIO_CTE_SHM_CACHE=0` opts out.
 - `shm_writethru_cache/src/`: `_runtime.cc` (create/segment/locator, tags,
   SyncTag, BarrierForward), `_data.cc` (task-path data verbs, fill,
   register sharer), `_flush.cc` (FlushLog, HomeFlush, Invalidate, sharer map).
@@ -108,7 +108,7 @@ Code map:
   `PoolQuery::Local()`, assuming the core's MultiPutBlob routes each nested
   put to its owner (the old defer batch did the same). Confirm multi-node.
 - `PoolQuery::DirectId(container)` for HomeFlush/Invalidate assumes one
-  container per node in pool 565 (compose `pool_query: local`).
+  container per node in pool 567 (compose `pool_query: local`).
 - HomeFlush passes the writer container in `route_tag_id_.major_` (minor
   `0xFFFFFFF7`) and restores the route before forwarding; core MultiPutBlob
   must not depend on that field after dispatch.
@@ -121,7 +121,7 @@ Code map:
 - A `MultiPutBlob` record whose put flags conflict with the cached blob's is
   reported as failed instead of forwarded.
 - Processes that cannot map the segment (TCP clients, remote nodes) stay on
-  the core pool unless `CLIO_CTE_POOL=565.0`; writes through the core bypass
+  the core pool unless `CLIO_CTE_POOL=567.0`; writes through the core bypass
   invalidation.
 - The HDF5 VFD goes through clio-fs, so it does not benefit from this cache;
   the VOL does.

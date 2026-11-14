@@ -35,7 +35,7 @@
  * clio_cte_shm_wtc_bench: per-op cost of the CTE task path vs the shm
  * write-through cache path, from a separate client process.
  *
- * Start a runtime with cte_config_shm_wtc.yaml (core 512.0 + cache 565.0),
+ * Start a runtime with cte_config_shm_wtc.yaml (core 512.0 + cache 567.0),
  * then run this. For each size it measures, per path:
  *   put    - AsyncPutBlob + Wait, distinct blobs
  *   get    - AsyncGetBlob + Wait of a blob it just wrote
@@ -129,7 +129,7 @@ int main(int argc, char **argv) {
   Client task_path(clio::cte::core::kCtePoolId);
   Client cache_path(clio::cte::core::wtc::kDefaultPoolId);
   if (!cache_path.HasWtc()) {
-    std::fprintf(stderr, "cache pool 565.0 not mapped; compose it first\n");
+    std::fprintf(stderr, "cache pool 567.0 not mapped; compose it first\n");
     return 2;
   }
   std::printf("%-8s %-6s %12s %12s %12s %14s %12s\n", "size", "path",

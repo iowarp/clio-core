@@ -432,8 +432,12 @@ inline Status View::TryPut(u32 tag_major, u32 tag_minor, const char *name,
   // flusher, which must be free to take this stripe and read the entry.
   Slot(slot)->pins_.fetch_sub(1, std::memory_order_acq_rel);
   DirtyRange r{slot, 0, off, size};
-  log_->Push(r);
+  // Count the range BEFORE it enters the log. A barrier's target
+  // (PushedNow) then covers every range already in the log or about to be:
+  // a writer counted after its push could leave pushed_ short of an earlier
+  // writer's slot, and a later SyncTag would stop before its own range.
   root_->pushed_.fetch_add(1, std::memory_order_acq_rel);
+  log_->Push(r);
   root_->stats_.puts_.fetch_add(1, std::memory_order_relaxed);
   root_->stats_.put_bytes_.fetch_add(size, std::memory_order_relaxed);
   return Status::kOk;

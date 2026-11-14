@@ -81,7 +81,7 @@ using u64 = clio::run::u64;
 using WtcAlloc = CLIO_TASK_ALLOC_T;
 
 /** Pool id of the default-compose shm write-through cache. */
-inline const clio::run::PoolId kDefaultPoolId(565, 0);
+inline const clio::run::PoolId kDefaultPoolId(567, 0);
 
 /** Longest blob name the segment can hold; longer names take the task path. */
 static constexpr u32 kMaxBlobName = 200;
@@ -202,7 +202,7 @@ struct Root {
   u64 log_off_;
   u64 max_fill_;
   u64 half_life_ns_;
-  std::atomic<u64> pushed_;        /**< ranges pushed onto the log */
+  std::atomic<u64> pushed_;        /**< ranges counted before entering the log */
   std::atomic<u64> flushed_;       /**< ranges the flusher completed */
   std::atomic<u64> evict_cursor_;
   std::atomic<u32> global_rc_;     /**< sticky rc for tags not in TagTable */

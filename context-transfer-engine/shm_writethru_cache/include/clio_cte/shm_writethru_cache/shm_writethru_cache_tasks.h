@@ -49,7 +49,7 @@
 namespace clio::cte::shm_wtc {
 
 /** Well-known pool id of the default-compose shm write-through cache. */
-inline const clio::run::PoolId kShmWtcPoolId(565, 0);  // == wtc::kDefaultPoolId
+inline const clio::run::PoolId kShmWtcPoolId(567, 0);  // == wtc::kDefaultPoolId
 
 /**
  * Pool configuration (compose YAML keys in brackets). Every field

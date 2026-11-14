@@ -597,7 +597,7 @@ compose:
   - mod_name: clio_cte_shm_writethru_cache
     pool_name: clio_cte_shm_writethru_cache
     pool_query: local
-    pool_id: "565.0"
+    pool_id: "567.0"
     next_pool_id: "563.0"               # cache -- see entry above
     capacity: "256M"                    # segment bytes: buffers + tables + log
     log_depth: 65536                    # dirty-range log entries
