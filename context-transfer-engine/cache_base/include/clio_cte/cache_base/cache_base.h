@@ -211,18 +211,6 @@ class CacheBase : public clio::cte::core::DualTargetInterposer {
                                        clio::run::u64 &size,
                                        clio::run::u32 &rc);
   clio::run::TaskResume DeleteVolatileCopy(TagId tag, std::string name);
-  /**
-   * Copy a blob's first `total` bytes from the persistent chain into the
-   * volatile core, chunk by chunk, evicting (MakeRoom) once if the volatile
-   * core is full. The caller holds the entry's reservation.
-   * @param tag the blob's tag
-   * @param name the blob's name
-   * @param total bytes to copy (the persistent blob's size)
-   * @param rc 0, or the failing get/put's return code
-   */
-  clio::run::TaskResume CopyPersistentToVolatile(TagId tag, std::string name,
-                                                 clio::run::u64 total,
-                                                 clio::run::u32 &rc);
 
   // ---- Policy steps ----
   clio::run::TaskResume WriteThruPut(
