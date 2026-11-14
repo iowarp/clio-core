@@ -39,6 +39,8 @@
  * goes down the chain.
  */
 
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -47,6 +49,13 @@
 #include <clio_cte/shm_writethru_cache/shm_writethru_cache_runtime.h>
 
 namespace clio::cte::shm_wtc {
+
+/** Wall-clock ms (CLOCK_REALTIME) for cross-node trace ordering. */
+static double WallMs() {
+  return std::chrono::duration<double, std::milli>(
+             std::chrono::system_clock::now().time_since_epoch())
+      .count();
+}
 
 namespace wtc = clio::cte::core::wtc;
 using clio::cte::core::BlobRegion;
@@ -349,6 +358,14 @@ clio::run::TaskResume Runtime::GetBlob(
                                   task.template Cast<clio::run::Task>()));
     }
     EndChainRead();
+    {
+      const char *tr = std::getenv("CLIO_WTC_TRACE");
+      if (tr != nullptr && tr[0] == '1' && task->GetReturnCode() != 0) {
+        HLOG(kInfo, "[WTC-TRACE] t={} chainread-miss at={} blob={}.{}/{} home={} "
+             "rc={}", WallMs(), container_id_, tag.major_, tag.minor_, name,
+             HomeOf(tag, name), task->GetReturnCode());
+      }
+    }
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END

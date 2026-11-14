@@ -162,10 +162,28 @@ class Runtime : public clio::cte::core::CoreInterposer {
   }
   /** Pop up to one batch of log ranges and coalesce them. */
   std::vector<FlushRecord> PopAndCoalesce(clio::run::u64 *popped);
-  /** Resolve keys/homes and stage payloads per home node. */
-  void StageRecords(std::vector<FlushRecord> &recs,
-                    std::map<clio::run::u32, ctp::ipc::FullPtr<char>> *staging,
-                    std::map<clio::run::u32, clio::run::u64> *staged);
+  /**
+   * Resolve each record's key and home container.
+   * @param recs   coalesced records (a record whose entry cannot be read is
+   *               zeroed and reported: it should never happen while pending)
+   * @param totals out: payload bytes per home
+   */
+  void ResolveRecords(std::vector<FlushRecord> &recs,
+                      std::map<clio::run::u32, clio::run::u64> *totals);
+  /**
+   * Allocate one staging buffer per home, waiting (never dropping) when the
+   * runtime data segment is momentarily full: the ranges are already popped
+   * from the log, so a dropped batch would be a lost acknowledged write.
+   * @param totals  payload bytes per home
+   * @param staging out: staging buffer per home
+   */
+  clio::run::TaskResume AllocStaging(
+      const std::map<clio::run::u32, clio::run::u64> &totals,
+      std::map<clio::run::u32, ctp::ipc::FullPtr<char>> *staging);
+  /** Copy every resolved record's current bytes into its home's buffer. */
+  void CopyRecords(std::vector<FlushRecord> &recs,
+                   std::map<clio::run::u32, ctp::ipc::FullPtr<char>> &staging,
+                   std::map<clio::run::u32, clio::run::u64> *staged);
   /** Descriptors of one home group. */
   static std::vector<clio::cte::core::MultiPutDesc> GroupDescs(
       const std::vector<FlushRecord> &recs, clio::run::u32 home);

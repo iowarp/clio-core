@@ -43,6 +43,8 @@
  */
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <string>
@@ -54,6 +56,13 @@
 
 namespace clio::cte::shm_wtc {
 
+/** Wall-clock ms (CLOCK_REALTIME) for cross-node trace ordering. */
+static double WallMs() {
+  return std::chrono::duration<double, std::milli>(
+             std::chrono::system_clock::now().time_since_epoch())
+      .count();
+}
+
 namespace wtc = clio::cte::core::wtc;
 using clio::cte::core::Context;
 using clio::cte::core::MultiPutBlobTask;
@@ -62,6 +71,16 @@ using clio::cte::core::MultiPutDesc;
 static constexpr size_t kMaxRangesPerFlush = 8192;
 static constexpr clio::run::u32 kWriterMarker = 0xFFFFFFF7u;
 static constexpr double kChainReadPollUs = 5.0;
+static constexpr double kStagingRetryUs = 50.0;
+
+/** CLIO_WTC_TRACE=1: log every flush group, home flush and barrier. */
+bool WtcTrace() {
+  static const bool v = [] {
+    const char *e = std::getenv("CLIO_WTC_TRACE");
+    return e != nullptr && e[0] == '1';
+  }();
+  return v;
+}
 
 std::vector<FlushRecord> Runtime::PopAndCoalesce(clio::run::u64 *popped) {
   std::vector<wtc::DirtyRange> rs;
@@ -98,33 +117,58 @@ std::vector<FlushRecord> Runtime::PopAndCoalesce(clio::run::u64 *popped) {
   return recs;
 }
 
-void Runtime::StageRecords(
-    std::vector<FlushRecord> &recs,
-    std::map<clio::run::u32, ctp::ipc::FullPtr<char>> *staging,
-    std::map<clio::run::u32, clio::run::u64> *staged) {
-  std::map<clio::run::u32, clio::run::u64> totals;
+void Runtime::ResolveRecords(std::vector<FlushRecord> &recs,
+                             std::map<clio::run::u32, clio::run::u64> *totals) {
   for (FlushRecord &fr : recs) {
     clio::run::u64 none = 0;
     std::string name;
     if (!view_.ReadRange(fr.slot_, fr.off_, &none, nullptr, &fr.key_.major_,
                          &fr.key_.minor_, &name, &fr.put_flags_)) {
+      HLOG(kError, "shm_writethru_cache: logged range of slot {} [{}, +{}) "
+           "has no resident entry; its bytes cannot be flushed",
+           fr.slot_, fr.off_, fr.size_);
       fr.size_ = 0;
       continue;
     }
     fr.key_.name_ = std::move(name);
     fr.home_ = HomeOf(TagId(fr.key_.major_, fr.key_.minor_), fr.key_.name_);
-    totals[fr.home_] += fr.size_;
+    (*totals)[fr.home_] += fr.size_;
   }
-  auto *ipc = CLIO_IPC;
+}
+
+clio::run::TaskResume Runtime::AllocStaging(
+    const std::map<clio::run::u32, clio::run::u64> &totals,
+    std::map<clio::run::u32, ctp::ipc::FullPtr<char>> *staging) {
+  CLIO_TASK_BODY_BEGIN
   for (const auto &t : totals) {
-    if (t.second > 0) {
-      (*staging)[t.first] = ipc->AllocateBuffer(t.second);
-      (*staged)[t.first] = 0;
+    if (t.second == 0) {
+      continue;
+    }
+    clio::run::u32 waits = 0;
+    while (true) {
+      ctp::ipc::FullPtr<char> buf = CLIO_IPC->AllocateBuffer(t.second);
+      if (!buf.IsNull()) {
+        (*staging)[t.first] = buf;
+        break;
+      }
+      if (waits++ % 10000 == 0) {
+        HLOG(kWarning, "shm_writethru_cache: no room for a {} B flush staging "
+             "buffer; waiting", t.second);
+      }
+      CLIO_CO_AWAIT(clio::run::yield(kStagingRetryUs));
     }
   }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+void Runtime::CopyRecords(
+    std::vector<FlushRecord> &recs,
+    std::map<clio::run::u32, ctp::ipc::FullPtr<char>> &staging,
+    std::map<clio::run::u32, clio::run::u64> *staged) {
   for (FlushRecord &fr : recs) {
-    auto it = staging->find(fr.home_);
-    if (fr.size_ == 0 || it == staging->end() || it->second.IsNull()) {
+    auto it = staging.find(fr.home_);
+    if (fr.size_ == 0 || it == staging.end()) {
       fr.size_ = 0;
       continue;
     }
@@ -136,6 +180,8 @@ void Runtime::StageRecords(
     clio::run::u32 f = 0;
     if (!view_.ReadRange(fr.slot_, fr.off_, &size, it->second.ptr_ + cursor,
                          &a, &b, &ignored, &f)) {
+      HLOG(kError, "shm_writethru_cache: entry of slot {} vanished while "
+           "pending; range [{}, +{}) not flushed", fr.slot_, fr.off_, fr.size_);
       size = 0;
     }
     fr.size_ = size;
@@ -211,9 +257,12 @@ clio::run::TaskResume Runtime::FlushLog(clio::run::shared_ptr<FlushLogTask> &tas
   {
     clio::run::u64 popped = 0;
     std::vector<FlushRecord> recs = PopAndCoalesce(&popped);
+    std::map<clio::run::u32, clio::run::u64> totals;
+    ResolveRecords(recs, &totals);
     std::map<clio::run::u32, ctp::ipc::FullPtr<char>> staging;
+    CLIO_CO_AWAIT(AllocStaging(totals, &staging));
     std::map<clio::run::u32, clio::run::u64> staged;
-    StageRecords(recs, &staging, &staged);
+    CopyRecords(recs, staging, &staged);
     auto *ipc = CLIO_IPC;
     std::vector<clio::run::u32> homes;
     std::vector<clio::run::Future<MultiPutBlobTask>> futs;
@@ -237,12 +286,23 @@ clio::run::TaskResume Runtime::FlushLog(clio::run::shared_ptr<FlushLogTask> &tas
       if (!local) {
         t->method_ = Method::kHomeFlush;
       }
+      if (WtcTrace()) {
+        HLOG(kInfo, "[WTC-TRACE] t={} flush from={} home={} recs={} bytes={} "
+             "first={}.{}/{}", WallMs(), container_id_, g.first, descs.size(),
+             staged[g.first], descs.front().tag_id_.major_,
+             descs.front().tag_id_.minor_, descs.front().blob_name_);
+      }
       task->bytes_ += staged[g.first];
       homes.push_back(g.first);
       futs.push_back(ipc->Send(t));
     }
     for (size_t i = 0; i < futs.size(); ++i) {
       CLIO_CO_AWAIT(futs[i]);
+      if (WtcTrace()) {
+        HLOG(kInfo, "[WTC-TRACE] t={} flush-done from={} home={} rc={} first_rc={}", WallMs(),
+             container_id_, homes[i], futs[i]->GetReturnCode(),
+             futs[i]->first_rc_);
+      }
       if (futs[i]->GetReturnCode() != 0 || futs[i]->first_rc_ != 0) {
         CLIO_CO_AWAIT(RetryGroup(recs, homes[i], staging[homes[i]]));
       }
@@ -346,6 +406,10 @@ clio::run::TaskResume Runtime::HomeFlush(clio::run::shared_ptr<HomeFlushTask> &t
   CLIO_TASK_BODY_BEGIN
   {
     const clio::run::u32 writer = task->route_tag_id_.major_;
+    if (WtcTrace()) {
+      HLOG(kInfo, "[WTC-TRACE] t={} homeflush-recv at={} writer={}", WallMs(),
+           container_id_, writer);
+    }
     std::vector<MultiPutDesc> descs =
         clio::cte::core::DecodeMultiPutDescs(task->descs_);
     if (!descs.empty()) {
@@ -357,6 +421,14 @@ clio::run::TaskResume Runtime::HomeFlush(clio::run::shared_ptr<HomeFlushTask> &t
     CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kMultiPutBlob,
                                 task.template Cast<clio::run::Task>()));
     task->method_ = Method::kHomeFlush;
+    if (WtcTrace()) {
+      HLOG(kInfo, "[WTC-TRACE] t={} homeflush at={} writer={} recs={} rc={} "
+           "first_rc={} first={}.{}/{}", WallMs(), container_id_, writer, descs.size(),
+           task->GetReturnCode(), task->first_rc_,
+           descs.empty() ? 0u : descs.front().tag_id_.major_,
+           descs.empty() ? 0u : descs.front().tag_id_.minor_,
+           descs.empty() ? std::string() : descs.front().blob_name_);
+    }
     std::vector<BlobKey> keys;
     for (const MultiPutDesc &d : descs) {
       keys.push_back(BlobKey{d.tag_id_.major_, d.tag_id_.minor_, d.blob_name_});

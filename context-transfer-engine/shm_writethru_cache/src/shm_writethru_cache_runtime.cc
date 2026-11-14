@@ -41,6 +41,8 @@
  */
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <utility>
@@ -51,6 +53,13 @@
 #include <clio_cte/shm_writethru_cache/shm_writethru_cache_runtime.h>
 
 namespace clio::cte::shm_wtc {
+
+/** Wall-clock ms (CLOCK_REALTIME) for cross-node trace ordering. */
+static double WallMs() {
+  return std::chrono::duration<double, std::milli>(
+             std::chrono::system_clock::now().time_since_epoch())
+      .count();
+}
 
 namespace wtc = clio::cte::core::wtc;
 
@@ -265,6 +274,12 @@ clio::run::TaskResume Runtime::SyncTag(
       CLIO_CO_AWAIT(clio::run::yield(kBarrierPollUs));
     }
     sticky = view_.TakeTagError(task->tag_id_.major_, task->tag_id_.minor_);
+    const char *tr = std::getenv("CLIO_WTC_TRACE");
+    if (tr != nullptr && tr[0] == '1') {
+      HLOG(kInfo, "[WTC-TRACE] t={} synctag at={} tag={}.{} target={} flushed={}", WallMs(),
+           container_id_, task->tag_id_.major_, task->tag_id_.minor_, target,
+           view_.GetRoot()->flushed_.load());
+    }
   }
   CLIO_CO_AWAIT(ForwardToCore(Method::kSyncTag,
                               task.template Cast<clio::run::Task>()));
