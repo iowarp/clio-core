@@ -164,6 +164,7 @@ def load_tests():
   import tests_capacity  # noqa: F401
   import tests_stress  # noqa: F401
   import tests_safe  # noqa: F401
+  import tests_mdtest  # noqa: F401
   import tests_copy  # noqa: F401
   import tests_tier  # noqa: F401
   import tests_replcache  # noqa: F401
