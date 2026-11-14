@@ -35,11 +35,13 @@
 #define CLIO_CTE_SHM_WRITETHRU_CACHE_RUNTIME_H_
 
 #include <atomic>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <clio_runtime/clio_runtime.h>
@@ -63,6 +65,16 @@ struct FlushRecord {
   clio::run::u32 home_ = 0;    ///< container of the blob's home cache
   clio::run::u64 payload_off_ = 0;  ///< offset in its home group's staging
   clio::run::u32 put_flags_ = 0;    ///< put flags of the blob
+};
+
+/** One flush batch in flight: popped, staged and sent, not yet landed. */
+struct InflightBatch {
+  std::vector<FlushRecord> recs_;  ///< coalesced records it carries
+  clio::run::u64 popped_ = 0;      ///< raw log ranges popped for it
+  clio::run::u64 bytes_ = 0;       ///< payload bytes sent
+  std::map<clio::run::u32, ctp::ipc::FullPtr<char>> staging_;  ///< per home
+  std::vector<clio::run::u32> homes_;  ///< home of each future below
+  std::vector<clio::run::Future<clio::cte::core::MultiPutBlobTask>> futs_;
 };
 
 /** Nodes holding a blob, as tracked by the blob's home. */
@@ -211,6 +223,22 @@ class Runtime : public clio::cte::core::CoreInterposer {
       std::map<clio::run::u32, ctp::ipc::FullPtr<char>> &staging,
       const std::vector<clio::run::u32> &homes,
       std::vector<clio::run::Future<clio::cte::core::MultiPutBlobTask>> &futs);
+  /**
+   * Pop, coalesce, stage and send one batch, appending it to inflight_. If
+   * any of its blobs is still landing in an older batch, those batches land
+   * first (oldest-first), so a blob's bytes reach the chain in staging order.
+   * @param launched out: false when nothing was popped
+   */
+  clio::run::TaskResume LaunchBatch(bool *launched);
+  /**
+   * Await the oldest in-flight batch, retry or invalidate as needed, and
+   * retire it: complete its ranges and advance the flushed_ watermark.
+   * Batches retire strictly oldest-first, so flushed_ still means "the
+   * first N popped ranges have landed" (the SyncTag barrier depends on it).
+   */
+  clio::run::TaskResume LandOldest();
+  /** True when a record of `recs` names a slot an in-flight batch carries. */
+  bool ConflictsInflight(const std::vector<FlushRecord> &recs) const;
   /** Descriptors of one home group. */
   static std::vector<clio::cte::core::MultiPutDesc> GroupDescs(
       const std::vector<FlushRecord> &recs, clio::run::u32 home);
@@ -263,7 +291,16 @@ class Runtime : public clio::cte::core::CoreInterposer {
   WtcConfig config_;
   clio::cte::core::wtc::View view_;
   std::unique_ptr<clio::cte::core::Client> next_client_;
-  std::atomic<bool> flushing_{false};
+  /** Batches staged or in flight (the chain-read fence reads it as "a
+   *  flush is landing"); incremented before a batch checks for readers. */
+  std::atomic<int> flush_active_{0};
+  /** One FlushLog coroutine drains the log at a time. */
+  std::atomic<bool> flush_running_{false};
+  /** Chain reads backed off by an active flush: no new batch starts while
+   *  one waits, so in-flight batches drain and the read gets in. */
+  std::atomic<int> reads_waiting_{0};
+  std::deque<InflightBatch> inflight_;  ///< oldest first (flusher only)
+  std::unordered_map<clio::run::u32, clio::run::u32> inflight_slots_;
   /** Chain reads in flight (BeginChainRead); FlushLog waits for zero. */
   std::atomic<int> chain_reads_{0};
   /** Task-path chain writes in flight (BeginChainWrite). */

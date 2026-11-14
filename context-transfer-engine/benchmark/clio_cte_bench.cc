@@ -433,7 +433,26 @@ class CTEBenchmark {
     }
     for (auto &t : threads) t.join();
     clio_bench::PrintResults(a_.test_case, a_, times, ops);
+    PrintWtcStats();
     return !err.load();
+  }
+
+  /** Node-wide shm write-through cache counters, when this client uses it. */
+  static void PrintWtcStats() {
+    auto *cte = CLIO_CTE_CLIENT;
+    const auto *s = cte != nullptr ? cte->WtcStats() : nullptr;
+    if (s == nullptr) return;
+    std::printf("WTC stats: puts=%llu hits=%llu misses=%llu fills=%llu "
+                "evictions=%llu waits=%llu flush_batches=%llu "
+                "flush_ranges=%llu\n",
+                (unsigned long long)s->puts_.load(),
+                (unsigned long long)s->get_hits_.load(),
+                (unsigned long long)s->get_misses_.load(),
+                (unsigned long long)s->fills_.load(),
+                (unsigned long long)s->evictions_.load(),
+                (unsigned long long)s->waits_.load(),
+                (unsigned long long)s->flush_batches_.load(),
+                (unsigned long long)s->flush_ranges_.load());
   }
 
   BenchArgs a_;

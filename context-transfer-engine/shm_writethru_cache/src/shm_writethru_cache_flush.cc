@@ -43,6 +43,7 @@
  */
 
 #include <algorithm>
+#include <deque>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -72,7 +73,6 @@ using clio::cte::core::MultiPutDesc;
 
 static constexpr size_t kMaxRangesPerFlush = 8192;
 static constexpr clio::run::u32 kWriterMarker = 0xFFFFFFF7u;
-static constexpr double kChainReadPollUs = 5.0;
 static constexpr double kStagingRetryUs = 50.0;
 
 /** CLIO_WTC_TRACE=1: log every flush group, home flush and barrier. */
@@ -341,47 +341,102 @@ clio::run::TaskResume Runtime::LandGroups(
   CLIO_TASK_BODY_END
 }
 
+bool Runtime::ConflictsInflight(const std::vector<FlushRecord> &recs) const {
+  for (const FlushRecord &fr : recs) {
+    if (inflight_slots_.count(fr.slot_) != 0) return true;
+  }
+  return false;
+}
+
+clio::run::TaskResume Runtime::LaunchBatch(bool *launched) {
+  CLIO_TASK_BODY_BEGIN
+  *launched = false;
+  {
+    InflightBatch b;
+    b.recs_ = PopAndCoalesce(&b.popped_);
+    if (b.popped_ != 0) {
+      // A blob still landing in an older batch: land those first, so this
+      // batch stages (and lands) the blob's newer bytes after them.
+      while (ConflictsInflight(b.recs_)) {
+        CLIO_CO_AWAIT(LandOldest());
+      }
+      std::map<clio::run::u32, clio::run::u64> totals;
+      ResolveRecords(b.recs_, &totals);
+      CLIO_CO_AWAIT(AllocStaging(totals, &b.staging_));
+      std::map<clio::run::u32, clio::run::u64> staged;
+      CopyRecords(b.recs_, b.staging_, &staged);
+      b.bytes_ = SendGroups(b.recs_, b.staging_, staged, &b.homes_, &b.futs_);
+      for (const FlushRecord &fr : b.recs_) ++inflight_slots_[fr.slot_];
+      inflight_.push_back(std::move(b));
+      *launched = true;
+    }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::LandOldest() {
+  CLIO_TASK_BODY_BEGIN
+  {
+    InflightBatch b = std::move(inflight_.front());
+    inflight_.pop_front();
+    CLIO_CO_AWAIT(LandGroups(b.recs_, b.staging_, b.homes_, b.futs_));
+    auto *ipc = CLIO_IPC;
+    for (auto &g : b.staging_) {
+      if (!g.second.IsNull()) ipc->FreeBuffer(g.second);
+    }
+    for (const FlushRecord &fr : b.recs_) {
+      view_.CompleteRanges(fr.slot_, fr.ranges_);
+      auto it = inflight_slots_.find(fr.slot_);
+      if (it != inflight_slots_.end() && --it->second == 0) {
+        inflight_slots_.erase(it);
+      }
+    }
+    wtc::Root *root = view_.GetRoot();
+    root->stats_.flush_batches_.fetch_add(b.futs_.size());
+    root->stats_.flush_ranges_.fetch_add(b.popped_);
+    root->stats_.flush_bytes_.fetch_add(b.bytes_);
+    // Oldest-first retirement keeps flushed_ a prefix of the pop order.
+    root->flushed_.fetch_add(b.popped_, std::memory_order_acq_rel);
+    flush_active_.fetch_sub(1);
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 clio::run::TaskResume Runtime::FlushLog(clio::run::shared_ptr<FlushLogTask> &task) {
   CLIO_TASK_BODY_BEGIN
   task->ranges_ = 0;
   task->bytes_ = 0;
-  if (!view_.Ready() || view_.Log()->Empty() || flushing_.exchange(true)) {
+  if (!view_.Ready() || flush_running_.exchange(true)) {
     task->SetReturnCode(0);
     CLIO_CO_RETURN;
   }
-  // Let chain reads already in flight finish before landing newer bytes
-  // (seq_cst pairs with BeginChainRead: one side always sees the other).
-  while (chain_reads_.load() != 0) {
-    CLIO_CO_AWAIT(clio::run::yield(kChainReadPollUs));
-  }
-  {
-    clio::run::u64 popped = 0;
-    std::vector<FlushRecord> recs = PopAndCoalesce(&popped);
-    std::map<clio::run::u32, clio::run::u64> totals;
-    ResolveRecords(recs, &totals);
-    std::map<clio::run::u32, ctp::ipc::FullPtr<char>> staging;
-    CLIO_CO_AWAIT(AllocStaging(totals, &staging));
-    std::map<clio::run::u32, clio::run::u64> staged;
-    CopyRecords(recs, staging, &staged);
-    auto *ipc = CLIO_IPC;
-    std::vector<clio::run::u32> homes;
-    std::vector<clio::run::Future<MultiPutBlobTask>> futs;
-    task->bytes_ = SendGroups(recs, staging, staged, &homes, &futs);
-    CLIO_CO_AWAIT(LandGroups(recs, staging, homes, futs));
-    for (auto &g : staging) {
-      if (!g.second.IsNull()) ipc->FreeBuffer(g.second);
+  // Pipeline: keep up to flush_depth batches in flight, staging the next
+  // while older ones land; land oldest-first; stop starting batches while a
+  // chain read is in progress or waiting, so the fence can open.
+  while (true) {
+    while (inflight_.size() < std::max<clio::run::u32>(1, config_.flush_depth_) &&
+           !view_.Log()->Empty() && reads_waiting_.load() == 0) {
+      // seq_cst pairs with BeginChainRead (increment, then check the other).
+      flush_active_.fetch_add(1);
+      if (chain_reads_.load() != 0) {
+        flush_active_.fetch_sub(1);
+        break;
+      }
+      bool launched = false;
+      CLIO_CO_AWAIT(LaunchBatch(&launched));
+      if (!launched) {
+        flush_active_.fetch_sub(1);
+        break;
+      }
+      task->ranges_ += inflight_.back().popped_;
+      task->bytes_ += inflight_.back().bytes_;
     }
-    for (const FlushRecord &fr : recs) {
-      view_.CompleteRanges(fr.slot_, fr.ranges_);
-    }
-    wtc::Root *root = view_.GetRoot();
-    root->stats_.flush_batches_.fetch_add(futs.size());
-    root->stats_.flush_ranges_.fetch_add(popped);
-    root->stats_.flush_bytes_.fetch_add(task->bytes_);
-    root->flushed_.fetch_add(popped, std::memory_order_acq_rel);
-    task->ranges_ = popped;
+    if (inflight_.empty()) break;
+    CLIO_CO_AWAIT(LandOldest());
   }
-  flushing_.store(false);
+  flush_running_.store(false);
   task->SetReturnCode(0);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END

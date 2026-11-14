@@ -80,14 +80,26 @@ clio::run::TaskResume Runtime::BeginChainRead(const TagId &tag,
                                               const std::string &name) {
   CLIO_TASK_BODY_BEGIN
   while (true) {
+    // The blob's own unflushed ranges must land first: wait for them WITHOUT
+    // holding the flusher off (it is what lands them).
+    if (view_.Ready() && view_.BlobPending(tag.major_, tag.minor_,
+                                           name.c_str(), name.size()) != 0) {
+      CLIO_CO_AWAIT(clio::run::yield(kBarrierPollUs));
+      continue;
+    }
     chain_reads_.fetch_add(1);
-    if (!flushing_.load() && chain_writes_.load() == 0 &&
+    const bool flushing = flush_active_.load() != 0;
+    if (!flushing && chain_writes_.load() == 0 &&
         (!view_.Ready() || view_.BlobPending(tag.major_, tag.minor_,
                                              name.c_str(), name.size()) == 0)) {
       break;  // held: no batch is landing and none can start
     }
     chain_reads_.fetch_sub(1);
+    // Only a landing flush is drained for us: ask the flusher to stop
+    // starting batches until this read is through.
+    if (flushing) reads_waiting_.fetch_add(1);
     CLIO_CO_AWAIT(clio::run::yield(kBarrierPollUs));
+    if (flushing) reads_waiting_.fetch_sub(1);
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
