@@ -188,6 +188,19 @@ class Runtime : public clio::cte::core::CoreInterposer {
   /** Wait until a blob has no unflushed ranges. */
   clio::run::TaskResume WaitBlobFlushed(const TagId &tag,
                                         const std::string &name);
+  /**
+   * Enter a chain read of a blob this container may be flushing: waits until
+   * the blob has no unflushed ranges and no flush batch is landing, and keeps
+   * FlushLog from starting one until EndChainRead. Without it a miss could
+   * read the chain while this node's own flusher is mid-way through writing
+   * newer bytes of the same blob (a torn read).
+   * @param tag  blob's tag
+   * @param name blob name
+   */
+  clio::run::TaskResume BeginChainRead(const TagId &tag,
+                                       const std::string &name);
+  /** Leave a chain read entered with BeginChainRead. */
+  void EndChainRead() { chain_reads_.fetch_sub(1); }
   /** Fetch the whole blob from the chain into the segment. */
   clio::run::TaskResume FillFromChain(const TagId &tag, const std::string &name,
                                       bool *filled);
@@ -196,6 +209,8 @@ class Runtime : public clio::cte::core::CoreInterposer {
   clio::cte::core::wtc::View view_;
   std::unique_ptr<clio::cte::core::Client> next_client_;
   std::atomic<bool> flushing_{false};
+  /** Chain reads in flight (BeginChainRead); FlushLog waits for zero. */
+  std::atomic<int> chain_reads_{0};
   std::mutex sharers_mtx_;
   std::map<std::string, SharerSet> sharers_;
 };

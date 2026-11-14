@@ -61,6 +61,7 @@ using clio::cte::core::MultiPutDesc;
 
 static constexpr size_t kMaxRangesPerFlush = 8192;
 static constexpr clio::run::u32 kWriterMarker = 0xFFFFFFF7u;
+static constexpr double kChainReadPollUs = 5.0;
 
 std::vector<FlushRecord> Runtime::PopAndCoalesce(clio::run::u64 *popped) {
   std::vector<wtc::DirtyRange> rs;
@@ -201,6 +202,11 @@ clio::run::TaskResume Runtime::FlushLog(clio::run::shared_ptr<FlushLogTask> &tas
   if (!view_.Ready() || view_.Log()->Empty() || flushing_.exchange(true)) {
     task->SetReturnCode(0);
     CLIO_CO_RETURN;
+  }
+  // Let chain reads already in flight finish before landing newer bytes
+  // (seq_cst pairs with BeginChainRead: one side always sees the other).
+  while (chain_reads_.load() != 0) {
+    CLIO_CO_AWAIT(clio::run::yield(kChainReadPollUs));
   }
   {
     clio::run::u64 popped = 0;

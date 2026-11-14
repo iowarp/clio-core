@@ -421,11 +421,13 @@ inline Status View::TryPut(u32 tag_major, u32 tag_minor, const char *name,
     e->pins_.fetch_add(1, std::memory_order_acq_rel);
     e->pending_.fetch_add(1, std::memory_order_acq_rel);
     e->write_gen_.fetch_add(1, std::memory_order_acq_rel);
+    e->wbegin_.fetch_add(1, std::memory_order_acq_rel);
     e->hits_.fetch_add(1, std::memory_order_relaxed);
     e->last_access_ns_.store(NowNs(), std::memory_order_relaxed);
     dst = Ptr(e->buf_off_) + off;
   }
   std::memcpy(dst, src, size);
+  Slot(slot)->wend_.fetch_add(1, std::memory_order_release);
   // Unpin BEFORE the (possibly blocking) push: a full log waits on the
   // flusher, which must be free to take this stripe and read the entry.
   Slot(slot)->pins_.fetch_sub(1, std::memory_order_acq_rel);
@@ -444,30 +446,48 @@ inline Status View::TryGet(u32 tag_major, u32 tag_minor, const char *name,
   }
   u64 h = KeyHash(tag_major, tag_minor, name, name_len);
   u32 stripe = StripeOf(h);
-  const char *src = nullptr;
-  BlobEntry *e = nullptr;
-  {
-    Guard g(root_->stripes_[stripe]);
-    long s = FindLocked(h, tag_major, tag_minor, name, name_len);
-    if (s >= 0) {
-      e = Slot(static_cast<u32>(s));
-      if ((e->flags_ & (kResident | kComplete)) == (kResident | kComplete) &&
-          off + size <= e->size_) {
-        e->pins_.fetch_add(1, std::memory_order_acq_rel);
-        e->hits_.fetch_add(1, std::memory_order_relaxed);
-        e->last_access_ns_.store(NowNs(), std::memory_order_relaxed);
-        src = Ptr(e->buf_off_) + off;
+  for (u32 attempt = 0; attempt < kTornRetries; ++attempt) {
+    const char *src = nullptr;
+    BlobEntry *e = nullptr;
+    u64 seq = 0;
+    bool busy = false;
+    {
+      Guard g(root_->stripes_[stripe]);
+      long s = FindLocked(h, tag_major, tag_minor, name, name_len);
+      if (s >= 0) {
+        e = Slot(static_cast<u32>(s));
+        if ((e->flags_ & (kResident | kComplete)) == (kResident | kComplete) &&
+            off + size <= e->size_) {
+          // wbegin_ only moves under this lock, so seq is stable here.
+          seq = e->wbegin_.load(std::memory_order_acquire);
+          busy = e->wend_.load(std::memory_order_acquire) != seq;
+          if (!busy) {
+            e->pins_.fetch_add(1, std::memory_order_acq_rel);
+            e->hits_.fetch_add(1, std::memory_order_relaxed);
+            e->last_access_ns_.store(NowNs(), std::memory_order_relaxed);
+            src = Ptr(e->buf_off_) + off;
+          }
+        }
       }
     }
+    if (busy) {
+      ctp::CpuRelax();
+      continue;  // a writer is mid-copy into this buffer
+    }
+    if (src == nullptr) {
+      break;
+    }
+    std::memcpy(dst, src, size);
+    std::atomic_thread_fence(std::memory_order_acquire);
+    const bool torn = e->wbegin_.load(std::memory_order_relaxed) != seq;
+    e->pins_.fetch_sub(1, std::memory_order_acq_rel);
+    if (!torn) {
+      root_->stats_.get_hits_.fetch_add(1, std::memory_order_relaxed);
+      return Status::kOk;
+    }
   }
-  if (src == nullptr) {
-    root_->stats_.get_misses_.fetch_add(1, std::memory_order_relaxed);
-    return Status::kMiss;
-  }
-  std::memcpy(dst, src, size);
-  e->pins_.fetch_sub(1, std::memory_order_acq_rel);
-  root_->stats_.get_hits_.fetch_add(1, std::memory_order_relaxed);
-  return Status::kOk;
+  root_->stats_.get_misses_.fetch_add(1, std::memory_order_relaxed);
+  return Status::kMiss;
 }
 
 inline Status View::TryGetSize(u32 tag_major, u32 tag_minor, const char *name,

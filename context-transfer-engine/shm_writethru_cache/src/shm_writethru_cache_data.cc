@@ -67,6 +67,23 @@ clio::run::TaskResume Runtime::WaitBlobFlushed(const TagId &tag,
   CLIO_TASK_BODY_END
 }
 
+clio::run::TaskResume Runtime::BeginChainRead(const TagId &tag,
+                                              const std::string &name) {
+  CLIO_TASK_BODY_BEGIN
+  while (true) {
+    chain_reads_.fetch_add(1);
+    if (!flushing_.load() &&
+        (!view_.Ready() || view_.BlobPending(tag.major_, tag.minor_,
+                                             name.c_str(), name.size()) == 0)) {
+      break;  // held: no batch is landing and none can start
+    }
+    chain_reads_.fetch_sub(1);
+    CLIO_CO_AWAIT(clio::run::yield(kBarrierPollUs));
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 clio::run::TaskResume Runtime::FanoutInvalidate(const TagId &tag,
                                                 const std::string &name) {
   CLIO_TASK_BODY_BEGIN
@@ -306,17 +323,18 @@ clio::run::TaskResume Runtime::GetBlob(
         task->SetReturnCode(0);
         CLIO_CO_RETURN;
       }
-      CLIO_CO_AWAIT(WaitBlobFlushed(tag, name));
+      CLIO_CO_AWAIT(BeginChainRead(tag, name));
       bool filled = false;
       CLIO_CO_AWAIT(FillFromChain(tag, name, &filled));
       if (filled &&
           view_.TryGet(tag.major_, tag.minor_, name.c_str(), name.size(),
                        task->offset_, task->size_, dst) == wtc::Status::kOk) {
+        EndChainRead();
         task->SetReturnCode(0);
         CLIO_CO_RETURN;
       }
     } else {
-      CLIO_CO_AWAIT(WaitBlobFlushed(tag, name));
+      CLIO_CO_AWAIT(BeginChainRead(tag, name));
     }
     if (task->segments_.empty()) {
       auto f = Next()->AsyncGetBlob(tag, name, task->offset_, task->size_,
@@ -330,6 +348,7 @@ clio::run::TaskResume Runtime::GetBlob(
       CLIO_CO_AWAIT(ForwardToCore(Method::kGetBlob,
                                   task.template Cast<clio::run::Task>()));
     }
+    EndChainRead();
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END

@@ -89,6 +89,9 @@ static constexpr u32 kMaxBlobName = 200;
 static constexpr u32 kStripes = 64;
 /** Probe budget inside one stripe before an insert gives up. */
 static constexpr u32 kMaxProbe = 64;
+/** Reader attempts while a writer is mid-copy before falling back to the
+ *  task path. */
+static constexpr u32 kTornRetries = 256;
 /** Smallest buffer allocated for a blob. */
 static constexpr u64 kMinBuffer = 4096;
 
@@ -139,6 +142,11 @@ struct BlobEntry {
   std::atomic<u64> inval_epoch_;   /**< bumped by every invalidation */
   std::atomic<u64> hits_;          /**< frecency: access count */
   std::atomic<u64> last_access_ns_;/**< frecency: last access */
+  /** Seqlock over the buffer bytes: writers bump wbegin_ under the stripe
+   *  lock before their memcpy and wend_ after it. A reader copies only when
+   *  they are equal and re-checks wbegin_ afterwards (torn-read guard). */
+  std::atomic<u64> wbegin_;
+  std::atomic<u64> wend_;
   char name_[kMaxBlobName];
 };
 
@@ -180,7 +188,7 @@ struct Stats {
 /** Segment root: the first allocation in the segment. */
 struct Root {
   static constexpr u64 kMagic = 0x3143544357534C43ull;  // "CLSWCTC1"
-  static constexpr u32 kVersion = 1;
+  static constexpr u32 kVersion = 2;
 
   u64 magic_;
   u32 version_;
