@@ -75,6 +75,38 @@ GLOBAL_CROSS_CONST clio::run::u32 kSettleTagCopies = 102;
 /** Highest method id + 1 across the policy cache modules. */
 GLOBAL_CROSS_CONST clio::run::u32 kCacheMaxMethodId = 103;
 
+/** A byte range [first, second) of a blob. */
+using Extent = std::pair<clio::run::u64, clio::run::u64>;
+
+/**
+ * Add [begin, end) to a sorted list of disjoint ranges, merging any it
+ * overlaps or touches.
+ * @param ext the ranges (kept sorted and disjoint)
+ * @param begin first byte
+ * @param end one past the last byte
+ */
+inline void AddExtent(std::vector<Extent> &ext, clio::run::u64 begin,
+                      clio::run::u64 end) {
+  if (begin >= end) return;
+  std::vector<Extent> out;
+  out.reserve(ext.size() + 1);
+  bool placed = false;
+  for (const Extent &e : ext) {
+    if (e.second < begin) {
+      out.push_back(e);
+    } else if (end < e.first) {
+      if (!placed) out.emplace_back(begin, end);
+      placed = true;
+      out.push_back(e);
+    } else {
+      begin = std::min(begin, e.first);
+      end = std::max(end, e.second);
+    }
+  }
+  if (!placed) out.emplace_back(begin, end);
+  ext.swap(out);
+}
+
 /** Return codes the core uses when a tier cannot hold a put (11..13). */
 inline bool IsNoSpaceRc(clio::run::u32 rc) { return rc >= 11 && rc <= 13; }
 
@@ -88,6 +120,7 @@ struct CacheEntry {
   std::string name_;
   clio::run::u64 size_ = 0;            ///< logical size of the copy
   bool dirty_ = false;                 ///< newer than the persistent blob
+  std::vector<Extent> dirty_ext_;      ///< the bytes that are newer
   clio::run::u64 gen_ = 0;             ///< bumped by every write to the copy
   clio::run::u32 pins_ = 0;            ///< ops reading/writing the copy now
   bool busy_ = false;                  ///< being filled, evicted or dropped
@@ -201,15 +234,31 @@ class CacheBase : public clio::cte::core::DualTargetInterposer {
   // ---- Map state (mu_ held only inside these, never across co_await) ----
   PinState Pin(const std::string &key);
   void Unpin(const std::string &key);
-  /** Record a write into the copy (creating the entry if absent). */
+  /**
+   * Record a write into the copy (creating the entry if absent).
+   * @param key the cache key
+   * @param tag the blob's tag
+   * @param name the blob's name
+   * @param regions the byte ranges written
+   * @param dirty whether those bytes are now newer than persistent's
+   */
   void NoteWrite(const std::string &key, const TagId &tag,
-                 const std::string &name, clio::run::u64 end, bool dirty);
+                 const std::string &name, const std::vector<Extent> &regions,
+                 bool dirty);
   /** Mark an absent key busy for a fill or create; false if present/busy. */
   bool Reserve(const std::string &key, const TagId &tag,
                const std::string &name);
-  /** Release a reservation; keep the entry only when the copy was written. */
+  /**
+   * Release a reservation; keep the entry only when the copy was written.
+   * @param key the cache key
+   * @param written whether the copy now exists
+   * @param size the copy's size
+   * @param dirty the ranges of the copy newer than persistent's (none:
+   *        the copy is clean)
+   */
   void ReleaseReserve(const std::string &key, bool written,
-                      clio::run::u64 size, bool dirty);
+                      clio::run::u64 size,
+                      const std::vector<Extent> &dirty = {});
   /** Mark a present, unpinned, idle copy busy; false otherwise. */
   bool MarkBusy(const std::string &key);
   /** Erase an entry (the copy has been deleted). */
@@ -244,6 +293,27 @@ class CacheBase : public clio::cte::core::DualTargetInterposer {
                                                  clio::run::u32 &rc);
 
   // ---- Policy steps ----
+  /** Whether a put depends on the blob's current state (append, replace,
+   *  put-if-absent, put-if-version): such puts are applied by persistent. */
+  static bool IsSpecialPut(const clio::cte::core::PutBlobTask &task);
+  /**
+   * Apply a state-dependent put on persistent: write out and delete the
+   * copy, holding the key so no copy is rebuilt until the put lands.
+   * @param task the put
+   */
+  clio::run::TaskResume SpecialPut(
+      clio::run::shared_ptr<clio::cte::core::PutBlobTask> task);
+  /**
+   * Take a key out of service: wait for it to be idle, write out a dirty
+   * copy, delete the copy, and leave the key held as a bare reservation.
+   * Release with ReleaseReserve(key, false, 0, false).
+   * @param key the cache key
+   * @param tag the blob's tag
+   * @param name the blob's name
+   * @param rc 0 when held; else the flush failed and nothing is held
+   */
+  clio::run::TaskResume HoldSettled(std::string key, TagId tag,
+                                    std::string name, clio::run::u32 &rc);
   clio::run::TaskResume WriteThruPut(
       clio::run::shared_ptr<clio::cte::core::PutBlobTask> task);
   clio::run::TaskResume WriteBackPut(
@@ -263,7 +333,7 @@ class CacheBase : public clio::cte::core::DualTargetInterposer {
       std::string key);
   clio::run::TaskResume MirrorIntoCopy(
       clio::run::shared_ptr<clio::cte::core::PutBlobTask> task,
-      std::string key, clio::run::u64 end);
+      std::string key);
   clio::run::TaskResume Fill(TagId tag, std::string name,
                              ctp::ipc::ShmPtr<> whole_buf,
                              clio::run::u64 whole_len);

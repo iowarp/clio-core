@@ -551,6 +551,33 @@ TEST_CASE("Write-back: a batch of partial writes is absorbed",
   REQUIRE(Get(kPersistentPool, tag, "m1", 0, want1.size()) == want1);
 }
 
+TEST_CASE("Write-back: an append lands after the cached bytes",
+          "[cte][policy_cache][write_back]") {
+  Fixture();
+  const TagId tag = MakeTag("pc_wb_append");
+  const std::string base = Payload(8192, 'k');
+  REQUIRE(Put(kPersistentPool, tag, "a0", 0, base) == 0);
+  // A dirty, absorbed patch first: the append must see it and land after
+  // the blob's current end, not at offset 0 of a fresh copy.
+  const std::string patch = Payload(1024, 'p');
+  REQUIRE(Put(kBackPool, tag, "a0", 2048, patch) == 0);
+  const std::string tail = Payload(4096, 't');
+  clio::cte::core::Client back(kBackPool);
+  auto f = back.AsyncPutBlob(tag, "a0", 0, tail.size(), tail.data(), -1.0f,
+                             clio::cte::core::Context(),
+                             clio::cte::core::kCtePutAppend);
+  f.Wait();
+  REQUIRE(f.get() != nullptr);
+  REQUIRE(f->GetReturnCode() == 0);
+  std::string want = base;
+  want.replace(2048, patch.size(), patch);
+  want += tail;
+  REQUIRE(SizeOn(kPersistentPool, tag, "a0") == (long long)want.size());
+  REQUIRE(Get(kBackPool, tag, "a0", 0, want.size()) == want);
+  REQUIRE(FlushCache(kBackPool) == 0);
+  REQUIRE(Get(kPersistentPool, tag, "a0", 0, want.size()) == want);
+}
+
 TEST_CASE("Write-back: SyncTag flushes the tag's dirty copies",
           "[cte][policy_cache][write_back]") {
   Fixture();

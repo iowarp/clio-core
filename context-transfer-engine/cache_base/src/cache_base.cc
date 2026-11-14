@@ -176,15 +176,18 @@ void CacheBase::Unpin(const std::string &key) {
 }
 
 void CacheBase::NoteWrite(const std::string &key, const TagId &tag,
-                          const std::string &name, clio::run::u64 end,
-                          bool dirty) {
+                          const std::string &name,
+                          const std::vector<Extent> &regions, bool dirty) {
   std::lock_guard<std::mutex> lock(mu_);
   CacheEntry &e = entries_[key];
   e.tag_ = tag;
   e.name_ = name;
-  e.size_ = std::max(e.size_, end);
+  for (const Extent &r : regions) {
+    e.size_ = std::max(e.size_, r.second);
+    if (dirty) AddExtent(e.dirty_ext_, r.first, r.second);
+  }
   e.gen_++;
-  e.dirty_ = e.dirty_ || dirty;
+  e.dirty_ = !e.dirty_ext_.empty();
   e.last_access_ns_ = clio::cte::core::GetCurrentTimeNs();
 }
 
@@ -201,7 +204,8 @@ bool CacheBase::Reserve(const std::string &key, const TagId &tag,
 }
 
 void CacheBase::ReleaseReserve(const std::string &key, bool written,
-                               clio::run::u64 size, bool dirty) {
+                               clio::run::u64 size,
+                               const std::vector<Extent> &dirty) {
   std::lock_guard<std::mutex> lock(mu_);
   auto it = entries_.find(key);
   if (it == entries_.end()) return;
@@ -211,7 +215,8 @@ void CacheBase::ReleaseReserve(const std::string &key, bool written,
   }
   it->second.busy_ = false;
   it->second.size_ = size;
-  it->second.dirty_ = dirty;
+  it->second.dirty_ext_ = dirty;
+  it->second.dirty_ = !dirty.empty();
   it->second.gen_++;
 }
 
@@ -498,15 +503,19 @@ clio::run::TaskResume CacheBase::TruncateBlob(
       CLIO_CO_AWAIT(SendToContainer(task, target));
       CLIO_CO_RETURN;
     }
-    const std::string key = Key(task->tag_id_, task->blob_name_.str());
+    // The key stays held until persistent has truncated, so no put can
+    // rebuild a copy from the untruncated blob in between.
+    const std::string name = task->blob_name_.str();
+    const std::string key = Key(task->tag_id_, name);
     clio::run::u32 rc = 0;
-    CLIO_CO_AWAIT(DropCopy(key, /*flush_first=*/IsWriteBack(), rc));
+    CLIO_CO_AWAIT(HoldSettled(key, task->tag_id_, name, rc));
     if (rc != 0) {
       task->SetReturnCode(rc);
       CLIO_CO_RETURN;
     }
     CLIO_CO_AWAIT(ForwardToCore(Method::kTruncateBlob,
                                 task.template Cast<clio::run::Task>()));
+    ReleaseReserve(key, false, 0);
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END

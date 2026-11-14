@@ -72,6 +72,18 @@ static clio::run::u64 RegionEnd(TaskT &task) {
   return end;
 }
 
+/** The byte ranges a put/get task addresses. */
+template <typename TaskT>
+static std::vector<Extent> Regions(TaskT &task) {
+  std::vector<Extent> out;
+  clio::cte::core::ForEachBlobRegion(
+      task, [&out](const clio::cte::core::BlobRegion &r) {
+        out.emplace_back(r.blob_off_, r.blob_off_ + r.size_);
+        return true;
+      });
+  return out;
+}
+
 /** Whether a task addresses exactly one region starting at offset 0. */
 template <typename TaskT>
 static bool IsSingleFromZero(const TaskT &task) {
@@ -193,10 +205,85 @@ clio::run::TaskResume CacheBase::PutBlob(
       CLIO_CO_RETURN;
     }
   }
-  if (IsWriteBack() || !HasPersistent()) {
+  if (HasPersistent() && IsSpecialPut(*task)) {
+    CLIO_CO_AWAIT(SpecialPut(task));
+  } else if (IsWriteBack() || !HasPersistent()) {
     CLIO_CO_AWAIT(WriteBackPut(task));
   } else {
     CLIO_CO_AWAIT(WriteThruPut(task));
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+bool CacheBase::IsSpecialPut(const clio::cte::core::PutBlobTask &task) {
+  namespace core = clio::cte::core;
+  return (task.flags_ & (core::kCtePutReplace | core::kCtePutAppend)) != 0 ||
+         (task.context_.op_flags_ &
+          (Context::kPutIfAbsent | Context::kPutIfVersion)) != 0;
+}
+
+clio::run::TaskResume CacheBase::SpecialPut(
+    clio::run::shared_ptr<clio::cte::core::PutBlobTask> task) {
+  CLIO_TASK_BODY_BEGIN
+  {
+    // Appends, replaces and conditional puts are decided by the blob's
+    // current state, which only persistent holds once the copy is written
+    // out: settle the copy and keep the key held while persistent applies
+    // the put, so no other put can rebuild a copy from the old blob.
+    const std::string name = task->blob_name_.str();
+    const std::string key = Key(task->tag_id_, name);
+    clio::run::u32 rc = 0;
+    CLIO_CO_AWAIT(HoldSettled(key, task->tag_id_, name, rc));
+    if (rc != 0) {
+      task->SetReturnCode(rc);
+      CLIO_CO_RETURN;
+    }
+    CLIO_CO_AWAIT(ForwardToCore(Method::kPutBlob,
+                                task.template Cast<clio::run::Task>()));
+    ReleaseReserve(key, false, 0);
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume CacheBase::HoldSettled(std::string key, TagId tag,
+                                             std::string name,
+                                             clio::run::u32 &rc) {
+  CLIO_TASK_BODY_BEGIN
+  {
+    rc = 0;
+    while (true) {
+      if (Reserve(key, tag, name)) CLIO_CO_RETURN;  // no copy: now held
+      if (MarkBusy(key)) break;                     // idle copy: now held
+      CLIO_CO_AWAIT(clio::run::yield(kBusyPollUs));
+    }
+    bool dirty = false;
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      auto it = entries_.find(key);
+      if (it != entries_.end()) dirty = it->second.dirty_;
+    }
+    if (dirty) {
+      CLIO_CO_AWAIT(FlushEntry(key, rc));
+      if (rc != 0) {
+        // Keep the copy (the only holder of its bytes); release the hold.
+        std::lock_guard<std::mutex> lock(mu_);
+        auto it = entries_.find(key);
+        if (it != entries_.end()) it->second.busy_ = false;
+        CLIO_CO_RETURN;
+      }
+    }
+    CLIO_CO_AWAIT(DeleteVolatileCopy(tag, name));
+    {
+      // The entry stays as a bare reservation (no copy).
+      std::lock_guard<std::mutex> lock(mu_);
+      CacheEntry held;
+      held.tag_ = tag;
+      held.name_ = name;
+      held.busy_ = true;
+      entries_[key] = held;
+    }
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -208,7 +295,6 @@ clio::run::TaskResume CacheBase::WriteThruPut(
   {
     const std::string name = task->blob_name_.str();
     const std::string key = Key(task->tag_id_, name);
-    const clio::run::u64 end = RegionEnd(*task);
     const Context in_ctx = task->context_;
     // 1. The durable write. Its outcome is the put's outcome.
     CLIO_CO_AWAIT(ForwardToCore(Method::kPutBlob,
@@ -224,7 +310,7 @@ clio::run::TaskResume CacheBase::WriteThruPut(
     // 2. Keep the copy current: mirror into an existing copy, or create one
     //    when this put is the whole blob. A refused copy is just dropped.
     task->context_ = in_ctx;
-    CLIO_CO_AWAIT(MirrorIntoCopy(task, key, end));
+    CLIO_CO_AWAIT(MirrorIntoCopy(task, key));
     if (params_.Fill() != FillMode::kNone && IsSingleFromZero(*task)) {
       clio::run::u64 psize = 0;
       clio::run::u32 src = 0;
@@ -240,7 +326,7 @@ clio::run::TaskResume CacheBase::WriteThruPut(
         if (vrc != 0) {
           CLIO_CO_AWAIT(DeleteVolatileCopy(task->tag_id_, name));
         }
-        ReleaseReserve(key, vrc == 0, psize, false);
+        ReleaseReserve(key, vrc == 0, psize);
       }
     }
     task->context_ = out_ctx;
@@ -273,7 +359,7 @@ clio::run::TaskResume CacheBase::WriteBackPut(
           CLIO_CO_AWAIT(MakeRoom(task->size_, freed));
           CLIO_CO_AWAIT(VolatilePutRegions(task, rc));
         }
-        if (rc == 0) NoteWrite(key, task->tag_id_, name, end, dirty);
+        if (rc == 0) NoteWrite(key, task->tag_id_, name, Regions(*task), dirty);
         Unpin(key);
         if (IsNoSpaceRc(rc)) {
           CLIO_CO_AWAIT(WriteBackFallback(task, key));
@@ -294,7 +380,7 @@ clio::run::TaskResume CacheBase::WriteBackPut(
                                 task.template Cast<clio::run::Task>()));
     if (task->GetReturnCode() == 0) {
       const Context out_ctx = task->context_;
-      CLIO_CO_AWAIT(MirrorIntoCopy(task, key, end));
+      CLIO_CO_AWAIT(MirrorIntoCopy(task, key));
       task->context_ = out_ctx;
       task->SetReturnCode(0);
     }
@@ -346,15 +432,16 @@ clio::run::TaskResume CacheBase::WriteBackCreate(
       }
     }
     if (rc == 0) {
+      // Only the put's bytes are dirty: fetched bytes equal persistent's.
       ReleaseReserve(key, true, fetch ? std::max(end, psize) : end,
-                     HasPersistent());
+                     HasPersistent() ? Regions(*task) : std::vector<Extent>());
       task->SetReturnCode(0);
       outcome = kCreateDone;
       CLIO_CO_RETURN;
     }
     // A refused create leaves nothing usable behind.
     CLIO_CO_AWAIT(DeleteVolatileCopy(task->tag_id_, name));
-    ReleaseReserve(key, false, 0, false);
+    ReleaseReserve(key, false, 0);
     // Persistent is authoritative: a fetch that could not read it, or a
     // full volatile core (when allowed), writes this put around the cache.
     if (fetch_failed ||
@@ -394,7 +481,7 @@ clio::run::TaskResume CacheBase::WriteBackFallback(
     // A copy created after the drop fetched persistent before this write.
     if (task->GetReturnCode() == 0) {
       const Context out_ctx = task->context_;
-      CLIO_CO_AWAIT(MirrorIntoCopy(task, key, RegionEnd(*task)));
+      CLIO_CO_AWAIT(MirrorIntoCopy(task, key));
       task->context_ = out_ctx;
       task->SetReturnCode(0);
     }
@@ -405,7 +492,7 @@ clio::run::TaskResume CacheBase::WriteBackFallback(
 
 clio::run::TaskResume CacheBase::MirrorIntoCopy(
     clio::run::shared_ptr<clio::cte::core::PutBlobTask> task,
-    std::string key, clio::run::u64 end) {
+    std::string key) {
   CLIO_TASK_BODY_BEGIN
   {
     // A write that landed on persistent while a copy exists (or appears via
@@ -423,7 +510,7 @@ clio::run::TaskResume CacheBase::MirrorIntoCopy(
         // Write-back: mark it dirty. A flush of this copy that read it
         // before this mirror may have landed on persistent AFTER the write
         // did, overwriting it there; the copy is then the only holder.
-        NoteWrite(key, task->tag_id_, task->blob_name_.str(), end,
+        NoteWrite(key, task->tag_id_, task->blob_name_.str(), Regions(*task),
                   IsWriteBack() && HasPersistent());
       }
       Unpin(key);
@@ -594,7 +681,7 @@ clio::run::TaskResume CacheBase::Fill(TagId tag, std::string name,
     clio::run::u32 rc = 0;
     CLIO_CO_AWAIT(PersistentSize(tag, name, total, rc));
     if (rc != 0 || total == 0) {
-      ReleaseReserve(key, false, 0, false);
+      ReleaseReserve(key, false, 0);
       CLIO_CO_RETURN;
     }
     // Copy persistent -> volatile: straight from the caller's buffer when
@@ -617,7 +704,7 @@ clio::run::TaskResume CacheBase::Fill(TagId tag, std::string name,
       // A fill is optional: a refused one leaves the blob uncached.
       CLIO_CO_AWAIT(DeleteVolatileCopy(tag, name));
     }
-    ReleaseReserve(key, rc == 0, total, false);
+    ReleaseReserve(key, rc == 0, total);
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -633,8 +720,7 @@ clio::run::TaskResume CacheBase::FlushEntry(std::string key,
     rc = 0;
     TagId tag;
     std::string name;
-    clio::run::u64 size = 0;
-    clio::run::u64 gen = 0;
+    std::vector<Extent> ext;
     // One flusher per copy: two racing flushes could land an older read
     // after a newer one and then mark the copy clean.
     while (true) {
@@ -647,30 +733,36 @@ clio::run::TaskResume CacheBase::FlushEntry(std::string key,
           it->second.pins_++;  // a delete waits for the flush to finish
           tag = it->second.tag_;
           name = it->second.name_;
-          size = it->second.size_;
-          gen = it->second.gen_;
+          // Take the dirty ranges: a write during the flush adds its own.
+          ext.swap(it->second.dirty_ext_);
           break;
         }
       }
       CLIO_CO_AWAIT(clio::run::yield(kBusyPollUs));
     }
+    // Only the dirty ranges are written out.
+    clio::run::u64 widest = 0;
+    for (const Extent &e : ext) widest = std::max(widest, e.second - e.first);
     ctp::ipc::FullPtr<char> buf;
-    if (size > 0) {
-      buf = CLIO_IPC->AllocateBuffer(std::min(size, kCopyChunkBytes));
+    if (widest > 0) {
+      buf = CLIO_IPC->AllocateBuffer(std::min(widest, kCopyChunkBytes));
       if (buf.IsNull()) rc = 1;
     }
-    for (clio::run::u64 off = 0; rc == 0 && off < size;) {
-      const clio::run::u64 len = std::min(kCopyChunkBytes, size - off);
-      ctp::ipc::ShmPtr<> p = buf.shm_.template Cast<void>();
-      auto get = vol_client_.AsyncGetBlob(tag, name, off, len, 0, p,
-                                          clio::run::PoolQuery::Local());
-      CLIO_CO_AWAIT(get);
-      rc = get->GetReturnCode();
-      if (rc != 0) break;
-      auto put = pers_client_.AsyncPutBlob(tag, name, off, len, p);
-      CLIO_CO_AWAIT(put);
-      rc = put->GetReturnCode();
-      off += len;
+    for (size_t i = 0; rc == 0 && i < ext.size(); ++i) {
+      for (clio::run::u64 off = ext[i].first; rc == 0 && off < ext[i].second;) {
+        const clio::run::u64 len =
+            std::min(kCopyChunkBytes, ext[i].second - off);
+        ctp::ipc::ShmPtr<> p = buf.shm_.template Cast<void>();
+        auto get = vol_client_.AsyncGetBlob(tag, name, off, len, 0, p,
+                                            clio::run::PoolQuery::Local());
+        CLIO_CO_AWAIT(get);
+        rc = get->GetReturnCode();
+        if (rc != 0) break;
+        auto put = pers_client_.AsyncPutBlob(tag, name, off, len, p);
+        CLIO_CO_AWAIT(put);
+        rc = put->GetReturnCode();
+        off += len;
+      }
     }
     if (!buf.IsNull()) CLIO_IPC->FreeBuffer(buf);
     {
@@ -679,8 +771,14 @@ clio::run::TaskResume CacheBase::FlushEntry(std::string key,
       if (it != entries_.end()) {
         it->second.flushing_ = false;
         if (it->second.pins_ > 0) it->second.pins_--;
-        // A write during the flush bumped gen: those bytes stay dirty.
-        if (rc == 0 && it->second.gen_ == gen) it->second.dirty_ = false;
+        // A failed flush leaves its ranges dirty; a write during the flush
+        // added its own.
+        if (rc != 0) {
+          for (const Extent &e : ext) {
+            AddExtent(it->second.dirty_ext_, e.first, e.second);
+          }
+        }
+        it->second.dirty_ = !it->second.dirty_ext_.empty();
       }
     }
     if (rc != 0) {
