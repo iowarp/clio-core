@@ -26,10 +26,10 @@ y_hat = cm.predict("iso", r, 0.25)
 
 <h2>C++</h2>
 <pre data-label="cpp">
-IsotonicResult FitIsotonic(Dataset &amp;ds, const IsotonicOptions &amp;opt);
+IsotonicResult FitIsotonic(Dataset &ds, const IsotonicOptions &opt);
 IsotonicResult FitIsotonicPlain(const float *data, u64 n_rows, u64 elems_per_page,
-                                u32 nblocks, const IsotonicOptions &amp;opt);
-float IsotonicPredict(const IsotonicModel &amp;m, float x);
+                                u32 nblocks, const IsotonicOptions &opt);
+float IsotonicPredict(const IsotonicModel &m, float x);
 </pre>
 <p>The paged call needs the runtime; the <code>Plain</code> call runs the same kernel over a plain copy of the data without one.</p>
 

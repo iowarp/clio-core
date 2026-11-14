@@ -26,10 +26,10 @@ median = cm.predict("aft", r, X[0, :-2])        # exp(mu) * (ln 2)^sigma
 
 <h2>C++</h2>
 <pre data-label="cpp">
-AftResult FitAft(Dataset &amp;ds, const AftOptions &amp;opt);
+AftResult FitAft(Dataset &ds, const AftOptions &opt);
 AftResult FitAftPlain(const float *data, u64 n_rows, u32 nf, u64 elems_per_page,
-                      u32 nblocks, const AftOptions &amp;opt);
-float AftPredictMedian(const AftResult &amp;r, const float *x);  // median survival time
+                      u32 nblocks, const AftOptions &opt);
+float AftPredictMedian(const AftResult &r, const float *x);  // median survival time
 </pre>
 <p>The paged call needs the runtime; the <code>Plain</code> call runs the same kernel over a plain copy of the data without one.</p>
 

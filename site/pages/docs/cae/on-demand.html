@@ -62,7 +62,7 @@ chunk_1 0 1048576 1048576
 <p>The CAE core's <code>GetBlob</code> handler treats a blob name of the form <code>page:&lt;id&gt;</code> as a page request. It loads the tag's <code>pagemap</code> blob once per tag, zeroes the caller's buffer, and reads every slice of that page directly into its place. A page composed of several blobs, a blob covering only part of a page, and gaps covered by no extent all read correctly, with gaps as zero. A tag with no <code>pagemap</code> blob fails the page read with a warning. Any blob name without the prefix forwards unchanged, so pagify costs an unpaged deployment one string comparison and is opt-in per request.</p>
 <pre data-label="cpp">
 // A CTE client pointed at the CAE pool (CLIO_CTE_POOL=400.0, or the CAE client's passthrough).
-auto buf = CLIO_IPC-&gt;AllocateBuffer(page_size);
+auto buf = CLIO_IPC->AllocateBuffer(page_size);
 auto g = cae.AsyncGetBlob(tag_id, "page:1", 0, page_size, 0, buf.shm_);
 g.Wait();   // buf holds page 1 assembled from its slices
 </pre>

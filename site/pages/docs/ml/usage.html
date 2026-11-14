@@ -78,7 +78,7 @@ cm.finalize()
 // and clio::cte::core::CLIO_CTE_CLIENT_INIT().
 constexpr clio_ml::u32 kNf = 7, kCols = kNf + 1, kBlocks = 4;
 constexpr clio_ml::u64 kPageBytes = 16 * 1024;           // 4096 floats = 512 rows
-std::vector&lt;float&gt; data = /* rows of 7 features then the label */;
+std::vector<float> data = /* rows of 7 features then the label */;
 const clio_ml::u64 rows = data.size() / kCols;
 
 clio_ml::Dataset ds("linreg_demo", {0}, kPageBytes, kBlocks, /*set_size=*/16, rows, kCols);

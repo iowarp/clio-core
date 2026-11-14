@@ -8,7 +8,7 @@ facts: Header | clio_cee/api/context_interface.h ; Module | clio_cee (nanobind) 
 -->
 <h2>ContextInterface (C++)</h2>
 <pre data-label="cpp">
-#include &lt;clio_cee/api/context_interface.h&gt;
+#include <clio_cee/api/context_interface.h>
 
 namespace iowarp {
 class ContextInterface {
@@ -16,28 +16,28 @@ class ContextInterface {
   ContextInterface();      // does not touch the runtime
   ~ContextInterface();
 
-  int ContextBundle(const std::vector&lt;clio::cae::core::AssimilationCtx&gt; &amp;bundle);
+  int ContextBundle(const std::vector<clio::cae::core::AssimilationCtx> &bundle);
 
-  std::vector&lt;std::string&gt; ContextQuery(const std::string &amp;tag_re,
-                                        const std::string &amp;blob_re,
+  std::vector<std::string> ContextQuery(const std::string &tag_re,
+                                        const std::string &blob_re,
                                         unsigned int max_results = 0,
-                                        const std::string &amp;prompt = "",
+                                        const std::string &prompt = "",
                                         uint64_t time_begin = 0,
                                         uint64_t time_end = 0);
 
-  std::vector&lt;std::string&gt; ContextRetrieve(const std::string &amp;tag_re,
-                                           const std::string &amp;blob_re,
+  std::vector<std::string> ContextRetrieve(const std::string &tag_re,
+                                           const std::string &blob_re,
                                            unsigned int max_results = 1024,
                                            size_t max_context_size = 256 * 1024 * 1024,
                                            unsigned int batch_size = 32,
-                                           const std::string &amp;prompt = "",
+                                           const std::string &prompt = "",
                                            uint64_t time_begin = 0,
                                            uint64_t time_end = 0);
 
-  int ContextSplice(const std::string &amp;new_ctx, const std::string &amp;tag_re,
-                    const std::string &amp;blob_re);
+  int ContextSplice(const std::string &new_ctx, const std::string &tag_re,
+                    const std::string &blob_re);
 
-  int ContextDestroy(const std::vector&lt;std::string&gt; &amp;context_names);
+  int ContextDestroy(const std::vector<std::string> &context_names);
 };
 }
 </pre>
@@ -89,14 +89,14 @@ import clio_cee as cee
 
 class cee.ContextInterface:
     def __init__(self)
-    def context_bundle(self, bundle: list[AssimilationCtx]) -&gt; int
+    def context_bundle(self, bundle: list[AssimilationCtx]) -> int
     def context_query(self, tag_re: str, blob_re: str, max_results: int = 0,
-                      prompt: str = "", time_begin: int = 0, time_end: int = 0) -&gt; list[str]
+                      prompt: str = "", time_begin: int = 0, time_end: int = 0) -> list[str]
     def context_retrieve(self, tag_re: str, blob_re: str, max_results: int = 1024,
                          max_context_size: int = 268435456, batch_size: int = 32,
-                         prompt: str = "", time_begin: int = 0, time_end: int = 0) -&gt; list[str]
-    def context_splice(self, new_ctx: str, tag_re: str, blob_re: str) -&gt; int
-    def context_destroy(self, context_names: list[str]) -&gt; int
+                         prompt: str = "", time_begin: int = 0, time_end: int = 0) -> list[str]
+    def context_splice(self, new_ctx: str, tag_re: str, blob_re: str) -> int
+    def context_destroy(self, context_names: list[str]) -> int
 </pre>
 <p>Arguments can be passed by keyword. Behavior and return values are those of the C++ methods above. <code>context_retrieve</code> returns a list of zero or one <code>str</code>; nanobind converts the packed bytes to <code>str</code>, so binary payloads that are not valid UTF-8 are not safely recoverable through this call.</p>
 

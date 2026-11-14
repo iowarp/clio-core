@@ -80,9 +80,9 @@ ctx.context_destroy(["cae_check"])
 </pre>
 <p>With a native install, check the tool against a real file:</p>
 <pre data-label="shell">
-$ clio_run start &amp;
-$ head -c 3M /dev/urandom &gt; /tmp/sample.bin
-$ printf 'transfers:\n  - src: file::/tmp/sample.bin\n    dst: iowarp::sample\n    format: binary\n' &gt; /tmp/sample.yaml
+$ clio_run start &
+$ head -c 3M /dev/urandom > /tmp/sample.bin
+$ printf 'transfers:\n  - src: file::/tmp/sample.bin\n    dst: iowarp::sample\n    format: binary\n' > /tmp/sample.yaml
 $ clio_cae /tmp/sample.yaml
 $ cte_search 'sample.*'
 </pre>

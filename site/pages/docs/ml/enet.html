@@ -26,10 +26,10 @@ print(r.coef)
 
 <h2>C++</h2>
 <pre data-label="cpp">
-ElasticNetResult FitElasticNet(Dataset &amp;ds, const ElasticNetOptions &amp;opt);
+ElasticNetResult FitElasticNet(Dataset &ds, const ElasticNetOptions &opt);
 ElasticNetResult FitElasticNetPlain(const float *data, u64 n_rows, u32 nf,
                                     u64 elems_per_page, u32 nblocks,
-                                    const ElasticNetOptions &amp;opt);
+                                    const ElasticNetOptions &opt);
 </pre>
 <p>The paged call needs the runtime; the <code>Plain</code> call runs the same kernel over a plain copy of the data without one.</p>
 

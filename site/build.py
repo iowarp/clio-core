@@ -176,12 +176,12 @@ NAV = {
 
 PRIMARY = [
     ("index.html", "Overview", "overview"),
+    ("design/index.html", "Design", "design"),
     ("technologies/index.html", "Technologies", "technologies"),
     ("docs/index.html", "Docs", "docs"),
     ("tutorials/index.html", "Tutorials", "tutorials"),
     ("modules/index.html", "Modules", "modules"),
     ("develop/index.html", "Develop", "develop"),
-    ("design/index.html", "Design", "design"),
 ]
 
 # Old URLs that keep working as redirects.
@@ -333,7 +333,9 @@ def highlight(code: str, lang: str) -> str:
         code: Raw (unescaped) code text.
         lang: Label given on the block, used to choose highlighting rules.
     """
-    out = html.escape(code.strip("\n"), quote=False)
+    # Blocks are raw text, but many sources pre-escape (&lt;); unescape first so
+    # those entities do not render literally.
+    out = html.escape(html.unescape(code.strip("\n")), quote=False)
     rules = HL_RULES.get(HL_ALIASES.get(lang.split()[0].lower() if lang else "", ""), [])
     for pattern, repl in rules:
         # Never highlight inside a span that is already there.

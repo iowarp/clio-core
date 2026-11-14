@@ -28,6 +28,16 @@ facts: Mount | clio_cte_fuse &lt;mountpoint&gt; -f ; Filesystem pool | 560.0 ; P
 <p><a href="/design/filesystem.html">Filesystem and FUSE design</a> explains the inode table, the shared-memory mirror that answers <code>stat</code>, and the write path in detail.</p>
 
 <h2>How it relates to the other technologies</h2>
+
+<ol class="stack-position" aria-label="Where Context FS sits in the CLIO Core stack">
+  <li class="here"><b>Front ends</b><span>Context FS, memory expansion, machine learning, CAE, CEE</span></li>
+  <li class="here"><b>Interceptors</b><span>POSIX, STDIO, MPI-IO and HDF5 adapters; FUSE mount</span></li>
+  <li><b>ChiMod chain</b><span>Cache, replication, compressor, indexer, summarizer</span></li>
+  <li><b>CTE core</b><span>Tags, blobs, placement across tiers</span></li>
+  <li><b>Context Runtime</b><span>Modules, pools, tasks, scheduling, transports</span></li>
+  <li><b>Storage</b><span>Block devices: RAM, NVMe, SSD, HDD, S3/GCS</span></li>
+</ol>
+<p>Context FS is a front end, and its FUSE mount sits with the interceptors. It turns file operations into CTE tags and blobs, so everything below (chain, CTE, runtime, storage) applies to files unchanged. See <a href="/docs/context-fs/design.html">the Context FS design</a>.</p>
 <ul>
   <li><a href="/docs/runtime/index.html">Context Runtime</a> hosts the filesystem module as a pool and runs <code>clio_run</code>, the daemon the mount attaches to. The runtime's documentation covers <code>clio_run</code> and the compose file; this section covers only the filesystem entries of that file.</li>
   <li><a href="/docs/cte/index.html">Context Transfer Engine</a> stores every page and inode record. The CTE's C++ and Python clients can read files written through the mount by tag name.</li>
