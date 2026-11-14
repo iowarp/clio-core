@@ -287,13 +287,19 @@ inline bool View::EvictOne(u32 held_stripe) {
   u32 sps = root_->slots_per_stripe_;
   u32 want = root_->evict_sample_;
   u64 now = NowNs();
-  u64 cursor = root_->evict_cursor_.fetch_add(want * 4) % n;
+  const u32 scan = n < kEvictScanMax ? n : kEvictScanMax;
+  // Advance by the whole window, so a stretch with nothing clean is not
+  // re-walked by the next attempts.
+  u64 cursor = root_->evict_cursor_.fetch_add(scan) % n;
   long best = -1;
   double best_f = 0.0;
   u32 seen = 0;
   // Approximate frecency: sample clean resident entries from a rotating
   // cursor (reads here are unlocked hints, re-verified under the lock).
-  for (u32 k = 0; k < n && seen < want; ++k) {
+  // Bounded: with few clean entries an unbounded walk visits every slot of
+  // a large table on each allocation attempt (holding a stripe lock); the
+  // caller yields and retries instead, letting the flusher clean entries.
+  for (u32 k = 0; k < scan && seen < want; ++k) {
     u32 slot = static_cast<u32>((cursor + k) % n);
     BlobEntry *e = Slot(slot);
     if (e->state_ != kSlotLive || !(e->flags_ & kResident) ||

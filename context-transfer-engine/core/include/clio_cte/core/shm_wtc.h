@@ -92,6 +92,8 @@ static constexpr u32 kMaxProbe = 64;
 /** Reader attempts while a writer is mid-copy before falling back to the
  *  task path. */
 static constexpr u32 kTornRetries = 256;
+/** Most blob-table slots one eviction attempt examines. */
+static constexpr u32 kEvictScanMax = 4096;
 /** Free log entries a non-blocking (runtime) put leaves for concurrent
  *  producers, so its Push does not spin on a worker. */
 static constexpr u64 kLogHeadroom = 1024;
