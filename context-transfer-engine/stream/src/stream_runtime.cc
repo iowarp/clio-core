@@ -79,9 +79,14 @@ constexpr double kStagingTagRetryUs = 1e6;
 clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   CLIO_TASK_BODY_BEGIN
   config_ = task->GetParams();
-  cte_ = clio::cte::core::Client(config_.next_pool_id_.IsNull()
-                                     ? clio::cte::core::kCtePoolId
-                                     : config_.next_pool_id_);
+  if (config_.next_pool_id_.IsNull()) {
+    // No default data pool: the stream must be told where its pages live.
+    HLOG(kError, "clio_cte_stream {}: next_pool_id is required",
+         task->new_pool_id_);
+    task->SetReturnCode(1);
+    CLIO_CO_RETURN;
+  }
+  cte_ = clio::cte::core::Client(config_.next_pool_id_);
   staging_ = clio::cte::core::Client(config_.staging_pool_id_.IsNull()
                                          ? cte_.pool_id_
                                          : config_.staging_pool_id_);

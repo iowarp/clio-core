@@ -269,7 +269,7 @@ compose:
   # To enable, uncomment this block AND point the CAE core's next_pool_id
   # (CAE entry below) at "401.0" so the data path runs through it. It must
   # be composed after the pool it forwards to exists and before the CAE
-  # entry: move it next to the CAE entry, after the cache.
+  # entry: move it next to the CAE entry, after the chain.
   #
   # Inference is synchronous on the handling worker, so scope tag_re/blob_re
   # tightly: a rule matching a hot write path serializes it behind the model.
@@ -278,7 +278,7 @@ compose:
   #   pool_name: clio_cae_summarizer
   #   pool_query: local
   #   pool_id: "401.0"
-  #   next_pool_id: "563.0"             # chain top (cache), as CAE uses
+  #   next_pool_id: "564.0"             # chain top (indexer), as CAE uses
   #   label_endpoint: "http://127.0.0.1:11434"   # inference server base URL
   #   label_api: ollama                 # ollama (default): POST
   #                                     #   {label_endpoint}/api/generate
@@ -329,36 +329,46 @@ compose:
   #       num_predict: 256
 
   # === Context Transfer Engine (CTE) ===
-  # High-performance data buffering and transfer engine. Sits at the
-  # canonical CTE entrypoint 512.0 (clio::cte::core::kCtePoolId) so every
-  # CTE client / FUSE adapter resolves to it directly. Remove this (and
-  # the CAE entry below) if you do not need CTE.
+  # Two DISCONNECTED cores: each core
+  # is either volatile or persistent, and moving data between them is the
+  # job of the write-back cache further down.
+  #
+  # durability: "persistent" | "volatile". Optional. When omitted it is
+  #   inferred at Create: persistent if every storage device has
+  #   persistence_level "temporary" or "long_term", else volatile (a device
+  #   without persistence_level is volatile). Devices are checked as they
+  #   register: a volatile device in a persistent core is refused; a
+  #   persistent device in a volatile core is accepted with a warning.
+  #   A volatile core writes no WAL (metadata_log_path is unused while
+  #   volatile) and starts empty; a persistent core logs metadata to
+  #   metadata_log_path when set and restores it on restart. The class can
+  #   be changed at runtime with Client::AsyncSetDurability until the next
+  #   restart.
+  #
+  # The PERSISTENT core sits at the canonical CTE entrypoint 512.0
+  # (clio::cte::core::kCtePoolId): a client that addresses the core directly
+  # reaches the durable store. Remove the CTE entries (and the CAE entry
+  # below) if you do not need CTE.
   - mod_name: clio_cte_core
     pool_name: cte_main
     pool_query: local
     pool_id: "512.0"
+    durability: persistent
 
     # Storage tiers ---------------------------------------------------------
     # Each entry creates a block device for CTE to buffer data onto.
     # score: 0.0 = slowest/cheapest, 1.0 = fastest/most expensive
     #        -1.0 = automatic scoring
     # persistence_level: "volatile" (default), "temporary", or "long_term".
-    #        Placement filters (Context::min_persistence_level_) and replica
-    #        durability (REPLICA_PERSISTENT, issue #886) key off this — a
-    #        tier left at "volatile" can never satisfy a persistence request.
+    #        Every device of a persistent core must be "temporary" or
+    #        "long_term" (both survive a process restart).
+    # growth_unit (file tiers, optional, default "1GB"): how far the file
+    #   grows -- and reserves -- at a time. The first unit is reserved when
+    #   the tier is created, so on a RAM-backed filesystem (tmpfs) each
+    #   file tier costs one unit of memory up front; use e.g. "64MB" there.
+    # Bdev pool ids are <core major + device index>.<1 + node>, so two cores
+    # on one runtime never share a device; give each device its own path.
     storage:
-      - path: "ram::cte_ram_tier1"       # "ram::<name>" for DRAM, filesystem path for disk
-        bdev_type: "ram"                 # Options: file, ram, hbm, pinned, noop
-        capacity_limit: "0g"             # 0/0g = default to 80% of total system DRAM
-        score: 1.0                       # DRAM = highest-performance tier
-
-      # Persistent disk tier: where the replication chimod (below) keeps the
-      # durable copies of DRAM-cached data. Grows lazily, so the
-      # capacity_limit is a cap, not an upfront allocation.
-      # growth_unit (file tiers, optional, default "1GB"): how far the file
-      #   grows -- and reserves -- at a time. The first unit is reserved when
-      #   the tier is created, so on a RAM-backed filesystem (tmpfs) each
-      #   file tier costs one unit of memory up front; use e.g. "64MB" there.
       - path: "${CLIO_STORAGE_ROOT}/cte_disk_tier.dat"
         bdev_type: "file"
         capacity_limit: "10GB"
@@ -369,7 +379,8 @@ compose:
     # Metadata durability ---------------------------------------------------
     # Write-ahead log + periodic snapshots for tag/blob metadata. Required
     # for data to survive a runtime reboot: without it the disk tier's bytes
-    # persist but nothing remembers which blob they belong to.
+    # persist but nothing remembers which blob they belong to. Ignored (with
+    # a warning) on a volatile core, which never has a WAL.
     performance:
       metadata_log_path: "${CLIO_STORAGE_ROOT}/cte_metadata_log"
       transaction_log_capacity: "32MB"
@@ -426,46 +437,62 @@ compose:
     #                                    # transaction_log_capacity, or at most
     #                                    # once a minute to persist blob score
     #                                    # changes the WAL does not record.
-    #   flush_data_period_ms: 10000      # Data flush interval (ms)
-    #   flush_data_min_persistence: 1    # Min persistence level (1=temp-nonvolatile)
     #   fsync_mode: "durable"            # fsync(2) on clio-fs. "durable": returns
-    #                                    # once the file's bytes are on a tier at
-    #                                    # flush_data_min_persistence or above and
-    #                                    # synced to the device, along with the WAL
-    #                                    # and namespace log. "deferred": returns
-    #                                    # at once; the periodic flushes make the
-    #                                    # data durable (a crash can lose up to
-    #                                    # flush_data_period_ms of fsync'd data).
-    #                                    # A graceful `clio_run stop` also moves
-    #                                    # RAM-tier data to disk before exiting
-    #                                    # (bounded by --grace-period).
+    #                                    # once the write-back cache has flushed
+    #                                    # the file's dirty copies and the devices
+    #                                    # holding its bytes are synced, along with
+    #                                    # the WAL and namespace log. "deferred":
+    #                                    # returns at once; the cache's periodic
+    #                                    # flush makes the data durable (a crash
+    #                                    # can lose up to its flush_period_ms).
+    # The core no longer flushes data itself: flush_data_period_ms and
+    # flush_data_min_persistence are ignored (with a warning). Use the
+    # write-back cache's flush_period_ms.
     #   transaction_log_capacity: "32MB" # Write-ahead log capacity
+
+  # === Volatile CTE core ==================================================
+  # DRAM (and optionally hbm, or NVMe scratch files marked "volatile").
+  # Runs without a WAL and is empty after every start; it may refuse a put
+  # when full, which the write-back cache handles (evict, then fall back to
+  # persistent). Clients should not address it directly.
+  - mod_name: clio_cte_core
+    pool_name: cte_volatile
+    pool_query: local
+    pool_id: "540.0"
+    durability: volatile
+    storage:
+      - path: "ram::cte_ram_tier1"       # "ram::<name>" for DRAM
+        bdev_type: "ram"                 # ram, hbm, pinned, or a volatile file
+        capacity_limit: "0g"             # 0/0g = default to 80% of total system DRAM
+        score: 1.0
+    dpe:
+      dpe_type: "max_bw"
+    targets:
+      neighborhood: 1
 
   # === The interposition chain (issue #886) ==============================
   # The chimods below all speak the CTE core's own Put/Get task interface
   # and stack via next_pool_id, separating RELIABILITY (replication) from
   # LOCALITY (cache) from ENCODING (compression). The canonical full chain:
   #
-  #   cache(563.0) -> indexer(564.0) -> [compressor(562.0) ->]
-  #     replication(561.0) -> core(512.0)
+  #   indexer(564.0) -> [compressor(562.0) ->] write_back_cache(567.0)
+  #     -> volatile core(540.0)
+  #     -> replication(561.0) -> persistent core(512.0)
   #
   # Point any clio::cte::core::Client (or the filesystem chimod below) at
-  # the TOP pool and the whole chain is transparent: a put writes through
-  # the chain (compressed, then replicated, then stored — the AUTHORITATIVE
-  # copy lands before the ack) and updates the raw node-local cache copy
-  # with it; a read serves from the raw cache copy — which also keeps the
-  # zero-IPC SHM fast path live even for compressed blobs — and falls
-  # through the chain on a miss (fetching from the blob's owner node and
-  # re-populating the local copy, coherently: the owner's next write
-  # invalidates it). Order in this file matters: each entry must come AFTER
-  # the entry its next_pool_id names.
+  # the TOP pool and the whole chain is transparent: the indexer notes the
+  # write, the optional compressor encodes it, and the write-back cache
+  # lands it in the volatile core and acks; the cache later flushes it
+  # through replication to the persistent core. A read is served from the
+  # volatile copy when there is one, else from persistent. Order in this
+  # file matters: each entry must come AFTER every pool it names.
 
   # === Replication (durable copies, issue #886) ===
   # Reliability layer. replication_factor is the total number of durable
   # copies of every blob:
   #   1 (default): the blob's own copy only, made durable by fsync and the
-  #     periodic data flush -- the ext4 contract and a single-copy disk
-  #     footprint. A node's blobs are unavailable while it is down.
+  #     write-back cache's periodic flush -- the ext4 contract and a
+  #     single-copy disk footprint. A node's blobs are unavailable while it is down.
   #   N > 1: plus N-1 copies on the next nodes by hash, written before a put
   #     is acknowledged; with the core's failover_to_successor a blob stays
   #     readable and writable while its owner is down, and changes made
@@ -500,6 +527,45 @@ compose:
     # owner returns. Default: "" (kept in memory only).
     # handoff_log_path: "/var/lib/clio/cte_handoff_log"
 
+  # === Write-back cache ===
+  # Sits over the two disconnected cores and owns every durability
+  # decision: a put lands in the volatile core and is acked; dirty copies
+  # are flushed to the persistent chain periodically, on fsync (SyncTag) and
+  # FlushData, before they are evicted, and at `clio_run stop` (bounded by
+  # --grace-period). A read miss is served from persistent and, per `fill`,
+  # copied into the volatile core. Eviction is a DelBlob on the volatile
+  # core.
+  #
+  # Every write lands in the volatile copy, including partial writes (the
+  # rest of the blob is fetched from persistent first) and the FUSE
+  # adapter's batched writes. Each blob's copy lives on ONE node, the
+  # blob's owner: puts and gets sent to another node are forwarded there,
+  # so two nodes never hold diverging dirty copies. A flush writes only the
+  # byte ranges that changed. Appends, replaces and conditional puts write
+  # the copy out and run on persistent, since they depend on the blob's
+  # current state.
+  #
+  # clio_cte_write_thru_cache takes the same keys (flush_period_ms and
+  # fallback_to_persistent are ignored there) and acks only after the
+  # persistent write: no dirty data, but every write pays the persistent
+  # chain's latency (measured slower than write-back on every workload of
+  # the Ares tier suite).
+  - mod_name: clio_cte_write_back_cache
+    pool_name: clio_cte_write_back_cache
+    pool_query: local
+    pool_id: "567.0"
+    next_volatile: "540.0"              # volatile core (required)
+    next_persistent: "561.0"            # replication -> persistent core;
+                                        #   omit for a volatile-only cache
+    fill: on_read_miss                  # on_read_miss | on_hit_count:N | none
+    evict: lru                          # lru | lfu
+    flush_period_ms: 10000              # dirty-copy flush period; 0 = off
+    # When the volatile core cannot hold a put even after eviction: true
+    # writes it straight to persistent (default); false fails the put with
+    # ENOSPC (kPutNoSpaceRc) so a deployment never silently drops to disk
+    # speed.
+    fallback_to_persistent: true
+
   # === Compression (optional, issue #886) ===
   # Encoding layer: transparently compresses on the way down and
   # decompresses on the way out. Requires a build with
@@ -509,7 +575,7 @@ compose:
   #   pool_name: clio_cte_compressor
   #   pool_query: local
   #   pool_id: "562.0"
-  #   next_pool_id: "561.0"             # replication pool — see entry above
+  #   next_pool_id: "567.0"             # write-back cache — see entry above
   #   # Steer each tag's compressed copy toward the node that last read it
   #   # (consumer tracking). false = always place by hash of the tag id.
   #   tracking_enabled: true            # default: true
@@ -547,51 +613,25 @@ compose:
     pool_name: clio_cte_indexer
     pool_query: local
     pool_id: "564.0"
-    next_pool_id: "561.0"               # replication (562.0 with compressor)
+    next_pool_id: "567.0"               # write-back cache (562.0 with compressor)
     index_log_path: "${CLIO_STORAGE_ROOT}/cte_indexer_index"
     # index_sweep_period_ms: 100        # async drain cadence (0 = lazy)
     # index_wal_compact_bytes: "8MB"    # WAL size that triggers compaction
     # tag_re: ".*"                      # index scope: only matching tags...
     # blob_re: ".*"                     # ...and blob names are tokenized
 
-  # === Cache (node-local raw copies, issue #886) ===
-  # Locality layer and the TOP of the chain, with ASYNCHRONOUS WRITE-THROUGH
-  # semantics: a put lands below (authoritative) before the ack — the layers
-  # underneath keep their own async machinery — and the raw local copy in
-  # the core's REPLICA_CACHE slot is updated with it. Reads serve the raw
-  # copy — including via the zero-IPC SHM fast path, which a compressed
-  # primary alone would refuse — and min_score is the floor below which the
-  # organizer will not rescore a cache copy (only genuine tier pressure
-  # evicts one).
-  #
-  # md_only (default false): metadata-only mode. The cache keeps NO node-local
-  # copies of blob data: no cache-replica writes, reads, populates or size
-  # probes. Every blob read and write goes straight to the authoritative owner
-  # chain. Tag metadata write-through and task routing are unchanged. Use it
-  # when node-local copies crowd the fast tiers more than they help (for
-  # example write-heavy runs where every remote-owned byte is otherwise written
-  # twice); leave it off for read-heavy workloads that re-read remote data
-  # locally.
-  - mod_name: clio_cte_cache
-    pool_name: clio_cte_cache
-    pool_query: local
-    pool_id: "563.0"
-    next_pool_id: "564.0"               # indexer — see entry above
-    min_score: 0.5                      # cache copies' score floor
-    md_only: false                      # true: metadata-only, no data copies
-
   # === Context Assimilation Engine (CAE) ===
   # Assimilation / discovery entrypoint at its own pool 400.0
   # (clio::cae::core::kCaePoolId). CEE calls ParseOmni here; CAE forwards
   # the data-path tasks it owns to next_pool_id. It points at the top of the
-  # operator chain (the cache, 563.0), not the bare core, so imported data
+  # operator chain (the indexer, 564.0), not a bare core, so imported data
   # passes through the indexer and is keyword-searchable (#1242); it is
   # composed here, after the chain it forwards to exists.
   - mod_name: clio_cae_core
     pool_name: cae_main
     pool_query: local
     pool_id: "400.0"
-    next_pool_id: "563.0"               # chain top (cache) — see entry above
+    next_pool_id: "564.0"               # chain top (indexer) — see entry above
 
   # === Stream (byte-stream layer over CTE tags) ===
   # Owns what makes a tag a byte stream: its page layout (1 MiB page blobs
@@ -607,7 +647,7 @@ compose:
     pool_name: clio_cte_stream
     pool_query: local
     pool_id: "565.0"
-    next_pool_id: "563.0"               # data path: the chain top (cache)
+    next_pool_id: "564.0"               # data path: the chain top (indexer)
     # Where staged (not yet merged) appends are written. They are written
     # once and read at most once, after a restart, so skip the cache.
     # Default: next_pool_id.
@@ -644,7 +684,10 @@ compose:
     pool_name: clio_cte_filesystem
     pool_query: local
     pool_id: "560.0"
-    next_pool_id: "563.0"               # chain top (cache) — see entries above
+    # REQUIRED: the pool its pages go through (no default). Clients find
+    # this filesystem by pool_name (CLIO_CFS_POOL overrides) and learn this
+    # chain and the stream pool from it.
+    next_pool_id: "564.0"               # chain top (indexer) — see entries above
     # No metadata server. Names live in the inode table: each directory's
     # rows (name -> inode) are split into table blocks, each block has one
     # home container that holds it in memory, and every node caches what it
@@ -673,5 +716,7 @@ compose:
     # is created; a runtime configured the other way refuses the volume.
     # case_insensitive: false
     # Stream pool holding every file's logical size and merging deferred
-    # O_APPEND writes (see the clio_cte_stream entry). Default: "565.0".
-    # stream_pool_id: "565.0"
+    # O_APPEND writes (see the clio_cte_stream entry). clio-fs assumes no
+    # pool id: unset, the filesystem creates its own stream pool, named
+    # "<pool_name>_stream", one minor above its own pool id.
+    stream_pool_id: "565.0"

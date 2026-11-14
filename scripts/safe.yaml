@@ -108,3 +108,11 @@ compose:
         score: 1.0
     dpe:
       dpe_type: "max_bw"
+
+  # clio-fs creates no pools and assumes no pool id: clio_cte_fuse finds this
+  # pool by name (clio_cte_filesystem) and routes through its next_pool_id.
+  - mod_name: clio_cte_filesystem
+    pool_name: clio_cte_filesystem
+    pool_query: local
+    pool_id: "560.0"
+    next_pool_id: "512.0"

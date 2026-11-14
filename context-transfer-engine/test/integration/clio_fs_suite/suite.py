@@ -164,6 +164,7 @@ def load_tests():
   import tests_capacity  # noqa: F401
   import tests_stress  # noqa: F401
   import tests_safe  # noqa: F401
+  import tests_mdtest  # noqa: F401
   import tests_copy  # noqa: F401
   import tests_tier  # noqa: F401
   import tests_replcache  # noqa: F401
@@ -200,7 +201,34 @@ def snapshot_bins(src, dst):
         os.symlink(os.readlink(sp), dp)
       else:
         shutil.copy2(sp, dp)
+        _rpath_to_origin(dp, src)
   return dst
+
+
+def _rpath_to_origin(path, build_bin):
+  """Point a snapshot copy's rpath entry for the build's bin dir at $ORIGIN.
+
+  Build-tree binaries carry an ABSOLUTE DT_RPATH to the build dir, which wins
+  over LD_LIBRARY_PATH; without this the "snapshot" still loads every library
+  from the live build, so a rebuild during a run replaces code under the
+  daemons (a delayed SIGBUS on NFS). Other entries (dependencies) are kept.
+  @param path the copied ELF file
+  @param build_bin the bin dir it was copied from
+  """
+  import subprocess
+  try:
+    cur = subprocess.run(['patchelf', '--print-rpath', path], check=True,
+                         capture_output=True, text=True).stdout.strip()
+  except (OSError, subprocess.CalledProcessError):
+    print(f'warning: cannot read the rpath of {path} (patchelf missing?); '
+          f'the snapshot may load libraries from {build_bin}')
+    return
+  real = os.path.realpath(build_bin)
+  entries = [e for e in cur.split(':') if e]
+  new = ['$ORIGIN' if os.path.realpath(e) == real else e for e in entries]
+  if new != entries:
+    subprocess.run(['patchelf', '--force-rpath', '--set-rpath', ':'.join(new),
+                    path], check=True)
 
 
 def cluster_mnt(cl):
@@ -289,6 +317,11 @@ def main():
   ap.add_argument('--groups', default='posix,dist,dirs,apps,perf,fault')
   ap.add_argument('--only', default='')
   ap.add_argument('--skip', default='')
+  ap.add_argument('--cache', default='write_back',
+                  choices=['write_thru', 'write_back'],
+                  help='policy cache over the volatile and persistent cores '
+                       '(layouts with a persistent tier); default as in '
+                       'clio_default.yaml')
   ap.add_argument('--profile', default='persistent',
                   choices=['persistent', 'persistent_norepl', 'ram',
                            'tiered', 'safe', 'ares_tiers'],
@@ -372,7 +405,7 @@ def main():
                disk_gb=args.disk_gb, ram_gb=args.ram_gb, ram_mb=args.ram_mb,
                fast_mb=args.fast_mb, organizer=args.organizer,
                neighborhood=args.neighborhood, local_root=args.local_root,
-               ssd_mb=args.ssd_mb)
+               ssd_mb=args.ssd_mb, cache=args.cache)
   cl.working_set_mb = args.working_set_mb
   cl.probe_silence_s = args.probe_silence_s
   log(f'hosts={hosts} profile={args.profile} '

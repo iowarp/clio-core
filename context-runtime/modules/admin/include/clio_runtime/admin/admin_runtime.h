@@ -141,6 +141,13 @@ public:
   static bool IsComposedPool(const clio::run::PoolId &pool_id);
 
   /**
+   * Whether the server's compose config defines a pool with this name.
+   * @param pool_name pool name to look for
+   * @return true when a compose entry has that pool_name
+   */
+  static bool IsComposedPoolName(const std::string &pool_name);
+
+  /**
    * Handle GetOrCreatePool task - Pool get-or-create operation (IS_ADMIN=false)
    * This is a coroutine that can co_await nested Create methods
    */

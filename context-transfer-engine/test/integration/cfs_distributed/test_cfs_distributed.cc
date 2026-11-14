@@ -73,8 +73,6 @@ constexpr clio::run::u64 kModLen = 128u * 1024u;                 // spans 1 MiB
 constexpr clio::run::u64 kFinalSize = 3u * kMiB + 512u * 1024u;  // 3.5 MiB
 constexpr const char *kSharedDir = "/dist685";
 constexpr const char *kSharedPath = "/dist685/shared.bin";
-// The CFS filesystem pool composed in clio_config.yaml (kCfsPoolId = 560.0).
-constexpr clio::run::u32 kCfsPoolMajor = 560;
 
 // Read an integer env var (seconds) with a default.
 int EnvSecs(const char *name, int def) {
@@ -115,8 +113,12 @@ int RunWriter() {
     Log(role, "FAIL: CLIO_INIT(kClient) failed");
     return 2;
   }
-  clio::cte::filesystem::Client cfs;
-  cfs.Init(clio::run::PoolId(kCfsPoolMajor, 0));
+  // The filesystem pool composed in clio_config.yaml, found by name.
+  if (!clio::cte::filesystem::CLIO_CFS_CLIENT_INIT()) {
+    Log(role, "FAIL: no filesystem pool");
+    return 2;
+  }
+  clio::cte::filesystem::Client &cfs = *CLIO_CFS_CLIENT;
   auto *ipc = CLIO_IPC;
 
   // The namespace has real directories: creating a file under a parent that
@@ -212,8 +214,12 @@ int RunReader() {
     Log(role, "FAIL: CLIO_INIT(kClient) failed");
     return 3;
   }
-  clio::cte::filesystem::Client cfs;
-  cfs.Init(clio::run::PoolId(kCfsPoolMajor, 0));
+  // The filesystem pool composed in clio_config.yaml, found by name.
+  if (!clio::cte::filesystem::CLIO_CFS_CLIENT_INIT()) {
+    Log(role, "FAIL: no filesystem pool");
+    return 2;
+  }
+  clio::cte::filesystem::Client &cfs = *CLIO_CFS_CLIENT;
   auto *ipc = CLIO_IPC;
 
   // Retry the cross-node open: the shared namespace should resolve the tag the

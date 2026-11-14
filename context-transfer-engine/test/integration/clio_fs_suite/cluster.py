@@ -137,8 +137,11 @@ class Cluster:
                extra_env=None, replicate_period_ms=0, fsync_mode=None,
                ram_mb=512, fast_mb=2048, organizer='frecency',
                organizer_period_ms=2000, neighborhood=1, ssd_mb=4096,
-               ssd_root=None, hdd_root=None):
+               ssd_root=None, hdd_root=None, cache='write_back'):
     self.hosts = list(hosts)
+    # Policy cache over the volatile and persistent cores: 'write_back'
+    # (default, as in clio_default.yaml) or 'write_thru'.
+    self.cache = cache
     self.bin_dir = bin_dir
     self.run_dir = run_dir            # shared (NFS): configs, logs, results
     self.profile = profile
@@ -336,9 +339,10 @@ class Cluster:
     # SAFE_MEMBERS file bdevs (SAFE_PARITY of them parity) on each node.
     tiered = self.profile in ('tiered', 'safe', 'ares_tiers')
     ram_cap = f'{self.ram_mb}MB' if tiered else f'{self.ram_gb}GB'
-    storage = []
+    storage = []       # persistent core devices
+    ram_storage = []   # volatile core devices
     if tiered or self.ram_gb > 0:  # ram_gb 0: disk tier only (#1116)
-      storage.append(
+      ram_storage.append(
           f'      - path: "ram::clio_fs_ram"\n'
           f'        bdev_type: "ram"\n'
           f'        capacity_limit: "{ram_cap}"\n'
@@ -394,13 +398,16 @@ class Cluster:
       # the file sizes / pending appends of the streams it homes.
       fs_extra = f'    metadata_log_path: "{lr}/data/cfs_namespace_log"\n'
       stream_extra = f'    log_path: "{lr}/data/cte_stream_log"\n'
+    # Write-back only: the cache (not the core) flushes dirty RAM copies to
+    # disk every flush_period_ms; write-through ignores it.
+    flush_period_ms = 10000
     if self.profile == 'persistent_norepl':
       # Nothing but fsync may move bytes off the RAM tier: no replica on the
       # disk tier, and the periodic volatile->disk flush pushed out an hour.
-      perf += '      flush_data_period_ms: 3600000\n'
+      flush_period_ms = 3600000
     organizer = ''
     if tiered:
-      perf += '      flush_data_period_ms: 2000\n'
+      flush_period_ms = 2000
       organizer = (f'    organizer: "{self.organizer}"\n'
                    f'    organizer_period_ms: {self.organizer_period_ms}\n')
     if self.profile in ('persistent', 'tiered', 'safe', 'ares_tiers'):
@@ -422,6 +429,68 @@ class Cluster:
                '    remote_copies: 1\n'
                f'    handoff_log_path: "{lr}/data/cte_handoff_log"\n')
       fs_next = '561.0'
+    targets = (f'    targets:\n'
+               f'      neighborhood: {self.neighborhood}\n'
+               f'      default_target_timeout_ms: 30000\n'
+               f'      poll_period_ms: 5000\n'
+               f'      failover_to_successor: true\n')
+    # Each core states its role with `durability`. With a persistent
+    # tier: a persistent core (512.0) and a volatile RAM core (540.0) behind
+    # a policy cache (567.0; write-back by default, which owns flushing;
+    # --cache write_thru for the write-through module). RAM only: one volatile
+    # core under the node-local cache, as before.
+    if storage:
+      cores = ('  - mod_name: clio_cte_core\n'
+               '    pool_name: cte_main\n'
+               '    pool_query: local\n'
+               '    pool_id: "512.0"\n'
+               '    durability: persistent\n'
+               '    storage:\n'
+               f"{''.join(storage)}{perf}{organizer}"
+               '    dpe:\n'
+               '      dpe_type: "max_bw"\n'
+               f'{targets}')
+      if ram_storage:
+        cores += ('  - mod_name: clio_cte_core\n'
+                  '    pool_name: cte_volatile\n'
+                  '    pool_query: local\n'
+                  '    pool_id: "540.0"\n'
+                  '    durability: volatile\n'
+                  '    storage:\n'
+                  f"{''.join(ram_storage)}"
+                  '    dpe:\n'
+                  '      dpe_type: "max_bw"\n'
+                  '    targets:\n'
+                  '      neighborhood: 1\n')
+        cache_mod = f'clio_cte_{self.cache}_cache'
+        top = (f'  - mod_name: {cache_mod}\n'
+               f'    pool_name: {cache_mod}\n'
+               '    pool_query: local\n'
+               '    pool_id: "567.0"\n'
+               '    next_volatile: "540.0"\n'
+               f'    next_persistent: "{fs_next}"\n'
+               f'    flush_period_ms: {flush_period_ms}\n')
+        top_id = '567.0'
+      else:
+        top, top_id = '', fs_next
+    else:
+      cores = ('  - mod_name: clio_cte_core\n'
+               '    pool_name: cte_main\n'
+               '    pool_query: local\n'
+               '    pool_id: "512.0"\n'
+               '    durability: volatile\n'
+               '    storage:\n'
+               f"{''.join(ram_storage)}{organizer}"
+               '    dpe:\n'
+               '      dpe_type: "max_bw"\n'
+               f'{targets}')
+      top = ('  - mod_name: clio_cte_cache\n'
+             '    pool_name: clio_cte_cache\n'
+             '    pool_query: local\n'
+             '    pool_id: "563.0"\n'
+             f'    next_pool_id: "{fs_next}"\n'
+             '    min_score: 0.5\n')
+      top_id = '563.0'
     cfg = f"""# Generated by clio_fs_suite/cluster.py -- profile {self.profile}
 memory:
   main_segment_size: auto
@@ -436,35 +505,18 @@ runtime:
   queue_depth: 1024
   conf_dir: {lr}/conf
 compose:
-{self.safe_compose()}  - mod_name: clio_cte_core
-    pool_name: cte_main
-    pool_query: local
-    pool_id: "512.0"
-    storage:
-{''.join(storage)}{perf}{organizer}    dpe:
-      dpe_type: "max_bw"
-    targets:
-      neighborhood: {self.neighborhood}
-      default_target_timeout_ms: 30000
-      poll_period_ms: 5000
-      failover_to_successor: true
-{chain}  - mod_name: clio_cte_cache
-    pool_name: clio_cte_cache
-    pool_query: local
-    pool_id: "563.0"
-    next_pool_id: "{fs_next}"
-    min_score: 0.5
-  - mod_name: clio_cte_stream
+{self.safe_compose()}{cores}{chain}{top}  - mod_name: clio_cte_stream
     pool_name: clio_cte_stream
     pool_query: local
     pool_id: "565.0"
-    next_pool_id: "563.0"
+    next_pool_id: "{top_id}"
     staging_pool_id: "{fs_next}"
 {stream_extra}  - mod_name: clio_cte_filesystem
     pool_name: clio_cte_filesystem
     pool_query: local
     pool_id: "560.0"
-    next_pool_id: "563.0"
+    next_pool_id: "{top_id}"
+    stream_pool_id: "565.0"
 {fs_extra}"""
     with open(self.conf, 'w') as f:
       f.write(cfg)

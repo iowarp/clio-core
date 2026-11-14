@@ -546,7 +546,11 @@ TEST_CASE("Cfs - filesystem chimod open/write/getattr/read/truncate",
     REQUIRE(clio::cte::filesystem::FsIdHasHome(packed));
     const clio::run::u32 home = clio::cte::filesystem::FsIdHome(packed);
     const clio::cte::core::TagId tag = clio::cte::filesystem::FsUnpack(packed);
-    clio::cte::stream::Client stream;
+    // The stream pool this filesystem keeps sizes in (clients assume no
+    // pool id: ask the filesystem which one it uses).
+    clio::run::PoolId stream_pool;
+    REQUIRE(cfs.QueryPoolId("stream_pool", &stream_pool));
+    clio::cte::stream::Client stream(stream_pool);
 
     constexpr clio::run::u64 kChunk = 4096;
     constexpr int kNum = 16;  // concurrent stress (probe for corruption)

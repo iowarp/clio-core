@@ -326,6 +326,8 @@ class Runtime : public clio::run::Container {
    */
   clio::run::TaskResume AwaitCteReady(bool &ok);
   clio::run::PoolId next_pool_id_ = clio::run::PoolId::GetNull();
+  /** The stream pool in use: configured, or derived at Create. */
+  clio::run::PoolId stream_pool_id_ = clio::run::PoolId::GetNull();
   // Client bound to THIS filesystem pool, for self-submitted tasks (the
   // append pipeline, and ShardOps to the owners of other namespace state).
   Client self_;

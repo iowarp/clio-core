@@ -218,6 +218,16 @@ clio::run::PoolQuery Runtime::ScheduleTask(const clio::run::shared_ptr<clio::run
   }
 }
 
+bool Runtime::IsComposedPoolName(const std::string &pool_name) {
+  if (pool_name.empty()) return false;
+  auto *config = CLIO_CONFIG_MANAGER;
+  if (config == nullptr) return false;
+  for (const auto &pc : config->GetComposeConfig().pools_) {
+    if (pc.pool_name_ == pool_name) return true;
+  }
+  return false;
+}
+
 bool Runtime::IsComposedPool(const clio::run::PoolId &pool_id) {
   if (pool_id.IsNull()) return false;
   auto *config = CLIO_CONFIG_MANAGER;
@@ -256,11 +266,17 @@ clio::run::TaskResume Runtime::GetOrCreatePool(
   // replace the configured ones -- e.g. a filesystem pool without its
   // metadata log, or over the bare core instead of the replication chain.
   // Wait (cooperatively) for compose to create such a pool, then bind to it.
-  if (!task->do_compose_ && IsComposedPool(task->new_pool_id_)) {
+  // A create with NO pool id is a lookup by name (clients that assume no
+  // fixed id find composed pools that way); it waits the same way.
+  const bool by_name = task->new_pool_id_.IsNull();
+  if (!task->do_compose_ &&
+      (by_name ? IsComposedPoolName(pool_name)
+               : IsComposedPool(task->new_pool_id_))) {
     auto *rm = CLIO_RUNTIME_MANAGER;
     const auto t0 = std::chrono::steady_clock::now();
     while (rm != nullptr && !rm->compose_done_.load(std::memory_order_acquire) &&
-           !pool_manager->HasPool(task->new_pool_id_) &&
+           (by_name ? pool_manager->FindPoolByName(pool_name).IsNull()
+                    : !pool_manager->HasPool(task->new_pool_id_)) &&
            std::chrono::steady_clock::now() - t0 < std::chrono::seconds(300)) {
       CLIO_CO_AWAIT(clio::run::yield(2000));
     }

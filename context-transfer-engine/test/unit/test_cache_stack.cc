@@ -121,11 +121,7 @@ compose:
       poll_period_ms: 5000
 
     storage:
-      - path: "ram::cache_stack_dram"
-        bdev_type: "ram"
-        capacity_limit: "128MB"
-        score: 1.0
-
+      # A core is uniform in durability: the persistent tier only.
       - path: ")" << file_storage_path_ << R"("
         bdev_type: "file"
         capacity_limit: "64MB"
@@ -194,6 +190,9 @@ TEST_CASE("CacheStack - cache over compressor over replication over core",
         clio::cte::replication::kReplicationPoolId, clio::cte::core::kCtePoolId);
     clio::cte::replication::ReplicationConfig params;
     params.next_pool_id_ = clio::cte::core::kCtePoolId;
+    // One local durable replica (index 1): the default replication_factor
+    // keeps only the primary, and this test inspects the replica.
+    params.num_replicas_ = 1;
     auto create = repl.AsyncCreateReplication(
         clio::run::PoolQuery::Local(),
         clio::cte::replication::kReplicationPoolName,

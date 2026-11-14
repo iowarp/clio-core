@@ -834,7 +834,7 @@ NB_MODULE(clio_cte_core_ext, m) {
             const clio::run::PoolQuery &target_query,
             const clio::run::PoolId &bdev_id,
             const clio::run::PoolQuery &pool_query, uint32_t attach_existing,
-            uint64_t growth_unit) {
+            uint64_t growth_unit, int32_t persistence_level) {
            using TaskT = clio::cte::core::RegisterTargetTask;
            clio::run::Future<TaskT> fut;
            {
@@ -842,7 +842,7 @@ NB_MODULE(clio_cte_core_ext, m) {
              fut = self.AsyncRegisterTarget(target_name, bdev_type,
                                             total_size, target_query, bdev_id,
                                             pool_query, attach_existing,
-                                            growth_unit);
+                                            growth_unit, persistence_level);
            }
            return MakePyFuture<TaskT>(std::move(fut));
          },
@@ -852,7 +852,11 @@ NB_MODULE(clio_cte_core_ext, m) {
          "pool_query"_a = clio::run::PoolQuery::Dynamic(),
          "attach_existing"_a = uint32_t{0},
          "growth_unit"_a = uint64_t{1} << 30,
+         "persistence_level"_a = int32_t{-1},
          "Asynchronously register a storage target. .wait() -> rc. "
+         "persistence_level labels the bdev (0 volatile, 1 temporary, 2 "
+         "long_term; -1 = from the core's config, else volatile): a "
+         "persistent core refuses a volatile bdev (rc 16). "
          "The original three-argument call retains native defaults. Supply "
          "an explicit stable bdev_id when creating a managed target; null "
          "does not allocate a new pool ID. Registration does not resize an "

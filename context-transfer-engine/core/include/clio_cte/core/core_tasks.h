@@ -387,6 +387,10 @@ struct RegisterTargetTask : public clio::run::Task {
   IN clio::run::u32 attach_existing_;
   // File bdevs: lazy-growth (and reservation) step passed to the bdev create.
   IN clio::run::u64 growth_unit_;
+  // Durability label of this bdev (clio::run::bdev::PersistenceLevel as an
+  // int). -1 = take it from the core's storage config entry for this target,
+  // or volatile for a target the config does not list.
+  IN clio::run::i32 persistence_level_;
 
   // SHM constructor
   CTP_CROSS_FUN RegisterTargetTask()
@@ -396,7 +400,8 @@ struct RegisterTargetTask : public clio::run::Task {
         total_size_(0),
         bdev_id_(clio::run::PoolId::GetNull()),
         attach_existing_(0),
-        growth_unit_(clio::run::u64(1) << 30) {}
+        growth_unit_(clio::run::u64(1) << 30),
+        persistence_level_(-1) {}
 
   // Emplace constructor
   CTP_CROSS_FUN explicit RegisterTargetTask(
@@ -405,7 +410,8 @@ struct RegisterTargetTask : public clio::run::Task {
       clio::run::bdev::BdevType bdev_type, clio::run::u64 total_size,
       const clio::run::PoolQuery &target_query, const clio::run::PoolId &bdev_id,
       clio::run::u32 attach_existing = 0,
-      clio::run::u64 growth_unit = clio::run::u64(1) << 30)
+      clio::run::u64 growth_unit = clio::run::u64(1) << 30,
+      clio::run::i32 persistence_level = -1)
       : clio::run::Task(task_id, pool_id, pool_query, Method::kRegisterTarget),
         target_name_(CLIO_PRIV_ALLOC, target_name),
         bdev_type_(bdev_type),
@@ -413,7 +419,8 @@ struct RegisterTargetTask : public clio::run::Task {
         target_query_(target_query),
         bdev_id_(bdev_id),
         attach_existing_(attach_existing),
-        growth_unit_(growth_unit) {
+        growth_unit_(growth_unit),
+        persistence_level_(persistence_level) {
     task_id_ = task_id;
     pool_id_ = pool_id;
     method_ = Method::kRegisterTarget;
@@ -428,7 +435,7 @@ struct RegisterTargetTask : public clio::run::Task {
   CTP_CROSS_FUN void SerializeIn(Archive &ar) {
     Task::SerializeIn(ar);
     ar(target_name_, bdev_type_, total_size_, target_query_, bdev_id_,
-       attach_existing_, growth_unit_);
+       attach_existing_, growth_unit_, persistence_level_);
   }
 
   /**
@@ -454,6 +461,7 @@ struct RegisterTargetTask : public clio::run::Task {
     bdev_id_ = other->bdev_id_;
     attach_existing_ = other->attach_existing_;
     growth_unit_ = other->growth_unit_;
+    persistence_level_ = other->persistence_level_;
   }
 
   /**
@@ -2306,6 +2314,12 @@ GLOBAL_CROSS_CONST clio::run::u32 kCtePutAppend = 0x4u;
  * this put would take ownership of bytes the tier may discard.
  */
 GLOBAL_CROSS_CONST clio::run::u32 kCteDroppabilityConflictRc = 14;
+/** Create return code: `durability` is neither "volatile" nor
+ *  "persistent". */
+GLOBAL_CROSS_CONST clio::run::u32 kCteInvalidDurabilityRc = 15;
+/** RegisterTarget / SetDurability return code: a volatile bdev cannot back a
+ *  persistent core (the registration or the mode change is refused). */
+GLOBAL_CROSS_CONST clio::run::u32 kCteVolatileTargetRc = 16;
 
 /**
  * CTE Telemetry data structure for performance monitoring
@@ -5603,6 +5617,67 @@ struct FlushMetadataTask : public clio::run::Task {
     // Each node flushes its own metadata shard, so the collective total is the
     // SUM (a whole-task copy clobbered it with the last replica's count).
     entries_flushed_ += replica->entries_flushed_;
+  }
+};
+
+/** Durability argument of SetDurabilityTask (matches CoreDurability). */
+GLOBAL_CROSS_CONST clio::run::u32 kCteDurabilityVolatile = 0;
+GLOBAL_CROSS_CONST clio::run::u32 kCteDurabilityPersistent = 1;
+
+/**
+ * SetDurabilityTask - switch a core between volatile and persistent at
+ * runtime. To persistent: refused with kCteVolatileTargetRc while any
+ * volatile bdev is registered; otherwise the WAL (if metadata_log_path is
+ * configured) is opened and a full snapshot written. To volatile: the WAL
+ * stops. The change lasts until the core restarts, which uses the config.
+ */
+struct SetDurabilityTask : public clio::run::Task {
+  IN clio::run::u32 durability_;   ///< kCteDurabilityVolatile / Persistent
+  OUT clio::run::u32 previous_;    ///< the class before this call
+
+  /** SHM default constructor */
+  SetDurabilityTask()
+      : clio::run::Task(), durability_(kCteDurabilityVolatile), previous_(0) {}
+
+  /** Emplace constructor */
+  CTP_CROSS_FUN explicit SetDurabilityTask(const clio::run::TaskId &task_node,
+                                           const clio::run::PoolId &pool_id,
+                                           const clio::run::PoolQuery &pool_query,
+                                           clio::run::u32 durability)
+      : clio::run::Task(task_node, pool_id, pool_query, Method::kSetDurability),
+        durability_(durability),
+        previous_(0) {
+    task_id_ = task_node;
+    pool_id_ = pool_id;
+    method_ = Method::kSetDurability;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(durability_);
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    ar(previous_);
+  }
+
+  void Copy(const ctp::ipc::FullPtr<SetDurabilityTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    durability_ = other->durability_;
+    previous_ = other->previous_;
+  }
+
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    // OUT fields only (issue #915). With a broadcast, previous_ is whichever
+    // container answered last; the return code carries any refusal.
+    Task::AggregateOut(other_base);
+    auto replica = other_base.template Cast<SetDurabilityTask>();
+    previous_ = replica->previous_;
   }
 };
 

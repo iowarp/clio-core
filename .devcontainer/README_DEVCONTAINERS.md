@@ -217,7 +217,7 @@ When contributing code:
 - **Contributing Guide**: `docs/contributing.md`
 - **CUDA Setup**: `.devcontainer/CUDA_SETUP.md`
 - **Project Documentation**: `CLAUDE.md`
-- **Module Development**: `docs/docs/sdk/context-runtime/2.module_dev_guide.md`
+- **Module Development**: https://core.iowarp.ai/develop/
 
 ## Quick Reference
 

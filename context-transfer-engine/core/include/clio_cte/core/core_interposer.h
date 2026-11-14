@@ -237,6 +237,44 @@ class CoreInterposer : public clio::run::Container {
   }
 };
 
+/**
+ * Interposer with TWO next pools: a
+ * volatile core and a persistent chain. The persistent chain is the base's
+ * single next pool, so every forwarded verb, the wire serialization defaults
+ * and owner routing (ScheduleTask) all keep going to the authoritative side.
+ * The volatile pool is reached only through an ordinary core client
+ * (tasks sent with PoolQuery::Local()), by the policy that decides what to
+ * keep in it: the two cores stay disconnected, and nothing runs inline on
+ * the volatile container.
+ *
+ * A deployment with no persistent chain sets only the volatile pool; the
+ * base's next pool is then the volatile core and HasPersistent() is false.
+ */
+class DualTargetInterposer : public CoreInterposer {
+ protected:
+  /** The volatile core this interposer keeps copies in. */
+  clio::run::PoolId volatile_pool_ = clio::run::PoolId::GetNull();
+  /** Whether a persistent chain was configured (else next == volatile). */
+  bool has_persistent_ = false;
+
+  /**
+   * Bind both targets. Call from the derived Create().
+   * @param volatile_pool pool id of the volatile core (required)
+   * @param persistent_pool pool id of the persistent chain, or null for a
+   *        purely volatile deployment
+   */
+  void SetTargets(const clio::run::PoolId &volatile_pool,
+                  const clio::run::PoolId &persistent_pool) {
+    volatile_pool_ = volatile_pool;
+    has_persistent_ = !persistent_pool.IsNull();
+    interposer_next_pool_ = has_persistent_ ? persistent_pool : volatile_pool;
+  }
+
+  /** Whether writes have a durable destination below this module. */
+  bool HasPersistent() const { return has_persistent_; }
+
+};
+
 }  // namespace clio::cte::core
 
 #endif  // CLIO_CTE_CORE_CORE_INTERPOSER_H_

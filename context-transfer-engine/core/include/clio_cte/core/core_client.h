@@ -530,6 +530,13 @@ class Client : public clio::run::ContainerClient {
    * @param target_query Pool query for target routing
    * @param bdev_id Block device ID
    * @param pool_query Pool query for task routing (default: Dynamic)
+   * @param attach_existing 1 = bind to an existing pool at bdev_id
+   * @param growth_unit file bdev lazy-growth step
+   * @param persistence_level the bdev's durability label
+   *        (clio::run::bdev::PersistenceLevel as int); -1 = from the core's
+   *        storage config, or volatile for an unlisted target. A volatile
+   *        bdev is refused by a persistent core (kCteVolatileTargetRc); a
+   *        persistent bdev in a volatile core only logs a warning.
    */
   clio::run::Future<RegisterTargetTask> AsyncRegisterTarget(
       const std::string &target_name, clio::run::bdev::BdevType bdev_type,
@@ -538,14 +545,34 @@ class Client : public clio::run::ContainerClient {
       const clio::run::PoolId &bdev_id = clio::run::PoolId::GetNull(),
       const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic(),
       clio::run::u32 attach_existing = 0,
-      clio::run::u64 growth_unit = clio::run::u64(1) << 30) {
+      clio::run::u64 growth_unit = clio::run::u64(1) << 30,
+      clio::run::i32 persistence_level = -1) {
     auto *ipc_manager = CLIO_CPU_IPC;
 
     auto task = ipc_manager->NewTask<RegisterTargetTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, target_name,
         bdev_type, total_size, target_query, bdev_id, attach_existing,
-        growth_unit);
+        growth_unit, persistence_level);
 
+    return ipc_manager->Send(task);
+  }
+
+  /**
+   * Switch this core between volatile and persistent at runtime.
+   * To persistent it is refused (kCteVolatileTargetRc) while a volatile bdev
+   * is registered; it then opens the WAL (if metadata_log_path is set) and
+   * writes a full snapshot. To volatile the WAL stops. Lasts until the core
+   * restarts, which goes back to the config.
+   * @param durability kCteDurabilityVolatile or kCteDurabilityPersistent
+   * @param pool_query containers to switch (default: this node's)
+   * @return future for the SetDurabilityTask (previous_ = the old class)
+   */
+  clio::run::Future<SetDurabilityTask> AsyncSetDurability(
+      clio::run::u32 durability,
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Local()) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    auto task = ipc_manager->NewTask<SetDurabilityTask>(
+        clio::run::CreateTaskId(), pool_id_, pool_query, durability);
     return ipc_manager->Send(task);
   }
 
