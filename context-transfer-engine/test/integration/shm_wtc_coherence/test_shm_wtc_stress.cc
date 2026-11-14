@@ -33,7 +33,7 @@
 
 /**
  * Multi-node stress for the shm write-through cache. Every node runs this
- * binary bound to the cache pool (CLIO_CTE_POOL=565.0). The scenarios are
+ * binary bound to the cache pool (CLIO_CTE_POOL=567.0). The scenarios are
  * collective and self-verifying: every byte read is checked against the
  * pattern its writer must have produced.
  *
@@ -64,6 +64,13 @@ namespace {
 using clio::cte::core::TagId;
 using clio::run::u64;
 
+/** Wall-clock ms, for ordering events across nodes in a failure report. */
+double WallMs() {
+  return std::chrono::duration<double, std::milli>(
+             std::chrono::system_clock::now().time_since_epoch())
+      .count();
+}
+
 /** Integer env knob with a default. */
 int Knob(const char *name, int def) {
   const char *e = std::getenv(name);
@@ -71,14 +78,26 @@ int Knob(const char *name, int def) {
   return v > 0 ? v : def;
 }
 
-/** Cluster size (CTE_NUM_NODES, default 4). */
-int NumNodes() { return Knob("CTE_NUM_NODES", 4); }
+/** Client processes per node (STRESS_PPN, default 1). */
+int Ppn() { return Knob("STRESS_PPN", 1); }
 
-/** This node's rank (NODE_ID is 1-based). */
-int Rank() {
+/** This process's index on its node (LOCAL_ID, 0-based). */
+int LocalId() {
+  const char *env = std::getenv("LOCAL_ID");
+  return env != nullptr ? std::atoi(env) : 0;
+}
+
+/** This node's index (NODE_ID is 1-based). */
+int NodeIdx() {
   const char *env = std::getenv("NODE_ID");
   return env != nullptr ? std::atoi(env) - 1 : 0;
 }
+
+/** Total client ranks: CTE_NUM_NODES (default 4) x processes per node. */
+int NumNodes() { return Knob("CTE_NUM_NODES", 4) * Ppn(); }
+
+/** This process's global rank. */
+int Rank() { return NodeIdx() * Ppn() + LocalId(); }
 
 /** The process client, bound to the cache pool. */
 clio::cte::core::Client *Io() { return CLIO_CTE_CLIENT; }
@@ -99,6 +118,10 @@ std::string Pattern(u64 size, u64 key, u64 version) {
 bool Sync(const TagId &tag) {
   auto s = Io()->AsyncSyncTag(tag);
   s.Wait();
+  if (s->GetReturnCode() != 0) {
+    fprintf(stderr, "[SYNC-ERR] rank=%d rc=%u (an earlier write failed)\n",
+            Rank(), s->GetReturnCode());
+  }
   return s->GetReturnCode() == 0;
 }
 
@@ -110,12 +133,17 @@ bool Put(const TagId &tag, const std::string &name, u64 off, u64 size,
   return p->GetReturnCode() == 0;
 }
 
-/** Read [off, off+out->size()) of a blob. */
+/** Return code of the last failed Read on this thread (0 = mismatch). */
+thread_local unsigned g_last_read_rc = 0;
+
+/** Read [off, off+out->size()) of a blob; a failure's rc is kept in
+ *  g_last_read_rc so a report can tell an error from wrong bytes. */
 bool Read(const TagId &tag, const std::string &name, std::string *out,
           u64 off = 0) {
   auto get = Io()->AsyncGetBlob(tag, name, off, out->size(), 0, out->data());
   get.Wait();
-  return get->GetReturnCode() == 0;
+  g_last_read_rc = get->GetReturnCode();
+  return g_last_read_rc == 0;
 }
 
 /** Size of a blob, or -1 when it does not exist. */
@@ -126,6 +154,17 @@ long long Size(const TagId &tag, const std::string &name) {
 }
 
 int g_epoch = 0;
+std::string g_phase = "init";
+
+/**
+ * Start a scenario's barrier namespace. Every scenario calls this first, so
+ * a scenario that failed part-way (skipping its later barriers) cannot
+ * shift the barrier epochs of the scenarios after it.
+ */
+void BeginPhase(const char *name) {
+  g_phase = name;
+  g_epoch = 0;
+}
 /**
  * Cluster barrier over blobs: each rank publishes a marker, syncs it, then
  * waits until every rank's marker is visible.
@@ -135,7 +174,8 @@ int g_epoch = 0;
 bool Barrier(const TagId &tag) {
   const int epoch = g_epoch++;
   char one = 1;
-  const std::string pre = "barrier_" + std::to_string(epoch) + "_";
+  const std::string pre =
+      "barrier_" + g_phase + "_" + std::to_string(epoch) + "_";
   if (!Put(tag, pre + std::to_string(Rank()), 0, 1, &one) || !Sync(tag)) {
     return false;
   }
@@ -158,6 +198,9 @@ TagId SharedTag(const std::string &name) {
   auto t = Io()->AsyncGetOrCreateTag(name);
   t.Wait();
   REQUIRE(t->GetReturnCode() == 0);
+  fprintf(stderr, "[TAG] rank=%d name=%s id=%u.%u created=%u\n", Rank(),
+          name.c_str(), t->tag_id_.major_, t->tag_id_.minor_,
+          static_cast<unsigned>(t->created_));
   return t->tag_id_;
 }
 
@@ -214,8 +257,9 @@ int VerifyRotating(const TagId &tag, int blobs, int round, int threads) {
         for (int rep = 0; rep < 2; ++rep) {
           if (!Read(tag, "rot_" + std::to_string(b), &got) ||
               got != Pattern(size, b, round)) {
-            fprintf(stderr, "[STALE] rank=%d thr=%d blob=%d round=%d rep=%d\n",
-                    Rank(), t, b, round, rep);
+            fprintf(stderr,
+                    "[STALE] rank=%d thr=%d blob=%d round=%d rep=%d rc=%u\n",
+                    Rank(), t, b, round, rep, g_last_read_rc);
             bad.fetch_add(1);
           }
         }
@@ -256,7 +300,12 @@ void PrintStats(const char *when) {
 
 TEST_CASE("ShmWtc stress - rotating writers, all nodes verify every round",
           "[shm_wtc][stress][rotate]") {
-  REQUIRE(Io()->HasWtc());
+  BeginPhase("rotate");
+  // STRESS_EXPECT_WTC=0 runs the suite against a pool below the cache (A/B).
+  const char *expect_wtc = std::getenv("STRESS_EXPECT_WTC");
+  if (expect_wtc == nullptr || std::string(expect_wtc) != "0") {
+    REQUIRE(Io()->HasWtc());
+  }
   const TagId tag = SharedTag("wtc_stress_rot");
   const int n = NumNodes();
   const int blobs = Knob("STRESS_BLOBS", 48);
@@ -307,7 +356,11 @@ u64 RecordVersion(const std::string &v) {
 
 TEST_CASE("ShmWtc stress - same-node readers never see a torn write",
           "[shm_wtc][stress][torn]") {
-  const TagId tag = SharedTag("wtc_stress_torn_" + std::to_string(Rank()));
+  BeginPhase("torn");
+  // One blob per NODE: process 0 writes, every process on the node reads,
+  // so readers in other processes copy out of the shared segment.
+  const TagId tag = SharedTag("wtc_stress_torn_" + std::to_string(NodeIdx()));
+  const bool writes_here = LocalId() == 0;
   const u64 size = 64 * 1024;
   const int ms = Knob("STRESS_TORN_MS", 5000);
   const int threads = Knob("STRESS_THREADS", 4);
@@ -315,11 +368,14 @@ TEST_CASE("ShmWtc stress - same-node readers never see a torn write",
   const char *te = std::getenv("STRESS_TORN_TASK_EVERY");
   const u64 task_every = te != nullptr ? std::strtoull(te, nullptr, 10) : 16;
   std::string v1 = Record(size, 1);
-  REQUIRE(Put(tag, "rec", 0, size, v1.data()));
+  if (writes_here) {
+    REQUIRE(Put(tag, "rec", 0, size, v1.data()));
+  }
+  REQUIRE(Barrier(BarrierTag()));
   std::atomic<bool> stop{false};
   std::atomic<u64> torn{0}, backwards{0}, reads{0}, writes{0};
   std::thread writer([&] {
-    for (u64 ver = 2; !stop.load(); ++ver) {
+    for (u64 ver = 2; writes_here && !stop.load(); ++ver) {
       std::string v = Record(size, ver);
       const bool task = task_every != 0 && ver % task_every == 0;
       if (!Put(tag, "rec", 0, size, v.data(), task ? 0.5f : -1.0f)) {
@@ -370,6 +426,7 @@ TEST_CASE("ShmWtc stress - same-node readers never see a torn write",
 
 TEST_CASE("ShmWtc stress - working set larger than the cache",
           "[shm_wtc][stress][evict]") {
+  BeginPhase("evict");
   const TagId tag = SharedTag("wtc_stress_evict");
   const int n = NumNodes();
   const int per = Knob("STRESS_EVICT_BLOBS", 48);
@@ -381,7 +438,9 @@ TEST_CASE("ShmWtc stress - working set larger than the cache",
     REQUIRE(Put(tag, "ev_" + std::to_string(key), 0, size, v.data()));
   }
   REQUIRE(Sync(tag));
+  fprintf(stderr, "[T] rank=%d evict-synced t=%.1f\n", Rank(), WallMs());
   REQUIRE(Barrier(BarrierTag()));
+  fprintf(stderr, "[T] rank=%d evict-barrier-out t=%.1f\n", Rank(), WallMs());
   std::mt19937_64 rng(99 + Rank());
   std::vector<u64> keys;
   for (int r = 0; r < n; ++r) {
@@ -394,8 +453,16 @@ TEST_CASE("ShmWtc stress - working set larger than the cache",
       std::string got(size, '\0');
       if (!Read(tag, "ev_" + std::to_string(key), &got) ||
           got != Pattern(size, key, 7)) {
-        fprintf(stderr, "[EVICT-BAD] rank=%d key=%llu pass=%d\n", Rank(),
-                (unsigned long long)key, pass);
+        const unsigned rc0 = g_last_read_rc;
+        const double t_bad = WallMs();
+        // Late or lost? Re-read once the cluster has had time to settle.
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        std::string again(size, '\0');
+        const bool late = Read(tag, "ev_" + std::to_string(key), &again) &&
+                          again == Pattern(size, key, 7);
+        fprintf(stderr, "[EVICT-BAD] rank=%d key=%llu pass=%d rc=%u t=%.1f %s\n",
+                Rank(), (unsigned long long)key, pass, rc0, t_bad,
+                late ? "LATE(visible after 2 s)" : "LOST(still bad)");
         ++bad;
       }
     }
@@ -409,6 +476,7 @@ TEST_CASE("ShmWtc stress - working set larger than the cache",
 
 TEST_CASE("ShmWtc stress - delete and recreate a tag every node cached",
           "[shm_wtc][stress][deltag]") {
+  BeginPhase("deltag");
   const int n = NumNodes();
   const u64 size = 16 * 1024;
   for (int iter = 0; iter < 4; ++iter) {
@@ -425,7 +493,11 @@ TEST_CASE("ShmWtc stress - delete and recreate a tag every node cached",
     REQUIRE(Barrier(BarrierTag()));
     for (int b = 0; b < 16; ++b) {
       std::string got(size, '\0');
-      REQUIRE(Read(tag, "d_" + std::to_string(b), &got));
+      if (!Read(tag, "d_" + std::to_string(b), &got)) {
+        fprintf(stderr, "[DELTAG-READ] rank=%d iter=%d blob=%d rc=%u\n",
+                Rank(), iter, b, g_last_read_rc);
+        FAIL("read of a synced blob failed");
+      }
       REQUIRE(got == Pattern(size, b, 100 + iter));
     }
     REQUIRE(Barrier(BarrierTag()));
