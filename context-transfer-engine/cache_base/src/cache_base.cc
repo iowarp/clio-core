@@ -39,6 +39,7 @@
  */
 
 #include <clio_cte/cache_base/cache_base.h>
+#include <clio_cte/core/blob_placement.h>
 
 #include <algorithm>
 
@@ -118,6 +119,8 @@ clio::run::PoolQuery CacheBase::ScheduleTask(
   switch (task->method_) {
     case Method::kFlushData:
     case kDropTagCopies:
+    case kFlushTagCopies:
+    case kSettleTagCopies:
       // Per-container work: keep it where it was sent (the periodic flush
       // is Local; DelTag broadcasts kDropTagCopies itself).
       return task->pool_query_;
@@ -276,6 +279,11 @@ clio::run::TaskResume CacheBase::DelBlob(
   {
     const TagId tag = task->tag_id_;
     const std::string name = task->blob_name_.str();
+    clio::run::u32 target = 0;
+    if (RouteTarget(tag, name, *task, target)) {
+      CLIO_CO_AWAIT(SendToContainer(task, target));
+      CLIO_CO_RETURN;
+    }
     const std::string key = Key(tag, name);
     bool had_copy = false;
     bool had_dirty = false;
@@ -352,12 +360,144 @@ clio::run::TaskResume CacheBase::DropTagCopies(
   CLIO_TASK_BODY_END
 }
 
+clio::run::TaskResume CacheBase::FlushTagCopies(
+    clio::run::shared_ptr<clio::cte::core::DelTagTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  {
+    const TagId tag = task->tag_id_;
+    clio::run::u32 rc = 0;
+    if (IsWriteBack() && HasPersistent()) {
+      KeyFilter filter = nullptr;
+      if (!tag.IsNull()) {
+        filter = [tag](const CacheEntry &e) { return e.tag_ == tag; };
+      }
+      CLIO_CO_AWAIT(FlushKeys(Collect(filter, true), rc));
+    }
+    task->SetReturnCode(rc);
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume CacheBase::SettleTagCopies(
+    clio::run::shared_ptr<clio::cte::core::DelTagTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  {
+    const TagId tag = task->tag_id_;
+    std::vector<std::string> keys = Collect(
+        [tag](const CacheEntry &e) { return e.tag_ == tag; }, false);
+    CLIO_CO_AWAIT(DropKeys(keys, /*flush_first=*/IsWriteBack()));
+    task->SetReturnCode(0);
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+// ===========================================================================
+// Owner routing (write-back)
+// ===========================================================================
+
+bool CacheBase::RouteTarget(const TagId &tag, const std::string &name,
+                            const clio::run::Task &task,
+                            clio::run::u32 &target) const {
+  const clio::run::PoolQuery &q = task.pool_query_;
+  if (q.IsDirectIdMode() && q.GetContainerId() == container_id_) {
+    return false;  // sent here on purpose
+  }
+  return OwnerTarget(tag, name, target);
+}
+
+bool CacheBase::OwnerTarget(const TagId &tag, const std::string &name,
+                            clio::run::u32 &target) const {
+  if (!IsWriteBack()) return false;
+  const clio::run::u32 n = clio::cte::core::PoolContainers(pool_id_);
+  if (n <= 1) return false;
+  const clio::run::u32 owner = clio::cte::core::BlobHash(tag, name) % n;
+  target = clio::cte::core::FailoverContainer(pool_id_, owner);
+  return target != container_id_;
+}
+
+void CacheBase::NoteRouted(const TagId &tag, clio::run::u32 target) {
+  std::lock_guard<std::mutex> lock(route_mu_);
+  routed_[tag].insert(target);
+}
+
+std::vector<clio::run::u32> CacheBase::TakeRouted(const TagId &tag) {
+  std::lock_guard<std::mutex> lock(route_mu_);
+  std::vector<clio::run::u32> out;
+  auto it = routed_.find(tag);
+  if (it == routed_.end()) return out;
+  out.assign(it->second.begin(), it->second.end());
+  routed_.erase(it);
+  return out;
+}
+
+std::vector<clio::run::u32> CacheBase::TakeAllRouted() {
+  std::lock_guard<std::mutex> lock(route_mu_);
+  std::unordered_set<clio::run::u32> all;
+  for (const auto &kv : routed_) all.insert(kv.second.begin(), kv.second.end());
+  routed_.clear();
+  return std::vector<clio::run::u32>(all.begin(), all.end());
+}
+
+clio::run::TaskResume CacheBase::SendTagVerb(
+    TagId tag, clio::run::u32 verb, std::vector<clio::run::u32> targets,
+    clio::run::u32 &rc) {
+  CLIO_TASK_BODY_BEGIN
+  {
+    rc = 0;
+    auto *ipc = CLIO_IPC;
+    std::vector<clio::run::Future<clio::cte::core::DelTagTask>> futs;
+    for (clio::run::u32 c : targets) {
+      auto t = ipc->NewTask<clio::cte::core::DelTagTask>(
+          clio::run::CreateTaskId(), pool_id_,
+          clio::run::PoolQuery::DirectId(
+              static_cast<clio::run::ContainerId>(c)),
+          tag);
+      t->method_ = verb;
+      futs.push_back(ipc->Send(t));
+    }
+    for (auto &f : futs) {
+      CLIO_CO_AWAIT(f);
+      if (rc == 0 && f->GetReturnCode() != 0) rc = f->GetReturnCode();
+    }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume CacheBase::SettleRemote(TagId tag, bool drop,
+                                              clio::run::u32 &rc) {
+  CLIO_TASK_BODY_BEGIN
+  {
+    rc = 0;
+    std::vector<clio::run::u32> targets =
+        tag.IsNull() ? TakeAllRouted() : TakeRouted(tag);
+    if (!targets.empty()) {
+      CLIO_CO_AWAIT(SendTagVerb(tag,
+                                drop ? kSettleTagCopies : kFlushTagCopies,
+                                targets, rc));
+      if (rc != 0 && !tag.IsNull()) {
+        // Not settled: keep them on the list for the next sync.
+        for (clio::run::u32 c : targets) NoteRouted(tag, c);
+      }
+    }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 clio::run::TaskResume CacheBase::TruncateBlob(
     clio::run::shared_ptr<clio::cte::core::TruncateBlobTask> &task) {
   CLIO_TASK_BODY_BEGIN
   {
     // Write the copy out (write-back), drop it, and truncate the durable
     // blob: the next read fills the truncated bytes back if wanted.
+    clio::run::u32 target = 0;
+    if (RouteTarget(task->tag_id_, task->blob_name_.str(), *task, target)) {
+      CLIO_CO_AWAIT(SendToContainer(task, target));
+      CLIO_CO_RETURN;
+    }
     const std::string key = Key(task->tag_id_, task->blob_name_.str());
     clio::run::u32 rc = 0;
     CLIO_CO_AWAIT(DropCopy(key, /*flush_first=*/IsWriteBack(), rc));
@@ -375,17 +515,96 @@ clio::run::TaskResume CacheBase::TruncateBlob(
 clio::run::TaskResume CacheBase::MultiPutBlob(
     clio::run::shared_ptr<clio::cte::core::MultiPutBlobTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  if (IsWriteBack() && task->context_.replica_ == 0) {
+    // Write-back absorbs batches like scalar puts: each record runs through
+    // the cache's put on the container serving its blob, so the dirty copy
+    // stays the one place the blob's newest bytes live.
+    CLIO_CO_AWAIT(WriteBackMultiPut(task));
+    CLIO_CO_RETURN;
+  }
   {
-    // Batches write around the cache: every record's copy is written out
-    // (write-back) and dropped, then the batch lands on persistent as one
-    // task. Reads fill the copies back.
+    // Write-through: the batch writes around the cache. Every record's copy
+    // is dropped, then the batch lands on persistent as one task; reads fill
+    // the copies back.
     std::vector<std::string> keys;
     for (const auto &d : clio::cte::core::DecodeMultiPutDescs(task->descs_)) {
       keys.push_back(Key(d.tag_id_, d.blob_name_));
     }
-    CLIO_CO_AWAIT(DropKeys(keys, /*flush_first=*/IsWriteBack()));
+    CLIO_CO_AWAIT(DropKeys(keys, /*flush_first=*/false));
     CLIO_CO_AWAIT(ForwardToCore(Method::kMultiPutBlob,
                                 task.template Cast<clio::run::Task>()));
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume CacheBase::WriteBackMultiPut(
+    clio::run::shared_ptr<clio::cte::core::MultiPutBlobTask> task) {
+  CLIO_TASK_BODY_BEGIN
+  {
+    namespace core = clio::cte::core;
+    core::MultiPutBatchView batch;
+    if (!core::MultiPutBatchView::Attach(*task, &batch)) {
+      task->SetReturnCode(batch.descs_.empty() ? 0 : 1);
+      CLIO_CO_RETURN;
+    }
+    auto *ipc = CLIO_IPC;
+    core::Client self(pool_id_);
+    // Records of one blob apply in batch order: a record waits for the
+    // blob's previous remote record before it is sent.
+    std::unordered_map<std::string, size_t> last_remote;
+    std::vector<clio::run::Future<core::PutBlobTask>> futs;
+    std::vector<std::pair<TagId, clio::run::u32>> fut_route;
+    auto note_rc = [&task](clio::run::u32 rc) {
+      if (rc == 0) {
+        task->num_ok_++;
+      } else if (task->first_rc_ == 0) {
+        task->first_rc_ = static_cast<int>(rc);
+      }
+    };
+    for (size_t i = 0; i < batch.size(); ++i) {
+      const core::MultiPutDesc &d = batch.descs_[i];
+      if (!batch.RecordValid(i)) {
+        if (task->first_rc_ == 0) task->first_rc_ = 2;  // malformed entry
+        continue;
+      }
+      if (d.size_ == 0) {
+        note_rc(0);  // nothing to write
+        continue;
+      }
+      clio::run::u32 target = 0;
+      if (!OwnerTarget(d.tag_id_, d.blob_name_, target)) {
+        auto sub = ipc->NewTask<core::PutBlobTask>(
+            clio::run::CreateTaskId(), pool_id_,
+            clio::run::PoolQuery::Local(), d.tag_id_, d.blob_name_,
+            d.offset_, d.size_, batch.RecordSlice(i), /*score=*/-1.0f,
+            task->context_, /*flags=*/0);
+        sub.get()->BeginRunContext();
+        CLIO_CO_AWAIT(WriteBackPut(sub));
+        note_rc(sub->GetReturnCode());
+        continue;
+      }
+      const std::string key = Key(d.tag_id_, d.blob_name_);
+      auto prev = last_remote.find(key);
+      if (prev != last_remote.end()) CLIO_CO_AWAIT(futs[prev->second]);
+      auto fut = self.AsyncPutBlob(
+          d.tag_id_, d.blob_name_, d.offset_, d.size_,
+          batch.base_ + d.payload_off_, /*score=*/-1.0f, task->context_,
+          /*flags=*/0,
+          clio::run::PoolQuery::DirectId(
+              static_cast<clio::run::ContainerId>(target)));
+      last_remote[key] = futs.size();
+      futs.push_back(fut);
+      fut_route.emplace_back(d.tag_id_, target);
+    }
+    for (size_t k = 0; k < futs.size(); ++k) {
+      CLIO_CO_AWAIT(futs[k]);
+      const clio::run::u32 rc =
+          futs[k].get() == nullptr ? 1 : futs[k]->GetReturnCode();
+      if (rc == 0) NoteRouted(fut_route[k].first, fut_route[k].second);
+      note_rc(rc);
+    }
+    task->SetReturnCode(task->first_rc_ == 0 ? 0 : task->first_rc_);
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -399,10 +618,12 @@ clio::run::TaskResume CacheBase::SyncTag(
     // first, then the persistent chain syncs its devices and WAL.
     if (IsWriteBack()) {
       const TagId tag = task->tag_id_;
+      // Copies this node's writes left on the owners' containers first.
+      clio::run::u32 rc = 0;
+      CLIO_CO_AWAIT(SettleRemote(tag, /*drop=*/false, rc));
       std::vector<std::string> keys = Collect(
           [tag](const CacheEntry &e) { return e.tag_ == tag; }, true);
-      clio::run::u32 rc = 0;
-      CLIO_CO_AWAIT(FlushKeys(keys, rc));
+      if (rc == 0) CLIO_CO_AWAIT(FlushKeys(keys, rc));
       if (rc != 0) {
         task->SetReturnCode(IsNoSpaceRc(rc) ? clio::cte::core::kSyncNoSpaceRc
                                             : clio::cte::core::kSyncIoRc);
@@ -489,6 +710,12 @@ clio::run::TaskResume CacheBase::ForwardCoherent(
       KeyFilter filter = nullptr;
       if (!any_tag) {
         filter = [tag](const CacheEntry &e) { return e.tag_ == tag; };
+      }
+      if (IsWriteBack()) {
+        // Copies this node's writes left on the owners' containers.
+        clio::run::u32 rrc = 0;
+        CLIO_CO_AWAIT(SettleRemote(any_tag ? TagId::GetNull() : tag,
+                                   mutates && !any_tag, rrc));
       }
       if (mutates) {
         // Device-side writes bypass the cache: settle and drop the tag's

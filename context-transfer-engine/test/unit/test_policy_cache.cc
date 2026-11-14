@@ -51,9 +51,13 @@
 #include <clio_cte/write_thru_cache/write_thru_cache_client.h>
 
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <algorithm>
+#include <atomic>
+#include <random>
 #include <thread>
 #include <vector>
 
@@ -382,6 +386,169 @@ TEST_CASE("Write-back: put acks from volatile, flush makes it durable",
   REQUIRE(FlushCache(kBackPool) == 0);
   REQUIRE(SizeOn(kPersistentPool, tag, "b0") == (long long)v.size());
   REQUIRE(Get(kPersistentPool, tag, "b0", 0, v.size()) == want);
+}
+
+TEST_CASE("Write-back: a partial write to a new blob is absorbed",
+          "[cte][policy_cache][write_back]") {
+  Fixture();
+  const TagId tag = MakeTag("pc_wb_partial_new");
+  // Not from offset 0: before, this went synchronously to persistent.
+  const std::string data = Payload(4096, 'n');
+  REQUIRE(Put(kBackPool, tag, "p0", 4096, data) == 0);
+  REQUIRE(SizeOn(kVolatilePool, tag, "p0") == 8192);
+  REQUIRE(SizeOn(kPersistentPool, tag, "p0") == -1);  // dirty, not flushed
+  std::string want(4096, '\0');
+  want += data;  // the gap before the write reads as zeros
+  REQUIRE(Get(kBackPool, tag, "p0", 0, want.size()) == want);
+
+  REQUIRE(FlushCache(kBackPool) == 0);
+  REQUIRE(SizeOn(kPersistentPool, tag, "p0") == (long long)want.size());
+  REQUIRE(Get(kPersistentPool, tag, "p0", 0, want.size()) == want);
+}
+
+TEST_CASE("Write-back: a partial overwrite of a persistent blob is absorbed",
+          "[cte][policy_cache][write_back]") {
+  Fixture();
+  const TagId tag = MakeTag("pc_wb_partial_old");
+  // The blob exists only on persistent (written below the cache).
+  const std::string base = Payload(64 * 1024, 'b');
+  REQUIRE(Put(kPersistentPool, tag, "o0", 0, base) == 0);
+  REQUIRE(SizeOn(kVolatilePool, tag, "o0") == -1);
+  const std::string patch = Payload(500, 'x');
+  REQUIRE(Put(kBackPool, tag, "o0", 1000, patch) == 0);
+  // Fetch-on-write: the copy holds the whole blob with the patch applied,
+  // and persistent is untouched until the flush.
+  std::string want = base;
+  want.replace(1000, patch.size(), patch);
+  REQUIRE(SizeOn(kVolatilePool, tag, "o0") == (long long)base.size());
+  REQUIRE(Get(kBackPool, tag, "o0", 0, base.size()) == want);
+  REQUIRE(Get(kPersistentPool, tag, "o0", 0, base.size()) == base);
+
+  REQUIRE(FlushCache(kBackPool) == 0);
+  REQUIRE(Get(kPersistentPool, tag, "o0", 0, base.size()) == want);
+}
+
+TEST_CASE("Write-back: a partial write past a persistent blob's end",
+          "[cte][policy_cache][write_back]") {
+  Fixture();
+  const TagId tag = MakeTag("pc_wb_partial_grow");
+  const std::string base = Payload(16 * 1024, 'g');
+  REQUIRE(Put(kPersistentPool, tag, "g0", 0, base) == 0);
+  const std::string tail = Payload(8192, 't');
+  REQUIRE(Put(kBackPool, tag, "g0", 12 * 1024, tail) == 0);
+  std::string want = base.substr(0, 12 * 1024) + tail;
+  REQUIRE(SizeOn(kVolatilePool, tag, "g0") == (long long)want.size());
+  REQUIRE(Get(kBackPool, tag, "g0", 0, want.size()) == want);
+
+  REQUIRE(FlushCache(kBackPool) == 0);
+  REQUIRE(SizeOn(kPersistentPool, tag, "g0") == (long long)want.size());
+  REQUIRE(Get(kPersistentPool, tag, "g0", 0, want.size()) == want);
+}
+
+TEST_CASE("Write-back: concurrent partial writes under eviction are exact",
+          "[cte][policy_cache][write_back][stress]") {
+  Fixture();
+  const TagId tag = MakeTag("pc_wb_partial_stress");
+  // 48 x 1 MiB blobs >> the 8 MiB volatile core: every blob is created,
+  // evicted (flush first), re-fetched and falls back to persistent while
+  // other threads write other ranges of the same blobs.
+  constexpr int kBlobs = 48;
+  constexpr clio::run::u64 kBlob = kMiB;
+  constexpr clio::run::u64 kChunk = 64 * 1024;
+  constexpr int kChunks = static_cast<int>(kBlob / kChunk);
+  constexpr int kThreads = 8;
+  std::vector<std::pair<int, int>> work;  // (blob, chunk), shuffled
+  for (int b = 0; b < kBlobs; ++b) {
+    for (int c = 0; c < kChunks; ++c) work.emplace_back(b, c);
+  }
+  std::mt19937 rng(1234);
+  std::shuffle(work.begin(), work.end(), rng);
+  auto chunk_bytes = [](int b, int c) {
+    return Payload(kChunk, static_cast<char>('A' + (b * 7 + c) % 50));
+  };
+  std::atomic<size_t> next{0};
+  std::atomic<int> put_fail{0};
+  std::vector<std::thread> threads;
+  for (int t = 0; t < kThreads; ++t) {
+    threads.emplace_back([&] {
+      for (size_t i; (i = next.fetch_add(1)) < work.size();) {
+        const auto [b, c] = work[i];
+        if (Put(kBackPool, tag, "s" + std::to_string(b), c * kChunk,
+                chunk_bytes(b, c)) != 0) {
+          put_fail.fetch_add(1);
+        }
+      }
+    });
+  }
+  for (auto &th : threads) th.join();
+  REQUIRE(put_fail.load() == 0);
+  auto expect = [&](int b) {
+    std::string want;
+    for (int c = 0; c < kChunks; ++c) want += chunk_bytes(b, c);
+    return want;
+  };
+  int bad_cache = 0;
+  for (int b = 0; b < kBlobs; ++b) {
+    if (Get(kBackPool, tag, "s" + std::to_string(b), 0, kBlob) != expect(b)) {
+      ++bad_cache;
+    }
+  }
+  INFO("blobs read back wrong through the cache: " << bad_cache);
+  REQUIRE(bad_cache == 0);
+  REQUIRE(FlushCache(kBackPool) == 0);
+  int bad_pers = 0;
+  for (int b = 0; b < kBlobs; ++b) {
+    if (Get(kPersistentPool, tag, "s" + std::to_string(b), 0, kBlob) !=
+        expect(b)) {
+      ++bad_pers;
+    }
+  }
+  INFO("blobs wrong on persistent after the flush: " << bad_pers);
+  REQUIRE(bad_pers == 0);
+}
+
+TEST_CASE("Write-back: a batch of partial writes is absorbed",
+          "[cte][policy_cache][write_back]") {
+  Fixture();
+  const TagId tag = MakeTag("pc_wb_batch");
+  // m0 exists on persistent; m1 is new. The batch patches m0 twice (in
+  // order, overlapping) and writes m1 from a nonzero offset, as the FUSE
+  // adapter's write-behind batches do.
+  const std::string base = Payload(64 * 1024, 'm');
+  REQUIRE(Put(kPersistentPool, tag, "m0", 0, base) == 0);
+  const std::string a = Payload(4096, 'x');
+  const std::string b = Payload(2048, 'y');
+  const std::string c = Payload(4096, 'z');
+  const std::string staged = a + b + c;
+  std::vector<clio::cte::core::MultiPutDesc> descs(3);
+  descs[0] = {tag, "m0", 8192, a.size(), 0};
+  descs[1] = {tag, "m0", 9216, b.size(), a.size()};
+  descs[2] = {tag, "m1", 4096, c.size(), a.size() + b.size()};
+  auto buf = CLIO_IPC->AllocateBuffer(staged.size());
+  REQUIRE(!buf.IsNull());
+  memcpy(buf.ptr_, staged.data(), staged.size());
+  clio::cte::core::Client back(kBackPool);
+  auto f = back.AsyncMultiPutVectored(buf.shm_.template Cast<void>(),
+                                      staged.size(), descs);
+  f.Wait();
+  REQUIRE(f->GetReturnCode() == 0);
+  REQUIRE(f->num_ok_ == 3);
+
+  std::string want0 = base;
+  want0.replace(8192, a.size(), a);
+  want0.replace(9216, b.size(), b);
+  std::string want1(4096, '\0');
+  want1 += c;
+  // Both land in the cache; persistent still has the old m0 and no m1.
+  REQUIRE(SizeOn(kVolatilePool, tag, "m0") == (long long)base.size());
+  REQUIRE(SizeOn(kPersistentPool, tag, "m1") == -1);
+  REQUIRE(Get(kPersistentPool, tag, "m0", 0, base.size()) == base);
+  REQUIRE(Get(kBackPool, tag, "m0", 0, base.size()) == want0);
+  REQUIRE(Get(kBackPool, tag, "m1", 0, want1.size()) == want1);
+
+  REQUIRE(FlushCache(kBackPool) == 0);
+  REQUIRE(Get(kPersistentPool, tag, "m0", 0, base.size()) == want0);
+  REQUIRE(Get(kPersistentPool, tag, "m1", 0, want1.size()) == want1);
 }
 
 TEST_CASE("Write-back: SyncTag flushes the tag's dirty copies",

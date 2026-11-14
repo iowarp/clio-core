@@ -23,5 +23,7 @@ kTruncateBlob: 37
 kMultiPutBlob: 48
 kSyncTag: 56
 
-# Module verb (above the core's id space)
+# Module verbs (above the core's id space)
 kDropTagCopies: 100
+kFlushTagCopies: 101
+kSettleTagCopies: 102

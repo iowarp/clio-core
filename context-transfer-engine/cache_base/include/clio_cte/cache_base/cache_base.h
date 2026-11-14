@@ -39,6 +39,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <clio_runtime/clio_runtime.h>
@@ -59,8 +60,20 @@ using Context = clio::cte::core::Context;
  * core::DelTagTask; numbered above the core's id space (interposer rule).
  */
 GLOBAL_CROSS_CONST clio::run::u32 kDropTagCopies = 100;
+/**
+ * Module verb: write out every dirty copy of one tag held by THIS container
+ * (write-back). Sent by SyncTag and the coherent verbs to the containers
+ * this node routed the tag's puts to. Carries a core::DelTagTask.
+ */
+GLOBAL_CROSS_CONST clio::run::u32 kFlushTagCopies = 101;
+/**
+ * Module verb: write out (write-back) and drop every copy of one tag held by
+ * THIS container. Sent before a device-side mutation of the tag. Carries a
+ * core::DelTagTask.
+ */
+GLOBAL_CROSS_CONST clio::run::u32 kSettleTagCopies = 102;
 /** Highest method id + 1 across the policy cache modules. */
-GLOBAL_CROSS_CONST clio::run::u32 kCacheMaxMethodId = 101;
+GLOBAL_CROSS_CONST clio::run::u32 kCacheMaxMethodId = 103;
 
 /** Return codes the core uses when a tier cannot hold a put (11..13). */
 inline bool IsNoSpaceRc(clio::run::u32 rc) { return rc >= 11 && rc <= 13; }
@@ -148,6 +161,12 @@ class CacheBase : public clio::cte::core::DualTargetInterposer {
   /** Module verb kDropTagCopies (see its declaration). */
   clio::run::TaskResume DropTagCopies(
       clio::run::shared_ptr<clio::cte::core::DelTagTask> &task);
+  /** Module verb kFlushTagCopies (see its declaration). */
+  clio::run::TaskResume FlushTagCopies(
+      clio::run::shared_ptr<clio::cte::core::DelTagTask> &task);
+  /** Module verb kSettleTagCopies (see its declaration). */
+  clio::run::TaskResume SettleTagCopies(
+      clio::run::shared_ptr<clio::cte::core::DelTagTask> &task);
 
   /**
    * Every other core verb: make the persistent side current where the verb
@@ -211,6 +230,18 @@ class CacheBase : public clio::cte::core::DualTargetInterposer {
                                        clio::run::u64 &size,
                                        clio::run::u32 &rc);
   clio::run::TaskResume DeleteVolatileCopy(TagId tag, std::string name);
+  /**
+   * Copy a blob's first `total` bytes from the persistent chain into the
+   * volatile core, chunk by chunk, evicting (MakeRoom) once if the volatile
+   * core is full. The caller holds the entry's reservation.
+   * @param tag the blob's tag
+   * @param name the blob's name
+   * @param total bytes to copy (the persistent blob's size)
+   * @param rc 0, or the failing get/put's return code
+   */
+  clio::run::TaskResume CopyPersistentToVolatile(TagId tag, std::string name,
+                                                 clio::run::u64 total,
+                                                 clio::run::u32 &rc);
 
   // ---- Policy steps ----
   clio::run::TaskResume WriteThruPut(
@@ -220,6 +251,13 @@ class CacheBase : public clio::cte::core::DualTargetInterposer {
   clio::run::TaskResume WriteBackCreate(
       clio::run::shared_ptr<clio::cte::core::PutBlobTask> task,
       std::string key, clio::run::u64 end, clio::run::u32 &outcome);
+  /**
+   * Write-back batch: run every record as a put on the container serving
+   * its blob (this one through WriteBackPut, others by DirectId).
+   * @param task the batch
+   */
+  clio::run::TaskResume WriteBackMultiPut(
+      clio::run::shared_ptr<clio::cte::core::MultiPutBlobTask> task);
   clio::run::TaskResume WriteBackFallback(
       clio::run::shared_ptr<clio::cte::core::PutBlobTask> task,
       std::string key);
@@ -243,6 +281,88 @@ class CacheBase : public clio::cte::core::DualTargetInterposer {
   clio::run::TaskResume MakeRoom(clio::run::u64 needed,
                                  clio::run::u64 &freed);
 
+  // ---- Owner routing (write-back) ----
+  /**
+   * Decide whether a blob verb must run on another cache container. A
+   * write-back copy is dirty state only one container may hold, so every
+   * verb on a blob runs on the container serving its owner (the owner, or
+   * its stand-in while the owner's node is down) -- also when the client
+   * sent it Local, as the FUSE adapter does.
+   * @param tag the blob's tag
+   * @param name the blob's name
+   * @param task the incoming task (a task already sent here by DirectId
+   *        is served here, which also ends any routing disagreement)
+   * @param target out: the container to send it to
+   * @return true when the task must be sent to `target`
+   */
+  bool RouteTarget(const TagId &tag, const std::string &name,
+                   const clio::run::Task &task, clio::run::u32 &target) const;
+  /**
+   * The cache container serving a blob's owner, when it is not this one.
+   * @param tag the blob's tag
+   * @param name the blob's name
+   * @param target out: that container
+   * @return true when the blob is served by another container
+   */
+  bool OwnerTarget(const TagId &tag, const std::string &name,
+                   clio::run::u32 &target) const;
+  /** Remember that this node routed a write of `tag` to `target`. */
+  void NoteRouted(const TagId &tag, clio::run::u32 target);
+  /** Containers this node routed writes of `tag` to (cleared). */
+  std::vector<clio::run::u32> TakeRouted(const TagId &tag);
+  /** Containers this node routed writes of any tag to (cleared). */
+  std::vector<clio::run::u32> TakeAllRouted();
+  /**
+   * Send a tag-scoped module verb to each target container and wait.
+   * @param tag the tag
+   * @param verb kFlushTagCopies or kSettleTagCopies
+   * @param targets containers to send it to
+   * @param rc out: 0, or the first failing return code
+   */
+  clio::run::TaskResume SendTagVerb(TagId tag, clio::run::u32 verb,
+                                    std::vector<clio::run::u32> targets,
+                                    clio::run::u32 &rc);
+  /**
+   * Write out the copies of `tag` this node's writes left on other
+   * containers (flush, or flush and drop when `drop`).
+   * @param tag the tag (null: every tag, flush only)
+   * @param drop also drop the copies
+   * @param rc out: 0, or the first failing return code
+   */
+  clio::run::TaskResume SettleRemote(TagId tag, bool drop,
+                                     clio::run::u32 &rc);
+  /**
+   * Run a copy of `task` on cache container `target` and copy its outputs
+   * back. The copy shares the task's data buffers.
+   * @param task the task to run remotely
+   * @param target the container to run it on
+   */
+  template <typename TaskT>
+  clio::run::TaskResume SendToContainer(clio::run::shared_ptr<TaskT> task,
+                                        clio::run::u32 target) {
+    CLIO_TASK_BODY_BEGIN
+    {
+      auto *ipc = CLIO_IPC;
+      auto dup = ipc->template NewTask<TaskT>();
+      if (dup.IsNull()) {
+        task->SetReturnCode(1);
+        CLIO_CO_RETURN;
+      }
+      dup->Copy(ctp::ipc::FullPtr<TaskT>(task.get()));
+      dup->task_id_ = clio::run::CreateTaskId();
+      dup->pool_id_ = pool_id_;
+      dup->pool_query_ = clio::run::PoolQuery::DirectId(
+          static_cast<clio::run::ContainerId>(target));
+      dup->SetReturnCode(0);
+      auto fut = ipc->Send(dup);
+      CLIO_CO_AWAIT(fut);
+      task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(dup.get()));
+      task->SetReturnCode(dup->GetReturnCode());
+    }
+    CLIO_CO_RETURN;
+    CLIO_TASK_BODY_END
+  }
+
   /** Register the stop hook that flushes every dirty copy (write-back). */
   void RegisterStopFlush(const clio::run::PoolId &self_pool);
 
@@ -253,6 +373,9 @@ class CacheBase : public clio::cte::core::DualTargetInterposer {
   std::mutex mu_;
   EntryMap entries_;
   std::unordered_map<std::string, clio::run::u32> miss_counts_;
+  std::mutex route_mu_;
+  /** Per tag: containers this node routed write-back puts to. */
+  std::unordered_map<TagId, std::unordered_set<clio::run::u32>> routed_;
   clio::run::u64 stop_hook_id_ = 0;
 };
 

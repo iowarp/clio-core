@@ -63,7 +63,11 @@
   X(clio::cte::core::Method::kFlushData, clio::cte::core::FlushDataTask,      \
     FlushData)                                                                \
   X(clio::cte::cache_base::kDropTagCopies, clio::cte::core::DelTagTask,       \
-    DropTagCopies)
+    DropTagCopies)                                                            \
+  X(clio::cte::cache_base::kFlushTagCopies, clio::cte::core::DelTagTask,      \
+    FlushTagCopies)                                                           \
+  X(clio::cte::cache_base::kSettleTagCopies, clio::cte::core::DelTagTask,     \
+    SettleTagCopies)
 
 /** Method names: the core's, plus the module verb. */
 static const std::vector<std::string> &PolicyCacheMethodNames() {
@@ -72,6 +76,8 @@ static const std::vector<std::string> &PolicyCacheMethodNames() {
     const auto &core = clio::cte::core::Method::GetMethodNames();
     for (size_t i = 0; i < core.size() && i < v.size(); ++i) v[i] = core[i];
     v[clio::cte::cache_base::kDropTagCopies] = "DropTagCopies";
+    v[clio::cte::cache_base::kFlushTagCopies] = "FlushTagCopies";
+    v[clio::cte::cache_base::kSettleTagCopies] = "SettleTagCopies";
     return v;
   }();
   return names;
