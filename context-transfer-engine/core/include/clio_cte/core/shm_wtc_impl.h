@@ -98,9 +98,15 @@ inline bool View::Format(const std::string &name,
   size_t tag_bytes = sizeof(TagEntry) * root_->max_tags_;
   auto t = alloc_->AllocateOffset(tag_bytes);
   auto l = alloc_->AllocateOffset(sizeof(DirtyLog));
-  if (b.IsNull() || t.IsNull() || l.IsNull()) {
+  root_->owner_count_ = seg_size_ / kMinBuffer + 1;
+  size_t owner_bytes = sizeof(std::atomic<u32>) * root_->owner_count_;
+  auto ow = alloc_->AllocateOffset(owner_bytes);
+  if (b.IsNull() || t.IsNull() || l.IsNull() || ow.IsNull()) {
     return false;
   }
+  root_->owners_off_ = ow.load();
+  owners_ = reinterpret_cast<std::atomic<u32> *>(Ptr(root_->owners_off_));
+  std::memset(static_cast<void *>(owners_), 0, owner_bytes);
   root_->blobs_off_ = b.load();
   root_->tags_off_ = t.load();
   root_->log_off_ = l.load();
@@ -136,6 +142,7 @@ inline bool View::Attach(const std::string &name, u64 root_off) {
   blobs_ = reinterpret_cast<BlobEntry *>(Ptr(root_->blobs_off_));
   tags_ = reinterpret_cast<TagEntry *>(Ptr(root_->tags_off_));
   log_ = reinterpret_cast<DirtyLog *>(Ptr(root_->log_off_));
+  owners_ = reinterpret_cast<std::atomic<u32> *>(Ptr(root_->owners_off_));
   return true;
 }
 
@@ -159,6 +166,7 @@ inline void View::Detach() {
   blobs_ = nullptr;
   tags_ = nullptr;
   log_ = nullptr;
+  owners_ = nullptr;
 }
 
 inline void View::WaitUnpinned(BlobEntry *e) {
@@ -277,14 +285,20 @@ inline bool View::ReclaimSlotLocked(u32 stripe) {
 }
 
 inline void View::FreeBuffer(u64 off) {
-  if (off != 0) {
-    alloc_->FreeOffset(ctp::ipc::OffsetPtr<>(off));
+  if (off == 0) {
+    return;
   }
+  // Clear before freeing: once freed, another allocation may start in the
+  // same granule and record itself, which this store must not erase.
+  u64 g = off / kMinBuffer;
+  if (g < root_->owner_count_) {
+    owners_[g].store(0, std::memory_order_release);
+  }
+  alloc_->FreeOffset(ctp::ipc::OffsetPtr<>(off));
 }
 
-inline bool View::EvictOne(u32 held_stripe, u64 want_bytes) {
+inline long View::PickVictim(u64 want_bytes) {
   u32 n = NumSlots();
-  u32 sps = root_->slots_per_stripe_;
   u32 want = root_->evict_sample_;
   u64 now = NowNs();
   const u32 scan = n < kEvictScanMax ? n : kEvictScanMax;
@@ -299,8 +313,7 @@ inline bool View::EvictOne(u32 held_stripe, u64 want_bytes) {
   // Approximate frecency: sample clean resident entries from a rotating
   // cursor (reads here are unlocked hints, re-verified under the lock).
   // Bounded: with few clean entries an unbounded walk visits every slot of
-  // a large table on each allocation attempt (holding a stripe lock); the
-  // caller yields and retries instead, letting the flusher clean entries.
+  // a large table on each allocation attempt (holding a stripe lock).
   for (u32 k = 0; k < scan && seen < want; ++k) {
     u32 slot = static_cast<u32>((cursor + k) % n);
     BlobEntry *e = Slot(slot);
@@ -319,24 +332,21 @@ inline bool View::EvictOne(u32 held_stripe, u64 want_bytes) {
       fit_f = f;
     }
   }
-  // Prefer a victim whose buffer covers the request: freeing small buffers
-  // one by one need not make room for a large one.
-  if (fit >= 0) {
-    best = fit;
-  }
-  if (best < 0) {
-    return false;
-  }
-  u32 stripe = static_cast<u32>(best) / sps;
+  return fit >= 0 ? fit : best;
+}
+
+inline bool View::EvictSlot(u32 held_stripe, u32 slot, u64 granule) {
+  u32 stripe = slot / root_->slots_per_stripe_;
   ctp::Mutex &m = root_->stripes_[stripe];
   bool own = stripe == held_stripe;
   if (!own && !m.TryLock(0)) {
-    return false;  // contended: no progress; the caller yields and retries
+    return false;  // contended: no progress
   }
-  BlobEntry *e = Slot(static_cast<u32>(best));
+  BlobEntry *e = Slot(slot);
   bool evicted = false;
   if (e->state_ == kSlotLive && (e->flags_ & kResident) &&
-      e->pending_.load() == 0 && e->pins_.load() == 0) {
+      e->pending_.load() == 0 && e->pins_.load() == 0 &&
+      (granule == kAnyGranule || e->buf_off_ / kMinBuffer == granule)) {
     ReleaseBufferLocked(e);
     root_->stats_.evictions_.fetch_add(1, std::memory_order_relaxed);
     evicted = true;
@@ -344,20 +354,91 @@ inline bool View::EvictOne(u32 held_stripe, u64 want_bytes) {
   if (!own) {
     m.Unlock();
   }
-  return evicted;  // only real progress keeps the caller trying
+  return evicted;
 }
 
-inline u64 View::AllocBuffer(u64 bytes, u32 held_stripe) {
-  for (u32 attempt = 0; attempt < 256; ++attempt) {
-    auto o = alloc_->AllocateOffset(bytes);
-    if (!o.IsNull()) {
-      return o.load();
-    }
-    if (!EvictOne(held_stripe, bytes)) {
-      return 0;
+inline u64 View::WindowSpan(u64 bytes) const {
+  // Wider than the request so one merge (a sort of every free page) yields
+  // several pages of this size; bounded so it evicts a small share of the
+  // cache.
+  const u64 seg = (root_->owner_count_ - 1) * kMinBuffer;
+  u64 span = kWindowFactor * bytes;
+  if (span > kWindowMaxBytes) {
+    span = kWindowMaxBytes;
+  }
+  if (span > seg / 8) {
+    span = seg / 8;
+  }
+  return span < 2 * bytes ? 2 * bytes : span;
+}
+
+inline bool View::EvictWindow(u32 held_stripe, u64 start, u64 span) {
+  // Keep the window inside the heap: one running off its end can never
+  // yield a page of the requested size.
+  const u64 seg_end = (root_->owner_count_ - 1) * kMinBuffer;
+  if (start + span > seg_end) {
+    start = seg_end > span ? seg_end - span : 0;
+  }
+  u64 first = start / kMinBuffer;
+  u64 last = (start + span) / kMinBuffer;
+  if (last >= root_->owner_count_) {
+    last = root_->owner_count_ - 1;
+  }
+  // Best effort: a dirty, pinned or contended buffer splits the window but
+  // the runs on either side of it may still be long enough.
+  bool evicted = false;
+  for (u64 g = first; g <= last; ++g) {
+    u32 o = owners_[g].load(std::memory_order_acquire);
+    if (o != 0 && EvictSlot(held_stripe, o - 1, g)) {
+      evicted = true;
     }
   }
-  return 0;
+  return evicted;
+}
+
+inline u64 View::AllocBuffer(u64 bytes, u32 held_stripe, u32 owner) {
+  // Every attempt runs under the caller's stripe lock, so each is cheap
+  // except the merge-and-retry, which sorts every free page under the
+  // allocator lock: it runs only after a window eviction, at most once per
+  // call, and backs off globally when it fails.
+  u64 off = 0;
+  bool merged = false;
+  for (u32 round = 0; round < kAllocRounds && off == 0; ++round) {
+    auto o = alloc_->AllocateOffsetNoCoalesce(bytes);
+    if (!o.IsNull()) {
+      off = o.load();
+      break;
+    }
+    long v = PickVictim(bytes);
+    if (v < 0) {
+      break;
+    }
+    BlobEntry *e = Slot(static_cast<u32>(v));
+    if (e->cap_ >= bytes) {
+      // Its page alone fits: the next attempt finds it on the free list.
+      EvictSlot(held_stripe, static_cast<u32>(v), kAnyGranule);
+      continue;
+    }
+    if (merged || NowNs() < root_->coalesce_after_ns_.load()) {
+      break;  // small victims only, and no merge allowed: write around
+    }
+    // Small victims never make room one by one (the allocator does not
+    // merge on free): free a contiguous span around this one, then merge.
+    if (!EvictWindow(held_stripe, e->buf_off_, WindowSpan(bytes))) {
+      continue;
+    }
+    merged = true;
+    o = alloc_->AllocateOffset(bytes);
+    if (!o.IsNull()) {
+      off = o.load();
+    } else {
+      root_->coalesce_after_ns_.store(NowNs() + kCoalesceBackoffNs);
+    }
+  }
+  if (off != 0 && off / kMinBuffer < root_->owner_count_) {
+    owners_[off / kMinBuffer].store(owner + 1, std::memory_order_release);
+  }
+  return off;
 }
 
 inline bool View::EnsureCapacityLocked(BlobEntry *e, u64 need, u32 stripe) {
@@ -372,7 +453,7 @@ inline bool View::EnsureCapacityLocked(BlobEntry *e, u64 need, u32 stripe) {
   }
   // Pin ourselves so eviction (which may run in this stripe) skips us.
   e->pins_.fetch_add(1, std::memory_order_acq_rel);
-  u64 off = AllocBuffer(cap, stripe);
+  u64 off = AllocBuffer(cap, stripe, static_cast<u32>(e - blobs_));
   e->pins_.fetch_sub(1, std::memory_order_acq_rel);
   if (off == 0) {
     return false;

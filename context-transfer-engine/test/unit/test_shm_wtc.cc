@@ -378,4 +378,57 @@ TEST_CASE("ShmWtc - eviction keeps a small cache writable",
   }
 }
 
+TEST_CASE("ShmWtc - large puts displace a cache full of small buffers",
+          "[cte][shm_wtc][evict][fragment]") {
+  WtcFixture fx;
+  const clio::run::PoolId pool(570, 0);
+  CreateCache(pool, "shm_wtc_frag", 8ull << 20);  // 8 MB segment
+  clio::cte::core::Client io(pool);
+  REQUIRE(io.HasWtc());
+  const wtc::Stats *st = io.WtcStats();
+  TagId tag = MakeTag(io, "wtc_frag");
+
+  // Fill the segment with clean 4 KB buffers: freeing any one of them never
+  // leaves room for a 1 MB buffer, since the allocator does not merge on
+  // free.
+  const std::string small = Payload(4096, 's');
+  for (int i = 0; i < 4000; ++i) {
+    auto p = io.AsyncPutBlob(tag, "s" + std::to_string(i), 0, small.size(),
+                             small.data());
+    p.Wait();
+    REQUIRE(p->GetReturnCode() == 0);
+  }
+  REQUIRE(WaitFlushed(io));
+
+  // Every large put must land in the cache (puts_ counts cached writes
+  // only; a write-around bypasses it), and quickly.
+  const clio::run::u64 puts0 = st->puts_.load();
+  std::vector<std::string> vals;
+  auto t0 = std::chrono::steady_clock::now();
+  for (int i = 0; i < 4; ++i) {
+    vals.push_back(Payload(1 << 20, static_cast<char>('a' + i)));
+    auto p = io.AsyncPutBlob(tag, "L" + std::to_string(i), 0,
+                             vals.back().size(), vals.back().data());
+    p.Wait();
+    REQUIRE(p->GetReturnCode() == 0);
+  }
+  double ms = std::chrono::duration<double, std::milli>(
+                  std::chrono::steady_clock::now() - t0)
+                  .count();
+  INFO("large puts took " << ms << " ms");
+  REQUIRE(st->puts_.load() - puts0 == 4);
+  REQUIRE(ms < 2000.0);
+  REQUIRE(WaitFlushed(io));
+  for (int i = 0; i < 4; ++i) {
+    std::string back(1 << 20, '\0');
+    auto g = io.AsyncGetBlob(tag, "L" + std::to_string(i), 0, back.size(), 0,
+                             back.data());
+    g.Wait();
+    REQUIRE(g->GetReturnCode() == 0);
+    REQUIRE(back == vals[i]);
+    REQUIRE(CoreRead(tag, "L" + std::to_string(i), 0, back.size()) ==
+            vals[i]);
+  }
+}
+
 SIMPLE_TEST_MAIN()

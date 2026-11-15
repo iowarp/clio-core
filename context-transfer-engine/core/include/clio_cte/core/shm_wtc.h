@@ -94,6 +94,16 @@ static constexpr u32 kMaxProbe = 64;
 static constexpr u32 kTornRetries = 256;
 /** Most blob-table slots one eviction attempt examines. */
 static constexpr u32 kEvictScanMax = 4096;
+/** Eviction rounds one buffer allocation makes before the caller writes
+ *  around the cache. */
+static constexpr u32 kAllocRounds = 8;
+/** After a merge-and-retry allocation fails, skip further ones (each sorts
+ *  every free page under the allocator lock) for this long. */
+static constexpr u64 kCoalesceBackoffNs = 2ull * 1000 * 1000;
+/** A window eviction frees up to this many times the request... */
+static constexpr u64 kWindowFactor = 8;
+/** ...but at most this many bytes (and at most 1/8 of the segment). */
+static constexpr u64 kWindowMaxBytes = 8ull << 20;
 /** Free log entries a non-blocking (runtime) put leaves for concurrent
  *  producers, so its Push does not spin on a worker. */
 static constexpr u64 kLogHeadroom = 1024;
@@ -193,7 +203,7 @@ struct Stats {
 /** Segment root: the first allocation in the segment. */
 struct Root {
   static constexpr u64 kMagic = 0x3143544357534C43ull;  // "CLSWCTC1"
-  static constexpr u32 kVersion = 2;
+  static constexpr u32 kVersion = 3;
 
   u64 magic_;
   u32 version_;
@@ -205,11 +215,15 @@ struct Root {
   u64 blobs_off_;
   u64 tags_off_;
   u64 log_off_;
+  u64 owners_off_;   /**< u32 per kMinBuffer granule: slot+1 of the buffer
+                          whose data starts there (0 = none) */
+  u64 owner_count_;  /**< granules covered by owners_off_ */
   u64 max_fill_;
   u64 half_life_ns_;
   std::atomic<u64> pushed_;        /**< ranges counted before entering the log */
   std::atomic<u64> flushed_;       /**< ranges the flusher completed */
   std::atomic<u64> evict_cursor_;
+  std::atomic<u64> coalesce_after_ns_;  /**< no merge-and-retry before this */
   std::atomic<u32> global_rc_;     /**< sticky rc for tags not in TagTable */
   u32 pad_;
   Stats stats_;
@@ -440,18 +454,48 @@ class View {
                           size_t len, bool *inserted);
   /** Reclaim a metadata-only entry in a full stripe (stripe lock held). */
   bool ReclaimSlotLocked(u32 stripe);
-  /** Allocate a buffer, evicting clean buffers if needed. 0 on failure. */
-  u64 AllocBuffer(u64 bytes, u32 held_stripe);
-  /** Free a buffer. */
+  /**
+   * Allocate a buffer for slot `owner`, evicting clean buffers if needed.
+   * @param bytes       buffer size
+   * @param held_stripe stripe the caller already holds (no relock)
+   * @param owner       slot the buffer is for (recorded in the owner map)
+   * @return the buffer's offset, or 0 (the caller writes around the cache)
+   */
+  u64 AllocBuffer(u64 bytes, u32 held_stripe, u32 owner);
+  /** Free a buffer (clears its owner-map granule first). */
   void FreeBuffer(u64 off);
   /**
-   * Evict one clean buffer from a bounded sample: the lowest-frecency one
-   * whose capacity covers want_bytes, else the lowest-frecency overall.
+   * Pick an eviction candidate from a bounded sample of clean entries: the
+   * lowest-frecency one whose capacity covers want_bytes, else the
+   * lowest-frecency overall. Unlocked hint; EvictSlot re-verifies.
+   * @param want_bytes size of the allocation the eviction makes room for
+   * @return the slot, or -1 if the sample held nothing clean
+   */
+  long PickVictim(u64 want_bytes);
+  /**
+   * Evict one slot's buffer if it is still clean, resident and unpinned.
    * @param held_stripe stripe the caller already holds (no relock)
-   * @param want_bytes  size of the allocation the eviction makes room for
+   * @param slot        the slot
+   * @param granule     owner-map granule its buffer must start in, or
+   *                    kAnyGranule
    * @return true only if a buffer was actually freed
    */
-  bool EvictOne(u32 held_stripe, u64 want_bytes);
+  bool EvictSlot(u32 held_stripe, u32 slot, u64 granule);
+  /**
+   * Evict every clean buffer that starts in [start, start + span), shifted
+   * back to stay inside the heap: the free pages left behind are
+   * contiguous, so one merge yields pages larger than any buffer evicted
+   * even when the cache is full of small buffers.
+   * @param held_stripe stripe the caller already holds (no relock)
+   * @param start       data offset of the window's first buffer
+   * @param span        window length in bytes (see WindowSpan)
+   * @return true if anything was evicted
+   */
+  bool EvictWindow(u32 held_stripe, u64 start, u64 span);
+  /** Window length a window eviction for a `bytes` allocation uses. */
+  u64 WindowSpan(u64 bytes) const;
+  /** EvictSlot: accept a buffer starting in any granule. */
+  static constexpr u64 kAnyGranule = ~0ull;
   /** Release an entry's buffer (lock held, unpinned, nothing pending). */
   void ReleaseBufferLocked(BlobEntry *e);
   /** Grow (or create) an entry's buffer to `need` bytes (lock held). */
@@ -474,6 +518,7 @@ class View {
   BlobEntry *blobs_ = nullptr;
   TagEntry *tags_ = nullptr;
   DirtyLog *log_ = nullptr;
+  std::atomic<u32> *owners_ = nullptr;
   u64 root_off_ = 0;
   u64 seg_size_ = 0;
 };
