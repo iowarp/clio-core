@@ -464,7 +464,7 @@ class Cluster:
                   '      dpe_type: "max_bw"\n'
                   '    targets:\n'
                   '      neighborhood: 1\n')
-        cache_mod = f'clio_cte_{self.cache}_cache'
+        cache_mod = f'clio_cte_core_persist_{self.cache}'
         top = (f'  - mod_name: {cache_mod}\n'
                f'    pool_name: {cache_mod}\n'
                '    pool_query: local\n'
