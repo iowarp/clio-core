@@ -358,14 +358,12 @@ inline bool View::EvictSlot(u32 held_stripe, u32 slot, u64 granule) {
 }
 
 inline u64 View::WindowSpan(u64 bytes) const {
-  // Wider than the request so one merge (a sort of every free page) yields
-  // several pages of this size; bounded so it evicts a small share of the
-  // cache.
+  // Much wider than the request so one merge (a sort of every free page)
+  // serves many later allocations: a phase of new large blobs then costs
+  // one merge per kWindowBytes, not one per blob. Bounded so it evicts a
+  // small share of the cache.
   const u64 seg = (root_->owner_count_ - 1) * kMinBuffer;
-  u64 span = kWindowFactor * bytes;
-  if (span > kWindowMaxBytes) {
-    span = kWindowMaxBytes;
-  }
+  u64 span = kWindowBytes;
   if (span > seg / 8) {
     span = seg / 8;
   }

@@ -104,10 +104,10 @@ static constexpr u64 kCoalesceBackoffNs = 2ull * 1000 * 1000;
 static constexpr u32 kMergeFailsForBackoff = 4;
 /** Window evictions (each followed by one merge) per buffer allocation. */
 static constexpr u32 kMergesPerAlloc = 2;
-/** A window eviction frees up to this many times the request... */
-static constexpr u64 kWindowFactor = 8;
-/** ...but at most this many bytes (and at most 1/8 of the segment). */
-static constexpr u64 kWindowMaxBytes = 8ull << 20;
+/** Bytes a window eviction frees (at most 1/8 of the segment, at least
+ *  twice the request): one merge then serves many allocations of the
+ *  request's size, since each merge sorts every free page. */
+static constexpr u64 kWindowBytes = 8ull << 20;
 /** Free log entries a non-blocking (runtime) put leaves for concurrent
  *  producers, so its Push does not spin on a worker. */
 static constexpr u64 kLogHeadroom = 1024;
