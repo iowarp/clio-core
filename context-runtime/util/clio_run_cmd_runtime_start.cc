@@ -165,10 +165,12 @@ void PrintVizUsage() {
   HIPRINT("      free one). Also CLIO_VIZ_PORT / `viz: port:`.");
   HIPRINT("  --viz-bind <addr>: Dashboard bind address (default 127.0.0.1).");
   HIPRINT("      Also CLIO_VIZ_BIND / `viz: bind:`.");
+  HIPRINT("  The dashboard can be started/stopped later without a restart:");
+  HIPRINT("      clio-run viz <start|stop|status>");
 }
 
 void PrintRuntimeStartUsage() {
-  HIPRINT("Usage: clio start [--fresh] [--induct] [--ephemeral] [viz options]");
+  HIPRINT("Usage: clio-run start [--fresh] [--induct] [--ephemeral] [viz options]");
   HIPRINT("  Starts the Clio runtime server. It RECOVERS every piece of persistent");
   HIPRINT("  state it finds (pools, metadata logs, allocators, data); it never");
   HIPRINT("  discards state unless asked to.");

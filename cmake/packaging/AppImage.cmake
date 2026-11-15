@@ -18,7 +18,7 @@ configure_file(
 # copy it without needing bash to write shell-variable literals.
 file(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/AppRun.generated"
     CONTENT "#!/bin/bash
-exec \"$APPDIR/usr/bin/clio_run\" \"$@\"
+exec \"$APPDIR/usr/bin/clio-run\" \"$@\"
 ")
 
 #------------------------------------------------------------------------------

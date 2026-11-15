@@ -313,6 +313,9 @@ if(CLIO_GPU_CLANG)
 endif()
 
 include(ClioCoreCommon)
+# clio_core_version (--version stamping) + clio_add_cli_alias (clio_run ->
+# clio-run style legacy names).
+include(ClioCliAlias)
 # Measured per-kernel register ceilings for device-coroutine kernels; a no-op
 # unless CLIO_GPU_CLANG is on.
 include(ClioCoroRegCap)
@@ -1766,7 +1769,7 @@ if(CLIO_CORE_ENABLE_TESTS)
     # reading the GENERATED command with `ctest -N -V`.
     set(_clio_proc_kill
         "ps -eo pid,comm 2>/dev/null \
-           | awk -v self=$$ '($2 == \"clio_run\" || $2 == \"clio_daemon\") && $1 != self {print $1}' \
+           | awk -v self=$$ '($2 == \"clio-run\" || $2 == \"clio_run\" || $2 == \"clio_daemon\") && $1 != self {print $1}' \
            | while read -r _pid; do kill -9 \"$_pid\" 2>/dev/null; done; \
          true")
     set(_clio_cleanup_cmd
@@ -2540,10 +2543,9 @@ endif()
 if(TARGET clio_run_thrpt_bench)
   install(TARGETS clio_run_thrpt_bench RUNTIME DESTINATION bin)
 endif()
-# `clio_run` is created as a symlink to `clio_run` by an install(CODE)
-# in context-runtime/util/CMakeLists.txt — that runs after this point
-# during cmake --install, so the symlink lands in the default
-# component too. No extra rule needed here.
+# The legacy `clio_run` alias of `clio-run` is created by
+# clio_add_cli_alias() in context-runtime/util/CMakeLists.txt, in the
+# default component. No extra rule needed here.
 
 # Python extensions -> iowarp_core/ext/
 if(CLIO_CORE_ENABLE_PYTHON)

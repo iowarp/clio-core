@@ -818,6 +818,8 @@ clio::run::TaskResume Runtime::Monitor(clio::run::shared_ptr<MonitorTask> &task)
     MonitorContainerStats(task);
   } else if (task->query_ == "get_host_info") {
     MonitorGetHostInfo(task);
+  } else if (task->query_.rfind("viz_", 0) == 0) {
+    MonitorViz(task);
   } else {
     // Unknown queries get empty results (forward-compatible)
     task->SetReturnCode(0);
@@ -1160,6 +1162,87 @@ void Runtime::MonitorGetHostInfo(clio::run::shared_ptr<MonitorTask> &task) {
   pk.pack(CLIO_IPC->GetThisHost().ip_address);
   pk.pack("node_id");
   pk.pack(CLIO_IPC->GetNodeId());
+  task->results_[container_id_] = std::string(sbuf.data(), sbuf.size());
+  task->SetReturnCode(0);
+}
+
+void Runtime::MonitorViz(clio::run::shared_ptr<MonitorTask> &task) {
+  const std::string &query = task->query_;
+  std::string action = query;
+  std::string args;
+  if (size_t q = query.find('?'); q != std::string::npos) {
+    action = query.substr(0, q);
+    args = query.substr(q + 1);
+  }
+
+  std::string error;
+  auto *viz = CLIO_VIZ;
+  auto *config = CLIO_CONFIG_MANAGER;
+  if (!viz || !config) {
+    error = "viz server not available in this runtime";
+  } else if (action == "viz_status") {
+    // report only
+  } else if (action == "viz_stop") {
+    if (viz->IsRunning()) {
+      // Bounded by VizServer's stop budget (3 s default), so this worker is
+      // never parked on a wedged HTTP handler for long.
+      viz->Stop();
+      HLOG(kInfo, "Viz: dashboard stopped by request (clio-run viz stop)");
+    }
+    config->SetVizEnabled(false);
+  } else if (action == "viz_start") {
+    if (!viz->IsRunning()) {
+      // Optional endpoint overrides: "bind=<addr>&port=<n>".
+      size_t pos = 0;
+      while (error.empty() && pos < args.size()) {
+        size_t amp = args.find('&', pos);
+        std::string kv = args.substr(
+            pos, amp == std::string::npos ? std::string::npos : amp - pos);
+        pos = amp == std::string::npos ? args.size() : amp + 1;
+        size_t eq = kv.find('=');
+        std::string key = kv.substr(0, eq);
+        std::string val =
+            eq == std::string::npos ? std::string() : kv.substr(eq + 1);
+        if (key == "bind" && !val.empty()) {
+          config->SetVizBindAddr(val);
+        } else if (key == "port") {
+          char *end = nullptr;
+          unsigned long port = std::strtoul(val.c_str(), &end, 10);
+          if (val.empty() || *end != '\0' || port > 65535) {
+            error = "invalid port '" + val + "'";
+          } else {
+            config->SetVizPort(static_cast<clio::run::u32>(port));
+          }
+        } else if (!kv.empty()) {
+          error = "unknown viz_start argument '" + kv + "'";
+        }
+      }
+      if (error.empty()) {
+        config->SetVizEnabled(true);
+        if (!viz->Start()) {
+          error = "dashboard failed to start on " + config->GetVizBindAddr() +
+                  ":" + std::to_string(config->GetVizPort()) +
+                  " (port in use, or no HTTP support in this build; see the "
+                  "runtime log)";
+        }
+      }
+    }
+  } else {
+    error = "unknown viz query '" + action + "'";
+  }
+
+  const bool running = viz && viz->IsRunning();
+  msgpack::sbuffer sbuf;
+  msgpack::packer<msgpack::sbuffer> pk(sbuf);
+  pk.pack_map(4);
+  pk.pack("running");
+  pk.pack(running);
+  pk.pack("bind");
+  pk.pack(running ? viz->GetBindAddr() : std::string());
+  pk.pack("port");
+  pk.pack(running ? viz->GetPort() : clio::run::u32(0));
+  pk.pack("error");
+  pk.pack(error);
   task->results_[container_id_] = std::string(sbuf.data(), sbuf.size());
   task->SetReturnCode(0);
 }

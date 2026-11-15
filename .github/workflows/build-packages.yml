@@ -294,6 +294,10 @@ jobs:
           echo "FAIL: clio_run --help died with exit code $rc"
           exit 1
         fi
+        echo "=== clio-run --version (canonical name; clio_run is its alias) ==="
+        clio-run --version || { echo "FAIL: clio-run --version"; exit 1; }
+        clio-cae --version || { echo "FAIL: clio-cae --version"; exit 1; }
+        clio_cae --version || { echo "FAIL: clio_cae alias"; exit 1; }
         echo "=== clio_cte_fuse (FUSE adapter, #899) ==="
         # The .deb now declares libfuse3-dev + fuse3, so the apt install
         # above must have pulled libfuse3.so.3 — a load failure here means
@@ -348,6 +352,10 @@ jobs:
           echo "FAIL: clio_run --help died with exit code $rc"
           exit 1
         fi
+        echo "=== clio-run --version (canonical name; clio_run is its alias) ==="
+        clio-run --version || { echo "FAIL: clio-run --version"; exit 1; }
+        clio-cae --version || { echo "FAIL: clio-cae --version"; exit 1; }
+        clio_cae --version || { echo "FAIL: clio_cae alias"; exit 1; }
         echo "=== clio_cte_fuse (FUSE adapter, #899) ==="
         # The .rpm now requires fuse3-devel + fuse3, so dnf must have
         # pulled libfuse3.so.3 — a load failure here means the dependency
@@ -586,6 +594,9 @@ jobs:
         if ($LASTEXITCODE -lt 0 -or $LASTEXITCODE -gt 100) {
           throw "clio_run --help died with exit code $LASTEXITCODE (likely missing DLL)"
         }
+        Write-Host "=== clio-run.exe --version (canonical name) ==="
+        & "$bin\clio-run.exe" --version
+        if ($LASTEXITCODE -ne 0) { throw "clio-run --version failed ($LASTEXITCODE)" }
 
         Write-Host "=== clio_cte_fuse.exe (FUSE adapter, #899) ==="
         if (-not (Test-Path "$bin\clio_cte_fuse.exe")) { throw "clio_cte_fuse.exe missing from package" }

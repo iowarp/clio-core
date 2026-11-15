@@ -2,7 +2,7 @@
 #define CLIO_RUN_COMMANDS_H_
 
 /**
- * Command function declarations for the unified clio_run CLI
+ * Command function declarations for the unified clio-run CLI
  * Each command function takes argc/argv with the subcommand args already stripped
  */
 
@@ -14,5 +14,6 @@ int Compose(int argc, char** argv);
 int Config(int argc, char** argv);
 int Migrate(int argc, char** argv);
 int RefreshRepo(int argc, char** argv);
+int Viz(int argc, char** argv);
 
 #endif  // CLIO_RUN_COMMANDS_H_

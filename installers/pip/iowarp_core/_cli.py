@@ -104,18 +104,16 @@ def _exec_iowarp_bin(name):
 
 
 def clio_run_main():
-    """Entry point for the ``clio_run`` console script (canonical)."""
-    _exec_iowarp_bin("clio_run")
+    """Entry point for the ``clio-run`` console script and its legacy
+    ``clio_run`` alias. Both exec the one bundled ``bin/clio-run`` binary
+    (a wheel cannot carry the symlink native packages use for the alias).
+    """
+    _exec_iowarp_bin("clio-run")
 
 
 def main():
-    """Entry point for the deprecated ``clio_run`` console script.
-
-    Kept as a backward-compat shim. New code should call ``clio_run``;
-    this dispatches to the clio_run.exe alias so existing pipelines
-    keep working until the alias is removed in a future release.
-    """
-    _exec_iowarp_bin("clio_run")
+    """Backward-compat shim for callers of ``iowarp_core._cli.main``."""
+    _exec_iowarp_bin("clio-run")
 
 
 def cte_bench_main():

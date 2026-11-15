@@ -625,6 +625,7 @@ jobs:
 
             echo "=== CLI test ==="
             clio_run --help
+            clio-run --version
 
             echo "=== Benchmark binaries: --help smoke test ==="
             # NOTE: This entire docker invocation is wrapped in bash -c
@@ -824,6 +825,7 @@ jobs:
 
         echo "=== CLI test ==="
         clio_run --help
+        clio-run --version
 
         echo "=== Benchmark binaries: --help smoke test ==="
         # Catch SIGSEGV / abort at load time. Bench --help exit codes
@@ -966,6 +968,8 @@ jobs:
         if ($LASTEXITCODE -lt 0 -or $LASTEXITCODE -gt 100) {
           throw "clio_run --help died with exit code $LASTEXITCODE (likely missing DLL or binary)"
         }
+        clio-run --version
+        if ($LASTEXITCODE -ne 0) { throw "clio-run --version failed ($LASTEXITCODE)" }
 
         Write-Host "=== Benchmark binaries: --help smoke test ==="
         foreach ($bench in @('clio_cte_bench', 'clio_run_thrpt_bench')) {
