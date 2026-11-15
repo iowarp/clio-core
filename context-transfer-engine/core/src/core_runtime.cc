@@ -9999,26 +9999,36 @@ clio::run::TaskResume Runtime::InvalidateCachedCopies(
   const clio::run::u64 self_node = CLIO_IPC->GetNodeId();
   HLOG(kInfo, "[COH] blob={} inval {} node(s) (keep={} ver={})", blob_name,
        inval_nodes.size(), keep_node, blob_info.last_modified_);
+  // All at once, so one slow node costs one wait, not one per node; a node
+  // already known dead is parked for a resend instead of being waited on
+  // while the caller holds the blob's write token.
+  std::vector<std::pair<clio::run::u64, clio::run::Future<DelBlobTask>>> sent;
   for (clio::run::u64 node : inval_nodes) {
     // This container IS the owner (nothing cached here); a put's writer
     // holds these very bytes and is re-registered by the put.
     if (node == self_node || node == keep_node) continue;
+    if (!ContainerNodeAlive(pool_id_, static_cast<clio::run::u32>(node))) {
+      NotePendingInval(node, tag_id, blob_name);
+      continue;
+    }
     // Cache copy only: a registered node may also hold a durable replica.
-    auto inval = client_.AsyncDelBlob(
+    sent.emplace_back(node, client_.AsyncDelBlob(
         tag_id, blob_name,
         clio::run::PoolQuery::Physical(static_cast<clio::run::u32>(node)),
-        kDelCacheCopyOnly);
-    CLIO_CO_AWAIT(inval);
-    if (inval->GetReturnCode() != 0) {
-      // "Not found" means the copy was already gone. An unreachable node may
-      // be alive behind a partition with its cache intact: keep the
-      // invalidation and resend it when the node answers again.
-      HLOG(kDebug, "cache invalidation of {} on node {} returned rc={}",
-           blob_name, node, inval->GetReturnCode());
-      if (IsNodeLostRc(inval->GetReturnCode()) ||
-          !ContainerNodeAlive(pool_id_, static_cast<clio::run::u32>(node))) {
-        NotePendingInval(node, tag_id, blob_name);
-      }
+        kDelCacheCopyOnly));
+  }
+  for (auto &s : sent) {
+    CLIO_CO_AWAIT(s.second);
+    const clio::run::u32 rc = s.second->GetReturnCode();
+    if (rc == 0) continue;
+    // "Not found" means the copy was already gone. An unreachable node may
+    // be alive behind a partition with its cache intact: keep the
+    // invalidation and resend it when the node answers again.
+    HLOG(kDebug, "cache invalidation of {} on node {} returned rc={}",
+         blob_name, s.first, rc);
+    if (IsNodeLostRc(rc) ||
+        !ContainerNodeAlive(pool_id_, static_cast<clio::run::u32>(s.first))) {
+      NotePendingInval(s.first, tag_id, blob_name);
     }
   }
   CLIO_CO_RETURN;
