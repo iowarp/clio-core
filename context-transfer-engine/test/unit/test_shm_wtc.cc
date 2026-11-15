@@ -243,6 +243,42 @@ TEST_CASE("ShmWtc - writes and reads complete in shared memory",
     REQUIRE(back == want);
   }
 
+  SECTION("reads inside written bytes of a partial blob hit") {
+    // The blob exists below (the cache did not create it), so the cached
+    // copy is never complete; the bytes written through the cache are still
+    // the blob's current bytes and serve reads of exactly that range.
+    clio::cte::core::Client core(clio::cte::core::kCtePoolId);
+    TagId tag = MakeTag(core, "wtc_valid_range");
+    const std::string base(128 * 1024, 'x');
+    core.AsyncPutBlob(tag, "v", 0, base.size(), base.data()).Wait();
+    const std::string a(8192, 'A');
+    io.AsyncPutBlob(tag, "v", 4096, a.size(), a.data()).Wait();
+
+    std::string back(4096, '\0');
+    const clio::run::u64 hits0 = st->get_hits_.load();
+    const clio::run::u64 fills0 = st->fills_.load();
+    io.AsyncGetBlob(tag, "v", 8192, back.size(), 0, back.data()).Wait();
+    REQUIRE(back == std::string(4096, 'A'));
+    REQUIRE(st->get_hits_.load() == hits0 + 1);  // served from the segment
+    REQUIRE(st->fills_.load() == fills0);         // no trip to the chain
+
+    // A read touching bytes the cache never saw is the chain's (not zeros).
+    std::string span(8192, '\0');
+    auto g = io.AsyncGetBlob(tag, "v", 0, span.size(), 0, span.data());
+    g.Wait();
+    REQUIRE(g->GetReturnCode() == 0);
+    REQUIRE(span == std::string(4096, 'x') + std::string(4096, 'A'));
+
+    // Another writer's invalidation: the written range no longer serves.
+    const std::string c(8192, 'C');
+    io.AsyncPutBlob(tag, "v", 4096, c.size(), c.data()).Wait();
+    REQUIRE(WaitFlushed(io));
+    io.Wtc()->Invalidate(tag.major_, tag.minor_, "v", 1);
+    core.AsyncPutBlob(tag, "v", 4096, a.size(), a.data()).Wait();
+    io.AsyncGetBlob(tag, "v", 8192, back.size(), 0, back.data()).Wait();
+    REQUIRE(back == std::string(4096, 'A'));  // the chain's newer bytes
+  }
+
   SECTION("small writes coalesce into few batches") {
     TagId tag = MakeTag(io, "wtc_coalesce");
     std::string want(128 * 512, '\0');

@@ -39,6 +39,7 @@
 #ifndef CLIO_CTE_CORE_SHM_WTC_IMPL_H_
 #define CLIO_CTE_CORE_SHM_WTC_IMPL_H_
 
+#include <algorithm>
 #include <cmath>
 
 namespace clio::cte::core::wtc {
@@ -244,6 +245,7 @@ inline long View::FindOrInsertLocked(u64 h, u32 major, u32 minor,
     e->buf_off_ = 0;
     e->cap_ = 0;
     e->size_ = 0;
+    e->valid_lo_ = e->valid_hi_ = 0;
     std::memcpy(e->name_, name, len);
     // Generations start from the clock so a dropped-and-reinserted key can
     // never match a fill snapshot taken against the old entry (ABA).
@@ -265,6 +267,7 @@ inline void View::ReleaseBufferLocked(BlobEntry *e) {
   e->flags_ &= ~(kResident | kComplete);
   e->buf_off_ = 0;
   e->cap_ = 0;
+  e->valid_lo_ = e->valid_hi_ = 0;
 }
 
 inline bool View::ReclaimSlotLocked(u32 stripe) {
@@ -536,6 +539,16 @@ inline Status View::TryPut(u32 tag_major, u32 tag_minor, const char *name,
     if (need > e->size_) {
       e->size_ = need;
     }
+    // This write's bytes are now the blob's: grow the valid range when they
+    // touch it, else (disjoint) track the newest write.
+    if (e->valid_hi_ > e->valid_lo_ && off <= e->valid_hi_ &&
+        need >= e->valid_lo_) {
+      e->valid_lo_ = std::min(e->valid_lo_, off);
+      e->valid_hi_ = std::max(e->valid_hi_, need);
+    } else {
+      e->valid_lo_ = off;
+      e->valid_hi_ = need;
+    }
     e->pins_.fetch_add(1, std::memory_order_acq_rel);
     e->pending_.fetch_add(1, std::memory_order_acq_rel);
     gen = e->write_gen_.fetch_add(1, std::memory_order_acq_rel) + 1;
@@ -582,8 +595,9 @@ inline Status View::TryGet(u32 tag_major, u32 tag_minor, const char *name,
       long s = FindLocked(h, tag_major, tag_minor, name, name_len);
       if (s >= 0) {
         e = Slot(static_cast<u32>(s));
-        if ((e->flags_ & (kResident | kComplete)) == (kResident | kComplete) &&
-            off + size <= e->size_) {
+        const bool whole = (e->flags_ & kComplete) != 0 && off + size <= e->size_;
+        const bool written = off >= e->valid_lo_ && off + size <= e->valid_hi_;
+        if ((e->flags_ & kResident) != 0 && (whole || written)) {
           // wbegin_ only moves under this lock, so seq is stable here.
           seq = e->wbegin_.load(std::memory_order_acquire);
           busy = e->wend_.load(std::memory_order_acquire) != seq;
@@ -925,6 +939,7 @@ inline bool View::Fill(u32 tag_major, u32 tag_minor, const char *name,
   }
   WaitUnpinned(e);
   e->flags_ &= ~kComplete;
+  e->valid_lo_ = e->valid_hi_ = 0;
   e->size_ = 0;
   if (!EnsureCapacityLocked(e, size == 0 ? 1 : size, stripe)) {
     return false;
@@ -933,6 +948,8 @@ inline bool View::Fill(u32 tag_major, u32 tag_minor, const char *name,
   std::memset(Ptr(e->buf_off_) + size, 0, e->cap_ - size);
   e->size_ = size;
   e->flags_ |= kComplete;
+  e->valid_lo_ = 0;
+  e->valid_hi_ = size;
   e->hits_.fetch_add(1, std::memory_order_relaxed);
   e->last_access_ns_.store(NowNs(), std::memory_order_relaxed);
   root_->stats_.fills_.fetch_add(1, std::memory_order_relaxed);
@@ -982,6 +999,7 @@ inline void View::Invalidate(u32 tag_major, u32 tag_minor, const char *name,
   }
   BlobEntry *e = Slot(static_cast<u32>(s));
   e->flags_ &= ~(kComplete | kSizeKnown);
+  e->valid_lo_ = e->valid_hi_ = 0;  // pending bytes still flush, never serve
   e->inval_epoch_.fetch_add(1, std::memory_order_acq_rel);
   if (e->pending_.load() == 0) {
     WaitUnpinned(e);
@@ -1004,6 +1022,7 @@ inline void View::DropBlob(u32 tag_major, u32 tag_minor, const char *name,
   BlobEntry *e = Slot(static_cast<u32>(s));
   e->inval_epoch_.fetch_add(1, std::memory_order_acq_rel);
   e->flags_ &= ~kComplete;
+  e->valid_lo_ = e->valid_hi_ = 0;
   if (e->pending_.load() != 0) {
     return;  // a racing write logged after the caller's barrier keeps it
   }
@@ -1024,6 +1043,7 @@ inline void View::DropTagBlobs(u32 major, u32 minor) {
       }
       e->inval_epoch_.fetch_add(1, std::memory_order_acq_rel);
       e->flags_ &= ~kComplete;
+      e->valid_lo_ = e->valid_hi_ = 0;
       if (e->pending_.load() != 0) {
         continue;
       }

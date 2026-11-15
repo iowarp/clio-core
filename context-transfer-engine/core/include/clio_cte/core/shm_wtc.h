@@ -191,6 +191,11 @@ struct BlobEntry {
    *  they are equal and re-checks wbegin_ afterwards (torn-read guard). */
   std::atomic<u64> wbegin_;
   std::atomic<u64> wend_;
+  /** Bytes [valid_lo_, valid_hi_) of the buffer are the blob's current
+   *  bytes even when the copy is not kComplete: written through this cache
+   *  since the last invalidation. A read inside it is a hit. Stripe lock. */
+  u64 valid_lo_;
+  u64 valid_hi_;
   char name_[kMaxBlobName];
 };
 
@@ -260,7 +265,7 @@ struct Stats {
 /** Segment root: the first allocation in the segment. */
 struct Root {
   static constexpr u64 kMagic = 0x3143544357534C43ull;  // "CLSWCTC1"
-  static constexpr u32 kVersion = 4;
+  static constexpr u32 kVersion = 5;
 
   u64 magic_;
   u32 version_;
