@@ -29,10 +29,7 @@ namespace clio::cte::shm_wtc {
   X(kFlushLog, FlushLogTask, FlushLog)                                     \
   X(kInvalidate, InvalidateTask, Invalidate)                               \
   X(kHomeFlush, HomeFlushTask, HomeFlush)                                  \
-  X(kTagAttrs, clio::cte::core::GetTagSizeTask, TagAttrs)                  \
-  X(kNameRecs, clio::cte::core::UpdateTagNamesTask, NameRecs)              \
-  X(kTagRec, clio::cte::core::GetTagNameTask, TagRec)                      \
-  X(kTagSearch, clio::cte::core::TagQueryTask, TagSearch)
+  X(kTagAttrs, clio::cte::core::GetTagSizeTask, TagAttrs)
 
 void Runtime::Init(const clio::run::PoolId &pool_id, const std::string &pool_name,
                    clio::run::u32 container_id) {

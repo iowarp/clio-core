@@ -299,40 +299,6 @@ class Runtime : public clio::cte::core::CoreInterposer {
    *  node (here: a local write counter; elsewhere: through each home). */
   clio::run::TaskResume NoteTagsWritten(const std::vector<TagId> &tags,
                                         bool count_local = true);
-  // ---- Tag names (core_shm_cache_writethru_names.cc) ----------------------------
-  /** NameRecs: apply name records this container is home for. */
-  clio::run::TaskResume NameRecs(
-      clio::run::shared_ptr<clio::cte::core::UpdateTagNamesTask> &task);
-  /** TagRec: a homed tag's stored (canonical) name. */
-  clio::run::TaskResume TagRec(
-      clio::run::shared_ptr<clio::cte::core::GetTagNameTask> &task);
-  /**
-   * TagQuery (one arm of the broadcast): the core's flat names here plus
-   * every name this container is home for, resolved to an absolute path
-   * through the cache and matched against the regex.
-   */
-  clio::run::TaskResume TagSearch(
-      clio::run::shared_ptr<clio::cte::core::TagQueryTask> &task);
-  /** Name records a forwarded UpdateTagNames/RenameTag published. */
-  std::vector<clio::cte::core::TagNameOpRec> PublishedNameOps(
-      clio::run::u32 method,
-      const clio::run::shared_ptr<clio::run::Task> &task);
-  /** Send name records (published here) to their tags' homes. */
-  clio::run::TaskResume RouteNameRecords(
-      const std::vector<clio::cte::core::TagNameOpRec> &ops);
-  /** Stored name of a tag: homed here, cached, or fetched from its home. */
-  clio::run::TaskResume StoredNameOf(const TagId &tag, std::string *stored,
-                                     bool *found);
-  /** Resolve a stored name ("$tagid{p}/leaf", "/", or flat) to a path. */
-  clio::run::TaskResume ResolveStored(const std::string &stored,
-                                      std::string *abs, bool *ok);
-  /** Apply one record to the homed table (last writer wins per name). */
-  void ApplyHomedOp(const clio::cte::core::TagNameOpRec &r);
-  /** Container that is home for a tag's metadata. */
-  clio::run::u32 TagHome(const TagId &tag) const {
-    return HomeOf(tag, std::string(clio::cte::core::wtc::kTagMetaName,
-                                   clio::cte::core::wtc::kTagMetaNameLen));
-  }
   /** Drop every node's cached blobs and metadata of these tags. */
   clio::run::TaskResume DropTagDataEverywhere(const std::vector<TagId> &tags);
   clio::run::TaskResume FanoutInvalidate(const TagId &tag,
@@ -406,11 +372,6 @@ class Runtime : public clio::cte::core::CoreInterposer {
   /** Tag-wide chain writes in flight (BeginChainWriteAll). */
   std::atomic<int> chain_writes_{0};
   std::mutex fence_mu_;  ///< guards blob_reads_ / blob_writes_
-  /** Names of the tags this container is home for (packed id -> names;
-   *  names_[0] is canonical), and the last-writer-wins stamp per name. */
-  std::unordered_map<clio::run::u64, std::vector<std::string>> homed_names_;
-  std::unordered_map<std::string, clio::run::u64> homed_seq_;
-  std::mutex homed_mu_;  ///< guards homed_names_ / homed_seq_
   /** Remote homes each tag's flushed ranges landed on since the tag's last
    *  SyncTag here: a SyncTag must make them durable there too (the home
    *  wrote them into its own next pool). Key: (major << 32) | minor. */

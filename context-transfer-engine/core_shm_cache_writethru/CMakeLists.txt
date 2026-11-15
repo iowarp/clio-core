@@ -12,7 +12,6 @@ add_clio_module_runtime(
     src/core_shm_cache_writethru_runtime.cc
     src/core_shm_cache_writethru_data.cc
     src/core_shm_cache_writethru_flush.cc
-    src/core_shm_cache_writethru_names.cc
     src/autogen/core_shm_cache_writethru_lib_exec.cc
 )
 
