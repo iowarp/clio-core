@@ -8,7 +8,6 @@ add_clio_module_runtime(
   SOURCES
     src/write_back_cache_runtime.cc
     ${CLIO_CTE_CACHE_BASE_DIR}/src/cache_base.cc
-    ${CLIO_CTE_CACHE_BASE_DIR}/src/cache_base_io.cc
 )
 
 add_clio_module_client(
