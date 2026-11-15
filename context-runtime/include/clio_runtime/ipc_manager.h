@@ -1697,9 +1697,13 @@ class IpcManager {
    * Helper method for host identification
    * Uses ZMQ port from ConfigManager and sets main_transport_
    * @param hostname Hostname to bind to
+   * @param advertise_addr Address this node advertises in the hostfile (the
+   *        one peers dial), or "" if unknown. Only the Thallium peer
+   *        transport uses it, to pick the interface for IP protocols.
    * @return true if server started successfully, false otherwise
    */
-  bool TryStartMainServer(const std::string &hostname);
+  bool TryStartMainServer(const std::string &hostname,
+                          const std::string &advertise_addr = "");
 
   /**
    * Effective runtime port for this IpcManager. Used on the client-init path for

@@ -44,6 +44,9 @@
 extern "C" void clio_evlat_add(int which, unsigned long long cycles);
 extern "C" void clio_evlat_busy(int which, unsigned long long start,
                                 unsigned long long end);
+/** Record the plain number `n` (not a duration) on channel `which`: the
+ *  report's "us" figures for that channel then read as that number. */
+extern "C" void clio_evlat_count(int which, unsigned long long n);
 
 namespace clio::run::evlat {
 
@@ -71,7 +74,132 @@ enum Chan : int {
   kClientE2E = 31,
   kOriginResLocal = 32,
   kOriginResRemote = 33,
-  kNumChan = 34,
+  // 34-60: the clio-fs create / unlink / size-advance path, each stage timed
+  // on the container that runs it (map in the filesystem module, next to
+  // each stamp). All microseconds except fs_row_holders, a plain count.
+  //   originating container, file create (Runtime::Open -> CreateEntry):
+  //     fs_cr_total  whole Open task that created a file
+  //     fs_cr_parent resolving the parent directory (same Opens)
+  //     fs_cr_lookup the name lookup that found the name free, before create
+  //     fs_cr_mint   minting the id
+  //     fs_cr_inode  inode step: combined create+open shard op, and/or the
+  //                  record store of the two-step form (send -> reply)
+  //     fs_cr_row    TableOp(kTableInsert) (walk + send -> reply)
+  //     fs_cr_open   the separate kShardInodeOpen, when still sent
+  //   directory block's home (Runtime::RowMutation, insert and remove):
+  //     fs_row_exec  whole RowMutation
+  //     fs_row_load  LoadBlock (incl. its poll loops)
+  //     fs_row_wait  per mutation: retry yields while the block splits, plus
+  //                  CommitBlock entry -> its own commit starts (or another
+  //                  task's commit made its version durable)
+  //     fs_row_journal / fs_row_blob / fs_row_push  one commit's journal
+  //                  append, blob write, PushToHolders
+  //     fs_row_holders  holders that commit pushed to (count, not time)
+  //     fs_row_split SplitBlock after an insert
+  //   inode step's container:
+  //     fs_ino_exec  whole combined create+open handler
+  //     fs_ino_store / fs_ino_mirror  StoreInodeRec: primary store, mirror
+  //   any shard op's executor:
+  //     fs_op_flush  the FlushInodes that ends ExecShardOp
+  //   originating container, unlink: fs_un_total / fs_un_parent / fs_un_row
+  //     (TableOp(kTableRemove)) / fs_un_nlink (kShardInodeNlink)
+  //   size advance: fs_sz_total (forward to the inode's home, send -> reply),
+  //     and at the home fs_sz_home (whole local part), fs_sz_stream
+  //     (FileSizeOp), fs_sz_flush (FlushInodes)
+  kFsCrTotal = 34,
+  kFsCrParent = 35,
+  kFsCrLookup = 36,
+  kFsCrMint = 37,
+  kFsCrInode = 38,
+  kFsCrRow = 39,
+  kFsCrOpen = 40,
+  kFsRowExec = 41,
+  kFsRowLoad = 42,
+  kFsRowWait = 43,
+  kFsRowJournal = 44,
+  kFsRowBlob = 45,
+  kFsRowPush = 46,
+  kFsRowHolders = 47,
+  kFsRowSplit = 48,
+  kFsInoExec = 49,
+  kFsInoStore = 50,
+  kFsInoMirror = 51,
+  kFsOpFlush = 52,
+  kFsUnTotal = 53,
+  kFsUnParent = 54,
+  kFsUnRow = 55,
+  kFsUnNlink = 56,
+  kFsSzTotal = 57,
+  kFsSzHome = 58,
+  kFsSzStream = 59,
+  kFsSzFlush = 60,
+  // 61-76: the clio-fs file data path, each stage timed in the process that
+  // runs it. Microseconds except rd_pages (a count) and rd_bytes (KiB).
+  //   FUSE adapter (a client process; CLIO_EVLAT in ITS environment):
+  //     rd_total  whole cte_fuse_read
+  //     rd_size   size lookup of a sieve read: OpenHandleSize + hiwater
+  //     rd_page   one page: AsyncGetBlobDefer -> Wait returned (bytes in the
+  //               caller's buffer), any node-lost retries included
+  //     rd_pages  pages one read fetched;  rd_bytes  KiB one read returned
+  //     wr_total  whole cte_fuse_write
+  //     wr_page   one AsyncPutBlobDefer call (pacing wall, overlap drain,
+  //               staging copy, submit -- the put itself is NOT awaited)
+  //     (read-ahead, CLIO_FUSE_READAHEAD_PAGES; channels 77-79 below)
+  //   originating container (cache module, where the client's task runs):
+  //     gb_local  GetBlob served by this node's core, inline
+  //     gb_fwd    GetBlob sent to the blob's owner, send -> reply
+  //     pb_fwd    PutBlob sent to the blob's owner, send -> reply
+  //   owner container (core GetBlobImpl / PutBlobImpl). The whole get is the
+  //   older get_total; get_meta is entry -> read start (it CONTAINS gb_tok);
+  //   read_await is the target read (direct_read = one inline block copy):
+  //     gb_tok    writer wait (torn-layout guard) + reader-pin retries
+  //     pb_exec   whole PutBlobImpl
+  //     pb_tok    waiting for the blob's write token
+  //     pb_drain  waiting for pinned readers to leave
+  //     pb_alloc  PlaceBlobBytes (extend / allocate / make room)
+  //     pb_bdev   the data write(s) to the target (ModifyExistingData)
+  kRdTotal = 61,
+  kRdSize = 62,
+  kRdPage = 63,
+  kRdPages = 64,
+  kRdBytes = 65,
+  kWrTotal = 66,
+  kWrPage = 67,
+  kGbLocal = 68,
+  kGbFwd = 69,
+  kPbFwd = 70,
+  kGbTok = 71,
+  kPbExec = 72,
+  kPbTok = 73,
+  kPbDrain = 74,
+  kPbAlloc = 75,
+  kPbBdev = 76,
+  // 77-79: the FUSE adapter's sequential read-ahead
+  // (CLIO_FUSE_READAHEAD_PAGES), in the adapter process:
+  //     ra_hit   1 per page part of a read answered from the handle's
+  //              read-ahead cache (a value channel: n = hits)
+  //     ra_wait  time a read waited for a prefetch still in flight
+  //     ra_miss  1 per page part fetched the normal way while read-ahead
+  //              was active for the handle (n = misses)
+  kRaHit = 77,
+  kRaWait = 78,
+  kRaMiss = 79,
+  // 80-82: one block I/O of a native DAOS bdev (bdev_type: daos), recorded by
+  // the transport's task coroutine when it sees the request finished. The
+  // three are consecutive, so per block they add up to the coroutine's wait,
+  // i.e. to what pb_bdev (writes) / read_await (reads) show for a DAOS tier
+  // minus the bdev task dispatch around it:
+  //   daos_q    request handed to the DAOS layer -> an I/O thread issues the
+  //             dfs_write / dfs_read (wait for room on the I/O threads when
+  //             they are all at their bound + wait in the thread's queue)
+  //   daos_io   dfs call issued -> the I/O thread reaps the completion event
+  //             (the call itself, DAOS + network, wait for the next poll)
+  //   daos_done completion reaped -> the coroutine observes the done flag
+  //             (its 10 us yield period + worker scheduling)
+  kDaosQ = 80,
+  kDaosIo = 81,
+  kDaosDone = 82,
+  kNumChan = 83,
 };
 
 enum Busy : int { kBusyPeerRecv = 0, kBusyNetSend = 1, kNumBusy = 2 };
@@ -91,6 +219,18 @@ inline unsigned long long Now() { return On() ? CycleNow() : 0; }
 /** Record t1 - t0 on channel `ch`; no-op if either stamp is unset. */
 inline void Span(int ch, unsigned long long t0, unsigned long long t1) {
   if (t0 != 0 && t1 > t0) clio_evlat_add(ch, t1 - t0);
+}
+
+/** Record an already-summed duration of `cycles` (0 included) on channel
+ *  `ch`, when enabled: for stages accumulated over several waits. */
+inline void Add(int ch, unsigned long long cycles) {
+  if (On()) clio_evlat_add(ch, cycles);
+}
+
+/** Record the plain number `n` on channel `ch`, when enabled (see
+ *  clio_evlat_count). */
+inline void Count(int ch, unsigned long long n) {
+  if (On()) clio_evlat_count(ch, n);
 }
 
 /** Record [t0, now) on channel `ch` (and optionally a busy kind) on scope

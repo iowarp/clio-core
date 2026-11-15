@@ -1165,6 +1165,7 @@ class Client : public clio::run::ContainerClient {
       clio::run::u64 page_off_ = 0;  // blob offset of buf_[0] (page-aligned)
       clio::run::u64 lo_ = 0;        // dirty extent [lo_, hi_), absolute
       clio::run::u64 hi_ = 0;        //   blob offsets (v1: ONE per page)
+      float score_ = -1.0f;          // placement score of the page's put
       ctp::ipc::FullPtr<char> buf_;  // kSievePage SHM slice (staging pool)
       // Written since the last flusher tick. Atomic because the flusher's
       // SHARED probe ages it while read-locked writers set it; both relaxed
@@ -1179,6 +1180,7 @@ class Client : public clio::run::ContainerClient {
             page_off_(o.page_off_),
             lo_(o.lo_),
             hi_(o.hi_),
+            score_(o.score_),
             buf_(o.buf_),
             touched_(o.touched_.load(std::memory_order_relaxed)) {}
       SievePage &operator=(SievePage &&o) noexcept {
@@ -1189,6 +1191,7 @@ class Client : public clio::run::ContainerClient {
         page_off_ = o.page_off_;
         lo_ = o.lo_;
         hi_ = o.hi_;
+        score_ = o.score_;
         buf_ = o.buf_;
         touched_.store(o.touched_.load(std::memory_order_relaxed),
                        std::memory_order_relaxed);
@@ -1914,6 +1917,12 @@ class Client : public clio::run::ContainerClient {
    * kCtePutAppend is NOT accepted here: deferred puts coalesce into batches
    * that carry no per-record flags, and a deferred put returns no future, so
    * the landed offset could never be read back. Use AsyncPutBlob.
+   *
+   * @param score placement score, honoured on every path: the large direct
+   *        put, a sieve page (the page keeps the score of the write that
+   *        opened it; callers score a blob consistently) and a batched
+   *        record (MultiPutDesc::score_). `context` and `flags` reach the
+   *        core only on the large direct path.
    * @return 0 submitted; -1 degenerate request (size 0 / null source); -2
    *         shared memory exhausted with nothing left to await; -3 the flags
    *         ask for an append, which this path cannot honour.
@@ -1975,7 +1984,6 @@ class Client : public clio::run::ContainerClient {
                             context, flags, pool_query);
       });
     }
-    (void)score;
     (void)context;
     (void)flags;
     // Client-side data sieving (issue #1007): small writes coalesce into
@@ -1989,7 +1997,8 @@ class Client : public clio::run::ContainerClient {
       DeferRegistry &sreg = DeferRegistry::Get();
       clio::run::u64 skey = DeferKeyHash(tag_id, blob_name);
       if (offset != 0 || sreg.IsKeyPending(skey)) {
-        int src = SievePut(tag_id, blob_name, offset, size, priv_data, skey);
+        int src =
+            SievePut(tag_id, blob_name, offset, size, priv_data, skey, score);
         if (src != -3) {
           return src;  // -3: no page slice right now -> batch path below
         }
@@ -2021,6 +2030,7 @@ class Client : public clio::run::ContainerClient {
       d.offset_ = offset;
       d.size_ = size;
       d.payload_off_ = reg.batch_used_;
+      d.score_ = score;
       reg.batch_descs_.push_back(std::move(d));
       reg.batch_ents_.push_back(DeferredPut::Ent{key, seq, size});
       reg.batch_used_ += size;
@@ -2399,12 +2409,15 @@ class Client : public clio::run::ContainerClient {
     reg.sieve_bytes_.fetch_sub(pg.hi_ - pg.lo_, std::memory_order_relaxed);
   }
 
-  /** Sieve one page-confined sub-write. @return 0 sieved; -3 page slice
-   *  unallocatable RIGHT NOW (caller falls back to the batch path, which
-   *  owns the full await-and-retry machinery). */
+  /** Sieve one page-confined sub-write. `score` is the placement score a
+   *  page OPENED by this write ships with (an already-open page keeps its
+   *  own). @return 0 sieved; -3 page slice unallocatable RIGHT NOW (caller
+   *  falls back to the batch path, which owns the full await-and-retry
+   *  machinery). */
   int SievePutOne(DeferRegistry &reg, clio::run::u64 key, const TagId &tag_id,
                   const std::string &blob_name, clio::run::u64 page_off,
-                  clio::run::u64 off, const char *src, clio::run::u64 len) {
+                  clio::run::u64 off, const char *src, clio::run::u64 len,
+                  float score = -1.0f) {
     using SievePage = DeferRegistry::SievePage;
     std::vector<SievePage> sweep;  // holed/evicted pages, batched after unlock
     SievePage ship;                // filled page, direct-put after unlock
@@ -2497,6 +2510,7 @@ class Client : public clio::run::ContainerClient {
           pg.page_off_ = page_off;
           pg.lo_ = off;
           pg.hi_ = off + len;
+          pg.score_ = score;
           pg.buf_ = buf;
           pg.touched_ = true;
           // Copy needs no shard lock: the extent is not registered yet.
@@ -2567,13 +2581,15 @@ class Client : public clio::run::ContainerClient {
     return rc;
   }
 
-  /** Sieve a small write, splitting it across page boundaries. Nonzero only
-   *  when a page slice was unallocatable; earlier sub-writes stay sieved
-   *  and the caller's batch fallback rewrites the SAME bytes (identical
-   *  overlap content, so apply order cannot matter). */
+  /** Sieve a small write, splitting it across page boundaries. `score` is
+   *  the placement score its pages ship with (-1 = the core's default).
+   *  Nonzero only when a page slice was unallocatable; earlier sub-writes
+   *  stay sieved and the caller's batch fallback rewrites the SAME bytes
+   *  (identical overlap content, so apply order cannot matter). */
   int SievePut(const TagId &tag_id, const std::string &blob_name,
                clio::run::u64 offset, clio::run::u64 size,
-               const char *priv_data, clio::run::u64 key) {
+               const char *priv_data, clio::run::u64 key,
+               float score = -1.0f) {
     DeferRegistry &reg = DeferRegistry::Get();
     reg.flush_client_.store(this, std::memory_order_release);
     clio::run::u64 off = offset;
@@ -2584,8 +2600,8 @@ class Client : public clio::run::ContainerClient {
           off / DeferRegistry::kSievePage * DeferRegistry::kSievePage;
       clio::run::u64 in_page =
           std::min(remaining, page_off + DeferRegistry::kSievePage - off);
-      int rc =
-          SievePutOne(reg, key, tag_id, blob_name, page_off, off, src, in_page);
+      int rc = SievePutOne(reg, key, tag_id, blob_name, page_off, off, src,
+                           in_page, score);
       if (rc == -4) {
         // Overlaps a put still in flight: drain the key so ORDER of the
         // overlapping bytes is preserved, then retry this same slice.
@@ -2612,13 +2628,15 @@ class Client : public clio::run::ContainerClient {
     ctp::ipc::ShmPtr<> data(
         pg.buf_.shm_.alloc_id_,
         pg.buf_.shm_.off_.load() + (pg.lo_ - pg.page_off_));
-    auto fut = AsyncPutBlob(pg.tag_id_, pg.blob_name_, pg.lo_, len, data);
+    auto fut = AsyncPutBlob(pg.tag_id_, pg.blob_name_, pg.lo_, len, data,
+                            pg.score_);
     while (fut.IsNull()) {
       if (!DeferAwaitOldest()) {
         SieveDropPage(reg, pg, len);  // exhausted, nothing awaitable
         return;
       }
-      fut = AsyncPutBlob(pg.tag_id_, pg.blob_name_, pg.lo_, len, data);
+      fut = AsyncPutBlob(pg.tag_id_, pg.blob_name_, pg.lo_, len, data,
+                         pg.score_);
     }
     DeferredPut rec;
     rec.fut_ = fut.template Cast<clio::run::Task>();
@@ -2678,6 +2696,7 @@ class Client : public clio::run::ContainerClient {
         d.offset_ = pg.lo_;
         d.size_ = len;
         d.payload_off_ = reg.batch_used_;
+        d.score_ = pg.score_;
         reg.batch_descs_.push_back(std::move(d));
         reg.batch_ents_.push_back(
             DeferredPut::Ent{pg.key_, pg.seq_, len});

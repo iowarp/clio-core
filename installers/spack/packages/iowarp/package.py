@@ -54,6 +54,10 @@ class Iowarp(CMakePackage):
     variant('s3_bdev', default=False,
             description='Enable the S3 (kS3) bdev storage tier (Poco + SigV4). '
                         'Distinct from +s3_cae, which is the CAE s3:// importer.')
+    variant('daos', default=False,
+            description='Enable the native DAOS (kDaos) bdev storage tier: '
+                        'a DFS file driven through libdfs/libdaos instead '
+                        'of a dfuse mount.')
     variant('boost_coro', default=False,
             description='Use Boost.Context stackful coroutine backend (issue #620)')
 
@@ -118,10 +122,26 @@ class Iowarp(CMakePackage):
     # (e.g. libpoco-dev), declare it a Spack external instead of building it.
     depends_on('poco', when='+s3_bdev')
 
+    # The DAOS bdev tier links the DAOS client library (libdfs, libdaos,
+    # libgurt; headers daos.h / daos_fs.h). CMake finds it through
+    # CMAKE_PREFIX_PATH (cmake/FindDAOS.cmake), so any `daos` install works.
+    # On a machine with a site DAOS (e.g. Aurora, daos-devel under /usr) do
+    # not build it: declare the system install as a Spack external --
+    #   packages:
+    #     daos:
+    #       buildable: false
+    #       externals:
+    #       - spec: daos@2.6.5
+    #         prefix: /usr
+    # The client must match the servers, which only the site install does.
+    depends_on('daos', when='+daos')
+
     conflicts('+s3_cae', when='~cae', msg='S3 import lives under CAE; enable +cae')
     conflicts('+gcs', when='~cae', msg='GCS import lives under CAE; enable +cae')
 
     conflicts('+fuse', when='~cte', msg='fuse adapter lives under CTE; enable +cte')
+    conflicts('+daos', when='~runtime',
+              msg='the DAOS bdev tier lives in the runtime; enable +runtime')
 
     # The POSIX/STDIO/MPI-IO adapters intercept calls through the ELF toolkit;
     # without it CMake silently skips them (#1194).
@@ -234,6 +254,11 @@ class Iowarp(CMakePackage):
         # so it is gated outside the '+cae' block above.
         if '+s3_bdev' in self.spec:
             args.append(self.define('CLIO_ENABLE_AMAZON_DRIVE', 'ON'))
+
+        # The native DAOS bdev tier, also in the runtime's bdev module.
+        # define_from_variant passes OFF too, so a ~daos build never picks up
+        # a stale ON from a reused build directory.
+        args.append(self.define_from_variant('CLIO_ENABLE_DAOS', 'daos'))
 
         return args
 

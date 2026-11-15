@@ -34,6 +34,16 @@ if(CLIO_ENABLE_GOOGLE_CLOUD)
   list(APPEND BDEV_GCS_LIBS Poco::Net Poco::NetSSL Poco::Crypto)
 endif()
 
+# Native DAOS transport (kDaos). Stores each target as a DFS file and drives
+# it with DAOS event queues; see daos_bdev_transport.h. The root CMakeLists
+# auto-disables CLIO_ENABLE_DAOS when the DAOS client files are absent. The
+# library and the -D define are attached PRIVATE after the target exists
+# (below), so nothing DAOS-specific leaks into the exported link interface.
+set(BDEV_DAOS_SOURCES "")
+if(CLIO_ENABLE_DAOS)
+  list(APPEND BDEV_DAOS_SOURCES src/transports/daos_bdev_transport.cc)
+endif()
+
 # Feature flags must reach the compiler as -D defines, not just gate the source
 # list: the transport .cc files and the factory switch are guarded by
 # #ifdef CLIO_ENABLE_AMAZON_DRIVE / #ifdef CLIO_ENABLE_GOOGLE_CLOUD. Propagated
@@ -71,6 +81,7 @@ add_clio_module_runtime(
     src/transports/mem_bdev_transport.cc
     ${BDEV_S3_SOURCES}
     ${BDEV_GCS_SOURCES}
+    ${BDEV_DAOS_SOURCES}
     src/autogen/bdev_lib_exec.cc
   COMPILE_DEFINITIONS
     ${BDEV_CLOUD_DEFS}
@@ -82,6 +93,14 @@ add_clio_module_runtime(
     ${BDEV_S3_LIBS}
     ${BDEV_GCS_LIBS}
 )
+
+# DAOS client library for the kDaos transport. PRIVATE: only this module's own
+# sources (the transport and the factory switch) include DAOS headers or test
+# CLIO_ENABLE_DAOS.
+if(CLIO_ENABLE_DAOS)
+  target_link_libraries(clio_bdev_runtime PRIVATE DAOS::dfs)
+  target_compile_definitions(clio_bdev_runtime PRIVATE CLIO_ENABLE_DAOS=1)
+endif()
 
 # Web dashboard page for this module (issue #990): mounted at /viz/clio_bdev by
 # the runtime as soon as a bdev pool comes up.

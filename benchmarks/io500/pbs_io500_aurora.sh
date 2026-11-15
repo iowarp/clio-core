@@ -20,6 +20,7 @@
 #              per node, sized from the node's share of the dataset D:
 #                ram::            RAM_PCT% of D  (score 1.0)
 #                file on dfuse    DAOS_PCT% of D (DAOS pool $DAOS_POOL, score 0.6)
+#                                 (DAOS_NATIVE=1: the same file through libdfs)
 #                file on Flare    FLARE_X x D    (score 0.2, overflow tier)
 #              With the defaults (25 + 50) 75% of the data fits in DRAM+DAOS
 #              and the remaining 25% has to spill to Flare.
@@ -32,6 +33,25 @@
 # caches directory attributes; passed through to clio_cte_fuse unchanged.
 # DAOS_API (MODE=daos; dfuse): dfs runs IO500 on libdfs directly, no FUSE.
 # NO_FLARE (0): 1 drops the Flare tier; tiers are then DRAM + DAOS only.
+# DAOS_NATIVE (unset/0 = off; MODE=cliofs): 1 makes the DAOS tier a native
+# DAOS bdev (bdev_type "daos") instead of a file on the dfuse mount: the
+# runtime reads and writes daos://$DAOS_POOL/$DAOS_CONT/tiers/<job>/<host>.dat
+# through libdfs, with no FUSE layer in the data path. Size, score and
+# persistence_level of the tier are unchanged. BUILD_DIR must be a build
+# configured with -DCLIO_ENABLE_DAOS=ON (checked up front). The dfuse mount is
+# still brought up: the tier file is an ordinary file of the container, so
+# the per-node du sampling and the teardown rm keep working through it.
+# DAOS_NATIVE_OPTS (unset): options appended to the daos:// path, e.g.
+# "chunk_size=4m&oclass=SX&prezero=0" (see
+# docs/docs/deployment/configuration.md). prezero=0 drops the transport's
+# zeroing of every read buffer; safe only once the DAOS client is known to
+# return zeros for holes.
+# META_RAM_MB (unset = off): MB of an extra DRAM target per node,
+# ram::clio_fs_meta (score 1.0), reserved for filesystem metadata and the
+# first MiB of each file. The bulk DRAM target (still RAM_PCT% of D) drops to
+# score 0.9 and the filesystem module gets data_score: 0.9, so file data
+# beyond a file's first MiB no longer competes with directory blocks and
+# small files for the fastest target. Works with every other knob.
 # HANG_DUMP_S (unset = off): seconds after IO500 starts at which a still-running
 # job dumps every node's runtime and adapter stacks (hang diagnosis).
 # COMPOSE (split): how the CTE is composed under clio-fs.
@@ -161,22 +181,48 @@ compose:
 $( [ "$COMPOSE" = split ] && echo "    durability: persistent" )
     storage:
 EOF
-  # Legacy: the DRAM tier is one more device of the single core. Split: it
-  # is the volatile core's only device (written further down).
-  [ "$COMPOSE" = split ] || cat >> clio_server.yaml <<EOF
-      - path: "ram::clio_fs_ram"
-        bdev_type: "ram"
-        capacity_limit: "${RAM_GB}MB"
+  # META_RAM_MB: a small DRAM target above the bulk one, for metadata and
+  # file heads (see the header). Its name differs from the bulk target's, so
+  # the two are separate bdev pools.
+  RAM_SCORE=1.0
+  RAM_TIERS=""
+  if [ -n "${META_RAM_MB:-}" ]; then
+    RAM_SCORE=0.9
+    echo "=== metadata DRAM target ${META_RAM_MB}MB per node (score 1.0); bulk DRAM score $RAM_SCORE; data_score 0.9"
+    RAM_TIERS="      - path: \"ram::clio_fs_meta\"
+        bdev_type: \"ram\"
+        capacity_limit: \"${META_RAM_MB}MB\"
         score: 1.0
-EOF
+"
+  fi
+  RAM_TIERS="$RAM_TIERS      - path: \"ram::clio_fs_ram\"
+        bdev_type: \"ram\"
+        capacity_limit: \"${RAM_GB}MB\"
+        score: $RAM_SCORE"
+  # Legacy: the DRAM targets are devices of the single core. Split: they are
+  # the volatile core's devices (written further down).
+  [ "$COMPOSE" = split ] || echo "$RAM_TIERS" >> clio_server.yaml
   # PERSIST=volatile turns off the file tiers' allocator write-ahead log
   # (a synchronous append to the network filesystem per allocate/free).
   # RAM_ONLY=1 leaves out the DAOS and Flare file tiers: a software-stack
   # ceiling with no storage I/O at all (diagnostic, not a real deployment).
   if [ "${RAM_ONLY:-0}" != 1 ]; then
+    # DAOS_NATIVE=1: the same file of the container (<host>.dat under
+    # tiers/$JOB), reached through libdfs by the bdev's DAOS transport
+    # instead of through the dfuse mount.
+    if [ "${DAOS_NATIVE:-0}" = 1 ]; then
+      ldd "$BUILD_DIR/bin/libclio_bdev_runtime.so" 2>/dev/null | grep -q 'libdfs' \
+        || { echo "DAOS_NATIVE=1 needs a build with -DCLIO_ENABLE_DAOS=ON; $BUILD_DIR has no DAOS transport"; exit 2; }
+      DAOS_TIER_PATH="daos://$DAOS_POOL/$DAOS_CONT/tiers/$JOB/__HOST__.dat${DAOS_NATIVE_OPTS:+?$DAOS_NATIVE_OPTS}"
+      DAOS_TIER_TYPE=daos
+      echo "=== DAOS tier: native (bdev_type daos) $DAOS_TIER_PATH"
+    else
+      DAOS_TIER_PATH="/tmp/$USER/daos_io500/tiers/$JOB/__HOST__.dat"
+      DAOS_TIER_TYPE=file
+    fi
     cat >> clio_server.yaml <<EOF
-      - path: "/tmp/$USER/daos_io500/tiers/$JOB/__HOST__.dat"
-        bdev_type: "file"
+      - path: "$DAOS_TIER_PATH"
+        bdev_type: "$DAOS_TIER_TYPE"
         capacity_limit: "${DAOS_GB}MB"
         score: 0.6
         persistence_level: "${PERSIST:-temporary}"
@@ -221,10 +267,7 @@ EOF
     pool_id: "540.0"
     durability: volatile
     storage:
-      - path: "ram::clio_fs_ram"
-        bdev_type: "ram"
-        capacity_limit: "${RAM_GB}MB"
-        score: 1.0
+$RAM_TIERS
     dpe:
       dpe_type: "max_bw"
     targets:
@@ -280,6 +323,7 @@ EOF
     stream_pool_id: "565.0"
 $( [ "${META_LOG:-0}" = 1 ] && echo "    metadata_log_path: \"$LR/meta/cfs_namespace_log\"" )
 $( [ -n "${DIR_LOG_COMPACT:-}" ] && echo "    dir_log_compact_bytes: \"$DIR_LOG_COMPACT\"" )
+$( [ -n "${META_RAM_MB:-}" ] && echo "    data_score: 0.9" )
 EOF
   # Per-node bring-up runs for the whole job in the background; it writes
   # $OUT/ready/<host> once the mount answers and tears down on $OUT/stop.
@@ -389,16 +433,37 @@ if [ "${BENCH:-io500}" = ior ]; then
   # instead of the half hour the metadata phases take.
   IOR=${IOR:-$(dirname "$IO500")/bin/ior}
   mkdir -p "$DATADIR/ior-easy" 2>/dev/null
-  for ph in write read; do
+  # IOR_VARIANTS: "fuse" (through the mount, default) and/or "preload"
+  # (the POSIX interposition adapter: no kernel FUSE, same filesystem client).
+  # STRACE=1: the first rank of each node runs under strace -T (ior_wrap.sh).
+  # After every phase each node's runtime and adapter get SIGUSR1, which
+  # prints the cumulative CLIO_EVLAT report, so phases can be told apart.
+  for v in ${IOR_VARIANTS:-fuse}; do
+   if [ $v = preload ]; then
+    mkdir -p "$DATADIR/ior-easy-pl" 2>/dev/null
+    tgt="clio::/$(basename "$DATADIR")/ior-easy-pl/ior_file_easy"; sfx="-preload"
+    pre="env LD_PRELOAD=$BUILD_DIR/bin/libclio_cte_posix.so CLIO_SERVER_CONF=$LR/clio_server.yaml CLIO_WITH_RUNTIME=0 CLIO_IPC_MODE=SHM CLIO_MEMFD_DIR=$LR/memfd"
+   else
+    tgt="$DATADIR/ior-easy/ior_file_easy"; sfx=""; pre=""
+   fi
+   for ph in write read; do
     [ $ph = write ] && fl="-w" || fl="-r"
     # PROFILE=1: sample thread CPU and stacks on this node during the phase.
     [ "${PROFILE:-0}" = 1 ] && bash "$HERE/sample_stacks.sh" "$OUT/prof_$ph" \
-      "${PROFILE_DELAY:-1}" > /dev/null 2>&1 &
+      "${PROFILE_DELAY:-1}" "${PROFILE_N:-8}" "${PROFILE_GAP:-0.4}" > /dev/null 2>&1 &
+    wrap=""
+    [ "${STRACE:-0}" = 1 ] && wrap="$HERE/ior_wrap.sh $OUT/ior$sfx-$ph $PPN"
     mpiexec -n $(( NN * PPN )) -ppn "$PPN" --cpu-bind depth -d 4 --envall \
-      "$IOR" -g -G 271828 -k -e -o "$DATADIR/ior-easy/ior_file_easy" -C -Q 1 \
-      -t 2m -b "${EASY_MB}m" -F $fl -a POSIX ${IOR_EXTRA:-} > "ior-easy-$ph.txt" 2>&1
+      $wrap $pre "$IOR" -g -G 271828 -k -e -o "$tgt" -C -Q 1 \
+      -t 2m -b "${EASY_MB}m" -F $fl -a POSIX ${IOR_EXTRA:-} > "ior-easy$sfx-$ph.txt" 2>&1
     rc=$?
-    echo "IORCELL tag=${RUN_TAG:-none} nodes=$NN phase=$ph rc=$rc $(grep -E '^(write|read) ' "ior-easy-$ph.txt" | awk '{print "MiB/s=" $2, "open_s=" $7, "io_s=" $8, "close_s=" $9}')"
+    echo "IORCELL tag=${RUN_TAG:-none} variant=$v nodes=$NN phase=$ph rc=$rc $(grep -E '^(write|read) ' "ior-easy$sfx-$ph.txt" | awk '{print "MiB/s=" $2, "open_s=" $7, "io_s=" $8, "close_s=" $9}')"
+    if [ "$MODE" = cliofs ]; then
+      mpiexec -n "$NN" -ppn 1 --cpu-bind none bash -c \
+        'pkill -USR1 -x clio_run; pkill -USR1 -x clio_cte_fuse; true' >/dev/null 2>&1
+      sleep 3
+    fi
+   done
   done
 elif [ "${BENCH:-io500}" = mdtest ]; then
   # BENCH=mdtest: create then delete, for the per-rank-directory layout

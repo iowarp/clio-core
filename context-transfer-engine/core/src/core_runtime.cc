@@ -32,6 +32,7 @@
  */
 
 #include "clio_runtime/cycle_counter.h"
+#include "clio_runtime/evlat.h"
 extern "C" void clio_evlat_add(int which, unsigned long long cycles);
 // Direct-read registry (core runtime lib): a node-local mem-transport bdev
 // publishes a synchronous read entry; ReadData services those blocks inline
@@ -835,6 +836,8 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
         bdev_type = clio::run::bdev::BdevType::kS3;
       } else if (device.bdev_type_ == "gcs") {
         bdev_type = clio::run::bdev::BdevType::kGcs;
+      } else if (device.bdev_type_ == "daos") {
+        bdev_type = clio::run::bdev::BdevType::kDaos;
       }
 
       // Memory tiers stay node-local (issue #1110): a blob placed in another
@@ -2269,6 +2272,8 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
 
   try {
     static const bool put_prof = getenv("CLIO_PUT_PROF") != nullptr;
+    // CLIO_EVLAT pb_exec: the whole put, whichever way it leaves.
+    clio::run::evlat::ScopedSpan ev_pb_exec(clio::run::evlat::kPbExec);
     const auto pi_t0 = std::chrono::steady_clock::now();
     auto pi_t1 = pi_t0, pi_t2 = pi_t0;
     // Inside "pre": the reader drain and the hole zero-fill (see SLOW-PUT).
@@ -2421,6 +2426,7 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     // env CLIO_WRITE_TOKEN_POLL_US).
     clio::run::u64 lock_tok = reinterpret_cast<clio::run::u64>(task.get());
     clio::run::u64 _tok_spin = 0;  // [HANGWATCH-TOK] stuck-holder probe (#822)
+    const unsigned long long ev_tok0 = clio::run::evlat::Now();  // pb_tok
     while (!blob_info_ptr->TryLockWrite(lock_tok, "PutBlob",
                                         GetCurrentTimeNs())) {
       if ((++_tok_spin % 20000) == 0) {
@@ -2438,6 +2444,8 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
       CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
     }
     BlobWriteLockGuard blob_write_guard(blob_info_ptr.get(), lock_tok);
+    clio::run::evlat::Span(clio::run::evlat::kPbTok, ev_tok0,
+                           clio::run::evlat::Now());
     pi_t1 = std::chrono::steady_clock::now();
 
     // Conditional puts (Context::kPutIfAbsent / kPutIfVersion), decided under
@@ -2478,9 +2486,12 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     blob_info_ptr->BeginDrainReaders();
     BlobReaderDrainGuard reader_drain_guard(blob_info_ptr.get());
     pi_dr0 = std::chrono::steady_clock::now();
+    const unsigned long long ev_dr0 = clio::run::evlat::Now();  // pb_drain
     while (blob_info_ptr->HasReadPins()) {
       CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
     }
+    clio::run::evlat::Span(clio::run::evlat::kPbDrain, ev_dr0,
+                           clio::run::evlat::Now());
     pi_dr1 = std::chrono::steady_clock::now();
 
     // Content seqlock, writer half (BlobInfo::content_seq_). The drain above
@@ -2631,10 +2642,13 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     // breakdown printed further down, which is how the extend cost was found
     // in the first place.
     const auto pi_ext0 = std::chrono::steady_clock::now();
+    const unsigned long long ev_al0 = clio::run::evlat::Now();  // pb_alloc
     CLIO_CO_AWAIT(PlaceBlobBytes(*blob_info_ptr, task->flags_, offset, size,
                                  blob_score,
                                  task->context_.min_persistence_level_,
                                  task->context_.preallocate_, alloc_result));
+    clio::run::evlat::Span(clio::run::evlat::kPbAlloc, ev_al0,
+                           clio::run::evlat::Now());
     const auto pi_ext1 = std::chrono::steady_clock::now();
     if (alloc_result != 0) {
       task->return_code_ = 10 + alloc_result;
@@ -2777,6 +2791,7 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
       // Step 3: ModifyExistingData — write data to blocks.
       pi_t2 = std::chrono::steady_clock::now();
       pi_z1 = pi_t2;
+      const unsigned long long ev_bd0 = clio::run::evlat::Now();  // pb_bdev
       clio::run::u32 write_result = 0;
       if constexpr (TaskT::kSupportsVectored) {
        if (vectored) {
@@ -2822,6 +2837,8 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
           CLIO_CO_RETURN;
         }
       }
+      clio::run::evlat::Span(clio::run::evlat::kPbBdev, ev_bd0,
+                             clio::run::evlat::Now());
     }
     // WAL: log all current blocks (full replacement semantics) -- only now,
     // AFTER the data writes above landed. A record logged first reaches the
@@ -3653,6 +3670,10 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     // which makes this the direct measure of tier migration stalling the
     // demand path. Sampled only when the wait actually happens, so a run with
     // no contention reports n=0 rather than a floor of zeros.
+    // CLIO_EVLAT gb_tok: everything a read can wait on before its target
+    // read -- this writer wait plus the pin retries below. Recorded for
+    // every get that reaches the pin, so a quiet run shows a floor near 0.
+    const unsigned long long ev_tok0 = clio::run::evlat::Now();
     {
       const unsigned long long ev_r0 = clio::run::CycleNow();
       bool ev_waited = false;
@@ -3711,6 +3732,8 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     while (!blob_info_ptr->TryPinRead()) {
       CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
     }
+    clio::run::evlat::Span(clio::run::evlat::kGbTok, ev_tok0,
+                           clio::run::evlat::Now());
     BlobReadPinGuard read_pin_guard(blob_info_ptr.get());
 
     // Liveness re-check, and it MUST be here -- after the pin, not before it
@@ -5861,11 +5884,14 @@ clio::run::TaskResume Runtime::MultiPutBlob(
     // segments applied in list order — the same last-writer-wins the scalar
     // sequence gave. Same-key streams and sieve sweeps (#1007) produce
     // exactly these runs; distinct-key batches degrade to runs of one and
-    // keep the scalar sub-put unchanged.
+    // keep the scalar sub-put unchanged. A run also shares ONE placement
+    // score (the nested put carries a single score), so a score change ends
+    // it; records default to -1, which leaves the runs as they always were.
     size_t re = bi + 1;
     while (re < batch.size() &&
            batch.descs_[re].tag_id_ == batch.descs_[bi].tag_id_ &&
-           batch.descs_[re].blob_name_ == batch.descs_[bi].blob_name_) {
+           batch.descs_[re].blob_name_ == batch.descs_[bi].blob_name_ &&
+           batch.descs_[re].score_ == batch.descs_[bi].score_) {
       ++re;
     }
     // Collect the run's valid records. Null-allocator ShmPtr = absolute
@@ -5895,13 +5921,13 @@ clio::run::TaskResume Runtime::MultiPutBlob(
           clio::run::CreateTaskId(), task->pool_id_,
           clio::run::PoolQuery::Local(), d0.tag_id_, d0.blob_name_,
           d0.offset_, d0.size_, batch.RecordSlice(valid.front()),
-          /*score=*/-1.0f, task->context_, d0.flags_);
+          d0.score_, task->context_, d0.flags_);
     } else {
       sub = ipc_manager->NewTask<PutBlobTask>(
           clio::run::CreateTaskId(), task->pool_id_,
           clio::run::PoolQuery::Local(), d0.tag_id_, d0.blob_name_,
           static_cast<clio::run::u64>(0), static_cast<clio::run::u64>(0),
-          ctp::ipc::ShmPtr<>::GetNull(), /*score=*/-1.0f, task->context_,
+          ctp::ipc::ShmPtr<>::GetNull(), d0.score_, task->context_,
           d0.flags_);
       auto *t = sub.get();
       for (size_t i : valid) {
@@ -5941,7 +5967,7 @@ clio::run::TaskResume Runtime::MultiPutBlob(
           break;
         }
         auto fut = client_.AsyncPutBlob(d.tag_id_, d.blob_name_, d.offset_,
-                                        d.size_, src, /*score=*/-1.0f,
+                                        d.size_, src, d.score_,
                                         task->context_, /*flags=*/0, owner);
         CLIO_CO_AWAIT(fut);
         rc = fut->GetReturnCode();
@@ -5955,7 +5981,7 @@ clio::run::TaskResume Runtime::MultiPutBlob(
           CLIO_CO_AWAIT(clio::run::yield(kForwardRetryUs));
           fut = client_.AsyncPutBlob(
               d.tag_id_, d.blob_name_, d.offset_, d.size_, src,
-              /*score=*/-1.0f, task->context_, /*flags=*/0,
+              d.score_, task->context_, /*flags=*/0,
               HashBlobToContainer(d.tag_id_, d.blob_name_));
           CLIO_CO_AWAIT(fut);
           rc = fut->GetReturnCode();
