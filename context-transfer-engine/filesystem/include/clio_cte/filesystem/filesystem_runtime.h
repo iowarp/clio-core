@@ -1332,10 +1332,8 @@ class Runtime : public clio::run::Container {
   // them as one batched core call before it returns.
   std::mutex tn_mu_;             ///< guards tn_batch_ (taken after ns_mu_)
   std::string tn_batch_;         ///< EncodeTagNameOp records not yet sent
-  /** Consecutive failed tag-name publishes; the batch is re-queued for up
-   *  to kNameFlushRetries of them (#1182). */
+  /** Consecutive flushes that left tag-name ops to re-send (#1182). */
   clio::run::u32 tn_flush_failures_ = 0;
-  static constexpr clio::run::u32 kNameFlushRetries = 30;
   /**
    * Queue one name operation for the next publish.
    * @param op operation

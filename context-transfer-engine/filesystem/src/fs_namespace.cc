@@ -853,17 +853,39 @@ clio::run::TaskResume Runtime::FlushNames() {
     // next flush (#1182); every step is idempotent, so re-sending is harmless.
     auto u = cte_.AsyncUpdateTagNames(batch, clio::run::PoolQuery::Local());
     CLIO_CO_AWAIT(u);
+    // Re-send what did not land: the whole batch when the call failed, else
+    // each op a down container could not apply (kTnUnreached). The drain
+    // flushes again every tick, so a name lands once its holder is back.
+    std::string again;
     if (u->GetReturnCode() != 0) {
-      ++tn_flush_failures_;
-      HLOG(kWarning, "filesystem: tag-name publish of {} byte(s) failed "
-           "(rc {}); {} failure(s) so far, re-queued", batch.size(),
-           u->GetReturnCode(), tn_flush_failures_);
-      if (tn_flush_failures_ <= kNameFlushRetries) {
-        std::lock_guard<std::mutex> g(tn_mu_);
-        tn_batch_.insert(0, batch);  // ahead of what was published since
-      }
+      again = batch;
     } else {
+      std::vector<clio::cte::core::TagNameOpRec> ops, res;
+      const std::string rb = u->results_.str();
+      clio::cte::core::DecodeTagNameOps(batch.data(), batch.size(), &ops);
+      clio::cte::core::DecodeTagNameOps(rb.data(), rb.size(), &res);
+      for (size_t i = 0; i < ops.size(); ++i) {
+        const bool unreached =
+            i >= res.size() || static_cast<clio::run::u32>(res[i].op_) ==
+                                   clio::cte::core::kTnUnreached;
+        if (!unreached) continue;
+        const auto &r = ops[i];
+        clio::cte::core::EncodeTagNameOp(&again, r.op_, r.tag_, r.flags_,
+                                         r.name_, r.name2_);
+      }
+    }
+    if (again.empty()) {
       tn_flush_failures_ = 0;
+    } else {
+      ++tn_flush_failures_;
+      if (tn_flush_failures_ <= 3 ||
+          (tn_flush_failures_ & (tn_flush_failures_ - 1)) == 0) {
+        HLOG(kWarning, "filesystem: {} byte(s) of tag-name ops did not land "
+             "(rc {}); re-queued, {} attempt(s) so far", again.size(),
+             u->GetReturnCode(), tn_flush_failures_);
+      }
+      std::lock_guard<std::mutex> g(tn_mu_);
+      tn_batch_.insert(0, again);  // ahead of what was published since
     }
   }
   CLIO_CO_RETURN;

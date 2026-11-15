@@ -4852,6 +4852,8 @@ enum TagNameResult : clio::run::u32 {
   kTnTaken = 2,     ///< kBind: name bound to another tag (tag_ = that tag)
   kTnDeleted = 3,   ///< kHomeUnlink / kHomeDrop: the tag lost its last name
                     ///< (name_ = every name it had, '\0'-separated)
+  kTnUnreached = 4, ///< a container holding this op's state did not answer
+                    ///< (down): nothing was undone; send the op again
 };
 
 /**

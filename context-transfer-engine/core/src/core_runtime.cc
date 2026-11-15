@@ -6727,6 +6727,10 @@ clio::run::TaskResume Runtime::SendNameSteps(std::vector<TagNameOpRec> steps,
       const std::string rb = futs[g]->results_.str();
       DecodeTagNameOps(rb.data(), rb.size(), &got);
       const std::vector<size_t> &idx = remote[g].second;
+      for (size_t i : idx) {
+        (*results)[i].op_ = static_cast<TagNameOp>(kTnUnreached);
+      }
+      if (futs[g]->GetReturnCode() != 0) got.clear();  // nothing applied there
       if (got.size() < idx.size()) {
         HLOG(kWarning, "UpdateTagNames: container {} answered {} of {} "
              "step(s) (rc {})", remote[g].first, got.size(), idx.size(),
@@ -6768,6 +6772,9 @@ clio::run::TaskResume Runtime::RunNameOps(std::vector<TagNameOpRec> ops,
       CLIO_CO_AWAIT(SendNameSteps(std::move(look), &got));
       for (size_t k = 0; k < got.size(); ++k) {
         if (StepIs(got[k], kTnOk)) ops[look_of[k]].tag_ = got[k].tag_;
+        if (StepIs(got[k], kTnUnreached)) {
+          (*results)[look_of[k]].op_ = static_cast<TagNameOp>(kTnUnreached);
+        }
       }
     }
     // 2. Every op's steps, all at once (one round trip per container).
@@ -6817,6 +6824,16 @@ clio::run::TaskResume Runtime::RunNameOps(std::vector<TagNameOpRec> ops,
       }
       res.tag_ = o.tag_;
       res.op_ = static_cast<TagNameOp>(kTnOk);
+      bool unreached = false;
+      for (size_t k = s; k < e; ++k) {
+        unreached = unreached || StepIs(got[k], kTnUnreached);
+      }
+      if (unreached) {
+        // A holder is down: undo nothing (every step is idempotent), and
+        // tell the caller to send the op again.
+        res.op_ = static_cast<TagNameOp>(kTnUnreached);
+        continue;
+      }
       if (o.op_ == TagNameOp::kAddName) {
         const TagNameOpRec &bind = got[s];
         const TagNameOpRec &home = got[s + 1];
