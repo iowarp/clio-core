@@ -183,6 +183,15 @@ class CacheBase : public clio::cte::core::DualTargetInterposer {
   bool Cached(const std::string &key, clio::run::u64 *size = nullptr);
   void Touch(const std::string &key);
   bool ShouldFill(const std::string &key);
+  /**
+   * Make room for a write by dropping clean copies only: with write-around
+   * on, a put that still finds no room is written through itself rather
+   * than flushing other blobs' dirty bytes inline (a full cache would
+   * otherwise pay a synchronous flush per put).
+   */
+  bool EvictCleanOnly() const {
+    return IsWriteBack() && params_.fallback_to_persistent_;
+  }
 
   /** Write the blob's dirty ranges to persistent (lock held). */
   clio::run::TaskResume Flush(std::string key, clio::run::u32 *rc);
@@ -191,7 +200,8 @@ class CacheBase : public clio::cte::core::DualTargetInterposer {
   /** Delete a blob from volatile whether or not it is recorded here. */
   clio::run::TaskResume DropVolatile(TagId tag, std::string name);
   /** Flush and drop least-recently-used unlocked copies. */
-  clio::run::TaskResume Evict(std::string keep, clio::run::u32 n);
+  clio::run::TaskResume Evict(std::string keep, clio::run::u32 n,
+                              bool clean_only);
   /** Copy the whole persistent blob into volatile (lock held). */
   clio::run::TaskResume FillFromPersistent(TagId tag, std::string name,
                                            clio::run::u64 size,

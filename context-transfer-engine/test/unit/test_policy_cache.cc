@@ -623,18 +623,22 @@ TEST_CASE("Write-through: persistent first, copy kept current",
   REQUIRE(Get(kPersistentPool, tag, "t0", 0, v1.size()) == want);
 }
 
-TEST_CASE("Read miss fills the volatile core",
+TEST_CASE("A blob read twice is filled into the volatile core",
           "[cte][policy_cache][fill]") {
   Fixture();
   const TagId tag = MakeTag("pc_fill");
   const std::string v = Payload(300 * 1024, 'f');
   REQUIRE(Put(kPersistentPool, tag, "f0", 0, v) == 0);  // behind the cache
   REQUIRE(SizeOn(kVolatilePool, tag, "f0") == -1);
-  REQUIRE(Get(kThruPool, tag, "f0", 0, v.size()) == v);   // miss -> fill
+  // Default admission (on_hit_count:2): a one-time read is not copied in.
+  REQUIRE(Get(kThruPool, tag, "f0", 0, v.size()) == v);
+  REQUIRE(SizeOn(kVolatilePool, tag, "f0") == -1);
+  REQUIRE(Get(kThruPool, tag, "f0", 0, v.size()) == v);   // 2nd miss -> fill
   REQUIRE(SizeOn(kVolatilePool, tag, "f0") == (long long)v.size());
   REQUIRE(Get(kThruPool, tag, "f0", 0, v.size()) == v);   // hit
-  // A partial read fills too (chunked from persistent).
+  // A partial read fills the whole blob on its second miss.
   REQUIRE(Put(kPersistentPool, tag, "f1", 0, v) == 0);
+  REQUIRE(Get(kThruPool, tag, "f1", 1000, 2000) == v.substr(1000, 2000));
   REQUIRE(Get(kThruPool, tag, "f1", 1000, 2000) == v.substr(1000, 2000));
   REQUIRE(Get(kVolatilePool, tag, "f1", 0, v.size()) == v);
 }

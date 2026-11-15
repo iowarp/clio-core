@@ -80,7 +80,7 @@ inline bool ParsePoolIdString(const std::string &s, clio::run::PoolId *out) {
  *
  *   next_volatile: "540.0"         # volatile core (required)
  *   next_persistent: "561.0"       # persistent chain (omit: volatile only)
- *   fill: on_read_miss             # | on_hit_count:N | none
+ *   fill: on_hit_count:2           # | on_read_miss | none
  *   evict: lru                     # | lfu
  *   flush_period_ms: 10000         # write-back only; 0 = no periodic flush
  *   fallback_to_persistent: true   # write-back: write around when full
@@ -88,7 +88,10 @@ inline bool ParsePoolIdString(const std::string &s, clio::run::PoolId *out) {
 struct PolicyCacheParams {
   clio::run::PoolId volatile_pool_;    ///< next_volatile
   clio::run::PoolId persistent_pool_;  ///< next_persistent (null = none)
-  clio::run::u32 fill_mode_ = static_cast<clio::run::u32>(FillMode::kOnReadMiss);
+  /** Default on_hit_count:2: a blob is copied in on its second read miss, so
+   *  one pass over data larger than the cache never displaces the working
+   *  set (and a small read never pulls in a whole cold blob). */
+  clio::run::u32 fill_mode_ = static_cast<clio::run::u32>(FillMode::kOnHitCount);
   clio::run::u32 fill_hits_ = 2;  ///< N of on_hit_count:N
   clio::run::u32 evict_mode_ = static_cast<clio::run::u32>(EvictMode::kLru);
   clio::run::u32 flush_period_ms_ = 10000;

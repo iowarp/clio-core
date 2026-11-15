@@ -53,6 +53,12 @@ namespace {
 constexpr double kLockPollUs = 10.0;
 /** Copies evicted per no-space retry. */
 constexpr clio::run::u32 kEvictBatch = 4;
+/** Resends of an op forwarded to a blob's owner that died in flight, and
+ *  the wait between them while the cluster marks it dead (us). */
+constexpr int kOwnerRetries = 10;
+constexpr double kOwnerRetryUs = 1000000.0;
+/** Read-miss counts kept for on_hit_count admission (then reset). */
+constexpr size_t kMaxMissCounts = 1u << 20;
 
 clio::run::u64 NowNs() {
   return static_cast<clio::run::u64>(
@@ -203,6 +209,8 @@ bool CacheBase::ShouldFill(const std::string &key) {
       return false;
     case FillMode::kOnHitCount: {
       std::lock_guard<std::mutex> g(mu_);
+      // Bounded: a long one-pass read leaves one count per blob behind.
+      if (miss_counts_.size() > kMaxMissCounts) miss_counts_.clear();
       clio::run::u32 &n = miss_counts_[key];
       if (++n < params_.fill_hits_) return false;
       miss_counts_.erase(key);
@@ -322,13 +330,15 @@ clio::run::TaskResume CacheBase::DropVolatile(TagId tag, std::string name) {
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume CacheBase::Evict(std::string keep, clio::run::u32 n) {
+clio::run::TaskResume CacheBase::Evict(std::string keep, clio::run::u32 n,
+                                       bool clean_only) {
   CLIO_TASK_BODY_BEGIN
   {
     std::vector<std::pair<clio::run::u64, std::string>> lru;
     {
       std::lock_guard<std::mutex> g(mu_);
       for (const auto &e : entries_) {
+        if (clean_only && !e.second.dirty_.empty()) continue;
         if (e.first != keep && busy_.count(e.first) == 0) {
           lru.emplace_back(e.second.last_ns_, e.first);
         }
@@ -392,7 +402,7 @@ clio::run::TaskResume CacheBase::PutVolatileRaw(TagId tag, std::string name,
     CLIO_CO_AWAIT(put);
     *rc = put->GetReturnCode();
     if (!IsNoSpaceRc(*rc) || attempt == 1) break;
-    CLIO_CO_AWAIT(Evict(Key(tag, name), kEvictBatch));
+    CLIO_CO_AWAIT(Evict(Key(tag, name), kEvictBatch, EvictCleanOnly()));
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -418,7 +428,8 @@ clio::run::TaskResume CacheBase::PutVolatile(
         CLIO_CO_AWAIT(put);
         *rc = put->GetReturnCode();
         if (!IsNoSpaceRc(*rc) || attempt == 1) break;
-        CLIO_CO_AWAIT(Evict(Key(task->tag_id_, name), kEvictBatch));
+        CLIO_CO_AWAIT(
+            Evict(Key(task->tag_id_, name), kEvictBatch, EvictCleanOnly()));
       }
     }
   }
@@ -475,38 +486,50 @@ clio::run::TaskResume CacheBase::PutAtOwner(
     clio::run::shared_ptr<core::PutBlobTask> task, clio::run::u32 owner) {
   CLIO_TASK_BODY_BEGIN
   {
-    const clio::run::PoolQuery q = clio::run::PoolQuery::DirectId(owner);
     const std::string name = task->blob_name_.str();
+    // An append is not idempotent: a lost one may have landed.
+    const bool may_resend = (task->flags_ & core::kCtePutAppend) == 0;
+    std::vector<core::BlobRegion> regions;
     if (task->segments_.empty()) {
-      auto f = self_client_.AsyncPutBlob(task->tag_id_, name, task->offset_,
-                                         task->size_, task->blob_data_,
-                                         task->score_, task->context_,
-                                         task->flags_, q);
-      CLIO_CO_AWAIT(f);
-      // INOUT: an append reports where it landed.
-      task->context_ = f->context_;
-      task->offset_ = f->offset_;
-      task->blob_name_ = f->blob_name_;
-      task->SetReturnCode(f->GetReturnCode());
+      regions.push_back(core::BlobRegion{task->offset_, task->size_,
+                                         task->blob_data_});
     } else {
-      std::vector<core::BlobRegion> regions;
       core::ForEachBlobRegion(*task, [&regions](const core::BlobRegion &r) {
         regions.push_back(r);
         return true;
       });
-      std::vector<clio::run::Future<core::PutBlobTask>> futs;
-      for (const core::BlobRegion &r : regions) {
-        futs.push_back(self_client_.AsyncPutBlob(
-            task->tag_id_, name, r.blob_off_, r.size_, r.data_, task->score_,
-            task->context_, task->flags_, q));
-      }
-      clio::run::u32 rc = 0;
-      for (auto &f : futs) {
-        CLIO_CO_AWAIT(f);
-        if (rc == 0) rc = f->GetReturnCode();
-      }
-      task->SetReturnCode(rc);
     }
+    std::vector<clio::run::Future<core::PutBlobTask>> futs;
+    for (const core::BlobRegion &r : regions) {
+      futs.push_back(self_client_.AsyncPutBlob(
+          task->tag_id_, name, r.blob_off_, r.size_, r.data_, task->score_,
+          task->context_, task->flags_, clio::run::PoolQuery::DirectId(owner)));
+    }
+    clio::run::u32 rc = 0;
+    for (size_t i = 0; i < futs.size(); ++i) {
+      CLIO_CO_AWAIT(futs[i]);
+      // The owner died with the put in flight: once failover names its
+      // successor, write there (idempotent), as the core's forwarding does.
+      for (int attempt = 0; may_resend && attempt < kOwnerRetries &&
+                            core::IsNodeLostRc(futs[i]->GetReturnCode());
+           ++attempt) {
+        CLIO_CO_AWAIT(clio::run::yield(kOwnerRetryUs));
+        const core::BlobRegion &r = regions[i];
+        futs[i] = self_client_.AsyncPutBlob(
+            task->tag_id_, name, r.blob_off_, r.size_, r.data_, task->score_,
+            task->context_, task->flags_,
+            clio::run::PoolQuery::DirectId(OwnerOf(task->tag_id_, name)));
+        CLIO_CO_AWAIT(futs[i]);
+      }
+      if (rc == 0) rc = futs[i]->GetReturnCode();
+    }
+    if (task->segments_.empty()) {
+      // INOUT: an append reports where it landed.
+      task->context_ = futs[0]->context_;
+      task->offset_ = futs[0]->offset_;
+      task->blob_name_ = futs[0]->blob_name_;
+    }
+    task->SetReturnCode(rc);
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -516,36 +539,42 @@ clio::run::TaskResume CacheBase::GetAtOwner(
     clio::run::shared_ptr<core::GetBlobTask> task, clio::run::u32 owner) {
   CLIO_TASK_BODY_BEGIN
   {
-    const clio::run::PoolQuery q = clio::run::PoolQuery::DirectId(owner);
     const std::string name = task->blob_name_.str();
+    std::vector<core::BlobRegion> regions;
     if (task->segments_.empty()) {
-      auto f = self_client_.AsyncGetBlob(task->tag_id_, name.c_str(),
-                                         task->offset_, task->size_,
-                                         task->flags_, task->blob_data_, q,
-                                         task->context_);
-      CLIO_CO_AWAIT(f);
-      task->context_ = f->context_;
-      task->SetReturnCode(f->GetReturnCode());
+      regions.push_back(core::BlobRegion{task->offset_, task->size_,
+                                         task->blob_data_});
     } else {
-      std::vector<core::BlobRegion> regions;
       core::ForEachBlobRegion(*task, [&regions](const core::BlobRegion &r) {
         regions.push_back(r);
         return true;
       });
-      std::vector<clio::run::Future<core::GetBlobTask>> futs;
-      for (const core::BlobRegion &r : regions) {
-        futs.push_back(self_client_.AsyncGetBlob(task->tag_id_, name.c_str(),
-                                                 r.blob_off_, r.size_,
-                                                 task->flags_, r.data_, q,
-                                                 task->context_));
-      }
-      clio::run::u32 rc = 0;
-      for (auto &f : futs) {
-        CLIO_CO_AWAIT(f);
-        if (rc == 0) rc = f->GetReturnCode();
-      }
-      task->SetReturnCode(rc);
     }
+    std::vector<clio::run::Future<core::GetBlobTask>> futs;
+    for (const core::BlobRegion &r : regions) {
+      futs.push_back(self_client_.AsyncGetBlob(
+          task->tag_id_, name.c_str(), r.blob_off_, r.size_, task->flags_,
+          r.data_, clio::run::PoolQuery::DirectId(owner), task->context_));
+    }
+    clio::run::u32 rc = 0;
+    for (size_t i = 0; i < futs.size(); ++i) {
+      CLIO_CO_AWAIT(futs[i]);
+      for (int attempt = 0; attempt < kOwnerRetries &&
+                            core::IsNodeLostRc(futs[i]->GetReturnCode());
+           ++attempt) {
+        CLIO_CO_AWAIT(clio::run::yield(kOwnerRetryUs));
+        const core::BlobRegion &r = regions[i];
+        futs[i] = self_client_.AsyncGetBlob(
+            task->tag_id_, name.c_str(), r.blob_off_, r.size_, task->flags_,
+            r.data_,
+            clio::run::PoolQuery::DirectId(OwnerOf(task->tag_id_, name)),
+            task->context_);
+        CLIO_CO_AWAIT(futs[i]);
+      }
+      if (rc == 0) rc = futs[i]->GetReturnCode();
+    }
+    if (task->segments_.empty()) task->context_ = futs[0]->context_;
+    task->SetReturnCode(rc);
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -556,15 +585,28 @@ clio::run::TaskResume CacheBase::TagCopiesEverywhere(TagId tag,
                                                      clio::run::u32 *rc) {
   CLIO_TASK_BODY_BEGIN
   {
+    // Every live container's copies. A dead container's copies died with its
+    // memory, so there is nothing of it to flush or drop: skip it, and do
+    // not fail the operation when one dies mid-call.
+    *rc = 0;
     auto *ipc = CLIO_IPC;
-    auto t = ipc->NewTask<core::DelTagTask>(clio::run::CreateTaskId(), pool_id_,
-                                            clio::run::PoolQuery::Broadcast(),
-                                            tag);
-    t->method_ = kDropTagCopies;
-    t->posix_unlink_ = mode;
-    auto fut = ipc->Send(t);
-    CLIO_CO_AWAIT(fut);
-    *rc = fut->GetReturnCode();
+    const clio::run::u32 n = std::max<clio::run::u32>(1, core::PoolContainers(pool_id_));
+    std::vector<clio::run::Future<core::DelTagTask>> futs;
+    for (clio::run::u32 c = 0; c < n; ++c) {
+      if (n > 1 && !core::ContainerNodeAlive(pool_id_, c)) continue;
+      auto t = ipc->NewTask<core::DelTagTask>(
+          clio::run::CreateTaskId(), pool_id_,
+          clio::run::PoolQuery::DirectId(static_cast<clio::run::ContainerId>(c)),
+          tag);
+      t->method_ = kDropTagCopies;
+      t->posix_unlink_ = mode;
+      futs.push_back(ipc->Send(t));
+    }
+    for (auto &f : futs) {
+      CLIO_CO_AWAIT(f);
+      const clio::run::u32 r = f->GetReturnCode();
+      if (r != 0 && !core::IsNodeLostRc(r) && *rc == 0) *rc = r;
+    }
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -629,8 +671,11 @@ clio::run::TaskResume CacheBase::PutBlob(
     if (rc == 0) CLIO_CO_AWAIT(PutVolatile(task, &rc));
     if (rc == 0) {
       NoteWrite(key, task->tag_id_, name, off, end, true);
-    } else if (IsNoSpaceRc(rc) && params_.fallback_to_persistent_) {
-      // Volatile is full even after eviction: write this blob through.
+    } else if (!IsNoSpaceRc(rc) || params_.fallback_to_persistent_) {
+      // No whole copy could be made -- volatile is full even after
+      // eviction, or persistent could not supply the blob's other bytes
+      // (an owner that just died, its stand-in still catching up): write
+      // this blob through instead of failing the put.
       CLIO_CO_AWAIT(Drop(key, true, &rc));
       CLIO_CO_AWAIT(DropVolatile(task->tag_id_, name));
       if (rc == 0) {
@@ -638,7 +683,7 @@ clio::run::TaskResume CacheBase::PutBlob(
                                     task.template Cast<clio::run::Task>()));
         rc = task->GetReturnCode();
       }
-    } else if (IsNoSpaceRc(rc)) {
+    } else {
       // No fallback: the put fails whole, leaving nothing behind.
       if (!Cached(key)) CLIO_CO_AWAIT(DropVolatile(task->tag_id_, name));
       rc = core::kPutNoSpaceRc;
@@ -667,6 +712,7 @@ clio::run::TaskResume CacheBase::MultiPutBlob(
       task->num_ok_ = 0;
       task->first_rc_ = 0;
       std::vector<clio::run::Future<core::PutBlobTask>> futs;
+      std::vector<size_t> rec_of;
       for (size_t i = 0; i < batch.size(); ++i) {
         const core::MultiPutDesc &d = batch.descs_[i];
         if (!batch.RecordValid(i)) {
@@ -681,9 +727,21 @@ clio::run::TaskResume CacheBase::MultiPutBlob(
             d.tag_id_, d.blob_name_, d.offset_, d.size_,
             batch.base_ + d.payload_off_, -1.0f, task->context_, d.flags_,
             clio::run::PoolQuery::DirectId(OwnerOf(d.tag_id_, d.blob_name_))));
+        rec_of.push_back(i);
       }
-      for (auto &f : futs) {
+      for (size_t k = 0; k < futs.size(); ++k) {
+        auto &f = futs[k];
         CLIO_CO_AWAIT(f);
+        for (int a = 0; a < kOwnerRetries && core::IsNodeLostRc(f->GetReturnCode());
+             ++a) {
+          CLIO_CO_AWAIT(clio::run::yield(kOwnerRetryUs));
+          const core::MultiPutDesc &d = batch.descs_[rec_of[k]];
+          f = self_client_.AsyncPutBlob(
+              d.tag_id_, d.blob_name_, d.offset_, d.size_,
+              batch.base_ + d.payload_off_, -1.0f, task->context_, d.flags_,
+              clio::run::PoolQuery::DirectId(OwnerOf(d.tag_id_, d.blob_name_)));
+          CLIO_CO_AWAIT(f);
+        }
         const clio::run::u32 rc = f->GetReturnCode();
         if (rc == 0) {
           ++task->num_ok_;
@@ -746,7 +804,10 @@ clio::run::TaskResume CacheBase::MultiPutBlob(
                     d.offset_ + d.size_, true);
         }
       }
-      if (special || (IsNoSpaceRc(rc) && params_.fallback_to_persistent_)) {
+      // Write the record through when it cannot be absorbed whole (see
+      // PutBlob); only a capacity failure with no fallback fails it.
+      if (special || (rc != 0 && (!IsNoSpaceRc(rc) ||
+                                  params_.fallback_to_persistent_))) {
         rc = 0;
         CLIO_CO_AWAIT(Drop(key, true, &rc));
         CLIO_CO_AWAIT(DropVolatile(d.tag_id_, d.blob_name_));
@@ -844,6 +905,15 @@ clio::run::TaskResume CacheBase::GetBlobSize(
           task->tag_id_, name, clio::run::PoolQuery::DirectId(owner),
           task->replica_);
       CLIO_CO_AWAIT(f);
+      for (int a = 0; a < kOwnerRetries && core::IsNodeLostRc(f->GetReturnCode());
+           ++a) {
+        CLIO_CO_AWAIT(clio::run::yield(kOwnerRetryUs));
+        f = self_client_.AsyncGetBlobSize(
+            task->tag_id_, name,
+            clio::run::PoolQuery::DirectId(OwnerOf(task->tag_id_, name)),
+            task->replica_);
+        CLIO_CO_AWAIT(f);
+      }
       task->size_ = f->size_;
       task->lost_bytes_ = f->lost_bytes_;
       task->SetReturnCode(f->GetReturnCode());
@@ -875,6 +945,15 @@ clio::run::TaskResume CacheBase::DelBlob(
                                          clio::run::PoolQuery::DirectId(owner),
                                          task->del_flags_);
       CLIO_CO_AWAIT(f);
+      for (int a = 0; a < kOwnerRetries && core::IsNodeLostRc(f->GetReturnCode());
+           ++a) {
+        CLIO_CO_AWAIT(clio::run::yield(kOwnerRetryUs));
+        f = self_client_.AsyncDelBlob(
+            task->tag_id_, name,
+            clio::run::PoolQuery::DirectId(OwnerOf(task->tag_id_, name)),
+            task->del_flags_);
+        CLIO_CO_AWAIT(f);
+      }
       task->SetReturnCode(f->GetReturnCode());
       CLIO_CO_RETURN;
     }
@@ -905,6 +984,14 @@ clio::run::TaskResume CacheBase::TruncateBlob(
           task->tag_id_, name, task->new_size_,
           clio::run::PoolQuery::DirectId(owner));
       CLIO_CO_AWAIT(f);
+      for (int a = 0; a < kOwnerRetries && core::IsNodeLostRc(f->GetReturnCode());
+           ++a) {
+        CLIO_CO_AWAIT(clio::run::yield(kOwnerRetryUs));
+        f = self_client_.AsyncTruncateBlob(
+            task->tag_id_, name, task->new_size_,
+            clio::run::PoolQuery::DirectId(OwnerOf(task->tag_id_, name)));
+        CLIO_CO_AWAIT(f);
+      }
       task->SetReturnCode(f->GetReturnCode());
       CLIO_CO_RETURN;
     }

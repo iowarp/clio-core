@@ -557,7 +557,7 @@ compose:
     next_volatile: "540.0"              # volatile core (required)
     next_persistent: "561.0"            # replication -> persistent core;
                                         #   omit for a volatile-only cache
-    fill: on_read_miss                  # on_read_miss | on_hit_count:N | none
+    fill: on_hit_count:2                # on_hit_count:N | on_read_miss | none
     evict: lru                          # lru | lfu
     flush_period_ms: 10000              # dirty-copy flush period; 0 = off
     # When the volatile core cannot hold a put even after eviction: true
