@@ -687,8 +687,7 @@ void Runtime::QueuePurge(const PurgeItem &item) {
 
 clio::run::TaskResume Runtime::PurgeDrain() {
   CLIO_TASK_BODY_BEGIN
-  // Names first: a create-then-unlink must reach each node as add, remove,
-  // then the page purge.
+  // Anything a failed flush re-queued.
   CLIO_CO_AWAIT(FlushNames());
   CLIO_CO_AWAIT(FlushInodes());  // anything a handler left dirty
   // Bound what a power loss can take from the directory journal.
@@ -744,10 +743,12 @@ clio::run::TaskResume Runtime::PurgeLocal(const FsReq &req) {
   CLIO_TASK_BODY_BEGIN
   FsDec dec(req.str_.data(), req.str_.size());
   clio::run::u64 packed = 0;
-  while (dec.U64(&packed)) {
-    // Local: this container's accounting share and page blobs of the file
-    // (a miss -- no pages here -- returns at once).
-    auto d = cte_.AsyncDelTag(FsUnpack(packed), clio::run::PoolQuery::Local());
+  std::vector<clio::cte::core::TagId> tags;
+  while (dec.U64(&packed)) tags.push_back(FsUnpack(packed));
+  if (!tags.empty()) {
+    // Local: this container's share (accounting and page blobs) of each
+    // file, in one call; a file with no pages here costs nothing.
+    auto d = cte_.AsyncMultiDelTag(tags, clio::run::PoolQuery::Local());
     CLIO_CO_AWAIT(d);
   }
   CLIO_CO_RETURN;
@@ -847,13 +848,9 @@ clio::run::TaskResume Runtime::FlushNames() {
     batch.swap(tn_batch_);
   }
   if (!batch.empty()) {
-    // One publish per drain tick carries every change since the last one.
-    // It goes to this node's CTE only: each filesystem container mirrors the
-    // names of the directory blocks it is home for into its own node's CTE,
-    // so no broadcast is needed. A publish that fails outright is retried on
-    // the next ticks (#1182: a node's index missed a directory rename and
-    // nothing said why); the records carry their own stamps, so re-sending
-    // them is harmless.
+    // One batched core call; the local CTE sends each step to the container
+    // holding that name or tag. A call that fails outright is retried by the
+    // next flush (#1182); every step is idempotent, so re-sending is harmless.
     auto u = cte_.AsyncUpdateTagNames(batch, clio::run::PoolQuery::Local());
     CLIO_CO_AWAIT(u);
     if (u->GetReturnCode() != 0) {

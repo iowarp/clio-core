@@ -1145,12 +1145,6 @@ class Runtime : public clio::run::Container {
    */
   clio::run::TaskResume CheckMoveTarget(clio::run::u64 moving,
                                         clio::run::u64 dst_parent, int &rc);
-  /**
-   * Encode every live entry of the blocks this container homes as kAddName
-   * records (restart catch-up; lists this node's block blobs in the CTE).
-   */
-  clio::run::TaskResume EncodeHomeNames(std::string *out);
-
   // ---- inodes (fs_namespace.cc) ----
   /**
    * Make sure at least `margin` ids are durably reserved beyond the next
@@ -1324,12 +1318,12 @@ class Runtime : public clio::run::Container {
    */
   clio::run::TaskResume LoadSysRecords();
 
-  // ---- CTE tag-name publisher (async mirror of the namespace) ----
-  // Every file and directory is also a CTE tag named "$tagid{parent}/leaf",
-  // so CTE search (TagQuery / BlobQuery / SemanticSearch, the indexer) sees
-  // paths. The block homes stay authoritative; name changes are queued here
-  // and published in batches by the periodic drain, each container to its own
-  // node's CTE (no broadcast).
+  // ---- CTE tag names ----
+  // Every file and directory is also a CTE tag, named "<leaf>/<inode>"
+  // (FsTagName) for each of its links, so CTE search (TagQuery / BlobQuery,
+  // the indexer) sees file names. The block homes stay authoritative for
+  // paths; each namespace operation queues its name changes here and sends
+  // them as one batched core call before it returns.
   std::mutex tn_mu_;             ///< guards tn_batch_ (taken after ns_mu_)
   std::string tn_batch_;         ///< EncodeTagNameOp records not yet sent
   /** Consecutive failed tag-name publishes; the batch is re-queued for up
@@ -1340,13 +1334,14 @@ class Runtime : public clio::run::Container {
    * Queue one name operation for the next publish.
    * @param op operation
    * @param id tag id (the file/dir id)
-   * @param name stored name ("$tagid{parent}/leaf")
-   * @param name2 new stored name (rename only)
+   * @param name tag name (FsTagName: "<leaf>/<inode>")
+   * @param name2 new tag name (rename only)
    */
   void PublishName(clio::cte::core::TagNameOp op,
                    const clio::cte::core::TagId &id, const std::string &name,
                    const std::string &name2 = std::string());
-  /** Publish queued name operations to this node's CTE (drain body). */
+  /** Send queued name operations as one batched core call (UpdateTagNames),
+   *  awaited: a namespace operation calls it before it returns. */
   clio::run::TaskResume FlushNames();
 
   // ---- file sizes (owned by the stream pool) ----

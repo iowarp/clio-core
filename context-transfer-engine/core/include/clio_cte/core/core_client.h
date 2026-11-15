@@ -34,6 +34,7 @@
 #ifndef WRPCTE_CORE_CLIENT_H_
 #define WRPCTE_CORE_CLIENT_H_
 
+#include <tuple>
 #include <clio_runtime/clio_runtime.h>
 #include <clio_ctp/util/singleton.h>
 #include <clio_cte/api.h>
@@ -3970,19 +3971,19 @@ class Client : public clio::run::ContainerClient {
   }
 
   /**
-   * Rename a tag, keeping its TagId (and all blobs). Broadcast so every
-   * container moves the name binding it holds. tag_id may be null if the
-   * caller only knows the name; pass it when known (e.g. from a prior open).
+   * Rename one of a tag's names, keeping its TagId (and all blobs). A tag
+   * that already has new_name loses it. tag_id may be null if the caller
+   * only knows the name. Batched form: AsyncMultiRenameTag.
    * @param old_name Current tag name
    * @param new_name Desired tag name
    * @param tag_id   Tag id (optional; TagId::GetNull() to resolve by name)
-   * @param pool_query Routing (default Broadcast)
+   * @param pool_query Routing (default Dynamic: the old name's owner)
    */
   clio::run::Future<RenameTagTask> AsyncRenameTag(
       const std::string &old_name,
       const std::string &new_name,
       const TagId &tag_id = TagId::GetNull(),
-      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Broadcast()) {
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
     auto *ipc_manager = CLIO_CPU_IPC;
 
     auto task = ipc_manager->NewTask<RenameTagTask>(
@@ -3994,15 +3995,16 @@ class Client : public clio::run::ContainerClient {
   /**
    * Bind an additional name to an EXISTING tag's id (tag-level hard link).
    * The alias shares the target's TagId and therefore all its blobs. If the
-   * target does not exist, the returned task's found_ is 0 (error). Broadcast.
-   * Overload: target identified by TagId.
+   * target does not exist, the returned task's found_ is 0 (error). If the
+   * alias already names a tag, that tag is returned. Overload: target
+   * identified by TagId. Batched form: AsyncMultiGetOrCreateTagAlias.
    * @param existing_id Target tag id (must exist)
    * @param alias_name  New name to bind to it
    */
   clio::run::Future<GetOrCreateTagAliasTask> AsyncGetOrCreateTagAlias(
       const TagId &existing_id,
       const std::string &alias_name,
-      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Broadcast()) {
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
     auto *ipc_manager = CLIO_CPU_IPC;
     auto task = ipc_manager->NewTask<GetOrCreateTagAliasTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, existing_id,
@@ -4018,7 +4020,7 @@ class Client : public clio::run::ContainerClient {
   clio::run::Future<GetOrCreateTagAliasTask> AsyncGetOrCreateTagAlias(
       const std::string &existing_name,
       const std::string &alias_name,
-      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Broadcast()) {
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
     auto *ipc_manager = CLIO_CPU_IPC;
     auto task = ipc_manager->NewTask<GetOrCreateTagAliasTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, TagId::GetNull(),
@@ -4027,16 +4029,14 @@ class Client : public clio::run::ContainerClient {
   }
 
   /**
-   * Resolve a TagId to its full, absolute tag name. Tag names are stored
-   * relatively ("$tagid{parent}/leaf"); this returns the fully-resolved path
-   * (or the verbatim name for a flat tag). Broadcast so the container that
-   * owns the tag's metadata answers; the result is in found_/tag_name_.
+   * A tag's canonical name, from the tag's home; the result is in
+   * found_/tag_name_.
    * @param tag_id Tag ID to resolve
-   * @param pool_query Pool query for task routing (default: Broadcast)
+   * @param pool_query Pool query for task routing (default: the tag's home)
    */
   clio::run::Future<GetTagNameTask> AsyncGetTagName(
       const TagId &tag_id,
-      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Broadcast()) {
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
     auto *ipc_manager = CLIO_CPU_IPC;
 
     auto task = ipc_manager->NewTask<GetTagNameTask>(
@@ -4134,8 +4134,9 @@ class Client : public clio::run::ContainerClient {
   }
 
   /**
-   * Publish a batch of tag-name operations (see EncodeTagNameOp). Local by
-   * default: a container publishes the names it owns into its own node CTE.
+   * The batched tag-name verb: kAddName / kRemoveName / kRename records (see
+   * EncodeTagNameOp). The receiving container sends each step to the
+   * container holding its state; results_ holds one result per record.
    * @param ops encoded batch
    * @param pool_query default Local()
    */
@@ -4146,6 +4147,36 @@ class Client : public clio::run::ContainerClient {
     auto task = ipc_manager->NewTask<UpdateTagNamesTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, ops);
     return ipc_manager->Send(task);
+  }
+
+  /**
+   * Batched RenameTag: one UpdateTagNames carrying a kRename per entry.
+   * Results (one per entry, op_ = TagNameResult) are in the task's results_.
+   * @param renames (tag id or null, old name, new name) per rename
+   */
+  clio::run::Future<UpdateTagNamesTask> AsyncMultiRenameTag(
+      const std::vector<std::tuple<TagId, std::string, std::string>> &renames) {
+    std::string ops;
+    for (const auto &r : renames) {
+      EncodeTagNameOp(&ops, TagNameOp::kRename, std::get<0>(r), 0,
+                      std::get<1>(r), std::get<2>(r));
+    }
+    return AsyncUpdateTagNames(ops);
+  }
+
+  /**
+   * Batched GetOrCreateTagAlias: one UpdateTagNames carrying a kAddName per
+   * entry (the target must exist).
+   * @param aliases (target tag id, alias name) per alias
+   */
+  clio::run::Future<UpdateTagNamesTask> AsyncMultiGetOrCreateTagAlias(
+      const std::vector<std::pair<TagId, std::string>> &aliases) {
+    std::string ops;
+    for (const auto &a : aliases) {
+      EncodeTagNameOp(&ops, TagNameOp::kAddName, a.first, kTnMustExist,
+                      a.second);
+    }
+    return AsyncUpdateTagNames(ops);
   }
 
   /**

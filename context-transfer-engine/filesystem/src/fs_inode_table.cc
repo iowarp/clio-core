@@ -1223,9 +1223,8 @@ int Runtime::InsertRowLocked(TableBlockSlot &slot, const FsReq &req,
   InodeTableBlock &b = slot.blk_;
   if (b.sealed_) return ENOENT;  // an rmdir is removing the directory
   if (req.id_ == 0) return EINVAL;  // the caller names the inode
-  const clio::cte::core::TagId dir_tag = FsUnpack(b.dir_);
   const std::string key = KeyOf(req.leaf_);
-  const std::string tn = clio::cte::core::MakeTagRefName(dir_tag, req.leaf_);
+  const std::string tn = FsTagName(req.leaf_, req.id_);
   auto it = b.rows_.find(key);
   TableDelta dl;
   if ((f & kInsCommit) != 0) {
@@ -1252,8 +1251,7 @@ int Runtime::InsertRowLocked(TableBlockSlot &slot, const FsReq &req,
     dl.ops_.push_back({key, true, it->second});
     RecordChangeLocked(slot, dl, true);
     PublishName(clio::cte::core::TagNameOp::kAddName, FsUnpack(req.id_),
-                clio::cte::core::MakeTagRefName(dir_tag,
-                                                RowName(key, it->second)));
+                FsTagName(RowName(key, it->second), req.id_));
     return 0;
   }
   if (it != b.rows_.end()) {
@@ -1282,7 +1280,7 @@ int Runtime::InsertRowLocked(TableBlockSlot &slot, const FsReq &req,
     RecordChangeLocked(slot, dl, true);
     if ((f & kInsNoTagName) == 0) {
       PublishName(clio::cte::core::TagNameOp::kRemoveName, FsUnpack(victim),
-                  clio::cte::core::MakeTagRefName(dir_tag, resp.str_));
+                  FsTagName(resp.str_, victim));
       PublishName(clio::cte::core::TagNameOp::kAddName, FsUnpack(e.id_), tn);
     }
     resp.id_ = req.id_;
@@ -1360,7 +1358,7 @@ int Runtime::RemoveRowLocked(TableBlockSlot &slot, const FsReq &req,
   RecordChangeLocked(slot, dl, true);
   if ((f & kRmNoTagName) == 0) {
     PublishName(clio::cte::core::TagNameOp::kRemoveName, FsUnpack(gone),
-                clio::cte::core::MakeTagRefName(FsUnpack(b.dir_), resp.str_));
+                FsTagName(resp.str_, gone));
   }
   return 0;
 }
@@ -1387,10 +1385,8 @@ int Runtime::RespellRowLocked(TableBlockSlot &slot, const FsReq &req,
   TableDelta dl;
   dl.ops_.push_back({key, true, e});
   RecordChangeLocked(slot, dl, true);
-  const clio::cte::core::TagId dir_tag = FsUnpack(b.dir_);
   PublishName(clio::cte::core::TagNameOp::kRename, FsUnpack(e.id_),
-              clio::cte::core::MakeTagRefName(dir_tag, resp.str_),
-              clio::cte::core::MakeTagRefName(dir_tag, req.leaf_));
+              FsTagName(resp.str_, e.id_), FsTagName(req.leaf_, e.id_));
   return 0;
 }
 
@@ -1436,6 +1432,9 @@ clio::run::TaskResume Runtime::RowMutation(clio::run::u32 op,
     if (crc != 0 && rc == 0) rc = crc;
   }
   resp.rc_ = static_cast<clio::run::u32>(rc);
+  // The row's CTE tag name changes before the operation returns, so a later
+  // operation on the inode always follows it.
+  CLIO_CO_AWAIT(FlushNames());
   if (rc == 0 && op == kTableInsert) CLIO_CO_AWAIT(SplitBlock(slot));
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -2217,45 +2216,6 @@ clio::run::TaskResume Runtime::CheckMoveTarget(clio::run::u64 moving,
     cur = up_dir;
   }
   rc = EBUSY;
-  CLIO_CO_RETURN;
-  CLIO_TASK_BODY_END
-}
-
-clio::run::TaskResume Runtime::EncodeHomeNames(std::string *out) {
-  CLIO_TASK_BODY_BEGIN
-  out->clear();
-  std::vector<TableBlockKey> keys;
-  if (dir_journal_) {
-    JournaledHomeKeys(&keys);
-  } else {
-    auto list = cte_.AsyncListLocalBlobs("d\\.[0-9]+",
-                                         clio::run::PoolQuery::Local());
-    CLIO_CO_AWAIT(list);
-    for (size_t i = 0; i < list->tag_ids_.size(); ++i) {
-      keys.push_back(TableBlockKey{
-          list->tag_ids_[i],
-          static_cast<clio::run::u32>(
-              std::strtoul(list->blob_names_[i].c_str() + 2, nullptr, 10))});
-    }
-  }
-  const clio::run::u64 now = NowNs();
-  for (const TableBlockKey &key : keys) {
-    const clio::run::u64 dir = key.dir_;
-    const clio::run::u32 k = key.index_;
-    if (BlockHome(dir, k) != container_id_) continue;
-    std::shared_ptr<TableBlockSlot> slot;
-    int rc = 0;
-    CLIO_CO_AWAIT(LoadBlock(dir, k, slot, rc));
-    if (rc != 0) continue;
-    std::lock_guard<std::mutex> g(ns_mu_);
-    for (const auto &kv : slot->blk_.rows_) {
-      if (kv.second.state_ == kRowPending) continue;
-      clio::cte::core::EncodeTagNameOp(
-          out, clio::cte::core::TagNameOp::kAddName, FsUnpack(kv.second.id_),
-          now, clio::cte::core::MakeTagRefName(FsUnpack(dir),
-                                               RowName(kv.first, kv.second)));
-    }
-  }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }

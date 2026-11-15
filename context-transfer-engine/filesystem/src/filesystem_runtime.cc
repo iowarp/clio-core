@@ -241,29 +241,6 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
       CLIO_CO_RETURN;
     }
   }
-  // Mirror the namespace into CTE tag names (async). The root first. On a
-  // restart this node's CTE still holds the names published before it went
-  // down, so drop them and re-add the ones this container owns. Names owned
-  // by other containers are published by those containers into their own
-  // nodes' CTE, so nothing is pulled from peers.
-  PublishName(clio::cte::core::TagNameOp::kSetRoot, FsRootId(), "/");
-  if (is_restart_) {
-    std::string reset;
-    clio::cte::core::EncodeTagNameOp(
-        &reset, clio::cte::core::TagNameOp::kResetPublished, FsRootId(),
-        clio::cte::core::GetWallTimeNs(), std::string());
-    clio::cte::core::EncodeTagNameOp(
-        &reset, clio::cte::core::TagNameOp::kSetRoot, FsRootId(),
-        clio::cte::core::GetWallTimeNs(), "/");
-    {
-      std::string own;
-      CLIO_CO_AWAIT(EncodeHomeNames(&own));
-      reset += own;
-    }
-    auto u = cte_.AsyncUpdateTagNames(reset, clio::run::PoolQuery::Local());
-    CLIO_CO_AWAIT(u);
-  }
-
   // issue #817: shared-memory attribute mirror. Node-local derived state that
   // clients treat as authoritative, so it is only safe when this node owns
   // the whole namespace (a single node). CLIO_CFS_SHM_MIRROR_MULTINODE=1
@@ -1380,15 +1357,13 @@ clio::run::TaskResume Runtime::RenameFile(const std::string &src,
   if (!same) {
     // ONE name change for the whole move (the per-home steps publish none),
     // under the names as they were spelled.
-    const clio::cte::core::TagId dt = FsUnpack(dp);
-    const std::string to = clio::cte::core::MakeTagRefName(dt, FsLeaf(dst));
     if (ir.old_id_ != 0) {
       PublishName(clio::cte::core::TagNameOp::kRemoveName,
-                  FsUnpack(ir.old_id_),
-                  clio::cte::core::MakeTagRefName(dt, ir.str_));
+                  FsUnpack(ir.old_id_), FsTagName(ir.str_, ir.old_id_));
     }
     PublishName(clio::cte::core::TagNameOp::kRename, FsUnpack(id),
-                clio::cte::core::MakeTagRefName(FsUnpack(sp), sr.str_), to);
+                FsTagName(sr.str_, id), FsTagName(FsLeaf(dst), id));
+    CLIO_CO_AWAIT(FlushNames());
   }
   rc = 0;
   CLIO_CO_RETURN;
@@ -1457,14 +1432,13 @@ clio::run::TaskResume Runtime::RenameDir(const std::string &src,
       CLIO_CO_AWAIT(DropTable(victim));
       CLIO_CO_AWAIT(UnlinkInode(victim, std::string()));
     }
-    const clio::cte::core::TagId dt = FsUnpack(dp);
-    const std::string to = clio::cte::core::MakeTagRefName(dt, FsLeaf(dst));
     if (victim != 0) {
       PublishName(clio::cte::core::TagNameOp::kRemoveName, FsUnpack(victim),
-                  clio::cte::core::MakeTagRefName(dt, ir.str_));
+                  FsTagName(ir.str_, victim));
     }
     PublishName(clio::cte::core::TagNameOp::kRename, FsUnpack(id),
-                clio::cte::core::MakeTagRefName(FsUnpack(sp), sr.str_), to);
+                FsTagName(sr.str_, id), FsTagName(FsLeaf(dst), id));
+    CLIO_CO_AWAIT(FlushNames());
   } else if (victim != 0) {
     int urc = 0;
     CLIO_CO_AWAIT(SealTable(victim, false, urc));

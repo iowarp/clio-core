@@ -128,6 +128,13 @@ enum class TxnType : uint8_t {
    * key is empty.
    */
   kDelTagXattr = 11,
+  /**
+   * A name was bound to a tag on the container that holds the name's
+   * binding (TxnCreateTag payload). Replay rebinds; a later record wins.
+   */
+  kBindName = 12,
+  /** A name's binding was dropped (TxnCreateTag payload: name, its tag). */
+  kUnbindName = 13,
 };
 
 /** A single block entry within TxnExtendBlob */

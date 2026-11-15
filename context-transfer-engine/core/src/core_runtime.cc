@@ -116,20 +116,7 @@ bool IsTargetEligibleForBlob(const TargetInfo &target,
 using clio::run::chi_cur_worker_key_;
 using clio::run::Worker;
 
-// ===========================================================================
-// Hierarchical tag-name encoding helpers.
-//
-// Absolute-path tags (names beginning with '/') are stored RELATIVELY so that
-// renaming/moving a directory tag is O(1): a child holds the canonical string
-//     "$tagid{<major>.<minor>}/<leaf>"
-// where <major>.<minor> is its PARENT tag's id and <leaf> is the single path
-// component. The root "/" is stored literally as "/". Flat (non-path) names
-// are stored verbatim. Resolution (ResolveTagName) walks the parent ids to
-// rebuild the full path. Non-path names are unaffected by any of this.
-// ===========================================================================
 namespace {
-
-constexpr const char *kTagRefPrefix = "$tagid{";
 
 // ExtendBlob/ResizeBlob placement failure codes. These are the RAW allocator
 // codes; PutBlob surfaces them to clients as 10 + code, which is the 11-13
@@ -207,22 +194,6 @@ inline double BlobWriteLockPollUs() {
   return v;
 }
 
-// Escape regex metacharacters so `s` matches itself literally. Used to build
-// exact/prefix patterns for the tag search index (#598).
-std::string EscapeRegexLiteral(const std::string &s) {
-  std::string out;
-  out.reserve(s.size() + 8);
-  for (char c : s) {
-    if (c == '.' || c == '[' || c == ']' || c == '(' || c == ')' ||
-        c == '{' || c == '}' || c == '+' || c == '*' || c == '?' ||
-        c == '\\' || c == '^' || c == '$' || c == '|' || c == '/') {
-      out += '\\';
-    }
-    out += c;
-  }
-  return out;
-}
-
 /**
  * Length of the part of [offset, offset + size) that lies inside a blob of
  * `declared` bytes.
@@ -260,16 +231,11 @@ void ZeroReadTail(const ctp::ipc::ShmPtr<> &dst, size_t from, size_t size) {
   std::memset(base + from, 0, size - from);
 }
 
-// True for absolute-path names that participate in the hierarchy.
-bool IsHierPath(const std::string &name) {
-  return !name.empty() && name[0] == '/';
-}
-
 // If `re` is an anchored literal pattern ("^...$" whose body is only literal
 // characters and backslash-escaped metacharacters), decode the literal string
 // it matches into `*literal` and return true. This lets TagQuery serve exact
-// lookups (getattr/lookup/rename) from the O(1) name hash + hierarchy walk
-// instead of compiling a std::regex per call (#680). Patterns with real
+// lookups from the O(1) name hash instead of compiling a std::regex per call
+// (#680). Patterns with real
 // metacharacters (e.g. the readdir child glob "^dir/[^/]+$") return false and
 // fall back to the trigram regex search index.
 bool TryParseAnchoredLiteral(const std::string &re, std::string *literal) {
@@ -297,73 +263,6 @@ bool TryParseAnchoredLiteral(const std::string &re, std::string *literal) {
     out += c;
   }
   *literal = std::move(out);
-  return true;
-}
-
-// Build the relative stored form for a child of `parent` with leaf `leaf`.
-std::string MakeRelativeName(const TagId &parent, const std::string &leaf) {
-  return std::string(kTagRefPrefix) + std::to_string(parent.major_) + "." +
-         std::to_string(parent.minor_) + "}/" + leaf;
-}
-
-// Split "/a/b/c" -> ["a","b","c"]; "/" or "" -> []. Repeated and trailing
-// slashes are collapsed (so "/a/b/" == "/a/b").
-std::vector<std::string> SplitPathComponents(const std::string &path) {
-  std::vector<std::string> out;
-  size_t i = 0;
-  const size_t n = path.size();
-  while (i < n) {
-    while (i < n && path[i] == '/') ++i;
-    size_t j = i;
-    while (j < n && path[j] != '/') ++j;
-    if (j > i) out.push_back(path.substr(i, j - i));
-    i = j;
-  }
-  return out;
-}
-
-// If `stored` is a "$tagid{M.m}/leaf" reference, parse out the parent id and
-// the leaf and return true; otherwise return false (flat name or root).
-bool ParseTagRef(const std::string &stored, TagId &parent_out,
-                 std::string &leaf_out) {
-  const size_t plen = std::char_traits<char>::length(kTagRefPrefix);
-  if (stored.compare(0, plen, kTagRefPrefix) != 0) return false;
-  size_t close = stored.find('}', plen);
-  if (close == std::string::npos) return false;
-  const std::string id_str = stored.substr(plen, close - plen);
-  size_t dot = id_str.find('.');
-  if (dot == std::string::npos) return false;
-  try {
-    parent_out.major_ =
-        static_cast<clio::run::u32>(std::stoul(id_str.substr(0, dot)));
-    parent_out.minor_ =
-        static_cast<clio::run::u32>(std::stoul(id_str.substr(dot + 1)));
-  } catch (const std::exception &) {
-    return false;
-  }
-  std::string suffix = stored.substr(close + 1);  // e.g. "/leaf"
-  if (!suffix.empty() && suffix[0] == '/') suffix.erase(0, 1);
-  leaf_out = std::move(suffix);
-  return true;
-}
-
-// Join an already-resolved parent path with a leaf, avoiding "//".
-std::string JoinPath(const std::string &parent_full, const std::string &leaf) {
-  if (parent_full == "/") return "/" + leaf;
-  return parent_full + "/" + leaf;
-}
-
-// Split an absolute path into (parent_path, leaf): "/a/b/c" -> ("/a/b","c"),
-// "/c" -> ("/","c"). Returns false for "/" or names with no component.
-bool SplitParentLeaf(const std::string &path, std::string &parent_out,
-                     std::string &leaf_out) {
-  std::vector<std::string> comps = SplitPathComponents(path);
-  if (comps.empty()) return false;
-  leaf_out = comps.back();
-  parent_out = "/";
-  for (size_t i = 0; i + 1 < comps.size(); ++i) {
-    parent_out += (i == 0 ? "" : "/") + comps[i];
-  }
   return true;
 }
 
@@ -1441,41 +1340,42 @@ clio::run::PoolQuery Runtime::ScheduleTask(const clio::run::shared_ptr<clio::run
     case Method::kGetTargetInfo:
       return clio::run::PoolQuery::Local();
 
-    // GetOrCreateTag: check the local tag cache, then hash the name to its
-    // owner container. There is no central metadata node: every name has
-    // exactly one hash-chosen owner.
+    // Tag names are flat. A name's binding lives on the container the name
+    // hashes to; a tag's name list on its home (TagHomeHash of its id).
     case Method::kGetOrCreateTag: {
       auto typed = task.template Cast<GetOrCreateTagTask<CreateParams>>();
-      std::string tag_name = typed->tag_name_.str();
-      bool tag_exists = false;
-      {
-        tag_exists = (tag_name_to_id_.find(tag_name) != nullptr);
-      }
-      if (tag_exists) {
-        return clio::run::PoolQuery::Local();
-      }
-      std::hash<std::string> string_hasher;
-      clio::run::u32 hash_value = static_cast<clio::run::u32>(string_hasher(tag_name));
-      return clio::run::PoolQuery::DirectHash(hash_value);
+      return clio::run::PoolQuery::DirectHash(NameHash(typed->tag_name_.str()));
     }
-
-    // DelTag by NAME goes to the name's hash owner, with no local shortcut:
-    // the delete must reach the owner whether or not this container holds a
-    // copy. DelTag by ID removes this container's share of the tag (its
-    // TagInfo and the blobs it holds), so it runs locally.
     case Method::kDelTag: {
       auto typed = task.template Cast<DelTagTask>();
-      if (typed->tag_id_.IsNull() && !typed->tag_name_.str().empty()) {
-        std::hash<std::string> string_hasher;
-        clio::run::u32 hash_value =
-            static_cast<clio::run::u32>(string_hasher(typed->tag_name_.str()));
-        return clio::run::PoolQuery::DirectHash(hash_value);
+      if (typed->tag_id_.IsNull()) {
+        return clio::run::PoolQuery::DirectHash(NameHash(typed->tag_name_.str()));
       }
-      return clio::run::PoolQuery::Local();
+      return clio::run::PoolQuery::DirectHash(TagHomeHash(typed->tag_id_));
     }
-
-    // Tag-name publication is a per-container table update; each filesystem
-    // container publishes the names it owns into its own node's CTE.
+    case Method::kRenameTag: {
+      auto typed = task.template Cast<RenameTagTask>();
+      if (typed->tag_id_.IsNull()) {
+        return clio::run::PoolQuery::DirectHash(NameHash(typed->old_name_.str()));
+      }
+      return clio::run::PoolQuery::DirectHash(TagHomeHash(typed->tag_id_));
+    }
+    case Method::kGetOrCreateTagAlias: {
+      auto typed = task.template Cast<GetOrCreateTagAliasTask>();
+      return clio::run::PoolQuery::DirectHash(NameHash(typed->alias_name_.str()));
+    }
+    case Method::kGetTagName: {
+      auto typed = task.template Cast<GetTagNameTask>();
+      return clio::run::PoolQuery::DirectHash(TagHomeHash(typed->tag_id_));
+    }
+    case Method::kGetNumAliases: {
+      auto typed = task.template Cast<GetNumAliasesTask>();
+      if (typed->tag_id_.IsNull()) {
+        return clio::run::PoolQuery::DirectHash(NameHash(typed->tag_name_.str()));
+      }
+      return clio::run::PoolQuery::DirectHash(TagHomeHash(typed->tag_id_));
+    }
+    // The batched name verb routes its own steps from wherever it runs.
     case Method::kUpdateTagNames:
       return clio::run::PoolQuery::Local();
 
@@ -2134,26 +2034,26 @@ clio::run::TaskResume Runtime::GetOrCreateTag(
   try {
     std::string tag_name = task->tag_name_.str();
     TagId preferred_id = task->tag_id_;
-    auto *ipc_manager = CLIO_IPC;
-    clio::run::u32 local_node_id = ipc_manager->GetNodeId();
 
-    // Check if this is a returning task from a remote canonical node
-    // Hierarchical (absolute-path) names are never cached as flat remote
-    // bindings: they are created through the chain on the container the name
-    // hashes to, so a preferred id is adopted INTO the hierarchy below instead
-    // of being inserted as a flat key the hierarchy walk cannot find.
-    bool is_remote_tag =
-        !IsHierPath(tag_name) &&
-        (preferred_id.major_ != 0 && preferred_id.major_ != local_node_id);
-
+    // The name's binding lives on the container the name hashes to. Any
+    // other container that gets the request holds no binding: with a known
+    // id and a fault handler it is that container's handler registration
+    // (the CAE sends one to every container); anything else was misrouted
+    // and goes to the owner.
+    const bool is_remote_tag = !OwnsHash(NameHash(tag_name));
+    if (is_remote_tag &&
+        (preferred_id.IsNull() || task->fault_pool_id_.IsNull())) {
+      auto fwd = client_.AsyncGetOrCreateTag(
+          tag_name, preferred_id,
+          clio::run::PoolQuery::DirectHash(NameHash(tag_name)));
+      CLIO_CO_AWAIT(fwd);
+      task->tag_id_ = fwd->tag_id_;
+      task->created_ = fwd->created_;
+      task->tag_size_ = fwd->tag_size_;
+      task->return_code_ = fwd->GetReturnCode();
+      CLIO_CO_RETURN;
+    }
     if (is_remote_tag) {
-      TagId *existing_tag_id_ptr = tag_name_to_id_.find(tag_name);
-      if (existing_tag_id_ptr == nullptr) {
-        tag_name_to_id_.insert_or_assign(tag_name, preferred_id);
-        // Mirror the binding into the search index so a Local TagQuery still
-        // sees remote-canonical tag names (parity with the old full scan). (#598)
-        tag_search_.Insert(ResolveTagName(tag_name), preferred_id);
-      }
       // A FAULT HANDLER registered on a remote-canonical tag must still take
       // effect HERE: a blob op on this tag that lands on this container
       // (hashed owner, or node-local by-reference routing) consults THIS
@@ -2185,17 +2085,25 @@ clio::run::TaskResume Runtime::GetOrCreateTag(
     // created_ comes from the insert that actually won, so of several racing
     // creators of one name exactly one sees created_=1 -- O_EXCL and mkdir
     // exclusivity across nodes key off it.
-    //
-    // Absolute paths are created as a hierarchy ("/a/b/c" -> "/", "/a", "/a/b",
-    // "/a/b/c") with each child stored relative to its parent; the returned id
-    // is the deepest tag. Flat names create a single tag (legacy behavior).
     bool leaf_created = false;
-    TagId tag_id = GetOrCreateTagChain(tag_name, preferred_id, &leaf_created);
+    TagId tag_id = GetOrAssignTagId(tag_name, preferred_id, &leaf_created);
     task->tag_id_ = tag_id;
     task->created_ = leaf_created ? 1u : 0u;
+    // A new tag whose home is another container: its name list starts there.
+    if (leaf_created && !OwnsHash(TagHomeHash(tag_id))) {
+      std::vector<TagNameOpRec> steps(1);
+      steps[0].op_ = TagNameOp::kHomeAdd;
+      steps[0].tag_ = tag_id;
+      steps[0].name_ = tag_name;
+      std::vector<TagNameOpRec> res;
+      CLIO_CO_AWAIT(SendNameSteps(std::move(steps), &res));
+    }
 
     auto now = GetCurrentTimeNs();
     {
+      if (!task->fault_pool_id_.IsNull() && !tag_id_to_info_.contains(tag_id)) {
+        EditTagInfo(tag_id, [](TagInfo &) {});  // a share to hold the handler
+      }
       std::shared_ptr<TagInfo> tag_info_ptr = tag_id_to_info_.get(tag_id);
       if (tag_info_ptr != nullptr) {
         tag_info_ptr->last_read_ = GetWallTimeNs()  /* atime: wall clock */;
@@ -5382,26 +5290,17 @@ clio::run::TaskResume Runtime::MultiDelTag(
   task->num_ok_ = 0;
   task->first_rc_ = 0;
   {
-    auto *ipc_manager = CLIO_CPU_IPC;
+    // Each tag's share on this container, one after another on this fiber:
+    // one scheduled task for the whole set.
     std::vector<TagId> tags = DecodeMultiDelTags(task->tags_);
     for (const TagId &tag : tags) {
-      // DelTag's own logic on this fiber, nested like MultiPutBlob's puts:
-      // one scheduled task for the whole set.
-      auto sub = ipc_manager->NewTask<DelTagTask>(
-          clio::run::CreateTaskId(), task->pool_id_,
-          clio::run::PoolQuery::Local(), tag);
-      sub.get()->BeginRunContext();
-      CLIO_CO_AWAIT(DelTag(sub));
-      const clio::run::u32 rc = sub->GetReturnCode();
-      if (rc == 0) {
-        ++task->num_ok_;
-      } else if (task->first_rc_ == 0) {
-        task->first_rc_ = static_cast<int>(rc);
-      }
+      bool found = false;
+      CLIO_CO_AWAIT(DelTagShare(tag, &found));
+      if (found) ++task->num_ok_;
     }
   }
-  // Like DelTag by id: a container with no share of a tag is not an error
-  // for the set; the per-tag outcome is in num_ok_ / first_rc_.
+  // A container with no share of a tag is not an error for the set; num_ok_
+  // counts the shares dropped.
   task->SetReturnCode(0);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -6226,10 +6125,9 @@ void Runtime::LogTagIdentity(const TagId &tag_id, const TagInfo &info) {
 
 clio::run::TaskResume Runtime::RenameTag(clio::run::shared_ptr<RenameTagTask> &task) {
   CLIO_TASK_BODY_BEGIN
-  try {
-    TagId tag_id = task->tag_id_;
-    std::string old_name = task->old_name_.str();
-    std::string new_name = task->new_name_.str();
+  {
+    const std::string old_name = task->old_name_.str();
+    const std::string new_name = task->new_name_.str();
     if (old_name.empty() || new_name.empty()) {
       task->return_code_ = 1;
       CLIO_CO_RETURN;
@@ -6238,118 +6136,17 @@ clio::run::TaskResume Runtime::RenameTag(clio::run::shared_ptr<RenameTagTask> &t
       task->return_code_ = 0;
       CLIO_CO_RETURN;
     }
-
-    // The tag keeps its TagId — only the name changes, so its blobs (keyed by
-    // TagId) are untouched, and so are any CHILDREN (they reference this tag's
-    // id, which does not change). That is what makes moving a directory tag
-    // O(1) regardless of how many descendants it has.
-    if (IsHierPath(old_name) && IsHierPath(new_name)) {
-      // ---- Hierarchical move: rebind only the leaf under its new parent. ----
-      // Split destination into parent path + leaf.
-      std::vector<std::string> comps = SplitPathComponents(new_name);
-      if (comps.empty()) {
-        task->return_code_ = 1;  // cannot rename onto the root
-        CLIO_CO_RETURN;
-      }
-      std::string new_leaf = comps.back();
-      std::string new_parent_path = "/";
-      for (size_t i = 0; i + 1 < comps.size(); ++i) {
-        new_parent_path += (i == 0 ? "" : "/") + comps[i];
-      }
-
-      // Get-or-create the destination parent chain FIRST, before taking the tag
-      // map lock — GetOrCreateTagChain acquires tag_map_lock_ itself, so it
-      // cannot run while we hold it. Auto-creates missing parents (mkdir -p).
-      TagId new_parent_id = GetOrCreateTagChain(new_parent_path);
-      std::string new_rel = MakeRelativeName(new_parent_id, new_leaf);
-
-      // Resolve the source, move the name binding, and refresh the stored name
-      // as a SINGLE atomic read-modify-write under the write lock. The previous
-      // design read the tag's current name under a read lock, released it, then
-      // erased that value under a separate write lock — so a name read before
-      // the lock could go stale and erase a binding a racing rename/create had
-      // since reassigned to a *different* tag. That left a tag still resolvable
-      // upward (readdir/stat list it) but not forward (unlink/rmdir cannot find
-      // it). Reading the canonical name under the SAME lock that erases it, with
-      // no gap, serializes overlapping renames and keeps tag_name_to_id_ and the
-      // per-tag canonical name in agreement. See issue #596.
-      {
-        if (tag_id.IsNull()) {
-          tag_id = ResolvePathToIdLocked(old_name);
-        }
-        if (tag_id.IsNull()) {
-          task->return_code_ = 1;  // source path not found
-          CLIO_CO_RETURN;
-        }
-        std::shared_ptr<TagInfo> info = tag_id_to_info_.get(tag_id);
-        if (info == nullptr) {
-          task->return_code_ = 1;  // source tag has no metadata
-          CLIO_CO_RETURN;
-        }
-        // Fresh read of the canonical name, under the lock that erases it.
-        std::string cur_rel = info->tag_name_.str();
-        // Absolute paths BEFORE/AFTER the move. old_abs == ResolveTagName(
-        // cur_rel) is exactly the search-index key stored at insert time.
-        std::string old_abs = ResolveTagName(cur_rel);
-        std::string new_abs = ResolveTagName(new_rel);
-        if (cur_rel != new_rel) {
-          tag_name_to_id_.erase(cur_rel);
-        }
-        tag_name_to_id_.insert_or_assign(new_rel, tag_id);
-        info->tag_name_ = clio::run::priv::string(CLIO_PRIV_ALLOC, new_rel);
-        info->last_modified_ = GetWallTimeNs();
-        info->last_changed_ = info->last_modified_;  // rename => ctime bump
-
-        // Re-key this tag and its descendants in the search index from old_abs
-        // to new_abs (#598). A directory move changes the absolute names of the
-        // whole subtree, so move every entry under old_abs; a file moves just
-        // one. Enumerated via the index's own trigram-prefiltered prefix search
-        // => O(subtree), not O(N).
-        std::string esc = EscapeRegexLiteral(old_abs);
-        auto self_hit = tag_search_.Search("^" + esc + "$");
-        auto descendants = tag_search_.Search("^" + esc + "/.*");
-        std::vector<std::string> movers = self_hit.keys();
-        for (const auto &k : descendants.keys()) {
-          movers.push_back(k);
-        }
-        for (const auto &k : movers) {
-          tag_search_.Rename(k, new_abs + k.substr(old_abs.size()));
-        }
-        LogTagIdentity(tag_id, *info);
-      }
-      task->tag_id_ = tag_id;
-      task->return_code_ = 0;
-      CLIO_CO_RETURN;
-    }
-
-    // ---- Flat rename (non-path tags): move the verbatim name binding. ----
-    // Broadcast: each container moves the name->id binding it happens to hold.
-    TagId *idp = tag_name_to_id_.find(old_name);
-    if (idp != nullptr) {
-      TagId bound = *idp;
-      if (tag_id.IsNull()) {
-        tag_id = bound;
-      }
-      tag_name_to_id_.erase(old_name);
-      tag_name_to_id_.insert_or_assign(new_name, bound);
-    }
-    if (!tag_id.IsNull()) {
-      std::shared_ptr<TagInfo> info = tag_id_to_info_.get(tag_id);
-      if (info != nullptr) {
-        info->tag_name_ = clio::run::priv::string(CLIO_PRIV_ALLOC, new_name);
-        info->last_modified_ = GetWallTimeNs();
-        info->last_changed_ = info->last_modified_;  // rename => ctime bump
-        LogTagIdentity(tag_id, *info);
-      }
-    }
-    // Flat tags have no hierarchy, so the index key is the verbatim name; move
-    // the single entry (no-op if it was never indexed). (#598)
-    tag_search_.Rename(old_name, new_name);
-    task->tag_id_ = tag_id;
-    task->return_code_ = 0;
-  } catch (const std::exception &e) {
-    HLOG(kError, "RenameTag failed: {}", e.what());
-    task->return_code_ = 1;
+    // The tag keeps its TagId, so its blobs (keyed by TagId) are untouched.
+    std::vector<TagNameOpRec> ops(1);
+    ops[0].op_ = TagNameOp::kRename;
+    ops[0].tag_ = task->tag_id_;
+    ops[0].name_ = old_name;
+    ops[0].name2_ = new_name;
+    std::vector<TagNameOpRec> res;
+    CLIO_CO_AWAIT(RunNameOps(std::move(ops), &res));
+    const bool ok = res[0].op_ == static_cast<TagNameOp>(kTnOk);
+    if (ok) task->tag_id_ = res[0].tag_;
+    task->return_code_ = ok ? 0 : 1;
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -6358,448 +6155,184 @@ clio::run::TaskResume Runtime::RenameTag(clio::run::shared_ptr<RenameTagTask> &t
 clio::run::TaskResume Runtime::GetOrCreateTagAlias(
     clio::run::shared_ptr<GetOrCreateTagAliasTask> &task) {
   CLIO_TASK_BODY_BEGIN
-  try {
-    TagId tag_id = task->tag_id_;
-    std::string existing_name = task->existing_name_.str();
-    std::string alias_name = task->alias_name_.str();
+  {
+    const std::string alias_name = task->alias_name_.str();
     if (alias_name.empty()) {
       task->return_code_ = 1;
       CLIO_CO_RETURN;
     }
-
-    // Phase A: resolve + verify the target tag exists. The target may be given
-    // by id or by name (absolute paths are walked through the hierarchy).
-    {
-      if (tag_id.IsNull() && !existing_name.empty()) {
-        if (IsHierPath(existing_name)) {
-          tag_id = ResolvePathToIdLocked(existing_name);
-        }
-        if (tag_id.IsNull()) {
-          TagId *p = tag_name_to_id_.find(existing_name);
-          if (p != nullptr) tag_id = *p;
-        }
-      }
-      if (tag_id.IsNull() || !tag_id_to_info_.contains(tag_id)) {
-        task->found_ = 0;
-        task->tag_id_ = TagId::GetNull();
-        task->return_code_ = 0;  // found_ conveys "target missing"; not an error
-        CLIO_CO_RETURN;
-      }
-    }
-    task->found_ = 1;
-
-    // Compute the binding KEY for the alias. An absolute-path alias becomes a
-    // first-class hierarchy entry: create its parent chain (outside the lock —
-    // GetOrCreateTagChain takes tag_map_lock_) and bind the relative key
-    // "$tagid{parent}/leaf" so the link resolves, lists, and opens like any
-    // other path. A flat alias binds verbatim (legacy behavior).
-    std::string alias_key = alias_name;
-    if (IsHierPath(alias_name)) {
-      std::string parent_path, leaf;
-      if (!SplitParentLeaf(alias_name, parent_path, leaf)) {
-        task->return_code_ = 1;  // cannot alias onto the root
-        CLIO_CO_RETURN;
-      }
-      TagId parent_id = GetOrCreateTagChain(parent_path);
-      alias_key = MakeRelativeName(parent_id, leaf);
-    }
-
-    // Phase C: bind the alias key to the target id (a tag-level hard link — the
-    // alias shares the target's id and therefore all of its blobs). GetOrCreate:
-    // if the key is already bound, return whatever it points at unchanged.
-    {
-      TagId *existing_alias = tag_name_to_id_.find(alias_key);
-      if (existing_alias != nullptr) {
-        tag_id = *existing_alias;
-      } else {
-        tag_name_to_id_.insert_or_assign(alias_key, tag_id);
-        // Index the alias's absolute name so it is findable via TagQuery
-        // (getattr/readdir) just like a canonical name (#598). Aliases bypass
-        // GetOrAssignTagId, so this is the only place they enter the index.
-        tag_search_.Insert(ResolveTagName(alias_key), tag_id);
-        // Record the alias key on the target so DelTag cascades to it when the
-        // canonical tag is deleted. The canonical name is never added here.
-        std::shared_ptr<TagInfo> info = tag_id_to_info_.get(tag_id);
-        if (info != nullptr) {
-          bool present = (alias_key == info->tag_name_.str());
-          for (size_t i = 0; !present && i < info->aliases_.size(); ++i) {
-            if (info->aliases_[i].str() == alias_key) present = true;
-          }
-          if (!present) {
-            info->aliases_.push_back(
-                clio::run::priv::string(CLIO_PRIV_ALLOC, alias_key));
-          }
-          info->last_modified_ = GetWallTimeNs();
-          info->last_changed_ = info->last_modified_;  // link added => ctime
-          LogTagIdentity(tag_id, *info);
-        }
-      }
-    }
-    task->tag_id_ = tag_id;
-    task->return_code_ = 0;
-  } catch (const std::exception &e) {
-    HLOG(kError, "GetOrCreateTagAlias failed: {}", e.what());
-    task->return_code_ = 1;
+    // A tag-level hard link: the alias shares the target's id and so all of
+    // its blobs. The target may be given by id or by one of its names.
+    std::vector<TagNameOpRec> ops(1);
+    ops[0].op_ = TagNameOp::kAddName;
+    ops[0].tag_ = task->tag_id_;
+    ops[0].seq_ = kTnMustExist;
+    ops[0].name_ = alias_name;
+    ops[0].name2_ = task->existing_name_.str();
+    std::vector<TagNameOpRec> res;
+    CLIO_CO_AWAIT(RunNameOps(std::move(ops), &res));
+    const clio::run::u32 rc = static_cast<clio::run::u32>(res[0].op_);
+    // GetOrCreate: an alias already bound reports the tag it names.
+    task->found_ = rc == kTnMissing ? 0 : 1;
+    task->tag_id_ = rc == kTnMissing ? TagId::GetNull() : res[0].tag_;
+    task->return_code_ = 0;  // found_ conveys "target missing"; not an error
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
 
+namespace {
+
+/** Split a '\0'-joined name list (a kHomeNames / kTnDeleted result). */
+std::vector<std::string> SplitNameList(const std::string &joined) {
+  std::vector<std::string> out;
+  size_t i = 0;
+  while (i < joined.size()) {
+    size_t j = joined.find('\0', i);
+    if (j == std::string::npos) j = joined.size();
+    out.push_back(joined.substr(i, j - i));
+    i = j + 1;
+  }
+  return out;
+}
+
+/** Every name of a tag, canonical first. */
+std::vector<std::string> NamesOf(const TagInfo &t) {
+  std::vector<std::string> out;
+  if (!t.tag_name_.empty()) out.push_back(t.tag_name_.str());
+  for (size_t i = 0; i < t.aliases_.size(); ++i) {
+    out.push_back(t.aliases_[i].str());
+  }
+  return out;
+}
+
+/** Join names with '\0' (the result encoding of a name list). */
+std::string JoinNameList(const std::vector<std::string> &names) {
+  std::string out;
+  for (size_t i = 0; i < names.size(); ++i) {
+    if (i != 0) out.push_back('\0');
+    out += names[i];
+  }
+  return out;
+}
+
+/** One step record. */
+TagNameOpRec NameStep(TagNameOp op, const TagId &tag, const std::string &name,
+                      clio::run::u64 flags = 0,
+                      const std::string &name2 = std::string()) {
+  TagNameOpRec r;
+  r.op_ = op;
+  r.tag_ = tag;
+  r.seq_ = flags;
+  r.name_ = name;
+  r.name2_ = name2;
+  return r;
+}
+
+/** True for a step result of `rc`. */
+bool StepIs(const TagNameOpRec &r, clio::run::u32 rc) {
+  return static_cast<clio::run::u32>(r.op_) == rc;
+}
+
+}  // namespace
+
 clio::run::TaskResume Runtime::DelTag(clio::run::shared_ptr<DelTagTask> &task) {
   CLIO_TASK_BODY_BEGIN
-  try {
+  {
     TagId tag_id = task->tag_id_;
-    std::string tag_name = task->tag_name_.str();
-
-    // Step 1: Resolve the tag id AND the tag_name_to_id_ key the request
-    // resolves *through* (resolved_key). For an absolute path that key is the
-    // relative "$tagid{parent}/leaf"; for a flat name it is the name itself;
-    // for a by-id delete it stays empty. resolved_key is what distinguishes
-    // deleting an alias (a non-canonical name) from deleting the tag itself.
-    std::string resolved_key;
-    if (tag_id.IsNull() && !tag_name.empty()) {
-      if (IsHierPath(tag_name)) {
-        std::string parent_path, leaf;
-        if (tag_name == "/") {
-          TagId *r = tag_name_to_id_.find(std::string("/"));
-          if (r != nullptr) { tag_id = *r; resolved_key = "/"; }
-        } else if (SplitParentLeaf(tag_name, parent_path, leaf)) {
-          TagId parent_id = ResolvePathToIdLocked(parent_path);
-          if (!parent_id.IsNull()) {
-            std::string key = MakeRelativeName(parent_id, leaf);
-            TagId *p = tag_name_to_id_.find(key);
-            if (p != nullptr) { tag_id = *p; resolved_key = key; }
-          }
-        }
-      }
-      // Fall back to a verbatim lookup (flat tags and flat aliases).
-      if (tag_id.IsNull()) {
-        TagId *p = tag_name_to_id_.find(tag_name);
-        if (p != nullptr) { tag_id = *p; resolved_key = tag_name; }
-      }
-      if (tag_id.IsNull()) {
-        task->return_code_ = 1;  // Tag not found by name
+    const std::string tag_name = task->tag_name_.str();
+    std::vector<TagNameOpRec> res;
+    if (tag_id.IsNull()) {
+      if (tag_name.empty()) {
+        task->return_code_ = 1;
         CLIO_CO_RETURN;
       }
+      std::vector<TagNameOpRec> look{
+          NameStep(TagNameOp::kLookup, TagId::GetNull(), tag_name)};
+      CLIO_CO_AWAIT(SendNameSteps(std::move(look), &res));
+      if (!StepIs(res[0], kTnOk)) {
+        task->return_code_ = 1;  // no such name
+        CLIO_CO_RETURN;
+      }
+      tag_id = res[0].tag_;
       task->tag_id_ = tag_id;
-    } else if (tag_id.IsNull() && tag_name.empty()) {
-      task->return_code_ = 1;
-      CLIO_CO_RETURN;
     }
+    // The tag's home decides: a name that is not the tag's last (an alias,
+    // or with POSIX unlink any name while another is left) is only unbound;
+    // otherwise the tag goes, with every name it has.
+    std::vector<TagNameOpRec> home{
+        tag_name.empty()
+            ? NameStep(TagNameOp::kHomeDrop, tag_id, std::string())
+            : NameStep(TagNameOp::kHomeUnlink, tag_id, tag_name,
+                       task->posix_unlink_ != 0 ? kTnPosix : 0)};
+    res.clear();
+    CLIO_CO_AWAIT(SendNameSteps(std::move(home), &res));
+    const bool deleted = StepIs(res[0], kTnDeleted);
+    std::vector<std::string> names =
+        deleted ? SplitNameList(res[0].name_)
+                : std::vector<std::string>{tag_name};
+    std::vector<TagNameOpRec> unbind;
+    for (const std::string &n : names) {
+      if (!n.empty()) unbind.push_back(NameStep(TagNameOp::kUnbind, tag_id, n));
+    }
+    if (!unbind.empty()) {
+      res.clear();
+      CLIO_CO_AWAIT(SendNameSteps(std::move(unbind), &res));
+    }
+    clio::run::u32 shares = 0;
+    if (deleted) {
+      // A tag's blobs hash to every container: each drops its own share.
+      auto f = client_.AsyncMultiDelTag({tag_id},
+                                        clio::run::PoolQuery::Broadcast());
+      CLIO_CO_AWAIT(f);
+      shares = f->num_ok_;
+    }
+    // By id, a tag nobody knew is "not found"; by name the name existed.
+    task->return_code_ =
+        (tag_name.empty() && names.empty() && shares == 0) ? 1 : 0;
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
 
-    // Step 2: Find the tag by ID and capture its canonical (own) stored name
-    // and its absolute path (the search-index key) while the subtree is intact.
-    std::string canonical;
-    std::string del_abs;
-    {
-      std::shared_ptr<TagInfo> tag_info_ptr = tag_id_to_info_.get(tag_id);
-      if (tag_info_ptr == nullptr) {
-        task->return_code_ = 1;  // Tag not found by ID
-        CLIO_CO_RETURN;
-      }
-      canonical = tag_info_ptr->tag_name_.str();
-      del_abs = ResolveTagName(canonical);
+clio::run::TaskResume Runtime::DelTagShare(TagId tag_id, bool *found) {
+#ifdef CLIO_ENABLE_BOOST_COROUTINES
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
+#endif
+  CLIO_TASK_BODY_BEGIN
+  {
+    // Every blob this container holds under the tag, from the per-tag index,
+    // deleted as ONE plan (lock + invalidate each, one FreeBlocks per pool):
+    // its own blobs and the shadow copies it keeps for other containers.
+    std::vector<std::pair<TagId, std::string>> blobs;
+    for (auto &name : BlobIndexNames(tag_id)) {
+      blobs.emplace_back(tag_id, std::move(name));
     }
-
-    // Capture the target's ancestor id chain (immediate parent up to, but
-    // excluding, the root) BEFORE any deletion. After the subtree is removed we
-    // prune any of these that became an empty directory. GetOrCreateTagChain
-    // materializes a tag for every path component, so deleting the last file
-    // under "/a/b" would otherwise leave orphaned "/a" and "/a/b" tags that keep
-    // CteDirExists("/a") true forever. An *explicit* cfs directory always keeps
-    // its reserved ".__clio_dir__" child, so it is never childless and is never
-    // pruned here.
-    std::vector<TagId> ancestor_chain;
-    {
-      TagId root_id;
-      TagId *rp = tag_name_to_id_.find(std::string("/"));
-      if (rp != nullptr) root_id = *rp;
-      std::string name = canonical;
-      TagId parent;
-      std::string leaf;
-      while (ParseTagRef(name, parent, leaf)) {
-        if (!root_id.IsNull() && parent == root_id) break;  // never prune root
-        std::shared_ptr<TagInfo> pinfo = tag_id_to_info_.get(parent);
-        if (pinfo == nullptr) break;
-        ancestor_chain.push_back(parent);
-        name = pinfo->tag_name_.str();
-      }
-    }
-
-    // If the request resolved through a key that is NOT the tag's own canonical
-    // name, it is an alias/hard-link "unlink": drop only that one name binding
-    // and leave the tag, its blobs, and other names intact. Deleting by id, or
-    // through the canonical name, falls through to a full recursive delete that
-    // cascades to every alias below.
-    if (!resolved_key.empty() && resolved_key != canonical) {
-      tag_name_to_id_.erase(resolved_key);
-      // Drop just this alias name from the search index; the tag and its other
-      // names (canonical + remaining aliases) stay. (#598)
-      tag_search_.Delete(ResolveTagName(resolved_key));
-      std::shared_ptr<TagInfo> tag_info_ptr = tag_id_to_info_.get(tag_id);
-      if (tag_info_ptr != nullptr) {
-        for (size_t i = 0; i < tag_info_ptr->aliases_.size(); ++i) {
-          if (tag_info_ptr->aliases_[i].str() == resolved_key) {
-            tag_info_ptr->aliases_.erase(tag_info_ptr->aliases_.begin() + i);
-            break;
-          }
-        }
-        tag_info_ptr->last_changed_ = GetWallTimeNs();  // unlink => ctime
-        tag_info_ptr->last_modified_ = tag_info_ptr->last_changed_;
-        LogTagIdentity(tag_id, *tag_info_ptr);
-      }
-      task->return_code_ = 0;
-      CLIO_CO_RETURN;
-    }
-
-    // Unlinking the CANONICAL name while hard-link aliases still exist must NOT
-    // destroy the file: POSIX keeps the inode alive until the last link is
-    // removed. Promote a surviving alias to be the new canonical name and drop
-    // only the unlinked name; the tag, its blobs, and remaining links stay.
-    // (#680: without this, `link(a,b); unlink(a)` also destroyed b, which spun
-    // t_mtab's lock loop forever -- the real cause of the generic/089 "hang".)
-    // Only when the caller requested POSIX unlink (the FUSE/filesystem layer);
-    // a direct core "delete tag" (posix_unlink_==0) still cascades to all names.
-    if (task->posix_unlink_ != 0) {
-      std::shared_ptr<TagInfo> tinfo = tag_id_to_info_.get(tag_id);
-      if (!resolved_key.empty() && resolved_key == canonical &&
-          tinfo != nullptr && !tinfo->aliases_.empty()) {
-        std::string new_canonical = tinfo->aliases_[0].str();
-        tinfo->aliases_.erase(tinfo->aliases_.begin());
-        // Remove ONLY the old canonical name binding (name hash + search index);
-        // the promoted alias is already bound under its own key, so the tag stays
-        // fully resolvable under its new canonical and any other aliases.
-        tag_name_to_id_.erase(resolved_key);
-        tag_search_.Delete(del_abs);
-        tinfo->tag_name_ = clio::run::priv::string(CLIO_PRIV_ALLOC, new_canonical);
-        tinfo->last_changed_ = GetWallTimeNs();   // unlink => ctime
-        tinfo->last_modified_ = tinfo->last_changed_;
-        LogTagIdentity(tag_id, *tinfo);
-        task->return_code_ = 0;
-        CLIO_CO_RETURN;
-      }
-    }
-
-    // Full recursive delete: remove this tag and its whole subtree from the
-    // search index (#598), using the absolute path captured before any deletion.
-    // O(subtree) via the index's trigram-prefiltered prefix search.
-    {
-      // The self entry is keyed by exactly del_abs, so delete it directly --
-      // no need to compile a std::regex to rediscover a key we already hold
-      // (#680; this runs on every unlink/rmdir). Delete() is a no-op if absent.
-      if (!del_abs.empty()) tag_search_.Delete(del_abs);
-      // Descendants need the prefix search -- but only a hierarchy node can
-      // have any. For a flat or NAMELESS tag (a node's accounting share of a
-      // file whose pages it holds) del_abs is "" and the pattern "^/.*"
-      // matched every path on the node: an O(all tags) sweep per delete.
-      TagId sweep_parent;
-      std::string sweep_leaf;
-      if (canonical == "/" || ParseTagRef(canonical, sweep_parent, sweep_leaf)) {
-        std::string esc = EscapeRegexLiteral(del_abs);
-        auto descendants = tag_search_.Search("^" + esc + "/.*");
-        // keys() is a snapshot independent of the engine's maps, so deleting
-        // from the engine while iterating it is safe.
-        for (const auto &k : descendants.keys()) {
-          tag_search_.Delete(k);
-        }
-      }
-    }
-
-    // Step 3: Determine the full set of tags to delete — the target plus every
-    // transitive hierarchical descendant. A child stores its parent's id in
-    // its name ("$tagid{parent}/leaf"), so build parent->children once and BFS
-    // from the target. A flat or leaf tag has no descendants and deletes only
-    // itself; a directory tag deletes its entire subtree (rm -r semantics).
-    std::vector<TagId> to_delete;
-    // Alias absolute names of the deleted tags. Canonical names live under
-    // del_abs and were removed by the prefix cleanup above, but an alias can
-    // resolve OUTSIDE that subtree (e.g. a hard link elsewhere), so collect and
-    // remove those from the search index too. (#598)
-    std::vector<std::string> dead_alias_abs;
-    {
-      // Only a hierarchy node ("/" or "$tagid{parent}/leaf") can have
-      // children; a flat or nameless tag deletes just itself, without the
-      // O(all tags) scan that building the child map costs.
-      TagId unused_parent;
-      std::string unused_leaf;
-      const bool may_have_children =
-          canonical == "/" ||
-          ParseTagRef(canonical, unused_parent, unused_leaf);
-      std::unordered_map<TagId, std::vector<TagId>> children;
-      if (may_have_children) {
-        tag_id_to_info_.for_each([&](const TagId &id, const std::shared_ptr<TagInfo> &info_sp) { const TagInfo &info = *info_sp; (void)info;
-          TagId parent;
-          std::string leaf;
-          if (ParseTagRef(info.tag_name_.str(), parent, leaf)) {
-            children[parent].push_back(id);
-          }
-        }, ctp::priv::ForEachLock::kShared);
-      }
-      std::vector<TagId> frontier{tag_id};
-      while (!frontier.empty()) {
-        TagId cur = frontier.back();
-        frontier.pop_back();
-        to_delete.push_back(cur);
-        std::shared_ptr<TagInfo> cinfo = tag_id_to_info_.get(cur);
-        if (cinfo != nullptr) {
-          for (size_t i = 0; i < cinfo->aliases_.size(); ++i) {
-            dead_alias_abs.push_back(ResolveTagName(cinfo->aliases_[i].str()));
-          }
-        }
-        auto it = children.find(cur);
-        if (it != children.end()) {
-          for (const TagId &c : it->second) frontier.push_back(c);
-        }
-      }
-    }
-    if (!dead_alias_abs.empty()) {
-      for (const auto &a : dead_alias_abs) {
-        tag_search_.Delete(a);
-      }
-    }
-
-    // Step 4: collect every blob this container holds under those tags,
-    // from the per-tag index (no scan of the whole blob table).
-    std::vector<std::pair<TagId, std::string>> blobs_to_delete;
-    for (const TagId &del_id : to_delete) {
-      for (auto &name : BlobIndexNames(del_id)) {
-        blobs_to_delete.emplace_back(del_id, std::move(name));
-      }
-    }
-    // Step 5: delete them as ONE plan (lock + invalidate each, then one
-    // FreeBlocks per pool for all of them), not one DelBlob task per blob.
-    // LOCAL by construction: DelTag runs on every container, and each
-    // deletes the copies IT holds -- its own blobs and the shadow copies it
-    // keeps for other containers.
-    const size_t processed_blobs = blobs_to_delete.size();
-    CLIO_CO_AWAIT(DeleteBlobsPlanned(blobs_to_delete));
-
-    // Step 6: erase blob-name mappings for all deleted tags (a DelBlob
-    // above that failed or raced still leaves its key here).
-    for (const auto &tb : blobs_to_delete) {
+    std::shared_ptr<TagInfo> info = tag_id_to_info_.get(tag_id);
+    *found = info != nullptr || !blobs.empty() || HasTagXattrs(tag_id);
+    const clio::run::u64 total_size = info != nullptr ? info->total_size_ : 0;
+    CLIO_CO_AWAIT(DeleteBlobsPlanned(blobs));
+    // A delete that failed or raced still leaves its key here.
+    for (const auto &tb : blobs) {
       const std::string key = std::to_string(tb.first.major_) + "." +
-                              std::to_string(tb.first.minor_) + "." +
-                              tb.second;
+                              std::to_string(tb.first.minor_) + "." + tb.second;
       tag_blob_name_to_info_.erase(key);
       BlobIndexErase(key);
       shm_cache_.EraseBlob(key);  // issue #783: keep the mirror from going stale
     }
-
-    // Step 7: erase each tag's name binding(s) + aliases, WAL-log the delete,
-    // and drop the TagInfo.
-    size_t total_size = 0;
-    const clio::run::u32 wid = tag_txn_logs_.empty()
-                             ? 0
-                             : CLIO_CUR_WORKER->GetWorkerStats().worker_id_;
-    for (const TagId &del_id : to_delete) {
-      std::string del_name;
-      std::vector<std::string> del_aliases;
-      {
-        std::shared_ptr<TagInfo> info = tag_id_to_info_.get(del_id);
-        if (info != nullptr) {
-          total_size += info->total_size_;
-          del_name = info->tag_name_.str();
-          if (!info->tag_name_.empty()) {
-            tag_name_to_id_.erase(info->tag_name_.str());
-          }
-          // Cascade: remove every alias name bound to this tag. Captured
-          // into del_aliases BEFORE erasing so the WAL record below can
-          // replay the same cleanup (issue: aliases dangling in
-          // tag_name_to_id_ after a replayed delete otherwise).
-          del_aliases.reserve(info->aliases_.size());
-          for (size_t i = 0; i < info->aliases_.size(); ++i) {
-            del_aliases.push_back(info->aliases_[i].str());
-            tag_name_to_id_.erase(info->aliases_[i].str());
-          }
-        }
-      }
-      if (!tag_txn_logs_.empty()) {
-        TxnDelTag txn;
-        txn.tag_name_ = del_name;
-        txn.tag_major_ = del_id.major_;
-        txn.tag_minor_ = del_id.minor_;
-        txn.aliases_ = del_aliases;
-        tag_txn_logs_[wid % tag_txn_logs_.size()]->Log(TxnType::kDelTag, txn);
-      }
-      {
-        tag_id_to_info_.erase(del_id);
-      }
-      EraseTagXattrs(del_id);
+    if (*found && !tag_txn_logs_.empty()) {
+      TxnDelTag txn;  // names are unbound by their own records
+      txn.tag_major_ = tag_id.major_;
+      txn.tag_minor_ = tag_id.minor_;
+      const clio::run::u32 wid = CLIO_CUR_WORKER->GetWorkerStats().worker_id_;
+      tag_txn_logs_[wid % tag_txn_logs_.size()]->Log(TxnType::kDelTag, txn);
     }
-
-    // Step 7b: prune now-empty auto-created parent directories, bottom-up. Stop
-    // at the first ancestor that still has a child (it — and everything above —
-    // stays). Pruning a child first can make its parent childless, so each
-    // iteration re-checks against the live tag table.
-    for (const TagId &anc : ancestor_chain) {
-      bool has_child = false;
-      {
-        if (!tag_id_to_info_.contains(anc)) {
-          continue;  // already removed (e.g. part of the deleted subtree)
-        }
-        // A parent holding state -- an xattr section or blobs -- was made on
-        // purpose, not materialized for a path: it is not empty, so it and
-        // everything above it stay. Pruning one dropped only its TagInfo
-        // here, but the kDelTag record below erases its xattrs and blobs on
-        // replay: a filesystem directory's inode record survived the delete
-        // of its last child and vanished at the next restart, leaving its
-        // row naming an inode with no state.
-        if (HasTagXattrs(anc) || !BlobIndexNames(anc).empty()) break;
-        tag_id_to_info_.for_each([&](const TagId &id, const std::shared_ptr<TagInfo> &info_sp) { const TagInfo &info = *info_sp; (void)info;
-          (void)id;
-          if (has_child) return;
-          TagId cparent;
-          std::string cleaf;
-          if (ParseTagRef(info.tag_name_.str(), cparent, cleaf) &&
-              cparent == anc) {
-            has_child = true;
-          }
-        }, ctp::priv::ForEachLock::kShared);
-      }
-      if (has_child) {
-        break;  // non-empty directory: this and all higher ancestors persist
-      }
-      std::string anc_name;
-      std::vector<std::string> anc_aliases;
-      {
-        std::shared_ptr<TagInfo> info = tag_id_to_info_.get(anc);
-        if (info == nullptr) continue;
-        anc_name = info->tag_name_.str();
-        std::string anc_abs = ResolveTagName(anc_name);  // parent chain intact
-        if (!info->tag_name_.empty()) {
-          tag_name_to_id_.erase(anc_name);
-        }
-        anc_aliases.reserve(info->aliases_.size());
-        for (size_t i = 0; i < info->aliases_.size(); ++i) {
-          anc_aliases.push_back(info->aliases_[i].str());
-          tag_name_to_id_.erase(info->aliases_[i].str());
-        }
-        tag_search_.Delete(anc_abs);
-        tag_id_to_info_.erase(anc);
-      }
-      if (!tag_txn_logs_.empty()) {
-        TxnDelTag txn;
-        txn.tag_name_ = anc_name;
-        txn.tag_major_ = anc.major_;
-        txn.tag_minor_ = anc.minor_;
-        txn.aliases_ = anc_aliases;
-        tag_txn_logs_[wid % tag_txn_logs_.size()]->Log(TxnType::kDelTag, txn);
-      }
+    tag_id_to_info_.erase(tag_id);
+    EraseTagXattrs(tag_id);
+    if (*found) {
+      auto now = GetCurrentTimeNs();
+      LogTelemetry(CteOp::kDelTag, 0, total_size, tag_id, now, now);
     }
-
-    // Log telemetry for the DelTag operation (attributed to the target tag).
-    auto now = GetCurrentTimeNs();
-    LogTelemetry(CteOp::kDelTag, 0, total_size, tag_id, now, now);
-
-    task->return_code_ = 0;
-    HLOG(kDebug,
-         "DelTag successful: tag_id={},{}, removed {} tags, {} blobs, "
-         "total_size={}",
-         tag_id.major_, tag_id.minor_, to_delete.size(), processed_blobs,
-         total_size);
-
-  } catch (const std::exception &e) {
-    task->return_code_ = 1;
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -6807,28 +6340,27 @@ clio::run::TaskResume Runtime::DelTag(clio::run::shared_ptr<DelTagTask> &task) {
 
 clio::run::TaskResume Runtime::GetTagName(clio::run::shared_ptr<GetTagNameTask> &task) {
   CLIO_TASK_BODY_BEGIN
-  try {
-    TagId tag_id = task->tag_id_;
-    std::string stored;
-    bool found = false;
-    {
-      std::shared_ptr<TagInfo> info = tag_id_to_info_.get(tag_id);
-      if (info != nullptr) {
-        stored = info->tag_name_.str();
-        found = true;
-      }
-      // ResolveTagName walks parent ids in tag_id_to_info_; keep it under the
-      // same read lock so the hierarchy can't shift mid-resolution.
-      if (found) {
-        std::string full = ResolveTagName(stored);
-        task->tag_name_ = clio::run::priv::string(CLIO_PRIV_ALLOC, full);
+  {
+    const TagId tag_id = task->tag_id_;
+    std::string name;
+    std::shared_ptr<TagInfo> info = tag_id_to_info_.get(tag_id);
+    if (info != nullptr) name = info->tag_name_.str();
+    if (name.empty() && !OwnsHash(TagHomeHash(tag_id))) {
+      // Only the tag's home holds its name list.
+      std::vector<TagNameOpRec> res;
+      std::vector<TagNameOpRec> ask{
+          NameStep(TagNameOp::kHomeNames, tag_id, std::string())};
+      CLIO_CO_AWAIT(SendNameSteps(std::move(ask), &res));
+      if (StepIs(res[0], kTnOk)) {
+        std::vector<std::string> names = SplitNameList(res[0].name_);
+        if (!names.empty()) name = names[0];
       }
     }
-    task->found_ = found ? 1 : 0;
+    if (!name.empty()) {
+      task->tag_name_ = clio::run::priv::string(CLIO_PRIV_ALLOC, name);
+    }
+    task->found_ = name.empty() ? 0 : 1;
     task->return_code_ = 0;  // found_ conveys existence; the op itself is fine
-  } catch (const std::exception &e) {
-    HLOG(kError, "GetTagName failed: {}", e.what());
-    task->return_code_ = 1;
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -6946,134 +6478,72 @@ void Runtime::EditTagInfo(const TagId &id,
   tag_id_to_info_.insert_or_assign(id, std::make_shared<TagInfo>(next));
 }
 
-bool Runtime::ResolveNameStrict(const std::string &stored, std::string *abs,
-                                TagId *blocker) {
-  std::vector<std::string> parts;
-  std::string cur = stored;
-  for (int depth = 0; depth < 256; ++depth) {
-    if (cur == "/") {
-      std::string out;
-      for (auto it = parts.rbegin(); it != parts.rend(); ++it) {
-        out += "/" + *it;
-      }
-      *abs = out.empty() ? "/" : out;
-      return true;
-    }
-    TagId parent;
-    std::string leaf;
-    if (!ParseTagRef(cur, parent, leaf)) {
-      if (!parts.empty()) return false;  // a flat name cannot be a parent
-      *abs = cur;
-      return true;
-    }
-    parts.push_back(leaf);
-    std::shared_ptr<TagInfo> pinfo = tag_id_to_info_.get(parent);
-    if (pinfo == nullptr || pinfo->tag_name_.empty()) {
-      *blocker = parent;
-      return false;
-    }
-    cur = pinfo->tag_name_.str();
-  }
-  return false;
+bool Runtime::OwnsHash(clio::run::u32 h) {
+  return TargetIsNodeLocal(clio::run::PoolQuery::DirectHash(h), pool_id_);
 }
 
-void Runtime::IndexOrParkName(const TagId &id, const std::string &name) {
-  std::string abs;
-  TagId blocker;
-  if (ResolveNameStrict(name, &abs, &blocker)) {
-    tag_search_.Insert(abs, id);
-  } else if (!blocker.IsNull()) {
-    parked_names_[blocker].emplace_back(id, name);
+void Runtime::BindNameLocal(const std::string &name, const TagId &id) {
+  tag_name_to_id_.insert_or_assign(name, id);
+  tag_search_.Insert(name, id);
+  if (shm_cache_.IsEnabled()) shm_cache_.PutTagId(name, id);
+  if (!tag_txn_logs_.empty()) {
+    TxnCreateTag txn;
+    txn.tag_name_ = name;
+    txn.tag_major_ = id.major_;
+    txn.tag_minor_ = id.minor_;
+    const clio::run::u32 wid = CLIO_CUR_WORKER->GetWorkerStats().worker_id_;
+    tag_txn_logs_[wid % tag_txn_logs_.size()]->Log(TxnType::kBindName, txn);
   }
 }
 
-void Runtime::UnparkNames(const TagId &parent) {
-  auto it = parked_names_.find(parent);
-  if (it == parked_names_.end()) return;
-  std::vector<std::pair<TagId, std::string>> waiting = std::move(it->second);
-  parked_names_.erase(it);
-  for (const auto &w : waiting) {
-    TagId *bound = tag_name_to_id_.find(w.second);
-    if (bound == nullptr || !(*bound == w.first)) continue;
-    auto pr = pending_rekey_.find(w.first);
-    std::string abs;
-    TagId blocker;
-    if (pr != pending_rekey_.end() &&
-        ResolveNameStrict(w.second, &abs, &blocker)) {
-      // A renamed directory: its whole subtree moves to the new path.
-      RekeyIndexSubtree(pr->second, abs);
-      pending_rekey_.erase(pr);
-      continue;
-    }
-    IndexOrParkName(w.first, w.second);  // may park again, higher up
-  }
-}
-
-void Runtime::RekeyIndexSubtree(const std::string &old_abs,
-                                const std::string &new_abs) {
-  if (old_abs == new_abs) return;
-  const std::string esc = EscapeRegexLiteral(old_abs);
-  // Hold each result by value: range-for over Search(...).keys() would
-  // iterate a member of a destroyed temporary.
-  auto self = tag_search_.Search("^" + esc + "$");
-  auto below = tag_search_.Search("^" + esc + "/.*");
-  std::vector<std::string> movers = self.keys();
-  const auto &below_keys = below.keys();
-  movers.insert(movers.end(), below_keys.begin(), below_keys.end());
-  for (const auto &k : movers) {
-    tag_search_.Rename(k, new_abs + k.substr(old_abs.size()));
-  }
-  // A rename parked under a parent this node has not heard of yet remembers
-  // the subtree's OLD absolute path, to move it when the parent arrives
-  // (UnparkNames). An ancestor rename applied meanwhile has just moved
-  // those keys: follow them, or the parked move finds nothing and the
-  // subtree stays under the ancestor's new name for good (#1182).
-  for (auto &pr : pending_rekey_) {
-    std::string &p = pr.second;
-    if (p == old_abs ||
-        (p.size() > old_abs.size() && p.compare(0, old_abs.size(), old_abs) == 0 &&
-         p[old_abs.size()] == '/')) {
-      p = new_abs + p.substr(old_abs.size());
-    }
-  }
-}
-
-void Runtime::TnAddName(const TagId &id, const std::string &name) {
+bool Runtime::UnbindNameLocal(const std::string &name, const TagId &id) {
   TagId *bound = tag_name_to_id_.find(name);
-  if (bound != nullptr && *bound == id) return;
-  if (bound != nullptr) TnRemoveName(TagId(*bound), name);  // copy: entry erased
-  std::shared_ptr<TagInfo> cur = tag_id_to_info_.get(id);
-  const bool was_nameless = cur == nullptr || cur->tag_name_.empty();
-  EditTagInfo(id, [&](TagInfo &t) {
+  if (bound == nullptr || !(*bound == id)) return false;
+  tag_name_to_id_.erase(name);
+  tag_search_.Delete(name);
+  if (shm_cache_.IsEnabled()) shm_cache_.EraseTagId(name);
+  if (!tag_txn_logs_.empty()) {
+    TxnCreateTag txn;
+    txn.tag_name_ = name;
+    txn.tag_major_ = id.major_;
+    txn.tag_minor_ = id.minor_;
+    const clio::run::u32 wid = CLIO_CUR_WORKER->GetWorkerStats().worker_id_;
+    tag_txn_logs_[wid % tag_txn_logs_.size()]->Log(TxnType::kUnbindName, txn);
+  }
+  return true;
+}
+
+TagNameOpRec Runtime::ApplyNameStep(const TagNameOpRec &r) {
+  TagNameOpRec out;
+  out.tag_ = r.tag_;
+  auto done = [&out](clio::run::u32 rc) {
+    out.op_ = static_cast<TagNameOp>(rc);
+    return out;
+  };
+  // Edit the tag's name list (home side) and WAL-log the result.
+  auto edit_names = [this, &r](const std::function<void(TagInfo &)> &fn) {
+    EditTagInfo(r.tag_, [&fn](TagInfo &t) {
+      fn(t);
+      t.last_changed_ = GetWallTimeNs();  // a name change is a ctime change
+    });
+    std::shared_ptr<TagInfo> now = tag_id_to_info_.get(r.tag_);
+    if (now != nullptr) LogTagIdentity(r.tag_, *now);
+  };
+  auto add = [&r](TagInfo &t, const std::string &n) {
     if (t.tag_name_.empty()) {
-      t.tag_name_ = clio::run::priv::string(CLIO_PRIV_ALLOC, name);
+      t.tag_name_ = clio::run::priv::string(CLIO_PRIV_ALLOC, n);
       return;
     }
-    if (t.tag_name_.str() == name) return;
+    if (t.tag_name_.str() == n) return;
     for (size_t i = 0; i < t.aliases_.size(); ++i) {
-      if (t.aliases_[i].str() == name) return;
+      if (t.aliases_[i].str() == n) return;
     }
-    t.aliases_.push_back(clio::run::priv::string(CLIO_PRIV_ALLOC, name));
-  });
-  tag_name_to_id_.insert_or_assign(name, id);
-  IndexOrParkName(id, name);
-  if (was_nameless) UnparkNames(id);
-  std::shared_ptr<TagInfo> now = tag_id_to_info_.get(id);
-  if (now != nullptr) LogTagIdentity(id, *now);
-}
-
-void Runtime::TnRemoveName(const TagId &id, const std::string &name) {
-  TagId *bound = tag_name_to_id_.find(name);
-  if (bound != nullptr && *bound == id) tag_name_to_id_.erase(name);
-  std::shared_ptr<TagInfo> cur = tag_id_to_info_.get(id);
-  if (cur == nullptr) return;
-  std::string abs;
-  TagId blocker;
-  const bool resolved = ResolveNameStrict(name, &abs, &blocker);
-  const bool canonical = cur->tag_name_.str() == name;
-  std::string promoted;
-  EditTagInfo(id, [&](TagInfo &t) {
-    if (canonical) {
+    t.aliases_.push_back(clio::run::priv::string(CLIO_PRIV_ALLOC, n));
+    (void)r;
+  };
+  auto remove = [](TagInfo &t, const std::string &n) {
+    if (t.tag_name_.str() == n) {
+      std::string promoted;
       if (!t.aliases_.empty()) {
         promoted = t.aliases_[0].str();
         t.aliases_.erase(t.aliases_.begin());
@@ -7082,197 +6552,324 @@ void Runtime::TnRemoveName(const TagId &id, const std::string &name) {
       return;
     }
     for (size_t i = 0; i < t.aliases_.size(); ++i) {
-      if (t.aliases_[i].str() == name) {
+      if (t.aliases_[i].str() == n) {
         t.aliases_.erase(t.aliases_.begin() + i);
-        break;
+        return;
       }
     }
-  });
-  if (resolved) {
-    std::string new_abs;
-    TagId b2;
-    if (canonical && !promoted.empty() &&
-        ResolveNameStrict(promoted, &new_abs, &b2)) {
-      // Children now hang off the promoted name. Drop the promoted name's own
-      // key first (it is re-created by the subtree move), then move.
-      tag_search_.Delete(new_abs);
-      RekeyIndexSubtree(abs, new_abs);
-    } else {
-      tag_search_.Delete(abs);
-    }
-  }
-  std::shared_ptr<TagInfo> now = tag_id_to_info_.get(id);
-  if (now == nullptr) return;
-  if (now->tag_name_.empty() && now->aliases_.empty() &&
-      now->total_size_ == 0 && BlobIndexNames(id).empty()) {
-    tag_id_to_info_.erase(id);  // a pure name record (e.g. a directory)
-  }
-  LogTagIdentity(id, *now);
-}
-
-void Runtime::TnRename(const TagId &id, const std::string &from,
-                       const std::string &to) {
-  TagId *other = tag_name_to_id_.find(to);
-  if (other != nullptr && !(*other == id)) TnRemoveName(TagId(*other), to);
-  std::shared_ptr<TagInfo> cur = tag_id_to_info_.get(id);
-  bool has_from = cur != nullptr && cur->tag_name_.str() == from;
-  const bool canonical = has_from;
-  for (size_t i = 0; cur != nullptr && !has_from && i < cur->aliases_.size();
-       ++i) {
-    has_from = cur->aliases_[i].str() == from;
-  }
-  if (!has_from) {  // never saw the old name: this is just a bind
-    TnAddName(id, to);
-    return;
-  }
-  std::string old_abs, new_abs;
-  TagId b1, b2;
-  const bool old_ok = ResolveNameStrict(from, &old_abs, &b1);
-  TagId *bound = tag_name_to_id_.find(from);
-  if (bound != nullptr && *bound == id) tag_name_to_id_.erase(from);
-  tag_name_to_id_.insert_or_assign(to, id);
-  EditTagInfo(id, [&](TagInfo &t) {
-    if (canonical) {
-      t.tag_name_ = clio::run::priv::string(CLIO_PRIV_ALLOC, to);
-    } else {
-      for (size_t i = 0; i < t.aliases_.size(); ++i) {
-        if (t.aliases_[i].str() == from) {
-          t.aliases_[i] = clio::run::priv::string(CLIO_PRIV_ALLOC, to);
-        }
-      }
-    }
-    t.last_changed_ = GetWallTimeNs();
-  });
-  const bool new_ok = ResolveNameStrict(to, &new_abs, &b2);
-  if (canonical && old_ok && new_ok) {
-    RekeyIndexSubtree(old_abs, new_abs);  // O(subtree) index keys, no messages
-  } else if (canonical && old_ok && !b2.IsNull()) {
-    // Renamed under a parent this node has not heard of yet (another node
-    // created it; its broadcast is still behind this one). Keep the subtree
-    // keyed by the old path and move all of it once the parent's name
-    // arrives -- re-indexing the directory alone left its descendants under
-    // the old path for good.
-    pending_rekey_[id] = old_abs;
-    parked_names_[b2].emplace_back(id, to);
-  } else {
-    if (old_ok) tag_search_.Delete(old_abs);
-    IndexOrParkName(id, to);
-  }
-  std::shared_ptr<TagInfo> now = tag_id_to_info_.get(id);
-  if (now != nullptr) LogTagIdentity(id, *now);
-}
-
-bool Runtime::ApplyTagNameOp(const TagNameOpRec &r) {
-  auto stamp = [this](const std::string &n) {
-    auto it = name_seq_.find(n);
-    return it == name_seq_.end() ? 0ULL : it->second;
   };
+  std::shared_ptr<TagInfo> cur;
   switch (r.op_) {
-    case TagNameOp::kAddName:
-    case TagNameOp::kRemoveName:
-      if (r.seq_ < stamp(r.name_)) return false;  // a newer op owns the name
-      name_seq_[r.name_] = r.seq_;
-      if (r.op_ == TagNameOp::kAddName) TnAddName(r.tag_, r.name_);
-      else TnRemoveName(r.tag_, r.name_);
-      return true;
-    case TagNameOp::kRename: {
-      const bool from_ok = r.seq_ >= stamp(r.name_);
-      const bool to_ok = r.seq_ >= stamp(r.name2_);
-      if (from_ok) name_seq_[r.name_] = r.seq_;
-      if (to_ok) name_seq_[r.name2_] = r.seq_;
-      if (from_ok && to_ok) TnRename(r.tag_, r.name_, r.name2_);
-      else if (to_ok) TnAddName(r.tag_, r.name2_);
-      else if (from_ok) TnRemoveName(r.tag_, r.name_);
-      return from_ok || to_ok;
-    }
-    case TagNameOp::kSetRoot: {
-      TagId *bound = tag_name_to_id_.find(std::string("/"));
+    case TagNameOp::kBind: {
+      TagId *bound = tag_name_to_id_.find(r.name_);
       if (bound != nullptr && !(*bound == r.tag_)) {
-        HLOG(kWarning, "UpdateTagNames: \"/\" is already tag {}.{}; the "
-             "published root {}.{} resolves for search but not by exact path",
-             bound->major_, bound->minor_, r.tag_.major_, r.tag_.minor_);
-      } else {
-        tag_name_to_id_.insert_or_assign(std::string("/"), r.tag_);
+        if ((r.seq_ & kTnReplace) == 0) {
+          out.tag_ = *bound;
+          return done(kTnTaken);
+        }
+        // Report the tag that lost the name: its home must drop it too.
+        out.seq_ = (static_cast<clio::run::u64>(bound->major_) << 32) |
+                   bound->minor_;
       }
-      std::shared_ptr<TagInfo> cur = tag_id_to_info_.get(r.tag_);
-      const bool was_nameless = cur == nullptr || cur->tag_name_.empty();
-      EditTagInfo(r.tag_, [](TagInfo &t) {
-        t.tag_name_ = clio::run::priv::string(CLIO_PRIV_ALLOC, "/");
+      if (bound == nullptr || !(*bound == r.tag_)) BindNameLocal(r.name_, r.tag_);
+      return done(kTnOk);
+    }
+    case TagNameOp::kUnbind:
+      return done(UnbindNameLocal(r.name_, r.tag_) ? kTnOk : kTnMissing);
+    case TagNameOp::kLookup: {
+      TagId *bound = tag_name_to_id_.find(r.name_);
+      if (bound == nullptr) return done(kTnMissing);
+      out.tag_ = *bound;
+      return done(kTnOk);
+    }
+    case TagNameOp::kHomeAdd:
+      if ((r.seq_ & kTnMustExist) != 0 && !tag_id_to_info_.contains(r.tag_)) {
+        return done(kTnMissing);
+      }
+      edit_names([&](TagInfo &t) { add(t, r.name_); });
+      return done(kTnOk);
+    case TagNameOp::kHomeRemove:
+      if (!tag_id_to_info_.contains(r.tag_)) return done(kTnMissing);
+      edit_names([&](TagInfo &t) { remove(t, r.name_); });
+      return done(kTnOk);
+    case TagNameOp::kHomeRename:
+      edit_names([&](TagInfo &t) {
+        if (t.tag_name_.str() == r.name_) {
+          t.tag_name_ = clio::run::priv::string(CLIO_PRIV_ALLOC, r.name2_);
+          return;
+        }
+        for (size_t i = 0; i < t.aliases_.size(); ++i) {
+          if (t.aliases_[i].str() == r.name_) {
+            t.aliases_[i] = clio::run::priv::string(CLIO_PRIV_ALLOC, r.name2_);
+            return;
+          }
+        }
+        add(t, r.name2_);  // never had the old name: just a bind
       });
-      if (was_nameless) UnparkNames(r.tag_);
-      return true;
-    }
-    case TagNameOp::kResetPublished: {
-      // A restarted node missed every broadcast while it was down; its
-      // publishers re-send the live namespace, so first forget all published
-      // (hierarchical) names instead of keeping ones deleted meanwhile.
-      std::vector<TagId> ids;
-      tag_id_to_info_.for_each(
-          [&](const TagId &id, const std::shared_ptr<TagInfo> &info) {
-            if (info->tag_name_.str().rfind("$tagid{", 0) == 0) {
-              ids.push_back(id);
-            }
-          },
-          ctp::priv::ForEachLock::kShared);
-      for (const TagId &id : ids) {
-        std::shared_ptr<TagInfo> info = tag_id_to_info_.get(id);
-        if (info == nullptr) continue;
-        std::vector<std::string> names{info->tag_name_.str()};
-        for (size_t i = 0; i < info->aliases_.size(); ++i) {
-          names.push_back(info->aliases_[i].str());
-        }
-        for (auto it = names.rbegin(); it != names.rend(); ++it) {
-          TnRemoveName(id, *it);  // aliases first, so none gets promoted
-        }
+      return done(kTnOk);
+    case TagNameOp::kHomeUnlink: {
+      cur = tag_id_to_info_.get(r.tag_);
+      std::vector<std::string> names;
+      if (cur != nullptr) names = NamesOf(*cur);
+      if (names.empty()) {  // a tag the home holds no names for
+        out.name_ = r.name_;
+        return done(kTnDeleted);
       }
-      parked_names_.clear();
-      pending_rekey_.clear();
-      name_seq_.clear();
-      // Removal order can leave children's index keys behind their parents';
-      // rebuild the index from the (now published-name-free) tag table.
-      RebuildTagSearchIndexLocked();
-      return true;
+      const bool canonical = names[0] == r.name_;
+      bool listed = canonical;
+      for (size_t i = 1; !listed && i < names.size(); ++i) {
+        listed = names[i] == r.name_;
+      }
+      if (!listed) return done(kTnOk);  // a stale binding: unbind just it
+      if (!canonical || ((r.seq_ & kTnPosix) != 0 && names.size() > 1)) {
+        edit_names([&](TagInfo &t) { remove(t, r.name_); });
+        return done(kTnOk);
+      }
+      edit_names([](TagInfo &t) {
+        t.tag_name_ = clio::run::priv::string(CLIO_PRIV_ALLOC, std::string());
+        t.aliases_.clear();
+      });
+      out.name_ = JoinNameList(names);
+      return done(kTnDeleted);
     }
+    case TagNameOp::kHomeDrop: {
+      cur = tag_id_to_info_.get(r.tag_);
+      if (cur != nullptr) {
+        out.name_ = JoinNameList(NamesOf(*cur));
+        edit_names([](TagInfo &t) {
+          t.tag_name_ = clio::run::priv::string(CLIO_PRIV_ALLOC, std::string());
+          t.aliases_.clear();
+        });
+      }
+      return done(kTnDeleted);
+    }
+    case TagNameOp::kHomeNames:
+      cur = tag_id_to_info_.get(r.tag_);
+      if (cur == nullptr) return done(kTnMissing);
+      out.name_ = JoinNameList(NamesOf(*cur));
+      return done(kTnOk);
     default:
-      return false;
+      return done(kTnMissing);
   }
+}
+
+namespace {
+
+/** Container hash of a per-container step: the name's owner or the tag's home. */
+clio::run::u32 StepHash(const TagNameOpRec &r) {
+  switch (r.op_) {
+    case TagNameOp::kBind:
+    case TagNameOp::kUnbind:
+    case TagNameOp::kLookup:
+      return NameHash(r.name_);
+    default:
+      return TagHomeHash(r.tag_);
+  }
+}
+
+/** True for the caller-level ops RunNameOps expands. */
+bool IsCallerNameOp(TagNameOp op) {
+  return op == TagNameOp::kAddName || op == TagNameOp::kRemoveName ||
+         op == TagNameOp::kRename;
+}
+
+}  // namespace
+
+clio::run::TaskResume Runtime::SendNameSteps(std::vector<TagNameOpRec> steps,
+                                             std::vector<TagNameOpRec> *results) {
+#ifdef CLIO_ENABLE_BOOST_COROUTINES
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
+#endif
+  CLIO_TASK_BODY_BEGIN
+  {
+    TagNameOpRec missing;
+    missing.op_ = static_cast<TagNameOp>(kTnMissing);
+    results->assign(steps.size(), missing);
+    const clio::run::PoolInfo *pi = CLIO_POOL_MANAGER->GetPoolInfo(pool_id_);
+    const clio::run::u32 n =
+        (pi != nullptr && pi->num_containers_ > 0) ? pi->num_containers_ : 1;
+    // Group by container, keeping each container's steps in input order.
+    std::vector<size_t> local;
+    std::vector<std::pair<clio::run::u32, std::vector<size_t>>> remote;
+    for (size_t i = 0; i < steps.size(); ++i) {
+      const clio::run::u32 h = StepHash(steps[i]);
+      if (OwnsHash(h)) {
+        local.push_back(i);
+        continue;
+      }
+      const clio::run::u32 cid = h % n;
+      size_t g = 0;
+      while (g < remote.size() && remote[g].first != cid) ++g;
+      if (g == remote.size()) remote.emplace_back(cid, std::vector<size_t>());
+      remote[g].second.push_back(i);
+    }
+    std::vector<clio::run::Future<UpdateTagNamesTask>> futs;
+    for (auto &grp : remote) {
+      std::string buf;
+      for (size_t i : grp.second) {
+        const TagNameOpRec &r = steps[i];
+        EncodeTagNameOp(&buf, r.op_, r.tag_, r.seq_, r.name_, r.name2_);
+      }
+      futs.push_back(client_.AsyncUpdateTagNames(
+          buf, clio::run::PoolQuery::DirectId(
+                   static_cast<clio::run::ContainerId>(grp.first))));
+    }
+    {
+      std::lock_guard<std::mutex> g(tag_names_mu_);
+      for (size_t i : local) (*results)[i] = ApplyNameStep(steps[i]);
+    }
+    for (size_t g = 0; g < futs.size(); ++g) {
+      CLIO_CO_AWAIT(futs[g]);
+      std::vector<TagNameOpRec> got;
+      const std::string rb = futs[g]->results_.str();
+      DecodeTagNameOps(rb.data(), rb.size(), &got);
+      const std::vector<size_t> &idx = remote[g].second;
+      for (size_t k = 0; k < idx.size() && k < got.size(); ++k) {
+        (*results)[idx[k]] = std::move(got[k]);
+      }
+    }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::RunNameOps(std::vector<TagNameOpRec> ops,
+                                          std::vector<TagNameOpRec> *results) {
+#ifdef CLIO_ENABLE_BOOST_COROUTINES
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
+#endif
+  CLIO_TASK_BODY_BEGIN
+  {
+    TagNameOpRec missing;
+    missing.op_ = static_cast<TagNameOp>(kTnMissing);
+    results->assign(ops.size(), missing);
+    // 1. Ops given by name rather than id: look the tag up at the name's
+    //    owner (an alias names its target in name2_).
+    std::vector<TagNameOpRec> look;
+    std::vector<size_t> look_of;
+    for (size_t i = 0; i < ops.size(); ++i) {
+      if (!IsCallerNameOp(ops[i].op_) || !ops[i].tag_.IsNull()) continue;
+      const std::string &key =
+          ops[i].op_ == TagNameOp::kAddName ? ops[i].name2_ : ops[i].name_;
+      if (key.empty()) continue;
+      look.push_back(NameStep(TagNameOp::kLookup, TagId::GetNull(), key));
+      look_of.push_back(i);
+    }
+    if (!look.empty()) {
+      std::vector<TagNameOpRec> got;
+      CLIO_CO_AWAIT(SendNameSteps(std::move(look), &got));
+      for (size_t k = 0; k < got.size(); ++k) {
+        if (StepIs(got[k], kTnOk)) ops[look_of[k]].tag_ = got[k].tag_;
+      }
+    }
+    // 2. Every op's steps, all at once (one round trip per container).
+    std::vector<TagNameOpRec> steps;
+    std::vector<size_t> first(ops.size(), 0);
+    for (size_t i = 0; i < ops.size(); ++i) {
+      const TagNameOpRec &o = ops[i];
+      first[i] = steps.size();
+      if (!IsCallerNameOp(o.op_)) {
+        steps.push_back(o);  // a step sent as is
+        continue;
+      }
+      if (o.tag_.IsNull() || o.name_.empty()) continue;  // unresolved
+      switch (o.op_) {
+        case TagNameOp::kAddName:
+          steps.push_back(NameStep(TagNameOp::kBind, o.tag_, o.name_));
+          steps.push_back(NameStep(TagNameOp::kHomeAdd, o.tag_, o.name_,
+                                   o.seq_ & kTnMustExist));
+          break;
+        case TagNameOp::kRemoveName:
+          steps.push_back(NameStep(TagNameOp::kUnbind, o.tag_, o.name_));
+          steps.push_back(NameStep(TagNameOp::kHomeRemove, o.tag_, o.name_));
+          break;
+        default:  // kRename
+          if (o.name2_.empty()) break;
+          steps.push_back(NameStep(TagNameOp::kUnbind, o.tag_, o.name_));
+          steps.push_back(
+              NameStep(TagNameOp::kBind, o.tag_, o.name2_, kTnReplace));
+          steps.push_back(NameStep(TagNameOp::kHomeRename, o.tag_, o.name_, 0,
+                                   o.name2_));
+          break;
+      }
+    }
+    std::vector<TagNameOpRec> got;
+    CLIO_CO_AWAIT(SendNameSteps(steps, &got));
+    // 3. Results, and the undo of a step whose partner lost a race.
+    std::vector<TagNameOpRec> undo;
+    for (size_t i = 0; i < ops.size(); ++i) {
+      const TagNameOpRec &o = ops[i];
+      const size_t s = first[i];
+      const size_t e = i + 1 < ops.size() ? first[i + 1] : steps.size();
+      if (s == e) continue;  // unresolved: stays kTnMissing
+      TagNameOpRec &res = (*results)[i];
+      if (!IsCallerNameOp(o.op_)) {
+        res = got[s];
+        continue;
+      }
+      res.tag_ = o.tag_;
+      res.op_ = static_cast<TagNameOp>(kTnOk);
+      if (o.op_ == TagNameOp::kAddName) {
+        const TagNameOpRec &bind = got[s];
+        const TagNameOpRec &home = got[s + 1];
+        if (StepIs(bind, kTnTaken)) {  // the name already names another tag
+          res = bind;
+          if (StepIs(home, kTnOk)) {
+            undo.push_back(NameStep(TagNameOp::kHomeRemove, o.tag_, o.name_));
+          }
+        } else if (!StepIs(home, kTnOk)) {  // the target does not exist
+          res.op_ = static_cast<TagNameOp>(kTnMissing);
+          undo.push_back(NameStep(TagNameOp::kUnbind, o.tag_, o.name_));
+        }
+      } else if (o.op_ == TagNameOp::kRemoveName) {
+        if (!StepIs(got[s], kTnOk) && !StepIs(got[s + 1], kTnOk)) {
+          res.op_ = static_cast<TagNameOp>(kTnMissing);
+        }
+      } else if (got[s + 1].seq_ != 0) {  // rename took the name from a tag
+        const TagId lost(static_cast<clio::run::u32>(got[s + 1].seq_ >> 32),
+                         static_cast<clio::run::u32>(got[s + 1].seq_));
+        undo.push_back(NameStep(TagNameOp::kHomeRemove, lost, o.name2_));
+      }
+    }
+    if (!undo.empty()) {
+      std::vector<TagNameOpRec> ignored;
+      CLIO_CO_AWAIT(SendNameSteps(std::move(undo), &ignored));
+    }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
 }
 
 clio::run::TaskResume Runtime::UpdateTagNames(
     clio::run::shared_ptr<UpdateTagNamesTask> &task) {
   CLIO_TASK_BODY_BEGIN
-  std::vector<TagNameOpRec> ops;
-  const std::string buf = task->ops_.str();
-  if (!DecodeTagNameOps(buf.data(), buf.size(), &ops)) {
-    HLOG(kWarning, "UpdateTagNames: malformed batch; applying {} records",
-         ops.size());
-  }
-  clio::run::u32 applied = 0;
   {
-    std::lock_guard<std::mutex> g(tag_names_mu_);
-    for (const auto &r : ops) {
-      try {
-        if (ApplyTagNameOp(r)) ++applied;
-      } catch (const std::exception &e) {
-        // One bad record must not take the node down (or its whole batch).
-        HLOG(kError, "UpdateTagNames: op {} on tag {}.{} ('{}' -> '{}') "
-             "failed: {}", static_cast<clio::run::u32>(r.op_), r.tag_.major_,
-             r.tag_.minor_, r.name_, r.name2_, e.what());
-
-      }
+    std::vector<TagNameOpRec> ops;
+    const std::string buf = task->ops_.str();
+    if (!DecodeTagNameOps(buf.data(), buf.size(), &ops)) {
+      HLOG(kWarning, "UpdateTagNames: malformed batch; applying {} records",
+           ops.size());
     }
-    // Bound the last-writer-wins stamps: drop ones older than 10 minutes
-    // (a reordering window of minutes is far beyond any batch delay).
-    constexpr size_t kMaxStamps = 4u << 20;
-    if (name_seq_.size() > kMaxStamps) {
-      const clio::run::u64 cutoff = GetWallTimeNs() - 600ULL * 1000000000ULL;
-      for (auto it = name_seq_.begin(); it != name_seq_.end();) {
-        it = it->second < cutoff ? name_seq_.erase(it) : std::next(it);
-      }
+    bool caller = false;
+    for (const auto &r : ops) caller = caller || IsCallerNameOp(r.op_);
+    std::vector<TagNameOpRec> res;
+    if (caller) {
+      CLIO_CO_AWAIT(RunNameOps(std::move(ops), &res));
+    } else {
+      // Steps another container sent here: this container holds their state.
+      std::lock_guard<std::mutex> g(tag_names_mu_);
+      for (const auto &r : ops) res.push_back(ApplyNameStep(r));
     }
+    std::string out;
+    clio::run::u32 applied = 0;
+    for (const auto &r : res) {
+      if (StepIs(r, kTnOk) || StepIs(r, kTnDeleted)) ++applied;
+      EncodeTagNameOp(&out, r.op_, r.tag_, r.seq_, r.name_, r.name2_);
+    }
+    task->results_ = clio::run::priv::string(CLIO_PRIV_ALLOC, out);
+    task->applied_ = applied;
+    task->return_code_ = 0;
   }
-  task->applied_ = applied;
-  task->return_code_ = 0;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
@@ -7280,51 +6877,30 @@ clio::run::TaskResume Runtime::UpdateTagNames(
 clio::run::TaskResume Runtime::GetNumAliases(
     clio::run::shared_ptr<GetNumAliasesTask> &task) {
   CLIO_TASK_BODY_BEGIN
-  try {
+  {
     task->num_aliases_ = 0;
     task->found_ = 0;
-
-
-    // Resolve the tag id: prefer an explicit id, else resolve the name the same
-    // way DelTag does — hierarchical "$tagid{parent}/leaf" key first, then a
-    // verbatim lookup for flat names and flat aliases.
     TagId tag_id = task->tag_id_;
-    if (tag_id.IsNull()) {
-      std::string tag_name = task->tag_name_.str();
-      if (!tag_name.empty()) {
-        if (IsHierPath(tag_name)) {
-          if (tag_name == "/") {
-            TagId *r = tag_name_to_id_.find(std::string("/"));
-            if (r != nullptr) tag_id = *r;
-          } else {
-            std::string parent_path, leaf;
-            if (SplitParentLeaf(tag_name, parent_path, leaf)) {
-              TagId parent_id = ResolvePathToIdLocked(parent_path);
-              if (!parent_id.IsNull()) {
-                TagId *p = tag_name_to_id_.find(MakeRelativeName(parent_id, leaf));
-                if (p != nullptr) tag_id = *p;
-              }
-            }
-          }
-        }
-        if (tag_id.IsNull()) {
-          TagId *p = tag_name_to_id_.find(tag_name);
-          if (p != nullptr) tag_id = *p;
-        }
-      }
+    std::vector<TagNameOpRec> res;
+    if (tag_id.IsNull() && !task->tag_name_.str().empty()) {
+      std::vector<TagNameOpRec> look{NameStep(
+          TagNameOp::kLookup, TagId::GetNull(), task->tag_name_.str())};
+      CLIO_CO_AWAIT(SendNameSteps(std::move(look), &res));
+      if (StepIs(res[0], kTnOk)) tag_id = res[0].tag_;
     }
-
     if (!tag_id.IsNull()) {
-      std::shared_ptr<TagInfo> info = tag_id_to_info_.get(tag_id);
-      if (info != nullptr) {
-        task->num_aliases_ = static_cast<clio::run::u32>(info->aliases_.size());
+      std::vector<TagNameOpRec> ask{
+          NameStep(TagNameOp::kHomeNames, tag_id, std::string())};
+      res.clear();
+      CLIO_CO_AWAIT(SendNameSteps(std::move(ask), &res));
+      if (StepIs(res[0], kTnOk)) {
+        const size_t names = SplitNameList(res[0].name_).size();
+        task->num_aliases_ =
+            static_cast<clio::run::u32>(names > 0 ? names - 1 : 0);
         task->found_ = 1;
       }
     }
     task->return_code_ = 0;  // found_ conveys existence; the op itself is fine
-  } catch (const std::exception &e) {
-    HLOG(kError, "GetNumAliases failed: {}", e.what());
-    task->return_code_ = 1;
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -7480,7 +7056,10 @@ TagId Runtime::GetOrAssignTagId(const std::string &tag_name,
   TagId tag_id;
   std::shared_ptr<TagInfo> seed;
   if (preferred_id.major_ != 0 || preferred_id.minor_ != 0) {
-    seed = tag_id_to_info_.get(preferred_id);
+    // Only the tag's home can tell whether a named tag already owns the
+    // preferred id; elsewhere the caller's (unique-minted) id is taken.
+    seed = OwnsHash(TagHomeHash(preferred_id)) ? tag_id_to_info_.get(preferred_id)
+                                               : nullptr;
     if (seed == nullptr || seed->tag_name_.empty()) {
       tag_id = preferred_id;
     } else {
@@ -7490,6 +7069,9 @@ TagId Runtime::GetOrAssignTagId(const std::string &tag_name,
   } else {
     tag_id = GenerateNewTagId();
   }
+  // The binding is this container's; the name list (TagInfo) is the home's.
+  // GetOrCreateTag sends it there when the home is another container.
+  const bool home_here = OwnsHash(TagHomeHash(tag_id));
 
   // Create tag info (use default constructor, allocator not used in struct).
   // Stamp all three timestamps at creation so a fresh tag (file OR directory)
@@ -7522,10 +7104,23 @@ TagId Runtime::GetOrAssignTagId(const std::string &tag_name,
     // pathologically cold; claim the name ourselves and continue.
     tag_name_to_id_.insert_or_assign(tag_name, tag_id);
   }
+  tag_search_.Insert(tag_name, tag_id);
+  if (!home_here) {
+    if (shm_cache_.IsEnabled()) shm_cache_.PutTagId(tag_name, tag_id);
+    if (!tag_txn_logs_.empty()) {
+      TxnCreateTag txn;
+      txn.tag_name_ = tag_name;
+      txn.tag_major_ = tag_id.major_;
+      txn.tag_minor_ = tag_id.minor_;
+      const clio::run::u32 wid = CLIO_CUR_WORKER->GetWorkerStats().worker_id_;
+      tag_txn_logs_[wid % tag_txn_logs_.size()]->Log(TxnType::kBindName, txn);
+    }
+    return tag_id;
+  }
   if (seed != nullptr) {
     // Adopt by REPLACING the map entry with a named copy — never by renaming
     // the live seed: tag_name_ is a heap string read lock-free by TagQuery
-    // scans and ResolveTagName (the maps self-lock per operation only), and
+    // scans (the maps self-lock per operation only), and
     // assigning it on a live object corrupts the heap under a concurrent
     // reader (clone-scale malloc_consolidate abort). The copy carries the
     // seed's accounting (total_size_, put-stamped times); readers still
@@ -7555,11 +7150,6 @@ TagId Runtime::GetOrAssignTagId(const std::string &tag_name,
     shm_cache_.PutTagInfo(tag_id, trec);
   }
 
-  // Index the new tag's ABSOLUTE name for regex TagQuery (#598). The parent
-  // chain is already created (GetOrCreateTagChain builds parents first), so
-  // ResolveTagName yields the full path. We hold the write lock here.
-  tag_search_.Insert(ResolveTagName(tag_name), tag_id);
-
   // WAL: log tag creation
   if (!tag_txn_logs_.empty()) {
     clio::run::u32 wid = CLIO_CUR_WORKER->GetWorkerStats().worker_id_;
@@ -7573,87 +7163,15 @@ TagId Runtime::GetOrAssignTagId(const std::string &tag_name,
   return tag_id;
 }
 
-std::string Runtime::ResolveTagName(const std::string &stored_name,
-                                    int depth) {
-  // Guard against pathological / cyclic parent references.
-  if (depth > 256) {
-    return stored_name;
-  }
-  TagId parent;
-  std::string leaf;
-  if (!ParseTagRef(stored_name, parent, leaf)) {
-    // Flat name, root "/", or a legacy absolute name stored verbatim.
-    return stored_name;
-  }
-  std::shared_ptr<TagInfo> pinfo = tag_id_to_info_.get(parent);
-  if (pinfo == nullptr) {
-    // Dangling parent (e.g. partially-replayed metadata). Best effort: present
-    // the leaf as a top-level name so the result is still a usable path.
-    return "/" + leaf;
-  }
-  std::string parent_full = ResolveTagName(pinfo->tag_name_.str(), depth + 1);
-  return JoinPath(parent_full, leaf);
-}
-
-TagId Runtime::ResolvePathToIdLocked(const std::string &path) {
-  // Walk from the root, looking up each component's relative key. Returns null
-  // if the root or any intermediate component does not exist.
-  TagId *root = tag_name_to_id_.find(std::string("/"));
-  if (root == nullptr) {
-    return TagId::GetNull();
-  }
-  TagId cur = *root;
-  for (const std::string &comp : SplitPathComponents(path)) {
-    TagId *child = tag_name_to_id_.find(MakeRelativeName(cur, comp));
-    if (child == nullptr) {
-      return TagId::GetNull();
-    }
-    cur = *child;
-  }
-  return cur;
-}
-
 void Runtime::RebuildTagSearchIndexLocked() {
-  // Repopulate the regex search index from the authoritative tag table (#598).
-  // Order-independent: every tag's parents are present, so ResolveTagName always
-  // yields the full path. Used after WAL/metadata restore, where tags are
-  // inserted directly (bypassing GetOrAssignTagId's per-insert indexing).
+  // The index holds the names this container binds (#598): rebuilt from the
+  // bindings after WAL/metadata restore, which insert them directly.
   tag_search_.Clear();
-  std::vector<std::pair<TagId, std::string>> tags;
-  tag_id_to_info_.for_each([&](const TagId & /*id*/, const std::shared_ptr<TagInfo> &info_sp) { const TagInfo &info = *info_sp; (void)info;
-    tags.emplace_back(info.tag_id_, info.tag_name_.str());
+  std::vector<std::pair<std::string, TagId>> names;
+  tag_name_to_id_.for_each([&](const std::string &name, const TagId &id) {
+    names.emplace_back(name, id);
   });
-  for (const auto &tag : tags) {
-    std::string abs = ResolveTagName(tag.second);
-    if (!abs.empty()) {
-      tag_search_.Insert(abs, tag.first);
-    }
-  }
-}
-
-TagId Runtime::GetOrCreateTagChain(const std::string &name,
-                                   const TagId &preferred_id, bool *created) {
-  if (!IsHierPath(name)) {
-    // Non-path tag: a single flat tag stored verbatim (legacy behavior).
-    return GetOrAssignTagId(name, preferred_id, created);
-  }
-  // Every absolute path is rooted at the "/" tag (stored literally).
-  std::vector<std::string> comps = SplitPathComponents(name);
-  TagId parent = GetOrAssignTagId(std::string("/"), TagId::GetNull(),
-                                  comps.empty() ? created : nullptr);
-  if (comps.empty()) {
-    // name was "/" (or all slashes): the root tag itself.
-    return parent;
-  }
-  for (size_t i = 0; i < comps.size(); ++i) {
-    const bool is_leaf = (i + 1 == comps.size());
-    // preferred_id (a cross-node hint) only applies to the deepest tag.
-    TagId id = GetOrAssignTagId(MakeRelativeName(parent, comps[i]),
-                                is_leaf ? preferred_id : TagId::GetNull(),
-                                is_leaf ? created : nullptr);
-    parent = id;
-  }
-  return parent;
+  for (const auto &kv : names) tag_search_.Insert(kv.first, kv.second);
 }
 
 /**
@@ -7816,6 +7334,17 @@ clio::run::TaskResume Runtime::FlushMetadata(clio::run::shared_ptr<FlushMetadata
     // Each tag's xattr section (entry_type 7): the WAL records that built
     // it are truncated once this snapshot is in place.
     task->entries_flushed_ += WriteTagXattrSnapshot(ofs);
+    // The name bindings this container holds (entry_type 8). A tag's name
+    // list (type 5) lives on its home; the bindings on the names' owners.
+    tag_name_to_id_.for_each([&](const std::string &name, const TagId &id) {
+      const uint8_t entry_type = kSnapNameBindEntry;
+      const uint32_t name_len = static_cast<uint32_t>(name.size());
+      ofs.write(reinterpret_cast<const char *>(&entry_type), sizeof(entry_type));
+      ofs.write(reinterpret_cast<const char *>(&name_len), sizeof(name_len));
+      ofs.write(name.data(), name_len);
+      ofs.write(reinterpret_cast<const char *>(&id), sizeof(id));
+      task->entries_flushed_++;
+    });
 
     // Write BlobInfo entries (entry_type 2; see below)
     // Serialize each blob while HOLDING its write token.
@@ -8433,11 +7962,10 @@ void Runtime::RestoreMetadataFromLog() {
       }
       if (!aliases_ok) break;
 
-      tag_name_to_id_.insert_or_assign(tag_name, tag_id);
+      // The name list only: bindings are their owners' type-8 entries.
       TagInfo tag_info(tag_name, tag_id);
       tag_info.total_size_ = total_size;
       for (const auto &alias : aliases) {
-        tag_name_to_id_.insert_or_assign(alias, tag_id);
         tag_info.aliases_.push_back(
             clio::run::priv::string(CLIO_PRIV_ALLOC, alias));
       }
@@ -8693,6 +8221,14 @@ void Runtime::RestoreMetadataFromLog() {
       if (!kvs_ok) break;
       RestoreTagXattrSection(tag_id, std::move(kvs));
 
+    } else if (entry_type == kSnapNameBindEntry) {
+      std::string name;
+      if (!read_str(name, "name binding length")) break;
+      TagId tag_id;
+      read_raw(reinterpret_cast<char *>(&tag_id), sizeof(tag_id));
+      if (!ifs.good()) break;
+      tag_name_to_id_.insert_or_assign(name, tag_id);
+
     } else {
       corrupt("entry type", entry_type);
       stop = true;
@@ -8785,6 +8321,11 @@ void Runtime::ReplayTransactionLogs() {
         break;
       case TxnType::kSetTagIdentity:
         ApplyWalSetTagIdentity(rec.payload_, tags_replayed);
+        break;
+      case TxnType::kBindName:
+      case TxnType::kUnbindName:
+        ApplyWalBindName(rec.payload_, rec.type_ == TxnType::kUnbindName);
+        ++tags_replayed;
         break;
       case TxnType::kSetTagXattr:
         ApplyWalTagXattr(rec.payload_, false);
@@ -8933,14 +8474,13 @@ void Runtime::ApplyWalDelTag(const std::vector<char> &payload,
                              clio::run::u32 &tags_replayed) {
   auto txn = TransactionLog::DeserializeDelTag(payload);
   TagId tag_id{txn.tag_major_, txn.tag_minor_};
-  // Erase tag name mapping
-  tag_name_to_id_.erase(txn.tag_name_);
-  // Erase every alias binding this tag carried at delete time too -- without
-  // this a hard-linked tag deleted before a crash left its alias names
-  // dangling in tag_name_to_id_ after restart (resolvable to a TagId with no
-  // TagInfo behind it).
-  for (const auto &alias : txn.aliases_) {
-    tag_name_to_id_.erase(alias);
+  // Records from before names had their own records carry the tag's names:
+  // drop the ones still bound to it.
+  std::vector<std::string> names = txn.aliases_;
+  names.push_back(txn.tag_name_);
+  for (const auto &name : names) {
+    TagId *bound = tag_name_to_id_.find(name);
+    if (bound != nullptr && *bound == tag_id) tag_name_to_id_.erase(name);
   }
   // Erase all blobs belonging to this tag, found through the per-tag index
   // (replay maintains it): scanning every blob per deleted tag made a log
@@ -8963,67 +8503,29 @@ void Runtime::ApplyWalDelTag(const std::vector<char> &payload,
 
 void Runtime::ApplyWalSetTagIdentity(const std::vector<char> &payload,
                                      clio::run::u32 &tags_replayed) {
+  // A tag's name list, on its home. The bindings are the name owners' own
+  // records (kCreateTag / kBindName / kUnbindName).
   auto txn = TransactionLog::DeserializeSetTagIdentity(payload);
   TagId tag_id{txn.tag_major_, txn.tag_minor_};
-  // Merge-by-seq replay preserves true write order, so the kCreateTag that
-  // made this tag (or the snapshot's type-5 entry) should already be here --
-  // in fact the NORMAL case is a snapshot-restored tag with no kCreateTag in
-  // the WAL at all (compacted away), just this record for a rename/link made
-  // afterward. Create-if-absent is still a defensive fallback, matching every
-  // other ApplyWal* handler.
-  std::shared_ptr<TagInfo> info = tag_id_to_info_.get(tag_id);
-  // Was this tag missing from tag_id_to_info_ entirely before this record?
-  // If so, tag_name_to_id_ cannot have a binding for it either yet -- the
-  // canonical-name bind below must run UNCONDITIONALLY in that case, even
-  // though info->tag_name_ (freshly seeded with txn.canonical_name_ two
-  // lines down) will equal txn.canonical_name_ and so look like a no-op
-  // rename. Missing this left the tag resolvable by id/readdir (it is in
-  // tag_id_to_info_) but NOT by path (ResolvePathToIdLocked walks
-  // tag_name_to_id_ only) -- every one of its descendants then read back
-  // ENOENT after a restart.
-  const bool was_absent = (info == nullptr);
-  if (info == nullptr) {
-    TagInfo fresh(txn.canonical_name_, tag_id);
-    tag_id_to_info_.insert_or_assign(tag_id, std::make_shared<TagInfo>(fresh));
-    info = tag_id_to_info_.get(tag_id);
-  }
-  if (info == nullptr) return;
-
-  const std::string old_canonical = info->tag_name_.str();
-  std::vector<std::string> old_aliases;
-  old_aliases.reserve(info->aliases_.size());
-  for (size_t i = 0; i < info->aliases_.size(); ++i) {
-    old_aliases.push_back(info->aliases_[i].str());
-  }
-
-  if (was_absent || old_canonical != txn.canonical_name_) {
-    if (!old_canonical.empty() && old_canonical != txn.canonical_name_) {
-      tag_name_to_id_.erase(old_canonical);
+  EditTagInfo(tag_id, [&txn](TagInfo &t) {
+    t.tag_name_ = clio::run::priv::string(CLIO_PRIV_ALLOC, txn.canonical_name_);
+    t.aliases_.clear();
+    for (const auto &alias : txn.aliases_) {
+      t.aliases_.push_back(clio::run::priv::string(CLIO_PRIV_ALLOC, alias));
     }
-    if (!txn.canonical_name_.empty()) {  // a name-less tag binds nothing
-      tag_name_to_id_.insert_or_assign(txn.canonical_name_, tag_id);
-    }
-  }
-  // Drop any alias this record no longer carries (an unlinked hard link).
-  for (const auto &old_alias : old_aliases) {
-    bool still_present = false;
-    for (const auto &new_alias : txn.aliases_) {
-      if (old_alias == new_alias) { still_present = true; break; }
-    }
-    if (!still_present) {
-      tag_name_to_id_.erase(old_alias);
-    }
-  }
-  // Bind every alias this record carries (idempotent for ones already bound).
-  clio::run::priv::vector<clio::run::priv::string> new_aliases(CLIO_PRIV_ALLOC);
-  for (const auto &alias : txn.aliases_) {
-    tag_name_to_id_.insert_or_assign(alias, tag_id);
-    new_aliases.push_back(clio::run::priv::string(CLIO_PRIV_ALLOC, alias));
-  }
-
-  info->tag_name_ = clio::run::priv::string(CLIO_PRIV_ALLOC, txn.canonical_name_);
-  info->aliases_ = new_aliases;
+  });
   tags_replayed++;
+}
+
+void Runtime::ApplyWalBindName(const std::vector<char> &payload, bool unbind) {
+  auto txn = TransactionLog::DeserializeCreateTag(payload);
+  const TagId tag_id{txn.tag_major_, txn.tag_minor_};
+  if (!unbind) {
+    tag_name_to_id_.insert_or_assign(txn.tag_name_, tag_id);
+    return;
+  }
+  TagId *bound = tag_name_to_id_.find(txn.tag_name_);
+  if (bound != nullptr && *bound == tag_id) tag_name_to_id_.erase(txn.tag_name_);
 }
 
 void Runtime::ApplyWalCreateNewBlob(const std::vector<char> &payload,
@@ -9435,7 +8937,7 @@ clio::run::TaskStat Runtime::GetTaskStats(const clio::run::Task *task) const {
       return stat;
     }
     case Method::kRenameTag: {
-      // Two TagQuery-class searches (self + descendants) plus the re-key.
+      // A lookup plus three name steps on up to three containers.
       clio::run::TaskStat stat;
       stat.compute_ = 400;
       stat.wall_time_ = 500.0f;
@@ -9650,18 +9152,28 @@ size_t Runtime::GetTagLockIndex(const TagId &tag_id) const {
 }
 
 TagId Runtime::GenerateNewTagId() {
-  // Get node_id from IPC manager as the major component
-  auto *ipc_manager = CLIO_IPC;
-  clio::run::u32 node_id = ipc_manager->GetNodeId();
-
-  // Get next minor component from atomic counter. The TOP BIT of the minor
+  // major = this node; minor from an atomic counter. The TOP BIT of the minor
   // space is RESERVED for client-minted ids (batched sieve-flushed creation
   // proposes ids via GetOrCreateTag's preferred_id so create(2) can return a
-  // stable inode without waiting); masking here keeps the server generator
-  // out of that partition forever.
-  clio::run::u32 minor_id = next_tag_id_minor_.fetch_add(1) & 0x7FFFFFFFu;
-
-  return TagId{node_id, minor_id};
+  // stable inode without waiting); masking keeps the server out of it.
+  //
+  // The minor is the next one whose home (TagHomeHash) is this container:
+  // the tag's name list then starts where its first name is bound, with no
+  // message. Each container takes its own residue class, so none is wasted.
+  const clio::run::u32 node_id = CLIO_IPC->GetNodeId();
+  const clio::run::PoolInfo *pi = CLIO_POOL_MANAGER->GetPoolInfo(pool_id_);
+  const clio::run::u32 n =
+      (pi != nullptr && pi->num_containers_ > 0) ? pi->num_containers_ : 1;
+  clio::run::u32 cur = next_tag_id_minor_.load();
+  for (;;) {
+    clio::run::u32 minor = cur & 0x7FFFFFFFu;
+    for (clio::run::u32 k = 0; k < n && !OwnsHash(TagHomeHash(TagId{node_id, minor})); ++k) {
+      minor = (minor + 1) & 0x7FFFFFFFu;
+    }
+    if (next_tag_id_minor_.compare_exchange_weak(cur, minor + 1)) {
+      return TagId{node_id, minor};
+    }
+  }
 }
 
 // Explicit template instantiations for required template methods
@@ -11811,26 +11323,16 @@ clio::run::TaskResume Runtime::GetContainedBlobs(
 
 std::vector<std::pair<std::string, TagId>> Runtime::MatchTags(
     const std::string &tag_regex) {
-  // One tag matcher for TagQuery and BlobQuery (#1336). An anchored literal
-  // (getattr/lookup/rename) resolves through the O(1) name hash, walking the
-  // hierarchy for absolute paths, instead of compiling a std::regex over the
-  // whole index per call (#680); aliases/hard links resolve too since they
-  // are stored under their own relative key. Anything else goes through the
-  // trigram search index, whose keys are the absolute tag names (#598).
+  // One tag matcher for TagQuery and BlobQuery (#1336), over the flat names
+  // this container binds. An anchored literal resolves through the O(1)
+  // name hash instead of compiling a std::regex over the index (#680);
+  // anything else goes through the trigram search index (#598).
   std::vector<std::pair<std::string, TagId>> out;
   std::string exact;
   if (TryParseAnchoredLiteral(tag_regex, &exact)) {
-    TagId id = TagId::GetNull();
-    if (IsHierPath(exact)) {
-      id = ResolvePathToIdLocked(exact);
-    } else {
-      TagId *p = tag_name_to_id_.find(exact);
-      if (p != nullptr) {
-        id = *p;
-      }
-    }
-    if (!id.IsNull()) {
-      out.emplace_back(exact, id);
+    TagId *p = tag_name_to_id_.find(exact);
+    if (p != nullptr) {
+      out.emplace_back(exact, *p);
     }
     return out;
   }
@@ -11847,8 +11349,7 @@ clio::run::TaskResume Runtime::TagQuery(clio::run::shared_ptr<TagQueryTask> &tas
   try {
     std::string tag_regex = task->tag_regex_.str();
 
-    // Query the secondary search index (#598): its keys are the absolute tag
-    // names, so a regex match over them needs no per-tag ResolveTagName scan.
+    // Query the secondary search index (#598): its keys are the tag names.
     // The index derives the trigrams every match must contain and only verifies
     // a small candidate set against the full regex (falling back to a scan of
     // its own entries when the pattern has no usable trigram). Held under the
@@ -11990,10 +11491,9 @@ clio::run::TaskResume Runtime::TemporalSearch(
   // Step 1: collect matching tags (same as BlobQuery / SemanticSearch).
   std::vector<std::pair<std::string, TagId>> matching_tags;
   tag_name_to_id_.for_each(
-      [&](const std::string &stored, const TagId &tag_id) {
-        std::string full = ResolveTagName(stored);
-        if (std::regex_match(full, tag_pattern)) {
-          matching_tags.emplace_back(full, tag_id);
+      [&](const std::string &name, const TagId &tag_id) {
+        if (std::regex_match(name, tag_pattern)) {
+          matching_tags.emplace_back(name, tag_id);
         }
       });
 

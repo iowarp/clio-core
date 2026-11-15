@@ -464,21 +464,26 @@ public:
   clio::run::TaskResume TruncateBlob(clio::run::shared_ptr<TruncateBlobTask> &task);
 
   /**
-   * Rename tag (Method::kRenameTag) - change a tag's name in place, keeping
-   * its TagId (and all blobs). Broadcast op; shares no data movement.
+   * Rename tag (Method::kRenameTag) - change one of a tag's names, keeping
+   * its TagId (and all blobs). Runs on the old name's owner; the batched
+   * form is UpdateTagNames kRename.
    */
   clio::run::TaskResume RenameTag(clio::run::shared_ptr<RenameTagTask> &task);
 
   /**
    * GetOrCreateTagAlias (Method::kGetOrCreateTagAlias) - bind an extra name to
-   * an existing tag's id (hard link at the tag level). Broadcast op.
+   * an existing tag's id (hard link at the tag level). If the alias is
+   * already bound, returns the tag it names. Batched form: UpdateTagNames
+   * kAddName.
    */
   clio::run::TaskResume GetOrCreateTagAlias(
       clio::run::shared_ptr<GetOrCreateTagAliasTask> &task);
 
   /**
-   * Delete tag operation - removes all blobs from tag and removes tag
-   * Returns TaskResume for coroutine-based async operations
+   * Delete a tag, by name (on the name's owner) or by id (on its home). A
+   * name that is not the tag's last (an alias, or with posix_unlink_ any
+   * name while another is left) is only unbound. Otherwise every name is
+   * unbound and every container drops its share (MultiDelTag broadcast).
    */
   clio::run::TaskResume DelTag(clio::run::shared_ptr<DelTagTask> &task);
 
@@ -493,52 +498,52 @@ public:
    */
   void LogTagIdentity(const TagId &tag_id, const TagInfo &info);
 
-  // ---- published tag names (UpdateTagNames) ----
-  /** Serializes every name operation (no suspension inside). */
+  // ---- flat tag names (UpdateTagNames; see TagNameOp) ----
+  /** Serializes this container's name steps (no suspension inside). */
   std::mutex tag_names_mu_;
-  /** Last-writer-wins stamp per stored name (kept for removed names too). */
-  std::unordered_map<std::string, clio::run::u64> name_seq_;
-  /** Names that cannot resolve yet, keyed by the ancestor they wait for. */
-  std::unordered_map<TagId, std::vector<std::pair<TagId, std::string>>>
-      parked_names_;
-  /** Tags renamed under a parent not known yet, with the absolute path the
-   *  index still keys their subtree by: it moves when the name resolves. */
-  std::unordered_map<TagId, std::string> pending_rekey_;
   /**
-   * Apply one decoded name operation unless a newer one for the same name
-   * was already applied. Caller holds tag_names_mu_.
-   * @return true if applied
+   * Apply one per-container name step (kBind ... kHomeNames) to this
+   * container's binding table / tag name lists. Caller holds tag_names_mu_.
+   * @param r the step
+   * @return its result record (op_ = TagNameResult)
    */
-  bool ApplyTagNameOp(const TagNameOpRec &r);
-  /** Bind `name` to `id` (canonical if it has none, else alias). */
-  void TnAddName(const TagId &id, const std::string &name);
-  /** Unbind `name` from `id`; drops a name-less, data-less tag. */
-  void TnRemoveName(const TagId &id, const std::string &name);
-  /** Rebind `id`'s name `from` to `to`, re-keying its indexed subtree. */
-  void TnRename(const TagId &id, const std::string &from, const std::string &to);
+  TagNameOpRec ApplyNameStep(const TagNameOpRec &r);
   /**
-   * Resolve a stored name to an absolute path, failing (instead of guessing)
-   * when an ancestor is unknown or name-less.
-   * @param stored stored name ("/", "$tagid{P}/leaf", or flat)
-   * @param abs receives the absolute path
-   * @param blocker receives the first ancestor that could not be resolved
-   * @return true if fully resolved
+   * Send per-container steps to the containers that hold their state: the
+   * local group is applied inline, each remote group goes as one task.
+   * @param steps steps, in the order each container must apply its own
+   * @param results receives one result per step, in input order
    */
-  bool ResolveNameStrict(const std::string &stored, std::string *abs,
-                         TagId *blocker);
-  /** Index `id` under `name`'s absolute path, or park it until resolvable. */
-  void IndexOrParkName(const TagId &id, const std::string &name);
-  /** Retry names parked on `parent` (it just gained a name). */
-  void UnparkNames(const TagId &parent);
-  /** Move every search-index key at or under old_abs to new_abs. */
-  void RekeyIndexSubtree(const std::string &old_abs, const std::string &new_abs);
+  clio::run::TaskResume SendNameSteps(std::vector<TagNameOpRec> steps,
+                                      std::vector<TagNameOpRec> *results);
+  /**
+   * Run a batch of name ops: caller ops (kAddName/kRemoveName/kRename) are
+   * expanded into their steps, steps are sent as they are. One round trip to
+   * each container, plus a second only to undo a step that lost a race.
+   * @param ops the batch
+   * @param results receives one result per op, in input order
+   */
+  clio::run::TaskResume RunNameOps(std::vector<TagNameOpRec> ops,
+                                   std::vector<TagNameOpRec> *results);
+  /** True when DirectHash(h) lands on this container. */
+  bool OwnsHash(clio::run::u32 h);
+  /** Bind name -> id here (owner side): table, search index, WAL. */
+  void BindNameLocal(const std::string &name, const TagId &id);
+  /** Drop name's binding here if it names id (owner side). */
+  bool UnbindNameLocal(const std::string &name, const TagId &id);
+  /**
+   * Delete this container's share of a tag: its blobs, TagInfo and xattrs
+   * (MultiDelTag; DelTag broadcasts it). Names are not touched.
+   * @param tag_id the tag
+   * @param found set true when this container held anything of it
+   */
+  clio::run::TaskResume DelTagShare(TagId tag_id, bool *found);
   /** Replace `id`'s TagInfo with a copy edited by `edit` (readers stay safe). */
   void EditTagInfo(const TagId &id, const std::function<void(TagInfo &)> &edit);
 
   /**
-   * GetTagName (Method::kGetTagName) - resolve a TagId to its full, absolute
-   * tag name by walking the stored relative "$tagid{parent}/leaf" references.
-   * Broadcast op; the container owning the tag's metadata answers.
+   * GetTagName (Method::kGetTagName) - a tag's canonical name, answered by
+   * the tag's home (which holds its name list).
    */
   clio::run::TaskResume GetTagName(clio::run::shared_ptr<GetTagNameTask> &task);
 
@@ -574,16 +579,14 @@ public:
   /**
    * GetNumAliases (Method::kGetNumAliases) - number of extra names (tag-level
    * hard links) bound to a tag, by name or id. Excludes the canonical name, so
-   * the POSIX link count is num_aliases_ + 1. Broadcast op; the container that
-   * owns the tag answers.
+   * the POSIX link count is num_aliases_ + 1. Answered from the tag's home.
    */
   clio::run::TaskResume GetNumAliases(clio::run::shared_ptr<GetNumAliasesTask> &task);
 
   /**
-   * UpdateTagNames (Method::kUpdateTagNames) - apply a batch of tag-name
-   * operations (add / remove / rename / set root) to this container's name
-   * table and search index. Routed Local by each filesystem container: a container
-   * publishes the names it owns into its own node CTE.
+   * UpdateTagNames (Method::kUpdateTagNames) - the batched name verb: runs
+   * caller ops across the containers that hold their state (RunNameOps) and
+   * applies per-container steps sent here by another container.
    */
   clio::run::TaskResume UpdateTagNames(
       clio::run::shared_ptr<UpdateTagNamesTask> &task);
@@ -926,6 +929,8 @@ private:
   std::mutex tag_xattr_mu_;
   /** FlushMetadata snapshot entry type of one tag's xattr section. */
   static constexpr uint8_t kSnapTagXattrEntry = 7;
+  /** Snapshot entry: one name binding this container holds, [name][TagId]. */
+  static constexpr uint8_t kSnapNameBindEntry = 8;
   /**
    * The container a Dynamic TagXattrTask goes to: the hash of its tag id.
    * @param tag_id the tag
@@ -1041,38 +1046,8 @@ private:
                          bool *created = nullptr);
 
   /**
-   * Get-or-create the chain of tags for an absolute path, returning the id of
-   * the deepest tag. "/a/b/c" creates "/", "/a", "/a/b", "/a/b/c" (each child
-   * stored relative to its parent as "$tagid{parent}/leaf") and returns the id
-   * of "/a/b/c". Non-absolute names are created as a single flat tag.
-   * preferred_id (if set) is applied to the deepest tag only.
-   * @param created if non-null, set to true iff THIS call inserted the
-   *        deepest tag (exactly one of several racing creators sees true)
-   */
-  TagId GetOrCreateTagChain(const std::string &name,
-                            const TagId &preferred_id = TagId::GetNull(),
-                            bool *created = nullptr);
-
-  /**
-   * Resolve an absolute path to an existing tag id by walking the hierarchy
-   * (no creation). Returns TagId::GetNull() if any component is missing.
-   * Must be called while holding tag_map_lock_.
-   */
-  TagId ResolvePathToIdLocked(const std::string &path);
-
-  /**
-   * Expand a stored (possibly relative "$tagid{parent}/leaf") tag name into its
-   * full absolute name by recursively resolving parent references against
-   * tag_id_to_info_. Flat names and the root "/" resolve to themselves. Lock
-   * free: callers iterate the tag maps with the same discipline used elsewhere.
-   * `depth` guards against pathological/cyclic references.
-   */
-  std::string ResolveTagName(const std::string &stored_name, int depth = 0);
-
-  /**
-   * Rebuild tag_search_ from scratch out of tag_id_to_info_. Order-independent
-   * (every tag's parents are present), so it is the safe way to repopulate the
-   * index after WAL/metadata restore. Caller must hold tag_map_lock_ (write).
+   * Rebuild tag_search_ from scratch out of the name bindings this container
+   * holds (after WAL/metadata restore).
    */
   void RebuildTagSearchIndexLocked();
 
@@ -1486,6 +1461,8 @@ private:
    *  canonical name + alias list (rename / hard link / unlink survival). */
   void ApplyWalSetTagIdentity(const std::vector<char> &payload,
                              clio::run::u32 &tags_replayed);
+  /** Apply one replayed kBindName (bind) or kUnbindName (unbind) record. */
+  void ApplyWalBindName(const std::vector<char> &payload, bool unbind);
   /**
    * Apply one replayed kSetTagXattr (upsert) or kDelTagXattr record.
    * @param payload the record payload
