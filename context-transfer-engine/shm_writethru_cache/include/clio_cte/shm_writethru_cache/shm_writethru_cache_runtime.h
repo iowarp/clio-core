@@ -270,6 +270,18 @@ class Runtime : public clio::cte::core::CoreInterposer {
   clio::run::TaskResume RegisterSharer(const TagId &tag,
                                        const std::string &name);
   /** Ask the blobs' homes to drop every other container's copy. */
+  /**
+   * After a forwarded verb that changes cached state behind the cache
+   * (truncate, Pod writes, multi deletes, renames, name updates), drop what
+   * it changed here and at the homes, so no node serves the old bytes,
+   * size or name.
+   * @param method core method id
+   * @param task   the forwarded task (already landed)
+   */
+  clio::run::TaskResume InvalidateAfterForward(
+      clio::run::u32 method, clio::run::shared_ptr<clio::run::Task> task);
+  /** Drop every node's cached blobs and metadata of these tags. */
+  clio::run::TaskResume DropTagDataEverywhere(const std::vector<TagId> &tags);
   clio::run::TaskResume FanoutInvalidate(const TagId &tag,
                                          const std::string &name);
   /** Wait until a blob has no unflushed ranges. */

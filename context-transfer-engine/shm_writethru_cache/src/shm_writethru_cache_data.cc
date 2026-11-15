@@ -260,6 +260,14 @@ clio::run::TaskResume Runtime::PutBlob(
       CLIO_CO_AWAIT(ForwardToCore(Method::kPutBlob,
                                   task.template Cast<clio::run::Task>()));
     }
+    // Drop again now that the write landed: a local reader may have cached
+    // the pre-write size (or bytes) between the drop above and the landing,
+    // and neither the home (it skips the writer) nor a single-node run
+    // (no fan-out) would invalidate it.
+    if (view_.Ready()) {
+      view_.Invalidate(task->tag_id_.major_, task->tag_id_.minor_,
+                       name.c_str(), name.size());
+    }
     EndChainWrite(task->tag_id_, name);
     CLIO_CO_AWAIT(FanoutInvalidate(task->tag_id_, name));
   }
@@ -509,12 +517,28 @@ clio::run::TaskResume Runtime::GetBlobSize(
       CLIO_CO_RETURN;
     }
     CLIO_CO_AWAIT(WaitBlobFlushed(tag, name));
+    // Cache the answer (metadata only): snapshot the entry's generations and
+    // register with the blob's home BEFORE asking the chain, so a write that
+    // lands after this point invalidates us and voids the fill.
+    clio::run::u64 gen = 0;
+    clio::run::u64 epoch = 0;
+    const bool cacheable =
+        task->replica_ == 0 && view_.Ready() &&
+        view_.SnapshotGens(tag.major_, tag.minor_, name.c_str(), name.size(),
+                           &gen, &epoch);
+    if (cacheable) {
+      CLIO_CO_AWAIT(RegisterSharer(tag, name));
+    }
     auto f = Next()->AsyncGetBlobSize(tag, name, clio::run::PoolQuery::Dynamic(),
                                       task->replica_);
     CLIO_CO_AWAIT(f);
     task->size_ = f->size_;
     task->lost_bytes_ = f->lost_bytes_;
     task->SetReturnCode(f->GetReturnCode());
+    if (cacheable && f->GetReturnCode() == 0 && f->lost_bytes_ == 0) {
+      view_.FillSize(tag.major_, tag.minor_, name.c_str(), name.size(),
+                     f->size_, gen, epoch);
+    }
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END

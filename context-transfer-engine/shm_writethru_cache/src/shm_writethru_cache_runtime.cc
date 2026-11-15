@@ -324,6 +324,107 @@ clio::run::TaskResume Runtime::BarrierForward(
     }
   }
   CLIO_CO_AWAIT(ForwardToCore(method, task));
+  CLIO_CO_AWAIT(InvalidateAfterForward(method, task));
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::DropTagDataEverywhere(
+    const std::vector<TagId> &tags) {
+  CLIO_TASK_BODY_BEGIN
+  if (!tags.empty() && view_.Ready()) {
+    std::vector<BlobKey> keys;
+    for (const TagId &t : tags) {
+      if (t.IsNull()) continue;
+      keys.push_back(BlobKey{t.major_, t.minor_, std::string()});
+      view_.DropTagBlobs(t.major_, t.minor_);
+      view_.DropTagMeta(t.major_, t.minor_);
+    }
+    auto *ipc = CLIO_IPC;
+    if (!keys.empty() && ipc->GetNumHosts() > 1) {
+      auto inv = ipc->NewTask<InvalidateTask>(
+          clio::run::CreateTaskId(), pool_id_, clio::run::PoolQuery::Broadcast(),
+          kInvalidateDropTagData, container_id_, PackKeys(keys));
+      auto fut = ipc->Send(inv);
+      CLIO_CO_AWAIT(fut);
+    }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::InvalidateAfterForward(
+    clio::run::u32 method, clio::run::shared_ptr<clio::run::Task> task) {
+  CLIO_TASK_BODY_BEGIN
+  {
+    namespace core = clio::cte::core;
+    std::vector<BlobKey> blobs;   // single blobs: local drop + their homes
+    std::vector<TagId> tag_wide;  // every node drops the tag's entries
+    std::vector<TagId> tag_meta;  // tag metadata (names) at the tag's home
+    switch (method) {
+      case core::Method::kTruncateBlob: {
+        auto t = task.template Cast<core::TruncateBlobTask>();
+        blobs.push_back(BlobKey{t->tag_id_.major_, t->tag_id_.minor_,
+                                t->blob_name_.str()});
+        break;
+      }
+      case core::Method::kMultiDelBlob: {
+        auto t = task.template Cast<core::MultiDelBlobTask>();
+        for (const core::MultiDelKey &k :
+             core::DecodeMultiDelKeys(t->keys_)) {
+          blobs.push_back(BlobKey{k.tag_id_.major_, k.tag_id_.minor_,
+                                  k.blob_name_});
+        }
+        break;
+      }
+      case core::Method::kMultiDelTag: {
+        auto t = task.template Cast<core::MultiDelTagTask>();
+        tag_wide = core::DecodeMultiDelTags(t->tags_);
+        break;
+      }
+      case core::Method::kPodPutBlob:
+        tag_wide.push_back(task.template Cast<core::PodPutBlobTask>()->tag_id_);
+        break;
+      case core::Method::kPodMultiPutBlob:
+        tag_wide.push_back(
+            task.template Cast<core::PodMultiPutBlobTask>()->tag_id_);
+        break;
+      case core::Method::kRenameTag:
+        tag_meta.push_back(task.template Cast<core::RenameTagTask>()->tag_id_);
+        break;
+      case core::Method::kGetOrCreateTagAlias:
+        tag_meta.push_back(
+            task.template Cast<core::GetOrCreateTagAliasTask>()->tag_id_);
+        break;
+      case core::Method::kUpdateTagNames: {
+        auto t = task.template Cast<core::UpdateTagNamesTask>();
+        std::vector<core::TagNameOpRec> ops;
+        const std::string buf = t->ops_.str();
+        core::DecodeTagNameOps(buf.data(), buf.size(), &ops);
+        for (const auto &r : ops) tag_meta.push_back(r.tag_);
+        break;
+      }
+      default:
+        break;
+    }
+    if (view_.Ready()) {
+      for (const BlobKey &k : blobs) {
+        view_.Invalidate(k.major_, k.minor_, k.name_.c_str(), k.name_.size());
+      }
+      for (const TagId &t : tag_meta) {
+        if (!t.IsNull()) view_.DropTagMeta(t.major_, t.minor_);
+      }
+    }
+    for (const BlobKey &k : blobs) {
+      CLIO_CO_AWAIT(FanoutInvalidate(TagId(k.major_, k.minor_), k.name_));
+    }
+    for (const TagId &t : tag_meta) {
+      if (t.IsNull()) continue;
+      CLIO_CO_AWAIT(FanoutInvalidate(
+          t, std::string(wtc::kTagMetaName, wtc::kTagMetaNameLen)));
+    }
+    CLIO_CO_AWAIT(DropTagDataEverywhere(tag_wide));
+  }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }

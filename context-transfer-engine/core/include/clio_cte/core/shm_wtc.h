@@ -123,6 +123,8 @@ enum BlobFlags : u32 {
   kResident = 1u << 0,
   /** The buffer holds the WHOLE blob (size_ bytes) and may serve reads. */
   kComplete = 1u << 1,
+  /** size_ is the chain's size of the blob (metadata only; no bytes). */
+  kSizeKnown = 1u << 2,
 };
 
 /** Tag entry flags. */
@@ -130,7 +132,21 @@ enum TagFlags : u32 {
   /** GetOrCreateTag reported that it created this tag: blobs written under it
    *  through this cache have no older bytes anywhere. */
   kTagCreated = 1u << 0,
+  /** name_ holds the tag's name as the chain reports it. */
+  kTagNameValid = 1u << 1,
 };
+
+/** Longest tag name cached (longer names are always fetched). */
+static constexpr u32 kMaxTagName = 255;
+
+/**
+ * Reserved blob name addressing a tag's METADATA in the coherence protocol:
+ * (tag id, kTagMetaName) has a home like any blob key, which tracks the
+ * nodes caching the tag's metadata and invalidates them when it changes.
+ * Starts with a control byte, so no real blob name collides with it.
+ */
+static constexpr char kTagMetaName[] = "\x01tagmeta";
+static constexpr size_t kTagMetaNameLen = sizeof(kTagMetaName) - 1;
 
 /** Result of a client-side operation. */
 enum class Status : u32 {
@@ -169,14 +185,25 @@ struct BlobEntry {
   char name_[kMaxBlobName];
 };
 
-/** One tag this cache has seen created. */
+/** One tag: creation knowledge, sticky flush error and cached metadata. */
 struct TagEntry {
   u32 state_;
-  u32 flags_;
+  u32 flags_;                      /**< TagFlags */
   u32 major_;
   u32 minor_;
   std::atomic<u32> sticky_rc_;     /**< first failed flush of this tag */
+  u32 name_len_;                   /**< kTagNameValid */
+  u64 name_hash_;                  /**< KeyHash of the name (NameSlot key) */
+  char name_[kMaxTagName + 1];
+};
+
+/** Name -> tag id index (GetOrCreateTag hits). */
+struct NameSlot {
+  u32 state_;
+  u32 major_;
+  u32 minor_;
   u32 pad_;
+  u64 hash_;
 };
 
 /** One logged write: slot + exact byte range inside that blob. */
@@ -204,12 +231,14 @@ struct Stats {
   std::atomic<u64> waits_;
   std::atomic<u64> flush_skipped_;  /**< ranges retired without a resend: a
                                          later flush already carried them */
+  std::atomic<u64> tag_hits_;       /**< tag lookups served from the segment */
+  std::atomic<u64> md_fills_;       /**< metadata fetched and cached */
 };
 
 /** Segment root: the first allocation in the segment. */
 struct Root {
   static constexpr u64 kMagic = 0x3143544357534C43ull;  // "CLSWCTC1"
-  static constexpr u32 kVersion = 3;
+  static constexpr u32 kVersion = 4;
 
   u64 magic_;
   u32 version_;
@@ -220,6 +249,7 @@ struct Root {
   u32 evict_sample_;
   u64 blobs_off_;
   u64 tags_off_;
+  u64 names_off_;    /**< NameSlot[max_tags_ * 2] */
   u64 log_off_;
   u64 owners_off_;   /**< u32 per kMinBuffer granule: slot+1 of the buffer
                           whose data starts there (0 = none) */
@@ -231,6 +261,9 @@ struct Root {
   std::atomic<u64> evict_cursor_;
   std::atomic<u64> coalesce_after_ns_;  /**< no merge-and-retry before this */
   std::atomic<u32> merge_fails_;        /**< consecutive failed merges */
+  /** Bumped by every tag-metadata drop: a fill fetched before the bump
+   *  might carry a name the drop invalidated, so it is not installed. */
+  std::atomic<u64> tag_inval_seq_;
   std::atomic<u32> global_rc_;     /**< sticky rc for tags not in TagTable */
   u32 md_only_;                    /**< metadata only: no blob bytes */
   Stats stats_;
@@ -408,6 +441,33 @@ class View {
   /** Forget a tag (DelTag). */
   void DropTag(u32 major, u32 minor);
 
+  // ---- Tag metadata ---------------------------------------------------------
+
+  /** Current tag-metadata invalidation sequence (snapshot before a fetch). */
+  u64 TagInvalSeq() const {
+    return root_->tag_inval_seq_.load(std::memory_order_acquire);
+  }
+  /**
+   * Install a tag's name fetched from the chain, unless a tag-metadata drop
+   * happened after `seq` was snapshotted.
+   * @return true when installed
+   */
+  bool FillTagName(u32 major, u32 minor, const char *name, size_t len,
+                   u64 seq);
+  /** Tag id cached for a name (GetOrCreateTag hit). */
+  bool LookupTagByName(const char *name, size_t len, u32 *major, u32 *minor);
+  /** Cached name of a tag. */
+  bool LookupTagName(u32 major, u32 minor, std::string *name);
+  /** Drop a tag's cached metadata (rename, name update, DelTag). */
+  void DropTagMeta(u32 major, u32 minor);
+
+  /**
+   * Record a blob size fetched from the chain (metadata only), unless the
+   * entry was written or invalidated after its gens were snapshotted.
+   */
+  bool FillSize(u32 tag_major, u32 tag_minor, const char *name,
+                size_t name_len, u64 size, u64 write_gen, u64 inval_epoch);
+
   // ---- Runtime-side maintenance ---------------------------------------------
 
   /**
@@ -533,6 +593,10 @@ class View {
   char *Ptr(u64 off) const { return base_ + off; }
   /** Find a tag entry (tag lock held). */
   TagEntry *FindTagLocked(u32 major, u32 minor, bool insert);
+  /** Name index slot for (hash, name), verified against the tag entry. */
+  NameSlot *FindNameLocked(u64 h, const char *name, size_t len, bool insert);
+  /** Remove a tag's name from the name index (tag lock held). */
+  void UnindexNameLocked(TagEntry *t);
   /** Wait until an entry has no pins (lock held; unpins need no lock). */
   static void WaitUnpinned(BlobEntry *e);
 
@@ -544,6 +608,7 @@ class View {
   Root *root_ = nullptr;
   BlobEntry *blobs_ = nullptr;
   TagEntry *tags_ = nullptr;
+  NameSlot *names_ = nullptr;
   DirtyLog *log_ = nullptr;
   std::atomic<u32> *owners_ = nullptr;
   u64 root_off_ = 0;

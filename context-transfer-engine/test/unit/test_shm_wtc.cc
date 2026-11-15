@@ -123,9 +123,10 @@ compose:
 
 /** Create a cache pool over the core. */
 static void CreateCache(const clio::run::PoolId &id, const std::string &name,
-                        clio::run::u64 capacity) {
+                        clio::run::u64 capacity, bool md_only = false) {
   clio::cte::shm_wtc::Client admin;
   clio::cte::shm_wtc::WtcConfig params;
+  params.md_only_ = md_only;
   params.next_pool_id_ = clio::cte::core::kCtePoolId;
   params.capacity_ = capacity;
   params.max_blobs_ = 4096;
@@ -417,6 +418,79 @@ TEST_CASE("ShmWtc - overwrites flush once and the last write wins",
             last[b]);
   }
   REQUIRE(st->flush_skipped_.load() > skipped0);
+}
+
+/** Size of a blob through a client (served from SHM when cached). */
+static clio::run::u64 SizeOf(clio::cte::core::Client &io, const TagId &tag,
+                             const std::string &name) {
+  auto f = io.AsyncGetBlobSize(tag, name);
+  f.Wait();
+  REQUIRE(f->GetReturnCode() == 0);
+  return f->size_;
+}
+
+TEST_CASE("ShmWtc - md_only caches blob sizes and drops them on change",
+          "[cte][shm_wtc][md_only]") {
+  WtcFixture fx;
+  const clio::run::PoolId pool(571, 0);
+  CreateCache(pool, "shm_wtc_md", 32ull << 20, /*md_only=*/true);
+  clio::cte::core::Client io(pool);
+  REQUIRE(io.HasWtc());
+  const wtc::Stats *st = io.WtcStats();
+  TagId tag = MakeTag(io, "wtc_md");
+
+  // Bytes are not cached: a put takes the task path and lands in the core.
+  const std::string v1 = Payload(1000, 'a');
+  auto p = io.AsyncPutBlob(tag, "m", 0, v1.size(), v1.data());
+  p.Wait();
+  REQUIRE(p->GetReturnCode() == 0);
+  REQUIRE(st->puts_.load() == 0);
+  REQUIRE(CoreRead(tag, "m", 0, v1.size()) == v1);
+
+  // First size query fetches and caches; the second is served from SHM.
+  REQUIRE(SizeOf(io, tag, "m") == 1000);
+  REQUIRE(st->md_fills_.load() >= 1);
+  const clio::run::u64 fills = st->md_fills_.load();
+  REQUIRE(SizeOf(io, tag, "m") == 1000);
+  REQUIRE(st->md_fills_.load() == fills);
+
+  // A growing write, then a truncate: the cached size never goes stale.
+  const std::string v2 = Payload(3000, 'b');
+  p = io.AsyncPutBlob(tag, "m", 0, v2.size(), v2.data());
+  p.Wait();
+  REQUIRE(p->GetReturnCode() == 0);
+  REQUIRE(SizeOf(io, tag, "m") == 3000);
+  auto t = io.AsyncTruncateBlob(tag, "m", 700);
+  t.Wait();
+  REQUIRE(t->GetReturnCode() == 0);
+  REQUIRE(SizeOf(io, tag, "m") == 700);
+  std::string back(700, '\0');
+  auto g = io.AsyncGetBlob(tag, "m", 0, back.size(), 0, back.data());
+  g.Wait();
+  REQUIRE(g->GetReturnCode() == 0);
+  REQUIRE(back == v2.substr(0, 700));
+}
+
+TEST_CASE("ShmWtc - truncate through the cache drops cached bytes",
+          "[cte][shm_wtc][truncate]") {
+  WtcFixture fx;
+  clio::cte::core::Client io(kPool);
+  REQUIRE(io.HasWtc());
+  TagId tag = MakeTag(io, "wtc_trunc");
+  const std::string v = Payload(8192, 'q');
+  auto p = io.AsyncPutBlob(tag, "t", 0, v.size(), v.data());
+  p.Wait();
+  REQUIRE(p->GetReturnCode() == 0);
+  REQUIRE(SizeOf(io, tag, "t") == 8192);  // cached with its bytes
+  auto t = io.AsyncTruncateBlob(tag, "t", 100);
+  t.Wait();
+  REQUIRE(t->GetReturnCode() == 0);
+  REQUIRE(SizeOf(io, tag, "t") == 100);
+  std::string back(100, '\0');
+  auto g = io.AsyncGetBlob(tag, "t", 0, back.size(), 0, back.data());
+  g.Wait();
+  REQUIRE(g->GetReturnCode() == 0);
+  REQUIRE(back == v.substr(0, 100));
 }
 
 TEST_CASE("ShmWtc - large puts displace a cache full of small buffers",

@@ -261,6 +261,9 @@ enum InvalidateMode : clio::run::u32 {
   kInvalidateFanout = 2,
   /** Drop every cached blob of these tags (key name empty; DelTag). */
   kInvalidateDropTag = 3,
+  /** Drop every cached blob AND the tag metadata of these tags, keeping the
+   *  tag's sticky error (a tag-wide write that bypassed the cache). */
+  kInvalidateDropTagData = 4,
 };
 
 /**

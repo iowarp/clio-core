@@ -98,13 +98,18 @@ inline bool View::Format(const std::string &name,
   auto b = alloc_->AllocateOffset(blob_bytes);
   size_t tag_bytes = sizeof(TagEntry) * root_->max_tags_;
   auto t = alloc_->AllocateOffset(tag_bytes);
+  size_t name_bytes = sizeof(NameSlot) * root_->max_tags_ * 2;
+  auto nm = alloc_->AllocateOffset(name_bytes);
   auto l = alloc_->AllocateOffset(sizeof(DirtyLog));
   root_->owner_count_ = seg_size_ / kMinBuffer + 1;
   size_t owner_bytes = sizeof(std::atomic<u32>) * root_->owner_count_;
   auto ow = alloc_->AllocateOffset(owner_bytes);
-  if (b.IsNull() || t.IsNull() || l.IsNull() || ow.IsNull()) {
+  if (b.IsNull() || t.IsNull() || l.IsNull() || ow.IsNull() || nm.IsNull()) {
     return false;
   }
+  root_->names_off_ = nm.load();
+  names_ = reinterpret_cast<NameSlot *>(Ptr(root_->names_off_));
+  std::memset(static_cast<void *>(names_), 0, name_bytes);
   root_->owners_off_ = ow.load();
   owners_ = reinterpret_cast<std::atomic<u32> *>(Ptr(root_->owners_off_));
   std::memset(static_cast<void *>(owners_), 0, owner_bytes);
@@ -144,6 +149,7 @@ inline bool View::Attach(const std::string &name, u64 root_off) {
   tags_ = reinterpret_cast<TagEntry *>(Ptr(root_->tags_off_));
   log_ = reinterpret_cast<DirtyLog *>(Ptr(root_->log_off_));
   owners_ = reinterpret_cast<std::atomic<u32> *>(Ptr(root_->owners_off_));
+  names_ = reinterpret_cast<NameSlot *>(Ptr(root_->names_off_));
   return true;
 }
 
@@ -168,6 +174,7 @@ inline void View::Detach() {
   tags_ = nullptr;
   log_ = nullptr;
   owners_ = nullptr;
+  names_ = nullptr;
 }
 
 inline void View::WaitUnpinned(BlobEntry *e) {
@@ -620,7 +627,7 @@ inline Status View::TryGetSize(u32 tag_major, u32 tag_minor, const char *name,
     return Status::kMiss;
   }
   BlobEntry *e = Slot(static_cast<u32>(s));
-  if (!(e->flags_ & kComplete)) {
+  if (!(e->flags_ & (kComplete | kSizeKnown))) {
     return Status::kMiss;
   }
   *out_size = e->size_;
@@ -662,6 +669,8 @@ inline TagEntry *View::FindTagLocked(u32 major, u32 minor, bool insert) {
   free_slot->major_ = major;
   free_slot->minor_ = minor;
   free_slot->sticky_rc_.store(0, std::memory_order_relaxed);
+  free_slot->name_len_ = 0;
+  free_slot->name_hash_ = 0;
   return free_slot;
 }
 
@@ -699,10 +708,133 @@ inline u32 View::TakeTagError(u32 major, u32 minor) {
 
 inline void View::DropTag(u32 major, u32 minor) {
   Guard g(root_->tag_lock_);
+  root_->tag_inval_seq_.fetch_add(1, std::memory_order_acq_rel);
   TagEntry *t = FindTagLocked(major, minor, false);
   if (t != nullptr) {
+    UnindexNameLocked(t);
     t->state_ = kSlotTomb;
     t->flags_ = 0;
+  }
+}
+
+inline NameSlot *View::FindNameLocked(u64 h, const char *name, size_t len,
+                                      bool insert) {
+  const u32 n = root_->max_tags_ * 2;
+  NameSlot *free_slot = nullptr;
+  for (u32 i = 0; i < n && i < kMaxProbe; ++i) {
+    NameSlot *ns = names_ + (h + i) % n;
+    if (ns->state_ == kSlotLive && ns->hash_ == h) {
+      // Verify against the tag's stored name (hashes can collide).
+      TagEntry *t = FindTagLocked(ns->major_, ns->minor_, false);
+      if (t != nullptr && (t->flags_ & kTagNameValid) && t->name_len_ == len &&
+          std::memcmp(t->name_, name, len) == 0) {
+        return ns;
+      }
+    }
+    if (ns->state_ != kSlotLive && free_slot == nullptr) {
+      free_slot = ns;
+    }
+    if (ns->state_ == kSlotEmpty) {
+      break;
+    }
+  }
+  if (!insert || free_slot == nullptr) {
+    return nullptr;
+  }
+  free_slot->state_ = kSlotLive;
+  free_slot->hash_ = h;
+  return free_slot;
+}
+
+inline void View::UnindexNameLocked(TagEntry *t) {
+  if (!(t->flags_ & kTagNameValid)) {
+    return;
+  }
+  const u32 n = root_->max_tags_ * 2;
+  for (u32 i = 0; i < n && i < kMaxProbe; ++i) {
+    NameSlot *ns = names_ + (t->name_hash_ + i) % n;
+    if (ns->state_ == kSlotLive && ns->major_ == t->major_ &&
+        ns->minor_ == t->minor_) {
+      ns->state_ = kSlotTomb;
+      break;
+    }
+    if (ns->state_ == kSlotEmpty) {
+      break;
+    }
+  }
+  t->flags_ &= ~kTagNameValid;
+  t->name_len_ = 0;
+}
+
+inline bool View::FillTagName(u32 major, u32 minor, const char *name,
+                              size_t len, u64 seq) {
+  if (len == 0 || len > kMaxTagName) {
+    return false;
+  }
+  Guard g(root_->tag_lock_);
+  if (root_->tag_inval_seq_.load(std::memory_order_acquire) != seq) {
+    return false;  // a drop raced the fetch: the name may be stale
+  }
+  const u64 h = KeyHash(0, 0, name, len);
+  // A different tag cached under this name lost it (renamed away).
+  NameSlot *old = FindNameLocked(h, name, len, false);
+  if (old != nullptr && (old->major_ != major || old->minor_ != minor)) {
+    TagEntry *ot = FindTagLocked(old->major_, old->minor_, false);
+    if (ot != nullptr) UnindexNameLocked(ot);
+  }
+  TagEntry *t = FindTagLocked(major, minor, true);
+  if (t == nullptr) {
+    return false;
+  }
+  UnindexNameLocked(t);
+  std::memcpy(t->name_, name, len);
+  t->name_[len] = '\0';
+  t->name_len_ = static_cast<u32>(len);
+  t->name_hash_ = h;
+  t->flags_ |= kTagNameValid;
+  NameSlot *ns = FindNameLocked(h, name, len, true);
+  if (ns == nullptr) {
+    UnindexNameLocked(t);  // index full: keep the table consistent
+    return false;
+  }
+  ns->major_ = major;
+  ns->minor_ = minor;
+  return true;
+}
+
+inline bool View::LookupTagByName(const char *name, size_t len, u32 *major,
+                                  u32 *minor) {
+  if (len == 0 || len > kMaxTagName) {
+    return false;
+  }
+  Guard g(root_->tag_lock_);
+  NameSlot *ns = FindNameLocked(KeyHash(0, 0, name, len), name, len, false);
+  if (ns == nullptr) {
+    return false;
+  }
+  *major = ns->major_;
+  *minor = ns->minor_;
+  root_->stats_.tag_hits_.fetch_add(1, std::memory_order_relaxed);
+  return true;
+}
+
+inline bool View::LookupTagName(u32 major, u32 minor, std::string *name) {
+  Guard g(root_->tag_lock_);
+  TagEntry *t = FindTagLocked(major, minor, false);
+  if (t == nullptr || !(t->flags_ & kTagNameValid)) {
+    return false;
+  }
+  name->assign(t->name_, t->name_len_);
+  root_->stats_.tag_hits_.fetch_add(1, std::memory_order_relaxed);
+  return true;
+}
+
+inline void View::DropTagMeta(u32 major, u32 minor) {
+  Guard g(root_->tag_lock_);
+  root_->tag_inval_seq_.fetch_add(1, std::memory_order_acq_rel);
+  TagEntry *t = FindTagLocked(major, minor, false);
+  if (t != nullptr) {
+    UnindexNameLocked(t);
   }
 }
 
@@ -764,8 +896,38 @@ inline bool View::Fill(u32 tag_major, u32 tag_minor, const char *name,
   return true;
 }
 
+inline bool View::FillSize(u32 tag_major, u32 tag_minor, const char *name,
+                           size_t name_len, u64 size, u64 write_gen,
+                           u64 inval_epoch) {
+  if (name_len > kMaxBlobName) {
+    return false;
+  }
+  u64 h = KeyHash(tag_major, tag_minor, name, name_len);
+  Guard g(root_->stripes_[StripeOf(h)]);
+  long s = FindLocked(h, tag_major, tag_minor, name, name_len);
+  if (s < 0) {
+    return false;
+  }
+  BlobEntry *e = Slot(static_cast<u32>(s));
+  if (e->write_gen_.load() != write_gen ||
+      e->inval_epoch_.load() != inval_epoch || e->pending_.load() != 0) {
+    return false;  // a local write or an invalidation raced the fetch
+  }
+  if (!(e->flags_ & kComplete)) {
+    e->size_ = size;
+  }
+  e->flags_ |= kSizeKnown;
+  root_->stats_.md_fills_.fetch_add(1, std::memory_order_relaxed);
+  return true;
+}
+
 inline void View::Invalidate(u32 tag_major, u32 tag_minor, const char *name,
                              size_t name_len) {
+  if (name_len == kTagMetaNameLen &&
+      std::memcmp(name, kTagMetaName, kTagMetaNameLen) == 0) {
+    DropTagMeta(tag_major, tag_minor);
+    return;
+  }
   if (name_len > kMaxBlobName) {
     return;
   }
@@ -776,7 +938,7 @@ inline void View::Invalidate(u32 tag_major, u32 tag_minor, const char *name,
     return;
   }
   BlobEntry *e = Slot(static_cast<u32>(s));
-  e->flags_ &= ~kComplete;
+  e->flags_ &= ~(kComplete | kSizeKnown);
   e->inval_epoch_.fetch_add(1, std::memory_order_acq_rel);
   if (e->pending_.load() == 0) {
     WaitUnpinned(e);

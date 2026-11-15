@@ -624,6 +624,11 @@ clio::run::TaskResume Runtime::Invalidate(
       for (const BlobKey &k : keys) {
         view_.Invalidate(k.major_, k.minor_, k.name_.c_str(), k.name_.size());
       }
+    } else if (task->mode_ == kInvalidateDropTagData && view_.Ready()) {
+      for (const BlobKey &k : keys) {
+        view_.DropTagBlobs(k.major_, k.minor_);
+        view_.DropTagMeta(k.major_, k.minor_);
+      }
     } else if (task->mode_ == kInvalidateDropTag && view_.Ready()) {
       for (const BlobKey &k : keys) {
         view_.DropTagBlobs(k.major_, k.minor_);
