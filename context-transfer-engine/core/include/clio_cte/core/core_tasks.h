@@ -4875,16 +4875,16 @@ inline clio::run::u32 NameHash(const std::string &name) {
 
 /**
  * Append one tag-name operation to an UpdateTagNames batch.
- * Record: [u32 op][u32 major][u32 minor][u64 seq][u32 len][name][u32 len][name2]
+ * Record: [u32 op][u32 major][u32 minor][u64 flags][u32 len][name][u32 len][name2]
  * @param out batch buffer
  * @param op operation
  * @param tag tag id
- * @param seq per-op flags / argument (kTn* flags; 0 for caller ops)
+ * @param flags kTn* flags (kTnMustExist on kAddName; step flags); 0 for none
  * @param name tag name
  * @param name2 new tag name (kRename / kHomeRename only)
  */
 inline void EncodeTagNameOp(std::string *out, TagNameOp op, const TagId &tag,
-                            clio::run::u64 seq, const std::string &name,
+                            clio::run::u64 flags, const std::string &name,
                             const std::string &name2 = std::string()) {
   auto put32 = [out](clio::run::u32 v) {
     out->append(reinterpret_cast<const char *>(&v), sizeof(v));
@@ -4892,7 +4892,7 @@ inline void EncodeTagNameOp(std::string *out, TagNameOp op, const TagId &tag,
   put32(static_cast<clio::run::u32>(op));
   put32(tag.major_);
   put32(tag.minor_);
-  out->append(reinterpret_cast<const char *>(&seq), sizeof(seq));
+  out->append(reinterpret_cast<const char *>(&flags), sizeof(flags));
   put32(static_cast<clio::run::u32>(name.size()));
   out->append(name);
   put32(static_cast<clio::run::u32>(name2.size()));
@@ -4903,7 +4903,7 @@ inline void EncodeTagNameOp(std::string *out, TagNameOp op, const TagId &tag,
 struct TagNameOpRec {
   TagNameOp op_ = TagNameOp::kAddName;
   TagId tag_;
-  clio::run::u64 seq_ = 0;
+  clio::run::u64 flags_ = 0;  ///< kTn* flags; a kBind result: the displaced tag
   std::string name_;
   std::string name2_;
 };
@@ -4935,7 +4935,7 @@ inline bool DecodeTagNameOps(const char *data, size_t len,
     TagNameOpRec r;
     clio::run::u32 op = 0;
     if (!get(&op, 4) || !get(&r.tag_.major_, 4) || !get(&r.tag_.minor_, 4) ||
-        !get(&r.seq_, 8) || !get_str(&r.name_) || !get_str(&r.name2_)) {
+        !get(&r.flags_, 8) || !get_str(&r.name_) || !get_str(&r.name2_)) {
       return false;
     }
     r.op_ = static_cast<TagNameOp>(op);
@@ -5004,7 +5004,11 @@ struct UpdateTagNamesTask : public clio::run::Task {
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
     auto other = other_base.template Cast<UpdateTagNamesTask>();
-    if (other->applied_ > applied_) applied_ = other->applied_;
+    // A remote reply reaches the sender through here too: carry the
+    // per-record results (a broadcast concatenates them).
+    applied_ += other->applied_;
+    results_ = clio::run::priv::string(
+        CLIO_PRIV_ALLOC, results_.str() + other->results_.str());
   }
 };
 

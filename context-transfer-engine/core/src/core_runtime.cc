@@ -6169,7 +6169,7 @@ clio::run::TaskResume Runtime::GetOrCreateTagAlias(
     std::vector<TagNameOpRec> ops(1);
     ops[0].op_ = TagNameOp::kAddName;
     ops[0].tag_ = task->tag_id_;
-    ops[0].seq_ = kTnMustExist;
+    ops[0].flags_ = kTnMustExist;
     ops[0].name_ = alias_name;
     ops[0].name2_ = task->existing_name_.str();
     std::vector<TagNameOpRec> res;
@@ -6226,7 +6226,7 @@ TagNameOpRec NameStep(TagNameOp op, const TagId &tag, const std::string &name,
   TagNameOpRec r;
   r.op_ = op;
   r.tag_ = tag;
-  r.seq_ = flags;
+  r.flags_ = flags;
   r.name_ = name;
   r.name2_ = name2;
   return r;
@@ -6566,12 +6566,12 @@ TagNameOpRec Runtime::ApplyNameStep(const TagNameOpRec &r) {
     case TagNameOp::kBind: {
       TagId *bound = tag_name_to_id_.find(r.name_);
       if (bound != nullptr && !(*bound == r.tag_)) {
-        if ((r.seq_ & kTnReplace) == 0) {
+        if ((r.flags_ & kTnReplace) == 0) {
           out.tag_ = *bound;
           return done(kTnTaken);
         }
         // Report the tag that lost the name: its home must drop it too.
-        out.seq_ = (static_cast<clio::run::u64>(bound->major_) << 32) |
+        out.flags_ = (static_cast<clio::run::u64>(bound->major_) << 32) |
                    bound->minor_;
       }
       if (bound == nullptr || !(*bound == r.tag_)) BindNameLocal(r.name_, r.tag_);
@@ -6586,7 +6586,7 @@ TagNameOpRec Runtime::ApplyNameStep(const TagNameOpRec &r) {
       return done(kTnOk);
     }
     case TagNameOp::kHomeAdd:
-      if ((r.seq_ & kTnMustExist) != 0 && !tag_id_to_info_.contains(r.tag_)) {
+      if ((r.flags_ & kTnMustExist) != 0 && !tag_id_to_info_.contains(r.tag_)) {
         return done(kTnMissing);
       }
       edit_names([&](TagInfo &t) { add(t, r.name_); });
@@ -6624,7 +6624,7 @@ TagNameOpRec Runtime::ApplyNameStep(const TagNameOpRec &r) {
         listed = names[i] == r.name_;
       }
       if (!listed) return done(kTnOk);  // a stale binding: unbind just it
-      if (!canonical || ((r.seq_ & kTnPosix) != 0 && names.size() > 1)) {
+      if (!canonical || ((r.flags_ & kTnPosix) != 0 && names.size() > 1)) {
         edit_names([&](TagInfo &t) { remove(t, r.name_); });
         return done(kTnOk);
       }
@@ -6711,7 +6711,7 @@ clio::run::TaskResume Runtime::SendNameSteps(std::vector<TagNameOpRec> steps,
       std::string buf;
       for (size_t i : grp.second) {
         const TagNameOpRec &r = steps[i];
-        EncodeTagNameOp(&buf, r.op_, r.tag_, r.seq_, r.name_, r.name2_);
+        EncodeTagNameOp(&buf, r.op_, r.tag_, r.flags_, r.name_, r.name2_);
       }
       futs.push_back(client_.AsyncUpdateTagNames(
           buf, clio::run::PoolQuery::DirectId(
@@ -6727,6 +6727,11 @@ clio::run::TaskResume Runtime::SendNameSteps(std::vector<TagNameOpRec> steps,
       const std::string rb = futs[g]->results_.str();
       DecodeTagNameOps(rb.data(), rb.size(), &got);
       const std::vector<size_t> &idx = remote[g].second;
+      if (got.size() < idx.size()) {
+        HLOG(kWarning, "UpdateTagNames: container {} answered {} of {} "
+             "step(s) (rc {})", remote[g].first, got.size(), idx.size(),
+             futs[g]->GetReturnCode());
+      }
       for (size_t k = 0; k < idx.size() && k < got.size(); ++k) {
         (*results)[idx[k]] = std::move(got[k]);
       }
@@ -6780,7 +6785,7 @@ clio::run::TaskResume Runtime::RunNameOps(std::vector<TagNameOpRec> ops,
         case TagNameOp::kAddName:
           steps.push_back(NameStep(TagNameOp::kBind, o.tag_, o.name_));
           steps.push_back(NameStep(TagNameOp::kHomeAdd, o.tag_, o.name_,
-                                   o.seq_ & kTnMustExist));
+                                   o.flags_ & kTnMustExist));
           break;
         case TagNameOp::kRemoveName:
           steps.push_back(NameStep(TagNameOp::kUnbind, o.tag_, o.name_));
@@ -6828,13 +6833,23 @@ clio::run::TaskResume Runtime::RunNameOps(std::vector<TagNameOpRec> ops,
         if (!StepIs(got[s], kTnOk) && !StepIs(got[s + 1], kTnOk)) {
           res.op_ = static_cast<TagNameOp>(kTnMissing);
         }
-      } else if (got[s + 1].seq_ != 0) {  // rename took the name from a tag
-        const TagId lost(static_cast<clio::run::u32>(got[s + 1].seq_ >> 32),
-                         static_cast<clio::run::u32>(got[s + 1].seq_));
+      } else if (got[s + 1].flags_ != 0) {  // rename took the name from a tag
+        const TagId lost(static_cast<clio::run::u32>(got[s + 1].flags_ >> 32),
+                         static_cast<clio::run::u32>(got[s + 1].flags_));
         undo.push_back(NameStep(TagNameOp::kHomeRemove, lost, o.name2_));
       }
     }
     if (!undo.empty()) {
+      static std::atomic<clio::run::u64> undos{0};
+      for (const TagNameOpRec &u : undo) {
+        const clio::run::u64 nu = undos.fetch_add(1) + 1;
+        if (nu <= 20 || (nu & (nu - 1)) == 0) {
+          HLOG(kWarning, "UpdateTagNames: undo #{} {} of '{}' on tag {}.{} "
+               "(a step lost a race or its container did not answer)", nu,
+               static_cast<clio::run::u32>(u.op_), u.name_, u.tag_.major_,
+               u.tag_.minor_);
+        }
+      }
       std::vector<TagNameOpRec> ignored;
       CLIO_CO_AWAIT(SendNameSteps(std::move(undo), &ignored));
     }
@@ -6985,7 +7000,7 @@ clio::run::TaskResume Runtime::UpdateTagNames(
     clio::run::u32 applied = 0;
     for (const auto &r : res) {
       if (StepIs(r, kTnOk) || StepIs(r, kTnDeleted)) ++applied;
-      EncodeTagNameOp(&out, r.op_, r.tag_, r.seq_, r.name_, r.name2_);
+      EncodeTagNameOp(&out, r.op_, r.tag_, r.flags_, r.name_, r.name2_);
     }
     task->results_ = clio::run::priv::string(CLIO_PRIV_ALLOC, out);
     task->applied_ = applied;

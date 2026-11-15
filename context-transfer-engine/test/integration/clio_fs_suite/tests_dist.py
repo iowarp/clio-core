@@ -36,8 +36,8 @@ def tag_index_names(ctx, i, rx):
   rc, out = sh(ctx.hosts[i], cmd, timeout=60)
   if rc != 0:
     return None, out[-500:]
-  return {l.strip() for l in out.splitlines()
-          if l.strip() and l.strip() != '(no results)'}, None
+  pat = re.compile(rx)  # the output also carries the client's log lines
+  return {l.strip() for l in out.splitlines() if pat.match(l.strip())}, None
 
 
 def _tags_match(ctx, i, rx, want, what, timeout=5):
@@ -52,7 +52,9 @@ def _tags_match(ctx, i, rx, want, what, timeout=5):
     return got == want, None
   done, _, dt = ctx.eventually(f, timeout=timeout, period=0.5)
   got = last['got'] or set()
-  ctx.check(done, f'node{i} tag names {what}: missing '
+  ctx.check(done, f'node{i} tag names {what}: '
+                  f'{len(want - got)}/{len(want)} missing, '
+                  f'{len(got - want)} extra; missing '
                   f'{sorted(want - got)[:8]} extra {sorted(got - want)[:8]}'
                   f'{" err " + last["err"] if last["err"] else ""}')
   key = 'max_tag_lag_s'

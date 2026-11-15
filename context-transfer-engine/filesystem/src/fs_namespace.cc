@@ -837,7 +837,7 @@ void Runtime::PublishName(clio::cte::core::TagNameOp op,
                           const clio::cte::core::TagId &id,
                           const std::string &name, const std::string &name2) {
   std::lock_guard<std::mutex> g(tn_mu_);
-  clio::cte::core::EncodeTagNameOp(&tn_batch_, op, id, NowNs(), name, name2);
+  clio::cte::core::EncodeTagNameOp(&tn_batch_, op, id, 0, name, name2);
 }
 
 clio::run::TaskResume Runtime::FlushNames() {
