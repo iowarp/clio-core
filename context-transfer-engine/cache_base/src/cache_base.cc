@@ -501,7 +501,6 @@ clio::run::TaskResume CacheBase::PutBlob(
           clio::run::u32 vrc = 0;
           CLIO_CO_AWAIT(PrepareAbsorb(task->tag_id_, name, off, end, &vrc));
           if (vrc == 0) CLIO_CO_AWAIT(PutVolatile(task, &vrc));
-          CLIO_CO_AWAIT(PutVolatile(task, &vrc));
           if (vrc == 0) {
             NoteWrite(key, task->tag_id_, name, off, end, false);
           } else {
@@ -548,17 +547,28 @@ clio::run::TaskResume CacheBase::MultiPutBlob(
     if (!HasPersistent() || !attached || !IsWriteBack()) {
       // Write-through (or nothing to absorb): persistent takes the batch;
       // the records' volatile copies are dropped (the next read refills).
+      // Every record's lock is held across the forward AND the drop, as a
+      // single put holds its own: otherwise a put or read-fill of the same
+      // blob sizes its volatile copy from persistent before the batch lands
+      // and installs it after the drop check -- a copy missing the batch's
+      // bytes, served to every later read (clio-fs pages read zeros).
+      std::vector<std::string> keys;
+      for (size_t i = 0; attached && i < batch.size(); ++i) {
+        keys.push_back(Key(batch.descs_[i].tag_id_, batch.descs_[i].blob_name_));
+      }
+      std::sort(keys.begin(), keys.end());  // one global lock order
+      keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+      // A copy's dirty ranges land before the batch, which may overwrite
+      // them; no copy can be refilled until the locks are released.
+      for (size_t i = 0; i < keys.size(); ++i) CLIO_CO_AWAIT(Lock(keys[i]));
+      for (size_t i = 0; i < keys.size(); ++i) {
+        if (!Cached(keys[i])) continue;
+        clio::run::u32 r = 0;
+        CLIO_CO_AWAIT(Drop(keys[i], true, &r));
+      }
       CLIO_CO_AWAIT(ForwardToCore(Method::kMultiPutBlob,
                                   task.template Cast<clio::run::Task>()));
-      for (size_t i = 0; attached && i < batch.size(); ++i) {
-        const std::string key =
-            Key(batch.descs_[i].tag_id_, batch.descs_[i].blob_name_);
-        if (!Cached(key)) continue;
-        CLIO_CO_AWAIT(Lock(key));
-        clio::run::u32 r = 0;
-        CLIO_CO_AWAIT(Drop(key, false, &r));
-        Unlock(key);
-      }
+      for (size_t i = 0; i < keys.size(); ++i) Unlock(keys[i]);
       CLIO_CO_RETURN;
     }
     task->num_ok_ = 0;
@@ -862,6 +872,17 @@ clio::run::TaskResume CacheBase::ForwardCoherent(
       }
     }
     CLIO_CO_AWAIT(ForwardToCore(method, task));
+    if (HasPersistent() && mutates) {
+      // A read may have filled a copy of this tag from persistent while the
+      // write was landing: drop again (each drop waits for that blob's fill).
+      std::vector<std::string> keys = KeysOf(&tag);
+      for (size_t i = 0; i < keys.size(); ++i) {
+        CLIO_CO_AWAIT(Lock(keys[i]));
+        clio::run::u32 rc = 0;
+        CLIO_CO_AWAIT(Drop(keys[i], true, &rc));  // a newer dirty write lands
+        Unlock(keys[i]);
+      }
+    }
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
