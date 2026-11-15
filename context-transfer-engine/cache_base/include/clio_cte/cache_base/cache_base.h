@@ -57,6 +57,10 @@ using Context = clio::cte::core::Context;
  * a broadcast by DelTag). Carries a core::DelTagTask.
  */
 GLOBAL_CROSS_CONST clio::run::u32 kDropTagCopies = 100;
+/** kDropTagCopies modes, carried in DelTagTask::posix_unlink_. */
+GLOBAL_CROSS_CONST clio::run::u32 kCopiesDiscard = 0;    ///< drop, dirty lost (delete)
+GLOBAL_CROSS_CONST clio::run::u32 kCopiesFlushDrop = 1;  ///< flush, then drop
+GLOBAL_CROSS_CONST clio::run::u32 kCopiesFlush = 2;      ///< flush, keep
 /** Highest method id + 1 across the policy cache modules. */
 GLOBAL_CROSS_CONST clio::run::u32 kCacheMaxMethodId = 101;
 
@@ -144,7 +148,8 @@ class CacheBase : public clio::cte::core::DualTargetInterposer {
       clio::run::shared_ptr<clio::cte::core::SyncTagTask> &task);
   clio::run::TaskResume FlushData(
       clio::run::shared_ptr<clio::cte::core::FlushDataTask> &task);
-  /** kDropTagCopies: drop this container's copies of a tag. */
+  /** kDropTagCopies: flush and/or drop this container's copies of a tag
+   *  (null tag: every copy), per the mode in posix_unlink_. */
   clio::run::TaskResume DropTagCopies(
       clio::run::shared_ptr<clio::cte::core::DelTagTask> &task);
   /**
@@ -217,8 +222,31 @@ class CacheBase : public clio::cte::core::DualTargetInterposer {
   clio::run::TaskResume FlushAll(TagId tag, bool all_tags, clio::run::u32 *rc);
   void RegisterStopFlush(const clio::run::PoolId &self_pool);
 
+  /**
+   * The container that applies this cache's policy to a blob: its owner
+   * (BlobHash, with the core's failover). Tasks reach this pool on other
+   * containers too -- an interposer above forwards to its LOCAL container
+   * -- and are sent on to the owner, which holds the blob's only copy.
+   */
+  clio::run::u32 OwnerOf(const TagId &tag, const std::string &name);
+  /** Send a put (regions one by one when vectored) to the blob's owner. */
+  clio::run::TaskResume PutAtOwner(
+      clio::run::shared_ptr<clio::cte::core::PutBlobTask> task,
+      clio::run::u32 owner);
+  /** Send a get (regions one by one when vectored) to the blob's owner. */
+  clio::run::TaskResume GetAtOwner(
+      clio::run::shared_ptr<clio::cte::core::GetBlobTask> task,
+      clio::run::u32 owner);
+  /**
+   * Apply a kDropTagCopies mode to a tag's copies (null: all) everywhere.
+   * @param rc set to the first container's flush failure, else 0
+   */
+  clio::run::TaskResume TagCopiesEverywhere(TagId tag, clio::run::u32 mode,
+                                            clio::run::u32 *rc);
+
   CachePolicy policy_;
   PolicyCacheParams params_;
+  clio::cte::core::Client self_client_;  ///< this cache's pool (to owners)
   clio::cte::core::Client vol_client_;   ///< volatile core (owner-local)
   clio::cte::core::Client pers_client_;  ///< persistent chain (owner-local)
   std::mutex mu_;                         ///< guards entries_ / busy_
