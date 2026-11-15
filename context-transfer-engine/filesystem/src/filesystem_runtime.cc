@@ -241,6 +241,10 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
       CLIO_CO_RETURN;
     }
   }
+  // On a restart, name every link this container homes in the CTE again:
+  // idempotent, and it names the files of a volume written before links
+  // had flat CTE tag names (the core drops those old names itself).
+  if (is_restart_) CLIO_CO_AWAIT(RepublishHomeNames());
   // issue #817: shared-memory attribute mirror. Node-local derived state that
   // clients treat as authoritative, so it is only safe when this node owns
   // the whole namespace (a single node). CLIO_CFS_SHM_MIRROR_MULTINODE=1

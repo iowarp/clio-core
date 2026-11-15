@@ -525,6 +525,24 @@ public:
    */
   clio::run::TaskResume RunNameOps(std::vector<TagNameOpRec> ops,
                                    std::vector<TagNameOpRec> *results);
+  /** Restored name lists not yet checked against owners/homes. */
+  bool names_migration_pending_ = false;
+  /**
+   * After a restore: bind every flat name of the restored name lists that
+   * no binding names yet (a metadata log from before names had their own
+   * records binds nothing), so existing tags keep their ids from the first
+   * request on. Names this container does not own are dropped later by
+   * MigrateRestoredNames. No WAL records; sets names_migration_pending_.
+   */
+  void BindRestoredNames();
+  /**
+   * Once every container is up (first StatTargets tick, retried until it
+   * succeeds): make each restored name list agree with the flat layout --
+   * drop old hierarchical "$tagid{..}" and "/" names, bind every name on
+   * its owner, keep local bindings only for names owned here, and move a
+   * list whose home is another container to that home.
+   */
+  clio::run::TaskResume MigrateRestoredNames();
   /** True when DirectHash(h) lands on this container. */
   bool OwnsHash(clio::run::u32 h);
   /** Bind name -> id here (owner side): table, search index, WAL. */

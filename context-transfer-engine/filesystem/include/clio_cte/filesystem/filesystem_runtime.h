@@ -1145,6 +1145,12 @@ class Runtime : public clio::run::Container {
    */
   clio::run::TaskResume CheckMoveTarget(clio::run::u64 moving,
                                         clio::run::u64 dst_parent, int &rc);
+  /**
+   * Queue kAddName for every live row of the blocks this container homes
+   * and send them in batches (restart: re-names every link; idempotent).
+   */
+  clio::run::TaskResume RepublishHomeNames();
+
   // ---- inodes (fs_namespace.cc) ----
   /**
    * Make sure at least `margin` ids are durably reserved beyond the next

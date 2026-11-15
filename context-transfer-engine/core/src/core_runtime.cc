@@ -62,6 +62,7 @@ extern "C" void clio_cte_locate_register(
 #include <clio_ctp/serialize/msgpack_wrapper.h>
 
 #include <algorithm>
+#include <set>
 #include <chrono>
 #include <atomic>
 #include <cmath>
@@ -962,6 +963,7 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
            "start clean.",
            config_.performance_.metadata_log_path_, e.what());
     }
+    BindRestoredNames();
     // Both paths populate the tag table directly (bypassing GetOrAssignTagId's
     // per-insert indexing), so rebuild the regex search index once from the
     // final tag set (#598).
@@ -1846,6 +1848,7 @@ clio::run::TaskResume Runtime::StatTargets(clio::run::shared_ptr<StatTargetsTask
   CLIO_TASK_BODY_BEGIN
   RefreshCacheCopyBytes();
   CLIO_CO_AWAIT(RetryPendingInvals());
+  if (names_migration_pending_) CLIO_CO_AWAIT(MigrateRestoredNames());
   try {
     // Collect all target IDs under read lock (can't co_await inside lambda)
     std::vector<clio::run::PoolId> target_ids;
@@ -6834,6 +6837,124 @@ clio::run::TaskResume Runtime::RunNameOps(std::vector<TagNameOpRec> ops,
     if (!undo.empty()) {
       std::vector<TagNameOpRec> ignored;
       CLIO_CO_AWAIT(SendNameSteps(std::move(undo), &ignored));
+    }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+namespace {
+
+/** A name from the hierarchical layout ("$tagid{..}/leaf" or the root "/"). */
+bool IsLegacyHierName(const std::string &n) {
+  return n == "/" || n.rfind("$tagid{", 0) == 0;
+}
+
+}  // namespace
+
+void Runtime::BindRestoredNames() {
+  std::vector<std::pair<TagId, std::vector<std::string>>> lists;
+  tag_id_to_info_.for_each(
+      [&lists](const TagId &id, const std::shared_ptr<TagInfo> &info) {
+        std::vector<std::string> names = NamesOf(*info);
+        if (!names.empty()) lists.emplace_back(id, std::move(names));
+      },
+      ctp::priv::ForEachLock::kShared);
+  for (const auto &l : lists) {
+    for (const std::string &n : l.second) {
+      if (IsLegacyHierName(n)) continue;
+      if (tag_name_to_id_.find(n) == nullptr) tag_name_to_id_.insert_or_assign(n, l.first);
+    }
+  }
+  names_migration_pending_ = !lists.empty();
+}
+
+clio::run::TaskResume Runtime::MigrateRestoredNames() {
+#ifdef CLIO_ENABLE_BOOST_COROUTINES
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
+#endif
+  CLIO_TASK_BODY_BEGIN
+  {
+    names_migration_pending_ = false;  // one pass at a time; set on failure
+    std::vector<std::pair<TagId, std::vector<std::string>>> lists;
+    tag_id_to_info_.for_each(
+        [&lists](const TagId &id, const std::shared_ptr<TagInfo> &info) {
+          std::vector<std::string> names = NamesOf(*info);
+          if (!names.empty()) lists.emplace_back(id, std::move(names));
+        },
+        ctp::priv::ForEachLock::kShared);
+    // Every flat name bound on its owner; every list on its home.
+    std::vector<TagNameOpRec> steps;
+    std::vector<std::pair<size_t, size_t>> step_of;  // (list, name) per step
+    for (size_t l = 0; l < lists.size(); ++l) {
+      const TagId id = lists[l].first;
+      const bool home_here = OwnsHash(TagHomeHash(id));
+      for (size_t k = 0; k < lists[l].second.size(); ++k) {
+        const std::string &n = lists[l].second[k];
+        if (IsLegacyHierName(n)) continue;
+        if (!OwnsHash(NameHash(n))) {
+          steps.push_back(NameStep(TagNameOp::kBind, id, n));
+          step_of.emplace_back(l, k);
+        }
+        if (!home_here) {
+          steps.push_back(NameStep(TagNameOp::kHomeAdd, id, n));
+          step_of.emplace_back(l, k);
+        }
+      }
+    }
+    std::vector<TagNameOpRec> res;
+    if (!steps.empty()) CLIO_CO_AWAIT(SendNameSteps(steps, &res));
+    std::set<std::pair<size_t, size_t>> taken;
+    for (size_t i = 0; i < res.size(); ++i) {
+      if (StepIs(res[i], kTnTaken)) {
+        taken.insert(step_of[i]);  // the owner binds it to another tag now
+      } else if (!StepIs(res[i], kTnOk)) {
+        names_migration_pending_ = true;  // an owner/home is not up yet
+        HLOG(kInfo, "cte_core: restored-name migration waits for container "
+             "{} (retried next tick)", StepHash(steps[i]));
+        CLIO_CO_RETURN;
+      }
+    }
+    // Every remote step landed: make this container's state agree.
+    std::lock_guard<std::mutex> g(tag_names_mu_);
+    size_t moved = 0, dropped = 0;
+    for (size_t l = 0; l < lists.size(); ++l) {
+      const TagId id = lists[l].first;
+      const bool home_here = OwnsHash(TagHomeHash(id));
+      std::vector<std::string> keep;
+      for (size_t k = 0; k < lists[l].second.size(); ++k) {
+        const std::string &n = lists[l].second[k];
+        const bool legacy = IsLegacyHierName(n);
+        if (legacy || !OwnsHash(NameHash(n))) {
+          TagId *b = tag_name_to_id_.find(n);
+          if (b != nullptr && *b == id) {
+            tag_name_to_id_.erase(n);
+            tag_search_.Delete(n);
+          }
+        }
+        if (legacy || taken.count({l, k}) != 0) {
+          ++dropped;
+          continue;
+        }
+        if (home_here) keep.push_back(n);
+      }
+      if (keep != lists[l].second) {
+        if (!home_here) ++moved;
+        EditTagInfo(id, [&keep](TagInfo &t) {
+          t.tag_name_ = clio::run::priv::string(
+              CLIO_PRIV_ALLOC, keep.empty() ? std::string() : keep[0]);
+          t.aliases_.clear();
+          for (size_t i = 1; i < keep.size(); ++i) {
+            t.aliases_.push_back(clio::run::priv::string(CLIO_PRIV_ALLOC, keep[i]));
+          }
+        });
+        std::shared_ptr<TagInfo> now = tag_id_to_info_.get(id);
+        if (now != nullptr) LogTagIdentity(id, *now);
+      }
+    }
+    if (moved != 0 || dropped != 0) {
+      HLOG(kInfo, "cte_core: restored names migrated: {} list(s) moved to "
+           "their homes, {} old or superseded name(s) dropped", moved, dropped);
     }
   }
   CLIO_CO_RETURN;

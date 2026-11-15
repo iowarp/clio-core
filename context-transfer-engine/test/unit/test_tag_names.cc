@@ -44,8 +44,12 @@
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/core/core_tasks.h>
 
+#include <clio_runtime/admin/admin_client.h>
+
 #include <chrono>
+#include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <set>
 #include <string>
 #include <thread>
@@ -298,6 +302,108 @@ TEST_CASE("batched name ops (clio-fs style <leaf>/<inode> names)",
   REQUIRE(m->applied_ == 2);
   REQUIRE(Query("^[a-z.]+/1[123]$") ==
           std::set<std::string>({"e.txt/11", "f.txt/13"}));
+}
+
+namespace {
+
+/** Append one type-5 snapshot entry (name list of a tag) to `out`. */
+void WriteType5(std::ofstream &out, const std::string &name, const TagId &id,
+                const std::vector<std::string> &aliases) {
+  const uint8_t entry_type = 5;
+  const uint32_t name_len = static_cast<uint32_t>(name.size());
+  const clio::run::u64 total = 0;
+  const uint32_t n = static_cast<uint32_t>(aliases.size());
+  out.write(reinterpret_cast<const char *>(&entry_type), sizeof(entry_type));
+  out.write(reinterpret_cast<const char *>(&name_len), sizeof(name_len));
+  out.write(name.data(), name_len);
+  out.write(reinterpret_cast<const char *>(&id), sizeof(id));
+  out.write(reinterpret_cast<const char *>(&total), sizeof(total));
+  out.write(reinterpret_cast<const char *>(&n), sizeof(n));
+  for (const auto &a : aliases) {
+    const uint32_t len = static_cast<uint32_t>(a.size());
+    out.write(reinterpret_cast<const char *>(&len), sizeof(len));
+    out.write(a.data(), len);
+  }
+}
+
+}  // namespace
+
+TEST_CASE("a snapshot from before flat names restores every name",
+          "[cte][tagnames][compat]") {
+  TagNameFixture fx;
+  namespace fs = std::filesystem;
+  // An older binary wrote name lists only (no binding entries) and named
+  // filesystem links hierarchically. The restored pool must open the old
+  // flat names under their old ids and drop the hierarchical ones.
+  const std::string log_path = DataDir() + "/tag_names_compat_meta.log";
+  const TagId flat(1, 4243), dirent(1, 4244);
+  {
+    std::ofstream out(log_path, std::ios::binary | std::ios::trunc);
+    REQUIRE(out.is_open());
+    WriteType5(out, "compat_flat", flat, {"compat_alias"});
+    WriteType5(out, "$tagid{1.4243}/leaf", dirent, {});
+    REQUIRE(out.good());
+  }
+  const clio::run::PoolId pool_id(516, 0);
+  clio::run::PoolConfig cfg;
+  cfg.mod_name_ = "clio_cte_core";
+  cfg.pool_name_ = "clio_cte_compat_restored";
+  cfg.pool_id_ = pool_id;
+  cfg.pool_query_ = clio::run::PoolQuery::Local();
+  cfg.restart_ = true;
+  {
+    std::ostringstream y;
+    y << "targets:\n  neighborhood: 1\nstorage:\n"
+      << "  - path: \"" << log_path + ".dat" << "\"\n"
+      << "    bdev_type: \"file\"\n    capacity_limit: \"16MB\"\n"
+      << "    persistence_level: \"temporary\"\n"
+      << "performance:\n  metadata_log_path: " << log_path << "\n"
+      << "  stat_targets_period_ms: 100\n";
+    cfg.config_ = y.str();
+  }
+  clio::run::admin::Client admin(clio::run::kAdminPoolId);
+  auto compose = admin.AsyncCompose(cfg);
+  compose.Wait();
+  const clio::run::u32 compose_rc = compose->GetReturnCode();
+  clio::cte::core::Client c(pool_id);
+  TagId got_flat, got_alias;
+  bool created_flat = true, created_alias = true;
+  std::string canonical;
+  bool legacy_gone = false;
+  if (compose_rc == 0) {
+    auto o1 = c.AsyncGetOrCreateTag("compat_flat");
+    o1.Wait();
+    got_flat = o1->tag_id_;
+    created_flat = o1->created_ != 0;
+    auto o2 = c.AsyncGetOrCreateTag("compat_alias");
+    o2.Wait();
+    got_alias = o2->tag_id_;
+    created_alias = o2->created_ != 0;
+    auto nm = c.AsyncGetTagName(flat);
+    nm.Wait();
+    canonical = nm->found_ ? nm->tag_name_.str() : std::string();
+    for (int i = 0; i < 100 && !legacy_gone; ++i) {  // migration: next tick
+      auto q = c.AsyncGetTagName(dirent);
+      q.Wait();
+      legacy_gone = q->found_ == 0;
+      if (!legacy_gone) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    auto destroy = admin.AsyncDestroyPool(clio::run::PoolQuery::Local(), pool_id);
+    destroy.Wait();
+  }
+  std::error_code ec;
+  for (const auto &e : fs::directory_iterator(fs::path(log_path).parent_path(), ec)) {
+    if (e.path().filename().string().rfind("tag_names_compat_meta.log", 0) == 0) {
+      fs::remove(e.path(), ec);
+    }
+  }
+  REQUIRE(compose_rc == 0);
+  REQUIRE(got_flat == flat);
+  REQUIRE_FALSE(created_flat);
+  REQUIRE(got_alias == flat);
+  REQUIRE_FALSE(created_alias);
+  REQUIRE(canonical == "compat_flat");
+  REQUIRE(legacy_gone);
 }
 
 SIMPLE_TEST_MAIN()

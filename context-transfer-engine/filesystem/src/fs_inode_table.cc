@@ -2220,4 +2220,52 @@ clio::run::TaskResume Runtime::CheckMoveTarget(clio::run::u64 moving,
   CLIO_TASK_BODY_END
 }
 
+clio::run::TaskResume Runtime::RepublishHomeNames() {
+  CLIO_TASK_BODY_BEGIN
+  std::vector<TableBlockKey> keys;
+  if (dir_journal_) {
+    JournaledHomeKeys(&keys);
+  } else {
+    auto list = cte_.AsyncListLocalBlobs("d\\.[0-9]+",
+                                         clio::run::PoolQuery::Local());
+    CLIO_CO_AWAIT(list);
+    for (size_t i = 0; i < list->tag_ids_.size(); ++i) {
+      keys.push_back(TableBlockKey{
+          list->tag_ids_[i],
+          static_cast<clio::run::u32>(
+              std::strtoul(list->blob_names_[i].c_str() + 2, nullptr, 10))});
+    }
+  }
+  constexpr size_t kBatchRows = 4096;
+  size_t queued = 0, total = 0;
+  for (const TableBlockKey &key : keys) {
+    if (BlockHome(key.dir_, key.index_) != container_id_) continue;
+    std::shared_ptr<TableBlockSlot> slot;
+    int rc = 0;
+    CLIO_CO_AWAIT(LoadBlock(key.dir_, key.index_, slot, rc));
+    if (rc != 0) continue;
+    {
+      std::lock_guard<std::mutex> g(ns_mu_);
+      for (const auto &kv : slot->blk_.rows_) {
+        if (kv.second.state_ == kRowPending) continue;
+        PublishName(clio::cte::core::TagNameOp::kAddName,
+                    FsUnpack(kv.second.id_),
+                    FsTagName(RowName(kv.first, kv.second), kv.second.id_));
+        ++queued;
+      }
+    }
+    if (queued >= kBatchRows) {
+      total += queued;
+      queued = 0;
+      CLIO_CO_AWAIT(FlushNames());
+    }
+  }
+  total += queued;
+  CLIO_CO_AWAIT(FlushNames());
+  HLOG(kInfo, "filesystem: re-named {} link(s) of {} homed block(s) in the "
+       "CTE", total, keys.size());
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 }  // namespace clio::cte::filesystem
