@@ -500,8 +500,8 @@ class Cluster:
     # caches tag and blob metadata only. CLIO_FS_SUITE_SHM_CACHE=0 leaves it
     # out (the chain then ends at top_id as before).
     if os.environ.get('CLIO_FS_SUITE_SHM_CACHE', '1') != '0':
-      shm_cache = ('  - mod_name: clio_cte_shm_writethru_cache\n'
-                   '    pool_name: clio_cte_shm_writethru_cache\n'
+      shm_cache = ('  - mod_name: clio_cte_core_shm_cache_writethru\n'
+                   '    pool_name: clio_cte_core_shm_cache_writethru\n'
                    '    pool_query: local\n'
                    '    pool_id: "568.0"\n'
                    f'    next_pool_id: "{top_id}"\n'

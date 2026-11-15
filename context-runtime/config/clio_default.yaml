@@ -475,7 +475,7 @@ compose:
   # and stack via next_pool_id, separating RELIABILITY (replication) from
   # LOCALITY (cache) from ENCODING (compression). The canonical full chain:
   #
-  #   indexer(564.0) -> [compressor(562.0) ->] write_back_cache(567.0)
+  #   indexer(564.0) -> [compressor(562.0) ->] core_persist_write_back(567.0)
   #     -> volatile core(540.0)
   #     -> replication(561.0) -> persistent core(512.0)
   #
@@ -545,13 +545,13 @@ compose:
   # the copy out and run on persistent, since they depend on the blob's
   # current state.
   #
-  # clio_cte_write_thru_cache takes the same keys (flush_period_ms and
+  # clio_cte_core_persist_write_thru takes the same keys (flush_period_ms and
   # fallback_to_persistent are ignored there) and acks only after the
   # persistent write: no dirty data, but every write pays the persistent
   # chain's latency (measured slower than write-back on every workload of
   # the Ares tier suite).
-  - mod_name: clio_cte_write_back_cache
-    pool_name: clio_cte_write_back_cache
+  - mod_name: clio_cte_core_persist_write_back
+    pool_name: clio_cte_core_persist_write_back
     pool_query: local
     pool_id: "567.0"
     next_volatile: "540.0"              # volatile core (required)
@@ -609,7 +609,7 @@ compose:
   # (uncompressed) bytes. The module persists its own snapshot + WAL: a
   # restart restores the index and never rescans storage; pre-existing data
   # enters via a tag's first-insertion backfill or the kReindexScan verb.
-  # === Shared-memory cache (shm_writethru_cache/DESIGN.md) ===
+  # === Shared-memory cache (core_shm_cache_writethru/DESIGN.md) ===
   # Sits BELOW the indexer (which reads and writes through it) and ABOVE the
   # data transformations and data caches. It owns one shared-memory segment
   # per node that client processes map, and caches tag and blob metadata
@@ -619,8 +619,8 @@ compose:
   # changes. md_only: true here because the write-back cache below already
   # holds the bytes. CLIO_CTE_CLIENT_INIT binds a process to entry_pool_id
   # (the indexer) and maps this segment; CLIO_CTE_SHM_CACHE=0 opts out.
-  - mod_name: clio_cte_shm_writethru_cache
-    pool_name: clio_cte_shm_writethru_cache
+  - mod_name: clio_cte_core_shm_cache_writethru
+    pool_name: clio_cte_core_shm_cache_writethru
     pool_query: local
     pool_id: "568.0"
     next_pool_id: "567.0"               # write-back cache (562.0 with compressor)

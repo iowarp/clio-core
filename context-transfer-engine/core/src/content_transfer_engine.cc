@@ -151,7 +151,7 @@ bool ContentTransferEngine::ClientInit(const clio::run::PoolQuery &pool_query) {
     HLOG(kDebug, "CTE ClientInit: SHM metadata cache unavailable; using RPC");
   }
 
-  // shm write-through cache (shm_writethru_cache/DESIGN.md): when the compose
+  // shm write-through cache (core_shm_cache_writethru/DESIGN.md): when the compose
   // publishes one at its well-known pool, bind this process's client to it so
   // puts, covered gets and known sizes complete in shared memory. Only a
   // process that can MAP the segment detects it; others (TCP clients, remote

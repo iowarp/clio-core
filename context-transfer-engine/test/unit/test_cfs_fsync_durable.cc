@@ -160,7 +160,7 @@ TEST_CASE("cfs fsync flushes a file's pages to the persistent core",
          "        bdev_type: ram\n"
          "        capacity_limit: 64mb\n"
          "        score: 1.0\n"
-         "  - mod_name: clio_cte_write_back_cache\n"
+         "  - mod_name: clio_cte_core_persist_write_back\n"
          "    pool_name: \"cfs_fsync_cache\"\n"
          "    pool_query: local\n"
          "    pool_id: \"567.0\"\n"

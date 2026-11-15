@@ -33,7 +33,7 @@
 
 /**
  * @file shm_wtc.h
- * The shared-memory write-through cache (shm_writethru_cache chimod) segment:
+ * The shared-memory write-through cache (core_shm_cache_writethru chimod) segment:
  * layout and the operations both sides run on it.
  *
  * One named segment per cache pool per node, formatted as a BuddyAllocator.
@@ -55,7 +55,7 @@
  *
  * Everything in the segment is reached by offset from the allocator's
  * backend data, so the segment may map at different addresses per process.
- * See context-transfer-engine/shm_writethru_cache/DESIGN.md.
+ * See context-transfer-engine/core_shm_cache_writethru/DESIGN.md.
  */
 
 #ifndef CLIO_CTE_CORE_SHM_WTC_H_

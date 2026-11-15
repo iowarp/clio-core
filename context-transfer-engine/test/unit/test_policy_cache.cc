@@ -47,8 +47,8 @@
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/core/core_config.h>
 #include <clio_cte/core/core_tasks.h>
-#include <clio_cte/write_back_cache/write_back_cache_client.h>
-#include <clio_cte/write_thru_cache/write_thru_cache_client.h>
+#include <clio_cte/core_persist_write_back/core_persist_write_back_client.h>
+#include <clio_cte/core_persist_write_thru/core_persist_write_thru_client.h>
 
 #include <chrono>
 #include <cstring>
@@ -230,8 +230,8 @@ class PolicyCacheFixture {
 
   void CreateCaches() {
     {
-      clio::cte::write_thru_cache::Client c;
-      clio::cte::write_thru_cache::WriteThruCacheConfig params;
+      clio::cte::core_persist_write_thru::Client c;
+      clio::cte::core_persist_write_thru::WriteThruCacheConfig params;
       params.volatile_pool_ = kVolatilePool;
       params.persistent_pool_ = kPersistentPool;
       auto f = c.AsyncCreateCache(clio::run::PoolQuery::Local(),
@@ -240,8 +240,8 @@ class PolicyCacheFixture {
       REQUIRE(f->GetReturnCode() == 0);
     }
     for (int strict = 0; strict < 2; ++strict) {
-      clio::cte::write_back_cache::Client c;
-      clio::cte::write_back_cache::WriteBackCacheConfig params;
+      clio::cte::core_persist_write_back::Client c;
+      clio::cte::core_persist_write_back::WriteBackCacheConfig params;
       params.volatile_pool_ = kVolatilePool;
       params.persistent_pool_ = kPersistentPool;
       params.flush_period_ms_ = 0;  // flushes only when the test asks

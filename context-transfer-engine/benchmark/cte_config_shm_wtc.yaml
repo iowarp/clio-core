@@ -25,8 +25,8 @@ compose:
     dpe:
       dpe_type: "max_bw"
 
-  - mod_name: clio_cte_shm_writethru_cache
-    pool_name: clio_cte_shm_writethru_cache
+  - mod_name: clio_cte_core_shm_cache_writethru
+    pool_name: clio_cte_core_shm_cache_writethru
     pool_query: local
     pool_id: 568.0
     next_pool_id: 512.0

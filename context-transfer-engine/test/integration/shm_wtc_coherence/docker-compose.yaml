@@ -1,4 +1,4 @@
-# 4-node shm write-through cache coherence cluster (shm_writethru_cache/DESIGN.md).
+# 4-node shm write-through cache coherence cluster (core_shm_cache_writethru/DESIGN.md).
 #
 # Unlike the sibling distributed suite (tests on node 1 only), EVERY node
 # runs the coherence binary — the scenarios are collective (each rank puts,

@@ -32,10 +32,10 @@
  */
 
 /**
- * Unit tests for the shm_writethru_cache chimod and the core client's cache
- * path (context-transfer-engine/shm_writethru_cache/DESIGN.md).
+ * Unit tests for the core_shm_cache_writethru chimod and the core client's cache
+ * path (context-transfer-engine/core_shm_cache_writethru/DESIGN.md).
  *
- * Chain under test: shm_writethru_cache (568.0) -> core (512.0). `io` is a
+ * Chain under test: core_shm_cache_writethru (568.0) -> core (512.0). `io` is a
  * core client bound to the cache pool (SHM path); `core` reads the chain
  * directly to check what actually landed.
  */
@@ -43,7 +43,7 @@
 #include <clio_runtime/clio_runtime.h>
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/core/core_tasks.h>
-#include <clio_cte/shm_writethru_cache/shm_writethru_cache_client.h>
+#include <clio_cte/core_shm_cache_writethru/core_shm_cache_writethru_client.h>
 
 #include <atomic>
 #include <chrono>

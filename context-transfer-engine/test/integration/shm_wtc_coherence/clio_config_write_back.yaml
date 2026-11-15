@@ -1,6 +1,6 @@
 # shm write-through cache over the write-back policy cache, the default
 # chain since #1368 (minus the indexer, which only adds keyword indexing):
-#   shm_writethru_cache(568) -> write_back_cache(567)
+#   core_shm_cache_writethru(568) -> core_persist_write_back(567)
 #        -> volatile core(540)  /  replication(561) -> persistent core(512)
 # Clients bind via CLIO_CTE_POOL=568.0.
 
@@ -70,8 +70,8 @@ compose:
     cache_score: 1.0
     replica_score: 0.2
 
-  - mod_name: clio_cte_write_back_cache
-    pool_name: clio_cte_write_back_cache
+  - mod_name: clio_cte_core_persist_write_back
+    pool_name: clio_cte_core_persist_write_back
     pool_query: local
     pool_id: "567.0"
     next_volatile: "540.0"
@@ -81,8 +81,8 @@ compose:
     flush_period_ms: 10000
     fallback_to_persistent: true
 
-  - mod_name: clio_cte_shm_writethru_cache
-    pool_name: clio_cte_shm_writethru_cache
+  - mod_name: clio_cte_core_shm_cache_writethru
+    pool_name: clio_cte_core_shm_cache_writethru
     pool_query: local
     pool_id: "568.0"
     next_pool_id: "567.0"

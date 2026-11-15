@@ -477,7 +477,7 @@ bool Config::ParsePerformanceConfig(const YAML::Node &node) {
     HLOG(kWarning,
          "Config: performance.flush_data_period_ms / "
          "flush_data_min_persistence are no longer CTE core keys and are "
-         "ignored; set flush_period_ms on a clio_cte_write_back_cache entry");
+         "ignored; set flush_period_ms on a clio_cte_core_persist_write_back entry");
   }
 
   if (node["transaction_log_capacity"]) {

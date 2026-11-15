@@ -1,7 +1,7 @@
 # clio-fs shared-memory cache — design
 
 Status: proposal (branch `cte-shm-cache`). Companion to
-`context-transfer-engine/shm_writethru_cache/DESIGN.md` (the CTE cache);
+`context-transfer-engine/core_shm_cache_writethru/DESIGN.md` (the CTE cache);
 read that first. This doc only covers what differs for a filesystem.
 
 ## Why clio-fs needs its own

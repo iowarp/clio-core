@@ -3080,13 +3080,13 @@ class Client : public clio::run::ContainerClient {
     return v;
   }
 
-  // ==== Shared-memory write-through cache (shm_writethru_cache) ============
+  // ==== Shared-memory write-through cache (core_shm_cache_writethru) ============
   //
-  // When this client's pool is a shm_writethru_cache pool, puts, covered gets
+  // When this client's pool is a core_shm_cache_writethru pool, puts, covered gets
   // and known sizes complete in that pool's segment with no task. Anything
   // the segment cannot express takes the ordinary task path to the SAME pool,
   // whose handlers order it against the buffered writes. See
-  // context-transfer-engine/shm_writethru_cache/DESIGN.md.
+  // context-transfer-engine/core_shm_cache_writethru/DESIGN.md.
 
   /**
    * Whether a put/get context is one the cache serves directly: no codec,
