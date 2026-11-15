@@ -444,7 +444,9 @@ class CTEBenchmark {
     if (s == nullptr) return;
     std::printf("WTC stats: puts=%llu hits=%llu misses=%llu fills=%llu "
                 "evictions=%llu waits=%llu flush_batches=%llu "
-                "flush_ranges=%llu flush_skipped=%llu\n",
+                "flush_ranges=%llu flush_skipped=%llu miss_absent=%llu "
+                "miss_nonres=%llu miss_range=%llu miss_busy=%llu "
+                "invalidations=%llu\n",
                 (unsigned long long)s->puts_.load(),
                 (unsigned long long)s->get_hits_.load(),
                 (unsigned long long)s->get_misses_.load(),
@@ -453,7 +455,12 @@ class CTEBenchmark {
                 (unsigned long long)s->waits_.load(),
                 (unsigned long long)s->flush_batches_.load(),
                 (unsigned long long)s->flush_ranges_.load(),
-                (unsigned long long)s->flush_skipped_.load());
+                (unsigned long long)s->flush_skipped_.load(),
+                (unsigned long long)s->miss_absent_.load(),
+                (unsigned long long)s->miss_nonres_.load(),
+                (unsigned long long)s->miss_range_.load(),
+                (unsigned long long)s->miss_busy_.load(),
+                (unsigned long long)s->invalidations_.load());
   }
 
   BenchArgs a_;

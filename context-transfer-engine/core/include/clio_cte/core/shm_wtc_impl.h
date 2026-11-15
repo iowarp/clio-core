@@ -585,6 +585,7 @@ inline Status View::TryGet(u32 tag_major, u32 tag_minor, const char *name,
   }
   u64 h = KeyHash(tag_major, tag_minor, name, name_len);
   u32 stripe = StripeOf(h);
+  std::atomic<u64> *why = &root_->stats_.miss_busy_;
   for (u32 attempt = 0; attempt < kTornRetries; ++attempt) {
     const char *src = nullptr;
     BlobEntry *e = nullptr;
@@ -593,8 +594,11 @@ inline Status View::TryGet(u32 tag_major, u32 tag_minor, const char *name,
     {
       Guard g(root_->stripes_[stripe]);
       long s = FindLocked(h, tag_major, tag_minor, name, name_len);
+      why = &root_->stats_.miss_absent_;
       if (s >= 0) {
         e = Slot(static_cast<u32>(s));
+        why = !(e->flags_ & kResident) ? &root_->stats_.miss_nonres_
+                                       : &root_->stats_.miss_range_;
         const bool whole = (e->flags_ & kComplete) != 0 && off + size <= e->size_;
         const bool written = off >= e->valid_lo_ && off + size <= e->valid_hi_;
         if ((e->flags_ & kResident) != 0 && (whole || written)) {
@@ -611,6 +615,7 @@ inline Status View::TryGet(u32 tag_major, u32 tag_minor, const char *name,
       }
     }
     if (busy) {
+      why = &root_->stats_.miss_busy_;
       ctp::CpuRelax();
       continue;  // a writer is mid-copy into this buffer
     }
@@ -627,6 +632,7 @@ inline Status View::TryGet(u32 tag_major, u32 tag_minor, const char *name,
     }
   }
   root_->stats_.get_misses_.fetch_add(1, std::memory_order_relaxed);
+  why->fetch_add(1, std::memory_order_relaxed);
   return Status::kMiss;
 }
 

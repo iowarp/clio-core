@@ -524,23 +524,36 @@ std::map<clio::run::u32, std::vector<BlobKey>> Runtime::HomeApply(
     const std::vector<BlobKey> &keys, clio::run::u32 writer) {
   std::map<clio::run::u32, std::vector<BlobKey>> by_node;
   std::lock_guard<std::mutex> lk(sharers_mtx_);
+  // The directory tracks OTHER containers only. This home's own copy is
+  // dropped directly whenever another container's write lands here, so a
+  // home writing its own blobs keeps no entries -- and never invalidates
+  // its own fresh copies when the bounded directory overflows.
   for (const BlobKey &k : keys) {
-    SharerSet &s = sharers_[SharerKey(k.major_, k.minor_, k.name_)];
-    bool foreign_writer = false;
-    for (clio::run::u32 w : s.writers_) {
-      foreign_writer = foreign_writer || w != writer;
+    const std::string sk = SharerKey(k.major_, k.minor_, k.name_);
+    if (writer != container_id_) by_node[container_id_].push_back(k);
+    auto it = sharers_.find(sk);
+    if (it != sharers_.end()) {
+      bool foreign_writer = false;
+      for (clio::run::u32 w : it->second.writers_) {
+        foreign_writer = foreign_writer || w != writer;
+      }
+      for (clio::run::u32 n : it->second.nodes_) {
+        if (n != writer) by_node[n].push_back(k);
+      }
+      if (foreign_writer) {
+        // The writer's buffer may lack another writer's bytes.
+        by_node[writer].push_back(k);
+      }
     }
-    for (clio::run::u32 n : s.nodes_) {
-      if (n != writer) by_node[n].push_back(k);
+    if (writer == container_id_) {
+      if (it != sharers_.end()) sharers_.erase(it);
+    } else {
+      SharerSet &s = sharers_[sk];
+      s.nodes_.clear();
+      s.writers_.clear();
+      s.nodes_.insert(writer);
+      s.writers_.insert(writer);
     }
-    if (foreign_writer) {
-      // The writer's buffer may lack another writer's bytes.
-      by_node[writer].push_back(k);
-    }
-    s.nodes_.clear();
-    s.writers_.clear();
-    s.nodes_.insert(writer);
-    s.writers_.insert(writer);
   }
   while (sharers_.size() > config_.max_sharer_entries_) {
     // Bounded directory: forget an entry by invalidating its holders.
@@ -663,9 +676,11 @@ clio::run::TaskResume Runtime::Invalidate(
                "sharers={}", container_id_, k.major_, k.minor_, sender,
                it == sharers_.end() ? 0 : it->second.nodes_.size());
         }
+        // This home's copy is untracked: another container's write drops it.
+        if (sender != container_id_) fan[container_id_].push_back(k);
         if (it == sharers_.end()) continue;
         for (clio::run::u32 n : it->second.nodes_) {
-          if (n != sender) fan[n].push_back(k);
+          if (n != sender && n != container_id_) fan[n].push_back(k);
         }
         sharers_.erase(it);
       }

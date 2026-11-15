@@ -260,12 +260,16 @@ struct Stats {
                                          later flush already carried them */
   std::atomic<u64> tag_hits_;       /**< tag lookups served from the segment */
   std::atomic<u64> md_fills_;       /**< metadata fetched and cached */
+  std::atomic<u64> miss_absent_;    /**< get miss: no entry for the blob */
+  std::atomic<u64> miss_nonres_;    /**< get miss: entry holds no bytes */
+  std::atomic<u64> miss_range_;     /**< get miss: bytes not known current */
+  std::atomic<u64> miss_busy_;      /**< get miss: writer mid-copy / torn */
 };
 
 /** Segment root: the first allocation in the segment. */
 struct Root {
   static constexpr u64 kMagic = 0x3143544357534C43ull;  // "CLSWCTC1"
-  static constexpr u32 kVersion = 5;
+  static constexpr u32 kVersion = 6;
 
   u64 magic_;
   u32 version_;

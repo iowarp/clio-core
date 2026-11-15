@@ -417,9 +417,8 @@ clio::run::TaskResume Runtime::RegisterSharer(const TagId &tag,
   {
     const clio::run::u32 home = HomeOf(tag, name);
     if (home == container_id_) {
-      std::lock_guard<std::mutex> lk(sharers_mtx_);
-      sharers_[SharerKey(tag.major_, tag.minor_, name)].nodes_.insert(
-          container_id_);
+      // The home never tracks itself: every write from another container
+      // lands here and drops this copy directly (HomeApply / fanout).
     } else {
       auto *ipc = CLIO_IPC;
       BlobKey k{tag.major_, tag.minor_, name};
