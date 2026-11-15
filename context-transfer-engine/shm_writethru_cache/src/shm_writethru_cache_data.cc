@@ -79,6 +79,12 @@ clio::run::TaskResume Runtime::WaitBlobFlushed(const TagId &tag,
   CLIO_TASK_BODY_END
 }
 
+/** Fence key of one blob. */
+static std::string FenceKey(const TagId &tag, const std::string &name) {
+  return std::to_string(tag.major_) + "." + std::to_string(tag.minor_) + "/" +
+         name;
+}
+
 clio::run::TaskResume Runtime::BeginChainRead(const TagId &tag,
                                               const std::string &name) {
   CLIO_TASK_BODY_BEGIN
@@ -90,13 +96,20 @@ clio::run::TaskResume Runtime::BeginChainRead(const TagId &tag,
       CLIO_CO_AWAIT(clio::run::yield(kBarrierPollUs));
       continue;
     }
-    chain_reads_.fetch_add(1);
+    chain_reads_.fetch_add(1);  // the flusher waits for this to drain
     const bool flushing = flush_active_.load() != 0;
+    bool held = false;
     if (!flushing && chain_writes_.load() == 0 &&
         (!view_.Ready() || view_.BlobPending(tag.major_, tag.minor_,
                                              name.c_str(), name.size()) == 0)) {
-      break;  // held: no batch is landing and none can start
+      std::lock_guard<std::mutex> lk(fence_mu_);
+      const std::string key = FenceKey(tag, name);
+      if (blob_writes_.find(key) == blob_writes_.end()) {
+        ++blob_reads_[key];
+        held = true;  // no batch landing, none can start, no write of it
+      }
     }
+    if (held) break;
     chain_reads_.fetch_sub(1);
     // Only a landing flush is drained for us: ask the flusher to stop
     // starting batches until this read is through.
@@ -108,7 +121,43 @@ clio::run::TaskResume Runtime::BeginChainRead(const TagId &tag,
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::BeginChainWrite() {
+void Runtime::EndChainRead(const TagId &tag, const std::string &name) {
+  {
+    std::lock_guard<std::mutex> lk(fence_mu_);
+    auto it = blob_reads_.find(FenceKey(tag, name));
+    if (it != blob_reads_.end() && --it->second == 0) blob_reads_.erase(it);
+  }
+  chain_reads_.fetch_sub(1);
+}
+
+clio::run::TaskResume Runtime::BeginChainWrite(const TagId &tag,
+                                               const std::string &name) {
+  CLIO_TASK_BODY_BEGIN
+  {
+    const std::string key = FenceKey(tag, name);
+    {
+      std::lock_guard<std::mutex> lk(fence_mu_);
+      ++blob_writes_[key];  // new reads of this blob back off from here
+    }
+    while (true) {
+      {
+        std::lock_guard<std::mutex> lk(fence_mu_);
+        if (blob_reads_.find(key) == blob_reads_.end()) break;
+      }
+      CLIO_CO_AWAIT(clio::run::yield(kBarrierPollUs));
+    }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+void Runtime::EndChainWrite(const TagId &tag, const std::string &name) {
+  std::lock_guard<std::mutex> lk(fence_mu_);
+  auto it = blob_writes_.find(FenceKey(tag, name));
+  if (it != blob_writes_.end() && --it->second == 0) blob_writes_.erase(it);
+}
+
+clio::run::TaskResume Runtime::BeginChainWriteAll() {
   CLIO_TASK_BODY_BEGIN
   // seq_cst pairs with BeginChainRead (increment, then check the other).
   chain_writes_.fetch_add(1);
@@ -194,7 +243,7 @@ clio::run::TaskResume Runtime::PutBlob(
     // the chain orders this write after them, then drop the local copy. No
     // miss may fill from the chain until this write has landed.
     CLIO_CO_AWAIT(WaitBlobFlushed(task->tag_id_, name));
-    CLIO_CO_AWAIT(BeginChainWrite());
+    CLIO_CO_AWAIT(BeginChainWrite(task->tag_id_, name));
     if (view_.Ready()) {
       view_.Invalidate(task->tag_id_.major_, task->tag_id_.minor_,
                        name.c_str(), name.size());
@@ -211,7 +260,7 @@ clio::run::TaskResume Runtime::PutBlob(
       CLIO_CO_AWAIT(ForwardToCore(Method::kPutBlob,
                                   task.template Cast<clio::run::Task>()));
     }
-    EndChainWrite();
+    EndChainWrite(task->tag_id_, name);
     CLIO_CO_AWAIT(FanoutInvalidate(task->tag_id_, name));
   }
   CLIO_CO_RETURN;
@@ -226,7 +275,7 @@ clio::run::TaskResume Runtime::WriteAroundRecord(
   // Same order as a task-path put: this blob's logged ranges land first,
   // no fill may race the write, and the stale local copy is dropped.
   CLIO_CO_AWAIT(WaitBlobFlushed(tag, name));
-  CLIO_CO_AWAIT(BeginChainWrite());
+  CLIO_CO_AWAIT(BeginChainWrite(tag, name));
   if (view_.Ready()) {
     view_.Invalidate(tag.major_, tag.minor_, name.c_str(), name.size());
   }
@@ -237,7 +286,7 @@ clio::run::TaskResume Runtime::WriteAroundRecord(
     CLIO_CO_AWAIT(f);
     *rc = f.get() == nullptr ? 1u : f->GetReturnCode();
   }
-  EndChainWrite();
+  EndChainWrite(tag, name);
   CLIO_CO_AWAIT(FanoutInvalidate(tag, name));
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -298,7 +347,7 @@ clio::run::TaskResume Runtime::DelBlob(
   {
     const std::string name = task->blob_name_.str();
     CLIO_CO_AWAIT(WaitBlobFlushed(task->tag_id_, name));
-    CLIO_CO_AWAIT(BeginChainWrite());
+    CLIO_CO_AWAIT(BeginChainWrite(task->tag_id_, name));
     if (view_.Ready()) {
       view_.DropBlob(task->tag_id_.major_, task->tag_id_.minor_, name.c_str(),
                      name.size());
@@ -307,7 +356,7 @@ clio::run::TaskResume Runtime::DelBlob(
                                   clio::run::PoolQuery::Dynamic(),
                                   task->del_flags_);
     CLIO_CO_AWAIT(f);
-    EndChainWrite();
+    EndChainWrite(task->tag_id_, name);
     task->SetReturnCode(f->GetReturnCode());
     CLIO_CO_AWAIT(FanoutInvalidate(task->tag_id_, name));
   }
@@ -409,7 +458,7 @@ clio::run::TaskResume Runtime::GetBlob(
       if (filled &&
           view_.TryGet(tag.major_, tag.minor_, name.c_str(), name.size(),
                        task->offset_, task->size_, dst) == wtc::Status::kOk) {
-        EndChainRead();
+        EndChainRead(tag, name);
         task->SetReturnCode(0);
         CLIO_CO_RETURN;
       }
@@ -428,7 +477,7 @@ clio::run::TaskResume Runtime::GetBlob(
       CLIO_CO_AWAIT(ForwardToCore(Method::kGetBlob,
                                   task.template Cast<clio::run::Task>()));
     }
-    EndChainRead();
+    EndChainRead(tag, name);
     {
       const char *tr = std::getenv("CLIO_WTC_TRACE");
       if (tr != nullptr && tr[0] == '1' && task->GetReturnCode() != 0) {

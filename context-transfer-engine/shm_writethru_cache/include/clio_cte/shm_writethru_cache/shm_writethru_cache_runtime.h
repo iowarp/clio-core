@@ -272,16 +272,24 @@ class Runtime : public clio::cte::core::CoreInterposer {
    */
   clio::run::TaskResume BeginChainRead(const TagId &tag,
                                        const std::string &name);
-  /** Leave a chain read entered with BeginChainRead. */
-  void EndChainRead() { chain_reads_.fetch_sub(1); }
+  /** Leave a chain read entered with BeginChainRead (same blob). */
+  void EndChainRead(const TagId &tag, const std::string &name);
   /**
-   * Enter a task-path write of the chain (explicit-score / flagged put,
-   * delete): waits for in-flight chain reads and keeps new ones out until
-   * EndChainWrite. Without it a miss could snapshot the entry after this
-   * write's invalidation, fetch the chain BEFORE the write lands, and
-   * install the older bytes as complete.
+   * Enter a task-path write of ONE blob down the chain (explicit-score or
+   * flagged put, write-around, DelBlob): waits for in-flight chain reads of
+   * that blob and keeps new ones out until EndChainWrite. Without it a miss
+   * could snapshot the entry after this write's invalidation, fetch the
+   * chain BEFORE the write lands, and install the older bytes as complete.
+   * Per blob, so streaming write-arounds never starve misses of other blobs.
    */
-  clio::run::TaskResume BeginChainWrite();
+  clio::run::TaskResume BeginChainWrite(const TagId &tag,
+                                        const std::string &name);
+  /** Leave a per-blob chain write (same blob). */
+  void EndChainWrite(const TagId &tag, const std::string &name);
+  /** Tag-wide variant (DelTag): fences chain reads of EVERY blob. */
+  clio::run::TaskResume BeginChainWriteAll();
+  /** Leave a BeginChainWriteAll. */
+  void EndChainWriteAll() { chain_writes_.fetch_sub(1); }
   /**
    * Write one record around the cache (segment full): drain the blob's
    * logged ranges, fence chain reads, drop the local copy, put down the
@@ -294,8 +302,7 @@ class Runtime : public clio::cte::core::CoreInterposer {
                                           clio::run::u64 size, const char *src,
                                           clio::run::u32 flags,
                                           clio::run::u32 *rc);
-  /** Leave a chain write entered with BeginChainWrite. */
-  void EndChainWrite() { chain_writes_.fetch_sub(1); }
+
   /** Fetch the whole blob from the chain into the segment. */
   clio::run::TaskResume FillFromChain(const TagId &tag, const std::string &name,
                                       bool *filled);
@@ -315,8 +322,11 @@ class Runtime : public clio::cte::core::CoreInterposer {
   std::unordered_map<clio::run::u32, clio::run::u32> inflight_slots_;
   /** Chain reads in flight (BeginChainRead); FlushLog waits for zero. */
   std::atomic<int> chain_reads_{0};
-  /** Task-path chain writes in flight (BeginChainWrite). */
+  /** Tag-wide chain writes in flight (BeginChainWriteAll). */
   std::atomic<int> chain_writes_{0};
+  std::mutex fence_mu_;  ///< guards blob_reads_ / blob_writes_
+  std::unordered_map<std::string, int> blob_reads_;   ///< chain reads per blob
+  std::unordered_map<std::string, int> blob_writes_;  ///< chain writes per blob
   std::mutex sharers_mtx_;
   std::map<std::string, SharerSet> sharers_;
 };
