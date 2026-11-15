@@ -4220,7 +4220,7 @@ static void RaIssueLocked(RaCache &c, CfsHandle *h, clio::run::u64 page,
   lk.unlock();
   // Holes and short pages read as zeros, as in the uncached read.
   std::memset(pg->buf.get(), 0, len);
-  auto fut = CLIO_CTE_CLIENT->AsyncGetBlobDefer(
+  auto fut = CLIO_CFS_CLIENT->Cte()->AsyncGetBlobDefer(
       h->tag,
       clio::cte::filesystem::PageName(page *
                                       clio::cte::filesystem::kFsPageSize),
