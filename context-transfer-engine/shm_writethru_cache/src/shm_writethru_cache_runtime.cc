@@ -353,6 +353,27 @@ clio::run::TaskResume Runtime::SyncTag(
   CLIO_TASK_BODY_END
 }
 
+std::vector<clio::cte::core::TagNameOpRec> Runtime::PublishedNameOps(
+    clio::run::u32 method, const clio::run::shared_ptr<clio::run::Task> &task) {
+  std::vector<clio::cte::core::TagNameOpRec> ops;
+  if (task->GetReturnCode() != 0) return ops;
+  if (method == clio::cte::core::Method::kUpdateTagNames) {
+    auto t = task.template Cast<clio::cte::core::UpdateTagNamesTask>();
+    const std::string buf = t->ops_.str();
+    clio::cte::core::DecodeTagNameOps(buf.data(), buf.size(), &ops);
+  } else if (method == clio::cte::core::Method::kRenameTag) {
+    auto t = task.template Cast<clio::cte::core::RenameTagTask>();
+    clio::cte::core::TagNameOpRec r;
+    r.op_ = clio::cte::core::TagNameOp::kRename;
+    r.tag_ = t->tag_id_;
+    r.seq_ = clio::cte::core::GetWallTimeNs();
+    r.name_ = t->old_name_.str();
+    r.name2_ = t->new_name_.str();
+    ops.push_back(r);
+  }
+  return ops;
+}
+
 clio::run::TaskResume Runtime::BarrierForward(
     clio::run::u32 method, clio::run::shared_ptr<clio::run::Task> task) {
   CLIO_TASK_BODY_BEGIN
@@ -363,6 +384,15 @@ clio::run::TaskResume Runtime::BarrierForward(
     }
   }
   CLIO_CO_AWAIT(ForwardToCore(method, task));
+  // Published names also go to their tags' homes (search and resolution
+  // read them there), before the invalidations below.
+  {
+    std::vector<clio::cte::core::TagNameOpRec> ops = PublishedNameOps(method,
+                                                                      task);
+    if (!ops.empty()) {
+      CLIO_CO_AWAIT(RouteNameRecords(ops));
+    }
+  }
   CLIO_CO_AWAIT(InvalidateAfterForward(method, task));
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END

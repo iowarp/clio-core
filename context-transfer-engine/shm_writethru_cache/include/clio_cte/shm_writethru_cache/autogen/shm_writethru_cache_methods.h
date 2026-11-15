@@ -36,7 +36,14 @@ GLOBAL_CROSS_CONST clio::run::u32 kHomeFlush = 102;
 /** Cached tag size/times (carries a core::GetTagSizeTask; see
  *  wtc::kTagAttrsMethod, which clients use without this header). */
 GLOBAL_CROSS_CONST clio::run::u32 kTagAttrs = 103;
-GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 104;
+/** Name records routed to their tag's home (a core::UpdateTagNamesTask). */
+GLOBAL_CROSS_CONST clio::run::u32 kNameRecs = 104;
+/** A tag's stored name from its home (a core::GetTagNameTask). */
+GLOBAL_CROSS_CONST clio::run::u32 kTagRec = 105;
+/** Cluster-wide tag search, one arm per container (a core::TagQueryTask;
+ *  see wtc::kTagSearchMethod). */
+GLOBAL_CROSS_CONST clio::run::u32 kTagSearch = 106;
+GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 107;
 
 /** Method names indexed by id. */
 inline const std::vector<std::string> &GetMethodNames() {
@@ -57,6 +64,9 @@ inline const std::vector<std::string> &GetMethodNames() {
     v[kInvalidate] = "Invalidate";
     v[kHomeFlush] = "HomeFlush";
     v[kTagAttrs] = "TagAttrs";
+    v[kNameRecs] = "NameRecs";
+    v[kTagRec] = "TagRec";
+    v[kTagSearch] = "TagSearch";
     return v;
   }();
   return names;

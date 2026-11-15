@@ -204,6 +204,8 @@ class Cluster:
     # Failure detection: the runtime defaults (30 s silence + 30 s retry per
     # send) ride out restarts but stall every op on a dead node for 30 s;
     # a filesystem deployment wants a prompt EIO. Overridable per run.
+    if os.environ.get('CLIO_WTC_TRACE'):  # shm cache tracing (debug)
+      e['CLIO_WTC_TRACE'] = os.environ['CLIO_WTC_TRACE']
     e['CLIO_PROBE_SILENCE_S'] = str(getattr(self, 'probe_silence_s', 0) or
                                     os.environ.get(
                                         'CLIO_SUITE_PROBE_SILENCE_S', '10'))

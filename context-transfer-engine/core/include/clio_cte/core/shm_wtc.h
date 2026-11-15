@@ -156,6 +156,9 @@ static constexpr size_t kTagMetaNameLen = sizeof(kTagMetaName) - 1;
  * (the cluster total) and cached. Must equal shm_wtc::Method::kTagAttrs.
  */
 static constexpr u32 kTagAttrsMethod = 103;
+/** Method id of the cache module's TagSearch verb (cluster-wide TagQuery,
+ *  one arm per cache container). Must equal shm_wtc::Method::kTagSearch. */
+static constexpr u32 kTagSearchMethod = 106;
 
 /** Result of a client-side operation. */
 enum class Status : u32 {

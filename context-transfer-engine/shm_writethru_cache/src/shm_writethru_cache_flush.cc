@@ -631,6 +631,11 @@ clio::run::TaskResume Runtime::Invalidate(
     std::map<clio::run::u32, std::vector<BlobKey>> fan;
     if (task->mode_ == kInvalidateDrop && view_.Ready()) {
       for (const BlobKey &k : keys) {
+        if (WtcTrace() && k.name_.size() == wtc::kTagMetaNameLen &&
+            k.name_.compare(0, wtc::kTagMetaNameLen, wtc::kTagMetaName) == 0) {
+          HLOG(kInfo, "[WTC-TRACE] tagmeta-drop at={} tag={}.{} from={}",
+               container_id_, k.major_, k.minor_, sender);
+        }
         view_.Invalidate(k.major_, k.minor_, k.name_.c_str(), k.name_.size());
       }
     } else if (task->mode_ == kInvalidateDropTagData && view_.Ready()) {
@@ -652,6 +657,12 @@ clio::run::TaskResume Runtime::Invalidate(
       std::lock_guard<std::mutex> lk(sharers_mtx_);
       for (const BlobKey &k : keys) {
         auto it = sharers_.find(SharerKey(k.major_, k.minor_, k.name_));
+        if (WtcTrace() && k.name_.size() == wtc::kTagMetaNameLen &&
+            k.name_.compare(0, wtc::kTagMetaNameLen, wtc::kTagMetaName) == 0) {
+          HLOG(kInfo, "[WTC-TRACE] tagmeta-fanout at={} tag={}.{} from={} "
+               "sharers={}", container_id_, k.major_, k.minor_, sender,
+               it == sharers_.end() ? 0 : it->second.nodes_.size());
+        }
         if (it == sharers_.end()) continue;
         for (clio::run::u32 n : it->second.nodes_) {
           if (n != sender) fan[n].push_back(k);

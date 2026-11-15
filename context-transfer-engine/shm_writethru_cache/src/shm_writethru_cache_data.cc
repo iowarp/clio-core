@@ -254,7 +254,12 @@ clio::run::TaskResume Runtime::PutBlob(
                                     task->score_, task->context_, task->flags_,
                                     clio::run::PoolQuery::Dynamic());
       CLIO_CO_AWAIT(f);
+      // INOUT fields: an append reports the offset its bytes landed at, and
+      // the name may be completed handler-side (clio-fs log appends read
+      // the landed offset back).
       task->context_ = f->context_;
+      task->offset_ = f->offset_;
+      task->blob_name_ = f->blob_name_;
       task->SetReturnCode(f->GetReturnCode());
     } else {
       CLIO_CO_AWAIT(ForwardToCore(Method::kPutBlob,
@@ -311,6 +316,28 @@ clio::run::TaskResume Runtime::MultiPutBlob(
   {
     clio::cte::core::MultiPutBatchView batch;
     const bool attached = clio::cte::core::MultiPutBatchView::Attach(*task, &batch);
+    if (view_.Ready() && view_.MdOnly() && attached) {
+      // Metadata only: the batch goes down as one task, then every
+      // record's cached metadata is dropped here and at its home.
+      std::vector<BlobKey> keys;
+      std::vector<TagId> tags;
+      for (size_t i = 0; i < batch.size(); ++i) {
+        const auto &d = batch.descs_[i];
+        keys.push_back(BlobKey{d.tag_id_.major_, d.tag_id_.minor_,
+                               d.blob_name_});
+        tags.push_back(d.tag_id_);
+      }
+      CLIO_CO_AWAIT(BarrierForward(Method::kMultiPutBlob,
+                                   task.template Cast<clio::run::Task>()));
+      for (const BlobKey &k : keys) {
+        view_.Invalidate(k.major_, k.minor_, k.name_.c_str(), k.name_.size());
+      }
+      for (const BlobKey &k : keys) {
+        CLIO_CO_AWAIT(FanoutInvalidate(TagId(k.major_, k.minor_), k.name_));
+      }
+      CLIO_CO_AWAIT(NoteTagsWritten(tags));
+      CLIO_CO_RETURN;
+    }
     if (view_.Ready() && attached && PlainContext(task->context_)) {
       task->num_ok_ = 0;
       task->first_rc_ = 0;
@@ -331,7 +358,9 @@ clio::run::TaskResume Runtime::MultiPutBlob(
              ++tries) {
           CLIO_CO_AWAIT(clio::run::yield(kNoSpacePollUs));
         }
-        if (st == wtc::Status::kNoSpace) {
+        if (st != wtc::Status::kOk) {
+          // No room (kNoSpace), conflicting put flags (kMiss) or a name the
+          // segment cannot hold: write this record around the cache.
           clio::run::u32 rc = 0;
           CLIO_CO_AWAIT(WriteAroundRecord(d.tag_id_, d.blob_name_, d.offset_,
                                           d.size_, batch.base_ + d.payload_off_,

@@ -3322,7 +3322,7 @@ class Client : public clio::run::ContainerClient {
         (context.op_flags_ & Context::kGenerational) || ForceNetEnv()) {
       return false;
     }
-    if (Wtc() != nullptr) {
+    if (wtc::View *w = Wtc(); w != nullptr && !w->MdOnly()) {
       return false;  // the write-through cache is authoritative for reads
     }
     if (!HasShmCache() && !AttachShmCache()) {
@@ -4285,6 +4285,15 @@ class Client : public clio::run::ContainerClient {
 
     auto task = ipc_manager->NewTask<TagQueryTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, tag_regex, max_tags);
+
+    // Cluster-wide search through the shm cache: every cache container
+    // returns the names it is home for (resolved through the cache) plus
+    // its core's flat names -- correct whichever node published a name.
+    if (pool_query.IsBroadcastMode() && Wtc() != nullptr) {
+      task->pool_id_ = wtc_cache_pool_;
+      task->method_ = wtc::kTagSearchMethod;
+      return ipc_manager->Send(task);
+    }
 
     // Inline-eligible (CLIO_ENABLE_INLINE_RUN=1): nested metadata
     // lookups from co-located chimods (clio-fs Open does three in a
