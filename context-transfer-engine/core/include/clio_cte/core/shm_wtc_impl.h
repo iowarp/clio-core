@@ -92,6 +92,7 @@ inline bool View::Format(const std::string &name,
   root_->max_fill_ = lim.max_fill_;
   root_->half_life_ns_ = lim.half_life_ns_ == 0 ? 1 : lim.half_life_ns_;
   root_->node_id_ = node_id;
+  root_->md_only_ = lim.md_only_ ? 1u : 0u;
 
   size_t blob_bytes = sizeof(BlobEntry) * NumSlots();
   auto b = alloc_->AllocateOffset(blob_bytes);
@@ -480,6 +481,9 @@ inline Status View::TryPut(u32 tag_major, u32 tag_minor, const char *name,
   if (name_len > kMaxBlobName) {
     return Status::kTooLong;
   }
+  if (MdOnly()) {
+    return Status::kMiss;  // bytes are not cached here: take the task path
+  }
   if (!may_block) {
     const u64 cap = log_->Capacity();
     const u64 room = kLogHeadroom < cap / 4 ? kLogHeadroom : cap / 4;
@@ -552,6 +556,9 @@ inline Status View::TryPut(u32 tag_major, u32 tag_minor, const char *name,
 
 inline Status View::TryGet(u32 tag_major, u32 tag_minor, const char *name,
                            size_t name_len, u64 off, u64 size, char *dst) {
+  if (MdOnly()) {
+    return Status::kMiss;  // no bytes cached in metadata-only mode
+  }
   if (name_len > kMaxBlobName || dst == nullptr) {
     return Status::kMiss;
   }

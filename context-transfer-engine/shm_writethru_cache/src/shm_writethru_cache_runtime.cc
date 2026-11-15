@@ -111,6 +111,7 @@ bool Runtime::OpenSegment() {
   lim.evict_sample_ = config_.evict_sample_;
   lim.max_fill_ = config_.max_fill_;
   lim.half_life_ns_ = config_.half_life_ms_ * 1000ull * 1000ull;
+  lim.md_only_ = config_.md_only_;
   const std::string name = wtc::SegmentName(pid, pool_id_);
   const ctp::ipc::MemoryBackendId id(pid, 0x57540000u | (pool_id_.major_ & 0xFFFFu));
   if (!view_.Format(name, id, lim, SelfNode())) {
@@ -130,6 +131,9 @@ bool Runtime::OpenSegment() {
   loc->runtime_pid_ = pid;
   loc->root_off_ = view_.RootOff();
   loc->seg_size_ = view_.SegSize();
+  loc->entry_pool_ = config_.entry_pool_id_.IsNull()
+                         ? 0
+                         : config_.entry_pool_id_.ToU64();
   loc->ready_.store(1, std::memory_order_release);
   const clio::run::u64 off = static_cast<clio::run::u64>(
       reinterpret_cast<char *>(loc) - reinterpret_cast<char *>(meta));

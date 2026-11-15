@@ -441,7 +441,9 @@ clio::run::TaskResume Runtime::GetBlob(
     char *dst = task->blob_data_.IsNull()
                     ? nullptr
                     : ipc->ToFullPtr<char>(task->blob_data_.template Cast<char>()).ptr_;
-    const bool eligible = view_.Ready() && task->flags_ == 0 &&
+    // Metadata-only: bytes are never cached here, so no fill either.
+    const bool eligible = view_.Ready() && !view_.MdOnly() &&
+                          task->flags_ == 0 &&
                           PlainContext(task->context_) &&
                           task->segments_.empty() && dst != nullptr &&
                           task->size_ > 0 && name.size() <= wtc::kMaxBlobName;

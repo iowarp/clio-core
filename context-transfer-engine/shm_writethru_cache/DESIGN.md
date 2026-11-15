@@ -255,34 +255,80 @@ sharer sets when the runtime reports the node failed (or after an
 is full, the home invalidates the lowest-frecency entry's sharers to free
 one.
 
-## Tags
+## Tags and metadata
 
-Tag creation is NOT done in the cache. `GetOrCreateTag` is always a task,
-forwarded down the chain, and the core assigns the id exactly as today
-(`GenerateNewTagId`: `{node_id, counter}`).
+The cache holds tag and blob METADATA, not only bytes: a cache that sends
+every tag lookup, name resolution or size query to the runtime keeps the
+overhead it exists to remove. With `md_only: true` it holds metadata only
+(the data cache below, e.g. the write-back cache, holds the bytes).
 
-Why: a cache cannot create a tag safely without asking the authority.
-- An id derived from the name (a hash) breaks on rename: tags keep their id
-  when renamed or given extra names (`UpdateTagNames`), and clio-fs depends
-  on that (inode = packed TagId), so `hash(new name)` is wrong for every
-  renamed file. It also has undetected collisions.
-- A node cannot tell, from the name alone, whether the tag already exists
-  somewhere with a different id.
-- Names are full paths and can be arbitrarily long, so they are a poor key
-  for a fixed-size SHM table anyway.
+### Chain position
 
-The cost is one round trip per tag open/create (per file or dataset), which
-is small next to the per-blob traffic the cache removes.
+```
+clio-fs / CAE / stream -> indexer (564) -> shm cache (568) -> write-back (567)
+                                            -> replication (561) -> cores
+```
 
-The chimod still sees every `GetOrCreateTag` (it interposes the method) and
-keeps a TagTable entry keyed by **TagId** (not name), holding the
-`created_` flag the core returns. A tag the core reports as newly created
-lets blobs written under it be `kComplete` (see Reads). `DelTag` drops the
-entry.
+The indexer sits ABOVE the cache: it reads and writes through it, and
+indexing precedes the data transformations below. Clients bind to the
+cache's `entry_pool_id` (the indexer) so their tasks pass every module above
+the cache, and map the segment for the shared-memory paths. A put absorbed
+in shared memory (data mode) bypasses the indexer at put time; the flusher
+notifies the indexer when that write lands (index on flush).
 
-Later optimization (not planned): memoize name-to-id in SHM, invalidated by
-the `UpdateTagNames` broadcast and `DelTag`. Only worth doing if opens show
-up in profiles.
+### Tag homes
+
+Every tag has a HOME among the cache's containers: hash(tag id) % N, the
+same rule blobs use (see Known gaps for the hash-layout caveat). The home
+is the authority this cache uses for the tag's metadata:
+
+- **Names.** clio-fs publishes hierarchical names as records
+  "$tagid{parent}/leaf" (`UpdateTagNames`, `RenameTag`). The cache routes
+  each record to its tag's home -- never to the publishing node, never as
+  a broadcast. The home applies it to its own core (durable, as before) and
+  keeps it in its tag table.
+- **Size and times.** Each node's cache tracks the size and mtime changes
+  its own writes make to a tag and reports them to the tag's home with the
+  flushed batch; the home folds them in and pushes the new values to the
+  nodes caching the tag.
+- **Sharers and invalidation.** A node that fetches a tag's metadata
+  registers at the home; a rename, a name change, a size/time change or a
+  DelTag invalidates (or updates) every registered copy before it is
+  acknowledged -- the blob protocol, applied to tags.
+
+### Segment
+
+```
+TagTable   key = TagId; value = stored name (parent id + leaf), size,
+           atime/mtime/ctime, flags (kCreated, kNameValid, kAttrValid),
+           seqlock, inval epoch, sticky_rc
+NameIndex  key = hash(absolute or stored name) -> TagId (GetOrCreateTag hits)
+```
+
+### Verbs
+
+| Verb | Hit (no task) | Miss |
+|---|---|---|
+| GetOrCreateTag (existing name) | NameIndex | task to the chain, fill |
+| GetTagName(id) | resolve the parent chain through TagTable | fetch the missing ancestor from its home, fill |
+| GetTagSize / times | TagTable | fetch from the home, fill |
+| GetBlobSize / blob info | BlobTable | fetch from the blob's home, fill |
+| TagQuery | -- | to every cache container: each scans the records it is home for, resolves them through the cache, applies the regex |
+| UpdateTagNames / RenameTag | -- | records routed to their homes; homes invalidate copies |
+
+Tag creation still asks the authority (the core assigns ids); the NameIndex
+only memoizes existing name-to-id bindings, invalidated by rename and
+DelTag through the home.
+
+### Restart
+
+The core does not journal published names (a restarted core drops them,
+`kResetPublished`, and relies on publishers re-sending). So each home also
+persists the records it is home for as small blobs under a reserved tag
+(`_shm_tag_names`, blob name = packed tag id, payload = stored name and
+stamp) in the chain below, and a restarted home rebuilds its TagTable --
+and re-applies the names to its core -- from them at startup. No peer
+republish is needed.
 
 ## Replaces the client deferred-put pipeline
 

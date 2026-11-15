@@ -156,12 +156,23 @@ bool ContentTransferEngine::ClientInit(const clio::run::PoolQuery &pool_query) {
   // puts, covered gets and known sizes complete in shared memory. Only a
   // process that can MAP the segment detects it; others (TCP clients, remote
   // nodes) keep the core pool unless CLIO_CTE_POOL names the cache.
+  // The cache may name an entry pool (a module composed above it, e.g. the
+  // indexer): the client binds there so its tasks pass that module, and
+  // still maps the cache segment for its shared-memory paths.
   {
     const clio::run::PoolId core_pool = cte_client->pool_id_;
     cte_client->pool_id_ = clio::cte::core::wtc::kDefaultPoolId;
     if (cte_client->HasWtc()) {
-      HLOG(kInfo, "CTE ClientInit: bound to shm write-through cache {}.{}",
-           cte_client->pool_id_.major_, cte_client->pool_id_.minor_);
+      const clio::run::u64 entry = cte_client->WtcEntryPool();
+      if (entry != 0) {
+        cte_client->pool_id_ = clio::run::PoolId::FromU64(entry);
+        cte_client->ResetWtc();
+      }
+      HLOG(kInfo, "CTE ClientInit: bound to {}.{} over shm write-through "
+           "cache {}.{}", cte_client->pool_id_.major_,
+           cte_client->pool_id_.minor_,
+           clio::cte::core::wtc::kDefaultPoolId.major_,
+           clio::cte::core::wtc::kDefaultPoolId.minor_);
     } else {
       cte_client->pool_id_ = core_pool;
     }

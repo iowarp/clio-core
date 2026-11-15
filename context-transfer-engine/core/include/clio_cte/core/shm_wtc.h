@@ -232,7 +232,7 @@ struct Root {
   std::atomic<u64> coalesce_after_ns_;  /**< no merge-and-retry before this */
   std::atomic<u32> merge_fails_;        /**< consecutive failed merges */
   std::atomic<u32> global_rc_;     /**< sticky rc for tags not in TagTable */
-  u32 pad_;
+  u32 md_only_;                    /**< metadata only: no blob bytes */
   Stats stats_;
   ctp::Mutex tag_lock_;
   ctp::Mutex stripes_[kStripes];
@@ -250,6 +250,7 @@ struct Locator {
   u32 runtime_pid_;
   u64 root_off_;
   u64 seg_size_;
+  u64 entry_pool_;  ///< PoolId::ToU64 clients bind to (0 = the cache pool)
 };
 
 /** Segment name for a cache pool of a given runtime. */
@@ -291,6 +292,7 @@ struct Limits {
   u32 evict_sample_ = 16;
   u64 max_fill_ = 16ull << 20;
   u64 half_life_ns_ = 10ull * 1000 * 1000 * 1000;
+  bool md_only_ = false;  ///< cache metadata only (see WtcConfig::md_only_)
 };
 
 /**
@@ -336,6 +338,8 @@ class View {
   u64 RootOff() const { return root_off_; }
   /** Segment size. */
   u64 SegSize() const { return seg_size_; }
+  /** True when the segment caches metadata only (no blob bytes). */
+  bool MdOnly() const { return root_ != nullptr && root_->md_only_ != 0; }
   /** Root accessor (counters, seqs). */
   Root *GetRoot() const { return root_; }
   /** The dirty log. */

@@ -3134,12 +3134,6 @@ class Client : public clio::run::ContainerClient {
     }
     wtc_retry_ns_ = now + 1000ull * 1000ull * 1000ull;
     std::lock_guard<std::mutex> lk(WtcMutex());
-    auto &views = WtcViews();
-    auto it = views.find(pool_id_.ToU64());
-    if (it != views.end()) {
-      wtc_ = it->second.get();
-      return wtc_->Ready() ? wtc_ : nullptr;
-    }
     auto *ipc = CLIO_CPU_IPC;
     if (ipc == nullptr) {
       return nullptr;
@@ -3149,28 +3143,58 @@ class Client : public clio::run::ContainerClient {
     if (meta == nullptr || dir == nullptr) {
       return nullptr;
     }
-    const clio::run::u64 off = dir->FindRoot(pool_id_.ToU64());
-    if (off == 0) {
-      return nullptr;
+    // The cache serves this client when the client is bound to the cache
+    // pool itself, or to the pool the cache names as its entry (a module
+    // composed above it, e.g. the indexer): tasks then pass that module,
+    // and the client still uses the segment for its shared-memory paths.
+    auto locate = [&](const clio::run::PoolId &cache_pool) -> wtc::Locator * {
+      const clio::run::u64 off = dir->FindRoot(cache_pool.ToU64());
+      if (off == 0) return nullptr;
+      auto *l = reinterpret_cast<wtc::Locator *>(
+          reinterpret_cast<char *>(meta) + off);
+      if (l->magic_ != wtc::Locator::kMagic ||
+          l->ready_.load(std::memory_order_acquire) != 1) {
+        return nullptr;
+      }
+      return l;
+    };
+    clio::run::PoolId cache_pool = pool_id_;
+    wtc::Locator *loc = locate(cache_pool);
+    if (loc == nullptr) {
+      cache_pool = wtc::kDefaultPoolId;
+      loc = locate(cache_pool);
+      if (loc == nullptr || loc->entry_pool_ != pool_id_.ToU64()) {
+        return nullptr;
+      }
     }
-    auto *loc = reinterpret_cast<wtc::Locator *>(
-        reinterpret_cast<char *>(meta) + off);
-    if (loc->magic_ != wtc::Locator::kMagic ||
-        loc->ready_.load(std::memory_order_acquire) != 1) {
-      return nullptr;
+    wtc_entry_pool_ = loc->entry_pool_;
+    auto &views = WtcViews();
+    auto it = views.find(cache_pool.ToU64());
+    if (it != views.end()) {
+      wtc_ = it->second.get();
+      return wtc_->Ready() ? wtc_ : nullptr;
     }
     auto view = std::make_unique<wtc::View>();
-    if (!view->Attach(wtc::SegmentName(loc->runtime_pid_, pool_id_),
+    if (!view->Attach(wtc::SegmentName(loc->runtime_pid_, cache_pool),
                       loc->root_off_)) {
       return nullptr;
     }
     wtc_ = view.get();
-    views[pool_id_.ToU64()] = std::move(view);
+    views[cache_pool.ToU64()] = std::move(view);
     return wtc_;
   }
 
   /** True when this client is bound to a shm write-through cache. */
   bool HasWtc() { return Wtc() != nullptr; }
+
+  /** Entry pool the attached cache names (PoolId::ToU64), 0 if none. */
+  clio::run::u64 WtcEntryPool() const { return wtc_entry_pool_; }
+
+  /** Forget the attached cache view (after rebinding pool_id_). */
+  void ResetWtc() {
+    wtc_ = nullptr;
+    wtc_retry_ns_ = 0;
+  }
 
   /** An already-complete future over a put the cache absorbed. */
   clio::run::Future<PutBlobTask> WtcDonePut(
@@ -4488,6 +4512,8 @@ class Client : public clio::run::ContainerClient {
   // shm write-through cache segment of pool_id_ (process-wide, never freed),
   // and the earliest time to retry a failed attach.
   wtc::View *wtc_ = nullptr;
+  /** Entry pool of the attached cache (see WtcEntryPool). */
+  clio::run::u64 wtc_entry_pool_ = 0;
   clio::run::u64 wtc_retry_ns_ = 0;
   // True only when the mirror was attached via AttachShmCacheOf for a pool
   // OTHER than this client's own (interposition binding): gates the

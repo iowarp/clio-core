@@ -73,8 +73,16 @@ struct WtcConfig {
   clio::run::u32 flush_shards_ = 8;             ///< [flush_shards] parallel tasks per home
   clio::run::u32 flush_depth_ = 4;              ///< [flush_depth] batches in flight
   clio::run::u32 max_sharer_entries_ = 65536;   ///< [max_sharer_entries]
+  /** [md_only] cache tag and blob metadata only; blob bytes go down the
+   *  chain (a data cache below already holds them). */
+  bool md_only_ = false;
+  /** [entry_pool_id] pool clients bind to so their tasks pass every module
+   *  above this cache (e.g. the indexer); null = this pool. */
+  clio::run::PoolId entry_pool_id_;
 
-  WtcConfig() : next_pool_id_(clio::run::PoolId::GetNull()) {}
+  WtcConfig()
+      : next_pool_id_(clio::run::PoolId::GetNull()),
+        entry_pool_id_(clio::run::PoolId::GetNull()) {}
   WtcConfig(const clio::run::PoolId &pool_id, const WtcConfig &other) {
     (void)pool_id;
     *this = other;
@@ -84,7 +92,8 @@ struct WtcConfig {
   void serialize(Archive &ar) {
     ar(next_pool_id_, capacity_, log_depth_, flush_batch_bytes_, max_tags_,
        max_blobs_, max_fill_, evict_sample_, half_life_ms_, flush_period_us_,
-       flush_retries_, max_sharer_entries_, flush_shards_, flush_depth_);
+       flush_retries_, max_sharer_entries_, flush_shards_, flush_depth_,
+       md_only_, entry_pool_id_);
   }
 
   /** Parse "major.minor". */
@@ -137,6 +146,10 @@ struct WtcConfig {
       }
       if (node["flush_retries"]) {
         flush_retries_ = node["flush_retries"].as<clio::run::u32>();
+      }
+      if (node["md_only"]) md_only_ = node["md_only"].as<bool>();
+      if (node["entry_pool_id"]) {
+        entry_pool_id_ = ParsePoolId(node["entry_pool_id"].as<std::string>());
       }
       if (node["max_sharer_entries"]) {
         max_sharer_entries_ = node["max_sharer_entries"].as<clio::run::u32>();
