@@ -33,3 +33,19 @@ target_link_libraries(test_shm_wtc_stress
 add_dependencies(test_shm_wtc_stress
     clio_run clio_cte_core_runtime clio_cte_replication_runtime
     clio_cte_cache_runtime clio_cte_shm_writethru_cache_runtime)
+
+# Restart / crash checker (one phase per run; the harness restarts and
+# kills runtimes between phases).
+add_executable(test_shm_wtc_restart test_shm_wtc_restart.cc)
+set_target_properties(test_shm_wtc_restart PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+target_link_libraries(test_shm_wtc_restart
+    clio_cte_core_client
+    clio_admin_client
+    clio_run_cxx
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+add_dependencies(test_shm_wtc_restart
+    clio_run clio_cte_core_runtime clio_cte_replication_runtime
+    clio_cte_cache_runtime clio_cte_shm_writethru_cache_runtime)

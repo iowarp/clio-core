@@ -270,17 +270,35 @@ clio::run::TaskResume Runtime::SyncTag(
     clio::run::shared_ptr<clio::cte::core::SyncTagTask> &task) {
   CLIO_TASK_BODY_BEGIN
   clio::run::u32 sticky = 0;
+  std::set<clio::run::u32> homes;
   if (view_.Ready()) {
     const clio::run::u64 target = view_.PushedNow();
     while (!view_.FlushedThrough(target)) {
       CLIO_CO_AWAIT(clio::run::yield(kBarrierPollUs));
     }
     sticky = view_.TakeTagError(task->tag_id_.major_, task->tag_id_.minor_);
+    homes = TakeSyncHomes(task->tag_id_);
     const char *tr = std::getenv("CLIO_WTC_TRACE");
     if (tr != nullptr && tr[0] == '1') {
       HLOG(kInfo, "[WTC-TRACE] t={} synctag at={} tag={}.{} target={} flushed={}", WallMs(),
            container_id_, task->tag_id_.major_, task->tag_id_.minor_, target,
            view_.GetRoot()->flushed_.load());
+    }
+  }
+  // This node's flushes landed on remote homes, which wrote them into
+  // THEIR next pool: sync the tag there as well. The broadcast arm on a
+  // home may have run before these ranges arrived, so it cannot cover them.
+  {
+    std::vector<clio::run::Future<clio::cte::core::SyncTagTask>> futs;
+    for (clio::run::u32 h : homes) {
+      futs.push_back(next_client_->AsyncSyncTag(
+          task->tag_id_, clio::run::PoolQuery::DirectId(h),
+          task->min_persistence_));
+    }
+    for (auto &f : futs) {
+      CLIO_CO_AWAIT(f);
+      clio::run::u32 rc = f.get() == nullptr ? 1 : f->GetReturnCode();
+      if (rc != 0 && sticky == 0) sticky = rc;
     }
   }
   CLIO_CO_AWAIT(ForwardToCore(Method::kSyncTag,

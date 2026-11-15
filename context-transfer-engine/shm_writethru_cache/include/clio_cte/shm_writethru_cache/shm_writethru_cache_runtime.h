@@ -341,6 +341,15 @@ class Runtime : public clio::cte::core::CoreInterposer {
   /** Tag-wide chain writes in flight (BeginChainWriteAll). */
   std::atomic<int> chain_writes_{0};
   std::mutex fence_mu_;  ///< guards blob_reads_ / blob_writes_
+  /** Remote homes each tag's flushed ranges landed on since the tag's last
+   *  SyncTag here: a SyncTag must make them durable there too (the home
+   *  wrote them into its own next pool). Key: (major << 32) | minor. */
+  std::unordered_map<clio::run::u64, std::set<clio::run::u32>> sync_homes_;
+  std::mutex sync_homes_mu_;  ///< guards sync_homes_
+  /** Note that a batch's records landed on their homes (before flushed_). */
+  void NoteLandedHomes(const std::vector<FlushRecord> &recs);
+  /** Take (and clear) the remote homes of a tag. */
+  std::set<clio::run::u32> TakeSyncHomes(const TagId &tag);
   std::unordered_map<std::string, int> blob_reads_;   ///< chain reads per blob
   std::unordered_map<std::string, int> blob_writes_;  ///< chain writes per blob
   std::mutex sharers_mtx_;

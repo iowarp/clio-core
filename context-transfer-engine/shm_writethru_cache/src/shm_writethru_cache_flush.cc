@@ -86,6 +86,27 @@ bool WtcTrace() {
   return v;
 }
 
+void Runtime::NoteLandedHomes(const std::vector<FlushRecord> &recs) {
+  std::lock_guard<std::mutex> g(sync_homes_mu_);
+  for (const FlushRecord &fr : recs) {
+    if (fr.size_ == 0 || fr.home_ == container_id_) continue;
+    clio::run::u64 k = (static_cast<clio::run::u64>(fr.key_.major_) << 32) |
+                       fr.key_.minor_;
+    sync_homes_[k].insert(fr.home_);
+  }
+}
+
+std::set<clio::run::u32> Runtime::TakeSyncHomes(const TagId &tag) {
+  clio::run::u64 k = (static_cast<clio::run::u64>(tag.major_) << 32) |
+                     tag.minor_;
+  std::lock_guard<std::mutex> g(sync_homes_mu_);
+  auto it = sync_homes_.find(k);
+  if (it == sync_homes_.end()) return {};
+  std::set<clio::run::u32> out = std::move(it->second);
+  sync_homes_.erase(it);
+  return out;
+}
+
 bool Runtime::Superseded(const wtc::DirtyRange &r) const {
   auto it = flush_marks_.find(r.slot_);
   if (it == flush_marks_.end()) {
@@ -418,6 +439,9 @@ clio::run::TaskResume Runtime::LandOldest() {
         inflight_slots_.erase(it);
       }
     }
+    // Before flushed_ moves: a SyncTag that sees these ranges flushed must
+    // also find their homes.
+    NoteLandedHomes(b.recs_);
     // Skipped ranges retire only now: every older batch (including the one
     // that carried their bytes) has landed.
     clio::run::u64 nskipped = 0;
