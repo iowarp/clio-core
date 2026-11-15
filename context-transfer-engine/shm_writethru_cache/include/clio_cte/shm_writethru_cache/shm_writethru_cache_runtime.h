@@ -75,6 +75,16 @@ struct InflightBatch {
   std::map<clio::run::u32, ctp::ipc::FullPtr<char>> staging_;  ///< per home
   std::vector<clio::run::u32> homes_;  ///< home of each future below
   std::vector<clio::run::Future<clio::cte::core::MultiPutBlobTask>> futs_;
+  /** Ranges popped for this batch but not resent (an earlier flush already
+   *  carried their bytes): slot -> count, retired when this batch lands. */
+  std::unordered_map<clio::run::u32, clio::run::u32> skipped_;
+};
+
+/** What the flusher last copied of a blob with no write in progress. */
+struct FlushMark {
+  clio::run::u64 gen_ = 0;  ///< every write up to this generation included
+  clio::run::u64 off_ = 0;  ///< copied range
+  clio::run::u64 end_ = 0;
 };
 
 /** Nodes holding a blob, as tracked by the blob's home. */
@@ -173,7 +183,11 @@ class Runtime : public clio::cte::core::CoreInterposer {
     return clio::cte::core::Client::WtcPlainContext(ctx);
   }
   /** Pop up to one batch of log ranges and coalesce them. */
-  std::vector<FlushRecord> PopAndCoalesce(clio::run::u64 *popped);
+  std::vector<FlushRecord> PopAndCoalesce(
+      clio::run::u64 *popped,
+      std::unordered_map<clio::run::u32, clio::run::u32> *skipped);
+  /** True if an earlier flush copy already carried this logged range. */
+  bool Superseded(const clio::cte::core::wtc::DirtyRange &r) const;
   /**
    * Resolve each record's key and home container.
    * @param recs   coalesced records (a record whose entry cannot be read is
@@ -320,6 +334,8 @@ class Runtime : public clio::cte::core::CoreInterposer {
   std::atomic<int> reads_waiting_{0};
   std::deque<InflightBatch> inflight_;  ///< oldest first (flusher only)
   std::unordered_map<clio::run::u32, clio::run::u32> inflight_slots_;
+  /** Per slot with ranges pending: the last quiescent flush copy. */
+  std::unordered_map<clio::run::u32, FlushMark> flush_marks_;
   /** Chain reads in flight (BeginChainRead); FlushLog waits for zero. */
   std::atomic<int> chain_reads_{0};
   /** Tag-wide chain writes in flight (BeginChainWriteAll). */

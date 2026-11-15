@@ -72,6 +72,8 @@ using clio::cte::core::MultiPutBlobTask;
 using clio::cte::core::MultiPutDesc;
 
 static constexpr size_t kMaxRangesPerFlush = 8192;
+/** Raw log ranges (resent or skipped) one batch may pop. */
+static constexpr size_t kMaxPopsPerFlush = 65536;
 static constexpr clio::run::u32 kWriterMarker = 0xFFFFFFF7u;
 static constexpr double kStagingRetryUs = 50.0;
 
@@ -84,17 +86,38 @@ bool WtcTrace() {
   return v;
 }
 
-std::vector<FlushRecord> Runtime::PopAndCoalesce(clio::run::u64 *popped) {
+bool Runtime::Superseded(const wtc::DirtyRange &r) const {
+  auto it = flush_marks_.find(r.slot_);
+  if (it == flush_marks_.end()) {
+    return false;
+  }
+  const FlushMark &m = it->second;
+  return view_.RangeGen(r) <= m.gen_ && r.off_ >= m.off_ &&
+         r.off_ + r.size_ <= m.end_;
+}
+
+std::vector<FlushRecord> Runtime::PopAndCoalesce(
+    clio::run::u64 *popped,
+    std::unordered_map<clio::run::u32, clio::run::u32> *skipped) {
   std::vector<wtc::DirtyRange> rs;
   clio::run::u64 bytes = 0;
+  clio::run::u64 n = 0;
   wtc::DirtyRange r{};
   wtc::DirtyLog *log = view_.Log();
-  while (rs.size() < kMaxRangesPerFlush && bytes < config_.flush_batch_bytes_ &&
-         log->Pop(r)) {
+  // Overwrites: a range whose bytes an earlier flush copy already carried
+  // (older generation, covered range) is retired with this batch instead of
+  // being resent, and does not count against the batch budget.
+  while (rs.size() < kMaxRangesPerFlush && n < kMaxPopsPerFlush &&
+         bytes < config_.flush_batch_bytes_ && log->Pop(r)) {
+    ++n;
+    if (Superseded(r)) {
+      ++(*skipped)[r.slot_];
+      continue;
+    }
     rs.push_back(r);
     bytes += r.size_;
   }
-  *popped = rs.size();
+  *popped = n;
   std::sort(rs.begin(), rs.end(),
             [](const wtc::DirtyRange &a, const wtc::DirtyRange &b) {
               return a.slot_ != b.slot_ ? a.slot_ < b.slot_ : a.off_ < b.off_;
@@ -180,11 +203,14 @@ void Runtime::CopyRecords(
     clio::run::u32 a = 0;
     clio::run::u32 b = 0;
     clio::run::u32 f = 0;
+    clio::run::u64 gen = 0;
     if (!view_.ReadRange(fr.slot_, fr.off_, &size, it->second.ptr_ + cursor,
-                         &a, &b, &ignored, &f)) {
+                         &a, &b, &ignored, &f, &gen)) {
       HLOG(kError, "shm_writethru_cache: entry of slot {} vanished while "
            "pending; range [{}, +{}) not flushed", fr.slot_, fr.off_, fr.size_);
       size = 0;
+    } else if (gen != 0 && size != 0) {
+      flush_marks_[fr.slot_] = FlushMark{gen, fr.off_, fr.off_ + size};
     }
     fr.size_ = size;
     fr.payload_off_ = cursor;
@@ -353,7 +379,7 @@ clio::run::TaskResume Runtime::LaunchBatch(bool *launched) {
   *launched = false;
   {
     InflightBatch b;
-    b.recs_ = PopAndCoalesce(&b.popped_);
+    b.recs_ = PopAndCoalesce(&b.popped_, &b.skipped_);
     if (b.popped_ != 0) {
       // A blob still landing in an older batch: land those first, so this
       // batch stages (and lands) the blob's newer bytes after them.
@@ -392,7 +418,22 @@ clio::run::TaskResume Runtime::LandOldest() {
         inflight_slots_.erase(it);
       }
     }
+    // Skipped ranges retire only now: every older batch (including the one
+    // that carried their bytes) has landed.
+    clio::run::u64 nskipped = 0;
+    for (const auto &s : b.skipped_) {
+      view_.CompleteRanges(s.first, s.second);
+      nskipped += s.second;
+    }
+    // A mark is only useful while the slot has ranges left in the log;
+    // one that does is in a later batch, which checks again.
+    auto prune = [this](clio::run::u32 slot) {
+      if (view_.Pending(slot) == 0) flush_marks_.erase(slot);
+    };
+    for (const FlushRecord &fr : b.recs_) prune(fr.slot_);
+    for (const auto &s : b.skipped_) prune(s.first);
     wtc::Root *root = view_.GetRoot();
+    root->stats_.flush_skipped_.fetch_add(nskipped);
     root->stats_.flush_batches_.fetch_add(b.futs_.size());
     root->stats_.flush_ranges_.fetch_add(b.popped_);
     root->stats_.flush_bytes_.fetch_add(b.bytes_);

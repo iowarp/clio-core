@@ -97,9 +97,13 @@ static constexpr u32 kEvictScanMax = 4096;
 /** Eviction rounds one buffer allocation makes before the caller writes
  *  around the cache. */
 static constexpr u32 kAllocRounds = 8;
-/** After a merge-and-retry allocation fails, skip further ones (each sorts
- *  every free page under the allocator lock) for this long. */
+/** After kMergeFailsForBackoff merge-and-retry allocations fail in a row,
+ *  skip further ones (each sorts every free page under the allocator lock)
+ *  for this long. */
 static constexpr u64 kCoalesceBackoffNs = 2ull * 1000 * 1000;
+static constexpr u32 kMergeFailsForBackoff = 4;
+/** Window evictions (each followed by one merge) per buffer allocation. */
+static constexpr u32 kMergesPerAlloc = 2;
 /** A window eviction frees up to this many times the request... */
 static constexpr u64 kWindowFactor = 8;
 /** ...but at most this many bytes (and at most 1/8 of the segment). */
@@ -178,7 +182,7 @@ struct TagEntry {
 /** One logged write: slot + exact byte range inside that blob. */
 struct DirtyRange {
   u32 slot_;
-  u32 pad_;
+  u32 gen_;   /**< low 32 bits of the entry's write_gen_ after this write */
   u64 off_;
   u64 size_;
 };
@@ -198,6 +202,8 @@ struct Stats {
   std::atomic<u64> fills_;
   std::atomic<u64> invalidations_;
   std::atomic<u64> waits_;
+  std::atomic<u64> flush_skipped_;  /**< ranges retired without a resend: a
+                                         later flush already carried them */
 };
 
 /** Segment root: the first allocation in the segment. */
@@ -224,6 +230,7 @@ struct Root {
   std::atomic<u64> flushed_;       /**< ranges the flusher completed */
   std::atomic<u64> evict_cursor_;
   std::atomic<u64> coalesce_after_ns_;  /**< no merge-and-retry before this */
+  std::atomic<u32> merge_fails_;        /**< consecutive failed merges */
   std::atomic<u32> global_rc_;     /**< sticky rc for tags not in TagTable */
   u32 pad_;
   Stats stats_;
@@ -431,13 +438,29 @@ class View {
    * of the blob in `slot`, and report its key.
    * @param dst destination (size bytes)
    * @param size in/out: clamped to the bytes the buffer holds
+   * @param copied_gen out (optional): the entry's write_gen_ if no write was
+   *        in progress when the copy started (every write up to it is in
+   *        the copy), else 0
    * @return false if the slot no longer holds a live resident entry
    */
   bool ReadRange(u32 slot, u64 off, u64 *size, char *dst, u32 *tag_major,
-                 u32 *tag_minor, std::string *name, u32 *put_flags);
+                 u32 *tag_minor, std::string *name, u32 *put_flags,
+                 u64 *copied_gen = nullptr);
+
+  /**
+   * Full write generation of a logged range: its 32-bit gen_ widened
+   * against the entry's current write_gen_ (valid while the range is
+   * pending, which keeps the slot's entry from being replaced).
+   */
+  u64 RangeGen(const DirtyRange &r) const;
 
   /** Flusher completion: `n` ranges of `slot` landed. */
   void CompleteRanges(u32 slot, u32 n);
+
+  /** Ranges of `slot` logged and not yet completed. */
+  u32 Pending(u32 slot) const {
+    return slot < NumSlots() ? Slot(slot)->pending_.load() : 0;
+  }
 
   /** Total slots in the blob table. */
   u32 NumSlots() const { return root_->slots_per_stripe_ * kStripes; }

@@ -378,6 +378,47 @@ TEST_CASE("ShmWtc - eviction keeps a small cache writable",
   }
 }
 
+TEST_CASE("ShmWtc - overwrites flush once and the last write wins",
+          "[cte][shm_wtc][dedup]") {
+  WtcFixture fx;
+  clio::cte::core::Client io(kPool);
+  REQUIRE(io.HasWtc());
+  const wtc::Stats *st = io.WtcStats();
+  TagId tag = MakeTag(io, "wtc_dedup");
+  REQUIRE(WaitFlushed(io));
+  const clio::run::u64 skipped0 = st->flush_skipped_.load();
+
+  // Many overwrites of a few blobs, faster than one flush each: ranges an
+  // earlier flush copy already carried are retired without a resend.
+  const int kBlobs = 4;
+  const int kRounds = 400;
+  std::vector<std::string> last(kBlobs);
+  for (int r = 0; r < kRounds; ++r) {
+    for (int b = 0; b < kBlobs; ++b) {
+      last[b] = Payload(64 << 10, static_cast<char>('a' + (r + b) % 26));
+      auto p = io.AsyncPutBlob(tag, "d" + std::to_string(b), 0,
+                               last[b].size(), last[b].data());
+      p.Wait();
+      REQUIRE(p->GetReturnCode() == 0);
+    }
+  }
+  // A partial overwrite after all that must not be skipped.
+  std::string tail = Payload(4096, 'Z');
+  {
+    auto p = io.AsyncPutBlob(tag, "d0", 8192, tail.size(), tail.data());
+    p.Wait();
+    REQUIRE(p->GetReturnCode() == 0);
+    std::memcpy(&last[0][8192], tail.data(), tail.size());
+  }
+  REQUIRE(WaitFlushed(io));
+  INFO("skipped " << st->flush_skipped_.load() - skipped0);
+  for (int b = 0; b < kBlobs; ++b) {
+    REQUIRE(CoreRead(tag, "d" + std::to_string(b), 0, last[b].size()) ==
+            last[b]);
+  }
+  REQUIRE(st->flush_skipped_.load() > skipped0);
+}
+
 TEST_CASE("ShmWtc - large puts displace a cache full of small buffers",
           "[cte][shm_wtc][evict][fragment]") {
   WtcFixture fx;

@@ -399,10 +399,11 @@ inline bool View::EvictWindow(u32 held_stripe, u64 start, u64 span) {
 inline u64 View::AllocBuffer(u64 bytes, u32 held_stripe, u32 owner) {
   // Every attempt runs under the caller's stripe lock, so each is cheap
   // except the merge-and-retry, which sorts every free page under the
-  // allocator lock: it runs only after a window eviction, at most once per
-  // call, and backs off globally when it fails.
+  // allocator lock: it runs only after a window eviction, at most
+  // kMergesPerAlloc times per call, and backs off globally after several
+  // consecutive failures.
   u64 off = 0;
-  bool merged = false;
+  u32 merges = 0;
   for (u32 round = 0; round < kAllocRounds && off == 0; ++round) {
     auto o = alloc_->AllocateOffsetNoCoalesce(bytes);
     if (!o.IsNull()) {
@@ -419,7 +420,8 @@ inline u64 View::AllocBuffer(u64 bytes, u32 held_stripe, u32 owner) {
       EvictSlot(held_stripe, static_cast<u32>(v), kAnyGranule);
       continue;
     }
-    if (merged || NowNs() < root_->coalesce_after_ns_.load()) {
+    if (merges >= kMergesPerAlloc ||
+        NowNs() < root_->coalesce_after_ns_.load()) {
       break;  // small victims only, and no merge allowed: write around
     }
     // Small victims never make room one by one (the allocator does not
@@ -427,11 +429,13 @@ inline u64 View::AllocBuffer(u64 bytes, u32 held_stripe, u32 owner) {
     if (!EvictWindow(held_stripe, e->buf_off_, WindowSpan(bytes))) {
       continue;
     }
-    merged = true;
+    ++merges;
     o = alloc_->AllocateOffset(bytes);
     if (!o.IsNull()) {
       off = o.load();
-    } else {
+      root_->merge_fails_.store(0);
+    } else if (root_->merge_fails_.fetch_add(1) + 1 >= kMergeFailsForBackoff) {
+      root_->merge_fails_.store(0);
       root_->coalesce_after_ns_.store(NowNs() + kCoalesceBackoffNs);
     }
   }
@@ -489,6 +493,7 @@ inline Status View::TryPut(u32 tag_major, u32 tag_minor, const char *name,
   u32 stripe = StripeOf(h);
   u32 slot = 0;
   char *dst = nullptr;
+  u64 gen = 0;
   {
     Guard g(root_->stripes_[stripe]);
     bool inserted = false;
@@ -524,7 +529,7 @@ inline Status View::TryPut(u32 tag_major, u32 tag_minor, const char *name,
     }
     e->pins_.fetch_add(1, std::memory_order_acq_rel);
     e->pending_.fetch_add(1, std::memory_order_acq_rel);
-    e->write_gen_.fetch_add(1, std::memory_order_acq_rel);
+    gen = e->write_gen_.fetch_add(1, std::memory_order_acq_rel) + 1;
     e->wbegin_.fetch_add(1, std::memory_order_acq_rel);
     e->hits_.fetch_add(1, std::memory_order_relaxed);
     e->last_access_ns_.store(NowNs(), std::memory_order_relaxed);
@@ -535,7 +540,7 @@ inline Status View::TryPut(u32 tag_major, u32 tag_minor, const char *name,
   // Unpin BEFORE the (possibly blocking) push: a full log waits on the
   // flusher, which must be free to take this stripe and read the entry.
   Slot(slot)->pins_.fetch_sub(1, std::memory_order_acq_rel);
-  DirtyRange r{slot, 0, off, size};
+  DirtyRange r{slot, static_cast<u32>(gen), off, size};
   // Count the range BEFORE it enters the log. A barrier's target
   // (PushedNow) then covers every range already in the log or about to be:
   // a writer counted after its push could leave pushed_ short of an earlier
@@ -821,7 +826,8 @@ inline void View::DropTagBlobs(u32 major, u32 minor) {
 
 inline bool View::ReadRange(u32 slot, u64 off, u64 *size, char *dst,
                             u32 *tag_major, u32 *tag_minor,
-                            std::string *name, u32 *put_flags) {
+                            std::string *name, u32 *put_flags,
+                            u64 *copied_gen) {
   if (slot >= NumSlots()) {
     return false;
   }
@@ -842,6 +848,13 @@ inline bool View::ReadRange(u32 slot, u64 off, u64 *size, char *dst,
     *tag_minor = e->tag_minor_;
     *put_flags = e->put_flags_;
     name->assign(e->name_, e->name_len_);
+    if (copied_gen != nullptr) {
+      // Generations are assigned under this lock, before the data copy;
+      // wend_ catching up with wbegin_ means every assigned one finished.
+      bool quiet = e->wbegin_.load(std::memory_order_acquire) ==
+                   e->wend_.load(std::memory_order_acquire);
+      *copied_gen = quiet ? e->write_gen_.load(std::memory_order_acquire) : 0;
+    }
     e->pins_.fetch_add(1, std::memory_order_acq_rel);
     src = Ptr(e->buf_off_) + off;
   }
@@ -850,6 +863,15 @@ inline bool View::ReadRange(u32 slot, u64 off, u64 *size, char *dst,
   }
   e->pins_.fetch_sub(1, std::memory_order_acq_rel);
   return true;
+}
+
+inline u64 View::RangeGen(const DirtyRange &r) const {
+  if (r.slot_ >= NumSlots()) {
+    return 0;
+  }
+  u64 cur = Slot(r.slot_)->write_gen_.load(std::memory_order_acquire);
+  // The range's write happened at or before `cur`, within 2^32 writes.
+  return cur - static_cast<u32>(static_cast<u32>(cur) - r.gen_);
 }
 
 inline void View::CompleteRanges(u32 slot, u32 n) {
