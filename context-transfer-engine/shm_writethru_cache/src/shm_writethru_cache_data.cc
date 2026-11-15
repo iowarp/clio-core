@@ -270,6 +270,7 @@ clio::run::TaskResume Runtime::PutBlob(
     }
     EndChainWrite(task->tag_id_, name);
     CLIO_CO_AWAIT(FanoutInvalidate(task->tag_id_, name));
+    CLIO_CO_AWAIT(NoteTagsWritten({task->tag_id_}));
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -294,8 +295,12 @@ clio::run::TaskResume Runtime::WriteAroundRecord(
     CLIO_CO_AWAIT(f);
     *rc = f.get() == nullptr ? 1u : f->GetReturnCode();
   }
+  if (view_.Ready()) {  // see PutBlob: drop what a reader cached meanwhile
+    view_.Invalidate(tag.major_, tag.minor_, name.c_str(), name.size());
+  }
   EndChainWrite(tag, name);
   CLIO_CO_AWAIT(FanoutInvalidate(tag, name));
+  CLIO_CO_AWAIT(NoteTagsWritten({tag}));
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
@@ -367,6 +372,7 @@ clio::run::TaskResume Runtime::DelBlob(
     EndChainWrite(task->tag_id_, name);
     task->SetReturnCode(f->GetReturnCode());
     CLIO_CO_AWAIT(FanoutInvalidate(task->tag_id_, name));
+    CLIO_CO_AWAIT(NoteTagsWritten({task->tag_id_}));
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END

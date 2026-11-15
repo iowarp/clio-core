@@ -33,7 +33,10 @@ GLOBAL_CROSS_CONST clio::run::u32 kSyncTag = clio::cte::core::Method::kSyncTag;
 GLOBAL_CROSS_CONST clio::run::u32 kFlushLog = 100;
 GLOBAL_CROSS_CONST clio::run::u32 kInvalidate = 101;
 GLOBAL_CROSS_CONST clio::run::u32 kHomeFlush = 102;
-GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 103;
+/** Cached tag size/times (carries a core::GetTagSizeTask; see
+ *  wtc::kTagAttrsMethod, which clients use without this header). */
+GLOBAL_CROSS_CONST clio::run::u32 kTagAttrs = 103;
+GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 104;
 
 /** Method names indexed by id. */
 inline const std::vector<std::string> &GetMethodNames() {
@@ -53,6 +56,7 @@ inline const std::vector<std::string> &GetMethodNames() {
     v[kFlushLog] = "FlushLog";
     v[kInvalidate] = "Invalidate";
     v[kHomeFlush] = "HomeFlush";
+    v[kTagAttrs] = "TagAttrs";
     return v;
   }();
   return names;

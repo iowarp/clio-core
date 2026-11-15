@@ -662,6 +662,28 @@ class Client : public clio::run::ContainerClient {
         clio::run::CreateTaskId(), pool_id_, pool_query, tag_name,
         tag_id);
 
+    // Open of an existing tag through the shm cache: the name -> id binding
+    // and the tag's size are both cached, so it completes with no task.
+    if (tag_id.IsNull() && !tag_name.empty()) {
+      if (wtc::View *w = Wtc()) {
+        clio::run::u32 maj = 0;
+        clio::run::u32 min = 0;
+        wtc::TagAttrs a;
+        if (w->LookupTagByName(tag_name.data(), tag_name.size(), &maj, &min) &&
+            w->LookupTagAttrs(maj, min, &a)) {
+          task->tag_id_ = TagId(maj, min);
+          task->created_ = 0;
+          task->tag_size_ = a.size_;
+          task->return_code_ = 0;
+          clio::run::Future<GetOrCreateTagTask<CreateParams>> fut(
+              task->pool_id_, task->method_, task);
+          fut.GetFutureShm()->origin_ = clio::run::ClientOrigin::kClientShm;
+          task->SetComplete();
+          return fut;
+        }
+      }
+    }
+
     // Inline-eligible (CLIO_ENABLE_INLINE_RUN=1): nested metadata
     // lookups from co-located chimods (clio-fs Open does three in a
     // row) each paid a queue+schedule+wake hop; inline they run on
@@ -3168,6 +3190,7 @@ class Client : public clio::run::ContainerClient {
       }
     }
     wtc_entry_pool_ = loc->entry_pool_;
+    wtc_cache_pool_ = cache_pool;
     auto &views = WtcViews();
     auto it = views.find(cache_pool.ToU64());
     if (it != views.end()) {
@@ -4035,6 +4058,31 @@ class Client : public clio::run::ContainerClient {
     auto task = ipc_manager->NewTask<GetTagSizeTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, tag_id);
 
+    // Cluster-wide size/times (Broadcast) through the shm cache: served
+    // from the segment when cached; on a miss the LOCAL cache container
+    // fetches the total once and caches it (TagAttrs verb).
+    if (pool_query.IsBroadcastMode() && !tag_id.IsNull()) {
+      if (wtc::View *w = Wtc()) {
+        wtc::TagAttrs a;
+        if (w->LookupTagAttrs(tag_id.major_, tag_id.minor_, &a)) {
+          task->tag_size_ = a.size_;
+          task->ctime_ = a.ctime_;
+          task->mtime_ = a.mtime_;
+          task->atime_ = a.atime_;
+          task->return_code_ = 0;
+          clio::run::Future<GetTagSizeTask> fut(task->pool_id_, task->method_,
+                                                task);
+          fut.GetFutureShm()->origin_ = clio::run::ClientOrigin::kClientShm;
+          task->SetComplete();
+          return fut;
+        }
+        task->pool_id_ = wtc_cache_pool_;
+        task->pool_query_ = clio::run::PoolQuery::Local();
+        task->method_ = wtc::kTagAttrsMethod;
+        return ipc_manager->Send(task);
+      }
+    }
+
     // Inline-eligible (CLIO_ENABLE_INLINE_RUN=1): nested metadata
     // lookups from co-located chimods (clio-fs Open does three in a
     // row) each paid a queue+schedule+wake hop; inline they run on
@@ -4514,6 +4562,8 @@ class Client : public clio::run::ContainerClient {
   wtc::View *wtc_ = nullptr;
   /** Entry pool of the attached cache (see WtcEntryPool). */
   clio::run::u64 wtc_entry_pool_ = 0;
+  /** Pool of the attached cache itself (its own verbs go there). */
+  clio::run::PoolId wtc_cache_pool_;
   clio::run::u64 wtc_retry_ns_ = 0;
   // True only when the mirror was attached via AttachShmCacheOf for a pool
   // OTHER than this client's own (interposition binding): gates the

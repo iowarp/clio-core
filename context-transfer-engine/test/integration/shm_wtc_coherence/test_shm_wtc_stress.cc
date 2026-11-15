@@ -525,6 +525,93 @@ TEST_CASE("ShmWtc stress - delete and recreate a tag every node cached",
   }
 }
 
+/** Cluster-wide tag size (Broadcast; cached by the shm cache). */
+u64 TagSize(const TagId &tag) {
+  auto f = Io()->AsyncGetTagSize(tag, clio::run::PoolQuery::Broadcast(0.0f));
+  f.Wait();
+  return f->GetReturnCode() == 0 ? static_cast<u64>(f->tag_size_) : ~0ull;
+}
+
+TEST_CASE("ShmWtc stress - tag size and opens stay exact across nodes",
+          "[shm_wtc][stress][tagmeta]") {
+  BeginPhase("tagmeta");
+  const int n = NumNodes();
+  // Without the cache (STRESS_EXPECT_WTC=0) the core reports per-container
+  // shares, not the tag's total: check ids and the delete only.
+  const char *ew = std::getenv("STRESS_EXPECT_WTC");
+  const bool check_sizes = ew == nullptr || std::string(ew) != "0";
+  const std::string tname = "wtc_stress_tagmeta";
+  TagId tag = SharedTag(tname);
+  std::vector<u64> sizes;  // every rank tracks each blob's size
+  int last = -1;           // newest blob not yet truncated
+  for (int iter = 0; iter < 8; ++iter) {
+    const int writer = iter % n;
+    // Grow by a new blob, or (every third round) truncate the newest one.
+    const u64 add = 4096 * static_cast<u64>(iter + 1);
+    const bool trunc = iter % 3 == 2 && last >= 0;
+    if (Rank() == writer) {
+      if (trunc) {
+        auto t = Io()->AsyncTruncateBlob(tag, "m" + std::to_string(last), 100);
+        t.Wait();
+        REQUIRE(t->GetReturnCode() == 0);
+      } else {
+        const std::string v = Pattern(add, iter, 7);
+        REQUIRE(Put(tag, "m" + std::to_string(iter), 0, add, v.data()));
+      }
+      REQUIRE(Sync(tag));
+    }
+    if (trunc) {
+      sizes[last] = 100;
+      last = -1;
+    } else {
+      sizes.resize(iter + 1, 0);
+      sizes[iter] = add;
+      last = iter;
+    }
+    u64 expect = 0;
+    for (u64 v : sizes) expect += v;
+    REQUIRE(Barrier(BarrierTag()));
+    // Twice: the second answer comes from the segment when cached.
+    for (int k = 0; k < 2; ++k) {
+      const u64 got = check_sizes ? TagSize(tag) : expect;
+      if (got != expect) {
+        fprintf(stderr, "[TAGMETA-SIZE] rank=%d iter=%d k=%d got=%llu "
+                "want=%llu\n", Rank(), iter, k, (unsigned long long)got,
+                (unsigned long long)expect);
+        FAIL("stale tag size");
+      }
+      auto o = Io()->AsyncGetOrCreateTag(tname);
+      o.Wait();
+      REQUIRE(o->GetReturnCode() == 0);
+      if (!(o->tag_id_ == tag) ||
+          (check_sizes && o->tag_size_ != expect)) {
+        fprintf(stderr, "[TAGMETA-OPEN] rank=%d iter=%d id=%u.%u size=%llu "
+                "want=%u.%u/%llu\n", Rank(), iter, o->tag_id_.major_,
+                o->tag_id_.minor_, (unsigned long long)o->tag_size_,
+                tag.major_, tag.minor_, (unsigned long long)expect);
+        FAIL("stale open");
+      }
+    }
+    REQUIRE(Barrier(BarrierTag()));
+  }
+  // Delete and recreate: every node must see the new id and an empty tag.
+  if (Rank() == 0) {
+    auto d = Io()->AsyncDelTag(tname);
+    d.Wait();
+    REQUIRE(d->GetReturnCode() == 0);
+  }
+  REQUIRE(Barrier(BarrierTag()));
+  auto o = Io()->AsyncGetOrCreateTag(tname);
+  o.Wait();
+  REQUIRE(o->GetReturnCode() == 0);
+  if (o->tag_id_ == tag) {
+    fprintf(stderr, "[TAGMETA-DELETED] rank=%d still opens the old id\n",
+            Rank());
+    FAIL("deleted tag still opened by name");
+  }
+  REQUIRE(Barrier(BarrierTag()));
+}
+
 int main(int argc, char *argv[]) {
   if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, false)) {
     fprintf(stderr, "CLIO_INIT failed\n");

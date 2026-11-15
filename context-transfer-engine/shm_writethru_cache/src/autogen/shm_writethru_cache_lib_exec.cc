@@ -28,7 +28,8 @@ namespace clio::cte::shm_wtc {
   X(kSyncTag, clio::cte::core::SyncTagTask, SyncTag)                       \
   X(kFlushLog, FlushLogTask, FlushLog)                                     \
   X(kInvalidate, InvalidateTask, Invalidate)                               \
-  X(kHomeFlush, HomeFlushTask, HomeFlush)
+  X(kHomeFlush, HomeFlushTask, HomeFlush)                                  \
+  X(kTagAttrs, clio::cte::core::GetTagSizeTask, TagAttrs)
 
 void Runtime::Init(const clio::run::PoolId &pool_id, const std::string &pool_name,
                    clio::run::u32 container_id) {

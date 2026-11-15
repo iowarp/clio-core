@@ -211,9 +211,27 @@ clio::run::TaskResume Runtime::GetOrCreateTag(
         clio::cte::core::CreateParams>> &task) {
   CLIO_TASK_BODY_BEGIN
   {
+    const std::string name = task->tag_name_.str();
+    // Only a plain open-by-name is memoized: no fault handler, no id given.
+    const bool plain = view_.Ready() && task->tag_id_.IsNull() &&
+                       task->fault_pool_id_.IsNull() &&
+                       task->fault_params_.str().empty() && !name.empty() &&
+                       name.size() <= wtc::kMaxTagName;
+    clio::run::u32 maj = 0;
+    clio::run::u32 min = 0;
+    wtc::TagAttrs a;
+    if (plain && view_.LookupTagByName(name.data(), name.size(), &maj, &min) &&
+        view_.LookupTagAttrs(maj, min, &a)) {
+      task->tag_id_ = TagId(maj, min);
+      task->created_ = 0;
+      task->tag_size_ = a.size_;
+      task->SetReturnCode(0);
+      CLIO_CO_RETURN;
+    }
+    const clio::run::u64 seq = plain ? view_.TagInvalSeq() : 0;
     auto f = Next()->AsyncGetOrCreateTag(
-        task->tag_name_.str(), task->fault_pool_id_,
-        task->fault_pool_name_.str(), task->fault_params_.str(), task->tag_id_,
+        name, task->fault_pool_id_, task->fault_pool_name_.str(),
+        task->fault_params_.str(), task->tag_id_,
         clio::run::PoolQuery::Dynamic());
     CLIO_CO_AWAIT(f);
     task->tag_id_ = f->tag_id_;
@@ -223,6 +241,27 @@ clio::run::TaskResume Runtime::GetOrCreateTag(
       view_.NoteTagCreated(task->tag_id_.major_, task->tag_id_.minor_);
     }
     task->SetReturnCode(f->GetReturnCode());
+    if (plain && f->GetReturnCode() == 0 && !f->tag_id_.IsNull()) {
+      // Register with the tag's home, THEN confirm the binding: a rename
+      // that landed before the registration reached the home would never
+      // invalidate us, but it does change what this second lookup returns.
+      const TagId id = f->tag_id_;
+      CLIO_CO_AWAIT(RegisterSharer(
+          id, std::string(wtc::kTagMetaName, wtc::kTagMetaNameLen)));
+      auto again = Next()->AsyncGetOrCreateTag(name, TagId::GetNull(),
+                                               clio::run::PoolQuery::Dynamic());
+      CLIO_CO_AWAIT(again);
+      if (again->GetReturnCode() == 0 && again->tag_id_ == id) {
+        view_.FillTagName(id.major_, id.minor_, name.data(), name.size(), seq);
+      }
+      // tag_size_ is the tag's TOTAL bytes (the field's contract). The core
+      // answers from one container's TagInfo -- only that container's share
+      // when blobs spread over nodes -- so a hit (the cached total) and a
+      // miss would disagree. Report the total either way, and cache it.
+      clio::run::u32 rc = 0;
+      CLIO_CO_AWAIT(FetchTagAttrs(id, &a, &rc));
+      if (rc == 0) task->tag_size_ = a.size_;
+    }
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -329,6 +368,84 @@ clio::run::TaskResume Runtime::BarrierForward(
   CLIO_TASK_BODY_END
 }
 
+clio::run::TaskResume Runtime::TagAttrs(
+    clio::run::shared_ptr<clio::cte::core::GetTagSizeTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  {
+    const TagId tag = task->tag_id_;
+    wtc::TagAttrs a;
+    if (view_.Ready() && view_.LookupTagAttrs(tag.major_, tag.minor_, &a)) {
+      task->tag_size_ = a.size_;
+      task->ctime_ = a.ctime_;
+      task->mtime_ = a.mtime_;
+      task->atime_ = a.atime_;
+      task->SetReturnCode(0);
+      CLIO_CO_RETURN;
+    }
+    clio::run::u32 rc = 0;
+    CLIO_CO_AWAIT(FetchTagAttrs(tag, &a, &rc));
+    task->tag_size_ = a.size_;
+    task->ctime_ = a.ctime_;
+    task->mtime_ = a.mtime_;
+    task->atime_ = a.atime_;
+    task->SetReturnCode(rc);
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::FetchTagAttrs(const TagId &tag,
+                                             wtc::TagAttrs *a,
+                                             clio::run::u32 *rc) {
+  CLIO_TASK_BODY_BEGIN
+  {
+    // Snapshot BEFORE draining and registering: a drop or a local write
+    // after this point voids the fill below. Draining puts every write
+    // buffered here before the snapshot into the chain's total.
+    const clio::run::u64 seq = view_.Ready() ? view_.TagInvalSeq() : 0;
+    const clio::run::u64 wseq = view_.Ready() ? view_.LocalWriteSeq() : 0;
+    if (view_.Ready()) {
+      const clio::run::u64 target = view_.PushedNow();
+      while (!view_.FlushedThrough(target)) {
+        CLIO_CO_AWAIT(clio::run::yield(kBarrierPollUs));
+      }
+      CLIO_CO_AWAIT(RegisterSharer(
+          tag, std::string(wtc::kTagMetaName, wtc::kTagMetaNameLen)));
+    }
+    auto f = Next()->AsyncGetTagSize(tag, clio::run::PoolQuery::Broadcast(0.0f));
+    CLIO_CO_AWAIT(f);
+    a->size_ = f->tag_size_;
+    a->ctime_ = f->ctime_;
+    a->mtime_ = f->mtime_;
+    a->atime_ = f->atime_;
+    *rc = f->GetReturnCode();
+    if (view_.Ready() && *rc == 0) {
+      view_.FillTagAttrs(tag.major_, tag.minor_, *a, seq, wseq);
+    }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::NoteTagsWritten(const std::vector<TagId> &tags,
+                                               bool count_local) {
+  CLIO_TASK_BODY_BEGIN
+  if (view_.Ready() && !tags.empty()) {
+    // A landing flush batch passes count_local=false: its writes were
+    // counted when they were absorbed, and counting them again would void
+    // every fill that drained the log (the drain lands this very batch).
+    if (count_local) view_.NoteLocalWrite();
+    std::set<std::pair<clio::run::u32, clio::run::u32>> seen;
+    for (const TagId &t : tags) {
+      if (t.IsNull() || !seen.insert({t.major_, t.minor_}).second) continue;
+      CLIO_CO_AWAIT(FanoutInvalidate(
+          t, std::string(wtc::kTagMetaName, wtc::kTagMetaNameLen)));
+    }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 clio::run::TaskResume Runtime::DropTagDataEverywhere(
     const std::vector<TagId> &tags) {
   CLIO_TASK_BODY_BEGIN
@@ -424,6 +541,12 @@ clio::run::TaskResume Runtime::InvalidateAfterForward(
           t, std::string(wtc::kTagMetaName, wtc::kTagMetaNameLen)));
     }
     CLIO_CO_AWAIT(DropTagDataEverywhere(tag_wide));
+    {
+      std::vector<TagId> written;
+      for (const BlobKey &k : blobs) written.push_back(TagId(k.major_, k.minor_));
+      CLIO_CO_AWAIT(NoteTagsWritten(written));
+      if (!tag_wide.empty() && view_.Ready()) view_.NoteLocalWrite();
+    }
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END

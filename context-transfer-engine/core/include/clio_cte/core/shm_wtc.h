@@ -134,6 +134,8 @@ enum TagFlags : u32 {
   kTagCreated = 1u << 0,
   /** name_ holds the tag's name as the chain reports it. */
   kTagNameValid = 1u << 1,
+  /** size_/times hold the tag's cluster-wide attributes. */
+  kTagAttrValid = 1u << 2,
 };
 
 /** Longest tag name cached (longer names are always fetched). */
@@ -147,6 +149,13 @@ static constexpr u32 kMaxTagName = 255;
  */
 static constexpr char kTagMetaName[] = "\x01tagmeta";
 static constexpr size_t kTagMetaNameLen = sizeof(kTagMetaName) - 1;
+
+/**
+ * Method id of the cache module's TagAttrs verb: a core::GetTagSizeTask
+ * sent to the local cache container, answered from the segment or fetched
+ * (the cluster total) and cached. Must equal shm_wtc::Method::kTagAttrs.
+ */
+static constexpr u32 kTagAttrsMethod = 103;
 
 /** Result of a client-side operation. */
 enum class Status : u32 {
@@ -194,7 +203,20 @@ struct TagEntry {
   std::atomic<u32> sticky_rc_;     /**< first failed flush of this tag */
   u32 name_len_;                   /**< kTagNameValid */
   u64 name_hash_;                  /**< KeyHash of the name (NameSlot key) */
+  u64 size_;                       /**< kTagAttrValid: total bytes */
+  u64 ctime_;                      /**< kTagAttrValid: change time (ns) */
+  u64 mtime_;                      /**< kTagAttrValid: modify time (ns) */
+  u64 atime_;                      /**< kTagAttrValid: access time at fill */
+  u64 attr_write_seq_;             /**< local_write_seq_ when filled */
   char name_[kMaxTagName + 1];
+};
+
+/** Cluster-wide tag attributes (what GetTagSize returns). */
+struct TagAttrs {
+  u64 size_ = 0;
+  u64 ctime_ = 0;
+  u64 mtime_ = 0;
+  u64 atime_ = 0;
 };
 
 /** Name -> tag id index (GetOrCreateTag hits). */
@@ -264,6 +286,10 @@ struct Root {
   /** Bumped by every tag-metadata drop: a fill fetched before the bump
    *  might carry a name the drop invalidated, so it is not installed. */
   std::atomic<u64> tag_inval_seq_;
+  /** Bumped by every write absorbed or forwarded on this node: cached tag
+   *  attributes filled before it may miss that write (a coarse, lock-free
+   *  read-your-writes guard; remote writes invalidate through the home). */
+  std::atomic<u64> local_write_seq_;
   std::atomic<u32> global_rc_;     /**< sticky rc for tags not in TagTable */
   u32 md_only_;                    /**< metadata only: no blob bytes */
   Stats stats_;
@@ -460,6 +486,22 @@ class View {
   bool LookupTagName(u32 major, u32 minor, std::string *name);
   /** Drop a tag's cached metadata (rename, name update, DelTag). */
   void DropTagMeta(u32 major, u32 minor);
+  /** Note a local write to any tag (voids cached tag attributes). */
+  void NoteLocalWrite() {
+    root_->local_write_seq_.fetch_add(1, std::memory_order_acq_rel);
+  }
+  /** Snapshot of the local write sequence (before fetching attributes). */
+  u64 LocalWriteSeq() const {
+    return root_->local_write_seq_.load(std::memory_order_acquire);
+  }
+  /**
+   * Install a tag's attributes fetched from the chain, unless a tag drop
+   * (`seq`) or a local write (`write_seq`) happened since the snapshots.
+   */
+  bool FillTagAttrs(u32 major, u32 minor, const TagAttrs &a, u64 seq,
+                    u64 write_seq);
+  /** Cached attributes of a tag (no local write since they were filled). */
+  bool LookupTagAttrs(u32 major, u32 minor, TagAttrs *a);
 
   /**
    * Record a blob size fetched from the chain (metadata only), unless the

@@ -555,6 +555,7 @@ inline Status View::TryPut(u32 tag_major, u32 tag_minor, const char *name,
   // a writer counted after its push could leave pushed_ short of an earlier
   // writer's slot, and a later SyncTag would stop before its own range.
   root_->pushed_.fetch_add(1, std::memory_order_acq_rel);
+  NoteLocalWrite();
   log_->Push(r);
   root_->stats_.puts_.fetch_add(1, std::memory_order_relaxed);
   root_->stats_.put_bytes_.fetch_add(size, std::memory_order_relaxed);
@@ -671,6 +672,7 @@ inline TagEntry *View::FindTagLocked(u32 major, u32 minor, bool insert) {
   free_slot->sticky_rc_.store(0, std::memory_order_relaxed);
   free_slot->name_len_ = 0;
   free_slot->name_hash_ = 0;
+  free_slot->attr_write_seq_ = 0;
   return free_slot;
 }
 
@@ -835,7 +837,48 @@ inline void View::DropTagMeta(u32 major, u32 minor) {
   TagEntry *t = FindTagLocked(major, minor, false);
   if (t != nullptr) {
     UnindexNameLocked(t);
+    t->flags_ &= ~kTagAttrValid;
   }
+}
+
+inline bool View::FillTagAttrs(u32 major, u32 minor, const TagAttrs &a,
+                               u64 seq, u64 write_seq) {
+  Guard g(root_->tag_lock_);
+  if (root_->tag_inval_seq_.load(std::memory_order_acquire) != seq ||
+      root_->local_write_seq_.load(std::memory_order_acquire) != write_seq) {
+    return false;  // a drop or a local write raced the fetch
+  }
+  TagEntry *t = FindTagLocked(major, minor, true);
+  if (t == nullptr) {
+    return false;
+  }
+  t->size_ = a.size_;
+  t->ctime_ = a.ctime_;
+  t->mtime_ = a.mtime_;
+  t->atime_ = a.atime_;
+  t->attr_write_seq_ = write_seq;
+  t->flags_ |= kTagAttrValid;
+  root_->stats_.md_fills_.fetch_add(1, std::memory_order_relaxed);
+  return true;
+}
+
+inline bool View::LookupTagAttrs(u32 major, u32 minor, TagAttrs *a) {
+  Guard g(root_->tag_lock_);
+  TagEntry *t = FindTagLocked(major, minor, false);
+  if (t == nullptr || !(t->flags_ & kTagAttrValid)) {
+    return false;
+  }
+  if (t->attr_write_seq_ !=
+      root_->local_write_seq_.load(std::memory_order_acquire)) {
+    t->flags_ &= ~kTagAttrValid;  // a local write since the fill
+    return false;
+  }
+  a->size_ = t->size_;
+  a->ctime_ = t->ctime_;
+  a->mtime_ = t->mtime_;
+  a->atime_ = t->atime_;
+  root_->stats_.tag_hits_.fetch_add(1, std::memory_order_relaxed);
+  return true;
 }
 
 inline bool View::SnapshotGens(u32 tag_major, u32 tag_minor, const char *name,

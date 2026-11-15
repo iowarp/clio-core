@@ -471,6 +471,76 @@ TEST_CASE("ShmWtc - md_only caches blob sizes and drops them on change",
   REQUIRE(back == v2.substr(0, 700));
 }
 
+/** Cluster-wide tag size through a client (Broadcast). */
+static clio::run::u64 TagSizeOf(clio::cte::core::Client &io, const TagId &tag) {
+  auto f = io.AsyncGetTagSize(tag, clio::run::PoolQuery::Broadcast(0.0f));
+  f.Wait();
+  REQUIRE(f->GetReturnCode() == 0);
+  return f->tag_size_;
+}
+
+/** Tag attributes and open-by-name, served from SHM and never stale. */
+static void TagMetaScenario(clio::cte::core::Client &io, const char *tname) {
+  const wtc::Stats *st = io.WtcStats();
+  TagId tag = MakeTag(io, tname);
+  auto put = [&](const std::string &name, size_t n, char c) {
+    const std::string v = Payload(n, c);
+    auto p = io.AsyncPutBlob(tag, name, 0, v.size(), v.data());
+    p.Wait();
+    REQUIRE(p->GetReturnCode() == 0);
+  };
+  put("a", 1000, 'a');
+  REQUIRE(TagSizeOf(io, tag) == 1000);  // read-your-writes (absorbed or not)
+  const clio::run::u64 hits = st->tag_hits_.load();
+  REQUIRE(TagSizeOf(io, tag) == 1000);
+  REQUIRE(st->tag_hits_.load() > hits);  // served from the segment
+  put("b", 500, 'b');
+  REQUIRE(TagSizeOf(io, tag) == 1500);   // a local write voids the cache
+  auto t = io.AsyncTruncateBlob(tag, "a", 100);
+  t.Wait();
+  REQUIRE(t->GetReturnCode() == 0);
+  REQUIRE(TagSizeOf(io, tag) == 600);
+  // Open by name: the second open is answered from the segment.
+  auto o1 = io.AsyncGetOrCreateTag(tname);
+  o1.Wait();
+  REQUIRE(o1->GetReturnCode() == 0);
+  REQUIRE(o1->tag_id_ == tag);
+  REQUIRE(TagSizeOf(io, tag) == 600);
+  const clio::run::u64 hits2 = st->tag_hits_.load();
+  auto o2 = io.AsyncGetOrCreateTag(tname);
+  o2.Wait();
+  REQUIRE(o2->GetReturnCode() == 0);
+  REQUIRE(o2->tag_id_ == tag);
+  REQUIRE(o2->tag_size_ == 600);
+  REQUIRE(st->tag_hits_.load() > hits2);
+  // Delete the tag: the name no longer maps to the old id.
+  auto d = io.AsyncDelTag(tag);
+  d.Wait();
+  auto o3 = io.AsyncGetOrCreateTag(tname);
+  o3.Wait();
+  REQUIRE(o3->GetReturnCode() == 0);
+  REQUIRE(o3->created_ == 1);
+  REQUIRE(TagSizeOf(io, o3->tag_id_) == 0);
+}
+
+TEST_CASE("ShmWtc - tag attributes and opens are cached and exact (data)",
+          "[cte][shm_wtc][tagmeta]") {
+  WtcFixture fx;
+  clio::cte::core::Client io(kPool);
+  REQUIRE(io.HasWtc());
+  TagMetaScenario(io, "wtc_tagmeta_data");
+}
+
+TEST_CASE("ShmWtc - tag attributes and opens are cached and exact (md_only)",
+          "[cte][shm_wtc][tagmeta][md_only]") {
+  WtcFixture fx;
+  const clio::run::PoolId pool(572, 0);
+  CreateCache(pool, "shm_wtc_md2", 32ull << 20, /*md_only=*/true);
+  clio::cte::core::Client io(pool);
+  REQUIRE(io.HasWtc());
+  TagMetaScenario(io, "wtc_tagmeta_md");
+}
+
 TEST_CASE("ShmWtc - truncate through the cache drops cached bytes",
           "[cte][shm_wtc][truncate]") {
   WtcFixture fx;

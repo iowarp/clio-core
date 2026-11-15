@@ -458,6 +458,15 @@ clio::run::TaskResume Runtime::LandOldest() {
     for (const auto &s : b.skipped_) prune(s.first);
     wtc::Root *root = view_.GetRoot();
     root->stats_.flush_skipped_.fetch_add(nskipped);
+    // The batch's writes are in the chain now: other nodes' cached
+    // attributes of these tags are stale (once per tag per batch).
+    {
+      std::vector<TagId> written;
+      for (const FlushRecord &fr : b.recs_) {
+        if (fr.size_ > 0) written.push_back(TagId(fr.key_.major_, fr.key_.minor_));
+      }
+      CLIO_CO_AWAIT(NoteTagsWritten(written, /*count_local=*/false));
+    }
     root->stats_.flush_batches_.fetch_add(b.futs_.size());
     root->stats_.flush_ranges_.fetch_add(b.popped_);
     root->stats_.flush_bytes_.fetch_add(b.bytes_);

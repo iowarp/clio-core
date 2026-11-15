@@ -280,6 +280,25 @@ class Runtime : public clio::cte::core::CoreInterposer {
    */
   clio::run::TaskResume InvalidateAfterForward(
       clio::run::u32 method, clio::run::shared_ptr<clio::run::Task> task);
+  /**
+   * TagAttrs (module verb, a core::GetTagSizeTask sent Local by a client):
+   * the tag's cluster-wide size and times from the segment, or fetched once
+   * (Broadcast down the chain) and cached, registered with the tag's home.
+   */
+  clio::run::TaskResume TagAttrs(
+      clio::run::shared_ptr<clio::cte::core::GetTagSizeTask> &task);
+  /**
+   * Fetch a tag's cluster-wide size/times (draining this node's log first,
+   * registered with the tag's home) and cache them unless a drop or a local
+   * write raced the fetch.
+   */
+  clio::run::TaskResume FetchTagAttrs(const TagId &tag,
+                                      clio::cte::core::wtc::TagAttrs *a,
+                                      clio::run::u32 *rc);
+  /** A write changed these tags: drop their cached attributes on every
+   *  node (here: a local write counter; elsewhere: through each home). */
+  clio::run::TaskResume NoteTagsWritten(const std::vector<TagId> &tags,
+                                        bool count_local = true);
   /** Drop every node's cached blobs and metadata of these tags. */
   clio::run::TaskResume DropTagDataEverywhere(const std::vector<TagId> &tags);
   clio::run::TaskResume FanoutInvalidate(const TagId &tag,
