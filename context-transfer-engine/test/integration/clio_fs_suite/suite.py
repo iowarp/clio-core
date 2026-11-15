@@ -171,10 +171,23 @@ def load_tests():
   import tests_cache  # noqa: F401
 
 
+def pbs_hosts():
+  """Hosts of the enclosing PBS job, in nodefile order, each once.
+
+  @return the host names, or [] outside a PBS job
+  """
+  nf = os.environ.get('PBS_NODEFILE')
+  if not nf or not os.path.exists(nf):
+    return []
+  with open(nf) as f:
+    return list(dict.fromkeys(ln.strip() for ln in f if ln.strip()))
+
+
 def slurm_hosts():
+  """Hosts of the enclosing allocation: SLURM, else PBS, else this node."""
   nl = os.environ.get('SLURM_JOB_NODELIST')
   if not nl:
-    return [os.uname().nodename.split('.')[0]]
+    return pbs_hosts() or [os.uname().nodename.split('.')[0]]
   out = subprocess.run(['scontrol', 'show', 'hostnames', nl],
                        capture_output=True, text=True, check=True).stdout
   return out.split()
@@ -307,6 +320,26 @@ def count_stalls(cl, hosts):
   return out
 
 
+def finished_tests(path):
+  """Names of the tests a results.jsonl already holds a verdict for.
+
+  @param path a leg's results.jsonl (may not exist)
+  @return the set of test names whose last record is not NOTRUN
+  """
+  last = {}
+  try:
+    with open(path) as f:
+      for line in f:
+        try:
+          rec = json.loads(line)
+        except ValueError:
+          continue
+        last[rec.get('name')] = rec.get('status')
+  except OSError:
+    pass
+  return {n for n, st in last.items() if st != 'NOTRUN'}
+
+
 def main():
   ap = argparse.ArgumentParser()
   ap.add_argument('--bin', required=True)
@@ -364,6 +397,19 @@ def main():
                   help='node-local state directory (default '
                        '/mnt/nvme/$USER/clio_fs_suite)')
   ap.add_argument('--port', type=int, default=9519)
+  ap.add_argument('--net-suffix', default='-40g',
+                  help='appended to each host name in the runtime hostfile '
+                       '(the data network\'s name for the node). Default '
+                       '-40g (Ares); pass an empty string where the host '
+                       'name itself is the address to use')
+  ap.add_argument('--budget-s', type=int, default=0,
+                  help='stop starting tests this many seconds after the leg '
+                       'began (0: no limit). Tests not started are recorded '
+                       'NOTRUN, so a job with a walltime limit still tears '
+                       'down and reports; continue with --resume')
+  ap.add_argument('--resume', action='store_true',
+                  help='skip tests that already have a result other than '
+                       'NOTRUN in <out>/results.jsonl')
   ap.add_argument('--list', action='store_true')
   args = ap.parse_args()
 
@@ -396,6 +442,10 @@ def main():
            'stress': 5, 'tier': 5, 'cache': 5, 'safe': 7, 'fault': 6,
            'repl': 6}
   sel.sort(key=lambda t: order.get(t['group'], 9))
+  if args.resume:
+    done = finished_tests(os.path.join(args.out, 'results.jsonl'))
+    sel = [t for t in sel if t['name'] not in done]
+  t_leg = time.time()
 
   bin_dir = snapshot_bins(os.path.abspath(args.bin),
                           os.path.join(os.path.abspath(args.out), 'bin'))
@@ -405,7 +455,8 @@ def main():
                disk_gb=args.disk_gb, ram_gb=args.ram_gb, ram_mb=args.ram_mb,
                fast_mb=args.fast_mb, organizer=args.organizer,
                neighborhood=args.neighborhood, local_root=args.local_root,
-               ssd_mb=args.ssd_mb, cache=args.cache)
+               ssd_mb=args.ssd_mb, cache=args.cache,
+               net_suffix=args.net_suffix)
   cl.working_set_mb = args.working_set_mb
   cl.probe_silence_s = args.probe_silence_s
   log(f'hosts={hosts} profile={args.profile} '
@@ -420,7 +471,18 @@ def main():
     resf.write(json.dumps(rec) + '\n')
     results.append(rec)
   else:
-    for t in sel:
+    for k, t in enumerate(sel):
+      if args.budget_s and time.time() - t_leg > args.budget_s:
+        log(f'time budget ({args.budget_s} s) used up: '
+            f'{len(sel) - k} test(s) not run')
+        for u in sel[k:]:
+          rec = {'name': u['name'], 'group': u['group'], 'status': 'NOTRUN',
+                 'nodes': len(hosts), 'notes': [], 'metrics': {},
+                 'error': 'not started: the leg\'s time budget ran out'}
+          resf.write(json.dumps(rec) + '\n')
+          results.append(rec)
+        resf.flush()
+        break
       nh = hosts if t['max_nodes'] is None else hosts[:t['max_nodes']]
       log(f'RUN  {t["group"]}/{t["name"]} on {len(nh)} node(s)')
       stalls0 = count_stalls(cl, hosts)

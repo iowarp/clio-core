@@ -60,9 +60,10 @@ def parallel(fn, items):
 class AgentConn:
   """A JSON-lines connection to agent.py running on one node."""
 
-  def __init__(self, host, agent_py, env_prefix=''):
+  def __init__(self, host, agent_py, env_prefix='',
+               python='/usr/bin/python3'):
     self.host = host
-    cmd = f'{env_prefix} exec /usr/bin/python3 -u {agent_py}'
+    cmd = f'{env_prefix} exec {python} -u {agent_py}'
     self.p = subprocess.Popen(SSH + [host, cmd], stdin=subprocess.PIPE,
                               stdout=subprocess.PIPE,
                               stderr=subprocess.DEVNULL)
@@ -179,6 +180,10 @@ class Cluster:
     self.ssd_root = ssd_root or f'/mnt/ssd/{user}/clio_fs_suite'
     self.hdd_root = hdd_root or f'/mnt/hdd/{user}/clio_fs_suite'
     self.agents = {}
+    # Interpreter the per-node agent runs under. agent.py needs Python 3.7+;
+    # where the system python3 is older (3.6 on Aurora's compute image) point
+    # CLIO_SUITE_PYTHON at a newer one that every node can reach.
+    self.python = os.environ.get('CLIO_SUITE_PYTHON', '/usr/bin/python3')
     self.agent_py = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                  'agent.py')
     os.makedirs(run_dir, exist_ok=True)
@@ -199,7 +204,11 @@ class Cluster:
         'PATH': f'{self.bin_dir}:/usr/bin:/bin:/usr/sbin:/sbin',
         # The login shell's LD_LIBRARY_PATH (e.g. another build's bin dir)
         # would override the binaries' RUNPATH and load mismatched libs.
-        'LD_LIBRARY_PATH': self.bin_dir,
+        # CLIO_SUITE_LD_LIBRARY_PATH appends directories the binaries need
+        # and carry no RUNPATH for (e.g. the compiler's runtime libraries on
+        # a system where they come from a module, not /usr/lib).
+        'LD_LIBRARY_PATH': ':'.join(filter(None, [
+            self.bin_dir, os.environ.get('CLIO_SUITE_LD_LIBRARY_PATH')])),
     }
     # Failure detection: the runtime defaults (30 s silence + 30 s retry per
     # send) ride out restarts but stall every op on a dead node for 30 s;
@@ -726,7 +735,7 @@ compose:
     if a is None or a.dead:
       if a is not None:
         a.close()
-      a = AgentConn(host, self.agent_py, self.env_prefix())
+      a = AgentConn(host, self.agent_py, self.env_prefix(), self.python)
       self.agents[host] = a
     return a
 
@@ -774,8 +783,10 @@ compose:
       rc, out = sh(h, f'df -Pm {paths} | tail -n +2', timeout=30)
       if rc != 0:
         return f'df failed: {out[-200:]}'
+      # A df data row: six fields with a numeric "available" column. The
+      # device name is not a path on tmpfs or a network filesystem.
       lines = [ln for ln in out.strip().splitlines()
-               if ln.split() and ln.split()[0].startswith('/')]
+               if len(ln.split()) >= 6 and ln.split()[3].isdigit()]
       if len(lines) != len(need):
         return f'unexpected df output: {out.strip()[-300:]}'
       have = {}
