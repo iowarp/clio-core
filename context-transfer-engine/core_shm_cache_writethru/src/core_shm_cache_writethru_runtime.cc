@@ -108,6 +108,16 @@ bool Runtime::OpenSegment() {
   lim.max_blobs_ = config_.max_blobs_;
   lim.max_tags_ = config_.max_tags_;
   lim.log_depth_ = config_.log_depth_;
+  if (lim.log_depth_ == 0) {
+    // Metadata only: no byte writes are logged. Otherwise one entry per KiB
+    // of segment: the log must outlast what the buffers can absorb, or puts
+    // wait on the flusher long before the cache is full.
+    const clio::run::u64 auto_depth =
+        config_.md_only_ ? 65536ull : std::max<clio::run::u64>(
+                                          65536ull, config_.capacity_ >> 10);
+    lim.log_depth_ = static_cast<clio::run::u32>(
+        std::min<clio::run::u64>(auto_depth, 1ull << 28));
+  }
   lim.evict_sample_ = config_.evict_sample_;
   lim.max_fill_ = config_.max_fill_;
   lim.half_life_ns_ = config_.half_life_ms_ * 1000ull * 1000ull;

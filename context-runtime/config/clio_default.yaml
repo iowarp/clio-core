@@ -627,7 +627,7 @@ compose:
     entry_pool_id: "564.0"              # clients bind to the indexer above
     md_only: true                       # bytes are cached by the write-back cache
     capacity: "256M"                    # segment bytes: buffers + tables + log
-    log_depth: 65536                    # dirty-range log entries
+    log_depth: 0                        # dirty-range log entries (0: 1 per KiB)
     flush_batch_bytes: "16M"            # max payload per MultiPutBlob batch
     flush_period_us: 50                 # flusher cadence (it drains fully)
     flush_retries: 3                    # per-record retries before an error sticks

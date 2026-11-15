@@ -61,7 +61,10 @@ struct WtcConfig {
 
   clio::run::PoolId next_pool_id_;    ///< [next_pool_id] pool below this one
   clio::run::u64 capacity_ = 256ull << 20;      ///< [capacity] segment bytes
-  clio::run::u32 log_depth_ = 65536;            ///< [log_depth] ranges
+  /** [log_depth] dirty-range log entries; 0 = one per KiB of capacity
+   *  (24 B each, ~2.3% of the segment), so a burst the buffers can hold is
+   *  absorbed without waiting on the flusher. */
+  clio::run::u32 log_depth_ = 0;
   clio::run::u64 flush_batch_bytes_ = 16ull << 20;  ///< [flush_batch_bytes]
   clio::run::u32 max_tags_ = 4096;              ///< [max_tags]
   clio::run::u32 max_blobs_ = 65536;            ///< [max_blobs]
