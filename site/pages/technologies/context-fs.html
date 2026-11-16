@@ -150,6 +150,72 @@ $ ls ~/clio-mnt/results
 </table>
 <p>Context FS scores 3.1x OrangeFS on 4 nodes and 3.0x on 8. It leads on every write and file-per-process read, and on every create, stat, read and find phase: by 6-17x on stat and over 500x on find, which Context FS answers from its directory tables. On 4 nodes OrangeFS reads the single shared ior-hard file about as fast (0.215 vs 0.205 GiB/s); on 8 nodes Context FS leads it (0.588 vs 0.416). mdtest-hard write is even on 4 nodes (0.553 vs 0.566) and 12% behind on 8. Deleting the small mdtest-hard files is the remaining weak point: 0.54-0.78 thousand per second against 0.69-1.31 for OrangeFS.</p>
 <p>Two things in this setup cost OrangeFS bandwidth. <code>directio</code> keeps the server page cache from standing in for the device, and <code>pvfs2fuse</code> uses the FUSE 2 API, which splits writes into pieces of at most 128 KiB, so a 2 MiB IOR transfer reaches the device as 16 synchronous writes. OrangeFS through its kernel module, or with its default buffered <code>alt-aio</code> method, would post higher bandwidth. <code>pvfs2fuse</code> also needed a four-line fix: when several nodes create the shared ior-hard file at once, the losers got <code>EEXIST</code> from an <code>open(O_CREAT)</code> without <code>O_EXCL</code>, which aborted IO500 on NVMe every time. The patched client opens the existing file instead, as POSIX requires.</p>
+<h3>Against DAOS on Aurora: IO500 at 32 nodes</h3>
+<p>IO500 on 32 compute nodes of Aurora, 16 MPI ranks per node (512 ranks), against DAOS mounted through <code>dfuse</code>. Both systems store their data in the same DAOS pool and ran on the same allocation type, in alternating jobs.</p>
+<ul class="checks">
+  <li><strong>Context FS</strong>: build of <code>cte-shm-cache</code> (62419d69d). Each node runs a runtime and a FUSE mount, with a 3.1 GB DRAM tier (pre-faulted at start) over a DAOS tier reached natively through libdfs, plus 512 MB of DRAM for metadata. The write-back cache over the DRAM tier and the shared-memory metadata cache are on; nodes talk to each other over Thallium on Slingshot (<code>ofi+cxi</code>).</li>
+  <li><strong>DAOS</strong>: a POSIX container in the same pool, mounted on every node with <code>dfuse</code>.</li>
+  <li><strong>IO500</strong> with work per rank capped: 768 MB for ior-easy, 400 segments for ior-hard, 125 files for each mdtest. The ior-easy data (384 GiB) is about four times the DRAM tier, so most of it is written to DAOS inside the timed phase. With these caps the scores are not valid IO500 list submissions. Three runs per system; every value is the mean, and the three IO500 scores of each system are within 2% of each other.</li>
+</ul>
+<div class="chart-grid">
+  <figure><figcaption>IO500 score (higher is better)</figcaption>
+<ul class="bars" aria-label="IO500 score (higher is better)">
+  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:100%"></i></span><span class="val">39.00</span></li>
+  <li><span>DAOS dfuse</span><span class="bar"><i style="width:55%"></i></span><span class="val">21.48</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>Bandwidth score, GiB/s</figcaption>
+<ul class="bars" aria-label="Bandwidth score, GiB/s">
+  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:57%"></i></span><span class="val">23.86</span></li>
+  <li><span>DAOS dfuse</span><span class="bar"><i style="width:100%"></i></span><span class="val">42.18</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>Metadata score, kIOPS</figcaption>
+<ul class="bars" aria-label="Metadata score, kIOPS">
+  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:100%"></i></span><span class="val">63.80</span></li>
+  <li><span>DAOS dfuse</span><span class="bar"><i style="width:17%"></i></span><span class="val">10.94</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>ior-easy write, GiB/s</figcaption>
+<ul class="bars" aria-label="ior-easy write, GiB/s">
+  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:23%"></i></span><span class="val">53.2</span></li>
+  <li><span>DAOS dfuse</span><span class="bar"><i style="width:100%"></i></span><span class="val">234.0</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>ior-easy read, GiB/s</figcaption>
+<ul class="bars" aria-label="ior-easy read, GiB/s">
+  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:100%"></i></span><span class="val">228.4</span></li>
+  <li><span>DAOS dfuse</span><span class="bar"><i style="width:99%"></i></span><span class="val">225.6</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>mdtest-easy stat, kIOPS</figcaption>
+<ul class="bars" aria-label="mdtest-easy stat, kIOPS">
+  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:100%"></i></span><span class="val">553.0</span></li>
+  <li><span>DAOS dfuse</span><span class="bar"><i style="width:8%"></i></span><span class="val">46.9</span></li>
+</ul>
+  </figure>
+</div>
+<p>Every phase (bandwidth in GiB/s, metadata in thousands of operations per second; higher is better; mean of three runs):</p>
+<table>
+  <tr><th>Phase</th><th>Context FS</th><th>DAOS dfuse</th><th>Context FS / DAOS</th></tr>
+  <tr><td>ior easy write</td><td>53.24</td><td><strong>234.03</strong></td><td>0.23x</td></tr>
+  <tr><td>ior easy read</td><td><strong>228.41</strong></td><td>225.60</td><td>1.01x</td></tr>
+  <tr><td>ior hard write</td><td><strong>1.94</strong></td><td>1.73</td><td>1.12x</td></tr>
+  <tr><td>ior hard read</td><td>13.75</td><td><strong>34.66</strong></td><td>0.40x</td></tr>
+  <tr><td>mdtest easy write</td><td>82.89</td><td><strong>134.16</strong></td><td>0.62x</td></tr>
+  <tr><td>mdtest easy stat</td><td><strong>553.00</strong></td><td>46.89</td><td>11.79x</td></tr>
+  <tr><td>mdtest easy delete</td><td><strong>25.85</strong></td><td>0.54</td><td>47.72x</td></tr>
+  <tr><td>mdtest hard write</td><td>9.85</td><td><strong>14.25</strong></td><td>0.69x</td></tr>
+  <tr><td>mdtest hard stat</td><td><strong>148.22</strong></td><td>46.77</td><td>3.17x</td></tr>
+  <tr><td>mdtest hard read</td><td><strong>88.92</strong></td><td>45.47</td><td>1.96x</td></tr>
+  <tr><td>mdtest hard delete</td><td><strong>7.10</strong></td><td>0.48</td><td>14.84x</td></tr>
+  <tr><td>find</td><td><strong>265.53</strong></td><td>4.15</td><td>63.96x</td></tr>
+  <tr><td>Bandwidth score, GiB/s</td><td>23.86</td><td><strong>42.18</strong></td><td>0.57x</td></tr>
+  <tr><td>Metadata score, kIOPS</td><td><strong>63.80</strong></td><td>10.94</td><td>5.83x</td></tr>
+  <tr><td>IO500 score</td><td><strong>39.00</strong></td><td>21.48</td><td>1.82x</td></tr>
+</table>
+<p>Context FS scores 1.82x DAOS dfuse overall (38.69-39.28 against 21.02-21.78 across the runs). The lead comes from metadata: stat, read, delete and find are 2-64x faster, and the metadata score is 5.8x. Two of those ratios are less settled than the rest, because Context FS varied between runs on mdtest-easy stat (383-780 thousand per second) and find (217-325); it led by a wide margin in every run.</p>
+<p>DAOS dfuse leads on bandwidth, 42.18 against 23.86 GiB/s. It writes the file-per-process ior-easy data 4.4x faster and reads the shared ior-hard file 2.5x faster; Context FS matches it on ior-easy read and is 12% ahead on ior-hard write. dfuse also creates files faster (mdtest easy and hard write, 0.62x and 0.69x). Context FS acknowledges a write once it is in the DRAM tier and makes it durable at <code>fsync</code>; each IOR write phase ends with an <code>fsync</code>, so the data is on DAOS when the phase's clock stops.</p>
 <h3>Checkpointing a simulation through the tiers</h3>
 <p>From the Eternia paper's evaluation: Gray-Scott on 2 Aurora nodes, 8 steps, a checkpoint every 2 steps. Each checkpoint is a copy-on-write snapshot that CLIO Core drains down the tier stack in the background, in a layout the HDF5 VOL can read. It is compared with a conventional synchronous checkpoint, in which the simulation waits until the snapshot reaches persistent storage; in the Lustre-heavy composition that is a simulation writing its checkpoint to the parallel file system. Total runtime in seconds, lower is better.</p>
 <div class="chart-grid">
