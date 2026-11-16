@@ -1867,10 +1867,15 @@ void Worker::ProcessBlockedQueue(std::queue<clio::run::shared_ptr<Task>> &queue,
 
 void Worker::ProcessPeriodicQueue(std::queue<clio::run::shared_ptr<Task>> &queue,
                                   u32 queue_idx) {
-  (void)queue_idx;  // Unused parameter, kept for API consistency
-
-  // Check up to 8 tasks from the queue
-  size_t check_limit = 8;
+  // The two fast queues (yields of at most 200 us) hold tasks that poll for
+  // an external completion, e.g. a native DAOS bdev block I/O. Eight per pass
+  // made the time to notice a completion grow with the number of waiters:
+  // with ~400 block writes in flight per node, a write DAOS finished in
+  // 1.3 ms was seen by its task 139 ms later. A pass now resumes every task
+  // that was queued when it started, up to kFastPeriodicScan; tasks that
+  // yield again go to the back and wait for the next pass.
+  static constexpr size_t kFastPeriodicScan = 1024;
+  size_t check_limit = queue_idx <= 1 ? kFastPeriodicScan : 8;
   size_t queue_size;
   {
     std::lock_guard<std::mutex> lk(park_mtx_);  // #785: see ProcessBlockedQueue
