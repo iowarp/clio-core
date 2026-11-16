@@ -281,6 +281,7 @@ $RAM_TIERS
     next_persistent: "512.0"
     flush_period_ms: ${WB_FLUSH_MS:-10000}
 $( [ -n "${WB_FILL_PCT:-}" ] && echo "    flush_fill_pct: ${WB_FILL_PCT}" )
+$( [ -n "${WB_DIRTY_MB:-}" ] && echo "    flush_dirty_mb: ${WB_DIRTY_MB}" )
 EOF
     NEXT=567.0
     if [ "${SHM_CACHE:-1}" = 1 ]; then
@@ -455,6 +456,10 @@ if [ "${BENCH:-io500}" = ior ]; then
     tgt="$DATADIR/ior-hard/file"; sfx="-hard"; pre=""
     shape="-t 47008 -b 47008 -s $HARD_SEG"
    fi
+   # IOR_FSYNC=0 drops IO500's fsync before close (-e): with a DRAM tier
+   # that holds the whole dataset nothing then reaches the persistent tier
+   # inside the timed phase, which isolates the path into DRAM.
+   fs="-e"; [ "${IOR_FSYNC:-1}" = 0 ] && fs=""
    for ph in write read; do
     [ $ph = write ] && fl="-w" || fl="-r"
     # PROFILE=1: sample thread CPU and stacks on this node during the phase.
@@ -463,7 +468,7 @@ if [ "${BENCH:-io500}" = ior ]; then
     wrap=""
     [ "${STRACE:-0}" = 1 ] && wrap="$HERE/ior_wrap.sh $OUT/ior$sfx-$ph $PPN"
     mpiexec -n $(( NN * PPN )) -ppn "$PPN" --cpu-bind depth -d 4 --envall \
-      $wrap $pre "$IOR" -g -G 271828 -k -e -o "$tgt" -C -Q 1 \
+      $wrap $pre "$IOR" -g -G 271828 -k $fs -o "$tgt" -C -Q 1 \
       $shape $fl -a POSIX ${IOR_EXTRA:-} > "ior-easy$sfx-$ph.txt" 2>&1
     rc=$?
     echo "IORCELL tag=${RUN_TAG:-none} variant=$v nodes=$NN phase=$ph rc=$rc $(grep -E '^(write|read) ' "ior-easy$sfx-$ph.txt" | awk '{print "MiB/s=" $2, "open_s=" $7, "io_s=" $8, "close_s=" $9}')"
