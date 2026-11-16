@@ -40,6 +40,7 @@
 #define CLIO_CTE_CORE_SHM_WTC_IMPL_H_
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 
 #include <clio_ctp/introspect/system_info.h>
@@ -642,7 +643,7 @@ inline u64 View::NextFreeLocked(u64 from) const {
       step += 64 - g % 64;  // rest of this word is used
       continue;
     }
-    const u64 hit = g + static_cast<u64>(__builtin_ctzll(bits));
+    const u64 hit = g + static_cast<u64>(std::countr_zero(bits));  // MSVC too
     if (hit < n) return hit;
     step += n - g;  // past the end: wrap to granule 0
   }
