@@ -42,6 +42,8 @@
 #include <algorithm>
 #include <cmath>
 
+#include <clio_ctp/introspect/system_info.h>
+#include <clio_ctp/util/config_parse.h>
 #include <clio_runtime/bdev/transports/mem_bdev_transport.h>
 
 namespace clio::cte::core::wtc {
@@ -216,8 +218,32 @@ inline bool View::Attach(const std::string &name, u64 root_off) {
       Detach();  // no bytes reachable: do not use this cache at all
       return false;
     }
+    PrefaultData();
   }
   return true;
+}
+
+inline void View::PrefaultData() {
+  const char *env = std::getenv("CLIO_PREFAULT");
+  if (env == nullptr || *env == '\0') {
+    return;
+  }
+  u64 budget = std::string(env) == "0"
+                   ? ~0ull
+                   : static_cast<u64>(ctp::ConfigParse::ParseSize(env));
+  // One BulkFault (MADV_POPULATE_WRITE: maps, never alters contents) per
+  // stretch of granules that is contiguous in the device.
+  const u64 n = root_->granules_;
+  u64 g = 0;
+  while (g < n && budget > 0) {
+    u64 e = g + 1;
+    while (e < n && !((brk_bits_[e / 64] >> (e % 64)) & 1ull)) ++e;
+    const u64 bytes = std::min((e - g) * kGranule, budget);
+    ctp::SystemInfo::BulkFault(GranPtr(static_cast<u32>(g)),
+                               static_cast<size_t>(bytes));
+    budget -= bytes;
+    g = e;
+  }
 }
 
 inline bool View::AttachData() {

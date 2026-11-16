@@ -99,6 +99,9 @@ bool ContentTransferEngine::ClientInit(const clio::run::PoolQuery &pool_query) {
           HLOG(kDebug,
                "CTE ClientInit: SHM metadata cache unavailable; using RPC");
         }
+        // Attach a shm cache now, not on the first op: its attach maps (and
+        // under CLIO_PREFAULT pre-faults) the cache's data pages here.
+        cte_client->HasWtc();
         HLOG(kInfo, "CTE ClientInit: CLIO_CTE_POOL bound client to pool {}.{}",
              major, minor);
         is_initialized_ = true;

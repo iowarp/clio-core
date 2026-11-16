@@ -704,6 +704,10 @@ class View {
   bool Extents() const { return root_ != nullptr && root_->data_mode_ != 0; }
   /** Map the extent tables and the RAM bdev's memory (both sides). */
   bool AttachData();
+  /** CLIO_PREFAULT in a client: map every leased extent's pages into this
+   *  process now ("0" = all of them, else a size budget), so first touches
+   *  inside a measured run do not each take a fault. Contents unchanged. */
+  void PrefaultData();
   /** Address of a granule's first byte in the RAM bdev. */
   char *GranPtr(u32 g) const { return data_base_ + gran_off_[g]; }
   /** Grow an entry by `add` granules (data_lock_ held); all or nothing. */
