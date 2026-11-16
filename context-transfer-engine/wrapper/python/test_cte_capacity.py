@@ -134,10 +134,13 @@ def private_environment(
 
 def daemon_executable(bin_dir: Path) -> Path:
     """Require the exact executable alongside the selected installed artifact."""
-    executable = bin_dir / ("clio_run.exe" if os.name == "nt" else "clio_run")
-    if not executable.is_file():
-        raise RuntimeError(f"Missing installed daemon executable: {executable}")
-    return executable.resolve()
+    suffix = ".exe" if os.name == "nt" else ""
+    # clio-run is canonical; clio_run is the legacy alias (absent in wheels).
+    for name in ("clio-run", "clio_run"):
+        executable = bin_dir / f"{name}{suffix}"
+        if executable.is_file():
+            return executable.resolve()
+    raise RuntimeError(f"Missing installed daemon executable: {bin_dir / ('clio-run' + suffix)}")
 
 
 def owned_process(pid: int, created: float, executable: Path) -> Any:

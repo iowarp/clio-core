@@ -410,7 +410,10 @@ def main() -> None:
             CLIO_CLIENT_RETRY_TIMEOUT="3",
             CTE_CONDITIONAL_TAG=f"conditional-{uuid.uuid4().hex}",
         )
-        executable = Path.cwd() / ("clio_run.exe" if os.name == "nt" else "clio_run")
+        suffix = ".exe" if os.name == "nt" else ""
+        executable = Path.cwd() / f"clio-run{suffix}"
+        if not executable.is_file():  # legacy alias
+            executable = Path.cwd() / f"clio_run{suffix}"
         assert executable.is_file(), f"freshly built daemon not found: {executable}"
         daemon_log = root / "daemon.log"
         controller = Controller(root, environment)
