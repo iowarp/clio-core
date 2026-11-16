@@ -64,7 +64,7 @@ if [ -x '@APPIMAGE_STAGING_DIR@/usr/bin/clio_cte_fuse' ]; then
 fi
 "./$LINUXDEPLOY" \
     --appdir '@APPIMAGE_STAGING_DIR@' \
-    --executable '@APPIMAGE_STAGING_DIR@/usr/bin/clio_run' \
+    --executable '@APPIMAGE_STAGING_DIR@/usr/bin/clio-run' \
     $EXTRA_EXEC_ARGS \
     --desktop-file '@APPIMAGE_STAGING_DIR@/clio_run.desktop' \
     --icon-file '@APPIMAGE_STAGING_DIR@/clio_run.png' \

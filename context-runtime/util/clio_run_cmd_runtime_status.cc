@@ -47,7 +47,7 @@
 namespace {
 
 void PrintRuntimeStatusUsage() {
-  HIPRINT("Usage: clio_run status");
+  HIPRINT("Usage: clio-run status");
   HIPRINT("  Report the local Clio runtime's state.");
   HIPRINT("  Exit codes:");
   HIPRINT("    0  RUNNING - runtime answered a heartbeat probe");

@@ -115,8 +115,8 @@ def wait_for_daemon(log_path: str, daemon, timeout: float = 90.0) -> None:
 
 
 def find_clio_run(bin_dir: str) -> str:
-    """Locate the clio_run executable next to the module."""
-    for name in ("clio_run.exe", "clio_run"):
+    """Locate the clio-run executable (or its legacy clio_run alias)."""
+    for name in ("clio-run.exe", "clio-run", "clio_run.exe", "clio_run"):
         p = os.path.join(bin_dir, name)
         if os.path.exists(p):
             return p

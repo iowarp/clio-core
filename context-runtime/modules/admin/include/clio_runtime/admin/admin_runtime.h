@@ -249,6 +249,17 @@ public:
   void MonitorGetHostInfo(clio::run::shared_ptr<MonitorTask> &task);
 
   /**
+   * Monitor queries that drive this node's web dashboard, used by
+   * `clio-run viz <start|stop|status>`:
+   *   viz_status                          report only
+   *   viz_start[?bind=<addr>&port=<n>]    start unless already running
+   *   viz_stop                            stop if running
+   * Every form replies with a msgpack map {running, bind, port, error}
+   * describing the state AFTER the action.
+   */
+  void MonitorViz(clio::run::shared_ptr<MonitorTask> &task);
+
+  /**
    * Register the web dashboard's endpoints and claim its home page
    * (issue #990). Called on a prototype instance at module-load time (see
    * Container::RegisterViz), so every handler is stateless -- Monitor
