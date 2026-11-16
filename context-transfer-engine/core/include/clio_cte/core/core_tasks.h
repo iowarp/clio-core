@@ -6174,6 +6174,11 @@ static constexpr clio::run::u32 kSyncIoRc = 5;  // EIO
  *  barrier), so a blob with one at the persistence level needs no second
  *  durable copy of its primary (#1143). */
 GLOBAL_CROSS_CONST clio::run::u32 kSyncReplicasCurrent = 0x1;
+/** SyncTagTask::sync_flags_: the sync was broadcast, so every container of
+ *  the pool is running it. A cache that holds copies on several containers
+ *  then flushes only its own instead of asking every container again (one
+ *  fsync was otherwise a broadcast of broadcasts). */
+GLOBAL_CROSS_CONST clio::run::u32 kSyncFannedOut = 0x2;
 
 struct SyncTagTask : public clio::run::Task {
   IN TagId tag_id_;              ///< Tag whose blobs must become durable

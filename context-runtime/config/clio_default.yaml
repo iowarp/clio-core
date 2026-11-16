@@ -678,6 +678,10 @@ compose:
     # flushed copies are clean, and clean copies are what a full cache can
     # drop to keep absorbing writes. 0 = timer only.
     flush_fill_pct: 80
+    # Continuous flushing: start a flush whenever this many MiB of new dirty
+    # data were written since the last one started, so flushing keeps pace
+    # with the writes and an fsync finds little left to do. 0 = off.
+    flush_dirty_mb: 256
     # When the volatile core cannot hold a put even after eviction: true
     # writes it straight to persistent (default); false fails the put with
     # ENOSPC (kPutNoSpaceRc) so a deployment never silently drops to disk

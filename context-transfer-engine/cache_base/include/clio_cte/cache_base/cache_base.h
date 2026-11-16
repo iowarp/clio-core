@@ -34,6 +34,8 @@
 #ifndef CLIO_CTE_CACHE_BASE_CACHE_BASE_H_
 #define CLIO_CTE_CACHE_BASE_CACHE_BASE_H_
 
+#include <map>
+#include <set>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -285,6 +287,8 @@ class CacheBase : public clio::cte::core::DualTargetInterposer {
   /** Keys of this container's copies (of one tag, or all). */
   std::vector<std::string> KeysOf(const TagId *tag);
   /**
+   * Continuous flush trigger (flush_dirty_mb): once that much new dirty
+   * data arrived since the last triggered flush started, start another.
    * Fill-level flush trigger (flush_fill_pct): when there is unflushed
    * data and the volatile core is at least that full, start one flush of
    * every dirty copy on this container. Called after writes; it asks the
@@ -295,17 +299,48 @@ class CacheBase : public clio::cte::core::DualTargetInterposer {
    *  tag, or all), sorted by key. */
   std::vector<std::pair<std::string, clio::run::u64>> DirtyKeysOf(
       const TagId *tag);
+  /** One dirty range of a flush in flight (FlushAll). */
+  struct FlushOp {
+    size_t key_ = 0;  ///< index into the flush's FlushKey list
+    TagId tag_;
+    std::string name_;
+    Extent ext_;
+    ctp::ipc::FullPtr<char> buf_;
+    clio::run::Future<core::GetBlobTask> get_;
+    clio::run::Future<core::PutBlobTask> put_;
+  };
+  /** A blob of a flush in flight: its lock is held until left_ reaches 0. */
+  struct FlushKey {
+    std::string key_;
+    size_t left_ = 0;         ///< its ranges not yet landed
+    clio::run::u32 rc_ = 0;   ///< first failure among its ranges
+  };
   /**
-   * Write the dirty ranges of several blobs to persistent at once (every
-   * key's lock held): all reads from volatile are issued together, then
-   * all writes to persistent.
-   * @param keys the blobs to flush
+   * Lock a dirty blob of a flush and queue its dirty ranges. A blob with
+   * nothing dirty by then is unlocked again at once.
+   * @param keys the flush's blobs
+   * @param i the blob to open
+   * @param queued receives its ranges
+   */
+  clio::run::TaskResume FlushOpenKey(std::vector<FlushKey> *keys, size_t i,
+                                     std::deque<FlushOp> *queued);
+  /**
+   * Account one landed (or failed) range of a flush. When it was the blob's
+   * last, a blob whose ranges all landed is marked clean, and its lock is
+   * released either way (a failed blob stays dirty for the next flush).
+   * @param keys the flush's blobs
+   * @param i the range's blob
+   * @param rc the range's result
+   */
+  void FlushRangeDone(std::vector<FlushKey> *keys, size_t i, clio::run::u32 rc);
+  /**
+   * Flush every dirty copy of a tag (or all) on this container through a
+   * window of ranges in flight: as one range lands the next starts, so
+   * the persistent tier always has up to kFlushInflightOps writes.
+   * @param tag the tag (ignored with all_tags)
+   * @param all_tags flush every tag
    * @param rc set to the first failure, else 0
    */
-  clio::run::TaskResume FlushBatch(std::vector<std::string> keys,
-                                   clio::run::u32 *rc);
-  /** Flush every dirty copy of a tag (or all) on this container, several
-   *  blobs at a time. */
   clio::run::TaskResume FlushAll(TagId tag, bool all_tags, clio::run::u32 *rc);
   /**
    * Flush this container's dirty copies of one tag; concurrent callers
@@ -361,6 +396,33 @@ class CacheBase : public clio::cte::core::DualTargetInterposer {
   std::mutex mu_;                         ///< guards entries_ / busy_
   std::unordered_map<std::string, Entry> entries_;
   std::unordered_set<std::string> busy_;
+  /** (tag major, tag minor): the key the dirty index groups copies by. */
+  using TagKey = std::pair<clio::run::u32, clio::run::u32>;
+  /**
+   * Keys of the copies with dirty ranges, by tag, in key order. A sync of
+   * one tag reads its set instead of scanning every entry under mu_ (512
+   * ranks' fsyncs each asked every node, and every ask scanned the whole
+   * cache). Guarded by mu_; kept by IndexDirty / UnindexDirty.
+   */
+  std::map<TagKey, std::set<std::string>> dirty_tags_;
+  /**
+   * Record in the dirty index whether a copy has dirty ranges. Call with
+   * mu_ held after any change to the entry's dirty_.
+   * @param key the copy's key
+   * @param e its entry
+   */
+  void IndexDirty(const std::string &key, const Entry &e);
+  /**
+   * Take a copy out of the dirty index. Call with mu_ held before the
+   * entry is erased.
+   * @param key the copy's key
+   */
+  void UnindexDirty(const std::string &key);
+  /**
+   * @param tag a tag
+   * @return true when this container holds a dirty copy of one of its blobs
+   */
+  bool TagDirty(const TagId &tag);
   /** Copies kept on the eviction list between scans. */
   static constexpr size_t kVictimQueue = 256;
   /** Eviction list (RefillVictims / TakeVictim). Guarded by mu_. */
@@ -380,9 +442,15 @@ class CacheBase : public clio::cte::core::DualTargetInterposer {
   std::atomic<clio::run::u64> flushed_gen_{0};
   /** When the fill level was last asked for (ns). */
   std::atomic<clio::run::u64> fill_check_ns_{0};
-  /** A fill-level flush has been sent and has not finished. */
+  /** A fill-level or continuous flush has been sent and has not finished. */
   std::atomic<bool> fill_flush_pending_{false};
-  /** One kind of shared work (JoinRound). Guarded by mu_. */
+  /** Dirty bytes written since the last triggered flush started
+   *  (flush_dirty_mb). */
+  std::atomic<clio::run::u64> dirty_since_flush_{0};
+  /** Guards rounds_ only: waiters poll it, and must not hold up the
+   *  entry map (mu_) while they do. */
+  std::mutex round_mu_;
+  /** One kind of shared work (JoinRound). Guarded by round_mu_. */
   struct Round {
     clio::run::u64 started_ = 0;  ///< rounds started
     clio::run::u64 done_ = 0;     ///< rounds completed

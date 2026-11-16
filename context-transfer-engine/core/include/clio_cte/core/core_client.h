@@ -4571,6 +4571,9 @@ class Client : public clio::run::ContainerClient {
     auto task = ipc_manager->NewTask<SyncTagTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, tag_id,
         min_persistence);
+    if (pool_query.IsBroadcastMode()) {
+      task->sync_flags_ |= kSyncFannedOut;  // every container gets this sync
+    }
     return ipc_manager->Send(task);
   }
 
