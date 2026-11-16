@@ -82,10 +82,19 @@ struct WtcConfig {
   /** [entry_pool_id] pool clients bind to so their tasks pass every module
    *  above this cache (e.g. the indexer); null = this pool. */
   clio::run::PoolId entry_pool_id_;
+  /** [data_pool] a node-local RAM bdev to keep blob bytes in: the cache
+   *  leases data_capacity bytes of it and stores each blob as runs of 4 KiB
+   *  granules there (no buddy rounding, no contiguity). Null = bytes live in
+   *  this cache's own segment. A minor of 0 means this node's own device of
+   *  that core: the core names its storage pools <core major + index>.<1 +
+   *  node>, so "512.0" is the first storage device of core 512 here. */
+  clio::run::PoolId data_pool_;
+  clio::run::u64 data_capacity_ = 0;            ///< [data_capacity] bytes leased
 
   WtcConfig()
       : next_pool_id_(clio::run::PoolId::GetNull()),
-        entry_pool_id_(clio::run::PoolId::GetNull()) {}
+        entry_pool_id_(clio::run::PoolId::GetNull()),
+        data_pool_(clio::run::PoolId::GetNull()) {}
   WtcConfig(const clio::run::PoolId &pool_id, const WtcConfig &other) {
     (void)pool_id;
     *this = other;
@@ -96,7 +105,7 @@ struct WtcConfig {
     ar(next_pool_id_, capacity_, log_depth_, flush_batch_bytes_, max_tags_,
        max_blobs_, max_fill_, evict_sample_, half_life_ms_, flush_period_us_,
        flush_retries_, max_sharer_entries_, flush_shards_, flush_depth_,
-       md_only_, entry_pool_id_);
+       md_only_, entry_pool_id_, data_pool_, data_capacity_);
   }
 
   /** Parse "major.minor". */
@@ -129,6 +138,10 @@ struct WtcConfig {
       size_of("capacity", &capacity_);
       size_of("flush_batch_bytes", &flush_batch_bytes_);
       size_of("max_fill", &max_fill_);
+      size_of("data_capacity", &data_capacity_);
+      if (node["data_pool"]) {
+        data_pool_ = ParsePoolId(node["data_pool"].as<std::string>());
+      }
       if (node["log_depth"]) log_depth_ = node["log_depth"].as<clio::run::u32>();
       if (node["max_tags"]) max_tags_ = node["max_tags"].as<clio::run::u32>();
       if (node["max_blobs"]) max_blobs_ = node["max_blobs"].as<clio::run::u32>();

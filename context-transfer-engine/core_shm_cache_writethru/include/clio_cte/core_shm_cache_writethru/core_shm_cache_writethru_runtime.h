@@ -44,6 +44,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include <clio_runtime/bdev/bdev_client.h>
 #include <clio_runtime/clio_runtime.h>
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/core/core_interposer.h>
@@ -172,6 +173,8 @@ class Runtime : public clio::cte::core::CoreInterposer {
  private:
   /** Create and publish the segment. */
   bool OpenSegment();
+  /** Lease data_capacity bytes from the data_pool RAM bdev (extent mode). */
+  clio::run::TaskResume LeaseExtents();
   /** Core client bound to the next pool in the chain. */
   clio::cte::core::Client *Next();
   /** This node's id. */
@@ -354,6 +357,8 @@ class Runtime : public clio::cte::core::CoreInterposer {
 
   WtcConfig config_;
   clio::cte::core::wtc::View view_;
+  /** Blocks leased from the data_pool RAM bdev (returned at Destroy). */
+  std::vector<clio::run::bdev::Block> leased_;
   std::unique_ptr<clio::cte::core::Client> next_client_;
   /** Batches staged or in flight (the chain-read fence reads it as "a
    *  flush is landing"); incremented before a batch checks for readers. */

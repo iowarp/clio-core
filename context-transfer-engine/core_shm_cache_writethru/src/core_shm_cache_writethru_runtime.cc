@@ -75,6 +75,13 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   config_ = task->GetParams();
   interposer_next_pool_ = config_.next_pool_id_;
   next_client_ = std::make_unique<clio::cte::core::Client>(CorePoolId());
+  if (!config_.data_pool_.IsNull() && !config_.md_only_ &&
+      config_.data_capacity_ > 0) {
+    if (config_.data_pool_.minor_ == 0) {
+      config_.data_pool_.minor_ = 1 + container_id_;  // this node's device
+    }
+    CLIO_CO_AWAIT(LeaseExtents());
+  }
   if (OpenSegment()) {
     // The log's only consumer: a periodic flusher on this container.
     auto *ipc = CLIO_IPC;
@@ -122,6 +129,24 @@ bool Runtime::OpenSegment() {
   lim.max_fill_ = config_.max_fill_;
   lim.half_life_ns_ = config_.half_life_ms_ * 1000ull * 1000ull;
   lim.md_only_ = config_.md_only_;
+  if (!leased_.empty()) {
+    // Extent mode: adjacent leased blocks merge into one extent, so runs
+    // can span them (a fresh RAM bdev usually hands out one long stretch).
+    std::vector<std::pair<clio::run::u64, clio::run::u64>> ext;
+    for (const auto &b : leased_) ext.emplace_back(b.offset_, b.size_);
+    std::sort(ext.begin(), ext.end());
+    for (const auto &x : ext) {
+      if (!lim.extents_.empty() &&
+          lim.extents_.back().first + lim.extents_.back().second == x.first) {
+        lim.extents_.back().second += x.second;
+      } else {
+        lim.extents_.push_back(x);
+      }
+    }
+    lim.data_pid_ = pid;
+    lim.data_pool_major_ = config_.data_pool_.major_;
+    lim.data_pool_minor_ = config_.data_pool_.minor_;
+  }
   const std::string name = wtc::SegmentName(pid, pool_id_);
   const ctp::ipc::MemoryBackendId id(pid, 0x57540000u | (pool_id_.major_ & 0xFFFFu));
   if (!view_.Format(name, id, lim, SelfNode())) {
@@ -153,9 +178,42 @@ bool Runtime::OpenSegment() {
   return true;
 }
 
+clio::run::TaskResume Runtime::LeaseExtents() {
+  CLIO_TASK_BODY_BEGIN
+  {
+    // In 64 MiB requests until data_capacity is leased or the device is
+    // full; whatever was leased is used (a smaller cache, not no cache).
+    clio::run::bdev::Client bdev(config_.data_pool_);
+    constexpr clio::run::u64 kLeaseChunk = 64ull << 20;
+    clio::run::u64 got = 0;
+    while (got < config_.data_capacity_) {
+      const clio::run::u64 want =
+          std::min(kLeaseChunk, config_.data_capacity_ - got);
+      auto f = bdev.AsyncAllocateBlocks(clio::run::PoolQuery::Local(), want);
+      CLIO_CO_AWAIT(f);
+      if (f->GetReturnCode() != 0 || f->blocks_.empty()) break;
+      for (size_t i = 0; i < f->blocks_.size(); ++i) {
+        leased_.push_back(f->blocks_[i]);
+        got += f->blocks_[i].size_;
+      }
+    }
+    HLOG(kInfo, "core_shm_cache_writethru {}.{}: leased {} MB in {} block(s) "
+         "from RAM bdev {}.{}", pool_id_.major_, pool_id_.minor_, got >> 20,
+         leased_.size(), config_.data_pool_.major_, config_.data_pool_.minor_);
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 clio::run::TaskResume Runtime::Destroy(clio::run::shared_ptr<DestroyTask> &task) {
   CLIO_TASK_BODY_BEGIN
   view_.Detach();
+  if (!leased_.empty()) {
+    clio::run::bdev::Client bdev(config_.data_pool_);
+    auto f = bdev.AsyncFreeBlocks(clio::run::PoolQuery::Local(), leased_);
+    CLIO_CO_AWAIT(f);
+    leased_.clear();
+  }
   task->return_code_ = 0;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
