@@ -50,6 +50,9 @@
 
 namespace clio::cte::shm_wtc {
 
+/** Poll period of a write waiting for its invalidation batch (us). */
+static constexpr double kInvPollUs = 20.0;
+
 /** Wall-clock ms (CLOCK_REALTIME) for cross-node trace ordering. */
 static double WallMs() {
   return std::chrono::duration<double, std::milli>(
@@ -172,14 +175,97 @@ clio::run::TaskResume Runtime::FanoutInvalidate(const TagId &tag,
                                                 const std::string &name) {
   CLIO_TASK_BODY_BEGIN
   if (CLIO_IPC->GetNumHosts() > 1) {
+    CLIO_CO_AWAIT(FanoutBatched({BlobKey{tag.major_, tag.minor_, name}}));
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::FanoutBatched(std::vector<BlobKey> keys) {
+  CLIO_TASK_BODY_BEGIN
+  {
+    /** One key of this call: its home and the batch it was queued into. */
+    struct Wait {
+      clio::run::u32 home_;
+      clio::run::u64 seq_;
+    };
+    std::vector<Wait> waits;
+    {
+      std::lock_guard<std::mutex> lk(inv_mtx_);
+      for (BlobKey &k : keys) {
+        const clio::run::u32 home =
+            HomeOf(TagId(k.major_, k.minor_), k.name_);
+        InvLane &lane = inv_lanes_[home];
+        bool dup = false;
+        for (const BlobKey &p : lane.pending_) {
+          dup = dup || (p.major_ == k.major_ && p.minor_ == k.minor_ &&
+                        p.name_ == k.name_);
+        }
+        if (!dup) lane.pending_.push_back(std::move(k));
+        waits.push_back(Wait{home, lane.open_seq_});
+      }
+    }
     auto *ipc = CLIO_IPC;
-    BlobKey k{tag.major_, tag.minor_, name};
-    auto inv = ipc->NewTask<InvalidateTask>(
-        clio::run::CreateTaskId(), pool_id_,
-        clio::run::PoolQuery::DirectId(HomeOf(tag, name)), kInvalidateFanout,
-        container_id_, PackKeys({k}));
-    auto fut = ipc->Send(inv);
-    CLIO_CO_AWAIT(fut);
+    while (!waits.empty()) {
+      // Drop the keys already delivered; lead the first lane that is idle
+      // with this call's batch next in line.
+      std::vector<BlobKey> batch;
+      Wait led{0, 0};
+      {
+        std::lock_guard<std::mutex> lk(inv_mtx_);
+        for (size_t i = 0; i < waits.size();) {
+          InvLane &lane = inv_lanes_[waits[i].home_];
+          if (lane.done_seq_ >= waits[i].seq_) {
+            waits[i] = waits.back();
+            waits.pop_back();
+            continue;
+          }
+          if (batch.empty() && !lane.busy_ &&
+              lane.open_seq_ == waits[i].seq_) {
+            lane.busy_ = true;
+            batch.swap(lane.pending_);
+            ++lane.open_seq_;
+            led = waits[i];
+          }
+          ++i;
+        }
+      }
+      if (batch.empty()) {
+        if (!waits.empty()) CLIO_CO_AWAIT(clio::run::yield(kInvPollUs));
+        continue;
+      }
+      auto inv = ipc->NewTask<InvalidateTask>(
+          clio::run::CreateTaskId(), pool_id_,
+          clio::run::PoolQuery::DirectId(led.home_), kInvalidateFanout,
+          container_id_, PackKeys(batch));
+      auto fut = ipc->Send(inv);
+      CLIO_CO_AWAIT(fut);
+      std::lock_guard<std::mutex> lk(inv_mtx_);
+      InvLane &lane = inv_lanes_[led.home_];
+      lane.done_seq_ = led.seq_;
+      lane.busy_ = false;
+    }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::FanoutInvalidateWrite(
+    const TagId &tag, const std::string &name) {
+  CLIO_TASK_BODY_BEGIN
+  {
+    const bool meta = view_.Ready() && !tag.IsNull();
+    if (meta) view_.NoteLocalWrite();
+    if (CLIO_IPC->GetNumHosts() > 1) {
+      std::vector<BlobKey> keys;
+      keys.push_back(BlobKey{tag.major_, tag.minor_, name});
+      if (meta) {
+        keys.push_back(BlobKey{
+            tag.major_, tag.minor_,
+            std::string(wtc::kTagMetaName, wtc::kTagMetaNameLen)});
+      }
+      CLIO_CO_AWAIT(FanoutBatched(std::move(keys)));
+    }
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -274,8 +360,7 @@ clio::run::TaskResume Runtime::PutBlob(
                        name.c_str(), name.size());
     }
     EndChainWrite(task->tag_id_, name);
-    CLIO_CO_AWAIT(FanoutInvalidate(task->tag_id_, name));
-    CLIO_CO_AWAIT(NoteTagsWritten({task->tag_id_}));
+    CLIO_CO_AWAIT(FanoutInvalidateWrite(task->tag_id_, name));
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -304,8 +389,7 @@ clio::run::TaskResume Runtime::WriteAroundRecord(
     view_.Invalidate(tag.major_, tag.minor_, name.c_str(), name.size());
   }
   EndChainWrite(tag, name);
-  CLIO_CO_AWAIT(FanoutInvalidate(tag, name));
-  CLIO_CO_AWAIT(NoteTagsWritten({tag}));
+  CLIO_CO_AWAIT(FanoutInvalidateWrite(tag, name));
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
@@ -400,8 +484,7 @@ clio::run::TaskResume Runtime::DelBlob(
     CLIO_CO_AWAIT(f);
     EndChainWrite(task->tag_id_, name);
     task->SetReturnCode(f->GetReturnCode());
-    CLIO_CO_AWAIT(FanoutInvalidate(task->tag_id_, name));
-    CLIO_CO_AWAIT(NoteTagsWritten({task->tag_id_}));
+    CLIO_CO_AWAIT(FanoutInvalidateWrite(task->tag_id_, name));
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END

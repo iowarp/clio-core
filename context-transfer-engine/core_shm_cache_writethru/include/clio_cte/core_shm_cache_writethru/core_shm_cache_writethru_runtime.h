@@ -302,6 +302,26 @@ class Runtime : public clio::cte::core::CoreInterposer {
    *  node (here: a local write counter; elsewhere: through each home). */
   clio::run::TaskResume NoteTagsWritten(const std::vector<TagId> &tags,
                                         bool count_local = true);
+  /**
+   * After a write to one blob landed in the chain: tell the blob's home and
+   * the tag's home (its cached tag metadata) at the same time, and count
+   * the write locally. Equivalent to FanoutInvalidate(tag, name) followed
+   * by NoteTagsWritten({tag}), with the two sends in flight together.
+   * @param tag the written blob's tag
+   * @param name the written blob's name
+   */
+  clio::run::TaskResume FanoutInvalidateWrite(const TagId &tag,
+                                              const std::string &name);
+  /**
+   * Send write invalidations to the keys' homes and return once every key
+   * has been delivered. Keys bound for the same home that are waiting at
+   * the same time travel in one message: a home has at most one such
+   * message in flight, and the keys that arrive meanwhile form the next.
+   * A key is always sent after this call queued it, so the caller's write
+   * is ordered before its invalidation exactly as with one message per key.
+   * @param keys the written keys (duplicates bound for one home are merged)
+   */
+  clio::run::TaskResume FanoutBatched(std::vector<BlobKey> keys);
   /** Drop every node's cached blobs and metadata of these tags. */
   clio::run::TaskResume DropTagDataEverywhere(const std::vector<TagId> &tags);
   clio::run::TaskResume FanoutInvalidate(const TagId &tag,
@@ -389,6 +409,15 @@ class Runtime : public clio::cte::core::CoreInterposer {
   std::unordered_map<std::string, int> blob_reads_;   ///< chain reads per blob
   std::unordered_map<std::string, int> blob_writes_;  ///< chain writes per blob
   std::mutex sharers_mtx_;
+  /** Write invalidations waiting for, or on their way to, one home. */
+  struct InvLane {
+    std::vector<BlobKey> pending_;  ///< keys of the batch numbered open_seq_
+    clio::run::u64 open_seq_ = 1;   ///< batch that pending_ will leave in
+    clio::run::u64 done_seq_ = 0;   ///< last batch the home acknowledged
+    bool busy_ = false;             ///< a batch is in flight
+  };
+  std::mutex inv_mtx_;  ///< guards inv_lanes_
+  std::unordered_map<clio::run::u32, InvLane> inv_lanes_;  ///< by home node
   std::map<std::string, SharerSet> sharers_;
 };
 
