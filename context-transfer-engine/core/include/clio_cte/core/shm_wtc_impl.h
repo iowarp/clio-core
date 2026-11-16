@@ -42,6 +42,8 @@
 #include <algorithm>
 #include <cmath>
 
+#include <clio_runtime/bdev/transports/mem_bdev_transport.h>
+
 namespace clio::cte::core::wtc {
 
 /** RAII stripe/tag lock. */
@@ -122,6 +124,50 @@ inline bool View::Format(const std::string &name,
   std::memset(static_cast<void *>(blobs_), 0, blob_bytes);
   std::memset(static_cast<void *>(tags_), 0, tag_bytes);
   log_ = new (Ptr(root_->log_off_)) DirtyLog(alloc_, lim.log_depth_);
+  if (!lim.extents_.empty() && !lim.md_only_) {
+    // Extent mode: index every leased granule, in lease order, and mark
+    // where one leased block ends and a non-adjacent one begins (a run may
+    // never cross that point, so a run's bytes are contiguous).
+    u64 gcount = 0;
+    for (const auto &x : lim.extents_) gcount += x.second / kGranule;
+    if (gcount == 0 || gcount > 0xFFFFFFFFull) return false;
+    const u64 words = (gcount + 63) / 64;
+    auto go = alloc_->AllocateOffset(sizeof(u64) * gcount);
+    auto fb = alloc_->AllocateOffset(sizeof(u64) * words);
+    auto bb = alloc_->AllocateOffset(sizeof(u64) * words);
+    auto rs = alloc_->AllocateOffset(sizeof(RunSet) * NumSlots());
+    if (go.IsNull() || fb.IsNull() || bb.IsNull() || rs.IsNull()) return false;
+    root_->runsets_off_ = rs.load();
+    runsets_ = reinterpret_cast<RunSet *>(Ptr(root_->runsets_off_));
+    std::memset(static_cast<void *>(runsets_), 0, sizeof(RunSet) * NumSlots());
+    root_->gran_off_off_ = go.load();
+    root_->free_bits_off_ = fb.load();
+    root_->brk_bits_off_ = bb.load();
+    gran_off_ = reinterpret_cast<u64 *>(Ptr(root_->gran_off_off_));
+    free_bits_ = reinterpret_cast<u64 *>(Ptr(root_->free_bits_off_));
+    brk_bits_ = reinterpret_cast<u64 *>(Ptr(root_->brk_bits_off_));
+    std::memset(free_bits_, 0, sizeof(u64) * words);
+    std::memset(brk_bits_, 0, sizeof(u64) * words);
+    u64 g = 0;
+    for (const auto &x : lim.extents_) {
+      for (u64 k = 0; k < x.second / kGranule; ++k, ++g) {
+        gran_off_[g] = x.first + k * kGranule;
+        free_bits_[g / 64] |= 1ull << (g % 64);
+        if (g == 0 || gran_off_[g] != gran_off_[g - 1] + kGranule) {
+          brk_bits_[g / 64] |= 1ull << (g % 64);
+        }
+      }
+    }
+    root_->granules_ = gcount;
+    root_->free_granules_.store(gcount);
+    root_->data_cursor_ = 0;
+    root_->data_lock_.Init();
+    root_->data_pid_ = lim.data_pid_;
+    root_->data_pool_major_ = lim.data_pool_major_;
+    root_->data_pool_minor_ = lim.data_pool_minor_;
+    root_->data_mode_ = 1;
+    if (!AttachData()) return false;
+  }
   root_->magic_ = Root::kMagic;
   root_->version_ = Root::kVersion;
   root_->ready_.store(1, std::memory_order_release);
@@ -151,6 +197,37 @@ inline bool View::Attach(const std::string &name, u64 root_off) {
   log_ = reinterpret_cast<DirtyLog *>(Ptr(root_->log_off_));
   owners_ = reinterpret_cast<std::atomic<u32> *>(Ptr(root_->owners_off_));
   names_ = reinterpret_cast<NameSlot *>(Ptr(root_->names_off_));
+  if (root_->data_mode_ != 0) {
+    gran_off_ = reinterpret_cast<u64 *>(Ptr(root_->gran_off_off_));
+    free_bits_ = reinterpret_cast<u64 *>(Ptr(root_->free_bits_off_));
+    brk_bits_ = reinterpret_cast<u64 *>(Ptr(root_->brk_bits_off_));
+    runsets_ = reinterpret_cast<RunSet *>(Ptr(root_->runsets_off_));
+    if (!AttachData()) {
+      Detach();  // no bytes reachable: do not use this cache at all
+      return false;
+    }
+  }
+  return true;
+}
+
+inline bool View::AttachData() {
+  if (data_mapped_) return true;
+  const clio::run::PoolId pool(root_->data_pool_major_, root_->data_pool_minor_);
+  const std::string name = clio::run::bdev::MemBdevTransport::ShmSegmentName(
+      root_->data_pid_, pool);
+  if (!data_backend_.shm_attach(name)) return false;
+  data_mapped_ = true;
+  char *raw = reinterpret_cast<char *>(data_backend_.data_);
+  auto *hdr =
+      reinterpret_cast<clio::run::bdev::MemBdevTransport::ShmRamHeader *>(raw);
+  if (raw == nullptr ||
+      hdr->version_ != clio::run::bdev::MemBdevTransport::ShmRamHeader::kVersion ||
+      hdr->ready_ != 1) {
+    data_backend_.shm_detach();
+    data_mapped_ = false;
+    return false;
+  }
+  data_base_ = raw + hdr->data_off_;
   return true;
 }
 
@@ -166,6 +243,15 @@ inline void View::Detach() {
   } else {
     backend_.shm_detach();
   }
+  if (data_mapped_) {
+    data_backend_.shm_detach();  // the RAM bdev owns it: never destroyed here
+    data_mapped_ = false;
+  }
+  data_base_ = nullptr;
+  gran_off_ = nullptr;
+  free_bits_ = nullptr;
+  brk_bits_ = nullptr;
+  runsets_ = nullptr;
   mapped_ = false;
   owner_ = false;
   alloc_ = nullptr;
@@ -244,6 +330,7 @@ inline long View::FindOrInsertLocked(u64 h, u32 major, u32 minor,
     e->hash_ = h;
     e->buf_off_ = 0;
     e->cap_ = 0;
+    if (Extents()) RS(e)->n_ = 0;
     e->size_ = 0;
     e->valid_lo_ = e->valid_hi_ = 0;
     std::memcpy(e->name_, name, len);
@@ -261,7 +348,9 @@ inline long View::FindOrInsertLocked(u64 h, u32 major, u32 minor,
 }
 
 inline void View::ReleaseBufferLocked(BlobEntry *e) {
-  if (e->flags_ & kResident) {
+  if (Extents()) {
+    FreeRuns(e);
+  } else if (e->flags_ & kResident) {
     FreeBuffer(e->buf_off_);
   }
   e->flags_ &= ~(kResident | kComplete);
@@ -459,6 +548,27 @@ inline bool View::EnsureCapacityLocked(BlobEntry *e, u64 need, u32 stripe) {
     return true;
   }
   WaitUnpinned(e);
+  if (Extents()) {
+    // Grow by appending runs: the bytes already held never move.
+    if (!(e->flags_ & kResident)) {
+      RS(e)->n_ = 0;
+      e->cap_ = 0;
+    }
+    const u64 have = e->cap_;
+    u64 want = need - have;
+    if (have != 0 && want < have / 2) want = have / 2;  // amortize appends
+    const u64 add = (want + kGranule - 1) / kGranule;
+    e->pins_.fetch_add(1, std::memory_order_acq_rel);
+    const bool ok = AllocRunsEvicting(e, add, stripe);
+    e->pins_.fetch_sub(1, std::memory_order_acq_rel);
+    if (!ok) {
+      return false;
+    }
+    // Holes read as zeros, exactly what the chain returns for unwritten bytes.
+    ZeroRange(e, have, e->cap_);
+    e->flags_ |= kResident;
+    return true;
+  }
   u64 cap = RoundBuffer(need < kMinBuffer ? kMinBuffer : need);
   if (e->flags_ & kResident) {
     u64 grown = RoundBuffer(e->cap_ + e->cap_ / 2);
@@ -485,6 +595,177 @@ inline bool View::EnsureCapacityLocked(BlobEntry *e, u64 need, u32 stripe) {
   return true;
 }
 
+inline u64 View::NextFreeLocked(u64 from) const {
+  const u64 n = root_->granules_;
+  u64 step = 0;
+  while (step < n) {
+    const u64 g = (from + step) % n;
+    const u64 bits = free_bits_[g / 64] >> (g % 64);
+    if (bits == 0) {
+      step += 64 - g % 64;  // rest of this word is used
+      continue;
+    }
+    const u64 hit = g + static_cast<u64>(__builtin_ctzll(bits));
+    if (hit < n) return hit;
+    step += n - g;  // past the end: wrap to granule 0
+  }
+  return n;
+}
+
+inline bool View::AllocRunsLocked(BlobEntry *e, u64 add) {
+  const u64 n = root_->granules_;
+  auto is_free = [this](u64 g) {
+    return (free_bits_[g / 64] >> (g % 64)) & 1ull;
+  };
+  auto is_brk = [this](u64 g) { return (brk_bits_[g / 64] >> (g % 64)) & 1ull; };
+  auto mark = [this](u64 g, u64 len, bool free) {
+    for (u64 k = 0; k < len; ++k) {
+      const u64 x = g + k;
+      if (free) {
+        free_bits_[x / 64] |= 1ull << (x % 64);
+      } else {
+        free_bits_[x / 64] &= ~(1ull << (x % 64));
+      }
+    }
+  };
+  if (add == 0) return true;
+  if (add > root_->free_granules_.load()) return false;
+  // Saved so a failed call leaves the entry exactly as it was.
+  const u32 runs0 = RS(e)->n_;
+  const Run tail0 = runs0 > 0 ? RS(e)->r_[runs0 - 1] : Run{0, 0};
+  std::pair<u64, u64> taken[kInlineRuns + 1];
+  u32 ntaken = 0;
+  u64 need = add;
+  u64 cursor = root_->data_cursor_;
+  u64 scanned = 0;
+  while (need > 0 && scanned < n && ntaken <= kInlineRuns) {
+    const u64 g = NextFreeLocked(cursor);
+    if (g >= n) break;
+    scanned += (g >= cursor ? g - cursor : n - cursor + g) + 1;
+    u64 len = 1;
+    while (len < need && g + len < n && is_free(g + len) && !is_brk(g + len)) {
+      ++len;
+    }
+    // Extend the last run when this span continues it in the bdev.
+    Run *tail = RS(e)->n_ > 0 ? &RS(e)->r_[RS(e)->n_ - 1] : nullptr;
+    if (tail != nullptr && tail->g_ + tail->n_ == g && !is_brk(g)) {
+      tail->n_ += static_cast<u32>(len);
+    } else if (RS(e)->n_ < kInlineRuns) {
+      RS(e)->r_[RS(e)->n_++] = Run{static_cast<u32>(g), static_cast<u32>(len)};
+    } else {
+      break;  // out of run slots
+    }
+    mark(g, len, false);
+    taken[ntaken++] = {g, len};
+    need -= len;
+    cursor = (g + len) % n;
+  }
+  if (need > 0) {
+    for (u32 i = 0; i < ntaken; ++i) mark(taken[i].first, taken[i].second, true);
+    RS(e)->n_ = runs0;
+    if (runs0 > 0) RS(e)->r_[runs0 - 1] = tail0;
+    return false;
+  }
+  root_->data_cursor_ = cursor;
+  root_->free_granules_.fetch_sub(add);
+  e->cap_ += add * kGranule;
+  return true;
+}
+
+inline bool View::AllocRunsEvicting(BlobEntry *e, u64 add, u32 stripe) {
+  // One victim per round; small victims free few granules, so allow enough
+  // rounds to free a large blob's worth (bounded: then the put writes around).
+  constexpr u32 kExtentEvictRounds = 4096;
+  for (u32 round = 0; round < kExtentEvictRounds; ++round) {
+    {
+      Guard g(root_->data_lock_);
+      if (AllocRunsLocked(e, add)) return true;
+    }
+    // No room (or too fragmented for the run slots): evict and retry. The
+    // entry itself is pinned, so it is never its own victim.
+    long v = PickVictim(add * kGranule);
+    if (v < 0) return false;
+    EvictSlot(stripe, static_cast<u32>(v), kAnyGranule);
+  }
+  return false;
+}
+
+inline void View::FreeRuns(BlobEntry *e) {
+  if (RS(e)->n_ != 0) {
+    Guard g(root_->data_lock_);
+    u64 freed = 0;
+    for (u32 r = 0; r < RS(e)->n_; ++r) {
+      for (u64 k = 0; k < RS(e)->r_[r].n_; ++k) {
+        const u64 gr = RS(e)->r_[r].g_ + k;
+        free_bits_[gr / 64] |= 1ull << (gr % 64);
+      }
+      freed += RS(e)->r_[r].n_;
+    }
+    root_->free_granules_.fetch_add(freed);
+  }
+  RS(e)->n_ = 0;
+  e->cap_ = 0;
+}
+
+inline void View::CopyIn(BlobEntry *e, u64 off, const char *src, u64 n) {
+  if (!Extents()) {
+    std::memcpy(Ptr(e->buf_off_) + off, src, n);
+    return;
+  }
+  u64 pos = 0;
+  for (u32 r = 0; r < RS(e)->n_ && n > 0; ++r) {
+    const u64 rb = static_cast<u64>(RS(e)->r_[r].n_) * kGranule;
+    if (off < pos + rb) {
+      const u64 intra = off - pos;
+      const u64 chunk = std::min(rb - intra, n);
+      std::memcpy(GranPtr(RS(e)->r_[r].g_) + intra, src, chunk);
+      src += chunk;
+      off += chunk;
+      n -= chunk;
+    }
+    pos += rb;
+  }
+}
+
+inline void View::CopyOut(const BlobEntry *e, u64 off, char *dst, u64 n) const {
+  if (!Extents()) {
+    std::memcpy(dst, base_ + e->buf_off_ + off, n);
+    return;
+  }
+  u64 pos = 0;
+  for (u32 r = 0; r < RS(e)->n_ && n > 0; ++r) {
+    const u64 rb = static_cast<u64>(RS(e)->r_[r].n_) * kGranule;
+    if (off < pos + rb) {
+      const u64 intra = off - pos;
+      const u64 chunk = std::min(rb - intra, n);
+      std::memcpy(dst, GranPtr(RS(e)->r_[r].g_) + intra, chunk);
+      dst += chunk;
+      off += chunk;
+      n -= chunk;
+    }
+    pos += rb;
+  }
+}
+
+inline void View::ZeroRange(BlobEntry *e, u64 from, u64 to) {
+  if (to <= from) return;
+  if (!Extents()) {
+    std::memset(Ptr(e->buf_off_) + from, 0, to - from);
+    return;
+  }
+  u64 pos = 0;
+  for (u32 r = 0; r < RS(e)->n_ && from < to; ++r) {
+    const u64 rb = static_cast<u64>(RS(e)->r_[r].n_) * kGranule;
+    if (from < pos + rb) {
+      const u64 intra = from - pos;
+      const u64 chunk = std::min(rb - intra, to - from);
+      std::memset(GranPtr(RS(e)->r_[r].g_) + intra, 0, chunk);
+      from += chunk;
+    }
+    pos += rb;
+  }
+}
+
 inline Status View::TryPut(u32 tag_major, u32 tag_minor, const char *name,
                            size_t name_len, u64 off, u64 size,
                            const char *src, u32 put_flags, bool may_block) {
@@ -504,7 +785,7 @@ inline Status View::TryPut(u32 tag_major, u32 tag_minor, const char *name,
   u64 h = KeyHash(tag_major, tag_minor, name, name_len);
   u32 stripe = StripeOf(h);
   u32 slot = 0;
-  char *dst = nullptr;
+  BlobEntry *dst_e = nullptr;
   u64 gen = 0;
   {
     Guard g(root_->stripes_[stripe]);
@@ -555,9 +836,9 @@ inline Status View::TryPut(u32 tag_major, u32 tag_minor, const char *name,
     e->wbegin_.fetch_add(1, std::memory_order_acq_rel);
     e->hits_.fetch_add(1, std::memory_order_relaxed);
     e->last_access_ns_.store(NowNs(), std::memory_order_relaxed);
-    dst = Ptr(e->buf_off_) + off;
+    dst_e = e;
   }
-  std::memcpy(dst, src, size);
+  CopyIn(dst_e, off, src, size);
   Slot(slot)->wend_.fetch_add(1, std::memory_order_release);
   // Unpin BEFORE the (possibly blocking) push: a full log waits on the
   // flusher, which must be free to take this stripe and read the entry.
@@ -587,7 +868,7 @@ inline Status View::TryGet(u32 tag_major, u32 tag_minor, const char *name,
   u32 stripe = StripeOf(h);
   std::atomic<u64> *why = &root_->stats_.miss_busy_;
   for (u32 attempt = 0; attempt < kTornRetries; ++attempt) {
-    const char *src = nullptr;
+    const BlobEntry *src = nullptr;
     BlobEntry *e = nullptr;
     u64 seq = 0;
     bool busy = false;
@@ -609,7 +890,7 @@ inline Status View::TryGet(u32 tag_major, u32 tag_minor, const char *name,
             e->pins_.fetch_add(1, std::memory_order_acq_rel);
             e->hits_.fetch_add(1, std::memory_order_relaxed);
             e->last_access_ns_.store(NowNs(), std::memory_order_relaxed);
-            src = Ptr(e->buf_off_) + off;
+            src = e;
           }
         }
       }
@@ -622,7 +903,7 @@ inline Status View::TryGet(u32 tag_major, u32 tag_minor, const char *name,
     if (src == nullptr) {
       break;
     }
-    std::memcpy(dst, src, size);
+    CopyOut(src, off, dst, size);
     std::atomic_thread_fence(std::memory_order_acquire);
     const bool torn = e->wbegin_.load(std::memory_order_relaxed) != seq;
     e->pins_.fetch_sub(1, std::memory_order_acq_rel);
@@ -950,8 +1231,8 @@ inline bool View::Fill(u32 tag_major, u32 tag_minor, const char *name,
   if (!EnsureCapacityLocked(e, size == 0 ? 1 : size, stripe)) {
     return false;
   }
-  std::memcpy(Ptr(e->buf_off_), data, size);
-  std::memset(Ptr(e->buf_off_) + size, 0, e->cap_ - size);
+  CopyIn(e, 0, data, size);
+  ZeroRange(e, size, e->cap_);
   e->size_ = size;
   e->flags_ |= kComplete;
   e->valid_lo_ = 0;
@@ -1069,7 +1350,6 @@ inline bool View::ReadRange(u32 slot, u64 off, u64 *size, char *dst,
   }
   u32 stripe = slot / root_->slots_per_stripe_;
   BlobEntry *e = Slot(slot);
-  const char *src = nullptr;
   {
     Guard g(root_->stripes_[stripe]);
     if (e->state_ != kSlotLive || !(e->flags_ & kResident)) {
@@ -1092,10 +1372,9 @@ inline bool View::ReadRange(u32 slot, u64 off, u64 *size, char *dst,
       *copied_gen = quiet ? e->write_gen_.load(std::memory_order_acquire) : 0;
     }
     e->pins_.fetch_add(1, std::memory_order_acq_rel);
-    src = Ptr(e->buf_off_) + off;
   }
   if (*size > 0) {
-    std::memcpy(dst, src, *size);
+    CopyOut(e, off, dst, *size);
   }
   e->pins_.fetch_sub(1, std::memory_order_acq_rel);
   return true;

@@ -121,12 +121,18 @@ compose:
   }
 };
 
-/** Create a cache pool over the core. */
+/** Create a cache pool over the core (data_capacity > 0: extent mode, its
+ *  bytes in granules leased from the core's RAM bdev on this node). */
 static void CreateCache(const clio::run::PoolId &id, const std::string &name,
-                        clio::run::u64 capacity, bool md_only = false) {
+                        clio::run::u64 capacity, bool md_only = false,
+                        clio::run::u64 data_capacity = 0) {
   clio::cte::shm_wtc::Client admin;
   clio::cte::shm_wtc::WtcConfig params;
   params.md_only_ = md_only;
+  if (data_capacity > 0) {
+    params.data_pool_ = clio::run::PoolId(512, 0);  // this node's RAM tier
+    params.data_capacity_ = data_capacity;
+  }
   params.next_pool_id_ = clio::cte::core::kCtePoolId;
   params.capacity_ = capacity;
   params.max_blobs_ = 4096;
@@ -649,6 +655,100 @@ TEST_CASE("ShmWtc - large puts displace a cache full of small buffers",
     REQUIRE(back == vals[i]);
     REQUIRE(CoreRead(tag, "L" + std::to_string(i), 0, back.size()) ==
             vals[i]);
+  }
+}
+
+TEST_CASE("ShmWtc - extent mode keeps bytes in leased RAM-bdev granules",
+          "[cte][shm_wtc][extents]") {
+  WtcFixture fx;
+  const clio::run::PoolId kExtPool(575, 0);
+  // 8 MiB of metadata segment, 16 MiB of leased RAM-bdev extents.
+  CreateCache(kExtPool, "shm_wtc_extents", 8ull << 20, false, 16ull << 20);
+  clio::cte::core::Client io(kExtPool);
+  REQUIRE(io.HasWtc());
+  const wtc::Stats *st = io.WtcStats();
+  REQUIRE(st != nullptr);
+
+  SECTION("sizes that are not powers of two round trip and flush") {
+    TagId tag = MakeTag(io, "ext_sizes");
+    const std::vector<size_t> sizes = {1, 4096, 4097, 100 * 1024,
+                                       (1u << 20) + 1};
+    for (size_t i = 0; i < sizes.size(); ++i) {
+      const std::string name = "s" + std::to_string(i);
+      const std::string v = Payload(sizes[i], static_cast<char>('a' + i));
+      auto put = io.AsyncPutBlob(tag, name, 0, v.size(), v.data());
+      put.Wait();
+      REQUIRE(put->GetReturnCode() == 0);
+      std::string back(v.size(), '\0');
+      const clio::run::u64 hits0 = st->get_hits_.load();
+      auto get = io.AsyncGetBlob(tag, name, 0, back.size(), 0, back.data());
+      get.Wait();
+      REQUIRE(get->GetReturnCode() == 0);
+      REQUIRE(back == v);
+      REQUIRE(st->get_hits_.load() == hits0 + 1);  // served from the bdev
+    }
+    REQUIRE(WaitFlushed(io));
+    for (size_t i = 0; i < sizes.size(); ++i) {
+      const std::string v = Payload(sizes[i], static_cast<char>('a' + i));
+      REQUIRE(CoreRead(tag, "s" + std::to_string(i), 0, v.size()) == v);
+    }
+  }
+
+  SECTION("a blob grows by appending runs; its bytes never move") {
+    TagId tag = MakeTag(io, "ext_grow");
+    std::string want;
+    for (int k = 0; k < 6; ++k) {  // 6 appends of 300 KiB at the tail
+      const std::string piece = Payload(300 * 1024, static_cast<char>('A' + k));
+      auto put = io.AsyncPutBlob(tag, "g", want.size(), piece.size(),
+                                 piece.data());
+      put.Wait();
+      REQUIRE(put->GetReturnCode() == 0);
+      want += piece;
+    }
+    std::string back(want.size(), '\0');
+    io.AsyncGetBlob(tag, "g", 0, back.size(), 0, back.data()).Wait();
+    REQUIRE(back == want);
+    REQUIRE(WaitFlushed(io));
+    REQUIRE(CoreRead(tag, "g", 0, want.size()) == want);
+  }
+
+  SECTION("a working set larger than the lease evicts and stays correct") {
+    TagId tag = MakeTag(io, "ext_evict");
+    const int kBlobs = 40;  // 40 MiB through a 16 MiB lease
+    for (int k = 0; k < kBlobs; ++k) {
+      const std::string v = Payload(1u << 20, static_cast<char>(k));
+      auto put = io.AsyncPutBlob(tag, "e" + std::to_string(k), 0, v.size(),
+                                 v.data());
+      put.Wait();
+      REQUIRE(put->GetReturnCode() == 0);
+    }
+    REQUIRE(WaitFlushed(io));
+    for (int k = 0; k < kBlobs; ++k) {
+      const std::string v = Payload(1u << 20, static_cast<char>(k));
+      std::string back(v.size(), '\0');
+      auto get = io.AsyncGetBlob(tag, "e" + std::to_string(k), 0, back.size(),
+                                 0, back.data());
+      get.Wait();
+      REQUIRE(get->GetReturnCode() == 0);
+      REQUIRE(back == v);
+    }
+    REQUIRE(st->evictions_.load() > 0);
+  }
+
+  SECTION("a partial write into a blob that exists below") {
+    clio::cte::core::Client core(clio::cte::core::kCtePoolId);
+    TagId tag = MakeTag(core, "ext_partial");
+    const std::string base(128 * 1024, 'x');
+    core.AsyncPutBlob(tag, "p", 0, base.size(), base.data()).Wait();
+    const std::string a(5000, 'A');
+    io.AsyncPutBlob(tag, "p", 70000, a.size(), a.data()).Wait();
+    std::string want = base;
+    std::memcpy(&want[70000], a.data(), a.size());
+    std::string back(want.size(), '\0');
+    io.AsyncGetBlob(tag, "p", 0, back.size(), 0, back.data()).Wait();
+    REQUIRE(back == want);
+    REQUIRE(WaitFlushed(io));
+    REQUIRE(CoreRead(tag, "p", 0, want.size()) == want);
   }
 }
 

@@ -66,6 +66,8 @@
 #include <cstring>
 #include <string>
 #include <thread>
+#include <utility>
+#include <vector>
 
 #include <clio_ctp/data_structures/ipc/ring_buffer.h>
 #include <clio_ctp/memory/backend/posix_shm_mmap.h>
@@ -113,6 +115,30 @@ static constexpr u64 kWindowBytes = 8ull << 20;
 static constexpr u64 kLogHeadroom = 1024;
 /** Smallest buffer allocated for a blob. */
 static constexpr u64 kMinBuffer = 4096;
+/** Extent mode: bytes per granule of a leased RAM-bdev extent. */
+static constexpr u64 kGranule = 4096;
+/** Extent mode: runs of granules one entry can hold (no overflow list). */
+static constexpr u32 kInlineRuns = 8;
+
+/**
+ * Extent mode: a run of consecutive granules, contiguous in the RAM bdev
+ * (a run never crosses the boundary between two leased blocks).
+ */
+struct Run {
+  u32 g_;  /**< first granule */
+  u32 n_;  /**< granules */
+};
+
+/**
+ * Extent mode: an entry's buffer as runs of RAM-bdev granules (cap_ = their
+ * bytes; buf_off_ unused). One per blob slot, in a side table allocated only
+ * in extent mode, so the default layout is unchanged. Entry's stripe lock.
+ */
+struct RunSet {
+  u32 n_;
+  u32 pad_;
+  Run r_[kInlineRuns];
+};
 
 /** Slot states. */
 enum SlotState : u32 { kSlotEmpty = 0, kSlotLive = 1, kSlotTomb = 2 };
@@ -269,7 +295,7 @@ struct Stats {
 /** Segment root: the first allocation in the segment. */
 struct Root {
   static constexpr u64 kMagic = 0x3143544357534C43ull;  // "CLSWCTC1"
-  static constexpr u32 kVersion = 6;
+  static constexpr u32 kVersion = 7;
 
   u64 magic_;
   u32 version_;
@@ -301,6 +327,20 @@ struct Root {
   std::atomic<u64> local_write_seq_;
   std::atomic<u32> global_rc_;     /**< sticky rc for tags not in TagTable */
   u32 md_only_;                    /**< metadata only: no blob bytes */
+  /** Extent mode (data_mode_ 1): blob bytes live in granules of extents
+   *  leased from a node-local RAM bdev, not in this segment. */
+  u32 data_mode_;
+  u32 data_pid_;                   /**< runtime pid owning the RAM bdev */
+  u32 data_pool_major_;            /**< the RAM bdev's pool */
+  u32 data_pool_minor_;
+  u64 granules_;                   /**< granules leased */
+  u64 gran_off_off_;               /**< u64[granules_]: bdev offset of each */
+  u64 runsets_off_;                /**< RunSet[slots]: each entry's runs */
+  u64 free_bits_off_;              /**< u64 words: bit set = granule free */
+  u64 brk_bits_off_;               /**< bit set = granule starts a new block */
+  u64 data_cursor_;                /**< next-fit start (data_lock_) */
+  std::atomic<u64> free_granules_;
+  ctp::Mutex data_lock_;           /**< guards the bitmaps and cursor */
   Stats stats_;
   ctp::Mutex tag_lock_;
   ctp::Mutex stripes_[kStripes];
@@ -361,6 +401,12 @@ struct Limits {
   u64 max_fill_ = 16ull << 20;
   u64 half_life_ns_ = 10ull * 1000 * 1000 * 1000;
   bool md_only_ = false;  ///< cache metadata only (see WtcConfig::md_only_)
+  /** Extent mode: (bdev offset, bytes) of each extent leased from the RAM
+   *  bdev below; empty = bytes live in this segment (buddy allocator). */
+  std::vector<std::pair<u64, u64>> extents_;
+  u32 data_pid_ = 0;
+  u32 data_pool_major_ = 0;
+  u32 data_pool_minor_ = 0;
 };
 
 /**
@@ -650,6 +696,38 @@ class View {
   void UnindexNameLocked(TagEntry *t);
   /** Wait until an entry has no pins (lock held; unpins need no lock). */
   static void WaitUnpinned(BlobEntry *e);
+
+  // ---- extent mode (blob bytes in leased RAM-bdev granules) ----
+  /** True when blob bytes live in leased RAM-bdev extents. */
+  bool Extents() const { return root_ != nullptr && root_->data_mode_ != 0; }
+  /** Map the extent tables and the RAM bdev's memory (both sides). */
+  bool AttachData();
+  /** Address of a granule's first byte in the RAM bdev. */
+  char *GranPtr(u32 g) const { return data_base_ + gran_off_[g]; }
+  /** Grow an entry by `add` granules (data_lock_ held); all or nothing. */
+  bool AllocRunsLocked(BlobEntry *e, u64 add);
+  /** Grow an entry by `add` granules, evicting victims until it fits. */
+  bool AllocRunsEvicting(BlobEntry *e, u64 add, u32 stripe);
+  /** First free granule at or after `from` (wrapping), or granules_. */
+  u64 NextFreeLocked(u64 from) const;
+  /** Give an entry's runs back (entry's stripe lock held). */
+  void FreeRuns(BlobEntry *e);
+  /** Copy bytes into / out of an entry's buffer at a byte offset (the
+   *  entry is pinned or its stripe lock held, so its runs cannot change). */
+  void CopyIn(BlobEntry *e, u64 off, const char *src, u64 n);
+  void CopyOut(const BlobEntry *e, u64 off, char *dst, u64 n) const;
+  /** Zero [from, to) of an entry's buffer. */
+  void ZeroRange(BlobEntry *e, u64 from, u64 to);
+
+  ctp::ipc::PosixShmMmap data_backend_;  /**< the RAM bdev's segment */
+  bool data_mapped_ = false;
+  char *data_base_ = nullptr;   /**< byte 0 of the RAM bdev's device space */
+  u64 *gran_off_ = nullptr;
+  u64 *free_bits_ = nullptr;
+  u64 *brk_bits_ = nullptr;
+  RunSet *runsets_ = nullptr;
+  /** An entry's runs (extent mode only). */
+  RunSet *RS(const BlobEntry *e) const { return &runsets_[e - blobs_]; }
 
   ctp::ipc::PosixShmMmap backend_;
   bool owner_ = false;
