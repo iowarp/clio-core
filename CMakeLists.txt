@@ -2430,6 +2430,11 @@ endif()
 if(TARGET clio_cte_core_persist_write_thru_client)
   list(APPEND PIP_LIB_TARGETS clio_cte_core_persist_write_thru_client clio_cte_core_persist_write_thru_runtime)
 endif()
+# The shm cache: the default config composes it (568.0, metadata only) under
+# the indexer, so a wheel without it fails to create that pool.
+if(TARGET clio_cte_core_shm_cache_writethru_client)
+  list(APPEND PIP_LIB_TARGETS clio_cte_core_shm_cache_writethru_client clio_cte_core_shm_cache_writethru_runtime)
+endif()
 # Indexer chimod (#905): the default config composes it into the filesystem
 # chain (cache -> indexer -> replication), so without it the wheel's
 # `clio_run start` fails to create pool 564.0 and the runtime exits (#1240).
