@@ -295,7 +295,7 @@ struct Stats {
 /** Segment root: the first allocation in the segment. */
 struct Root {
   static constexpr u64 kMagic = 0x3143544357534C43ull;  // "CLSWCTC1"
-  static constexpr u32 kVersion = 7;
+  static constexpr u32 kVersion = 8;
 
   u64 magic_;
   u32 version_;
@@ -336,6 +336,8 @@ struct Root {
   u64 granules_;                   /**< granules leased */
   u64 gran_off_off_;               /**< u64[granules_]: bdev offset of each */
   u64 runsets_off_;                /**< RunSet[slots]: each entry's runs */
+  u64 gran_owner_off_;             /**< atomic u32[granules_]: slot + 1 */
+  std::atomic<u64> evict_gcursor_; /**< next window to evict (granules) */
   u64 free_bits_off_;              /**< u64 words: bit set = granule free */
   u64 brk_bits_off_;               /**< bit set = granule starts a new block */
   u64 data_cursor_;                /**< next-fit start (data_lock_) */
@@ -710,6 +712,10 @@ class View {
   bool AllocRunsEvicting(BlobEntry *e, u64 add, u32 stripe);
   /** First free granule at or after `from` (wrapping), or granules_. */
   u64 NextFreeLocked(u64 from) const;
+  /** Evict the clean owners of one contiguous window of `span` granules,
+   *  then point the next-fit cursor at it (one victim at a time cannot
+   *  fix fragmentation: small victims free scattered granules). */
+  void EvictGranWindow(u32 held_stripe, u64 span);
   /** Give an entry's runs back (entry's stripe lock held). */
   void FreeRuns(BlobEntry *e);
   /** Copy bytes into / out of an entry's buffer at a byte offset (the
@@ -726,6 +732,7 @@ class View {
   u64 *free_bits_ = nullptr;
   u64 *brk_bits_ = nullptr;
   RunSet *runsets_ = nullptr;
+  std::atomic<u32> *gran_owner_ = nullptr;
   /** An entry's runs (extent mode only). */
   RunSet *RS(const BlobEntry *e) const { return &runsets_[e - blobs_]; }
 

@@ -735,6 +735,39 @@ TEST_CASE("ShmWtc - extent mode keeps bytes in leased RAM-bdev granules",
     REQUIRE(st->evictions_.load() > 0);
   }
 
+  SECTION("large puts into a lease fragmented by small blobs stay cached") {
+    TagId tag = MakeTag(io, "ext_frag");
+    // Fill the whole lease with clean single-granule blobs: evicting any
+    // one frees one scattered granule, never a run a 1 MiB blob can use.
+    const std::string small = Payload(4096, 's');
+    for (int i = 0; i < 4200; ++i) {
+      auto p = io.AsyncPutBlob(tag, "s" + std::to_string(i), 0, small.size(),
+                               small.data());
+      p.Wait();
+      REQUIRE(p->GetReturnCode() == 0);
+    }
+    REQUIRE(WaitFlushed(io));
+    const clio::run::u64 puts0 = st->puts_.load();
+    auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < 4; ++i) {
+      const std::string v = Payload(1 << 20, static_cast<char>('a' + i));
+      auto p = io.AsyncPutBlob(tag, "L" + std::to_string(i), 0, v.size(),
+                               v.data());
+      p.Wait();
+      REQUIRE(p->GetReturnCode() == 0);
+    }
+    const double ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - t0).count();
+    INFO("large puts took " << ms << " ms");
+    REQUIRE(st->puts_.load() - puts0 == 4);  // cached, not written around
+    REQUIRE(ms < 2000.0);
+    REQUIRE(WaitFlushed(io));
+    for (int i = 0; i < 4; ++i) {
+      const std::string v = Payload(1 << 20, static_cast<char>('a' + i));
+      REQUIRE(CoreRead(tag, "L" + std::to_string(i), 0, v.size()) == v);
+    }
+  }
+
   SECTION("a partial write into a blob that exists below") {
     clio::cte::core::Client core(clio::cte::core::kCtePoolId);
     TagId tag = MakeTag(core, "ext_partial");

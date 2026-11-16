@@ -136,7 +136,15 @@ inline bool View::Format(const std::string &name,
     auto fb = alloc_->AllocateOffset(sizeof(u64) * words);
     auto bb = alloc_->AllocateOffset(sizeof(u64) * words);
     auto rs = alloc_->AllocateOffset(sizeof(RunSet) * NumSlots());
-    if (go.IsNull() || fb.IsNull() || bb.IsNull() || rs.IsNull()) return false;
+    auto ow = alloc_->AllocateOffset(sizeof(std::atomic<u32>) * gcount);
+    if (go.IsNull() || fb.IsNull() || bb.IsNull() || rs.IsNull() ||
+        ow.IsNull()) {
+      return false;
+    }
+    root_->gran_owner_off_ = ow.load();
+    gran_owner_ = reinterpret_cast<std::atomic<u32> *>(Ptr(root_->gran_owner_off_));
+    std::memset(static_cast<void *>(gran_owner_), 0,
+                sizeof(std::atomic<u32>) * gcount);
     root_->runsets_off_ = rs.load();
     runsets_ = reinterpret_cast<RunSet *>(Ptr(root_->runsets_off_));
     std::memset(static_cast<void *>(runsets_), 0, sizeof(RunSet) * NumSlots());
@@ -202,6 +210,8 @@ inline bool View::Attach(const std::string &name, u64 root_off) {
     free_bits_ = reinterpret_cast<u64 *>(Ptr(root_->free_bits_off_));
     brk_bits_ = reinterpret_cast<u64 *>(Ptr(root_->brk_bits_off_));
     runsets_ = reinterpret_cast<RunSet *>(Ptr(root_->runsets_off_));
+    gran_owner_ =
+        reinterpret_cast<std::atomic<u32> *>(Ptr(root_->gran_owner_off_));
     if (!AttachData()) {
       Detach();  // no bytes reachable: do not use this cache at all
       return false;
@@ -252,6 +262,7 @@ inline void View::Detach() {
   free_bits_ = nullptr;
   brk_bits_ = nullptr;
   runsets_ = nullptr;
+  gran_owner_ = nullptr;
   mapped_ = false;
   owner_ = false;
   alloc_ = nullptr;
@@ -618,13 +629,16 @@ inline bool View::AllocRunsLocked(BlobEntry *e, u64 add) {
     return (free_bits_[g / 64] >> (g % 64)) & 1ull;
   };
   auto is_brk = [this](u64 g) { return (brk_bits_[g / 64] >> (g % 64)) & 1ull; };
-  auto mark = [this](u64 g, u64 len, bool free) {
+  const u32 owner = static_cast<u32>(e - blobs_) + 1;
+  auto mark = [this, owner](u64 g, u64 len, bool free) {
     for (u64 k = 0; k < len; ++k) {
       const u64 x = g + k;
       if (free) {
         free_bits_[x / 64] |= 1ull << (x % 64);
+        gran_owner_[x].store(0, std::memory_order_relaxed);
       } else {
         free_bits_[x / 64] &= ~(1ull << (x % 64));
+        gran_owner_[x].store(owner, std::memory_order_relaxed);
       }
     }
   };
@@ -673,21 +687,41 @@ inline bool View::AllocRunsLocked(BlobEntry *e, u64 add) {
 }
 
 inline bool View::AllocRunsEvicting(BlobEntry *e, u64 add, u32 stripe) {
-  // One victim per round; small victims free few granules, so allow enough
-  // rounds to free a large blob's worth (bounded: then the put writes around).
-  constexpr u32 kExtentEvictRounds = 4096;
-  for (u32 round = 0; round < kExtentEvictRounds; ++round) {
+  const u64 want = add * kGranule;
+  for (u32 round = 0; round < 4 * kAllocRounds; ++round) {
     {
       Guard g(root_->data_lock_);
       if (AllocRunsLocked(e, add)) return true;
     }
-    // No room (or too fragmented for the run slots): evict and retry. The
-    // entry itself is pinned, so it is never its own victim.
-    long v = PickVictim(add * kGranule);
-    if (v < 0) return false;
-    EvictSlot(stripe, static_cast<u32>(v), kAnyGranule);
+    // The entry itself is pinned, so it is never its own victim.
+    long v = PickVictim(want);
+    if (v < 0) return false;  // nothing clean: the put writes around
+    if (Slot(static_cast<u32>(v))->cap_ >= want) {
+      // Its runs alone hold the request (at most kInlineRuns of them).
+      EvictSlot(stripe, static_cast<u32>(v), kAnyGranule);
+      continue;
+    }
+    EvictGranWindow(stripe, add);
   }
   return false;
+}
+
+inline void View::EvictGranWindow(u32 held_stripe, u64 span) {
+  const u64 n = root_->granules_;
+  if (span > n) span = n;
+  u64 start = root_->evict_gcursor_.fetch_add(span) % n;
+  if (start + span > n) start = n - span;
+  u32 last = 0;  // owners are slot + 1; 0 = free
+  for (u64 k = 0; k < span; ++k) {
+    const u64 g = start + k;
+    if (k > 0 && ((brk_bits_[g / 64] >> (g % 64)) & 1ull)) break;  // new block
+    const u32 o = gran_owner_[g].load(std::memory_order_relaxed);
+    if (o == 0 || o == last) continue;
+    last = o;
+    EvictSlot(held_stripe, o - 1, kAnyGranule);  // re-verified under its lock
+  }
+  Guard g(root_->data_lock_);
+  root_->data_cursor_ = start;  // next fit starts at the freed window
 }
 
 inline void View::FreeRuns(BlobEntry *e) {
@@ -698,6 +732,7 @@ inline void View::FreeRuns(BlobEntry *e) {
       for (u64 k = 0; k < RS(e)->r_[r].n_; ++k) {
         const u64 gr = RS(e)->r_[r].g_ + k;
         free_bits_[gr / 64] |= 1ull << (gr % 64);
+        gran_owner_[gr].store(0, std::memory_order_relaxed);
       }
       freed += RS(e)->r_[r].n_;
     }
