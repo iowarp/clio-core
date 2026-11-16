@@ -259,15 +259,16 @@ TagId Tag(const std::string &name) {
 }
 }  // namespace
 
-TEST_CASE("TagXattr - a parent with a section outlives its last child",
+TEST_CASE("TagXattr - deleting one tag leaves another's section",
           "[cte][tag_xattr]") {
   Fixture();
-  // "/xkeep/child" materializes "/xkeep"; a section on it makes it state, not
-  // a path placeholder, so deleting the child must not prune it (its delete
-  // record would erase the section at the next restart).
+  // Names are flat: "/xkeep/child" is its own tag, unrelated to "/xkeep".
+  // Deleting it removes its own section and nothing else.
   const TagId kept = Tag("/xkeep");
   const TagId child = Tag("/xkeep/child");
+  REQUIRE_FALSE(kept == child);
   REQUIRE(Set(kept, "~i", "record") == 0);
+  REQUIRE(Set(child, "~i", "gone") == 0);
   auto d = CLIO_CTE_CLIENT->AsyncDelTag(child);
   d.Wait();
   REQUIRE(d->GetReturnCode() == 0);
@@ -275,14 +276,7 @@ TEST_CASE("TagXattr - a parent with a section outlives its last child",
   std::string v;
   REQUIRE(Get(kept, "~i", &v));
   REQUIRE(v == "record");
-
-  // Without state the placeholder still goes with its last child.
-  const TagId plain = Tag("/xplain");
-  const TagId pchild = Tag("/xplain/child");
-  auto d2 = CLIO_CTE_CLIENT->AsyncDelTag(pchild);
-  d2.Wait();
-  REQUIRE(d2->GetReturnCode() == 0);
-  REQUIRE_FALSE(Tag("/xplain") == plain);
+  REQUIRE_FALSE(Get(child, "~i", &v));
 }
 
 SIMPLE_TEST_MAIN()

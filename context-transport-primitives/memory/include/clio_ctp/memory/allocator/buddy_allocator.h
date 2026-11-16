@@ -302,6 +302,29 @@ class _BuddyAllocator : public Allocator {
    * Allocate memory of specified size
    */
   CTP_CROSS_FUN OffsetPtr<> AllocateOffset(size_t requested_size) {
+    return AllocateOffsetImpl(requested_size, true);
+  }
+
+  /**
+   * Allocate without the merge-and-retry fallback. CoalesceFreePages sorts
+   * every free page under the allocator lock; a caller that retries many
+   * times (e.g. evicting between attempts) uses this for the cheap attempts
+   * and AllocateOffset only once its retries have freed something to merge.
+   * @param requested_size bytes requested
+   * @return the allocation, or null if no free page fits as-is
+   */
+  CTP_CROSS_FUN OffsetPtr<> AllocateOffsetNoCoalesce(size_t requested_size) {
+    return AllocateOffsetImpl(requested_size, false);
+  }
+
+  /**
+   * Allocate memory of specified size.
+   * @param requested_size bytes requested
+   * @param coalesce merge adjacent free pages and retry once on failure
+   * @return the allocation, or null
+   */
+  CTP_CROSS_FUN OffsetPtr<> AllocateOffsetImpl(size_t requested_size,
+                                               bool coalesce) {
     ScopedMutex guard(lock_, 0);
     // Fast path: bump-allocate from active arena
     if (cur_arena_.IsActive()) {
@@ -343,7 +366,7 @@ class _BuddyAllocator : public Allocator {
     // heap that is almost entirely free can still be too fragmented for one
     // large request. Merge adjacent free pages and retry once, only on the
     // path that would otherwise fail.
-    if (result.IsNull() && CoalesceFreePages()) {
+    if (result.IsNull() && coalesce && CoalesceFreePages()) {
       result = AllocateBySize(requested_size);
     }
     return result;

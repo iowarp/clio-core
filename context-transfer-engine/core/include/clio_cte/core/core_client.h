@@ -34,12 +34,14 @@
 #ifndef WRPCTE_CORE_CLIENT_H_
 #define WRPCTE_CORE_CLIENT_H_
 
+#include <tuple>
 #include <clio_runtime/clio_runtime.h>
 #include <clio_ctp/util/singleton.h>
 #include <clio_cte/api.h>
 #include <clio_cte/core/core_tasks.h>
 #include <clio_cte/core/blob_batch.h>
 #include <clio_cte/core/shm_metadata_cache.h>
+#include <clio_cte/core/shm_wtc.h>
 #include <clio_cte/core/shm_read_stats.h>
 #include <clio_runtime/bdev/transports/mem_bdev_transport.h>
 #include <clio_ctp/data_structures/priv/unordered_map_ll.h>
@@ -53,6 +55,7 @@
 #include <cstring>
 #include <deque>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
@@ -660,6 +663,28 @@ class Client : public clio::run::ContainerClient {
         clio::run::CreateTaskId(), pool_id_, pool_query, tag_name,
         tag_id);
 
+    // Open of an existing tag through the shm cache: the name -> id binding
+    // and the tag's size are both cached, so it completes with no task.
+    if (tag_id.IsNull() && !tag_name.empty()) {
+      if (wtc::View *w = Wtc()) {
+        clio::run::u32 maj = 0;
+        clio::run::u32 min = 0;
+        wtc::TagAttrs a;
+        if (w->LookupTagByName(tag_name.data(), tag_name.size(), &maj, &min) &&
+            w->LookupTagAttrs(maj, min, &a)) {
+          task->tag_id_ = TagId(maj, min);
+          task->created_ = 0;
+          task->tag_size_ = a.size_;
+          task->return_code_ = 0;
+          clio::run::Future<GetOrCreateTagTask<CreateParams>> fut(
+              task->pool_id_, task->method_, task);
+          fut.GetFutureShm()->origin_ = clio::run::ClientOrigin::kClientShm;
+          task->SetComplete();
+          return fut;
+        }
+      }
+    }
+
     // Inline-eligible (CLIO_ENABLE_INLINE_RUN=1): nested metadata
     // lookups from co-located chimods (clio-fs Open does three in a
     // row) each paid a queue+schedule+wake hop; inline they run on
@@ -709,6 +734,16 @@ class Client : public clio::run::ContainerClient {
       clio::run::u32 flags = 0,
       const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
     auto *ipc_manager = CLIO_CPU_IPC;
+
+    if (!blob_data.IsNull()) {
+      const char *src =
+          ipc_manager->ToFullPtr<char>(blob_data.template Cast<char>()).ptr_;
+      const std::string name(blob_name);
+      if (WtcTryPut(tag_id, name, offset, size, src, score, context, flags)) {
+        return WtcDonePut(tag_id, name, offset, size, score, context, flags,
+                          pool_query);
+      }
+    }
 
     auto task = ipc_manager->NewTask<PutBlobTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, tag_id,
@@ -921,6 +956,12 @@ class Client : public clio::run::ContainerClient {
       return clio::run::Future<PutBlobTask>();
     }
 
+    if (WtcTryPut(tag_id, blob_name, offset, size, priv_data, score, context,
+                  flags)) {
+      return WtcDonePut(tag_id, blob_name, offset, size, score, context, flags,
+                        pool_query);
+    }
+
     if (CLIO_RUNTIME_MANAGER->IsRuntime() && !NoPrivPutEnv()) {
       // Co-located daemon: read directly from the private buffer. The null
       // AllocatorId marks the offset as an absolute process address, so the
@@ -1124,6 +1165,7 @@ class Client : public clio::run::ContainerClient {
       clio::run::u64 page_off_ = 0;  // blob offset of buf_[0] (page-aligned)
       clio::run::u64 lo_ = 0;        // dirty extent [lo_, hi_), absolute
       clio::run::u64 hi_ = 0;        //   blob offsets (v1: ONE per page)
+      float score_ = -1.0f;          // placement score of the page's put
       ctp::ipc::FullPtr<char> buf_;  // kSievePage SHM slice (staging pool)
       // Written since the last flusher tick. Atomic because the flusher's
       // SHARED probe ages it while read-locked writers set it; both relaxed
@@ -1138,6 +1180,7 @@ class Client : public clio::run::ContainerClient {
             page_off_(o.page_off_),
             lo_(o.lo_),
             hi_(o.hi_),
+            score_(o.score_),
             buf_(o.buf_),
             touched_(o.touched_.load(std::memory_order_relaxed)) {}
       SievePage &operator=(SievePage &&o) noexcept {
@@ -1148,6 +1191,7 @@ class Client : public clio::run::ContainerClient {
         page_off_ = o.page_off_;
         lo_ = o.lo_;
         hi_ = o.hi_;
+        score_ = o.score_;
         buf_ = o.buf_;
         touched_.store(o.touched_.load(std::memory_order_relaxed),
                        std::memory_order_relaxed);
@@ -1873,6 +1917,12 @@ class Client : public clio::run::ContainerClient {
    * kCtePutAppend is NOT accepted here: deferred puts coalesce into batches
    * that carry no per-record flags, and a deferred put returns no future, so
    * the landed offset could never be read back. Use AsyncPutBlob.
+   *
+   * @param score placement score, honoured on every path: the large direct
+   *        put, a sieve page (the page keeps the score of the write that
+   *        opened it; callers score a blob consistently) and a batched
+   *        record (MultiPutDesc::score_). `context` and `flags` reach the
+   *        core only on the large direct path.
    * @return 0 submitted; -1 degenerate request (size 0 / null source); -2
    *         shared memory exhausted with nothing left to await; -3 the flags
    *         ask for an append, which this path cannot honour.
@@ -1934,7 +1984,6 @@ class Client : public clio::run::ContainerClient {
                             context, flags, pool_query);
       });
     }
-    (void)score;
     (void)context;
     (void)flags;
     // Client-side data sieving (issue #1007): small writes coalesce into
@@ -1948,7 +1997,8 @@ class Client : public clio::run::ContainerClient {
       DeferRegistry &sreg = DeferRegistry::Get();
       clio::run::u64 skey = DeferKeyHash(tag_id, blob_name);
       if (offset != 0 || sreg.IsKeyPending(skey)) {
-        int src = SievePut(tag_id, blob_name, offset, size, priv_data, skey);
+        int src =
+            SievePut(tag_id, blob_name, offset, size, priv_data, skey, score);
         if (src != -3) {
           return src;  // -3: no page slice right now -> batch path below
         }
@@ -1980,6 +2030,7 @@ class Client : public clio::run::ContainerClient {
       d.offset_ = offset;
       d.size_ = size;
       d.payload_off_ = reg.batch_used_;
+      d.score_ = score;
       reg.batch_descs_.push_back(std::move(d));
       reg.batch_ents_.push_back(DeferredPut::Ent{key, seq, size});
       reg.batch_used_ += size;
@@ -2358,12 +2409,15 @@ class Client : public clio::run::ContainerClient {
     reg.sieve_bytes_.fetch_sub(pg.hi_ - pg.lo_, std::memory_order_relaxed);
   }
 
-  /** Sieve one page-confined sub-write. @return 0 sieved; -3 page slice
-   *  unallocatable RIGHT NOW (caller falls back to the batch path, which
-   *  owns the full await-and-retry machinery). */
+  /** Sieve one page-confined sub-write. `score` is the placement score a
+   *  page OPENED by this write ships with (an already-open page keeps its
+   *  own). @return 0 sieved; -3 page slice unallocatable RIGHT NOW (caller
+   *  falls back to the batch path, which owns the full await-and-retry
+   *  machinery). */
   int SievePutOne(DeferRegistry &reg, clio::run::u64 key, const TagId &tag_id,
                   const std::string &blob_name, clio::run::u64 page_off,
-                  clio::run::u64 off, const char *src, clio::run::u64 len) {
+                  clio::run::u64 off, const char *src, clio::run::u64 len,
+                  float score = -1.0f) {
     using SievePage = DeferRegistry::SievePage;
     std::vector<SievePage> sweep;  // holed/evicted pages, batched after unlock
     SievePage ship;                // filled page, direct-put after unlock
@@ -2456,6 +2510,7 @@ class Client : public clio::run::ContainerClient {
           pg.page_off_ = page_off;
           pg.lo_ = off;
           pg.hi_ = off + len;
+          pg.score_ = score;
           pg.buf_ = buf;
           pg.touched_ = true;
           // Copy needs no shard lock: the extent is not registered yet.
@@ -2526,13 +2581,15 @@ class Client : public clio::run::ContainerClient {
     return rc;
   }
 
-  /** Sieve a small write, splitting it across page boundaries. Nonzero only
-   *  when a page slice was unallocatable; earlier sub-writes stay sieved
-   *  and the caller's batch fallback rewrites the SAME bytes (identical
-   *  overlap content, so apply order cannot matter). */
+  /** Sieve a small write, splitting it across page boundaries. `score` is
+   *  the placement score its pages ship with (-1 = the core's default).
+   *  Nonzero only when a page slice was unallocatable; earlier sub-writes
+   *  stay sieved and the caller's batch fallback rewrites the SAME bytes
+   *  (identical overlap content, so apply order cannot matter). */
   int SievePut(const TagId &tag_id, const std::string &blob_name,
                clio::run::u64 offset, clio::run::u64 size,
-               const char *priv_data, clio::run::u64 key) {
+               const char *priv_data, clio::run::u64 key,
+               float score = -1.0f) {
     DeferRegistry &reg = DeferRegistry::Get();
     reg.flush_client_.store(this, std::memory_order_release);
     clio::run::u64 off = offset;
@@ -2543,8 +2600,8 @@ class Client : public clio::run::ContainerClient {
           off / DeferRegistry::kSievePage * DeferRegistry::kSievePage;
       clio::run::u64 in_page =
           std::min(remaining, page_off + DeferRegistry::kSievePage - off);
-      int rc =
-          SievePutOne(reg, key, tag_id, blob_name, page_off, off, src, in_page);
+      int rc = SievePutOne(reg, key, tag_id, blob_name, page_off, off, src,
+                           in_page, score);
       if (rc == -4) {
         // Overlaps a put still in flight: drain the key so ORDER of the
         // overlapping bytes is preserved, then retry this same slice.
@@ -2571,13 +2628,15 @@ class Client : public clio::run::ContainerClient {
     ctp::ipc::ShmPtr<> data(
         pg.buf_.shm_.alloc_id_,
         pg.buf_.shm_.off_.load() + (pg.lo_ - pg.page_off_));
-    auto fut = AsyncPutBlob(pg.tag_id_, pg.blob_name_, pg.lo_, len, data);
+    auto fut = AsyncPutBlob(pg.tag_id_, pg.blob_name_, pg.lo_, len, data,
+                            pg.score_);
     while (fut.IsNull()) {
       if (!DeferAwaitOldest()) {
         SieveDropPage(reg, pg, len);  // exhausted, nothing awaitable
         return;
       }
-      fut = AsyncPutBlob(pg.tag_id_, pg.blob_name_, pg.lo_, len, data);
+      fut = AsyncPutBlob(pg.tag_id_, pg.blob_name_, pg.lo_, len, data,
+                         pg.score_);
     }
     DeferredPut rec;
     rec.fut_ = fut.template Cast<clio::run::Task>();
@@ -2637,6 +2696,7 @@ class Client : public clio::run::ContainerClient {
         d.offset_ = pg.lo_;
         d.size_ = len;
         d.payload_off_ = reg.batch_used_;
+        d.score_ = pg.score_;
         reg.batch_descs_.push_back(std::move(d));
         reg.batch_ents_.push_back(
             DeferredPut::Ent{pg.key_, pg.seq_, len});
@@ -3040,6 +3100,214 @@ class Client : public clio::run::ContainerClient {
     return v;
   }
 
+  // ==== Shared-memory write-through cache (core_shm_cache_writethru) ============
+  //
+  // When this client's pool is a core_shm_cache_writethru pool, puts, covered gets
+  // and known sizes complete in that pool's segment with no task. Anything
+  // the segment cannot express takes the ordinary task path to the SAME pool,
+  // whose handlers order it against the buffered writes. See
+  // context-transfer-engine/core_shm_cache_writethru/DESIGN.md.
+
+  /**
+   * Whether a put/get context is one the cache serves directly: no codec,
+   * replica, emulation, generation, versioning, persistence target or fault
+   * handler. Shared with the chimod so both sides agree.
+   * @param ctx operation context
+   * @return true for a plain context
+   */
+  static bool WtcPlainContext(const Context &ctx) {
+    static const Context kDef;
+    return ctx.persistence_target_ == kDef.persistence_target_ &&
+           ctx.min_persistence_level_ == kDef.min_persistence_level_ &&
+           ctx.preallocate_ == 0 && !ctx.emulate_ &&
+           ctx.transform_flags_ == 0 && ctx.replica_ == 0 &&
+           ctx.replica_flags_ == 0 && ctx.version_ == kDef.version_ &&
+           !ctx.create_on_get_ && ctx.op_flags_ == 0 &&
+           ctx.fault_params_[0] == '\0' &&
+           ctx.generation_ == kDef.generation_ &&
+           ctx.dynamic_compress_ == kDef.dynamic_compress_ &&
+           ctx.compress_lib_ == kDef.compress_lib_;
+  }
+
+  /** Put flags the cache can carry to the chain (per-blob properties only;
+   *  replace/append depend on the chain's state and take the task path). */
+  static bool WtcAbsorbableFlags(clio::run::u32 flags) {
+    return (flags & ~kCtePutDroppable) == 0;
+  }
+
+  /** CLIO_CTE_SHM_CACHE=0 turns the client cache path off. Read once. */
+  static bool WtcDisabledEnv() {
+    static const bool v = [] {
+      const char *e = std::getenv("CLIO_CTE_SHM_CACHE");
+      return e != nullptr && e[0] == '0' && e[1] == '\0';
+    }();
+    return v;
+  }
+
+  /** Process-wide segment views, one per cache pool. The map owns them
+   *  for the life of the process (clients cache raw pointers to them), so
+   *  they are released at exit rather than leaked. */
+  static std::mutex &WtcMutex() {
+    static std::mutex mu;
+    return mu;
+  }
+  static std::unordered_map<clio::run::u64, std::unique_ptr<wtc::View>> &
+  WtcViews() {
+    static std::unordered_map<clio::run::u64, std::unique_ptr<wtc::View>> views;
+    return views;
+  }
+
+  /**
+   * The cache segment of this client's pool, attaching on first use; nullptr
+   * when the pool is not a shm write-through cache (or this process cannot
+   * map it: TCP client, remote node). A failed attach is retried at most
+   * once per second.
+   */
+  wtc::View *Wtc() {
+    if (wtc_ != nullptr) {
+      return wtc_->Ready() ? wtc_ : nullptr;
+    }
+    if (WtcDisabledEnv() || ForceNetEnv()) {
+      return nullptr;
+    }
+    const clio::run::u64 now = wtc::NowNs();
+    if (now < wtc_retry_ns_) {
+      return nullptr;
+    }
+    wtc_retry_ns_ = now + 1000ull * 1000ull * 1000ull;
+    std::lock_guard<std::mutex> lk(WtcMutex());
+    auto *ipc = CLIO_CPU_IPC;
+    if (ipc == nullptr) {
+      return nullptr;
+    }
+    auto *meta = ipc->GetMetadataAllocator();
+    auto *dir = ipc->GetMetadataDirectory();
+    if (meta == nullptr || dir == nullptr) {
+      return nullptr;
+    }
+    // The cache serves this client when the client is bound to the cache
+    // pool itself, or to the pool the cache names as its entry (a module
+    // composed above it, e.g. the indexer): tasks then pass that module,
+    // and the client still uses the segment for its shared-memory paths.
+    auto locate = [&](const clio::run::PoolId &cache_pool) -> wtc::Locator * {
+      const clio::run::u64 off = dir->FindRoot(cache_pool.ToU64());
+      if (off == 0) return nullptr;
+      auto *l = reinterpret_cast<wtc::Locator *>(
+          reinterpret_cast<char *>(meta) + off);
+      if (l->magic_ != wtc::Locator::kMagic ||
+          l->ready_.load(std::memory_order_acquire) != 1) {
+        return nullptr;
+      }
+      return l;
+    };
+    clio::run::PoolId cache_pool = pool_id_;
+    wtc::Locator *loc = locate(cache_pool);
+    if (loc == nullptr) {
+      cache_pool = wtc::kDefaultPoolId;
+      loc = locate(cache_pool);
+      if (loc == nullptr || loc->entry_pool_ != pool_id_.ToU64()) {
+        return nullptr;
+      }
+    }
+    wtc_entry_pool_ = loc->entry_pool_;
+    wtc_cache_pool_ = cache_pool;
+    auto &views = WtcViews();
+    auto it = views.find(cache_pool.ToU64());
+    if (it != views.end()) {
+      wtc_ = it->second.get();
+      return wtc_->Ready() ? wtc_ : nullptr;
+    }
+    auto view = std::make_unique<wtc::View>();
+    if (!view->Attach(wtc::SegmentName(loc->runtime_pid_, cache_pool),
+                      loc->root_off_)) {
+      return nullptr;
+    }
+    wtc_ = view.get();
+    views[cache_pool.ToU64()] = std::move(view);
+    return wtc_;
+  }
+
+  /** True when this client is bound to a shm write-through cache. */
+  bool HasWtc() { return Wtc() != nullptr; }
+
+  /** Entry pool the attached cache names (PoolId::ToU64), 0 if none. */
+  clio::run::u64 WtcEntryPool() const { return wtc_entry_pool_; }
+
+  /** Forget the attached cache view (after rebinding pool_id_). */
+  void ResetWtc() {
+    wtc_ = nullptr;
+    wtc_retry_ns_ = 0;
+  }
+
+  /** An already-complete future over a put the cache absorbed. */
+  clio::run::Future<PutBlobTask> WtcDonePut(
+      const TagId &tag_id, const std::string &blob_name, clio::run::u64 offset,
+      clio::run::u64 size, float score, const Context &context,
+      clio::run::u32 flags, const clio::run::PoolQuery &pool_query) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    auto task = ipc_manager->NewTask<PutBlobTask>(
+        clio::run::CreateTaskId(), pool_id_, pool_query, tag_id, blob_name,
+        offset, size, ctp::ipc::ShmPtr<>::GetNull(), score, context, flags);
+    clio::run::Future<PutBlobTask> fut(task->pool_id_, task->method_, task);
+    fut.GetFutureShm()->origin_ = clio::run::ClientOrigin::kClientShm;
+    task->return_code_ = 0;
+    task->SetComplete();
+    return fut;
+  }
+
+  /**
+   * Try the cache for a put. kOk means it was absorbed; anything else means
+   * the caller takes the task path (to this same pool).
+   */
+  bool WtcTryPut(const TagId &tag_id, const std::string &blob_name,
+                 clio::run::u64 offset, clio::run::u64 size, const char *src,
+                 float score, const Context &context, clio::run::u32 flags) {
+    if (src == nullptr || size == 0 || !WtcAbsorbableFlags(flags) ||
+        score >= 0.0f || !WtcPlainContext(context)) {
+      return false;
+    }
+    wtc::View *w = Wtc();
+    return w != nullptr &&
+           w->TryPut(tag_id.major_, tag_id.minor_, blob_name.data(),
+                     blob_name.size(), offset, size, src,
+                     flags) == wtc::Status::kOk;
+  }
+
+  /** Try the cache for a get into `dst`; on success set *fut complete. */
+  bool WtcTryGet(const TagId &tag_id, const char *blob_name,
+                 clio::run::u64 offset, clio::run::u64 size,
+                 clio::run::u32 flags, char *dst,
+                 ctp::ipc::ShmPtr<> task_blob_data,
+                 const clio::run::PoolQuery &pool_query,
+                 const Context &context,
+                 clio::run::Future<GetBlobTask> *fut) {
+    if (dst == nullptr || size == 0 || flags != 0 ||
+        !WtcPlainContext(context)) {
+      return false;
+    }
+    wtc::View *w = Wtc();
+    if (w == nullptr ||
+        w->TryGet(tag_id.major_, tag_id.minor_, blob_name, std::strlen(blob_name),
+                  offset, size, dst) != wtc::Status::kOk) {
+      return false;
+    }
+    auto *ipc_manager = CLIO_CPU_IPC;
+    auto task = ipc_manager->NewTask<GetBlobTask>(
+        clio::run::CreateTaskId(), pool_id_, pool_query, tag_id, blob_name,
+        offset, size, flags, task_blob_data, context);
+    *fut = clio::run::Future<GetBlobTask>(task->pool_id_, task->method_, task);
+    fut->GetFutureShm()->origin_ = clio::run::ClientOrigin::kClientShm;
+    task->return_code_ = 0;
+    task->SetComplete();
+    return true;
+  }
+
+  /** Cache statistics of this client's pool, or nullptr. */
+  const wtc::Stats *WtcStats() {
+    wtc::View *w = Wtc();
+    return w == nullptr ? nullptr : &w->GetRoot()->stats_;
+  }
+
   bool TryShmGet(const TagId &tag_id, const char *blob_name,
                  clio::run::u64 offset, clio::run::u64 size,
                  clio::run::u32 flags, char *dst,
@@ -3073,6 +3341,9 @@ class Client : public clio::run::ContainerClient {
         context.replica_ != 0 || context.compress_lib_ != 0 ||
         (context.op_flags_ & Context::kGenerational) || ForceNetEnv()) {
       return false;
+    }
+    if (wtc::View *w = Wtc(); w != nullptr && !w->MdOnly()) {
+      return false;  // the write-through cache is authoritative for reads
     }
     if (!HasShmCache() && !AttachShmCache()) {
       return false;
@@ -3108,6 +3379,10 @@ class Client : public clio::run::ContainerClient {
                       : ipc_manager->ToFullPtr<char>(
                             blob_data.template Cast<char>()).ptr_;
       clio::run::Future<GetBlobTask> fut;
+      if (WtcTryGet(tag_id, blob_name, offset, size, flags, dst, blob_data,
+                    pool_query, context, &fut)) {
+        return fut;
+      }
       if (TryShmGet(tag_id, blob_name, offset, size, flags, dst, blob_data,
                     pool_query, context, &fut)) {
         return fut;
@@ -3175,6 +3450,11 @@ class Client : public clio::run::ContainerClient {
     // no-ops — the bytes are already in the caller's buffer.
     {
       clio::run::Future<GetBlobTask> fut;
+      if (WtcTryGet(tag_id, blob_name.c_str(), offset, size, flags, priv_data,
+                    ctp::ipc::ShmPtr<>::GetNull(), pool_query, context,
+                    &fut)) {
+        return fut;
+      }
       if (TryShmGet(tag_id, blob_name.c_str(), offset, size, flags, priv_data,
                     ctp::ipc::ShmPtr<>::GetNull(), pool_query, context,
                     &fut)) {
@@ -3647,6 +3927,50 @@ class Client : public clio::run::ContainerClient {
   }
 
   /**
+   * Delete a set of blobs in ONE task. The core splits the set by owner:
+   * each owner deletes its subset as one plan (one FreeBlocks per pool for
+   * the whole subset), all owners concurrently.
+   * @param keys       (tag, blob) pairs to delete
+   * @param pool_query routing (default Dynamic: the first blob's owner,
+   *                   which forwards the other owners' subsets)
+   * @param del_flags  kDelCacheCopyOnly to drop only cache copies, else 0
+   * @return future; num_ok_ = blobs deleted, first_rc_ = first failure
+   *         (1 = a blob was not found)
+   */
+  clio::run::Future<MultiDelBlobTask> AsyncMultiDelBlob(
+      const std::vector<MultiDelKey> &keys,
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic(),
+      clio::run::u32 del_flags = 0) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    const TagId route_tag = keys.empty() ? TagId() : keys.front().tag_id_;
+    const std::string route_blob =
+        keys.empty() ? std::string() : keys.front().blob_name_;
+    auto task = ipc_manager->NewTask<MultiDelBlobTask>(
+        clio::run::CreateTaskId(), pool_id_, pool_query, route_tag, route_blob,
+        EncodeMultiDelKeys(keys), del_flags);
+    return ipc_manager->Send(task);
+  }
+
+  /**
+   * Delete a set of tags (by id) in ONE task per container. Like DelTag by
+   * id, a container removes its own share of each tag, so the default
+   * Broadcast deletes the set cluster-wide.
+   * @param tags       tag ids to delete
+   * @param pool_query routing (default Broadcast)
+   * @return future; num_ok_ = tags deleted (summed over containers)
+   */
+  clio::run::Future<MultiDelTagTask> AsyncMultiDelTag(
+      const std::vector<TagId> &tags,
+      const clio::run::PoolQuery &pool_query =
+          clio::run::PoolQuery::Broadcast()) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    auto task = ipc_manager->NewTask<MultiDelTagTask>(
+        clio::run::CreateTaskId(), pool_id_, pool_query,
+        EncodeMultiDelTags(tags));
+    return ipc_manager->Send(task);
+  }
+
+  /**
    * Asynchronous delete tag by tag name - returns immediately
    * @param tag_name Tag name to delete
    * @param pool_query Pool query for task routing (default: Dynamic)
@@ -3666,19 +3990,19 @@ class Client : public clio::run::ContainerClient {
   }
 
   /**
-   * Rename a tag, keeping its TagId (and all blobs). Broadcast so every
-   * container moves the name binding it holds. tag_id may be null if the
-   * caller only knows the name; pass it when known (e.g. from a prior open).
+   * Rename one of a tag's names, keeping its TagId (and all blobs). A tag
+   * that already has new_name loses it. tag_id may be null if the caller
+   * only knows the name. Batched form: AsyncMultiRenameTag.
    * @param old_name Current tag name
    * @param new_name Desired tag name
    * @param tag_id   Tag id (optional; TagId::GetNull() to resolve by name)
-   * @param pool_query Routing (default Broadcast)
+   * @param pool_query Routing (default Dynamic: the old name's owner)
    */
   clio::run::Future<RenameTagTask> AsyncRenameTag(
       const std::string &old_name,
       const std::string &new_name,
       const TagId &tag_id = TagId::GetNull(),
-      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Broadcast()) {
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
     auto *ipc_manager = CLIO_CPU_IPC;
 
     auto task = ipc_manager->NewTask<RenameTagTask>(
@@ -3690,15 +4014,16 @@ class Client : public clio::run::ContainerClient {
   /**
    * Bind an additional name to an EXISTING tag's id (tag-level hard link).
    * The alias shares the target's TagId and therefore all its blobs. If the
-   * target does not exist, the returned task's found_ is 0 (error). Broadcast.
-   * Overload: target identified by TagId.
+   * target does not exist, the returned task's found_ is 0 (error). If the
+   * alias already names a tag, that tag is returned. Overload: target
+   * identified by TagId. Batched form: AsyncMultiGetOrCreateTagAlias.
    * @param existing_id Target tag id (must exist)
    * @param alias_name  New name to bind to it
    */
   clio::run::Future<GetOrCreateTagAliasTask> AsyncGetOrCreateTagAlias(
       const TagId &existing_id,
       const std::string &alias_name,
-      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Broadcast()) {
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
     auto *ipc_manager = CLIO_CPU_IPC;
     auto task = ipc_manager->NewTask<GetOrCreateTagAliasTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, existing_id,
@@ -3714,7 +4039,7 @@ class Client : public clio::run::ContainerClient {
   clio::run::Future<GetOrCreateTagAliasTask> AsyncGetOrCreateTagAlias(
       const std::string &existing_name,
       const std::string &alias_name,
-      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Broadcast()) {
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
     auto *ipc_manager = CLIO_CPU_IPC;
     auto task = ipc_manager->NewTask<GetOrCreateTagAliasTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, TagId::GetNull(),
@@ -3723,16 +4048,14 @@ class Client : public clio::run::ContainerClient {
   }
 
   /**
-   * Resolve a TagId to its full, absolute tag name. Tag names are stored
-   * relatively ("$tagid{parent}/leaf"); this returns the fully-resolved path
-   * (or the verbatim name for a flat tag). Broadcast so the container that
-   * owns the tag's metadata answers; the result is in found_/tag_name_.
+   * A tag's canonical name, from the tag's home; the result is in
+   * found_/tag_name_.
    * @param tag_id Tag ID to resolve
-   * @param pool_query Pool query for task routing (default: Broadcast)
+   * @param pool_query Pool query for task routing (default: the tag's home)
    */
   clio::run::Future<GetTagNameTask> AsyncGetTagName(
       const TagId &tag_id,
-      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Broadcast()) {
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
     auto *ipc_manager = CLIO_CPU_IPC;
 
     auto task = ipc_manager->NewTask<GetTagNameTask>(
@@ -3753,6 +4076,31 @@ class Client : public clio::run::ContainerClient {
 
     auto task = ipc_manager->NewTask<GetTagSizeTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, tag_id);
+
+    // Cluster-wide size/times (Broadcast) through the shm cache: served
+    // from the segment when cached; on a miss the LOCAL cache container
+    // fetches the total once and caches it (TagAttrs verb).
+    if (pool_query.IsBroadcastMode() && !tag_id.IsNull()) {
+      if (wtc::View *w = Wtc()) {
+        wtc::TagAttrs a;
+        if (w->LookupTagAttrs(tag_id.major_, tag_id.minor_, &a)) {
+          task->tag_size_ = a.size_;
+          task->ctime_ = a.ctime_;
+          task->mtime_ = a.mtime_;
+          task->atime_ = a.atime_;
+          task->return_code_ = 0;
+          clio::run::Future<GetTagSizeTask> fut(task->pool_id_, task->method_,
+                                                task);
+          fut.GetFutureShm()->origin_ = clio::run::ClientOrigin::kClientShm;
+          task->SetComplete();
+          return fut;
+        }
+        task->pool_id_ = wtc_cache_pool_;
+        task->pool_query_ = clio::run::PoolQuery::Local();
+        task->method_ = wtc::kTagAttrsMethod;
+        return ipc_manager->Send(task);
+      }
+    }
 
     // Inline-eligible (CLIO_ENABLE_INLINE_RUN=1): nested metadata
     // lookups from co-located chimods (clio-fs Open does three in a
@@ -3805,8 +4153,9 @@ class Client : public clio::run::ContainerClient {
   }
 
   /**
-   * Publish a batch of tag-name operations (see EncodeTagNameOp). Local by
-   * default: a container publishes the names it owns into its own node CTE.
+   * The batched tag-name verb: kAddName / kRemoveName / kRename records (see
+   * EncodeTagNameOp). The receiving container sends each step to the
+   * container holding its state; results_ holds one result per record.
    * @param ops encoded batch
    * @param pool_query default Local()
    */
@@ -3817,6 +4166,36 @@ class Client : public clio::run::ContainerClient {
     auto task = ipc_manager->NewTask<UpdateTagNamesTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, ops);
     return ipc_manager->Send(task);
+  }
+
+  /**
+   * Batched RenameTag: one UpdateTagNames carrying a kRename per entry.
+   * Results (one per entry, op_ = TagNameResult) are in the task's results_.
+   * @param renames (tag id or null, old name, new name) per rename
+   */
+  clio::run::Future<UpdateTagNamesTask> AsyncMultiRenameTag(
+      const std::vector<std::tuple<TagId, std::string, std::string>> &renames) {
+    std::string ops;
+    for (const auto &r : renames) {
+      EncodeTagNameOp(&ops, TagNameOp::kRename, std::get<0>(r), 0,
+                      std::get<1>(r), std::get<2>(r));
+    }
+    return AsyncUpdateTagNames(ops);
+  }
+
+  /**
+   * Batched GetOrCreateTagAlias: one UpdateTagNames carrying a kAddName per
+   * entry (the target must exist).
+   * @param aliases (target tag id, alias name) per alias
+   */
+  clio::run::Future<UpdateTagNamesTask> AsyncMultiGetOrCreateTagAlias(
+      const std::vector<std::pair<TagId, std::string>> &aliases) {
+    std::string ops;
+    for (const auto &a : aliases) {
+      EncodeTagNameOp(&ops, TagNameOp::kAddName, a.first, kTnMustExist,
+                      a.second);
+    }
+    return AsyncUpdateTagNames(ops);
   }
 
   /**
@@ -3870,6 +4249,20 @@ class Client : public clio::run::ContainerClient {
     auto task = ipc_manager->NewTask<GetBlobSizeTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, tag_id,
         blob_name, replica);
+
+    clio::run::u64 cached = 0;
+    wtc::View *w = replica == 0 ? Wtc() : nullptr;
+    if (w != nullptr &&
+        w->TryGetSize(tag_id.major_, tag_id.minor_, blob_name.data(),
+                      blob_name.size(), &cached) == wtc::Status::kOk) {
+      clio::run::Future<GetBlobSizeTask> fut(task->pool_id_, task->method_,
+                                             task);
+      fut.GetFutureShm()->origin_ = clio::run::ClientOrigin::kClientShm;
+      task->size_ = cached;
+      task->return_code_ = 0;
+      task->SetComplete();
+      return fut;
+    }
 
     return ipc_manager->Send(task);
   }
@@ -4214,6 +4607,14 @@ class Client : public clio::run::ContainerClient {
   // owns the segment and may drop the cache at any time, which is why every
   // read is validated rather than trusted.
   ShmMetadataCacheRoot *shm_root_ = nullptr;
+  // shm write-through cache segment of pool_id_ (process-wide, never freed),
+  // and the earliest time to retry a failed attach.
+  wtc::View *wtc_ = nullptr;
+  /** Entry pool of the attached cache (see WtcEntryPool). */
+  clio::run::u64 wtc_entry_pool_ = 0;
+  /** Pool of the attached cache itself (its own verbs go there). */
+  clio::run::PoolId wtc_cache_pool_;
+  clio::run::u64 wtc_retry_ns_ = 0;
   // True only when the mirror was attached via AttachShmCacheOf for a pool
   // OTHER than this client's own (interposition binding): gates the
   // serving-replica fast path (see AttachShmCacheOf).

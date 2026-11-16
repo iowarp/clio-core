@@ -937,12 +937,26 @@ clio::run::TaskResume Runtime::GetBlob(
       CLIO_CO_AWAIT(lsize);
       if (!(lsize->GetReturnCode() == 0 && lsize->size_ >= served_total)) {
         bool cached = false;
+        clio::run::u64 version = 0;
         CLIO_CO_AWAIT(CacheLocalCopy(task->tag_id_, blob_name, served_total,
-                                cached));
+                                cached, &version));
         if (cached) {
+          // VERSION-CHECKED registration (the #894 race, here): a write that
+          // landed between the copy's fetch and this registration ran its
+          // invalidation before we were registered, so the copy would stay
+          // stale -- served to later reads as older bytes. The owner rejects
+          // the registration when the blob moved past `version`; drop the
+          // copy then, and the next read refetches.
           auto reg = cte->AsyncRegisterReplicaContainer(
-              task->tag_id_, blob_name, CLIO_IPC->GetNodeId());
+              task->tag_id_, blob_name, CLIO_IPC->GetNodeId(),
+              clio::run::PoolQuery::Dynamic(), version);
           CLIO_CO_AWAIT(reg);
+          if (reg->GetReturnCode() != 0) {
+            auto del = cte->AsyncDelBlob(task->tag_id_, blob_name,
+                                         clio::run::PoolQuery::Local(),
+                                         clio::cte::core::kDelCacheCopyOnly);
+            CLIO_CO_AWAIT(del);
+          }
         }
       }
     }
@@ -1145,12 +1159,14 @@ clio::run::TaskResume Runtime::GetBlobSize(
 clio::run::TaskResume Runtime::CacheLocalCopy(const TagId &tag_id,
                                               const std::string &blob_name,
                                               clio::run::u64 total,
-                                              bool &cached) {
+                                              bool &cached,
+                                              clio::run::u64 *version) {
 #ifdef CLIO_ENABLE_BOOST_COROUTINES
   clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
 #endif
   CLIO_TASK_BODY_BEGIN
   cached = false;
+  *version = 0;
   auto *cte = GetCoreClient();
   for (clio::run::u64 off = 0; off < total; off += kReplicateChunkBytes) {
     clio::run::u64 len = std::min(kReplicateChunkBytes, total - off);
@@ -1165,6 +1181,19 @@ clio::run::TaskResume Runtime::CacheLocalCopy(const TagId &tag_id,
     CLIO_CO_AWAIT(get_task);
     if (get_task->GetReturnCode() != 0) {
       CLIO_IPC->FreeBuffer(buf);
+      CLIO_CO_RETURN;
+    }
+    // Every chunk must come from ONE version of the blob: a write landing
+    // between chunk fetches would otherwise splice two versions together.
+    const clio::run::u64 v = get_task->context_.version_;
+    if (off == 0) {
+      *version = v;
+    } else if (v != *version) {
+      CLIO_IPC->FreeBuffer(buf);
+      auto del = cte->AsyncDelBlob(tag_id, blob_name,
+                                   clio::run::PoolQuery::Local(),
+                                   clio::cte::core::kDelCacheCopyOnly);
+      CLIO_CO_AWAIT(del);
       CLIO_CO_RETURN;
     }
 

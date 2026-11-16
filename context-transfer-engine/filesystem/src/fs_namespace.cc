@@ -59,8 +59,11 @@
 #include <clio_runtime/pool_manager.h>
 #include <clio_cte/core/blob_placement.h>
 #include <clio_cte/filesystem/filesystem_runtime.h>
+#include <clio_runtime/evlat.h>
 
 namespace clio::cte::filesystem {
+
+namespace ev = clio::run::evlat;
 
 namespace {
 
@@ -86,6 +89,9 @@ void EncReq(const Runtime::FsReq &r, std::string *out) {
   e.U32(r.gid_);
   e.U64(r.dir_id_);
   e.U32(r.block_);
+  e.U32(r.from_);
+  e.U64(r.have_);
+  e.U64(r.reg_);
 }
 
 /** Decode a request. @return false on a malformed buffer */
@@ -95,7 +101,8 @@ bool DecReq(const std::string &s, Runtime::FsReq *r) {
          d.Str(&r->str2_) && d.U64(&r->id_) && d.U64(&r->a_) &&
          d.U64(&r->b_) && d.U32(&r->type_) && d.U32(&r->flags_) &&
          d.U32(&r->mode_) && d.U32(&r->uid_) && d.U32(&r->gid_) &&
-         d.U64(&r->dir_id_) && d.U32(&r->block_);
+         d.U64(&r->dir_id_) && d.U32(&r->block_) && d.U32(&r->from_) &&
+         d.U64(&r->have_) && d.U64(&r->reg_);
 }
 
 /** Encode a response. */
@@ -110,6 +117,8 @@ void EncResp(const Runtime::FsResp &r, std::string *out) {
   e.U64(r.handle_);
   Runtime::EncodeAttr(e, r.attr_);
   e.Str(r.str_);
+  e.U64(r.reg_);
+  e.Str(r.deltas_);
 }
 
 /** Decode a response. @return false on a malformed buffer */
@@ -117,7 +126,8 @@ bool DecResp(const std::string &s, Runtime::FsResp *r) {
   FsDec d(s.data(), s.size());
   return d.U32(&r->rc_) && d.U64(&r->id_) && d.U32(&r->type_) &&
          d.U64(&r->old_id_) && d.U32(&r->old_type_) && d.U32(&r->created_) &&
-         d.U64(&r->handle_) && Runtime::DecodeAttr(d, &r->attr_) && d.Str(&r->str_);
+         d.U64(&r->handle_) && Runtime::DecodeAttr(d, &r->attr_) && d.Str(&r->str_) &&
+         d.U64(&r->reg_) && d.Str(&r->deltas_);
 }
 
 }  // namespace
@@ -315,6 +325,12 @@ clio::run::TaskResume Runtime::ExecShardOp(clio::run::u32 op, const FsReq &req,
     case kShardPurgeLocal:
       CLIO_CO_AWAIT(PurgeLocal(req));
       break;
+    case kShardInodeCreate:
+      CLIO_CO_AWAIT(InodeCreateOpen(req, resp, rc));
+      break;
+    case kShardInodeDiscard:
+      CLIO_CO_AWAIT(InodeDiscard(req));
+      break;
     default:
       if (op >= kShardInodeStat && op <= kShardInodeXattr) {
         CLIO_CO_AWAIT(ExecInodeOp(op, req, resp, rc));
@@ -332,7 +348,9 @@ clio::run::TaskResume Runtime::ExecShardOp(clio::run::u32 op, const FsReq &req,
       op != kTableFetch && op != kTableStandInFetch &&
       op != kTableLoadBlocks) {
     int ferr = 0;
+    const unsigned long long ev_f0 = ev::Now();
     CLIO_CO_AWAIT(FlushInodes(&ferr, since));
+    ev::Span(ev::kFsOpFlush, ev_f0, ev::Now());
     // The change could not be made durable (a full store): say so rather
     // than acknowledge it.
     if (rc == 0 && ferr != 0) rc = ferr;
@@ -650,7 +668,8 @@ clio::run::TaskResume Runtime::InodeTruncate(const FsReq &req, FsResp &resp) {
     }
     std::memset(zbuf.ptr_, 0, zlen);
     auto zp = cte_.AsyncPutBlob(tag, std::to_string(boundary_page), zoff, zlen,
-                                zbuf.shm_.template Cast<void>(), -1.0f,
+                                zbuf.shm_.template Cast<void>(),
+                                page_score_.ScoreOf(boundary_page),
                                 clio::cte::core::Context(), 0u,
                                 clio::run::PoolQuery::Dynamic());
     CLIO_CO_AWAIT(zp);
@@ -687,8 +706,7 @@ void Runtime::QueuePurge(const PurgeItem &item) {
 
 clio::run::TaskResume Runtime::PurgeDrain() {
   CLIO_TASK_BODY_BEGIN
-  // Names first: a create-then-unlink must reach each node as add, remove,
-  // then the page purge.
+  // Anything a failed flush re-queued.
   CLIO_CO_AWAIT(FlushNames());
   CLIO_CO_AWAIT(FlushInodes());  // anything a handler left dirty
   // Bound what a power loss can take from the directory journal.
@@ -744,10 +762,12 @@ clio::run::TaskResume Runtime::PurgeLocal(const FsReq &req) {
   CLIO_TASK_BODY_BEGIN
   FsDec dec(req.str_.data(), req.str_.size());
   clio::run::u64 packed = 0;
-  while (dec.U64(&packed)) {
-    // Local: this container's accounting share and page blobs of the file
-    // (a miss -- no pages here -- returns at once).
-    auto d = cte_.AsyncDelTag(FsUnpack(packed), clio::run::PoolQuery::Local());
+  std::vector<clio::cte::core::TagId> tags;
+  while (dec.U64(&packed)) tags.push_back(FsUnpack(packed));
+  if (!tags.empty()) {
+    // Local: this container's share (accounting and page blobs) of each
+    // file, in one call; a file with no pages here costs nothing.
+    auto d = cte_.AsyncMultiDelTag(tags, clio::run::PoolQuery::Local());
     CLIO_CO_AWAIT(d);
   }
   CLIO_CO_RETURN;
@@ -836,7 +856,7 @@ void Runtime::PublishName(clio::cte::core::TagNameOp op,
                           const clio::cte::core::TagId &id,
                           const std::string &name, const std::string &name2) {
   std::lock_guard<std::mutex> g(tn_mu_);
-  clio::cte::core::EncodeTagNameOp(&tn_batch_, op, id, NowNs(), name, name2);
+  clio::cte::core::EncodeTagNameOp(&tn_batch_, op, id, 0, name, name2);
 }
 
 clio::run::TaskResume Runtime::FlushNames() {
@@ -847,26 +867,44 @@ clio::run::TaskResume Runtime::FlushNames() {
     batch.swap(tn_batch_);
   }
   if (!batch.empty()) {
-    // One publish per drain tick carries every change since the last one.
-    // It goes to this node's CTE only: each filesystem container mirrors the
-    // names of the directory blocks it is home for into its own node's CTE,
-    // so no broadcast is needed. A publish that fails outright is retried on
-    // the next ticks (#1182: a node's index missed a directory rename and
-    // nothing said why); the records carry their own stamps, so re-sending
-    // them is harmless.
+    // One batched core call; the local CTE sends each step to the container
+    // holding that name or tag. A call that fails outright is retried by the
+    // next flush (#1182); every step is idempotent, so re-sending is harmless.
     auto u = cte_.AsyncUpdateTagNames(batch, clio::run::PoolQuery::Local());
     CLIO_CO_AWAIT(u);
+    // Re-send what did not land: the whole batch when the call failed, else
+    // each op a down container could not apply (kTnUnreached). The drain
+    // flushes again every tick, so a name lands once its holder is back.
+    std::string again;
     if (u->GetReturnCode() != 0) {
-      ++tn_flush_failures_;
-      HLOG(kWarning, "filesystem: tag-name publish of {} byte(s) failed "
-           "(rc {}); {} failure(s) so far, re-queued", batch.size(),
-           u->GetReturnCode(), tn_flush_failures_);
-      if (tn_flush_failures_ <= kNameFlushRetries) {
-        std::lock_guard<std::mutex> g(tn_mu_);
-        tn_batch_.insert(0, batch);  // ahead of what was published since
-      }
+      again = batch;
     } else {
+      std::vector<clio::cte::core::TagNameOpRec> ops, res;
+      const std::string rb = u->results_.str();
+      clio::cte::core::DecodeTagNameOps(batch.data(), batch.size(), &ops);
+      clio::cte::core::DecodeTagNameOps(rb.data(), rb.size(), &res);
+      for (size_t i = 0; i < ops.size(); ++i) {
+        const bool unreached =
+            i >= res.size() || static_cast<clio::run::u32>(res[i].op_) ==
+                                   clio::cte::core::kTnUnreached;
+        if (!unreached) continue;
+        const auto &r = ops[i];
+        clio::cte::core::EncodeTagNameOp(&again, r.op_, r.tag_, r.flags_,
+                                         r.name_, r.name2_);
+      }
+    }
+    if (again.empty()) {
       tn_flush_failures_ = 0;
+    } else {
+      ++tn_flush_failures_;
+      if (tn_flush_failures_ <= 3 ||
+          (tn_flush_failures_ & (tn_flush_failures_ - 1)) == 0) {
+        HLOG(kWarning, "filesystem: {} byte(s) of tag-name ops did not land "
+             "(rc {}); re-queued, {} attempt(s) so far", again.size(),
+             u->GetReturnCode(), tn_flush_failures_);
+      }
+      std::lock_guard<std::mutex> g(tn_mu_);
+      tn_batch_.insert(0, again);  // ahead of what was published since
     }
   }
   CLIO_CO_RETURN;

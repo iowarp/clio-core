@@ -477,7 +477,7 @@ bool Config::ParsePerformanceConfig(const YAML::Node &node) {
     HLOG(kWarning,
          "Config: performance.flush_data_period_ms / "
          "flush_data_min_persistence are no longer CTE core keys and are "
-         "ignored; set flush_period_ms on a clio_cte_write_back_cache entry");
+         "ignored; set flush_period_ms on a clio_cte_core_persist_write_back entry");
   }
 
   if (node["transaction_log_capacity"]) {
@@ -580,16 +580,20 @@ bool Config::ParseStorageConfig(const YAML::Node &node) {
       // check. A bare bucket with no prefix is a configuration error: CTE
       // registers targets as <path>_node<N>, which would corrupt the bucket
       // name itself rather than the key prefix.
+      // 'daos' names a native DAOS tier. Its path is a URI as well
+      // (daos://<pool>/<container>/<file>[?options]); the bdev's DAOS
+      // transport creates the parent directories inside the container.
       if (device_config.bdev_type_ != "file" &&
           device_config.bdev_type_ != "ram" &&
           device_config.bdev_type_ != "hbm" &&
           device_config.bdev_type_ != "pinned" &&
           device_config.bdev_type_ != "noop" &&
           device_config.bdev_type_ != "s3" &&
-          device_config.bdev_type_ != "gcs") {
+          device_config.bdev_type_ != "gcs" &&
+          device_config.bdev_type_ != "daos") {
         HLOG(kError,
              "Config error: Invalid bdev_type '{}' (must be 'file', 'ram', "
-             "'hbm', 'pinned', 'noop', 's3', or 'gcs')",
+             "'hbm', 'pinned', 'noop', 's3', 'gcs', or 'daos')",
              device_config.bdev_type_);
         return false;
       }

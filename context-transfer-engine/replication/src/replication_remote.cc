@@ -411,7 +411,8 @@ clio::run::TaskResume Runtime::MultiPutBlob(
       Context ctx = task->context_;
       auto p = Self()->AsyncPutBlob(desc.tag_id_, desc.blob_name_,
                                     desc.offset_, desc.size_,
-                                    batch.RecordSlice(d), -1.0f, ctx, 0u,
+                                    batch.RecordSlice(d), desc.score_, ctx,
+                                    desc.flags_,
                                     clio::run::PoolQuery::Dynamic());
       CLIO_CO_AWAIT(p);
       // The owner died with this put in flight: re-resolve it (failover now
@@ -424,8 +425,8 @@ clio::run::TaskResume Runtime::MultiPutBlob(
              desc.tag_id_.minor_, desc.blob_name_, attempt + 1);
         CLIO_CO_AWAIT(clio::run::yield(kForwardRetryUs));
         p = Self()->AsyncPutBlob(desc.tag_id_, desc.blob_name_, desc.offset_,
-                                 desc.size_, batch.RecordSlice(d), -1.0f, ctx,
-                                 0u, clio::run::PoolQuery::Dynamic());
+                                 desc.size_, batch.RecordSlice(d), desc.score_,
+                                 ctx, 0u, clio::run::PoolQuery::Dynamic());
         CLIO_CO_AWAIT(p);
       }
       if (p->GetReturnCode() == 0) {

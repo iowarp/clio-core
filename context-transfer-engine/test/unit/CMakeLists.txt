@@ -875,6 +875,27 @@ set_tests_properties(
         ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1;STRESS_THREADS=8;STRESS_ITERS=1500"
 )
 
+# MultiDelBlob / MultiDelTag: delete a set of blobs or tags in one task.
+add_executable(test_multi_del test_multi_del.cc)
+target_link_libraries(test_multi_del
+    clio_cte_core_runtime
+    clio_cte_core_client
+    clio::run::admin_runtime
+    clio::run::admin_client
+    clio::run::bdev_runtime
+    clio::run::bdev_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+add_test(NAME cte_multi_del COMMAND test_multi_del)
+set_tests_properties(
+    cte_multi_del
+    PROPERTIES
+        TIMEOUT 300
+        LABELS "unit;cte"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
+)
+
 # Regression: blocks freed by DelBlob return to their bdev partition.
 add_test(NAME cte_block_reuse_all
     COMMAND test_blob_block_reuse)
@@ -944,7 +965,7 @@ set_tests_properties(
 # persistent core (successor of RELIABILITY.md defect 14, which raced the
 # core's own flush): no writer's region may be lost.
 if(CLIO_CTE_ENABLE_POLICY_CACHES)
-  add_dependencies(test_concurrent_same_blob clio_cte_write_back_cache_runtime)
+  add_dependencies(test_concurrent_same_blob clio_cte_core_persist_write_back_runtime)
 endif()
 add_test(NAME cte_concurrent_same_blob_flush
     COMMAND test_concurrent_same_blob)
@@ -1483,10 +1504,10 @@ target_include_directories(test_policy_cache PRIVATE
 target_link_libraries(test_policy_cache
     clio_cte_core_runtime
     clio_cte_core_client
-    clio_cte_write_thru_cache_runtime
-    clio_cte_write_thru_cache_client
-    clio_cte_write_back_cache_runtime
-    clio_cte_write_back_cache_client
+    clio_cte_core_persist_write_thru_runtime
+    clio_cte_core_persist_write_thru_client
+    clio_cte_core_persist_write_back_runtime
+    clio_cte_core_persist_write_back_client
     clio::run::admin_runtime
     clio::run::admin_client
     clio::run::bdev_runtime
@@ -2351,13 +2372,12 @@ set_tests_properties(
 endif()
 
 #------------------------------------------------------------------------------
-# Regression: renaming a published directory under a parent whose name has not
-# arrived yet must re-key the whole index subtree (pending_rekey_).
+# Flat tag names: every name verb, batched and single (test_tag_names.cc).
 #------------------------------------------------------------------------------
-add_executable(test_tag_name_rekey test_tag_name_rekey.cc)
-target_include_directories(test_tag_name_rekey PRIVATE
+add_executable(test_tag_names test_tag_names.cc)
+target_include_directories(test_tag_names PRIVATE
     ${CMAKE_SOURCE_DIR}/context-runtime/test)
-target_link_libraries(test_tag_name_rekey
+target_link_libraries(test_tag_names
     clio_cte_core_runtime
     clio_cte_core_client
     clio::run::admin_runtime
@@ -2366,8 +2386,8 @@ target_link_libraries(test_tag_name_rekey
     clio::run::bdev_client
     ctp::cxx
     ${CMAKE_THREAD_LIBS_INIT})
-add_test(NAME cte_tag_name_rekey COMMAND test_tag_name_rekey)
-set_tests_properties(cte_tag_name_rekey PROPERTIES
+add_test(NAME cte_tag_names COMMAND test_tag_names)
+set_tests_properties(cte_tag_names PROPERTIES
     TIMEOUT 120
     LABELS "unit;cte"
     ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1")
@@ -2416,7 +2436,7 @@ add_dependencies(test_cfs_fsync_durable
     clio_cte_core_runtime
     clio_cte_filesystem_runtime
     clio_cte_stream_runtime
-    clio_cte_write_back_cache_runtime
+    clio_cte_core_persist_write_back_runtime
     clio_bdev_runtime
     clio_admin_runtime)
 add_test(NAME cfs_fsync_durable
@@ -2428,3 +2448,32 @@ set_tests_properties(cfs_fsync_durable PROPERTIES
     ENVIRONMENT "${_cfs_shm_read_env}"
     LABELS "unit;cte;cfs;msan_skip")
 endif()  # UNIX
+
+#------------------------------------------------------------------------------
+# core_shm_cache_writethru: client SHM path + chimod flusher (DESIGN.md)
+#------------------------------------------------------------------------------
+if(CLIO_CTE_ENABLE_SHM_WTC)
+  add_executable(test_shm_wtc test_shm_wtc.cc)
+  target_include_directories(test_shm_wtc PRIVATE
+      ${CMAKE_SOURCE_DIR}/context-runtime/test
+      ${CMAKE_SOURCE_DIR}/context-transfer-engine/core_shm_cache_writethru/include
+  )
+  target_link_libraries(test_shm_wtc
+      clio_cte_core_runtime
+      clio_cte_core_client
+      clio_cte_core_shm_cache_writethru_runtime
+      clio_cte_core_shm_cache_writethru_client
+      clio::run::admin_runtime
+      clio::run::admin_client
+      clio::run::bdev_runtime
+      clio::run::bdev_client
+      ctp::cxx
+      ${CMAKE_THREAD_LIBS_INIT}
+  )
+  add_test(NAME cte_shm_wtc COMMAND test_shm_wtc)
+  set_tests_properties(cte_shm_wtc PROPERTIES
+      TIMEOUT 300
+      LABELS "unit;shm_wtc;cte"
+      ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
+  )
+endif()

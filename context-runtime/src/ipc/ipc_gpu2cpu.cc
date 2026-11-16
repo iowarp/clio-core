@@ -11,6 +11,7 @@
 #include <unordered_map>
 #include <vector>
 #include "clio_runtime/cycle_counter.h"
+#include "clio_runtime/evlat.h"
 #include <exception>
 #include <mutex>
 #include <csignal>
@@ -88,9 +89,13 @@ constexpr double kEvBucketUs[EvChan::kBuckets - 1] = {
 // the copy waited on the device before starting, and how long it ran.
 // 19-30: rtt_remote split into per-stage spans on the node that runs each
 // stage -- see clio_runtime/evlat.h for the map.
-constexpr int kNumEvChan = 34;
+// 34-60: the clio-fs create / unlink / size-advance stages (same header).
+// 61-76: the clio-fs file read / write data path (same header).
+// 77-79: the FUSE adapter's sequential read-ahead (same header).
+// 80-82: the stages of one native DAOS bdev block I/O (same header).
+constexpr int kNumEvChan = 86;
 EvChan g_chan[kNumEvChan];
-const char *g_chan_name[kNumEvChan] = {"multi_total", "multi_await", "get_total",
+const char *g_chan_name[] = {"multi_total", "multi_await", "get_total",
                               "bdev_h2d",   "read_await",  "get_meta",
                               "bdev_read",  "direct_read",
                               "reorg_stall", "reorg_move",
@@ -102,7 +107,32 @@ const char *g_chan_name[kNumEvChan] = {"multi_total", "multi_await", "get_total"
                               "r_read", "r_recvin", "r_lane", "r_exec",
                               "r_netq", "r_send", "r_resid",
                               "o_read", "o_recvout", "peer_poll",
-                              "c_e2e", "o_res_loc", "o_res_rem"};
+                              "c_e2e", "o_res_loc", "o_res_rem",
+                              "fs_cr_total", "fs_cr_parent", "fs_cr_lookup",
+                              "fs_cr_mint", "fs_cr_inode", "fs_cr_row",
+                              "fs_cr_open",
+                              "fs_row_exec", "fs_row_load", "fs_row_wait",
+                              "fs_row_journal", "fs_row_blob", "fs_row_push",
+                              "fs_row_holders", "fs_row_split",
+                              "fs_ino_exec", "fs_ino_store", "fs_ino_mirror",
+                              "fs_op_flush",
+                              "fs_un_total", "fs_un_parent", "fs_un_row",
+                              "fs_un_nlink",
+                              "fs_sz_total", "fs_sz_home", "fs_sz_stream",
+                              "fs_sz_flush",
+                              "rd_total", "rd_size", "rd_page", "rd_pages",
+                              "rd_bytes", "wr_total", "wr_page",
+                              "gb_local", "gb_fwd", "pb_fwd", "gb_tok",
+                              "pb_exec", "pb_tok", "pb_drain", "pb_alloc",
+                              "pb_bdev",
+                              "ra_hit", "ra_wait", "ra_miss",
+                              "daos_q", "daos_io", "daos_done",
+                              "wb_sync_loc", "wb_sync_all", "wb_sync_core"};
+// A name for every channel: a missing initializer would be a null %s.
+static_assert(sizeof(g_chan_name) / sizeof(g_chan_name[0]) == kNumEvChan,
+              "g_chan_name must name every channel");
+static_assert(kNumEvChan == clio::run::evlat::kNumChan,
+              "kNumEvChan must match clio::run::evlat::kNumChan");
 
 // TSC rate. The report used to assume a 3 GHz TSC (2995 cycles/us); on a
 // 2.2 GHz part every printed microsecond was 27% short. Measured once at
@@ -218,6 +248,18 @@ extern "C" void clio_evlat_busy(int which, unsigned long long start,
 
 extern "C" double clio_evlat_cycles_per_us() { return g_cyc_per_us; }
 
+/**
+ * Record a plain number on a latency channel, scaled so the report's
+ * microsecond figures for that channel read as the number itself (avg = mean,
+ * max = largest), e.g. a fan-out per operation.
+ * @param which channel index
+ * @param n the number to record
+ */
+extern "C" void clio_evlat_count(int which, unsigned long long n) {
+  clio_evlat_add(which, static_cast<unsigned long long>(
+                            static_cast<double>(n) * g_cyc_per_us + 0.5));
+}
+
 namespace {
 
 /** Per busy kind: the loaded windows (ops >= 10% of the busiest window's)
@@ -288,6 +330,10 @@ void EvDumpOnSignal(int) {
             r.kind, r.slot, r.aux);
   }
   fprintf(stderr, "==== end evlog ====\n");
+  // Under CLIO_EVLAT also the channel report so far: a process that is
+  // killed rather than exited (a FUSE adapter at job teardown) never runs
+  // the atexit report.
+  if (std::getenv("CLIO_EVLAT") != nullptr) EvChanReport();
   fflush(stderr);
 }
 #endif

@@ -118,6 +118,18 @@ class Runtime : public clio::run::Container {
   /** Order, reserve, persist and copy one batch (home). */
   clio::run::TaskResume Plan(clio::run::shared_ptr<PlanTask> &task);
 
+  /**
+   * Adopt the score rule for the page blobs this container merges appends
+   * into. The filesystem container that owns the files calls it at Create
+   * with its `data_score` settings; until then every merge page is put with
+   * the default score (-1).
+   * @param policy rule mapping a page index to its put score
+   */
+  void SetPageScorePolicy(const clio::cte::core::PageScorePolicy &policy) {
+    page_head_pages_.store(policy.head_pages_, std::memory_order_relaxed);
+    page_data_score_.store(policy.data_score_, std::memory_order_release);
+  }
+
   // ---- Container virtuals (autogen/stream_lib_exec.cc) ----
   void Init(const clio::run::PoolId &pool_id, const std::string &pool_name,
             clio::run::u32 container_id = 0) override;
@@ -335,7 +347,22 @@ class Runtime : public clio::run::Container {
    *  (called from the Sequence tick). */
   void SyncLogPeriodically();
 
+  /**
+   * The score rule merge pages are put with (see SetPageScorePolicy).
+   * @return the current rule; off unless a filesystem container set one
+   */
+  clio::cte::core::PageScorePolicy PageScore() const {
+    clio::cte::core::PageScorePolicy policy;
+    policy.data_score_ = page_data_score_.load(std::memory_order_acquire);
+    policy.head_pages_ = page_head_pages_.load(std::memory_order_relaxed);
+    return policy;
+  }
+
   StreamConfig config_;
+  /** Score of merge pages past the head pages (-1 = default placement). */
+  std::atomic<float> page_data_score_{-1.0f};
+  /** Leading pages of each stream that keep the default score. */
+  std::atomic<clio::run::u32> page_head_pages_{1};
   clio::cte::core::Client cte_;      ///< pages
   clio::cte::core::Client staging_;  ///< staged appends
   Client self_;

@@ -130,8 +130,8 @@ static void MaybeWriteFlushConfig() {
       "      - path: \"ram::same_blob_flush_dram\"\n        bdev_type: \"ram\"\n"
       "        capacity_limit: \"4GB\"\n        score: 1.0\n"
       "    dpe:\n      dpe_type: \"max_bw\"\n"
-      "  - mod_name: clio_cte_write_back_cache\n"
-      "    pool_name: clio_cte_write_back_cache\n"
+      "  - mod_name: clio_cte_core_persist_write_back\n"
+      "    pool_name: clio_cte_core_persist_write_back\n"
       "    pool_query: local\n    pool_id: 567.0\n"
       "    next_volatile: \"540.0\"\n    next_persistent: \"512.0\"\n"
       "    flush_period_ms: 500\n";

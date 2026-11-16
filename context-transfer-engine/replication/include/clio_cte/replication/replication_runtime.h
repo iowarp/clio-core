@@ -297,11 +297,15 @@ class Runtime : public clio::cte::core::CoreInterposer {
    * happens after a COMPLETE copy (a partial local copy is never served
    * because CachedGet requires coverage, but registering it would earn a
    * pointless invalidation).
+   * @param version out: the blob version every chunk was read at (0 if the
+   *        core reported none); registration passes it so the owner can
+   *        reject a copy a concurrent write already superseded
    */
   clio::run::TaskResume CacheLocalCopy(const TagId &tag_id,
                                        const std::string &blob_name,
                                        clio::run::u64 total,
-                                       bool &cached);
+                                       bool &cached,
+                                       clio::run::u64 *version);
 
   /** Lazily bind the core client (compose next_pool_id, default kCtePoolId) */
   clio::cte::core::Client *GetCoreClient();

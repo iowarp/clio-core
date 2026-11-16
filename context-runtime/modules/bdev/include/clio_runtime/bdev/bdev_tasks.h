@@ -89,7 +89,8 @@ enum class BdevType : clio::run::u32 {
   kPinned = 3,  // Pinned host memory via cudaMallocHost
   kNoop = 4,    // No-op backend for latency testing (no actual I/O)
   kS3 = 5,      // Amazon S3 object store backend
-  kGcs = 6      // Google Cloud Storage object store backend
+  kGcs = 6,     // Google Cloud Storage object store backend
+  kDaos = 7     // Native DAOS backend (a DFS file driven through libdfs)
 };
 
 /**
@@ -360,7 +361,8 @@ struct CreateParams {
         perf_metrics_.write_latency_us_ = 10.0;
         perf_metrics_.iops_ = 500000.0;
         break;
-      default:  // kFile / kS3 / kGcs / kNoop keep the conservative estimates
+      default:  // kFile / kS3 / kGcs / kDaos / kNoop keep the conservative
+                // estimates
         break;
     }
   }
@@ -395,6 +397,8 @@ struct CreateParams {
         bdev_type_ = BdevType::kS3;
       } else if (type_str == "gcs") {
         bdev_type_ = BdevType::kGcs;
+      } else if (type_str == "daos") {
+        bdev_type_ = BdevType::kDaos;
       }
       // The type now implies its speed. Before this, EVERY bdev type kept the
       // conservative file defaults (100/80 MB/s), so a kHbm tier and a kRam

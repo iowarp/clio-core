@@ -135,6 +135,20 @@ class CTEBenchmark {
     HLOG(kInfo, "===========================");
   }
 
+  /**
+   * Placement score every (non-defer) bench put carries. CLIO_BENCH_PUT_SCORE
+   * overrides the historical 0.8; -1 (auto) is what the shm write-through
+   * cache absorbs, an explicit score takes its task path.
+   * @return the score, read once per process
+   */
+  static float PutScore() {
+    static const float v = [] {
+      const char *e = std::getenv("CLIO_BENCH_PUT_SCORE");
+      return (e != nullptr && *e) ? std::strtof(e, nullptr) : 0.8f;
+    }();
+    return v;
+  }
+
   // PoolQuery flavor each AsyncPutBlob/AsyncGetBlob is issued with.
   // Read once per worker thread; constant for the duration of the run.
   clio::run::PoolQuery MakeQuery() const {
@@ -185,7 +199,7 @@ class CTEBenchmark {
     if (mode == Mode::kGet) {
       for (long k = 0; k < KeyspaceSize(); ++k) {
         auto t = cte->AsyncPutBlob(tag_id, blob_name(k), 0, a_.io_size,
-                                   put_ptr, 0.8f,
+                                   put_ptr, PutScore(),
                                    clio::cte::core::Context(), 0, pq);
         t.Wait();
         if (t->return_code_.load() != 0) {
@@ -213,7 +227,7 @@ class CTEBenchmark {
         for (long j = 0; j < batch; ++j) {
           pts.push_back(cte->AsyncPutBlob(
               tag_id, blob_name(KeyIndex(i + j, per_thread_blobs_)), 0,
-              a_.io_size, put_ptr, 0.8f,
+              a_.io_size, put_ptr, PutScore(),
               clio::cte::core::Context(), 0, pq));
         }
         for (auto &t : pts) {
@@ -419,7 +433,34 @@ class CTEBenchmark {
     }
     for (auto &t : threads) t.join();
     clio_bench::PrintResults(a_.test_case, a_, times, ops);
+    PrintWtcStats();
     return !err.load();
+  }
+
+  /** Node-wide shm write-through cache counters, when this client uses it. */
+  static void PrintWtcStats() {
+    auto *cte = CLIO_CTE_CLIENT;
+    const auto *s = cte != nullptr ? cte->WtcStats() : nullptr;
+    if (s == nullptr) return;
+    std::printf("WTC stats: puts=%llu hits=%llu misses=%llu fills=%llu "
+                "evictions=%llu waits=%llu flush_batches=%llu "
+                "flush_ranges=%llu flush_skipped=%llu miss_absent=%llu "
+                "miss_nonres=%llu miss_range=%llu miss_busy=%llu "
+                "invalidations=%llu\n",
+                (unsigned long long)s->puts_.load(),
+                (unsigned long long)s->get_hits_.load(),
+                (unsigned long long)s->get_misses_.load(),
+                (unsigned long long)s->fills_.load(),
+                (unsigned long long)s->evictions_.load(),
+                (unsigned long long)s->waits_.load(),
+                (unsigned long long)s->flush_batches_.load(),
+                (unsigned long long)s->flush_ranges_.load(),
+                (unsigned long long)s->flush_skipped_.load(),
+                (unsigned long long)s->miss_absent_.load(),
+                (unsigned long long)s->miss_nonres_.load(),
+                (unsigned long long)s->miss_range_.load(),
+                (unsigned long long)s->miss_busy_.load(),
+                (unsigned long long)s->invalidations_.load());
   }
 
   BenchArgs a_;

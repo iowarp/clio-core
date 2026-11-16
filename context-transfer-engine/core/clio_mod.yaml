@@ -68,3 +68,5 @@ kSyncTag: 56            # fsync for one tag: blobs to a persistent tier, sync de
 kListLocalBlobs: 57     # list blobs (tag id + name) matching a name pattern on the queried containers
 kTagXattr: 58           # set / get / delete / list one key of a tag's xattr section
 kSetDurability: 59      # switch the core between volatile and persistent at runtime
+kMultiDelBlob: 60       # delete a set of blobs in one task (split by owner, one plan each)
+kMultiDelTag: 61        # delete a set of tags (by id) in one task (each container its share)

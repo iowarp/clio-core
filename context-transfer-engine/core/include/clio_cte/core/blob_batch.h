@@ -49,6 +49,46 @@ inline std::vector<MultiPutDesc> DecodeMultiPutDescs(
   return descs;
 }
 
+/** Pack MultiDelBlobTask::keys_. */
+inline std::string EncodeMultiDelKeys(const std::vector<MultiDelKey> &keys) {
+  std::vector<char> buf;
+  ctp::ipc::GlobalSerialize<std::vector<char>> ar(buf);
+  ar(const_cast<std::vector<MultiDelKey> &>(keys));
+  ar.Finalize();
+  return std::string(buf.begin(), buf.end());
+}
+
+/** Unpack MultiDelBlobTask::keys_. */
+inline std::vector<MultiDelKey> DecodeMultiDelKeys(
+    const clio::run::priv::string &packed) {
+  std::vector<MultiDelKey> keys;
+  std::string raw = packed.str();
+  std::vector<char> buf(raw.begin(), raw.end());
+  ctp::ipc::GlobalDeserialize<std::vector<char>> ar(buf);
+  ar(keys);
+  return keys;
+}
+
+/** Pack MultiDelTagTask::tags_. */
+inline std::string EncodeMultiDelTags(const std::vector<TagId> &tags) {
+  std::vector<char> buf;
+  ctp::ipc::GlobalSerialize<std::vector<char>> ar(buf);
+  ar(const_cast<std::vector<TagId> &>(tags));
+  ar.Finalize();
+  return std::string(buf.begin(), buf.end());
+}
+
+/** Unpack MultiDelTagTask::tags_. */
+inline std::vector<TagId> DecodeMultiDelTags(
+    const clio::run::priv::string &packed) {
+  std::vector<TagId> tags;
+  std::string raw = packed.str();
+  std::vector<char> buf(raw.begin(), raw.end());
+  ctp::ipc::GlobalDeserialize<std::vector<char>> ar(buf);
+  ar(tags);
+  return tags;
+}
+
 /**
  * A decoded, addressable view of a MultiPutBlob batch: descriptors plus the
  * resolved base pointer of the shared staging buffer. Records whose payload

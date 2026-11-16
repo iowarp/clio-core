@@ -47,8 +47,8 @@
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/core/core_config.h>
 #include <clio_cte/core/core_tasks.h>
-#include <clio_cte/write_back_cache/write_back_cache_client.h>
-#include <clio_cte/write_thru_cache/write_thru_cache_client.h>
+#include <clio_cte/core_persist_write_back/core_persist_write_back_client.h>
+#include <clio_cte/core_persist_write_thru/core_persist_write_thru_client.h>
 
 #include <chrono>
 #include <cstring>
@@ -230,8 +230,8 @@ class PolicyCacheFixture {
 
   void CreateCaches() {
     {
-      clio::cte::write_thru_cache::Client c;
-      clio::cte::write_thru_cache::WriteThruCacheConfig params;
+      clio::cte::core_persist_write_thru::Client c;
+      clio::cte::core_persist_write_thru::WriteThruCacheConfig params;
       params.volatile_pool_ = kVolatilePool;
       params.persistent_pool_ = kPersistentPool;
       auto f = c.AsyncCreateCache(clio::run::PoolQuery::Local(),
@@ -240,8 +240,8 @@ class PolicyCacheFixture {
       REQUIRE(f->GetReturnCode() == 0);
     }
     for (int strict = 0; strict < 2; ++strict) {
-      clio::cte::write_back_cache::Client c;
-      clio::cte::write_back_cache::WriteBackCacheConfig params;
+      clio::cte::core_persist_write_back::Client c;
+      clio::cte::core_persist_write_back::WriteBackCacheConfig params;
       params.volatile_pool_ = kVolatilePool;
       params.persistent_pool_ = kPersistentPool;
       params.flush_period_ms_ = 0;  // flushes only when the test asks
@@ -623,18 +623,22 @@ TEST_CASE("Write-through: persistent first, copy kept current",
   REQUIRE(Get(kPersistentPool, tag, "t0", 0, v1.size()) == want);
 }
 
-TEST_CASE("Read miss fills the volatile core",
+TEST_CASE("A blob read twice is filled into the volatile core",
           "[cte][policy_cache][fill]") {
   Fixture();
   const TagId tag = MakeTag("pc_fill");
   const std::string v = Payload(300 * 1024, 'f');
   REQUIRE(Put(kPersistentPool, tag, "f0", 0, v) == 0);  // behind the cache
   REQUIRE(SizeOn(kVolatilePool, tag, "f0") == -1);
-  REQUIRE(Get(kThruPool, tag, "f0", 0, v.size()) == v);   // miss -> fill
+  // Default admission (on_hit_count:2): a one-time read is not copied in.
+  REQUIRE(Get(kThruPool, tag, "f0", 0, v.size()) == v);
+  REQUIRE(SizeOn(kVolatilePool, tag, "f0") == -1);
+  REQUIRE(Get(kThruPool, tag, "f0", 0, v.size()) == v);   // 2nd miss -> fill
   REQUIRE(SizeOn(kVolatilePool, tag, "f0") == (long long)v.size());
   REQUIRE(Get(kThruPool, tag, "f0", 0, v.size()) == v);   // hit
-  // A partial read fills too (chunked from persistent).
+  // A partial read fills the whole blob on its second miss.
   REQUIRE(Put(kPersistentPool, tag, "f1", 0, v) == 0);
+  REQUIRE(Get(kThruPool, tag, "f1", 1000, 2000) == v.substr(1000, 2000));
   REQUIRE(Get(kThruPool, tag, "f1", 1000, 2000) == v.substr(1000, 2000));
   REQUIRE(Get(kVolatilePool, tag, "f1", 0, v.size()) == v);
 }

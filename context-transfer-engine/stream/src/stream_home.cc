@@ -453,6 +453,8 @@ clio::run::TaskResume Runtime::CopySlice(const StreamPlan *plan,
   }
   size_t k = first;
   pos = 0;
+  // File data: scored by the filesystem's rule (off = -1, as before).
+  const clio::cte::core::PageScorePolicy page_score = PageScore();
   while (k < last && *ok) {
     if (!have[k - first]) {
       pos += plan->entries_[k].size_;
@@ -467,7 +469,8 @@ clio::run::TaskResume Runtime::CopySlice(const StreamPlan *plan,
       const clio::run::u64 page_off = cur % kStreamPageSize;
       const clio::run::u64 n = std::min(kStreamPageSize - page_off, end - cur);
       auto p = cte_.AsyncPutBlob(plan->tag_, StreamPageName(cur), page_off, n,
-                                 buf.ptr_ + (cur - off), -1.0f,
+                                 buf.ptr_ + (cur - off),
+                                 page_score.ScoreOf(cur / kStreamPageSize),
                                  clio::cte::core::Context(), 0u);
       CLIO_CO_AWAIT(p);
       if (p->GetReturnCode() != 0) {

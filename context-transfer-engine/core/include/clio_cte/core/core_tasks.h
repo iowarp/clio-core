@@ -3292,10 +3292,47 @@ struct MultiPutDesc {
   clio::run::u64 offset_ = 0;
   clio::run::u64 size_ = 0;
   clio::run::u64 payload_off_ = 0;
+  /** Per-record put flags (kCtePutDroppable). Records needing replace or
+   *  append semantics are not batched. */
+  clio::run::u32 flags_ = 0;
+  /** Placement score of this record's nested put, with PutBlob's meaning:
+   *  -1 (default) = the blob's existing score, or 1.0 for a new blob. */
+  float score_ = -1.0f;
 
+  /** Serialize every field (the wire format of MultiPutBlobTask::descs_). */
   template <typename Ar>
   void serialize(Ar &ar) {
-    ar(tag_id_, blob_name_, offset_, size_, payload_off_);
+    ar(tag_id_, blob_name_, offset_, size_, payload_off_, flags_,
+       score_);
+  }
+};
+
+/**
+ * Placement-score rule for the page blobs of a paged file (the filesystem
+ * module's `data_score` / `data_score_head_pages` settings).
+ *
+ * File data is stored as fixed-size page blobs named by page index. With the
+ * rule off (the default) every page is put with score -1, exactly as before
+ * the rule existed. With it on, pages at or past `head_pages_` are put with
+ * `data_score_`, while the first `head_pages_` pages of every file keep -1 so
+ * small files and file heads stay on the fastest tier next to the metadata.
+ */
+struct PageScorePolicy {
+  /** Score for file data pages; anything outside (0, 1] turns the rule off. */
+  float data_score_ = -1.0f;
+  /** Leading pages of each file that keep the default score. */
+  clio::run::u32 head_pages_ = 1;
+
+  /** @return true when data_score_ is a usable score, i.e. in (0, 1]. */
+  bool Enabled() const { return data_score_ > 0.0f && data_score_ <= 1.0f; }
+
+  /**
+   * Score to pass to PutBlob for one page of a file.
+   * @param page_index index of the page blob (byte offset / page size)
+   * @return data_score_ for a data page under an enabled rule, else -1
+   */
+  float ScoreOf(clio::run::u64 page_index) const {
+    return (Enabled() && page_index >= head_pages_) ? data_score_ : -1.0f;
   }
 };
 
@@ -3391,6 +3428,145 @@ struct MultiPutBlobTask : public clio::run::Task {
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
     auto other = other_base.template Cast<MultiPutBlobTask>();
+    num_ok_ += other->num_ok_;
+    if (first_rc_ == 0) first_rc_ = other->first_rc_;
+  }
+};
+
+/** One blob a MultiDelBlob deletes. */
+struct MultiDelKey {
+  TagId tag_id_;
+  std::string blob_name_;
+
+  template <typename Ar>
+  void serialize(Ar &ar) {
+    ar(tag_id_, blob_name_);
+  }
+};
+
+/**
+ * Delete a set of blobs in ONE task. The core splits the set by owner: the
+ * blobs this container owns are deleted as one plan (each locked and
+ * invalidated, then all their blocks freed with one FreeBlocks per pool);
+ * every other owner's subset goes out as one MultiDelBlob, all concurrently.
+ * Routed by its first key (Dynamic), like MultiPutBlob.
+ */
+struct MultiDelBlobTask : public clio::run::Task {
+  IN TagId route_tag_id_;                  // routing key (first blob)
+  IN clio::run::priv::string route_blob_;  // routing key (first blob)
+  IN clio::run::priv::string keys_;        // serialized vector<MultiDelKey>
+  IN clio::run::u32 del_flags_;            // kDelCacheCopyOnly, or 0
+  OUT clio::run::u32 num_ok_;              // blobs deleted
+  OUT int first_rc_;                       // first nonzero rc (1 = not found)
+
+  MultiDelBlobTask()
+      : clio::run::Task(),
+        route_blob_(CLIO_PRIV_ALLOC),
+        keys_(CLIO_PRIV_ALLOC),
+        del_flags_(0),
+        num_ok_(0),
+        first_rc_(0) {}
+
+  CTP_CROSS_FUN explicit MultiDelBlobTask(
+      const clio::run::TaskId &task_id, const clio::run::PoolId &pool_id,
+      const clio::run::PoolQuery &pool_query, const TagId &route_tag_id,
+      const std::string &route_blob, const std::string &keys,
+      clio::run::u32 del_flags = 0)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kMultiDelBlob),
+        route_tag_id_(route_tag_id),
+        route_blob_(CLIO_PRIV_ALLOC, route_blob),
+        keys_(CLIO_PRIV_ALLOC, keys),
+        del_flags_(del_flags),
+        num_ok_(0),
+        first_rc_(0) {
+    task_id_ = task_id;
+    pool_id_ = pool_id;
+    method_ = Method::kMultiDelBlob;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(route_tag_id_, route_blob_, keys_, del_flags_);
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    ar(num_ok_, first_rc_);
+  }
+
+  void Copy(const ctp::ipc::FullPtr<MultiDelBlobTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    route_tag_id_ = other->route_tag_id_;
+    route_blob_ = other->route_blob_;
+    keys_ = other->keys_;
+    del_flags_ = other->del_flags_;
+    num_ok_ = other->num_ok_;
+    first_rc_ = other->first_rc_;
+  }
+
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    auto other = other_base.template Cast<MultiDelBlobTask>();
+    num_ok_ += other->num_ok_;
+    if (first_rc_ == 0) first_rc_ = other->first_rc_;
+  }
+};
+
+/**
+ * Delete a set of tags (by id) in ONE task. Like DelTag by id, each
+ * container that runs it removes ITS share of every listed tag (TagInfo,
+ * aliases, descendants and the blobs it holds, deleted as one plan per
+ * tag); broadcast it once to delete the set cluster-wide.
+ */
+struct MultiDelTagTask : public clio::run::Task {
+  IN clio::run::priv::string tags_;  // serialized vector<TagId>
+  OUT clio::run::u32 num_ok_;        // tags this container deleted
+  OUT int first_rc_;                 // first nonzero per-tag rc
+
+  MultiDelTagTask()
+      : clio::run::Task(), tags_(CLIO_PRIV_ALLOC), num_ok_(0), first_rc_(0) {}
+
+  CTP_CROSS_FUN explicit MultiDelTagTask(const clio::run::TaskId &task_id,
+                                         const clio::run::PoolId &pool_id,
+                                         const clio::run::PoolQuery &pool_query,
+                                         const std::string &tags)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kMultiDelTag),
+        tags_(CLIO_PRIV_ALLOC, tags),
+        num_ok_(0),
+        first_rc_(0) {
+    task_id_ = task_id;
+    pool_id_ = pool_id;
+    method_ = Method::kMultiDelTag;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(tags_);
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    ar(num_ok_, first_rc_);
+  }
+
+  void Copy(const ctp::ipc::FullPtr<MultiDelTagTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    tags_ = other->tags_;
+    num_ok_ = other->num_ok_;
+    first_rc_ = other->first_rc_;
+  }
+
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    auto other = other_base.template Cast<MultiDelTagTask>();
     num_ok_ += other->num_ok_;
     if (first_rc_ == 0) first_rc_ = other->first_rc_;
   }
@@ -4670,40 +4846,81 @@ struct GetNumAliasesTask : public clio::run::Task {
   }
 };
 
-/** Operations carried by UpdateTagNamesTask (see EncodeTagNameOp). */
+/**
+ * Operations carried by UpdateTagNamesTask (see EncodeTagNameOp).
+ *
+ * Names are flat strings. A name's binding (name -> tag) lives on the
+ * container the name hashes to (NameHash, the same hash GetOrCreateTag routes
+ * by); a tag's name list (canonical name + aliases) lives on its home
+ * container (TagHomeHash). Callers send the first three ops; the core expands
+ * each into the per-container steps below and sends every step to the
+ * container that holds that state.
+ */
 enum class TagNameOp : clio::run::u32 {
   kAddName = 1,     ///< bind `name` to the tag (canonical if it has none, else an alias)
   kRemoveName = 2,  ///< unbind `name` from the tag
-  kRename = 3,      ///< rebind the tag's `name` to `name2` (O(1): children keep their ids)
-  kSetRoot = 4,     ///< bind "/" to the tag (the hierarchy's root)
-  kResetPublished = 5,  ///< drop every published "$tagid{..}" name (restart resync)
+  kRename = 3,      ///< rebind the tag's `name` to `name2` (replaces another tag's `name2`)
+  // ---- per-container steps (sent by the core to the container that holds the state) ----
+  kBind = 10,       ///< name owner: bind name -> tag (seq_ & kTnReplace: take it from another tag)
+  kUnbind = 11,     ///< name owner: drop the binding if it names the tag
+  kLookup = 12,     ///< name owner: report the bound tag
+  kHomeAdd = 20,    ///< tag home: add a name (seq_ & kTnMustExist: only to a known tag)
+  kHomeRemove = 21, ///< tag home: remove a name, promoting an alias if it was canonical
+  kHomeRename = 22, ///< tag home: replace name with name2 in place
+  kHomeUnlink = 23, ///< tag home: unlink a name; drops the tag when it was its last
+  kHomeDrop = 24,   ///< tag home: drop the whole name list (the tag is being deleted)
+  kHomeNames = 25,  ///< tag home: report the name list
+};
+
+/** kBind flag: take the name from another tag (rename semantics). */
+constexpr clio::run::u64 kTnReplace = 1;
+/** kHomeAdd flag: only when the home knows the tag. */
+constexpr clio::run::u64 kTnMustExist = 2;
+/** kHomeUnlink flag: POSIX unlink (keep the tag while another name is left). */
+constexpr clio::run::u64 kTnPosix = 4;
+
+/** Step results (TagNameOpRec::op_ of a result record). */
+enum TagNameResult : clio::run::u32 {
+  kTnOk = 0,        ///< applied; tag_ = the tag now bound / affected
+  kTnMissing = 1,   ///< name not bound / tag unknown at its home
+  kTnTaken = 2,     ///< kBind: name bound to another tag (tag_ = that tag)
+  kTnDeleted = 3,   ///< kHomeUnlink / kHomeDrop: the tag lost its last name
+                    ///< (name_ = every name it had, '\0'-separated)
+  kTnUnreached = 4, ///< a container holding this op's state did not answer
+                    ///< (down): nothing was undone; send the op again
 };
 
 /**
- * Stored hierarchical form of a child name: "$tagid{<major>.<minor>}/<leaf>"
- * relative to its parent tag, so moving a directory re-keys ONE name. The
- * core resolves it to an absolute path for its search index.
- * @param parent parent tag id
- * @param leaf single path component
- * @return stored name
+ * Hash that picks a tag's home container (DirectHash), from its id.
+ * Fixed and cheap: the server mints ids whose home is the minting container.
+ * @param id tag id
+ * @return routing hash
  */
-inline std::string MakeTagRefName(const TagId &parent, const std::string &leaf) {
-  return "$tagid{" + std::to_string(parent.major_) + "." +
-         std::to_string(parent.minor_) + "}/" + leaf;
+inline clio::run::u32 TagHomeHash(const TagId &id) {
+  return id.minor_ + (id.major_ * 2654435761u) % 65521u;
+}
+
+/**
+ * Hash that picks the container holding a name's binding (DirectHash).
+ * @param name tag name
+ * @return routing hash
+ */
+inline clio::run::u32 NameHash(const std::string &name) {
+  return static_cast<clio::run::u32>(std::hash<std::string>{}(name));
 }
 
 /**
  * Append one tag-name operation to an UpdateTagNames batch.
- * Record: [u32 op][u32 major][u32 minor][u64 seq][u32 len][name][u32 len][name2]
+ * Record: [u32 op][u32 major][u32 minor][u64 flags][u32 len][name][u32 len][name2]
  * @param out batch buffer
  * @param op operation
  * @param tag tag id
- * @param seq last-writer-wins stamp (wall-clock ns at the name's owner)
- * @param name stored name (see MakeTagRefName)
- * @param name2 new stored name (kRename only)
+ * @param flags kTn* flags (kTnMustExist on kAddName; step flags); 0 for none
+ * @param name tag name
+ * @param name2 new tag name (kRename / kHomeRename only)
  */
 inline void EncodeTagNameOp(std::string *out, TagNameOp op, const TagId &tag,
-                            clio::run::u64 seq, const std::string &name,
+                            clio::run::u64 flags, const std::string &name,
                             const std::string &name2 = std::string()) {
   auto put32 = [out](clio::run::u32 v) {
     out->append(reinterpret_cast<const char *>(&v), sizeof(v));
@@ -4711,7 +4928,7 @@ inline void EncodeTagNameOp(std::string *out, TagNameOp op, const TagId &tag,
   put32(static_cast<clio::run::u32>(op));
   put32(tag.major_);
   put32(tag.minor_);
-  out->append(reinterpret_cast<const char *>(&seq), sizeof(seq));
+  out->append(reinterpret_cast<const char *>(&flags), sizeof(flags));
   put32(static_cast<clio::run::u32>(name.size()));
   out->append(name);
   put32(static_cast<clio::run::u32>(name2.size()));
@@ -4722,7 +4939,7 @@ inline void EncodeTagNameOp(std::string *out, TagNameOp op, const TagId &tag,
 struct TagNameOpRec {
   TagNameOp op_ = TagNameOp::kAddName;
   TagId tag_;
-  clio::run::u64 seq_ = 0;
+  clio::run::u64 flags_ = 0;  ///< kTn* flags; a kBind result: the displaced tag
   std::string name_;
   std::string name2_;
 };
@@ -4754,7 +4971,7 @@ inline bool DecodeTagNameOps(const char *data, size_t len,
     TagNameOpRec r;
     clio::run::u32 op = 0;
     if (!get(&op, 4) || !get(&r.tag_.major_, 4) || !get(&r.tag_.minor_, 4) ||
-        !get(&r.seq_, 8) || !get_str(&r.name_) || !get_str(&r.name2_)) {
+        !get(&r.flags_, 8) || !get_str(&r.name_) || !get_str(&r.name2_)) {
       return false;
     }
     r.op_ = static_cast<TagNameOp>(op);
@@ -4764,20 +4981,25 @@ inline bool DecodeTagNameOps(const char *data, size_t len,
 }
 
 /**
- * UpdateTagNames task - apply a batch of tag-name operations to this
- * container's name table and search index. Sent as a Broadcast so EVERY
- * container holds every name: each can resolve "$tagid{parent}/leaf" names
- * to absolute paths and answer TagQuery/BlobQuery/SemanticSearch locally.
- * Idempotent and order-tolerant: per-name last-writer-wins by seq, and a
- * name whose parent has not arrived yet is parked until it does.
+ * UpdateTagNames task - the batched tag-name verb (MultiRenameTag,
+ * MultiGetOrCreateTagAlias and name removal in one). Each record names one
+ * tag and flat name(s); the core sends every step to the container that
+ * holds that state -- a name's binding to the container the name hashes to,
+ * a tag's name list to the tag's home -- and applies the steps for one
+ * container in record order. Send it Local: the receiving container routes.
  */
 struct UpdateTagNamesTask : public clio::run::Task {
-  IN clio::run::priv::string ops_;  // EncodeTagNameOp records
-  OUT clio::run::u32 applied_;      // records applied (not superseded)
+  IN clio::run::priv::string ops_;       // EncodeTagNameOp records
+  OUT clio::run::u32 applied_;           // records applied
+  OUT clio::run::priv::string results_;  // one EncodeTagNameOp record per op
+                                         // (op_ = TagNameResult)
 
   // SHM constructor
   UpdateTagNamesTask()
-      : clio::run::Task(), ops_(CLIO_PRIV_ALLOC), applied_(0) {}
+      : clio::run::Task(),
+        ops_(CLIO_PRIV_ALLOC),
+        applied_(0),
+        results_(CLIO_PRIV_ALLOC) {}
 
   // Emplace constructor
   CTP_CROSS_FUN explicit UpdateTagNamesTask(const clio::run::TaskId &task_id,
@@ -4786,7 +5008,8 @@ struct UpdateTagNamesTask : public clio::run::Task {
                                             const std::string &ops)
       : clio::run::Task(task_id, pool_id, pool_query, Method::kUpdateTagNames),
         ops_(CLIO_PRIV_ALLOC, ops),
-        applied_(0) {
+        applied_(0),
+        results_(CLIO_PRIV_ALLOC) {
     task_id_ = task_id;
     pool_id_ = pool_id;
     method_ = Method::kUpdateTagNames;
@@ -4803,20 +5026,25 @@ struct UpdateTagNamesTask : public clio::run::Task {
   template <typename Archive>
   CTP_CROSS_FUN void SerializeOut(Archive &ar) {
     Task::SerializeOut(ar);
-    ar(applied_);
+    ar(applied_, results_);
   }
 
   void Copy(const ctp::ipc::FullPtr<UpdateTagNamesTask> &other) {
     Task::Copy(other.template Cast<Task>());
     ops_ = other->ops_;
     applied_ = other->applied_;
+    results_ = other->results_;
   }
 
   // Broadcast aggregation: report the largest per-container count.
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
     auto other = other_base.template Cast<UpdateTagNamesTask>();
-    if (other->applied_ > applied_) applied_ = other->applied_;
+    // A remote reply reaches the sender through here too: carry the
+    // per-record results (a broadcast concatenates them).
+    applied_ += other->applied_;
+    results_ = clio::run::priv::string(
+        CLIO_PRIV_ALLOC, results_.str() + other->results_.str());
   }
 };
 

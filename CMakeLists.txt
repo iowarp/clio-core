@@ -162,6 +162,7 @@ option(CLIO_CORE_ENABLE_SYCL "Enable Intel GPU support via SYCL/oneAPI (icpx -fs
 option(CLIO_CORE_ENABLE_JARVIS "Enable Jarvis CI infrastructure installation" OFF)
 option(CLIO_ENABLE_AMAZON_DRIVE "Enable Amazon S3 intermediate storage" OFF)
 option(CLIO_ENABLE_GOOGLE_CLOUD "Enable Google Cloud Storage intermediate storage" OFF)
+option(CLIO_ENABLE_DAOS "Enable the native DAOS bdev transport (bdev_type: daos; needs libdaos + libdfs + libgurt)" OFF)
 
 #------------------------------------------------------------------------------
 # ClioCtp (context-transport-primitives) Options
@@ -505,9 +506,40 @@ endif()
 
 # Thallium (conditional)
 if(CLIO_CORE_ENABLE_THALLIUM)
+    # thallium's package config resolves margo -> mercury through pkg-config.
+    # Some Mercury packages (e.g. the mercury-devel RPM shipped with DAOS on
+    # Cray systems) install mercury.pc next to libmercury.so instead of in a
+    # pkgconfig/ directory, where pkg-config never looks. When pkg-config
+    # cannot see mercury, locate the library through the normal CMake search
+    # and add the directory holding its .pc file to PKG_CONFIG_PATH.
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(CLIO_MERCURY_PC QUIET mercury)
+    if(NOT CLIO_MERCURY_PC_FOUND)
+        find_library(CLIO_MERCURY_LIBRARY NAMES mercury)
+        if(CLIO_MERCURY_LIBRARY)
+            get_filename_component(CLIO_MERCURY_LIBDIR "${CLIO_MERCURY_LIBRARY}" DIRECTORY)
+            foreach(_clio_pc_dir "${CLIO_MERCURY_LIBDIR}/pkgconfig" "${CLIO_MERCURY_LIBDIR}")
+                if(EXISTS "${_clio_pc_dir}/mercury.pc")
+                    set(ENV{PKG_CONFIG_PATH} "${_clio_pc_dir}:$ENV{PKG_CONFIG_PATH}")
+                    message(STATUS "mercury.pc found at ${_clio_pc_dir} (added to PKG_CONFIG_PATH)")
+                    break()
+                endif()
+            endforeach()
+        endif()
+    endif()
     find_package(thallium CONFIG REQUIRED)
     if(thallium_FOUND)
         message(STATUS "found thallium at ${thallium_DIR}")
+    endif()
+    # A Mercury built with its system-Boost option (HG_HAS_BOOST in
+    # mercury_config.h) includes <boost/preprocessor.hpp> from mercury_macros.h,
+    # which margo.h and so thallium.hpp pull in, but neither mercury.pc nor the
+    # thallium package config exports the Boost include directory. Attach the
+    # Boost headers to the imported thallium target so every consumer sees them.
+    find_package(Boost QUIET)
+    if(Boost_FOUND AND TARGET Boost::headers)
+        target_link_libraries(thallium INTERFACE Boost::headers)
+        message(STATUS "thallium: using Boost headers ${Boost_INCLUDE_DIRS} for mercury_macros.h")
     endif()
     set(SERIALIZATION_LIBS thallium ${SERIALIZATION_LIBS})
     set(CLIO_CORE_ENABLE_CEREAL ON)
@@ -1120,6 +1152,27 @@ if(CLIO_ENABLE_AMAZON_DRIVE AND NOT Poco_FOUND)
 endif()
 if(CLIO_ENABLE_AMAZON_DRIVE)
   message(STATUS "Amazon S3 bdev support: ENABLED (Poco found)")
+endif()
+
+# The DAOS adapter (kDaos bdev transport) talks to a DAOS pool through the
+# client library itself (libdfs files + libdaos event queues) instead of going
+# through a dfuse mount. Same auto-disable treatment as the cloud adapters
+# above: a build that asks for it without the DAOS development files warns and
+# continues without the transport (bdev_type "daos" is then rejected at pool
+# creation with an error naming this option).
+if(CLIO_ENABLE_DAOS)
+  find_package(DAOS QUIET)
+  if(NOT DAOS_FOUND)
+    message(WARNING "CLIO_ENABLE_DAOS is ON but the DAOS client development "
+                    "files (daos_fs.h, libdfs, libdaos, libgurt) were not "
+                    "found. DAOS bdev support will be disabled. Install "
+                    "daos-devel or point DAOS_ROOT / CMAKE_PREFIX_PATH at a "
+                    "DAOS install to enable it.")
+    set(CLIO_ENABLE_DAOS OFF)
+  endif()
+endif()
+if(CLIO_ENABLE_DAOS)
+  message(STATUS "DAOS bdev support: ENABLED (${DAOS_DFS_LIBRARY})")
 endif()
 
 # AWS SDK for C++ (optional - for the CAE S3 assimilator, s3://). Reuses the
@@ -2424,11 +2477,16 @@ endif()
 # Policy caches over a volatile and a persistent core: the default config
 # composes the write-back cache (567.0), so a wheel without it fails to
 # create that pool. cache_base is compiled into each module.
-if(TARGET clio_cte_write_back_cache_client)
-  list(APPEND PIP_LIB_TARGETS clio_cte_write_back_cache_client clio_cte_write_back_cache_runtime)
+if(TARGET clio_cte_core_persist_write_back_client)
+  list(APPEND PIP_LIB_TARGETS clio_cte_core_persist_write_back_client clio_cte_core_persist_write_back_runtime)
 endif()
-if(TARGET clio_cte_write_thru_cache_client)
-  list(APPEND PIP_LIB_TARGETS clio_cte_write_thru_cache_client clio_cte_write_thru_cache_runtime)
+if(TARGET clio_cte_core_persist_write_thru_client)
+  list(APPEND PIP_LIB_TARGETS clio_cte_core_persist_write_thru_client clio_cte_core_persist_write_thru_runtime)
+endif()
+# The shm cache: the default config composes it (568.0, metadata only) under
+# the indexer, so a wheel without it fails to create that pool.
+if(TARGET clio_cte_core_shm_cache_writethru_client)
+  list(APPEND PIP_LIB_TARGETS clio_cte_core_shm_cache_writethru_client clio_cte_core_shm_cache_writethru_runtime)
 endif()
 # Indexer chimod (#905): the default config composes it into the filesystem
 # chain (cache -> indexer -> replication), so without it the wheel's

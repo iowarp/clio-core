@@ -80,18 +80,27 @@ inline bool ParsePoolIdString(const std::string &s, clio::run::PoolId *out) {
  *
  *   next_volatile: "540.0"         # volatile core (required)
  *   next_persistent: "561.0"       # persistent chain (omit: volatile only)
- *   fill: on_read_miss             # | on_hit_count:N | none
+ *   fill: on_hit_count:2           # | on_read_miss | none
  *   evict: lru                     # | lfu
  *   flush_period_ms: 10000         # write-back only; 0 = no periodic flush
+ *   flush_fill_pct: 80             # write-back only; flush when the volatile
+ *                                  #   core is this full; 0 = timer only
  *   fallback_to_persistent: true   # write-back: write around when full
  */
 struct PolicyCacheParams {
   clio::run::PoolId volatile_pool_;    ///< next_volatile
   clio::run::PoolId persistent_pool_;  ///< next_persistent (null = none)
-  clio::run::u32 fill_mode_ = static_cast<clio::run::u32>(FillMode::kOnReadMiss);
+  /** Default on_hit_count:2: a blob is copied in on its second read miss, so
+   *  one pass over data larger than the cache never displaces the working
+   *  set (and a small read never pulls in a whole cold blob). */
+  clio::run::u32 fill_mode_ = static_cast<clio::run::u32>(FillMode::kOnHitCount);
   clio::run::u32 fill_hits_ = 2;  ///< N of on_hit_count:N
   clio::run::u32 evict_mode_ = static_cast<clio::run::u32>(EvictMode::kLru);
   clio::run::u32 flush_period_ms_ = 10000;
+  /** Write-back: start a flush of the dirty copies as soon as the volatile
+   *  core is at least this full (percent of its capacity), without waiting
+   *  for the period. 0 = off. */
+  clio::run::u32 flush_fill_pct_ = 80;
   bool fallback_to_persistent_ = true;
 
   PolicyCacheParams()
@@ -108,7 +117,8 @@ struct PolicyCacheParams {
     // Every field round-trips (the rule three silently-dropped-field bugs
     // in the older interposers bought).
     ar(volatile_pool_, persistent_pool_, fill_mode_, fill_hits_,
-       evict_mode_, flush_period_ms_, fallback_to_persistent_);
+       evict_mode_, flush_period_ms_, fallback_to_persistent_,
+       flush_fill_pct_);
   }
 
   /**
@@ -178,6 +188,13 @@ struct PolicyCacheParams {
       }
       if (node["flush_period_ms"]) {
         flush_period_ms_ = node["flush_period_ms"].as<clio::run::u32>();
+      }
+      if (node["flush_fill_pct"]) {
+        flush_fill_pct_ = node["flush_fill_pct"].as<clio::run::u32>();
+        if (flush_fill_pct_ > 100) {
+          HLOG(kError, "policy cache: flush_fill_pct must be 0..100");
+          flush_fill_pct_ = 100;
+        }
       }
       if (node["fallback_to_persistent"]) {
         fallback_to_persistent_ = node["fallback_to_persistent"].as<bool>();
