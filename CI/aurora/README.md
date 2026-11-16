@@ -30,7 +30,7 @@ CI/aurora/run.sh --build build/aurora --suite all --nodes 32 --wait \
 
 | option | default | meaning |
 |---|---|---|
-| `--suite` | `all` | comma list of `smoke`, `posix`, `faults`, `stress`, `safe`, `perf`, `io500`; `all` is every one but `smoke` |
+| `--suite` | `all` | comma list of `smoke`, `cache`, `posix`, `faults`, `stress`, `safe`, `perf`, `io500`; `all` is every one but `smoke` and `cache` |
 | `--nodes` | 32 | nodes per job |
 | `--queue`, `--time`, `--account` | `debug-scaling`, `01:00:00`, `IOWarp` | PBS settings |
 | `--out` | `~/clio_aurora_runs/<date>-<sha>-<nodes>n` | results directory |
@@ -64,6 +64,7 @@ same command plus `--out <same dir> --resume`.
 | suite | leg | profile | groups |
 |---|---|---|---|
 | `smoke` | `smoke` | persistent | six POSIX and cross-node tests (harness check) |
+| `cache` | `cache` | persistent | `cache` alone (a few minutes; the policy-cache tests) |
 | `posix` | `posix_dist` | persistent | `posix`, `dist`, `dirs`, `apps`, `cache` |
 | `faults` | `node_faults` | persistent | `fault`, `repl` (killed daemons, lost nodes, aimed replication/cache faults) |
 | `stress` | `stress_tiers` | tiered | `stress`, `cache` (tier overflow with the organizer migrating) |
@@ -101,29 +102,49 @@ and filesystem (`clio_fs_suite/cluster.py`).
 
 ## IO500 against DAOS
 
-The `io500` suite submits two jobs with the same node count, 16 ranks per
-node and the same caps on work per rank (`IO500_EASY_MB` 768,
-`IO500_HARD_SEG` 400, `IO500_MD_N` 125), both with `SYNC_FS_ONLY=1`:
+The `io500` suite compares clio-fs with DAOS through dfuse, both as a POSIX
+mount on the same DAOS pool, with the same node count, 16 ranks per node and
+the same caps on work per rank (`IO500_EASY_MB` 768, `IO500_HARD_SEG` 400,
+`IO500_MD_N` 125), both with `SYNC_FS_ONLY=1`:
 
-- `cliofs`: clio-fs with `COMPOSE=split` and `NO_FLARE=1`: a volatile DRAM
-  core (25% of each node's share of the data) and a persistent core whose
-  only tier is a file on a dfuse mount of the DAOS pool, under the
-  write-back cache and the shared-memory cache.
-- `daos`: IO500 on a dfuse mount of the same pool.
+- `cliofs`: clio-fs with `COMPOSE=split`: a volatile DRAM core (25% of each
+  node's share of the data, plus 512 MB for metadata) and a persistent core
+  whose only tier is a native DAOS bdev, under the write-back cache and the
+  shared-memory cache; peers talk over Thallium on the Slingshot fabric.
+  The build needs `-DCLIO_CORE_ENABLE_THALLIUM=ON -DCLIO_ENABLE_DAOS=ON`.
+  The full list of settings is `tuned` in `run.sh`.
+- `daos`: IO500 on a dfuse mount of the same pool (`--thread-count=32
+  --eq-count=16`, otherwise dfuse defaults).
 
-`IO500_CLIOFS_VARS` / `IO500_DAOS_VARS` append `qsub -v` settings to one
-side, e.g. to measure DAOS through libdfs instead of dfuse (needs an IO500
-built with the DFS backend):
+`--repeat N` (default 1) submits N runs of each, alternating
+(`cliofs-1`, `daos-1`, `cliofs-2`, ...), so both systems see the same spread
+of nodes and of load on the shared pool. One run is not a result: use at
+least 3.
 
 ```bash
-IO500_DAOS_VARS=DAOS_API=dfs,IO500=$HOME/io500-dfs/io500 \
-  CI/aurora/run.sh --build build/aurora --suite io500 --nodes 32 --wait
+CI/aurora/run.sh --build build/aurora --suite io500 --nodes 32 --repeat 3 --wait
 ```
 
-`<out>/io500/io500.md` is the side-by-side table
-(`benchmarks/io500/compare_io500.py`); any further `*.out` job outputs put in
-`<out>/io500/` become more columns. The work per rank is capped, so the
-scores are not valid IO500 submissions.
+`<out>/io500/io500.md` (`benchmarks/io500/compare_io500.py`) has, per phase,
+each system's mean with its lowest and highest run and the coefficient of
+variation, and the ratio of the means. A phase whose runs differ by more
+than 10% is marked `~`: these runs do not settle its ratio. Above the table
+every run is listed with what would make it unfit to compare: a non-zero
+exit, a missing score, different caps, or error lines (failed fsync, ENOSPC,
+I/O errors) in the ior / mdtest outputs. The command exits non-zero if any
+run is unfit.
+
+`IO500_CLIOFS_VARS` / `IO500_DAOS_VARS` append `qsub -v` settings to one
+side. The work per rank is capped, so the scores are not valid IO500
+submissions.
+
+What the comparison does not equalise: clio-fs acknowledges a write once it
+is in the DRAM cache and makes it durable on `fsync`, or at the next periodic
+flush (`flush_period_ms`, 10 s); dfuse writes through to DAOS. ior calls
+`fsync` before it stops its clock, so the ior phases include the flush.
+mdtest ends a phase with `sync`, which the clio-fs mount does not turn into
+a flush (the adapter has no syncfs handler), so the small files of
+mdtest-hard-write may still be in DRAM when its clock stops.
 
 ## Files
 

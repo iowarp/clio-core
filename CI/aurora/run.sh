@@ -7,14 +7,15 @@
 #                    [--time 01:00:00] [--account IOWarp] [--wait] [--resume]
 #   CI/aurora/run.sh --report <out dir> [--baseline DIR]
 #
-# Suites: smoke, posix, faults, stress, safe, perf, io500, all (= every one
+# Suites: smoke, cache, posix, faults, stress, safe, perf, io500, all (= every one
 # but smoke). Outside a PBS job it submits ONE JOB PER SUITE (Aurora's debug
 # queues cap a job at one hour and a user at one running job, so the jobs
 # run one after another) and prints the job ids; --wait blocks until they
 # end and prints the report. Inside a job it runs the suite named by the
 # submission. Results land in --out:
 #   <out>/<leg>/{results.jsonl,summary.md,suite.log,logs/}
-#   <out>/io500/{cliofs,daos}.out, <out>/io500/io500.md
+#   <out>/io500/{cliofs,daos}-<run>.out, <out>/io500/io500.md (--repeat N
+#   runs of each, alternating; the table reports mean, range and spread)
 #   <out>/report.md   (CI/ares/compare.py: failures, regressions vs --baseline)
 # A leg that runs out of walltime records the tests it did not start as
 # NOTRUN; submit the same command with --out <same dir> --resume to go on.
@@ -29,6 +30,7 @@ SUITE_DIR="${REPO}/context-transfer-engine/test/integration/clio_fs_suite"
 IO500_DIR="${REPO}/benchmarks/io500"
 
 BUILD="" SUITE="all" NODES=32 OUT="" BASELINE="" QUEUE="debug-scaling"
+REPEAT="${IO500_REPEAT:-1}"
 TIME="01:00:00" ACCOUNT="${CLIO_AURORA_ACCOUNT:-IOWarp}" THRESHOLD="0.20"
 WAIT=0 RESUME=0 REPORT="" REL_DISK_GB=13
 FILESYSTEMS="${CLIO_AURORA_FILESYSTEMS:-home:flare:daos_user}"
@@ -44,6 +46,7 @@ while [ $# -gt 0 ]; do
     --time) TIME="$2"; shift 2 ;;
     --account) ACCOUNT="$2"; shift 2 ;;
     --threshold) THRESHOLD="$2"; shift 2 ;;
+    --repeat) REPEAT="$2"; shift 2 ;;
     --rel-disk-gb) REL_DISK_GB="$2"; shift 2 ;;
     --local-root) LOCAL_ROOT="$2"; shift 2 ;;
     --wait) WAIT=1; shift ;;
@@ -125,16 +128,30 @@ if [ -z "${PBS_JOBID:-}" ]; then
       # more would spend the hour in the two delete phases.
       common="BUILD_DIR=${BUILD},HERE=${IO500_DIR},SYNC_FS_ONLY=1,RUN_TAG=ci"
       common+=",EASY_MB=${IO500_EASY_MB:-768},HARD_SEG=${IO500_HARD_SEG:-400},MD_N=${IO500_MD_N:-125}"
-      for mode in cliofs daos; do
-        extra="MODE=${mode}"
-        [ "${mode}" = cliofs ] && extra+=",NO_FLARE=1${IO500_CLIOFS_VARS:+,${IO500_CLIOFS_VARS}}"
-        [ "${mode}" = daos ] && extra+="${IO500_DAOS_VARS:+,${IO500_DAOS_VARS}}"
-        jid="$(submit -q "${QUEUE}" -A "${ACCOUNT}" -l select="${NODES}" \
-                 -l walltime="${TIME}" -l filesystems="${FILESYSTEMS}" \
-                 -N "clio-io500-${mode}" -o "${OUT}/io500/${mode}.out" \
-                 -v "${common},${extra}" "${IO500_DIR}/pbs_io500_aurora.sh")" || exit 3
-        echo "submitted io500/${mode}: ${jid}"
-        jobs+=("${jid}")
+      # The measured clio-fs configuration (needs a build with
+      # CLIO_CORE_ENABLE_THALLIUM=ON and CLIO_ENABLE_DAOS=ON): DRAM + a
+      # native DAOS tier, peers over Thallium on the Slingshot fabric.
+      # IO500_CLIOFS_VARS appends to (and so overrides) these.
+      tuned="NO_FLARE=1,DAOS_NATIVE=1,DAOS_NATIVE_OPTS=prezero=0,META_RAM_MB=512"
+      tuned+=",CLIO_FUSE_MAX_BACKGROUND=256,CLIO_FUSE_READAHEAD_PAGES=4"
+      tuned+=",CLIO_FUSE_ATTR_CACHE_S=1,CLIO_FUSE_DIR_ATTR_CACHE_S=1,CLIO_PREFAULT=0"
+      tuned+=",CLIO_NET_SEND_THREADS=4,CLIO_NET_TIER_LANES=4,CLIO_PEER_TRANSPORT=thallium"
+      tuned+=",CLIO_LBM_THALLIUM_PROTOCOL=ofi+cxi,CLIO_LBM_THALLIUM_LISTEN=cxi0"
+      tuned+=",SETTLE=30,UP_WAIT=600,FUSE_PROFILE=0,HANG_DUMP_S=1200"
+      # --repeat N: N runs of each system, alternating, so that both see the
+      # same spread of nodes and of load on the shared DAOS pool over time.
+      for r in $(seq 1 "${REPEAT}"); do
+        for mode in cliofs daos; do
+          extra="MODE=${mode}"
+          [ "${mode}" = cliofs ] && extra+=",${tuned}${IO500_CLIOFS_VARS:+,${IO500_CLIOFS_VARS}}"
+          [ "${mode}" = daos ] && extra+="${IO500_DAOS_VARS:+,${IO500_DAOS_VARS}}"
+          jid="$(submit -q "${QUEUE}" -A "${ACCOUNT}" -l select="${NODES}" \
+                   -l walltime="${TIME}" -l filesystems="${FILESYSTEMS}" \
+                   -N "clio-io500-${mode}" -o "${OUT}/io500/${mode}-${r}.out" \
+                   -v "${common},${extra}" "${IO500_DIR}/pbs_io500_aurora.sh")" || exit 3
+          echo "submitted io500/${mode}-${r}: ${jid}"
+          jobs+=("${jid}")
+        done
       done
       continue
     fi
@@ -196,6 +213,7 @@ REL="--disk-gb ${REL_DISK_GB}"
 case "${SUITE}" in
   smoke)  LEGS=("smoke|persistent|posix,dist|${REL} --only rw_sizes,rename_file,append_mode,xnode_create_visible,xnode_shared_file_disjoint,xnode_unlink_rename_visible") ;;
   posix)  LEGS=("posix_dist|persistent|posix,dist,dirs,apps,cache|${REL}") ;;
+  cache)  LEGS=("cache|persistent|cache|${REL}") ;;
   faults) LEGS=("node_faults|persistent|fault,repl|${REL}") ;;
   stress) LEGS=("stress_tiers|tiered|stress,cache|--ram-mb 512 --fast-mb 1024 ${REL} --probe-silence-s 30") ;;
   safe)   LEGS=("safe_bdev|safe|safe|--ram-mb 512 --fast-mb 1024 ${REL}") ;;

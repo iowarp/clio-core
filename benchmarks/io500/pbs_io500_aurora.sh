@@ -59,7 +59,8 @@
 #           persistent core (DAOS / Flare file tiers) + volatile core (DRAM)
 #           under CACHE_POLICY (write_back | write_thru), and the
 #           shared-memory cache on top (SHM_CACHE=0 leaves it out;
-#           SHM_MD_ONLY, SHM_CAP size it). WB_FLUSH_MS is the write-back
+#           SHM_MD_ONLY, SHM_CAP size it). WB_FILL_PCT (unset = the module's
+#           80) is the write-back cache's flush_fill_pct. WB_FLUSH_MS is the write-back
 #           flush period.
 #   legacy: one core holding every tier under the node-local clio_cte_cache
 #           (CACHE, CACHE_MD_ONLY), as before the cache split.
@@ -279,6 +280,7 @@ $RAM_TIERS
     next_volatile: "540.0"
     next_persistent: "512.0"
     flush_period_ms: ${WB_FLUSH_MS:-10000}
+$( [ -n "${WB_FILL_PCT:-}" ] && echo "    flush_fill_pct: ${WB_FILL_PCT}" )
 EOF
     NEXT=567.0
     if [ "${SHM_CACHE:-1}" = 1 ]; then
@@ -433,7 +435,7 @@ if [ "${BENCH:-io500}" = ior ]; then
   # instead of the half hour the metadata phases take.
   IOR=${IOR:-$(dirname "$IO500")/bin/ior}
   mkdir -p "$DATADIR/ior-easy" 2>/dev/null
-  # IOR_VARIANTS: "fuse" (through the mount, default) and/or "preload"
+  # IOR_VARIANTS: "fuse" (through the mount, default), "hard" and/or "preload"
   # (the POSIX interposition adapter: no kernel FUSE, same filesystem client).
   # STRACE=1: the first rank of each node runs under strace -T (ior_wrap.sh).
   # After every phase each node's runtime and adapter get SIGUSR1, which
@@ -446,16 +448,23 @@ if [ "${BENCH:-io500}" = ior ]; then
    else
     tgt="$DATADIR/ior-easy/ior_file_easy"; sfx=""; pre=""
    fi
+   # "hard": IO500's ior-hard (one shared file, 47008-byte transfers).
+   shape="-t 2m -b ${EASY_MB}m -F"
+   if [ $v = hard ]; then
+    mkdir -p "$DATADIR/ior-hard" 2>/dev/null
+    tgt="$DATADIR/ior-hard/file"; sfx="-hard"; pre=""
+    shape="-t 47008 -b 47008 -s $HARD_SEG"
+   fi
    for ph in write read; do
     [ $ph = write ] && fl="-w" || fl="-r"
     # PROFILE=1: sample thread CPU and stacks on this node during the phase.
-    [ "${PROFILE:-0}" = 1 ] && bash "$HERE/sample_stacks.sh" "$OUT/prof_$ph" \
+    [ "${PROFILE:-0}" = 1 ] && bash "$HERE/sample_stacks.sh" "$OUT/prof$sfx-$ph" \
       "${PROFILE_DELAY:-1}" "${PROFILE_N:-8}" "${PROFILE_GAP:-0.4}" > /dev/null 2>&1 &
     wrap=""
     [ "${STRACE:-0}" = 1 ] && wrap="$HERE/ior_wrap.sh $OUT/ior$sfx-$ph $PPN"
     mpiexec -n $(( NN * PPN )) -ppn "$PPN" --cpu-bind depth -d 4 --envall \
       $wrap $pre "$IOR" -g -G 271828 -k -e -o "$tgt" -C -Q 1 \
-      -t 2m -b "${EASY_MB}m" -F $fl -a POSIX ${IOR_EXTRA:-} > "ior-easy$sfx-$ph.txt" 2>&1
+      $shape $fl -a POSIX ${IOR_EXTRA:-} > "ior-easy$sfx-$ph.txt" 2>&1
     rc=$?
     echo "IORCELL tag=${RUN_TAG:-none} variant=$v nodes=$NN phase=$ph rc=$rc $(grep -E '^(write|read) ' "ior-easy$sfx-$ph.txt" | awk '{print "MiB/s=" $2, "open_s=" $7, "io_s=" $8, "close_s=" $9}')"
     if [ "$MODE" = cliofs ]; then
