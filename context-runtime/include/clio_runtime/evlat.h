@@ -199,7 +199,15 @@ enum Chan : int {
   kDaosQ = 80,
   kDaosIo = 81,
   kDaosDone = 82,
-  kNumChan = 83,
+  // 83-85: one SyncTag round of a write-back policy cache (cache_base), on
+  // the container that leads it (concurrent syncs of a tag share a round):
+  //   wb_sync_loc   flush this container's dirty copies of the tag
+  //   wb_sync_all   ask every container to flush its copies of the tag
+  //   wb_sync_core  SyncTag on the persistent chain (device sync)
+  kWbSyncLocal = 83,
+  kWbSyncAll = 84,
+  kWbSyncCore = 85,
+  kNumChan = 86,
 };
 
 enum Busy : int { kBusyPeerRecv = 0, kBusyNetSend = 1, kNumBusy = 2 };

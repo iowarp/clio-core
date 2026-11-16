@@ -37,6 +37,8 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <atomic>
+#include <deque>
 #include <unordered_set>
 #include <vector>
 
@@ -167,6 +169,14 @@ class CacheBase : public clio::cte::core::DualTargetInterposer {
   bool IsWriteBack() const { return policy_ == CachePolicy::kWriteBack; }
 
  private:
+  /** The outputs of a SyncTag, as the sharers of its round receive them. */
+  struct SyncOut {
+    clio::run::u32 deferred_ = 0;
+    clio::run::u64 blobs_moved_ = 0;
+    clio::run::u64 bdevs_synced_ = 0;
+    clio::run::u32 containers_ = 0;
+    clio::run::u64 liveness_change_ns_ = 0;
+  };
   /** One volatile copy this owner keeps (always the whole blob). */
   struct Entry {
     TagId tag_;
@@ -199,9 +209,55 @@ class CacheBase : public clio::cte::core::DualTargetInterposer {
   clio::run::TaskResume Drop(std::string key, bool flush, clio::run::u32 *rc);
   /** Delete a blob from volatile whether or not it is recorded here. */
   clio::run::TaskResume DropVolatile(TagId tag, std::string name);
-  /** Flush and drop least-recently-used unlocked copies. */
+  /**
+   * Flush and drop least-recently-used unlocked copies.
+   * @param keep key never dropped (the blob being written)
+   * @param n copies to drop at most
+   * @param clean_only drop only copies with no dirty range
+   * @param done set to the number of copies dropped
+   * @param need_bytes when not 0: stop once the dropped copies held this
+   *        many bytes (at least one copy is dropped)
+   */
   clio::run::TaskResume Evict(std::string keep, clio::run::u32 n,
-                              bool clean_only);
+                              bool clean_only, clio::run::u32 *done,
+                              clio::run::u64 need_bytes = 0);
+  /**
+   * Rebuild the eviction list: the least-recently-used unlocked copies
+   * (clean ones only when clean_only), at most kVictimQueue of them, so
+   * that most evictions take a victim without scanning every copy.
+   */
+  void RefillVictims(const std::string &keep, bool clean_only);
+  /**
+   * Take and lock the next copy of the eviction list that can still be
+   * dropped.
+   * @param key set to its key (its lock is held on return)
+   * @param size set to the bytes it holds
+   * @return false when the list is empty
+   */
+  bool TakeVictim(const std::string &keep, bool clean_only, std::string *key,
+                  clio::run::u64 *size);
+  /** Record that volatile refused a put of `size` bytes for lack of room. */
+  void NoteNoSpace(clio::run::u64 size);
+  /** Record that a volatile copy was dropped (its space is free again). */
+  void NoteSpaceFreed() { full_size_.store(0, std::memory_order_relaxed); }
+  /** Record that a copy became clean (a clean-only eviction can take it). */
+  void NoteClean() { no_clean_.store(false, std::memory_order_relaxed); }
+  /**
+   * True while volatile is known to refuse a put of `size` bytes. The
+   * knowledge expires (kFullProbeNs), after which one put probes again.
+   */
+  bool KnownFull(clio::run::u64 size);
+  /**
+   * Before absorbing a write-back put to a blob with no volatile copy:
+   * when volatile is known full, make room by dropping clean copies, or
+   * report that the put should go straight to persistent because every
+   * copy is dirty (no failed volatile put, no eviction scan).
+   * @param key the blob's key (lock held)
+   * @param size bytes the put writes
+   * @param bypass set true when the put should skip volatile
+   */
+  clio::run::TaskResume MakeRoom(std::string key, clio::run::u64 size,
+                                 bool *bypass);
   /** Copy the whole persistent blob into volatile (lock held). */
   clio::run::TaskResume FillFromPersistent(TagId tag, std::string name,
                                            clio::run::u64 size,
@@ -228,8 +284,51 @@ class CacheBase : public clio::cte::core::DualTargetInterposer {
                  clio::run::u64 end, bool dirty);
   /** Keys of this container's copies (of one tag, or all). */
   std::vector<std::string> KeysOf(const TagId *tag);
-  /** Flush every dirty copy of a tag (or all) on this container. */
+  /**
+   * Fill-level flush trigger (flush_fill_pct): when there is unflushed
+   * data and the volatile core is at least that full, start one flush of
+   * every dirty copy on this container. Called after writes; it asks the
+   * volatile core for its fill level at most once per kFillCheckNs.
+   */
+  clio::run::TaskResume CheckFill();
+  /** Keys and dirty byte counts of this container's dirty copies (of one
+   *  tag, or all), sorted by key. */
+  std::vector<std::pair<std::string, clio::run::u64>> DirtyKeysOf(
+      const TagId *tag);
+  /**
+   * Write the dirty ranges of several blobs to persistent at once (every
+   * key's lock held): all reads from volatile are issued together, then
+   * all writes to persistent.
+   * @param keys the blobs to flush
+   * @param rc set to the first failure, else 0
+   */
+  clio::run::TaskResume FlushBatch(std::vector<std::string> keys,
+                                   clio::run::u32 *rc);
+  /** Flush every dirty copy of a tag (or all) on this container, several
+   *  blobs at a time. */
   clio::run::TaskResume FlushAll(TagId tag, bool all_tags, clio::run::u32 *rc);
+  /**
+   * Flush this container's dirty copies of one tag; concurrent callers
+   * share one flush (see JoinRound).
+   */
+  clio::run::TaskResume FlushTagShared(TagId tag, clio::run::u32 *rc);
+  /**
+   * Join the shared work named `id`: at most one round of it runs at a
+   * time, and every caller that arrives while a round runs shares the NEXT
+   * round (which starts after the caller arrived, so it covers everything
+   * the caller needs covered).
+   * @param id name of the work (e.g. sync of one tag)
+   * @param leader set true when the caller must do the work and then call
+   *        LeaveRound; false when a round that covers it has completed
+   * @param rc when not leader: the result of the round that covered it
+   * @param out when not leader and not null: that round's SyncTag outputs
+   */
+  clio::run::TaskResume JoinRound(std::string id, bool *leader,
+                                  clio::run::u32 *rc, SyncOut *out = nullptr);
+  /** End the round the caller led, publishing its result (and, for a sync,
+   *  its SyncTag outputs) to the sharers. */
+  void LeaveRound(const std::string &id, clio::run::u32 rc,
+                  const SyncOut *out = nullptr);
   void RegisterStopFlush(const clio::run::PoolId &self_pool);
 
   /**
@@ -262,9 +361,37 @@ class CacheBase : public clio::cte::core::DualTargetInterposer {
   std::mutex mu_;                         ///< guards entries_ / busy_
   std::unordered_map<std::string, Entry> entries_;
   std::unordered_set<std::string> busy_;
+  /** Copies kept on the eviction list between scans. */
+  static constexpr size_t kVictimQueue = 256;
+  /** Eviction list (RefillVictims / TakeVictim). Guarded by mu_. */
+  std::deque<std::string> victims_;
   /** on_hit_count fill: misses per uncached key. */
   std::unordered_map<std::string, clio::run::u32> miss_counts_;
   clio::run::u64 stop_hook_id_ = 0;
+  /** Smallest put volatile refused for lack of room (0: not known full). */
+  std::atomic<clio::run::u64> full_size_{0};
+  /** When full_size_ was last set (ns). */
+  std::atomic<clio::run::u64> full_ns_{0};
+  /** The last clean-only eviction found no clean copy to drop. */
+  std::atomic<bool> no_clean_{false};
+  /** Counts writes that left a dirty range; flushed_gen_ is its value when
+   *  the last complete flush of everything began (equal: nothing dirty). */
+  std::atomic<clio::run::u64> dirty_gen_{0};
+  std::atomic<clio::run::u64> flushed_gen_{0};
+  /** When the fill level was last asked for (ns). */
+  std::atomic<clio::run::u64> fill_check_ns_{0};
+  /** A fill-level flush has been sent and has not finished. */
+  std::atomic<bool> fill_flush_pending_{false};
+  /** One kind of shared work (JoinRound). Guarded by mu_. */
+  struct Round {
+    clio::run::u64 started_ = 0;  ///< rounds started
+    clio::run::u64 done_ = 0;     ///< rounds completed
+    bool running_ = false;
+    clio::run::u32 rc_ = 0;       ///< result of the last completed round
+    clio::run::u32 users_ = 0;    ///< callers inside JoinRound..LeaveRound
+    SyncOut out_;                 ///< SyncTag outputs of that round
+  };
+  std::unordered_map<std::string, Round> rounds_;
 };
 
 }  // namespace clio::cte::cache_base

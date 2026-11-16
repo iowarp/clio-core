@@ -39,6 +39,8 @@
 #include <clio_cte/cache_base/cache_base.h>
 #include <clio_cte/core/blob_placement.h>
 
+#include <clio_runtime/evlat.h>
+
 #include <algorithm>
 #include <chrono>
 
@@ -53,10 +55,24 @@ namespace {
 constexpr double kLockPollUs = 10.0;
 /** Copies evicted per no-space retry. */
 constexpr clio::run::u32 kEvictBatch = 4;
+/** Most copies dropped to make room for one put ahead of time. */
+constexpr clio::run::u32 kMakeRoomMax = 64;
 /** Resends of an op forwarded to a blob's owner that died in flight, and
  *  the wait between them while the cluster marks it dead (us). */
 constexpr int kOwnerRetries = 10;
 constexpr double kOwnerRetryUs = 1000000.0;
+/** How long "volatile is full" is trusted before a put probes it again
+ *  (ns): every path that frees space clears it at once, this bounds the
+ *  cost of one that does not. */
+constexpr clio::run::u64 kFullProbeNs = 100ull * 1000 * 1000;
+/** Blobs flushed to persistent at once, and the dirty bytes (so the I/O
+ *  buffers held) at which a batch is closed early. */
+constexpr size_t kFlushBatchBlobs = 32;
+constexpr clio::run::u64 kFlushBatchBytes = 64ull << 20;
+/** Least time between two fill-level queries of the volatile core (ns). */
+constexpr clio::run::u64 kFillCheckNs = 10ull * 1000 * 1000;
+/** Wait between checks for a shared round to complete (us). */
+constexpr double kRoundPollUs = 50.0;
 /** Read-miss counts kept for on_hit_count admission (then reset). */
 constexpr size_t kMaxMissCounts = 1u << 20;
 
@@ -230,6 +246,94 @@ void CacheBase::NoteWrite(const std::string &key, const TagId &tag,
   e.size_ = std::max(e.size_, end);
   if (dirty) AddExtent(e.dirty_, off, end);
   e.last_ns_ = NowNs();
+  if (e.dirty_.empty()) NoteClean();
+  if (dirty) dirty_gen_.fetch_add(1, std::memory_order_relaxed);
+}
+
+clio::run::TaskResume CacheBase::CheckFill() {
+  CLIO_TASK_BODY_BEGIN
+  if (IsWriteBack() && HasPersistent() && params_.flush_fill_pct_ != 0 &&
+      !fill_flush_pending_.load(std::memory_order_relaxed) &&
+      dirty_gen_.load(std::memory_order_relaxed) !=
+          flushed_gen_.load(std::memory_order_relaxed)) {
+    const clio::run::u64 now = NowNs();
+    clio::run::u64 last = fill_check_ns_.load(std::memory_order_relaxed);
+    if (now - last >= kFillCheckNs &&
+        fill_check_ns_.compare_exchange_strong(last, now)) {
+      auto cap = vol_client_.AsyncGetCapacity(clio::run::PoolQuery::Local());
+      CLIO_CO_AWAIT(cap);
+      const clio::run::u64 total = cap->total_capacity_;
+      if (cap->GetReturnCode() == 0 && total != 0) {
+        const clio::run::u64 used = total - cap->remaining_capacity_;
+        // total / 100 first: total * pct could overflow.
+        if (used >= total / 100 * params_.flush_fill_pct_ &&
+            !fill_flush_pending_.exchange(true)) {
+          // One-shot, not awaited: this put returns; FlushData clears the
+          // pending mark when it is done.
+          self_client_.AsyncFlushData(clio::run::PoolQuery::Local(), 0);
+        }
+      }
+    }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+void CacheBase::NoteNoSpace(clio::run::u64 size) {
+  const clio::run::u64 cur = full_size_.load(std::memory_order_relaxed);
+  if (cur == 0 || size < cur) {
+    full_size_.store(size == 0 ? 1 : size, std::memory_order_relaxed);
+  }
+  full_ns_.store(NowNs(), std::memory_order_relaxed);
+}
+
+bool CacheBase::KnownFull(clio::run::u64 size) {
+  const clio::run::u64 full = full_size_.load(std::memory_order_relaxed);
+  if (full == 0 || size < full) return false;
+  if (NowNs() - full_ns_.load(std::memory_order_relaxed) > kFullProbeNs) {
+    // Stale: let this put probe volatile (and its eviction look again).
+    full_size_.store(0, std::memory_order_relaxed);
+    no_clean_.store(false, std::memory_order_relaxed);
+    return false;
+  }
+  return true;
+}
+
+clio::run::TaskResume CacheBase::MakeRoom(std::string key,
+                                          clio::run::u64 size, bool *bypass) {
+  CLIO_TASK_BODY_BEGIN
+  *bypass = false;
+  if (EvictCleanOnly() && KnownFull(size) && !Cached(key)) {
+    if (!no_clean_.load(std::memory_order_relaxed)) {
+      clio::run::u32 done = 0;
+      // As many clean copies as hold this put's bytes, so the put below
+      // is not refused (a refusal costs the core a scan of its blob map).
+      CLIO_CO_AWAIT(Evict(key, kMakeRoomMax, true, &done, size));
+      if (done == 0) no_clean_.store(true, std::memory_order_relaxed);
+    }
+    *bypass = no_clean_.load(std::memory_order_relaxed);
+    // Still full for the next put; only a failed probe would say so again.
+    if (*bypass) full_ns_.store(NowNs(), std::memory_order_relaxed);
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+std::vector<std::pair<std::string, clio::run::u64>> CacheBase::DirtyKeysOf(
+    const TagId *tag) {
+  std::vector<std::pair<std::string, clio::run::u64>> keys;
+  {
+    std::lock_guard<std::mutex> g(mu_);
+    for (const auto &e : entries_) {
+      if (e.second.dirty_.empty()) continue;
+      if (tag != nullptr && !(e.second.tag_ == *tag)) continue;
+      clio::run::u64 bytes = 0;
+      for (const Extent &x : e.second.dirty_) bytes += x.second - x.first;
+      keys.emplace_back(e.first, bytes);
+    }
+  }
+  std::sort(keys.begin(), keys.end());  // the global lock order
+  return keys;
 }
 
 std::vector<std::string> CacheBase::KeysOf(const TagId *tag) {
@@ -283,6 +387,98 @@ clio::run::TaskResume CacheBase::Flush(std::string key, clio::run::u32 *rc) {
       std::lock_guard<std::mutex> g(mu_);
       auto it = entries_.find(key);
       if (it != entries_.end()) it->second.dirty_.clear();
+      NoteClean();
+    }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume CacheBase::FlushBatch(std::vector<std::string> keys,
+                                            clio::run::u32 *rc) {
+  CLIO_TASK_BODY_BEGIN
+  *rc = 0;
+  {
+    /** One dirty range on its way from volatile to persistent. */
+    struct Op {
+      size_t key_;  ///< index into keys
+      TagId tag_;
+      std::string name_;
+      Extent ext_;
+      ctp::ipc::FullPtr<char> buf_;
+      clio::run::u32 rc_ = 0;
+      clio::run::Future<core::GetBlobTask> get_;
+      clio::run::Future<core::PutBlobTask> put_;
+    };
+    auto *ipc = CLIO_IPC;
+    std::vector<Op> ops;
+    std::vector<clio::run::u32> key_rc(keys.size(), 0);
+    {
+      std::lock_guard<std::mutex> g(mu_);
+      for (size_t k = 0; k < keys.size(); ++k) {
+        auto it = entries_.find(keys[k]);
+        if (it == entries_.end()) continue;
+        for (const Extent &x : it->second.dirty_) {
+          Op op;
+          op.key_ = k;
+          op.tag_ = it->second.tag_;
+          op.name_ = it->second.name_;
+          op.ext_ = x;
+          ops.push_back(std::move(op));
+        }
+      }
+    }
+    // In waves: a wave is as many ranges as I/O buffers could be had for.
+    // When the buffers run out the rest wait for this wave to return its
+    // own, so a large batch never fails for memory a serial flush would
+    // have found; only a range that gets no buffer with none held fails.
+    size_t next = 0;
+    while (next < ops.size()) {
+      const size_t first = next;
+      for (; next < ops.size(); ++next) {
+        Op &op = ops[next];
+        const clio::run::u64 len = op.ext_.second - op.ext_.first;
+        op.buf_ = ipc->AllocateBuffer(len);
+        if (op.buf_.IsNull()) {
+          if (next > first) break;  // retry it in the next wave
+          op.rc_ = 12;
+          continue;
+        }
+        op.get_ = vol_client_.AsyncGetBlob(op.tag_, op.name_.c_str(),
+                                           op.ext_.first, len, 0,
+                                           ctp::ipc::ShmPtr<>(op.buf_.shm_),
+                                           clio::run::PoolQuery::Local());
+      }
+      for (size_t i = first; i < next; ++i) {
+        Op &op = ops[i];
+        if (op.rc_ != 0) continue;
+        CLIO_CO_AWAIT(op.get_);
+        op.rc_ = op.get_->GetReturnCode();
+        if (op.rc_ != 0) continue;
+        op.put_ = pers_client_.AsyncPutBlob(
+            op.tag_, op.name_, op.ext_.first, op.ext_.second - op.ext_.first,
+            ctp::ipc::ShmPtr<>(op.buf_.shm_), -1.0f, Context(), 0,
+            clio::run::PoolQuery::Local());
+      }
+      for (size_t i = first; i < next; ++i) {
+        Op &op = ops[i];
+        if (op.rc_ == 0 && !op.buf_.IsNull()) {
+          CLIO_CO_AWAIT(op.put_);
+          op.rc_ = op.put_->GetReturnCode();
+        }
+        if (!op.buf_.IsNull()) ipc->FreeBuffer(op.buf_);
+        if (op.rc_ != 0 && key_rc[op.key_] == 0) key_rc[op.key_] = op.rc_;
+      }
+    }
+    std::lock_guard<std::mutex> g(mu_);
+    for (size_t k = 0; k < keys.size(); ++k) {
+      if (key_rc[k] != 0) {
+        if (*rc == 0) *rc = key_rc[k];
+        continue;  // its ranges stay dirty for the next flush
+      }
+      auto it = entries_.find(keys[k]);
+      if (it != entries_.end()) it->second.dirty_.clear();
+      NoteClean();
     }
   }
   CLIO_CO_RETURN;
@@ -310,6 +506,7 @@ clio::run::TaskResume CacheBase::Drop(std::string key, bool flush,
     CLIO_CO_AWAIT(del);
     std::lock_guard<std::mutex> g(mu_);
     entries_.erase(key);
+    NoteSpaceFreed();
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -330,32 +527,74 @@ clio::run::TaskResume CacheBase::DropVolatile(TagId tag, std::string name) {
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume CacheBase::Evict(std::string keep, clio::run::u32 n,
-                                       bool clean_only) {
-  CLIO_TASK_BODY_BEGIN
-  {
-    std::vector<std::pair<clio::run::u64, std::string>> lru;
-    {
-      std::lock_guard<std::mutex> g(mu_);
-      for (const auto &e : entries_) {
-        if (clean_only && !e.second.dirty_.empty()) continue;
-        if (e.first != keep && busy_.count(e.first) == 0) {
-          lru.emplace_back(e.second.last_ns_, e.first);
-        }
-      }
+void CacheBase::RefillVictims(const std::string &keep, bool clean_only) {
+  std::vector<std::pair<clio::run::u64, std::string>> lru;
+  std::lock_guard<std::mutex> g(mu_);
+  for (const auto &e : entries_) {
+    if (clean_only && !e.second.dirty_.empty()) continue;
+    if (e.first != keep && busy_.count(e.first) == 0) {
+      lru.emplace_back(e.second.last_ns_, e.first);
     }
-    std::sort(lru.begin(), lru.end());
+  }
+  const size_t n = std::min(lru.size(), kVictimQueue);
+  std::partial_sort(lru.begin(), lru.begin() + n, lru.end());
+  victims_.clear();
+  for (size_t i = 0; i < n; ++i) victims_.push_back(std::move(lru[i].second));
+}
+
+bool CacheBase::TakeVictim(const std::string &keep, bool clean_only,
+                           std::string *key, clio::run::u64 *size) {
+  std::lock_guard<std::mutex> g(mu_);
+  while (!victims_.empty()) {
+    std::string k = std::move(victims_.front());
+    victims_.pop_front();
+    auto it = entries_.find(k);
+    // The list is a snapshot: the copy may be gone, rewritten or in use.
+    if (it == entries_.end() || k == keep) continue;
+    if (clean_only && !it->second.dirty_.empty()) continue;
+    if (!busy_.insert(k).second) continue;
+    *size = it->second.size_;
+    *key = std::move(k);
+    return true;
+  }
+  return false;
+}
+
+clio::run::TaskResume CacheBase::Evict(std::string keep, clio::run::u32 n,
+                                       bool clean_only,
+                                       clio::run::u32 *out_done,
+                                       clio::run::u64 need_bytes) {
+  CLIO_TASK_BODY_BEGIN
+  *out_done = 0;
+  {
+    // Dropping copies to admit a write does not make volatile less full for
+    // the next write: keep what is known about it.
+    const clio::run::u64 full = full_size_.load(std::memory_order_relaxed);
     clio::run::u32 done = 0;
-    for (size_t i = 0; i < lru.size() && done < n; ++i) {
-      {
-        std::lock_guard<std::mutex> g(mu_);
-        if (!busy_.insert(lru[i].second).second) continue;  // in use: skip
+    clio::run::u64 freed = 0;
+    bool refilled = false;
+    while (done < n && (need_bytes == 0 || freed < need_bytes || done == 0)) {
+      std::string key;
+      clio::run::u64 size = 0;
+      if (!TakeVictim(keep, clean_only, &key, &size)) {
+        if (refilled) break;  // a fresh list had nothing left to take
+        RefillVictims(keep, clean_only);
+        refilled = true;
+        continue;
       }
       clio::run::u32 rc = 0;
-      CLIO_CO_AWAIT(Drop(lru[i].second, true, &rc));
-      Unlock(lru[i].second);
-      if (rc == 0) ++done;
+      CLIO_CO_AWAIT(Drop(key, true, &rc));
+      Unlock(key);
+      if (rc == 0) {
+        ++done;
+        freed += size;
+      }
     }
+    if (clean_only && full != 0 && done != 0) {
+      full_size_.store(full, std::memory_order_relaxed);
+      full_ns_.store(NowNs(), std::memory_order_relaxed);
+    }
+    *out_done = done;
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -402,8 +641,15 @@ clio::run::TaskResume CacheBase::PutVolatileRaw(TagId tag, std::string name,
     CLIO_CO_AWAIT(put);
     *rc = put->GetReturnCode();
     if (!IsNoSpaceRc(*rc) || attempt == 1) break;
-    CLIO_CO_AWAIT(Evict(Key(tag, name), kEvictBatch, EvictCleanOnly()));
+    clio::run::u32 done = 0;
+    CLIO_CO_AWAIT(Evict(Key(tag, name), kEvictBatch, EvictCleanOnly(), &done));
+    if (done == 0) {
+      // Nothing was dropped, so the same put would only fail again.
+      if (EvictCleanOnly()) no_clean_.store(true, std::memory_order_relaxed);
+      break;
+    }
   }
+  if (IsNoSpaceRc(*rc)) NoteNoSpace(size);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
@@ -428,9 +674,18 @@ clio::run::TaskResume CacheBase::PutVolatile(
         CLIO_CO_AWAIT(put);
         *rc = put->GetReturnCode();
         if (!IsNoSpaceRc(*rc) || attempt == 1) break;
-        CLIO_CO_AWAIT(
-            Evict(Key(task->tag_id_, name), kEvictBatch, EvictCleanOnly()));
+        clio::run::u32 done = 0;
+        CLIO_CO_AWAIT(Evict(Key(task->tag_id_, name), kEvictBatch,
+                            EvictCleanOnly(), &done));
+        if (done == 0) {
+          // Nothing was dropped, so the same put would only fail again.
+          if (EvictCleanOnly()) {
+            no_clean_.store(true, std::memory_order_relaxed);
+          }
+          break;
+        }
       }
+      if (IsNoSpaceRc(*rc)) NoteNoSpace(regions[i].size_);
     }
   }
   CLIO_CO_RETURN;
@@ -463,13 +718,92 @@ clio::run::TaskResume CacheBase::FlushAll(TagId tag, bool all_tags,
   CLIO_TASK_BODY_BEGIN
   *rc = 0;
   if (IsWriteBack()) {
-    std::vector<std::string> keys = KeysOf(all_tags ? nullptr : &tag);
-    for (size_t i = 0; i < keys.size(); ++i) {
-      CLIO_CO_AWAIT(Lock(keys[i]));
+    // Batches of blobs in key order: every batch takes its locks in the one
+    // global order, flushes all its blobs at once, and releases them.
+    std::vector<std::pair<std::string, clio::run::u64>> dirty =
+        DirtyKeysOf(all_tags ? nullptr : &tag);
+    size_t i = 0;
+    while (i < dirty.size()) {
+      std::vector<std::string> batch;
+      clio::run::u64 bytes = 0;
+      while (i < dirty.size() && batch.size() < kFlushBatchBlobs &&
+             (batch.empty() || bytes + dirty[i].second <= kFlushBatchBytes)) {
+        bytes += dirty[i].second;
+        batch.push_back(dirty[i].first);
+        ++i;
+      }
+      for (size_t k = 0; k < batch.size(); ++k) CLIO_CO_AWAIT(Lock(batch[k]));
       clio::run::u32 r = 0;
-      CLIO_CO_AWAIT(Flush(keys[i], &r));
-      Unlock(keys[i]);
+      CLIO_CO_AWAIT(FlushBatch(batch, &r));
+      for (size_t k = 0; k < batch.size(); ++k) Unlock(batch[k]);
       if (r != 0 && *rc == 0) *rc = r;
+    }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume CacheBase::JoinRound(std::string id, bool *leader,
+                                           clio::run::u32 *rc,
+                                           SyncOut *out) {
+  CLIO_TASK_BODY_BEGIN
+  *leader = false;
+  *rc = 0;
+  {
+    clio::run::u64 target = 0;
+    {
+      std::lock_guard<std::mutex> g(mu_);
+      Round &r = rounds_[id];
+      target = r.started_ + 1;  // the first round to start after this call
+      ++r.users_;
+    }
+    while (true) {
+      {
+        std::lock_guard<std::mutex> g(mu_);
+        Round &r = rounds_[id];
+        if (r.done_ >= target) {
+          *rc = r.rc_;
+          if (out != nullptr) *out = r.out_;
+          if (--r.users_ == 0 && !r.running_) rounds_.erase(id);
+          break;
+        }
+        if (!r.running_) {
+          r.running_ = true;
+          ++r.started_;
+          *leader = true;
+          break;
+        }
+      }
+      CLIO_CO_AWAIT(clio::run::yield(kRoundPollUs));
+    }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+void CacheBase::LeaveRound(const std::string &id, clio::run::u32 rc,
+                           const SyncOut *out) {
+  std::lock_guard<std::mutex> g(mu_);
+  auto it = rounds_.find(id);
+  if (it == rounds_.end()) return;
+  Round &r = it->second;
+  r.done_ = r.started_;
+  r.rc_ = rc;
+  if (out != nullptr) r.out_ = *out;
+  r.running_ = false;
+  if (--r.users_ == 0) rounds_.erase(it);
+}
+
+clio::run::TaskResume CacheBase::FlushTagShared(TagId tag,
+                                                clio::run::u32 *rc) {
+  CLIO_TASK_BODY_BEGIN
+  {
+    const std::string id = "flush." + Key(tag, "");
+    bool leader = false;
+    CLIO_CO_AWAIT(JoinRound(id, &leader, rc));
+    if (leader) {
+      CLIO_CO_AWAIT(FlushAll(tag, false, rc));
+      LeaveRound(id, *rc);
     }
   }
   CLIO_CO_RETURN;
@@ -667,6 +1001,17 @@ clio::run::TaskResume CacheBase::PutBlob(
       CLIO_CO_RETURN;
     }
     // Write-back: absorb into the volatile copy and log the range dirty.
+    bool bypass = false;
+    CLIO_CO_AWAIT(MakeRoom(key, end - off, &bypass));
+    if (bypass) {
+      // Volatile is full of dirty copies and holds none of this blob: the
+      // put would be refused and written through anyway.
+      CLIO_CO_AWAIT(ForwardToCore(Method::kPutBlob,
+                                  task.template Cast<clio::run::Task>()));
+      Unlock(key);
+      CLIO_CO_AWAIT(CheckFill());
+      CLIO_CO_RETURN;
+    }
     CLIO_CO_AWAIT(PrepareAbsorb(task->tag_id_, name, off, end, &rc));
     if (rc == 0) CLIO_CO_AWAIT(PutVolatile(task, &rc));
     if (rc == 0) {
@@ -690,6 +1035,7 @@ clio::run::TaskResume CacheBase::PutBlob(
     }
     task->SetReturnCode(rc);
     Unlock(key);
+    CLIO_CO_AWAIT(CheckFill());
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -792,7 +1138,16 @@ clio::run::TaskResume CacheBase::MultiPutBlob(
       CLIO_CO_AWAIT(Lock(key));
       clio::run::u32 rc = 0;
       const bool special = IsSpecial(d.flags_, task->context_);
-      if (!special) {
+      bool bypass = false;
+      if (!special) CLIO_CO_AWAIT(MakeRoom(key, d.size_, &bypass));
+      if (bypass) {
+        // Volatile is full of dirty copies and holds none of this blob.
+        auto put = pers_client_.AsyncPutBlob(
+            d.tag_id_, d.blob_name_, d.offset_, d.size_, src, -1.0f,
+            task->context_, d.flags_, clio::run::PoolQuery::Local());
+        CLIO_CO_AWAIT(put);
+        rc = put->GetReturnCode();
+      } else if (!special) {
         CLIO_CO_AWAIT(PrepareAbsorb(d.tag_id_, d.blob_name_, d.offset_,
                                     d.offset_ + d.size_, &rc));
         if (rc == 0) {
@@ -806,8 +1161,9 @@ clio::run::TaskResume CacheBase::MultiPutBlob(
       }
       // Write the record through when it cannot be absorbed whole (see
       // PutBlob); only a capacity failure with no fallback fails it.
-      if (special || (rc != 0 && (!IsNoSpaceRc(rc) ||
-                                  params_.fallback_to_persistent_))) {
+      if (!bypass &&
+          (special || (rc != 0 && (!IsNoSpaceRc(rc) ||
+                                   params_.fallback_to_persistent_)))) {
         rc = 0;
         CLIO_CO_AWAIT(Drop(key, true, &rc));
         CLIO_CO_AWAIT(DropVolatile(d.tag_id_, d.blob_name_));
@@ -827,6 +1183,7 @@ clio::run::TaskResume CacheBase::MultiPutBlob(
       }
     }
     task->SetReturnCode(task->first_rc_ == 0 ? 0 : 1);
+    CLIO_CO_AWAIT(CheckFill());
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -877,7 +1234,11 @@ clio::run::TaskResume CacheBase::GetBlob(
     if (rc != 0) {
       CLIO_CO_AWAIT(ForwardToCore(Method::kGetBlob,
                                   task.template Cast<clio::run::Task>()));
-      if (task->GetReturnCode() == 0 && ShouldFill(key)) {
+      // No fill while volatile is full of dirty copies: it would re-read
+      // the blob from persistent only to have the copy refused.
+      const bool full = EvictCleanOnly() && KnownFull(task->size_) &&
+                        no_clean_.load(std::memory_order_relaxed);
+      if (task->GetReturnCode() == 0 && !full && ShouldFill(key)) {
         auto sz = pers_client_.AsyncGetBlobSize(task->tag_id_, name,
                                                 clio::run::PoolQuery::Local());
         CLIO_CO_AWAIT(sz);
@@ -1018,18 +1379,51 @@ clio::run::TaskResume CacheBase::SyncTag(
     // The tag's dirty copies live on their blobs' owners: every container
     // flushes its own (however this task arrived), then the persistent
     // chain syncs its devices.
+    //
+    // Concurrent syncs of one tag (every rank of a shared file calls fsync)
+    // share a round: one flushes and syncs, the others wait for the first
+    // round that started after they arrived and take its result.
+    namespace ev = clio::run::evlat;
+    // Only syncs asking for the same thing share.
+    const std::string id = "sync." + Key(task->tag_id_, "") +
+                           std::to_string(task->min_persistence_) + "." +
+                           std::to_string(task->sync_flags_);
+    bool leader = false;
     clio::run::u32 rc = 0;
-    CLIO_CO_AWAIT(FlushAll(task->tag_id_, false, &rc));
+    SyncOut out;
+    CLIO_CO_AWAIT(JoinRound(id, &leader, &rc, &out));
+    if (!leader) {
+      task->deferred_ = out.deferred_;
+      task->blobs_moved_ = out.blobs_moved_;
+      task->bdevs_synced_ = out.bdevs_synced_;
+      task->containers_ = out.containers_;
+      task->liveness_change_ns_ = out.liveness_change_ns_;
+      task->SetReturnCode(rc);
+      CLIO_CO_RETURN;
+    }
+    const unsigned long long t0 = ev::Now();
+    CLIO_CO_AWAIT(FlushTagShared(task->tag_id_, &rc));
+    const unsigned long long t1 = ev::Now();
+    ev::Span(ev::kWbSyncLocal, t0, t1);
     if (rc == 0 && IsWriteBack() && core::PoolContainers(pool_id_) > 1) {
       CLIO_CO_AWAIT(TagCopiesEverywhere(task->tag_id_, kCopiesFlush, &rc));
+      ev::Span(ev::kWbSyncAll, t1, ev::Now());
     }
     if (rc != 0) {
       task->SetReturnCode(IsNoSpaceRc(rc) ? core::kSyncNoSpaceRc
                                           : core::kSyncIoRc);
-      CLIO_CO_RETURN;
+    } else {
+      const unsigned long long t2 = ev::Now();
+      CLIO_CO_AWAIT(ForwardToCore(Method::kSyncTag,
+                                  task.template Cast<clio::run::Task>()));
+      ev::Span(ev::kWbSyncCore, t2, ev::Now());
     }
-    CLIO_CO_AWAIT(ForwardToCore(Method::kSyncTag,
-                                task.template Cast<clio::run::Task>()));
+    out.deferred_ = task->deferred_;
+    out.blobs_moved_ = task->blobs_moved_;
+    out.bdevs_synced_ = task->bdevs_synced_;
+    out.containers_ = task->containers_;
+    out.liveness_change_ns_ = task->liveness_change_ns_;
+    LeaveRound(id, task->GetReturnCode(), &out);
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -1039,8 +1433,18 @@ clio::run::TaskResume CacheBase::FlushData(
     clio::run::shared_ptr<core::FlushDataTask> &task) {
   CLIO_TASK_BODY_BEGIN
   {
+    // The periodic flush, a fill-level flush and a stop flush share rounds.
+    const std::string id = "flushall";
+    bool leader = false;
     clio::run::u32 rc = 0;
-    CLIO_CO_AWAIT(FlushAll(TagId::GetNull(), true, &rc));
+    CLIO_CO_AWAIT(JoinRound(id, &leader, &rc));
+    if (leader) {
+      const clio::run::u64 gen = dirty_gen_.load(std::memory_order_relaxed);
+      CLIO_CO_AWAIT(FlushAll(TagId::GetNull(), true, &rc));
+      if (rc == 0) flushed_gen_.store(gen, std::memory_order_relaxed);
+      LeaveRound(id, rc);
+    }
+    fill_flush_pending_.store(false, std::memory_order_relaxed);
     task->SetReturnCode(rc);
   }
   CLIO_CO_RETURN;
@@ -1082,16 +1486,24 @@ clio::run::TaskResume CacheBase::DropTagCopies(
   {
     const TagId tag = task->tag_id_;
     const clio::run::u32 mode = task->posix_unlink_;
+    if (mode == kCopiesFlush) {
+      // Flush and keep: several blobs at a time, shared by concurrent
+      // requests for the same tag.
+      clio::run::u32 frc = 0;
+      if (tag.IsNull()) {
+        CLIO_CO_AWAIT(FlushAll(tag, true, &frc));
+      } else {
+        CLIO_CO_AWAIT(FlushTagShared(tag, &frc));
+      }
+      task->SetReturnCode(frc);
+      CLIO_CO_RETURN;
+    }
     std::vector<std::string> keys = KeysOf(tag.IsNull() ? nullptr : &tag);
     clio::run::u32 first = 0;
     for (size_t i = 0; i < keys.size(); ++i) {
       CLIO_CO_AWAIT(Lock(keys[i]));
       clio::run::u32 rc = 0;
-      if (mode == kCopiesFlush) {
-        CLIO_CO_AWAIT(Flush(keys[i], &rc));
-      } else {
-        CLIO_CO_AWAIT(Drop(keys[i], mode == kCopiesFlushDrop, &rc));
-      }
+      CLIO_CO_AWAIT(Drop(keys[i], mode == kCopiesFlushDrop, &rc));
       Unlock(keys[i]);
       if (rc != 0 && first == 0) first = rc;
     }

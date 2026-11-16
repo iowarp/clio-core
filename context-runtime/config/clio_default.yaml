@@ -673,6 +673,11 @@ compose:
     fill: on_hit_count:2                # on_hit_count:N | on_read_miss | none
     evict: lru                          # lru | lfu
     flush_period_ms: 10000              # dirty-copy flush period; 0 = off
+    # Also flush as soon as the volatile core is this full (percent of its
+    # capacity) and holds unflushed data, without waiting for the period:
+    # flushed copies are clean, and clean copies are what a full cache can
+    # drop to keep absorbing writes. 0 = timer only.
+    flush_fill_pct: 80
     # When the volatile core cannot hold a put even after eviction: true
     # writes it straight to persistent (default); false fails the put with
     # ENOSPC (kPutNoSpaceRc) so a deployment never silently drops to disk
@@ -740,6 +745,14 @@ compose:
     entry_pool_id: "564.0"              # clients bind to the indexer above
     md_only: true                       # bytes are cached by the write-back cache
     capacity: "256M"                    # segment bytes: buffers + tables + log
+    # Extent mode (only with md_only: false): keep blob bytes in a node-local
+    # RAM bdev instead of this cache's own segment. The cache leases
+    # data_capacity bytes of data_pool and stores each blob as up to 8 runs
+    # of 4 KiB granules there (no power-of-two rounding, growth appends).
+    # A minor of 0 means this node's own device of that core ("540.0": the
+    # first storage device of core 540 on this node). Unset = off.
+    # data_pool: "540.0"
+    # data_capacity: "1G"
     log_depth: 0                        # dirty-range log entries (0: 1 per KiB)
     flush_batch_bytes: "16M"            # max payload per MultiPutBlob batch
     flush_period_us: 50                 # flusher cadence (it drains fully)
