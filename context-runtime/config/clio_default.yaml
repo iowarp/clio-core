@@ -837,6 +837,12 @@ compose:
   #                               one getattr per path component per syscall;
   #                               a directory changed through another node can
   #                               then read stale for up to that long.
+  # Concurrency:
+  #   CLIO_FUSE_MAX_THREADS       FUSE requests the mount serves at once (its
+  #                               worker threads). Default: 64. libfuse 3.12+
+  #                               otherwise caps the pool at 10, below the
+  #                               writing ranks of a busy node. 0 = libfuse
+  #                               default. Ignored with libfuse < 3.12.
   # Read path (not seconds):
   #   CLIO_FUSE_MAX_BACKGROUND    read-ahead requests the kernel may have in
   #                               flight on the mount. Default: unset (the
