@@ -125,7 +125,8 @@ compose:
  *  bytes in granules leased from the core's RAM bdev on this node). */
 static void CreateCache(const clio::run::PoolId &id, const std::string &name,
                         clio::run::u64 capacity, bool md_only = false,
-                        clio::run::u64 data_capacity = 0) {
+                        clio::run::u64 data_capacity = 0,
+                        double flush_period_us = 0) {
   clio::cte::shm_wtc::Client admin;
   clio::cte::shm_wtc::WtcConfig params;
   params.md_only_ = md_only;
@@ -137,6 +138,7 @@ static void CreateCache(const clio::run::PoolId &id, const std::string &name,
   params.capacity_ = capacity;
   params.max_blobs_ = 4096;
   params.log_depth_ = 4096;
+  if (flush_period_us > 0) params.flush_period_us_ = flush_period_us;
   auto create = admin.AsyncCreate(clio::run::PoolQuery::Local(), name, id,
                                   params);
   create.Wait();
@@ -424,7 +426,12 @@ TEST_CASE("ShmWtc - eviction keeps a small cache writable",
 TEST_CASE("ShmWtc - overwrites flush once and the last write wins",
           "[cte][shm_wtc][dedup]") {
   WtcFixture fx;
-  clio::cte::core::Client io(kPool);
+  // A slow flusher (100 ms) of its own: the overwrites below pile up between
+  // flushes on any machine, instead of racing a 50 us one (a fast runner's
+  // flusher kept up with every put and so never had a range to retire).
+  const clio::run::PoolId kDedupPool(576, 0);
+  CreateCache(kDedupPool, "shm_wtc_dedup", 64ull << 20, false, 0, 100000.0);
+  clio::cte::core::Client io(kDedupPool);
   REQUIRE(io.HasWtc());
   const wtc::Stats *st = io.WtcStats();
   TagId tag = MakeTag(io, "wtc_dedup");
