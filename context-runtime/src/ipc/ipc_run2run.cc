@@ -263,7 +263,11 @@ void IpcManagerRun2Run::SendInTransmitReplica(
   if (rc != 0) {
     HLOG(kWarning, "[SendIn] Task {} Lightbeam Send rc={} — re-queueing",
          origin_task->task_id_, rc);
-    if (rc != EAGAIN) {
+    // Only SWIM decides that a peer is dead. With SWIM off (the default) a
+    // failed send is retried against the same node until the task's network
+    // timeout; marking the peer dead here rerouted its work for the rest of
+    // the run.
+    if (rc != EAGAIN && CLIO_CONFIG_MANAGER->GetSwimEnabled()) {
       ipc_manager->SetDead(target_node_id);
     }
     std::lock_guard<std::mutex> _rqlk(retry_queues_mutex_);
@@ -537,7 +541,11 @@ int IpcManagerRun2Run::SendOutTransmit(
   if (rc != 0) {
     HLOG(kWarning, "[SendOut] Task {} Lightbeam Send rc={} — re-queueing",
          origin_task->task_id_, rc);
-    if (rc != EAGAIN) {
+    // Only SWIM decides that a peer is dead. With SWIM off (the default) a
+    // failed send is retried against the same node until the task's network
+    // timeout; marking the peer dead here rerouted its work for the rest of
+    // the run.
+    if (rc != EAGAIN && CLIO_CONFIG_MANAGER->GetSwimEnabled()) {
       ipc_manager->SetDead(target_node_id);
     }
     std::lock_guard<std::mutex> _rqlk(retry_queues_mutex_);
