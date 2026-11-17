@@ -308,7 +308,13 @@ void RunStopCycle(int cycle, const std::string &stop_args, int n_load_clients,
                   int load_ms, bool allow_watchdog) {
   clio::run::test::RuntimeServer server;
   REQUIRE(server.Start(kBtPort));
-  REQUIRE(server.WaitForReady());
+  if (!server.WaitForReady()) {
+    // WaitForReady fails early when the daemon exits during startup; why it
+    // exited is only in its captured log, which CI discards with the runner.
+    FAIL("cycle " + std::to_string(cycle) +
+         ": daemon did not become ready (exited during startup?)\n" +
+         clio::run::test::RuntimeServer::LogTail());
+  }
   AssertDeadOwnerEntriesReaped(cycle);
   const int pid = static_cast<int>(server.Pid());
 
