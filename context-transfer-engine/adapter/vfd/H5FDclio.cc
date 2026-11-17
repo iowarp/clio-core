@@ -244,8 +244,8 @@ class H5FD__clio_QuietQuery {
 /* Byte ranges THIS session has populated into the CTE tier.
  *
  * The tier cannot answer "was this range ever written" on its own. CFS is a
- * filesystem: an unwritten byte inside a file is zero, and TryReadBlobShm
- * happily returns those zeros with a success status. That is right for CFS and
+ * filesystem: an unwritten byte inside a file is zero, and the shared-memory
+ * read path happily returns those zeros with a success status. That is right for CFS and
  * wrong here, because this driver uses CFS as a cache of a DIFFERENT file,
  * where "never populated" and "really zero" are not the same answer. Page
  * presence is checked one level down; residency WITHIN a page is not, so a read
@@ -397,16 +397,16 @@ static size_t H5FD__clio_max_io_bytes(void) {
  * The CLIO client, by contrast, is a set of process-global objects whose
  * teardown runs as ordinary static destructors: the shared ZeroMQ context
  * (whose destructor zmq_ctx_shutdown()s every socket, so RecvZmqClientThread
- * exits), the deferred-write registry, the IPC manager's receive threads.
+ * exits), the IPC manager's receive threads.
  * Every one of those is registered LATER than HDF5's atexit handler -- the
  * client is first constructed on the first H5Fopen, long after H5open() -- and
  * exit handlers run last-registered-first. So by the time H5_term_library asks
  * this driver to close a file, CLIO is already gone. Calling into it then does
  * one of two things, both observed in the netCDF-C suite:
  *
- *   - SIGSEGV inside Client::DeferRegisterWrite, dereferencing the destroyed
- *     DeferRegistry hash table (h5_test/tst_h_dimscales, at exit, after the
- *     test itself printed "Tests successful!");
+ *   - SIGSEGV inside the (since removed) client deferred-write registry,
+ *     dereferencing its destroyed hash table (h5_test/tst_h_dimscales, at
+ *     exit, after the test itself printed "Tests successful!");
  *   - an unkillable hang in Client::CloseFd, waiting on a future that no
  *     surviving receive thread will ever complete (h5_test/tst_h_compounds2,
  *     tst_h_strings2, and every ncdump shell test whose child processes never

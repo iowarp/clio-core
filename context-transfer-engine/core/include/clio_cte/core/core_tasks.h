@@ -167,6 +167,41 @@ inline Timestamp WallToSteadyNs(Timestamp wall) {
 }
 
 /**
+ * Keys a client needs to connect to the shared-memory cache module
+ * (core_shm_cache_writethru) that fronts a CTE stack. Returned by the CTE
+ * Create (CreateParams::cache_keys_): a client that holds them maps the
+ * cache's segment and completes puts, covered gets and known sizes there,
+ * with no task. All zero when no cache fronts the stack.
+ */
+struct ShmCacheKeys {
+  clio::run::u32 runtime_pid_ = 0;  /**< pid of the runtime owning the segment */
+  clio::run::u64 cache_pool_ = 0;   /**< PoolId::ToU64 of the cache pool; 0 = none */
+  clio::run::u64 root_off_ = 0;     /**< offset of the segment root */
+  clio::run::u64 entry_pool_ = 0;   /**< pool clients bind to; 0 = the cache pool */
+
+  /** @return true when the keys name a cache segment */
+  CTP_CROSS_FUN bool Valid() const {
+    return cache_pool_ != 0 && root_off_ != 0 && runtime_pid_ != 0;
+  }
+
+  /** @return the pool a connected client sends its tasks to */
+  CTP_CROSS_FUN clio::run::u64 FrontPool() const {
+    return entry_pool_ != 0 ? entry_pool_ : cache_pool_;
+  }
+
+#if CTP_IS_HOST
+  /**
+   * Serialize the keys.
+   * @param ar the archive
+   */
+  template <class Archive>
+  void serialize(Archive &ar) {
+    ar(runtime_pid_, cache_pool_, root_off_, entry_pool_);
+  }
+#endif
+};
+
+/**
  * CreateParams for CTE Core chimod
  * Contains configuration parameters for CTE container creation
  */
@@ -174,15 +209,11 @@ struct CreateParams {
   // CTE configuration object (not serialized, loaded from pool_config)
   Config config_;
 
-  // OUT: byte offset of the CTE shared-memory metadata cache root within the
-  // runtime's metadata allocator (issue #783). 0 means caching is disabled --
-  // no metadata segment, or the cache could not be built -- and the client
-  // must simply use the RPC path.
-  //
-  // This is an OFFSET into a segment both processes map, not a raw address.
-  // That is the whole reason the cache can be read by another process at
-  // all; a pointer here would resolve to garbage in the client.
-  clio::run::u64 shm_cache_root_off_ = 0;
+  // OUT: keys of the shared-memory cache module fronting this CTE pool on the
+  // answering node. Filled by Create and, for a pool that already exists, by
+  // Runtime::FillExistingCreate -- so every client receives them, not just
+  // the one that caused the pool to be created.
+  ShmCacheKeys cache_keys_;
 
   // Required: chimod library name for module manager
   static constexpr const char *chimod_lib_name = "clio_cte_core";
@@ -192,14 +223,12 @@ struct CreateParams {
 
   // Copy constructor (required for task creation)
   CreateParams(const CreateParams &other)
-      : config_(other.config_),
-        shm_cache_root_off_(other.shm_cache_root_off_) {}
+      : config_(other.config_), cache_keys_(other.cache_keys_) {}
 
   // Constructor with pool_id and CreateParams (required for admin
   // task creation)
   CreateParams(const clio::run::PoolId &pool_id, const CreateParams &other)
-      : config_(other.config_),
-        shm_cache_root_off_(other.shm_cache_root_off_) {
+      : config_(other.config_), cache_keys_(other.cache_keys_) {
     // pool_id is used by the admin task framework, but we don't need to store
     // it
     (void)pool_id;  // Suppress unused parameter warning
@@ -214,14 +243,13 @@ struct CreateParams {
     // pass directly via CreateParams (no compose YAML required) are on
     // the wire.
     //
-    // shm_cache_root_off_ flows back on the OUT path: the server writes
-    // it into chimod_params_ at the end of Create, and the client's
-    // GetParams() returns it.
+    // cache_keys_ flows back on the OUT path: the server writes it into
+    // chimod_params_ at the end of Create (and in FillExistingCreate).
     ar(config_.performance_.stat_targets_period_ms_,
        config_.organizer_.name_,
        config_.organizer_.organizer_tasks_,
        config_.organizer_.period_ms_,
-       shm_cache_root_off_);
+       cache_keys_);
   }
 
   /**
@@ -787,6 +815,66 @@ struct hash<clio::cte::core::TagId> {
 }  // namespace ctp
 
 namespace clio::cte::core {
+
+/**
+ * Pool name of the checkpoint chimod (the copy-on-write fault handler).
+ * The core keys copy-on-write links off a fault registration that names this
+ * pool; checkpoint_tasks.h takes its own kCheckpointPoolName from here so the
+ * two cannot drift apart.
+ */
+static constexpr const char *kCowFaultPoolName = "clio_cte_checkpoint";
+
+/**
+ * Materialise error: the copy's fault pool is not present on this node. The
+ * router would retry a task for an absent pool forever, so the write or
+ * delete is failed with this code instead of dispatching the fault.
+ */
+static constexpr clio::run::u32 kCowErrFaultPoolMissing = 2;
+
+/**
+ * Fault-parameter form of a source tag id: "#major.minor". A copy registered
+ * with this form names its source by id, so it still resolves after the
+ * source's NAME has been unbound (a tag delete that keeps blobs for an
+ * un-materialised copy).
+ * @param id the source tag
+ * @return the parameter string (well inside Context::kFaultParamsSize)
+ */
+inline std::string CowSourceParam(const TagId &id) {
+  return "#" + std::to_string(id.major_) + "." + std::to_string(id.minor_);
+}
+
+/**
+ * Parses a CowSourceParam string back into a tag id.
+ * @param param a fault parameter; a plain tag name is not in id form
+ * @param id    receives the id when the parameter is in id form
+ * @return true when param was in id form (and id was set)
+ */
+inline bool ParseCowSourceParam(const std::string &param, TagId *id) {
+  if (param.size() < 4 || param[0] != '#') return false;
+  const size_t dot = param.find('.', 1);
+  if (dot == std::string::npos || dot == 1 || dot + 1 >= param.size()) {
+    return false;
+  }
+  // Reads the decimal digits of [from, to) into *out; false on any non-digit
+  // or on a value that does not fit a u32.
+  auto digits = [&param](size_t from, size_t to, unsigned long long *out) {
+    unsigned long long v = 0;
+    for (size_t i = from; i < to; ++i) {
+      if (param[i] < '0' || param[i] > '9') return false;
+      v = v * 10 + static_cast<unsigned long long>(param[i] - '0');
+      if (v > 0xFFFFFFFFull) return false;
+    }
+    *out = v;
+    return true;
+  };
+  unsigned long long major = 0, minor = 0;
+  if (!digits(1, dot, &major) || !digits(dot + 1, param.size(), &minor)) {
+    return false;
+  }
+  id->major_ = static_cast<clio::run::u32>(major);
+  id->minor_ = static_cast<clio::run::u32>(minor);
+  return true;
+}
 
 /**
  * Tag information structure for blob grouping
@@ -2047,6 +2135,11 @@ struct Context {
    *  alive: its liveness view can lag the router's, and "not found" there
    *  reads as a hole -- zeros returned for data held by the dead owner. */
   static constexpr clio::run::u32 kStandInRead = 1u << 8;
+  /** kNoCow -- skip the copy-on-write hook for THIS write. Set by the
+   *  checkpoint handler on the puts that materialise a copy: they are the
+   *  copy's own bytes, not a mutation of a source, and running the hook on
+   *  them would recurse into the copy's own copies. */
+  static constexpr clio::run::u32 kNoCow = 1u << 9;
 
   /**
    * Fault-handler parameters (checkpointing / lazy copy). When the core
@@ -3569,6 +3662,83 @@ struct MultiDelTagTask : public clio::run::Task {
     auto other = other_base.template Cast<MultiDelTagTask>();
     num_ok_ += other->num_ok_;
     if (first_rc_ == 0) first_rc_ = other->first_rc_;
+  }
+};
+
+/**
+ * Broadcast: register a copy-on-write link on this container (kCowLink).
+ *
+ * Sent once per lazy copy by the copy's name owner, to every container of the
+ * core pool. On receipt each container records two things locally:
+ *   - the copy-on-write link: before a write lands on a blob of source_tag_
+ *     here, copy_tag_ must already hold that blob (materialised from the
+ *     source's pre-write bytes by fault_pool_id_ / fault_params_);
+ *   - the copy tag's fault handler, so a miss on the copy resolves on this
+ *     container too (the blob's owner is not necessarily the name owner).
+ * The receiver does only this local part and never re-broadcasts.
+ *
+ * source_tag_      the tag being copied (its blobs are the snapshot)
+ * copy_tag_        the lazy copy
+ * fault_pool_id_   pool that materialises the copy (the checkpoint chimod)
+ * fault_pool_name_ name of fault_pool_id_ (kCowFaultPoolName)
+ * fault_params_    source tag NAME, as the fault handler resolves it
+ */
+struct CowLinkTask : public clio::run::Task {
+  IN TagId source_tag_;
+  IN TagId copy_tag_;
+  IN clio::run::PoolId fault_pool_id_;
+  IN clio::run::priv::string fault_pool_name_;
+  IN clio::run::priv::string fault_params_;
+
+  // SHM constructor
+  CowLinkTask()
+      : clio::run::Task(),
+        source_tag_(TagId::GetNull()),
+        copy_tag_(TagId::GetNull()),
+        fault_pool_id_(clio::run::PoolId::GetNull()),
+        fault_pool_name_(CLIO_PRIV_ALLOC),
+        fault_params_(CLIO_PRIV_ALLOC) {}
+
+  // Emplace constructor
+  CTP_CROSS_FUN explicit CowLinkTask(const clio::run::TaskId &task_id,
+                                     const clio::run::PoolId &pool_id,
+                                     const clio::run::PoolQuery &pool_query,
+                                     const TagId &source_tag,
+                                     const TagId &copy_tag,
+                                     const clio::run::PoolId &fault_pool_id,
+                                     const std::string &fault_pool_name,
+                                     const std::string &fault_params)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kCowLink),
+        source_tag_(source_tag),
+        copy_tag_(copy_tag),
+        fault_pool_id_(fault_pool_id),
+        fault_pool_name_(CLIO_PRIV_ALLOC, fault_pool_name),
+        fault_params_(CLIO_PRIV_ALLOC, fault_params) {
+    task_id_ = task_id;
+    pool_id_ = pool_id;
+    method_ = Method::kCowLink;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(source_tag_, copy_tag_, fault_pool_id_, fault_pool_name_, fault_params_);
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+  }
+
+  void Copy(const ctp::ipc::FullPtr<CowLinkTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    source_tag_ = other->source_tag_;
+    copy_tag_ = other->copy_tag_;
+    fault_pool_id_ = other->fault_pool_id_;
+    fault_pool_name_ = other->fault_pool_name_;
+    fault_params_ = other->fault_params_;
   }
 };
 

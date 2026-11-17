@@ -128,9 +128,7 @@ bool Sync(const TagId &tag) {
 /** Put bytes; score >= 0 forces the task path through the cache pool. */
 bool Put(const TagId &tag, const std::string &name, u64 off, u64 size,
          const char *src, float score = -1.0f) {
-  auto p = Io()->AsyncPutBlob(tag, name, off, size, src, score);
-  p.Wait();
-  return p->GetReturnCode() == 0;
+  return Io()->PutBlob(tag, name, off, size, src, score) == 0;
 }
 
 /** Return code of the last failed Read on this thread (0 = mismatch). */
@@ -140,17 +138,15 @@ thread_local unsigned g_last_read_rc = 0;
  *  g_last_read_rc so a report can tell an error from wrong bytes. */
 bool Read(const TagId &tag, const std::string &name, std::string *out,
           u64 off = 0) {
-  auto get = Io()->AsyncGetBlob(tag, name, off, out->size(), 0, out->data());
-  get.Wait();
-  g_last_read_rc = get->GetReturnCode();
+  g_last_read_rc = Io()->GetBlob(tag, name, off, out->size(), out->data());
   return g_last_read_rc == 0;
 }
 
 /** Size of a blob, or -1 when it does not exist. */
 long long Size(const TagId &tag, const std::string &name) {
-  auto sz = Io()->AsyncGetBlobSize(tag, name);
-  sz.Wait();
-  return sz->GetReturnCode() == 0 ? static_cast<long long>(sz->size_) : -1;
+  u64 sz = 0;
+  return Io()->GetBlobSize(tag, name, &sz) == 0 ? static_cast<long long>(sz)
+                                                 : -1;
 }
 
 int g_epoch = 0;
@@ -279,7 +275,7 @@ double Ms(std::chrono::steady_clock::time_point t0) {
 
 /** Print this node's cache counters. */
 void PrintStats(const char *when) {
-  const auto *s = Io()->WtcStats();
+  const auto *s = Io()->CacheStats();
   if (s == nullptr) return;
   fprintf(stderr,
           "[STATS %s] rank=%d puts=%llu hits=%llu misses=%llu fills=%llu "
@@ -304,7 +300,7 @@ TEST_CASE("ShmWtc stress - rotating writers, all nodes verify every round",
   // STRESS_EXPECT_WTC=0 runs the suite against a pool below the cache (A/B).
   const char *expect_wtc = std::getenv("STRESS_EXPECT_WTC");
   if (expect_wtc == nullptr || std::string(expect_wtc) != "0") {
-    REQUIRE(Io()->HasWtc());
+    REQUIRE(Io()->HasCache());
   }
   const TagId tag = SharedTag("wtc_stress_rot");
   const int n = NumNodes();
@@ -580,14 +576,13 @@ TEST_CASE("ShmWtc stress - tag size and opens stay exact across nodes",
                 (unsigned long long)expect);
         FAIL("stale tag size");
       }
-      auto o = Io()->AsyncGetOrCreateTag(tname);
-      o.Wait();
-      REQUIRE(o->GetReturnCode() == 0);
-      if (!(o->tag_id_ == tag) ||
-          (check_sizes && o->tag_size_ != expect)) {
+      TagId opened;
+      u64 opened_size = 0;
+      REQUIRE(Io()->GetOrCreateTag(tname, &opened, &opened_size) == 0);
+      if (!(opened == tag) || (check_sizes && opened_size != expect)) {
         fprintf(stderr, "[TAGMETA-OPEN] rank=%d iter=%d id=%u.%u size=%llu "
-                "want=%u.%u/%llu\n", Rank(), iter, o->tag_id_.major_,
-                o->tag_id_.minor_, (unsigned long long)o->tag_size_,
+                "want=%u.%u/%llu\n", Rank(), iter, opened.major_,
+                opened.minor_, (unsigned long long)opened_size,
                 tag.major_, tag.minor_, (unsigned long long)expect);
         FAIL("stale open");
       }
@@ -601,10 +596,9 @@ TEST_CASE("ShmWtc stress - tag size and opens stay exact across nodes",
     REQUIRE(d->GetReturnCode() == 0);
   }
   REQUIRE(Barrier(BarrierTag()));
-  auto o = Io()->AsyncGetOrCreateTag(tname);
-  o.Wait();
-  REQUIRE(o->GetReturnCode() == 0);
-  if (o->tag_id_ == tag) {
+  TagId reopened;
+  REQUIRE(Io()->GetOrCreateTag(tname, &reopened) == 0);
+  if (reopened == tag) {
     fprintf(stderr, "[TAGMETA-DELETED] rank=%d still opens the old id\n",
             Rank());
     FAIL("deleted tag still opened by name");
@@ -622,7 +616,7 @@ int main(int argc, char *argv[]) {
     return 2;
   }
   fprintf(stderr, "shm_wtc stress: rank %d of %d ready (cache %s)\n", Rank(),
-          NumNodes(), Io()->HasWtc() ? "attached" : "NOT attached");
+          NumNodes(), Io()->HasCache() ? "attached" : "NOT attached");
   std::string filter = argc > 1 ? argv[1] : "";
   int result = SimpleTest::run_all_tests(filter);
   if (SimpleTest::g_test_finalize) SimpleTest::g_test_finalize();

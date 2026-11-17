@@ -49,6 +49,7 @@
 #include "clio_runtime/pool_query.h"
 #include "clio_runtime/task.h"
 #include "clio_runtime/task_archives.h"
+#include "clio_runtime/task_cost.h"
 #include "clio_runtime/local_task_archives.h"
 #include "clio_runtime/task_stat_model.h"
 #include "clio_runtime/types.h"
@@ -629,6 +630,25 @@ class Container {
    * Default implementation is a no-op.
    */
   virtual void PostGpuContainerCreate() {}
+
+  /**
+   * The pool this container forwards requests to when it sits in a module
+   * chain (an interposer's next pool). Lets the runtime walk a chain from
+   * its top to the pool at its bottom without knowing any module's config.
+   * @return the next pool, or a null PoolId when this container does not
+   *         forward (the bottom of a chain, or a standalone module)
+   */
+  virtual PoolId GetNextPool() const { return PoolId::GetNull(); }
+
+  /**
+   * Fill the OUT fields of a create task that found this pool already
+   * existing. Get-or-create on an existing pool never runs the module's
+   * Create, so without this hook a later caller would receive only the
+   * params it sent. Called on the node that answered the create, only when
+   * the task names this pool's ChiMod.
+   * @param create_task the create task (an admin::CreatePoolFields)
+   */
+  virtual void FillExistingCreate(Task *create_task) { (void)create_task; }
 
   /**
    * Serialize task parameters for network transfer (unified method)

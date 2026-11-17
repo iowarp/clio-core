@@ -147,42 +147,37 @@ public:
   /**
    * Per-task cost estimate for the scheduler (see Container::GetTaskStats).
    *
-   * compute_ is the feature Container::InferCpuTime multiplies its learned
-   * per-method coefficient by; leaving it 0 — as every chimod but MOD_NAME and
-   * admin did — collapses that model to one constant per method with no
-   * dependence on request size. wall_time_ seeds InferWallClockTime at the
-   * ~500 MB/s house convention. Both coefficients are then learned from real
-   * completions, so these only need the right order of magnitude.
+   * Covers every method this pool serves. Compress/Decompress/DynamicSchedule
+   * and the interposed PutBlob/MultiPutBlob/GetBlob are charged at codec
+   * speed (compression ~300 B per CPU us, decompression ~900) when a codec
+   * will actually run, which is 30x / 10x the CPU per byte of a plain copy
+   * — exactly the distinction the cost model needs. Every other core verb
+   * falls back to CoreInterposer::GetTaskStats (the core's own estimate).
+   * @param task the task to estimate
+   * @return the task's cost features
    */
-  clio::run::TaskStat GetTaskStats(const clio::run::Task *task) const override {
-    clio::run::TaskStat stat;
-    if (task == nullptr) {
-      return stat;
-    }
-    switch (task->method_) {
-      case Method::kCompress: {
-        const auto *t = static_cast<const CompressTask *>(task);
-        stat.io_size_ = t->size_;
-        // Compression is genuinely CPU-bound: ~300 MB/s, i.e. ~300 bytes per
-        // microsecond of CPU. That is 30x more CPU per byte than a plain copy,
-        // which is exactly the distinction the cost model needs to see.
-        stat.compute_ = static_cast<size_t>(t->size_ / 300.0f) + 5;
-        stat.wall_time_ = static_cast<float>(t->size_) / 300.0f;
-        return stat;
-      }
-      case Method::kDecompress: {
-        const auto *t = static_cast<const DecompressTask *>(task);
-        stat.io_size_ = t->size_;
-        // Decompression runs ~3x faster than compression.
-        stat.compute_ = static_cast<size_t>(t->size_ / 900.0f) + 5;
-        stat.wall_time_ = static_cast<float>(t->size_) / 900.0f;
-        return stat;
-      }
-      default:
-        return clio::cte::core::CoreInterposer::GetTaskStats(task);
-    }
-  }
+  clio::run::TaskStat GetTaskStats(
+      const clio::run::Task *task) const override;
 
+ private:
+  /**
+   * Whether an interposed PutBlob will be compressed by this pool: the
+   * caller's (or the configured default) codec is set and the write is a
+   * whole-blob, non-replica, non-emulated put — the same gate PutBlob uses.
+   * @param task the put
+   * @return true if PutBlob will run a codec over the payload
+   */
+  bool PutWillCompress(const clio::cte::core::PutBlobTask *task) const;
+
+  /**
+   * Whether a batch put will compress its records (codec requested, not
+   * replica-addressed, not emulated) — the gate MultiPutBlob uses.
+   * @param ctx the batch-wide context
+   * @return true if the records run through a codec
+   */
+  bool BatchWillCompress(const clio::cte::core::Context &ctx) const;
+
+ public:
 
 private:
   // Client for this ChiMod

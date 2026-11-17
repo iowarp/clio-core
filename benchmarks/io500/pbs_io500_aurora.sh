@@ -98,6 +98,12 @@ stop_nodes() {
   kill "$NODES_PID" 2>/dev/null
 }
 NN=$(sort -u "$PBS_NODEFILE" | wc -l)
+# Log the DAOS pool's space at the start and end of every job, so a run's
+# footprint on a storage system we do not own is visible in its output.
+pool_space() {
+  echo "=== DAOS pool $DAOS_POOL space ($1): $(daos pool query "${DAOS_POOL:-IOWarp}" 2>/dev/null | grep -iE 'Total size|Free' | tr -s ' ' | paste -sd ';')"
+}
+pool_space start
 NP=$(( NN * PPN ))
 # Per-node share of the dataset in MB: ior-easy + ior-hard + mdtest-hard
 # (3901-byte files). Blobs land on the node that wrote them (pool_query
@@ -282,6 +288,7 @@ $RAM_TIERS
     flush_period_ms: ${WB_FLUSH_MS:-10000}
 $( [ -n "${WB_FILL_PCT:-}" ] && echo "    flush_fill_pct: ${WB_FILL_PCT}" )
 $( [ -n "${WB_DIRTY_MB:-}" ] && echo "    flush_dirty_mb: ${WB_DIRTY_MB}" )
+$( [ "$CACHE_POLICY" = write_back ] && [ "${SHM_CACHE:-1}" = 1 ] && [ "${WB_LAND_SHM:-1}" = 1 ] && echo "    flush_pool: \"568.0\"" )
 EOF
     NEXT=567.0
     if [ "${SHM_CACHE:-1}" = 1 ]; then
@@ -293,6 +300,10 @@ EOF
     next_pool_id: "567.0"
     md_only: ${SHM_MD_ONLY:-true}
     capacity: "${SHM_CAP:-256M}"
+$( [ -n "${SHM_MAX_BLOBS:-}" ] && echo "    max_blobs: ${SHM_MAX_BLOBS}" )
+$( [ -n "${SHM_FLUSH_DEPTH:-}" ] && echo "    flush_depth: ${SHM_FLUSH_DEPTH}" )
+$( [ -n "${SHM_FLUSH_BATCH:-}" ] && echo "    flush_batch_bytes: \"${SHM_FLUSH_BATCH}\"" )
+$( [ "$CACHE_POLICY" = write_back ] && [ "${WB_LAND_SHM:-1}" = 1 ] && echo "    invalidate_on_flush: true" )
 EOF
       NEXT=568.0
     fi
@@ -460,6 +471,12 @@ if [ "${BENCH:-io500}" = ior ]; then
    # that holds the whole dataset nothing then reaches the persistent tier
    # inside the timed phase, which isolates the path into DRAM.
    fs="-e"; [ "${IOR_FSYNC:-1}" = 0 ] && fs=""
+   # IOR_MINTIME=<s>: every phase runs for at least that long, starting over
+   # from the beginning of each file when it reaches the end (rewrites or
+   # rereads the same EASY_MB per rank, so the data footprint stays fixed),
+   # with a stonewall at the same time so a phase stops at the mark.
+   mintime=""
+   [ -n "${IOR_MINTIME:-}" ] && mintime="-D $IOR_MINTIME -O minTimeDuration=$IOR_MINTIME"
    for ph in write read; do
     [ $ph = write ] && fl="-w" || fl="-r"
     # PROFILE=1: sample thread CPU and stacks on this node during the phase.
@@ -469,7 +486,7 @@ if [ "${BENCH:-io500}" = ior ]; then
     [ "${STRACE:-0}" = 1 ] && wrap="$HERE/ior_wrap.sh $OUT/ior$sfx-$ph $PPN"
     mpiexec -n $(( NN * PPN )) -ppn "$PPN" --cpu-bind depth -d 4 --envall \
       $wrap $pre "$IOR" -g -G 271828 -k $fs -o "$tgt" -C -Q 1 \
-      $shape $fl -a POSIX ${IOR_EXTRA:-} > "ior-easy$sfx-$ph.txt" 2>&1
+      $shape $fl -a POSIX $mintime ${IOR_EXTRA:-} > "ior-easy$sfx-$ph.txt" 2>&1
     rc=$?
     echo "IORCELL tag=${RUN_TAG:-none} variant=$v nodes=$NN phase=$ph rc=$rc $(grep -E '^(write|read) ' "ior-easy$sfx-$ph.txt" | awk '{print "MiB/s=" $2, "open_s=" $7, "io_s=" $8, "close_s=" $9}')"
     if [ "$MODE" = cliofs ]; then
@@ -564,4 +581,5 @@ elif [ "$MODE" = daos ]; then
 else
   rm -rf "$DATADIR"
 fi
+pool_space end
 exit $rc

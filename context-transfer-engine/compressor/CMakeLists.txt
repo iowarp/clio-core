@@ -38,9 +38,8 @@ add_clio_module_runtime(
     ctp::compress
 )
 
-# The CTE client's zero-IPC read path (core_client.h, inline) counts its
-# outcomes through clio_cte_core_client (shm_read_stats.cc, #787), so link it
-# as every other CTE ChiMod does.
+# The compressor talks to the next pool through the CTE core client; link
+# its library as every other CTE ChiMod does.
 target_link_libraries(clio_cte_compressor_runtime PUBLIC clio_cte_core_client)
 
 # CUDA DRIVER API. A GPU codec runs in its own CUDA context (cuCtxCreate) and

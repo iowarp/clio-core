@@ -37,9 +37,12 @@
  *
  * Start a runtime with cte_config_shm_wtc.yaml (core 512.0 + cache 568.0),
  * then run this. For each size it measures, per path:
- *   put    - AsyncPutBlob + Wait, distinct blobs
- *   get    - AsyncGetBlob + Wait of a blob it just wrote
- *   size   - AsyncGetBlobSize + Wait
+ *   put    - PutBlob, distinct blobs
+ *   get    - GetBlob of a blob it just wrote
+ *   size   - GetBlobSize
+ * The "task" client is bound to the core and never connects a cache, so
+ * every op is a task; the "shm" client is connected to the cache, so the
+ * same calls complete in its segment.
  *   burst  - N puts then one SyncTag (end-to-end durable throughput)
  * All times are milliseconds.
  *
@@ -74,7 +77,14 @@ struct Row {
   double burst_ms = 0;
 };
 
-/** Run every measurement against `io` with `n` ops of `bytes`. */
+/**
+ * Run every measurement against `io` with `n` ops of `bytes`.
+ * @param io client (task path, or connected to the shm cache)
+ * @param label tag-name prefix distinguishing the two clients
+ * @param bytes blob size
+ * @param n ops per measurement
+ * @return per-op latencies (ms) and the burst total (ms)
+ */
 Row Measure(Client &io, const std::string &label, size_t bytes, int n) {
   Row row;
   auto tag_task = io.AsyncGetOrCreateTag("wtc_bench_" + label + "_" +
@@ -86,31 +96,26 @@ Row Measure(Client &io, const std::string &label, size_t bytes, int n) {
 
   auto t0 = Clock::now();
   for (int i = 0; i < n; ++i) {
-    auto p = io.AsyncPutBlob(tag, "b" + std::to_string(i), 0, bytes, buf.data());
-    p.Wait();
+    io.PutBlob(tag, "b" + std::to_string(i), 0, bytes, buf.data());
   }
   row.put_ms = Ms(t0) / n;
 
   t0 = Clock::now();
   for (int i = 0; i < n; ++i) {
-    auto g = io.AsyncGetBlob(tag, "b" + std::to_string(i), 0, bytes, 0,
-                             back.data());
-    g.Wait();
+    io.GetBlob(tag, "b" + std::to_string(i), 0, bytes, back.data());
   }
   row.get_ms = Ms(t0) / n;
 
   t0 = Clock::now();
   for (int i = 0; i < n; ++i) {
-    auto s = io.AsyncGetBlobSize(tag, "b" + std::to_string(i));
-    s.Wait();
+    clio::run::u64 sz = 0;
+    io.GetBlobSize(tag, "b" + std::to_string(i), &sz);
   }
   row.size_ms = Ms(t0) / n;
 
   t0 = Clock::now();
   for (int i = 0; i < n; ++i) {
-    auto p = io.AsyncPutBlob(tag, "burst" + std::to_string(i), 0, bytes,
-                             buf.data());
-    p.Wait();
+    io.PutBlob(tag, "burst" + std::to_string(i), 0, bytes, buf.data());
   }
   auto sync = io.AsyncSyncTag(tag, clio::run::PoolQuery::Local());
   sync.Wait();
@@ -128,7 +133,7 @@ int main(int argc, char **argv) {
   }
   Client task_path(clio::cte::core::kCtePoolId);
   Client cache_path(clio::cte::core::wtc::kDefaultPoolId);
-  if (!cache_path.HasWtc()) {
+  if (!cache_path.ConnectCache()) {
     std::fprintf(stderr, "cache pool 568.0 not mapped; compose it first\n");
     return 2;
   }

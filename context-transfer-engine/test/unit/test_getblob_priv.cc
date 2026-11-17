@@ -20,8 +20,7 @@
  *     marked TASK_DATA_OWNER, and GetBlobTask::PostWait() copies the staged
  *     bytes into the caller's buffer. `CLIO_GETBLOB_PRIV_MODE=separate`.
  *
- * Both configs additionally exercise the zero-IPC shared-cache fast path when
- * the cache is attachable.
+ * Both configs also exercise the synchronous PutBlob/GetBlob pair.
  *
  * The buffers handed to the API here are genuine private memory
  * (std::vector<char> / stack), never SHM — that is the whole point of the API.
@@ -146,8 +145,6 @@ class Fixture {
     std::this_thread::sleep_for(200ms);
 
     if (!RegisterRamTarget()) return false;
-    // Best-effort: attach the SHM metadata cache so the zero-IPC path can run.
-    (void)CLIO_CTE_CLIENT->AttachShmCache();
     return true;
   }
 
@@ -214,7 +211,6 @@ class Fixture {
     if (!RegisterRamTarget()) {
       return false;
     }
-    (void)CLIO_CTE_CLIENT->AttachShmCache();
     return true;
   }
 };
@@ -255,7 +251,7 @@ TEST_CASE("GetBlob into private memory returns correct bytes", "[cte][823]") {
   // Full read into a genuinely private buffer (heap, not SHM).
   std::vector<char> priv(kN, 0);
   auto g = cte->AsyncGetBlob(tag_id, blob, 0, kN, /*flags=*/0, priv.data());
-  g.Wait();  // Empty (cache-hit) future Wait()s to true; otherwise task rc==0.
+  g.Wait();
   for (size_t i = 0; i < kN; ++i) {
     REQUIRE(priv[i] == PatternByte(i));
   }
@@ -298,31 +294,29 @@ TEST_CASE("Private GetBlob is leak-free under repetition", "[cte][823]") {
   }
 }
 
-// The zero-IPC shared-cache fast path, when the cache is attachable, must
-// deliver identical bytes (it copies straight out of the RAM bdev's segment
-// and returns an empty, already-satisfied future).
-TEST_CASE("Private GetBlob shared-cache fast path is correct", "[cte][823]") {
+// The synchronous PutBlob/GetBlob pair must round-trip the same bytes the
+// Async* overloads do (task path unless a shm cache is connected).
+TEST_CASE("Synchronous private PutBlob/GetBlob round-trip", "[cte][823]") {
   REQUIRE(g_fixture != nullptr);
   REQUIRE(g_fixture->initialized_);
   auto *cte = CLIO_CTE_CLIENT;
-  if (!cte->HasShmCache() && !cte->AttachShmCache()) {
-    // Cache unavailable in this configuration; the direct/staged paths are
-    // covered by the cases above. Nothing to assert here.
-    return;
-  }
 
-  clio::cte::core::Tag tag("getblob_priv_cache_tag");
+  clio::cte::core::Tag tag("getblob_priv_sync_tag");
   clio::cte::core::TagId tag_id = tag.GetTagId();
-  const std::string blob = "cache_blob";
+  const std::string blob = "sync_blob";
   const size_t kN = 16 * 1024;
-  PutPattern(tag_id, blob, 0, kN, 99);
+  std::vector<char> src(kN);
+  for (size_t i = 0; i < kN; ++i) src[i] = PatternByte(99 + i);
+  REQUIRE(cte->PutBlob(tag_id, blob, 0, kN, src.data()) == 0);
 
   std::vector<char> priv(kN, 0);
-  auto g = cte->AsyncGetBlob(tag_id, blob, 0, kN, 0, priv.data());
-  g.Wait();
+  REQUIRE(cte->GetBlob(tag_id, blob, 0, kN, priv.data()) == 0);
   for (size_t i = 0; i < kN; ++i) {
     REQUIRE(priv[i] == PatternByte(99 + i));
   }
+  clio::run::u64 size = 0;
+  REQUIRE(cte->GetBlobSize(tag_id, blob, &size) == 0);
+  REQUIRE(size == kN);
 }
 
 // Private-memory AsyncPutBlob (issue #830): write a blob region straight from a
@@ -351,7 +345,7 @@ TEST_CASE("PutBlob from private memory round-trips", "[cte][830]") {
   // Read the whole blob back into a private buffer and compare byte-for-byte.
   std::vector<char> got(kN, 0);
   auto g = cte->AsyncGetBlob(tag_id, blob, 0, kN, /*flags=*/0, got.data());
-  g.Wait();  // Empty (cache-hit) future Wait()s to true; otherwise task rc==0.
+  g.Wait();
   for (size_t i = 0; i < kN; ++i) {
     REQUIRE(got[i] == PatternByte(i));
   }

@@ -286,15 +286,10 @@ int Client::SyncFd(int fd) {
   if (!LookupFd(fd, &of)) {
     return -1;
   }
-  // Wait for every deferred write on this file and report a latched failure
-  // exactly once — fsync and close are the only two places a deferred write's
-  // failure can reach the application.
-  if (Flush(of.path) != 0) {
-    return -1;
-  }
-  // Then put the bytes on a persistent device. Draining alone left them on
-  // whatever tier took them (RAM) until the periodic flush, while the same
-  // file fsynced through the FUSE mount was durable (#1188).
+  // Writes are synchronous, so every write(2) already landed; put the bytes
+  // on a persistent device. Otherwise they stay on whatever tier took them
+  // (RAM) until the periodic flush, while the same file fsynced through the
+  // FUSE mount was durable (#1188).
   int rc = SyncDurable(TagOfPath(of.path, /*want_dir=*/false),
                        FsParentDir(of.path));
   if (rc != 0) {
@@ -425,9 +420,6 @@ int Client::TruncatePath(const std::string &raw_path, FsOff length) {
     return -1;
   }
   std::string path = StripClioPrefix(raw_path);
-  // Order matters: a deferred write that landed AFTER the truncate would undo
-  // it, so drain before resizing (issue #817).
-  Flush(path);
   auto t = AsyncTruncate(path, static_cast<clio::run::u64>(length));
   t.Wait();
   if (t->GetReturnCode() != 0) {
@@ -443,9 +435,6 @@ int Client::RemovePath(const std::string &raw_path) {
     return -1;
   }
   std::string path = StripClioPrefix(raw_path);
-  // Drain first: a write still deferred against a deleted path would
-  // resurrect the tag.
-  Flush(path);
   auto t = AsyncUnlink(path);
   t.Wait();
   if (t->GetReturnCode() != 0) {
@@ -462,11 +451,6 @@ int Client::RenamePath(const std::string &raw_src, const std::string &raw_dst) {
   }
   std::string src = StripClioPrefix(raw_src);
   std::string dst = StripClioPrefix(raw_dst);
-  // Both sides drain: a deferred write to either path must land before the
-  // namespace moves, or it would be applied to a name that no longer means
-  // the same file.
-  Flush(src);
-  Flush(dst);
   auto t = AsyncRename(src, dst);
   t.Wait();
   if (t->GetReturnCode() != 0) {
@@ -501,7 +485,6 @@ int Client::ReaddirPath(const std::string &raw_path, std::vector<std::string> *o
 
 int Client::CloseFd(int fd) {
   clio::run::u64 handle;
-  std::string path;
   {
     std::lock_guard<std::mutex> g(fd_mu_);
     auto it = fds_.find(fd);
@@ -510,20 +493,11 @@ int Client::CloseFd(int fd) {
       return -1;
     }
     handle = it->second.handle;
-    path = it->second.path;
     fds_.erase(it);
   }
-  // Drain BEFORE releasing the chimod handle: a deferred write names that
-  // handle, and the runtime answers EBADF once it is gone (issue #817).
-  // close(2) is also the last chance to report a latched write failure, which
-  // is why its return code is not simply the Close task's.
-  int werr = Flush(path);
+  // Writes are synchronous, so nothing is pending against the handle.
   auto t = AsyncClose(handle);
   t.Wait();
-  if (werr != 0) {
-    errno = EIO;
-    return -1;
-  }
   return (t->GetReturnCode() == 0) ? 0 : -1;
 }
 

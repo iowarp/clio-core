@@ -354,9 +354,13 @@ public:
   clio::run::TaskResume RegisterGpuContainer(clio::run::shared_ptr<RegisterGpuContainerTask> &task);
 
   /**
-   * Get live task statistics for this task instance.
+   * Get live task statistics for this task instance (every admin method).
    * For network periodics, compute_ = total queue depth across priorities;
    * io_size_ is a static stand-in (admin periodics don't have a payload).
+   * SubmitBatch scales with its serialized bytes and task count; every
+   * control verb returns an explicit constant (clio_runtime/task_cost.h).
+   * @param task the task to estimate
+   * @return the task's cost features
    */
   clio::run::TaskStat GetTaskStats(const clio::run::Task *task) const override;
 

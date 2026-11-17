@@ -113,12 +113,11 @@ long PutAll(long n, long blobs, u64 ver) {
   long bad = 0;
   for (long i = 0; i < blobs; ++i) {
     std::string v = Pattern(BlobSize(i), Key(n, i), ver);
-    auto p = Io()->AsyncPutBlob(tag, "b" + std::to_string(i), 0, v.size(),
-                                v.data());
-    p.Wait();
-    if (p->GetReturnCode() != 0) {
+    const clio::run::u32 rc =
+        Io()->PutBlob(tag, "b" + std::to_string(i), 0, v.size(), v.data());
+    if (rc != 0) {
       fprintf(stderr, "[PUT-ERR] node=%ld blob=%ld ver=%llu rc=%u\n", n, i,
-              (unsigned long long)ver, p->GetReturnCode());
+              (unsigned long long)ver, rc);
       ++bad;
     }
   }
@@ -166,11 +165,10 @@ int PhaseVerify(long nodes, long blobs) {
     TagId tag = NodeTag(n);
     for (long i = 0; i < blobs; ++i) {
       std::string got(BlobSize(i), '\0');
-      auto g = Io()->AsyncGetBlob(tag, "b" + std::to_string(i), 0, got.size(),
-                                  0, got.data());
-      g.Wait();
-      if (g->GetReturnCode() != 0) {
-        printf("BAD node=%ld blob=%ld read_rc=%u\n", n, i, g->GetReturnCode());
+      const clio::run::u32 rc = Io()->GetBlob(
+          tag, "b" + std::to_string(i), 0, got.size(), got.data());
+      if (rc != 0) {
+        printf("BAD node=%ld blob=%ld read_rc=%u\n", n, i, rc);
         ++bad;
         continue;
       }
@@ -209,9 +207,9 @@ int main() {
   const char *ph = std::getenv("RESTART_PHASE");
   const std::string phase = ph != nullptr ? ph : "verify";
   fprintf(stderr, "wtc_restart node=%ld/%ld phase=%s cache=%s\n", node, nodes,
-          phase.c_str(), Io()->HasWtc() ? "attached" : "NOT attached");
+          phase.c_str(), Io()->HasCache() ? "attached" : "NOT attached");
   if (std::getenv("STRESS_EXPECT_WTC") != nullptr &&
-      std::string(std::getenv("STRESS_EXPECT_WTC")) == "1" && !Io()->HasWtc()) {
+      std::string(std::getenv("STRESS_EXPECT_WTC")) == "1" && !Io()->HasCache()) {
     printf("FAIL cache not attached\n");
     return 1;
   }

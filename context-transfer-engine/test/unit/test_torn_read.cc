@@ -37,9 +37,9 @@
 // version, never a mixture. Before the fixes:
 //  - the RPC path: PutBlob took the write token but never drained pinned
 //    readers, so a GetBlob mid-ReadData returned old and new bytes together;
-//  - the zero-IPC path: TryReadBlobShm memcpy'd extents straight out of the
-//    RAM tier and re-validated only placement_gen_, which an in-place put
-//    does not change.
+//  - a client-side zero-IPC read path (since removed) copied extents out of
+//    the RAM tier and re-validated only placement_gen_, which an in-place
+//    put does not change.
 // Both were measured by clio_cte_vector_stress (pages with the new
 // generation's header and the old generation's tail, rc=0).
 //
@@ -50,10 +50,9 @@
 // disagree with its own header is a torn read and fails the test.
 //
 // Case 1 uses generational gets (kGenerational): the runtime path, read
-// pinning against the writer's drain. Case 2 uses plain gets from this
-// process: the client's shared-memory fast path with the content seqlock.
-// The two cases together cover both mechanisms; with either fix reverted the
-// corresponding case reports torn pages within seconds on a 4-core box.
+// pinning against the writer's drain. Case 2 uses plain (non-generational)
+// gets from this process, which take the ordinary task path.
+// Both cases exercise the runtime's read pinning against an in-place writer.
 
 #include <clio_cte/core/core_client.h>
 #include <clio_ctp/util/logging.h>
@@ -175,7 +174,7 @@ clio::cte::core::Context Ctx(bool generational, u64 gen) {
 /**
  * Overwrite K blobs from W threads while R threads read and verify them.
  * @param generational  true: generational gets (runtime path); false: plain
- *                      gets (zero-IPC fast path from this process)
+ *                      gets (plain task-path gets from this process)
  * @return the number of torn pages observed
  */
 u64 RunCase(bool generational) {
@@ -278,7 +277,7 @@ TEST_CASE("TornRead - generational gets never see a mixture of two versions",
   REQUIRE(RunCase(/*generational=*/true) == 0);
 }
 
-TEST_CASE("TornRead - plain gets (zero-IPC fast path) never see a mixture",
+TEST_CASE("TornRead - plain gets never see a mixture",
           "[torn_read][cte][regression]") {
   static TornReadFixture fixture;
   REQUIRE(RunCase(/*generational=*/false) == 0);

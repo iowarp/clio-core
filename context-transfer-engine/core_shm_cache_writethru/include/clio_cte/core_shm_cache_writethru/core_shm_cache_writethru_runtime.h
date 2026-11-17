@@ -66,6 +66,9 @@ struct FlushRecord {
   clio::run::u32 home_ = 0;    ///< container of the blob's home cache
   clio::run::u64 payload_off_ = 0;  ///< offset in its home group's staging
   clio::run::u32 put_flags_ = 0;    ///< put flags of the blob
+  /** Zero-copy flush: the record's bytes in the cache segment, pinned
+   *  until the batch lands (nullptr when staged instead). */
+  const char *ptr_ = nullptr;
 };
 
 /** One flush batch in flight: popped, staged and sent, not yet landed. */
@@ -79,6 +82,8 @@ struct InflightBatch {
   /** Ranges popped for this batch but not resent (an earlier flush already
    *  carried their bytes): slot -> count, retired when this batch lands. */
   std::unordered_map<clio::run::u32, clio::run::u32> skipped_;
+  /** Records sent by pointer into the cache (pinned until landed). */
+  bool pinned_ = false;
 };
 
 /** What the flusher last copied of a blob with no write in progress. */
@@ -104,7 +109,7 @@ class Runtime : public clio::cte::core::CoreInterposer {
   using CreateParams = WtcConfig;  // required by CLIO_TASK_CC
 
   Runtime() = default;
-  ~Runtime() override = default;
+  ~Runtime() override;
 
   // ---- Method handlers ----
   clio::run::TaskResume Create(clio::run::shared_ptr<CreateTask> &task);
@@ -173,6 +178,60 @@ class Runtime : public clio::cte::core::CoreInterposer {
  private:
   /** Create and publish the segment. */
   bool OpenSegment();
+  /**
+   * Log the segment's counters (puts and refusals by reason, flushes,
+   * fills, read hits and misses) at warning level, so a run's log shows
+   * where the cache's time went. Called from a runtime stop hook.
+   */
+  void LogStats();
+  /**
+   * Zero-copy flush: pin every record's bytes in the cache segment and
+   * keep their addresses (FlushRecord::ptr_). All or nothing: when a
+   * record cannot be pinned (extent mode), the ones pinned are released
+   * and the batch is staged instead.
+   * @param recs the batch's resolved records
+   * @return true when every record with bytes is pinned
+   */
+  bool PinRecords(std::vector<FlushRecord> &recs);
+  /** Release the pins PinRecords took. */
+  void UnpinRecords(std::vector<FlushRecord> &recs);
+  /**
+   * Send a pinned batch: one task per record, its payload the record's
+   * bytes in the cache (no staging copy). A record of another home lands
+   * there through HomeFlush; one homed here goes into the core below.
+   * @param recs the pinned records
+   * @param homes receives the home of each future
+   * @param futs receives one future per record sent
+   * @return payload bytes sent
+   */
+  clio::run::u64 SendPinned(
+      const std::vector<FlushRecord> &recs, std::vector<clio::run::u32> *homes,
+      std::vector<clio::run::Future<clio::cte::core::MultiPutBlobTask>> *futs);
+  /**
+   * The flusher landed writes of these tags: invalidate their cached tag
+   * metadata on every node, in the background. At most one invalidation
+   * per tag is in flight; a landing while one is in flight marks the tag
+   * so exactly one more goes out after it (so the last landing is always
+   * covered). The flusher does not wait; SyncTag waits for all of them.
+   * @param tags the tags of the landed batch (duplicates are fine)
+   */
+  void NoteTagsLanded(const std::vector<TagId> &tags);
+  /**
+   * Retire the finished tag-metadata invalidations, sending the follow-up
+   * for each tag that landed again while one was in flight.
+   * @return true when none is in flight
+   */
+  bool ReapTagNotes();
+  /** Send one tag-metadata invalidation to the tag's home (no wait). */
+  clio::run::Future<InvalidateTask> SendTagNote(const TagId &tag);
+  /** A tag's background metadata invalidation (NoteTagsLanded). */
+  struct TagNote {
+    clio::run::Future<InvalidateTask> fut_;  ///< the one in flight
+    bool again_ = false;  ///< landed again since it was sent
+  };
+  std::mutex notes_mtx_;  ///< guards tag_notes_
+  std::unordered_map<clio::run::u64, TagNote> tag_notes_;  ///< by tag
+  clio::run::u64 stats_hook_id_ = 0;  ///< stop hook that runs LogStats
   /** Lease data_capacity bytes from the data_pool RAM bdev (extent mode). */
   clio::run::TaskResume LeaseExtents();
   /** Core client bound to the next pool in the chain. */
@@ -181,9 +240,68 @@ class Runtime : public clio::cte::core::CoreInterposer {
   clio::run::u32 SelfNode() const;
   /** Container (of this pool) that is a blob's home. */
   clio::run::u32 HomeOf(const TagId &tag, const std::string &name) const;
-  /** Whether a put/get context can be served by the segment. */
+  /**
+   * Whether a task's put/get context can be served by the segment: no codec,
+   * replica, emulation, generation, versioning, persistence target or fault
+   * handler -- the segment stores raw bytes and none of those properties.
+   * Task-path requests only; a client's shm path takes no context at all.
+   * @param ctx operation context
+   * @return true for a plain context
+   */
+  /**
+   * Cost of this cache's tasks for the scheduler: the data size of each
+   * (io_size_ selects the bulk network lane; wall_time_ drives worker
+   * placement), on the core's model (~10 KB per CPU us, ~500 MB/s wall).
+   * Core methods this cache does not handle specially use the interposer's.
+   * @param task the task
+   * @return its estimated size and cost
+   */
+  clio::run::TaskStat GetTaskStats(
+      const clio::run::Task *task) const override {
+    clio::run::TaskStat stat;
+    if (task == nullptr) return stat;
+    constexpr float kBytesPerComputeUs = 10000.0f;
+    constexpr float kBytesPerWallUs = 500.0f;
+    switch (task->method_) {
+      case Method::kHomeFlush:
+      case Method::kMultiPutBlob: {
+        const auto *t =
+            static_cast<const clio::cte::core::MultiPutBlobTask *>(task);
+        stat.io_size_ = t->data_len_;
+        stat.compute_ =
+            static_cast<size_t>(t->data_len_ / kBytesPerComputeUs) + 2;
+        stat.wall_time_ = static_cast<float>(t->data_len_) / kBytesPerWallUs;
+        return stat;
+      }
+      case Method::kInvalidate: {
+        const auto *t = static_cast<const InvalidateTask *>(task);
+        stat.io_size_ = t->keys_.size();
+        stat.compute_ = 2;
+        stat.wall_time_ = 5.0f;
+        return stat;
+      }
+      case Method::kFlushLog:
+      case Method::kTagAttrs:
+        stat.compute_ = 2;
+        stat.wall_time_ = 5.0f;
+        return stat;
+      default:
+        return clio::cte::core::CoreInterposer::GetTaskStats(task);
+    }
+  }
+
   static bool PlainContext(const clio::cte::core::Context &ctx) {
-    return clio::cte::core::Client::WtcPlainContext(ctx);
+    static const clio::cte::core::Context kDef;
+    return ctx.persistence_target_ == kDef.persistence_target_ &&
+           ctx.min_persistence_level_ == kDef.min_persistence_level_ &&
+           ctx.preallocate_ == 0 && !ctx.emulate_ &&
+           ctx.transform_flags_ == 0 && ctx.replica_ == 0 &&
+           ctx.replica_flags_ == 0 && ctx.version_ == kDef.version_ &&
+           !ctx.create_on_get_ && ctx.op_flags_ == 0 &&
+           ctx.fault_params_[0] == '\0' &&
+           ctx.generation_ == kDef.generation_ &&
+           ctx.dynamic_compress_ == kDef.dynamic_compress_ &&
+           ctx.compress_lib_ == kDef.compress_lib_;
   }
   /** Pop up to one batch of log ranges and coalesce them. */
   std::vector<FlushRecord> PopAndCoalesce(
@@ -377,6 +495,10 @@ class Runtime : public clio::cte::core::CoreInterposer {
 
   WtcConfig config_;
   clio::cte::core::wtc::View view_;
+  /** This cache's Locator in the metadata segment (null when none was
+   *  published); Destroy clears its ready flag so the core stops handing
+   *  out keys for a cache that is gone. */
+  clio::cte::core::wtc::Locator *locator_ = nullptr;
   /** Blocks leased from the data_pool RAM bdev (returned at Destroy). */
   std::vector<clio::run::bdev::Block> leased_;
   std::unique_ptr<clio::cte::core::Client> next_client_;

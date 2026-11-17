@@ -90,6 +90,9 @@ inline bool ParsePoolIdString(const std::string &s, clio::run::PoolId *out) {
  *                                  #   dirty data arrived since the last one
  *                                  #   started; 0 = off
  *   fallback_to_persistent: true   # write-back: write around when full
+ *   flush_pool: "568.0"            # write-back: the pool a flushed range
+ *                                  #   lands at on its owner (default: this
+ *                                  #   cache's own pool)
  */
 struct PolicyCacheParams {
   clio::run::PoolId volatile_pool_;    ///< next_volatile
@@ -111,10 +114,16 @@ struct PolicyCacheParams {
    *  fsync). 0 = off. */
   clio::run::u32 flush_dirty_mb_ = 256;
   bool fallback_to_persistent_ = true;
+  /** Write-back: the pool a flushed range of another node's blob is sent to
+   *  on that blob's owner. A cache above this one (the shm cache) lands it
+   *  there and invalidates the nodes caching its metadata, once per flushed
+   *  range instead of once per write. Null: this cache's own pool. */
+  clio::run::PoolId flush_pool_;
 
   PolicyCacheParams()
       : volatile_pool_(clio::run::PoolId::GetNull()),
-        persistent_pool_(clio::run::PoolId::GetNull()) {}
+        persistent_pool_(clio::run::PoolId::GetNull()),
+        flush_pool_(clio::run::PoolId::GetNull()) {}
 
   /** Fill mode as an enum. */
   FillMode Fill() const { return static_cast<FillMode>(fill_mode_); }
@@ -127,7 +136,7 @@ struct PolicyCacheParams {
     // in the older interposers bought).
     ar(volatile_pool_, persistent_pool_, fill_mode_, fill_hits_,
        evict_mode_, flush_period_ms_, fallback_to_persistent_,
-       flush_fill_pct_, flush_dirty_mb_);
+       flush_fill_pct_, flush_dirty_mb_, flush_pool_);
   }
 
   /**
@@ -179,6 +188,11 @@ struct PolicyCacheParams {
           !ParsePoolIdString(node["next_persistent"].as<std::string>(),
                              &persistent_pool_)) {
         HLOG(kError, "policy cache: malformed next_persistent");
+      }
+      if (node["flush_pool"] &&
+          !ParsePoolIdString(node["flush_pool"].as<std::string>(),
+                             &flush_pool_)) {
+        HLOG(kError, "policy cache: malformed flush_pool");
       }
       if (node["fill"] && !ParseFill(node["fill"].as<std::string>())) {
         HLOG(kError,

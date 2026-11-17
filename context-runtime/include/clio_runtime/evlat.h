@@ -47,6 +47,9 @@ extern "C" void clio_evlat_busy(int which, unsigned long long start,
 /** Record the plain number `n` (not a duration) on channel `which`: the
  *  report's "us" figures for that channel then read as that number. */
 extern "C" void clio_evlat_count(int which, unsigned long long n);
+/** Count one task sent to another node, by its pool's major id and method
+ *  (printed with the channel report as clio-evremote lines). */
+extern "C" void clio_evlat_remote_op(unsigned major, unsigned method);
 
 namespace clio::run::evlat {
 
@@ -138,12 +141,12 @@ enum Chan : int {
   //   FUSE adapter (a client process; CLIO_EVLAT in ITS environment):
   //     rd_total  whole cte_fuse_read
   //     rd_size   size lookup of a sieve read: OpenHandleSize + hiwater
-  //     rd_page   one page: AsyncGetBlobDefer -> Wait returned (bytes in the
-  //               caller's buffer), any node-lost retries included
+  //     rd_page   one page: GetBlob returned (bytes in the caller's
+  //               buffer), any node-lost retries included
   //     rd_pages  pages one read fetched;  rd_bytes  KiB one read returned
   //     wr_total  whole cte_fuse_write
-  //     wr_page   one AsyncPutBlobDefer call (pacing wall, overlap drain,
-  //               staging copy, submit -- the put itself is NOT awaited)
+  //     wr_page   one PutBlob call (a copy into the shm cache segment, or
+  //               the full task path when no cache is connected)
   //     (read-ahead, CLIO_FUSE_READAHEAD_PAGES; channels 77-79 below)
   //   originating container (cache module, where the client's task runs):
   //     gb_local  GetBlob served by this node's core, inline
@@ -207,7 +210,14 @@ enum Chan : int {
   kWbSyncLocal = 83,
   kWbSyncAll = 84,
   kWbSyncCore = 85,
-  kNumChan = 86,
+  // 86-88: the shm cache's flusher (core_shm_cache_writethru): on the
+  // writer, waiting for a flush batch to land at its homes (wtc_land) and
+  // the per-batch tag-metadata invalidation after it (wtc_note); on a home,
+  // one landing batch (HomeFlush: write below + invalidate, wtc_home).
+  kWtcLand = 86,
+  kWtcNote = 87,
+  kWtcHome = 88,
+  kNumChan = 89,
 };
 
 enum Busy : int { kBusyPeerRecv = 0, kBusyNetSend = 1, kNumBusy = 2 };
@@ -239,6 +249,13 @@ inline void Add(int ch, unsigned long long cycles) {
  *  clio_evlat_count). */
 inline void Count(int ch, unsigned long long n) {
   if (On()) clio_evlat_count(ch, n);
+}
+
+/** Count a task sent to another node by (pool major, method), when enabled.
+ *  @param major the task's pool major id
+ *  @param method the task's method */
+inline void RemoteOp(unsigned major, unsigned method) {
+  if (On()) clio_evlat_remote_op(major, method);
 }
 
 /** Record [t0, now) on channel `ch` (and optionally a busy kind) on scope

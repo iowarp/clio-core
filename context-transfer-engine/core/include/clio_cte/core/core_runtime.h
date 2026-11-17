@@ -81,6 +81,17 @@ bool IsTargetEligibleForBlob(const TargetInfo &target,
                              int min_persistence_level);
 
 /**
+ * One lazy copy registered on a source tag (copy-on-write, see
+ * Runtime::CowAddLink). Held per container, keyed by the source tag.
+ */
+struct CowCopyLink {
+  TagId copy_tag_;                        // the lazy copy
+  clio::run::PoolId fault_pool_id_;       // pool that materialises the copy
+  std::string fault_pool_name_;           // its name (kCowFaultPoolName)
+  std::string fault_params_;              // the source tag NAME
+};
+
+/**
  * CTE Core Runtime Container
  * Implements target management and tag/blob operations
  */
@@ -556,6 +567,76 @@ public:
    * @param found set true when this container held anything of it
    */
   clio::run::TaskResume DelTagShare(TagId tag_id, bool *found);
+
+  /**
+   * True when any copy-on-write link exists on this container. One relaxed
+   * atomic load: the only cost a write pays when no lazy copy exists.
+   * @return true if at least one source->copy link is registered here
+   */
+  bool CowActive() const {
+    return cow_link_count_.load(std::memory_order_acquire) != 0;
+  }
+  /**
+   * Snapshot of the lazy copies registered on `source` here.
+   * @param source the source tag
+   * @return the copies (empty when none); a copy, so no lock is held after
+   */
+  std::vector<CowCopyLink> CowCopiesOf(const TagId &source);
+  /**
+   * Record a lazy copy on `source`, or replace the entry for the same copy
+   * tag (a re-registered copy is one link, not two).
+   * @param source the source tag
+   * @param link   the copy and how to materialise it
+   */
+  void CowAddLink(const TagId &source, const CowCopyLink &link);
+  /**
+   * Forget every link involving `tag`: links FROM it (it is a source being
+   * deleted) and links TO it (it is a copy being deleted). Local only.
+   * @param tag the tag being deleted here
+   */
+  void CowForgetTag(const TagId &tag);
+  /**
+   * Before a write or delete mutates `blob_name` of `source`, make every
+   * registered copy that lacks the blob hold its PRE-WRITE bytes. Must run
+   * under the blob's write token; a copy that holds the blob is untouched.
+   * @param source    the source tag whose blob is about to change
+   * @param blob_name the blob
+   * @param rc        set to 0, or the first materialisation error (the
+   *                  mutation must then not proceed)
+   */
+  clio::run::TaskResume CowMaterializeBlob(const TagId &source,
+                                           const std::string &blob_name,
+                                           clio::run::u32 *rc);
+  /**
+   * Materialise one blob into one lazy copy if the copy lacks it: probe the
+   * copy, then dispatch a materialise-only fault to the copy's fault pool.
+   * @param link      the copy and its fault handler
+   * @param blob_name the blob
+   * @param rc        set to 0 on success, else the failing code
+   */
+  clio::run::TaskResume CowMaterializeCopy(const CowCopyLink &link,
+                                           const std::string &blob_name,
+                                           clio::run::u32 *rc);
+  /**
+   * Name owner side of a copy registration: resolve the source tag and
+   * broadcast the link (CowLinkTask) to every container of this pool.
+   * @param copy_tag       the lazy copy's id
+   * @param fault_pool_id  the copy's fault pool
+   * @param fault_pool_name its name
+   * @param fault_params   the source tag NAME
+   * @param rc             set to 0 once every container has the link
+   */
+  clio::run::TaskResume CowRegisterCopy(const TagId &copy_tag,
+                                        const clio::run::PoolId &fault_pool_id,
+                                        const std::string &fault_pool_name,
+                                        const std::string &fault_params,
+                                        clio::run::u32 *rc);
+  /**
+   * kCowLink handler: apply one link locally (copy-on-write entry and the
+   * copy's fault registration). Never re-broadcasts.
+   * @param task the broadcast link task
+   */
+  clio::run::TaskResume CowLink(clio::run::shared_ptr<CowLinkTask> &task);
   /** Replace `id`'s TagInfo with a copy edited by `edit` (readers stay safe). */
   void EditTagInfo(const TagId &id, const std::function<void(TagInfo &)> &edit);
 
@@ -633,7 +714,10 @@ public:
    * payload size (size_) for routing. Otherwise the scheduler buckets
    * every blob op as "metadata" and lands them on the scheduler worker,
    * making large blob transfers compete with latency-sensitive admin
-   * traffic instead of going to dedicated I/O workers.
+   * traffic instead of going to dedicated I/O workers. Every other core
+   * method returns an explicit estimate too (core_task_stats.h).
+   * @param task the task to estimate
+   * @return the task's cost features
    */
   clio::run::TaskStat GetTaskStats(const clio::run::Task *task) const override;
 
@@ -709,6 +793,17 @@ private:
   ctp::priv::unordered_map_ll<std::string, TagId>
       tag_name_to_id_;                                   // tag_name -> tag_id
   ctp::priv::unordered_map_ll<TagId, std::shared_ptr<TagInfo>> tag_id_to_info_; // tag_id -> TagInfo
+
+  // Copy-on-write links (lazy checkpoints): source tag -> an IMMUTABLE snapshot
+  // of the copies that must hold a blob's pre-write bytes before a write or
+  // delete lands on it here. Readers take a handle; writers serialise on
+  // cow_mutex_ (never held across a co_await) and replace the snapshot.
+  // cow_link_count_ is the total number of links: a write checks it with one
+  // atomic load, so a container with no links takes no lock at all.
+  std::mutex cow_mutex_;
+  ctp::priv::unordered_map_ll<TagId, std::shared_ptr<const std::vector<CowCopyLink>>>
+      cow_links_;
+  std::atomic<clio::run::u32> cow_link_count_{0};
   ctp::priv::unordered_map_ll<std::string, std::shared_ptr<BlobInfo>>
       tag_blob_name_to_info_; // "tag_id.blob_name" -> BlobInfo
 
@@ -761,31 +856,14 @@ private:
   // RenameTag, rebuilt after WAL/metadata restore).
   ctp::search::RegexSearchEngine<TagId> tag_search_;
 
-  // issue #783: shared-memory mirror of the tag/blob metadata, for zero-IPC
-  // client reads. DERIVED STATE ONLY -- the maps above stay authoritative.
-  // Every mirror call is best-effort and silently no-ops when the metadata
-  // segment is unavailable, so a metadata write is never rejected because the
-  // cache could not be updated.
-  ShmMetadataCache shm_cache_;
-
-  /** Project a BlobInfo into its cacheable form. Returns false when the blob
-   *  cannot be represented (too many blocks), in which case it is not
-   *  cached and clients keep using the RPC path for it. */
-  void MirrorTagShm(const TagId &tag_id, const TagInfo &info);
-  bool BuildShmBlobRecord(const BlobInfo &info, ShmBlobRecord *out);
-
-  /** Mirror one blob into the SHM cache. No-op when caching is off. */
-  void MirrorBlobToShm(const std::string &composite_key, const BlobInfo &info);
   /**
-   * Withdraw a blob's zero-IPC mirror record. Called before extents the
-   * record names are freed (#1131): a client copying from the mirror pins
-   * nothing and validates only against the mirror's generation, so a record
-   * left in place across the free lets it return another blob's reused bytes
-   * with rc 0. A miss sends it to the RPC path instead.
-   * @param tag_id the blob's tag
-   * @param blob_name the blob's name
+   * Project a BlobInfo into a ShmBlobRecord (GetResidency's direct-readable
+   * test).
+   * @param info the blob
+   * @param out receives the record
+   * @return false when the blob cannot be represented
    */
-  void WithdrawBlobMirror(const TagId &tag_id, const std::string &blob_name);
+  bool BuildShmBlobRecord(const BlobInfo &info, ShmBlobRecord *out);
 
   /**
    * Log a read served from a non-primary copy (CLIO_TRACE_COPY_READS=1):
@@ -858,6 +936,33 @@ private:
    * @return true on success; false (logged) for an unknown durability value
    */
   bool ApplyDurability();
+
+ public:
+  /**
+   * Fill the OUT params of a get-or-create that found this pool already
+   * existing (Container::FillExistingCreate): the shm cache keys, so every
+   * client of an existing pool can connect, not only the one that created it.
+   * @param create_task the CTE CreateTask
+   */
+  void FillExistingCreate(clio::run::Task *create_task) override;
+
+ private:
+  /**
+   * Serialize this pool's OUT CreateParams (config and shm cache keys) into
+   * a create task's chimod_params_, where the client's Wait() reads them.
+   * @param create_task the create task
+   */
+  void WriteCreateOut(clio::run::admin::CreatePoolFields *create_task);
+
+  /**
+   * Keys of the shm cache module that fronts this pool on this node: the
+   * cache whose chain of next pools (Container::GetNextPool) ends at this
+   * pool. Found through the metadata directory where every cache publishes
+   * its wtc::Locator; a destroyed cache clears its Locator's ready flag. When
+   * several live caches front this pool, the newest registration wins.
+   * @return the keys, all zero when no cache fronts this pool
+   */
+  ShmCacheKeys FindFrontCache() const;
 
   /**
    * Durability label of a target being registered: the task's
@@ -1147,9 +1252,18 @@ private:
    * per blob.
    * @param blobs (tag, blob name) pairs held by this container
    */
+  /**
+   * Delete a set of blobs as one plan. A blob whose copy-on-write
+   * materialisation fails is KEPT (not freed, index untouched) and reported.
+   * @param blobs   (tag, name) pairs; resolved and locked per owner
+   * @param deleted set to the number actually deleted (may be null)
+   * @param kept    receives the (tag, name) pairs kept because a lazy copy
+   *                could not take its snapshot first (may be null)
+   */
   clio::run::TaskResume DeleteBlobsPlanned(
       std::vector<std::pair<TagId, std::string>> blobs,
-      clio::run::u32 *deleted = nullptr);
+      clio::run::u32 *deleted = nullptr,
+      std::vector<std::pair<TagId, std::string>> *kept = nullptr);
 
   /**
    * Delete a set of blobs in one task: this container's blobs as one plan,

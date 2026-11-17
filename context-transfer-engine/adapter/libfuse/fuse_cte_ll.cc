@@ -45,7 +45,7 @@
 //
 // Every operation resolves ino -> path and DELEGATES to the exported
 // high-level implementations in fuse_cte.cc (mirror-first getattr,
-// complete-dir negatives, minted creates, sieve-direct I/O, the closer
+// complete-dir negatives, direct page-blob I/O, the closer
 // thread) — this file adds no filesystem semantics of its own.
 //
 // Deliberate simplifications (experimental perf target, not the default):

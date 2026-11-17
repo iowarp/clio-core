@@ -371,6 +371,8 @@ IpcManagerRun2Run::SendInPlan IpcManagerRun2Run::SendInPlanReplica(
       container->NewCopyTask(origin_task->method_, origin_task, true);
   origin_task->Subtasks()[replica_idx] = task_copy;
 
+  clio::run::evlat::RemoteOp(origin_task->pool_id_.major_,
+                             origin_task->method_);
   // Stamp the copy so the response can find the origin and its replica slot.
   task_copy->task_id_.net_key_ = send_map_key;
   task_copy->task_id_.replica_id_ = replica_idx;

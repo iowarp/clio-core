@@ -56,6 +56,7 @@
 
 #include <clio_cte/core/blob_batch.h>
 #include <clio_cte/core_shm_cache_writethru/core_shm_cache_writethru_runtime.h>
+#include <clio_runtime/evlat.h>
 
 namespace clio::cte::shm_wtc {
 
@@ -208,6 +209,66 @@ clio::run::TaskResume Runtime::AllocStaging(
   CLIO_TASK_BODY_END
 }
 
+bool Runtime::PinRecords(std::vector<FlushRecord> &recs) {
+  for (size_t i = 0; i < recs.size(); ++i) {
+    FlushRecord &fr = recs[i];
+    if (fr.size_ == 0) continue;
+    clio::run::u64 size = fr.size_;
+    clio::run::u64 gen = 0;
+    const char *p = view_.PinRange(fr.slot_, fr.off_, &size, &gen);
+    if (p == nullptr) {
+      for (size_t j = 0; j < i; ++j) {
+        if (recs[j].ptr_ != nullptr) view_.UnpinRange(recs[j].slot_);
+        recs[j].ptr_ = nullptr;
+      }
+      return false;
+    }
+    fr.ptr_ = p;
+    fr.size_ = size;
+    if (gen != 0 && size != 0) {
+      flush_marks_[fr.slot_] = FlushMark{gen, fr.off_, fr.off_ + size};
+    }
+  }
+  return true;
+}
+
+void Runtime::UnpinRecords(std::vector<FlushRecord> &recs) {
+  for (FlushRecord &fr : recs) {
+    if (fr.ptr_ != nullptr) view_.UnpinRange(fr.slot_);
+    fr.ptr_ = nullptr;
+  }
+}
+
+clio::run::u64 Runtime::SendPinned(
+    const std::vector<FlushRecord> &recs, std::vector<clio::run::u32> *homes,
+    std::vector<clio::run::Future<MultiPutBlobTask>> *futs) {
+  auto *ipc = CLIO_IPC;
+  clio::run::u64 bytes = 0;
+  for (const FlushRecord &fr : recs) {
+    if (fr.size_ == 0 || fr.ptr_ == nullptr) continue;
+    MultiPutDesc d;
+    d.tag_id_ = TagId(fr.key_.major_, fr.key_.minor_);
+    d.blob_name_ = fr.key_.name_;
+    d.offset_ = fr.off_;
+    d.size_ = fr.size_;
+    d.payload_off_ = 0;
+    d.flags_ = fr.put_flags_;
+    const bool local = fr.home_ == container_id_;
+    auto t = ipc->NewTask<MultiPutBlobTask>(
+        clio::run::CreateTaskId(), local ? CorePoolId() : pool_id_,
+        local ? clio::run::PoolQuery::Local()
+              : clio::run::PoolQuery::DirectId(fr.home_),
+        local ? d.tag_id_ : TagId(container_id_, kWriterMarker), d.blob_name_,
+        ctp::ipc::ShmPtr<>::FromRaw(const_cast<char *>(fr.ptr_)), fr.size_,
+        clio::cte::core::EncodeMultiPutDescs({d}), Context());
+    if (!local) t->method_ = Method::kHomeFlush;
+    homes->push_back(fr.home_);
+    futs->push_back(ipc->Send(t));
+    bytes += fr.size_;
+  }
+  return bytes;
+}
+
 void Runtime::CopyRecords(
     std::vector<FlushRecord> &recs,
     std::map<clio::run::u32, ctp::ipc::FullPtr<char>> &staging,
@@ -272,10 +333,13 @@ clio::run::TaskResume Runtime::RetryGroup(const std::vector<FlushRecord> &recs,
     clio::run::u32 rc = 1;
     for (clio::run::u32 attempt = 0;
          attempt < config_.flush_retries_ && rc != 0; ++attempt) {
+      // Pinned records retry from the cache bytes; staged ones from staging.
+      char *src = recs[i].ptr_ != nullptr
+                      ? const_cast<char *>(recs[i].ptr_)
+                      : staging.ptr_ + recs[i].payload_off_;
       auto f = Next()->AsyncPutBlob(
           TagId(recs[i].key_.major_, recs[i].key_.minor_), recs[i].key_.name_,
-          recs[i].off_, recs[i].size_,
-          ctp::ipc::ShmPtr<>::FromRaw(staging.ptr_ + recs[i].payload_off_),
+          recs[i].off_, recs[i].size_, ctp::ipc::ShmPtr<>::FromRaw(src),
           -1.0f, clio::cte::core::Context(), recs[i].put_flags_);
       CLIO_CO_AWAIT(f);
       rc = f->GetReturnCode();
@@ -409,10 +473,16 @@ clio::run::TaskResume Runtime::LaunchBatch(bool *launched) {
       }
       std::map<clio::run::u32, clio::run::u64> totals;
       ResolveRecords(b.recs_, &totals);
-      CLIO_CO_AWAIT(AllocStaging(totals, &b.staging_));
-      std::map<clio::run::u32, clio::run::u64> staged;
-      CopyRecords(b.recs_, b.staging_, &staged);
-      b.bytes_ = SendGroups(b.recs_, b.staging_, staged, &b.homes_, &b.futs_);
+      if (PinRecords(b.recs_)) {
+        // Zero copy: the tasks point at the bytes in the cache itself.
+        b.pinned_ = true;
+        b.bytes_ = SendPinned(b.recs_, &b.homes_, &b.futs_);
+      } else {
+        CLIO_CO_AWAIT(AllocStaging(totals, &b.staging_));
+        std::map<clio::run::u32, clio::run::u64> staged;
+        CopyRecords(b.recs_, b.staging_, &staged);
+        b.bytes_ = SendGroups(b.recs_, b.staging_, staged, &b.homes_, &b.futs_);
+      }
       for (const FlushRecord &fr : b.recs_) ++inflight_slots_[fr.slot_];
       inflight_.push_back(std::move(b));
       *launched = true;
@@ -427,7 +497,11 @@ clio::run::TaskResume Runtime::LandOldest() {
   {
     InflightBatch b = std::move(inflight_.front());
     inflight_.pop_front();
+    const unsigned long long ev_land0 = clio::run::evlat::Now();
     CLIO_CO_AWAIT(LandGroups(b.recs_, b.staging_, b.homes_, b.futs_));
+    clio::run::evlat::Span(clio::run::evlat::kWtcLand, ev_land0,
+                           clio::run::evlat::Now());
+    if (b.pinned_) UnpinRecords(b.recs_);
     auto *ipc = CLIO_IPC;
     for (auto &g : b.staging_) {
       if (!g.second.IsNull()) ipc->FreeBuffer(g.second);
@@ -465,7 +539,11 @@ clio::run::TaskResume Runtime::LandOldest() {
       for (const FlushRecord &fr : b.recs_) {
         if (fr.size_ > 0) written.push_back(TagId(fr.key_.major_, fr.key_.minor_));
       }
-      CLIO_CO_AWAIT(NoteTagsWritten(written, /*count_local=*/false));
+      const unsigned long long ev_note0 = clio::run::evlat::Now();
+      ReapTagNotes();
+      NoteTagsLanded(written);
+      clio::run::evlat::Span(clio::run::evlat::kWtcNote, ev_note0,
+                             clio::run::evlat::Now());
     }
     root->stats_.flush_batches_.fetch_add(b.futs_.size());
     root->stats_.flush_ranges_.fetch_add(b.popped_);
@@ -579,7 +657,9 @@ clio::run::TaskResume Runtime::SendInvalidations(
     std::vector<clio::run::Future<InvalidateTask>> futs;
     for (const auto &e : by_node) {
       if (e.first == container_id_) {
-        for (const BlobKey &k : e.second) {
+        // A cache without a segment (serving tasks only) has nothing here.
+        for (size_t i = 0; view_.Ready() && i < e.second.size(); ++i) {
+          const BlobKey &k = e.second[i];
           view_.Invalidate(k.major_, k.minor_, k.name_.c_str(), k.name_.size());
         }
         continue;
@@ -602,6 +682,7 @@ clio::run::TaskResume Runtime::HomeFlush(clio::run::shared_ptr<HomeFlushTask> &t
   CLIO_TASK_BODY_BEGIN
   {
     const clio::run::u32 writer = task->route_tag_id_.major_;
+    const unsigned long long ev_home0 = clio::run::evlat::Now();
     if (WtcTrace()) {
       HLOG(kInfo, "[WTC-TRACE] t={} homeflush-recv at={} writer={}", WallMs(),
            container_id_, writer);
@@ -630,6 +711,8 @@ clio::run::TaskResume Runtime::HomeFlush(clio::run::shared_ptr<HomeFlushTask> &t
       keys.push_back(BlobKey{d.tag_id_.major_, d.tag_id_.minor_, d.blob_name_});
     }
     CLIO_CO_AWAIT(SendInvalidations(HomeApply(keys, writer)));
+    clio::run::evlat::Span(clio::run::evlat::kWtcHome, ev_home0,
+                           clio::run::evlat::Now());
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END

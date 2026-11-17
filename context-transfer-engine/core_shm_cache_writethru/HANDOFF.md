@@ -50,13 +50,13 @@ Code map:
   invalidate, flusher reads). Shared by client and chimod. 64-stripe blob
   table, pins instead of locks during memcpy, lock order stripe -> tag ->
   allocator, eviction uses TryLock on other stripes.
-- `core/include/clio_cte/core/core_client.h`: client cache path (`Wtc()`,
-  `WtcTryPut`, `WtcTryGet`, `WtcDonePut`, `WtcPlainContext`,
-  `WtcAbsorbableFlags`) hooked into `AsyncPutBlob` (both overloads),
-  `AsyncGetBlob` (both), `AsyncGetBlobSize`. `TryShmGet` stands down when
-  bound to the cache.
-- `core/src/content_transfer_engine.cc`: `CLIO_CTE_CLIENT_INIT` auto-binds to
-  568.0 when the segment is mappable; `CLIO_CTE_SHM_CACHE=0` opts out.
+- `core/include/clio_cte/core/core_client.h`: two paths. Connected
+  (`ConnectCache`), the synchronous `PutBlob` / `GetBlob` / `GetBlobSize` /
+  `GetOrCreateTag` run on the segment first; everything else, and every
+  `Async*` method, is the task path.
+- `core/src/content_transfer_engine.cc`: `CLIO_CTE_CLIENT_INIT` reads the
+  cache keys from the core Create's OUT params, binds to the entry pool and
+  connects when the segment is mappable.
 - `core_shm_cache_writethru/src/`: `_runtime.cc` (create/segment/locator, tags,
   SyncTag, BarrierForward), `_data.cc` (task-path data verbs, fill,
   register sharer), `_flush.cc` (FlushLog, HomeFlush, Invalidate, sharer map).
@@ -114,9 +114,8 @@ Code map:
   must not depend on that field after dispatch.
 - The writer is invalidated too whenever another container also wrote the
   blob: N-1 disjoint writers exchange invalidation messages every flush.
-- `WtcDonePut`/`WtcTryGet` allocate a task object per op to return a
-  completed Future; likely the dominant client cost now. Candidate for a
-  cheaper completed-future type.
+- Done: the synchronous `Client::PutBlob`/`GetBlob` cache paths allocate no
+  task (the old completed-Future wrappers are gone).
 - FlushLog period 50 us: check idle CPU (dev recently had idle-CPU work).
 - A `MultiPutBlob` record whose put flags conflict with the cached blob's is
   reported as failed instead of forwarded.

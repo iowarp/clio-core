@@ -85,6 +85,11 @@ using WtcAlloc = CLIO_TASK_ALLOC_T;
 /** Pool id of the default-compose shm write-through cache. */
 inline const clio::run::PoolId kDefaultPoolId(568, 0);
 
+/** Put flags the segment can carry: per-blob properties only (equals
+ *  kCtePutDroppable). Replace/append depend on the chain's state, so a put
+ *  with any other flag is refused (kMiss) and takes the task path. */
+static constexpr u32 kPerBlobPutFlags = 0x2u;
+
 /** Longest blob name the segment can hold; longer names take the task path. */
 static constexpr u32 kMaxBlobName = 200;
 /** Independent lock regions of the blob table. */
@@ -290,12 +295,16 @@ struct Stats {
   std::atomic<u64> miss_nonres_;    /**< get miss: entry holds no bytes */
   std::atomic<u64> miss_range_;     /**< get miss: bytes not known current */
   std::atomic<u64> miss_busy_;      /**< get miss: writer mid-copy / torn */
+  std::atomic<u64> put_full_log_;   /**< put refused: dirty log near full */
+  std::atomic<u64> put_full_slot_;  /**< put refused: no blob entry free */
+  std::atomic<u64> put_full_buf_;   /**< put refused: no buffer space */
+  std::atomic<u64> put_miss_;       /**< put refused: md_only / put flags */
 };
 
 /** Segment root: the first allocation in the segment. */
 struct Root {
   static constexpr u64 kMagic = 0x3143544357534C43ull;  // "CLSWCTC1"
-  static constexpr u32 kVersion = 8;
+  static constexpr u32 kVersion = 9;
 
   u64 magic_;
   u32 version_;
@@ -595,6 +604,22 @@ class View {
 
   /** Remove every blob of a tag that has nothing pending. */
   void DropTagBlobs(u32 major, u32 minor);
+
+  /**
+   * Zero-copy flusher read of a logged range: the address of the CURRENT
+   * bytes of [off, off+size) of the blob in `slot`, pinned (the buffer is
+   * neither freed nor moved) until UnpinRange. Writes may still change the
+   * bytes while pinned; a later flush of the newer range lands after this
+   * one. Segment mode only.
+   * @param size in/out: clamped to the bytes the buffer holds
+   * @param copied_gen out: as ReadRange's
+   * @return the address, or nullptr in extent mode or when the slot holds
+   *         no live resident entry (then nothing is pinned)
+   */
+  const char *PinRange(u32 slot, u64 off, u64 *size, u64 *copied_gen);
+
+  /** Release a PinRange pin of `slot`. */
+  void UnpinRange(u32 slot);
 
   /**
    * Flusher read of a logged range: copy the CURRENT bytes of [off, off+size)

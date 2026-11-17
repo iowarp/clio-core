@@ -98,6 +98,9 @@ clio::run::TaskResume Runtime::GetBlob(
   auto *core = GetNextClient();
   Context nofault = task->context_;
   nofault.op_flags_ |= Context::kNoFault;
+  // The materialising put writes the copy's own bytes: it must not run the
+  // copy-on-write hook (that hook exists to protect a source from its writers).
+  nofault.op_flags_ |= Context::kNoCow;
   // The materialising put must not inherit read-side directives.
   nofault.create_on_get_ = false;
 
@@ -109,9 +112,26 @@ clio::run::TaskResume Runtime::GetBlob(
     CLIO_CO_RETURN;
   }
 
-  // 1. Resolve the source tag (idempotent lookup).
+  // 0. Materialise-only on a copy that already holds the blob: keep its own
+  // bytes. Re-materialising now would replace them with the source's CURRENT
+  // bytes, which may be later than the copy's snapshot. (Copy-on-write calls
+  // this with the source's pre-write bytes, but a racing reader may have
+  // already materialised the blob.)
+  if (materialize_only) {
+    auto probe = core->AsyncGetBlobSize(copy_tag, blob_name,
+                                        clio::run::PoolQuery::Dynamic());
+    CLIO_CO_AWAIT(probe);
+    // Any existing copy blob counts as held, including an empty tombstone.
+    if (probe->GetReturnCode() == 0) {
+      task->return_code_ = 0;
+      CLIO_CO_RETURN;
+    }
+  }
+
+  // 1. Resolve the source tag (idempotent lookup). An id-form parameter
+  // ("#major.minor") IS the source, and resolves even after its name is gone.
   TagId src_tag = TagId::GetNull();
-  {
+  if (!clio::cte::core::ParseCowSourceParam(src_tag_name, &src_tag)) {
     auto tf = core->AsyncGetOrCreateTag(src_tag_name);
     CLIO_CO_AWAIT(tf);
     if (tf->GetReturnCode() != 0) {
@@ -138,9 +158,21 @@ clio::run::TaskResume Runtime::GetBlob(
   }
   if (full == 0) {
     if (materialize_only) {
-      // Put-side fault of a blob with no source content: nothing to
-      // materialise; the put proceeds against a fresh blob.
-      task->return_code_ = 0;
+      // The source has no bytes at this instant: the blob is ABSENT at the
+      // copy's snapshot. Record that in the copy as an empty blob (a
+      // tombstone) so the copy never faults it again and a later source write
+      // cannot leak in. An ordinary read of the tombstone fails like a miss.
+      // A put-side fault then extends the tombstone like any fresh blob.
+      // create_on_get on a missing blob creates it and copies nothing.
+      auto tomb_buf = CLIO_IPC->AllocateBuffer(1);
+      ctp::ipc::ShmPtr<> tomb_shm = tomb_buf.shm_.template Cast<void>();
+      Context tomb = nofault;
+      tomb.create_on_get_ = true;
+      auto tomb_get = SendGet(copy_tag, blob_name, 0, 1, /*flags=*/0, tomb_shm,
+                              tomb);
+      CLIO_CO_AWAIT(tomb_get);
+      task->return_code_ = tomb_get->GetReturnCode();
+      CLIO_IPC->FreeBuffer(tomb_buf);
       CLIO_CO_RETURN;
     }
     Context fwd = task->context_;

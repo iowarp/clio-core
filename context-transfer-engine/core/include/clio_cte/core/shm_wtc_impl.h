@@ -73,6 +73,10 @@ inline bool View::Format(const std::string &name,
   if (!backend_.shm_init(backend_id, seg_size_, name)) {
     return false;
   }
+  // Map every page of the segment now (MADV_POPULATE_WRITE: maps, never
+  // alters contents): otherwise each first write to a 4 KiB page faults in
+  // the writing client, ~256 faults per MiB absorbed.
+  ctp::SystemInfo::BulkFault(backend_.data_, backend_.data_capacity_);
   owner_ = true;
   mapped_ = true;
   alloc_ = backend_.MakeAlloc<WtcAlloc>();
@@ -834,13 +838,15 @@ inline Status View::TryPut(u32 tag_major, u32 tag_minor, const char *name,
   if (name_len > kMaxBlobName) {
     return Status::kTooLong;
   }
-  if (MdOnly()) {
-    return Status::kMiss;  // bytes are not cached here: take the task path
+  if (MdOnly() || (put_flags & ~kPerBlobPutFlags) != 0) {
+    root_->stats_.put_miss_.fetch_add(1, std::memory_order_relaxed);
+    return Status::kMiss;  // not expressible here: take the task path
   }
   if (!may_block) {
     const u64 cap = log_->Capacity();
     const u64 room = kLogHeadroom < cap / 4 ? kLogHeadroom : cap / 4;
     if (log_->Size() + room >= cap) {
+      root_->stats_.put_full_log_.fetch_add(1, std::memory_order_relaxed);
       return Status::kNoSpace;  // nothing touched; caller yields and retries
     }
   }
@@ -859,6 +865,7 @@ inline Status View::TryPut(u32 tag_major, u32 tag_minor, const char *name,
                              &inserted);
     }
     if (s < 0) {
+      root_->stats_.put_full_slot_.fetch_add(1, std::memory_order_relaxed);
       return Status::kNoSpace;
     }
     slot = static_cast<u32>(s);
@@ -873,6 +880,7 @@ inline Status View::TryPut(u32 tag_major, u32 tag_minor, const char *name,
     }
     u64 need = off + size;
     if (!EnsureCapacityLocked(e, need, stripe)) {
+      root_->stats_.put_full_buf_.fetch_add(1, std::memory_order_relaxed);
       return Status::kNoSpace;
     }
     // Lock order is always stripe -> tag; nothing takes them the other way.
@@ -1072,6 +1080,7 @@ inline u32 View::TakeTagError(u32 major, u32 minor) {
 }
 
 inline void View::DropTag(u32 major, u32 minor) {
+  if (root_ == nullptr) return;  // no segment: nothing cached
   Guard g(root_->tag_lock_);
   root_->tag_inval_seq_.fetch_add(1, std::memory_order_acq_rel);
   TagEntry *t = FindTagLocked(major, minor, false);
@@ -1195,6 +1204,7 @@ inline bool View::LookupTagName(u32 major, u32 minor, std::string *name) {
 }
 
 inline void View::DropTagMeta(u32 major, u32 minor) {
+  if (root_ == nullptr) return;  // no segment: nothing cached
   Guard g(root_->tag_lock_);
   root_->tag_inval_seq_.fetch_add(1, std::memory_order_acq_rel);
   TagEntry *t = FindTagLocked(major, minor, false);
@@ -1332,6 +1342,7 @@ inline bool View::FillSize(u32 tag_major, u32 tag_minor, const char *name,
 
 inline void View::Invalidate(u32 tag_major, u32 tag_minor, const char *name,
                              size_t name_len) {
+  if (root_ == nullptr) return;  // no segment: nothing cached
   if (name_len == kTagMetaNameLen &&
       std::memcmp(name, kTagMetaName, kTagMetaNameLen) == 0) {
     DropTagMeta(tag_major, tag_minor);
@@ -1359,6 +1370,7 @@ inline void View::Invalidate(u32 tag_major, u32 tag_minor, const char *name,
 
 inline void View::DropBlob(u32 tag_major, u32 tag_minor, const char *name,
                            size_t name_len) {
+  if (root_ == nullptr) return;  // no segment: nothing cached
   if (name_len > kMaxBlobName) {
     return;
   }
@@ -1381,6 +1393,7 @@ inline void View::DropBlob(u32 tag_major, u32 tag_minor, const char *name,
 }
 
 inline void View::DropTagBlobs(u32 major, u32 minor) {
+  if (root_ == nullptr) return;  // no segment: nothing cached
   u32 sps = root_->slots_per_stripe_;
   for (u32 stripe = 0; stripe < kStripes; ++stripe) {
     Guard g(root_->stripes_[stripe]);
@@ -1440,6 +1453,33 @@ inline bool View::ReadRange(u32 slot, u64 off, u64 *size, char *dst,
   }
   e->pins_.fetch_sub(1, std::memory_order_acq_rel);
   return true;
+}
+
+inline const char *View::PinRange(u32 slot, u64 off, u64 *size,
+                                  u64 *copied_gen) {
+  if (Extents() || slot >= NumSlots()) {
+    return nullptr;
+  }
+  u32 stripe = slot / root_->slots_per_stripe_;
+  BlobEntry *e = Slot(slot);
+  Guard g(root_->stripes_[stripe]);
+  if (e->state_ != kSlotLive || !(e->flags_ & kResident)) {
+    return nullptr;
+  }
+  u64 end = off + *size;
+  if (end > e->cap_) {
+    end = e->cap_;
+  }
+  *size = end > off ? end - off : 0;
+  bool quiet = e->wbegin_.load(std::memory_order_acquire) ==
+               e->wend_.load(std::memory_order_acquire);
+  *copied_gen = quiet ? e->write_gen_.load(std::memory_order_acquire) : 0;
+  e->pins_.fetch_add(1, std::memory_order_acq_rel);
+  return base_ + e->buf_off_ + off;
+}
+
+inline void View::UnpinRange(u32 slot) {
+  Slot(slot)->pins_.fetch_sub(1, std::memory_order_acq_rel);
 }
 
 inline u64 View::RangeGen(const DirtyRange &r) const {

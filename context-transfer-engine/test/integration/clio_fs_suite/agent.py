@@ -38,6 +38,59 @@ import time
 
 import stress_records as sr
 
+
+def _install_fsync_on_close():
+  """Fsync every written file descriptor before it is closed.
+
+  Set up when CLIO_SUITE_FSYNC_ON_CLOSE=1 (the suite runs a write-back
+  cache): written data is only guaranteed visible on other nodes after an
+  fsync, so the agent closes the files it wrote the way a correct workload
+  does. Only descriptors that were written, truncated or mapped are synced
+  (an fsync asks every node), and every write path in this process (the
+  ops here, stress_records, fsx) goes through these os functions.
+  """
+  written = set()
+  real_close = os.close
+
+  def mark(fn):
+    def wrapper(fd, *a, **kw):
+      r = fn(fd, *a, **kw)
+      written.add(fd)
+      return r
+    return wrapper
+
+  for name in ('write', 'pwrite', 'writev', 'pwritev', 'ftruncate',
+               'posix_fallocate'):
+    if hasattr(os, name):
+      setattr(os, name, mark(getattr(os, name)))
+
+  import mmap as mmap_mod
+  real_mmap = mmap_mod.mmap
+
+  class _Mmap(real_mmap):
+    """mmap.mmap that marks a shared writable mapping's file written."""
+    def __new__(cls, fileno, *a, **kw):
+      if fileno >= 0:
+        written.add(fileno)
+      return real_mmap.__new__(cls, fileno, *a, **kw)
+
+  mmap_mod.mmap = _Mmap
+
+  def close(fd):
+    if fd in written:
+      written.discard(fd)
+      try:
+        os.fsync(fd)
+      except OSError:
+        pass  # the close (and the test's own checks) report real errors
+    real_close(fd)
+
+  os.close = close
+
+
+if os.environ.get('CLIO_SUITE_FSYNC_ON_CLOSE') == '1':
+  _install_fsync_on_close()
+
 BLOCK = 65536  # Granularity of the deterministic data pattern.
 
 _libc = ctypes.CDLL(None, use_errno=True)

@@ -682,6 +682,12 @@ compose:
     # data were written since the last one started, so flushing keeps pace
     # with the writes and an fsync finds little left to do. 0 = off.
     flush_dirty_mb: 256
+    # Write-back buffers a write on the node that makes it; a flush sends
+    # each range of another node's blob to that blob's owner, landing it
+    # through this pool there (the shm cache above, which then invalidates
+    # the nodes caching its metadata -- once per flushed range, not per
+    # write). Unset: this cache's own pool (no metadata invalidation).
+    flush_pool: "568.0"
     # When the volatile core cannot hold a put even after eviction: true
     # writes it straight to persistent (default); false fails the put with
     # ENOSPC (kPutNoSpaceRc) so a deployment never silently drops to disk
@@ -739,8 +745,11 @@ compose:
   # with no task; a miss fetches from the owner and caches the answer. Each
   # entry's home tracks which nodes cache it and invalidates them when it
   # changes. md_only: true here because the write-back cache below already
-  # holds the bytes. CLIO_CTE_CLIENT_INIT binds a process to entry_pool_id
-  # (the indexer) and maps this segment; CLIO_CTE_SHM_CACHE=0 opts out.
+  # holds the bytes. The CTE core's Create returns this cache's segment keys
+  # (pid, pool, root offset, entry pool) for the core at the bottom of its
+  # chain; CLIO_CTE_CLIENT_INIT then binds the process to entry_pool_id (the
+  # indexer) and maps the segment. A process that cannot map it (TCP client,
+  # remote node) stays on the task path.
   - mod_name: clio_cte_core_shm_cache_writethru
     pool_name: clio_cte_core_shm_cache_writethru
     pool_query: local
@@ -748,6 +757,11 @@ compose:
     next_pool_id: "567.0"               # write-back cache (562.0 with compressor)
     entry_pool_id: "564.0"              # clients bind to the indexer above
     md_only: true                       # bytes are cached by the write-back cache
+    # Writes send no invalidation of their own: the write-back cache below
+    # lands each flushed range through this pool on the blob's home, which
+    # invalidates its sharers then. Only with a write-back cache below whose
+    # flush_pool is this pool; false (default) invalidates on every write.
+    invalidate_on_flush: true
     capacity: "256M"                    # segment bytes: buffers + tables + log
     # Extent mode (only with md_only: false): keep blob bytes in a node-local
     # RAM bdev instead of this cache's own segment. The cache leases

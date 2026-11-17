@@ -256,7 +256,10 @@ clio::run::TaskResume Runtime::FanoutInvalidateWrite(
   {
     const bool meta = view_.Ready() && !tag.IsNull();
     if (meta) view_.NoteLocalWrite();
-    if (CLIO_IPC->GetNumHosts() > 1) {
+    // invalidate_on_flush: the write-back cache below sends nothing until it
+    // flushes, and its flush lands through this pool on the home, which
+    // invalidates then (MultiPutBlob). Deletes still invalidate at once.
+    if (CLIO_IPC->GetNumHosts() > 1 && !config_.invalidate_on_flush_) {
       std::vector<BlobKey> keys;
       keys.push_back(BlobKey{tag.major_, tag.minor_, name});
       if (meta) {
@@ -282,7 +285,7 @@ clio::run::TaskResume Runtime::PutBlob(
     const std::string name = task->GetBlobName();
     const bool plain =
         view_.Ready() &&
-        clio::cte::core::Client::WtcAbsorbableFlags(task->flags_) &&
+        (task->flags_ & ~wtc::kPerBlobPutFlags) == 0 &&
         task->score_ < 0.0f && PlainContext(task->context_) &&
         name.size() <= wtc::kMaxBlobName;
     bool absorbed = plain;
@@ -416,10 +419,20 @@ clio::run::TaskResume Runtime::MultiPutBlob(
       for (const BlobKey &k : keys) {
         view_.Invalidate(k.major_, k.minor_, k.name_.c_str(), k.name_.size());
       }
-      for (const BlobKey &k : keys) {
-        CLIO_CO_AWAIT(FanoutInvalidate(TagId(k.major_, k.minor_), k.name_));
+      // The records' blobs and their tags' cached metadata, invalidated at
+      // their homes together (one batch per home).
+      if (view_.Ready() && !tags.empty()) view_.NoteLocalWrite();
+      if (CLIO_IPC->GetNumHosts() > 1) {
+        const std::string meta(wtc::kTagMetaName, wtc::kTagMetaNameLen);
+        std::set<std::pair<clio::run::u32, clio::run::u32>> seen;
+        for (const TagId &t : tags) {
+          if (view_.Ready() && !t.IsNull() &&
+              seen.insert({t.major_, t.minor_}).second) {
+            keys.push_back(BlobKey{t.major_, t.minor_, meta});
+          }
+        }
+        CLIO_CO_AWAIT(FanoutBatched(std::move(keys)));
       }
-      CLIO_CO_AWAIT(NoteTagsWritten(tags));
       CLIO_CO_RETURN;
     }
     if (view_.Ready() && attached && PlainContext(task->context_)) {
