@@ -157,6 +157,13 @@ TEST_CASE("CheckpointFault - lazy copy via tag fault handler",
     auto put1 = core->AsyncPutBlob(src_tag, "pg1", 0, kValSize, v_src.data());
     put1.Wait();
     REQUIRE(put1->GetReturnCode() == 0);
+    // Section 4's blob. It must exist BEFORE the copy is taken: a blob the
+    // source gains after the copy is absent from the snapshot (copy-on-write
+    // records it absent), so it would no longer fault through.
+    auto put2 = core->AsyncPutBlob(src_tag, "pg_slice", 0, kValSize,
+                                   v_src.data());
+    put2.Wait();
+    REQUIRE(put2->GetReturnCode() == 0);
   }
 
   // Copy tag: fault handler = checkpoint pool, params = source tag name.
@@ -241,11 +248,7 @@ TEST_CASE("CheckpointFault - lazy copy via tag fault handler",
   //    blob is full-size (no interval-cannot-describe-a-hole corruption).
   // ======================================================================
   {
-    const std::string kSlice = "pg_slice";
-    auto sput = core->AsyncPutBlob(src_tag, kSlice.c_str(), 0, kValSize,
-                                   v_src.data());
-    sput.Wait();
-    REQUIRE(sput->GetReturnCode() == 0);
+    const std::string kSlice = "pg_slice";  // written to the source in setup
 
     const clio::run::u64 kOff = 4096, kLen = 512;
     std::vector<char> got(kLen, 0);

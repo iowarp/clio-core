@@ -175,7 +175,11 @@ clio::run::TaskResume Runtime::FanoutInvalidate(const TagId &tag,
                                                 const std::string &name) {
   CLIO_TASK_BODY_BEGIN
   if (CLIO_IPC->GetNumHosts() > 1) {
-    CLIO_CO_AWAIT(FanoutBatched({BlobKey{tag.major_, tag.minor_, name}}));
+    // A named local, not a braced temporary inside the co_await: GCC 16.2
+    // hits an internal compiler error (build_special_member_call) on the
+    // temporary initializer_list in a coroutine await expression.
+    std::vector<BlobKey> keys{BlobKey{tag.major_, tag.minor_, name}};
+    CLIO_CO_AWAIT(FanoutBatched(std::move(keys)));
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
