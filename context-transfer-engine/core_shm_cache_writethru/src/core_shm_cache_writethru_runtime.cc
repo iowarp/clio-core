@@ -72,7 +72,13 @@ static constexpr double kBarrierPollUs = 10.0;
 
 clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   CLIO_TASK_BODY_BEGIN
-  config_ = task->GetParams();
+  // The task is NOT a CreateTask, whatever the parameter says: compose hands
+  // this ChiMod a ComposeTask<PoolConfig>, a direct caller its own
+  // instantiation. All of them ARE a CreatePoolFields, so every read and write
+  // goes through that (see CreatePoolFields::GetParamsAs). Calling a member
+  // through `task` is undefined behaviour, which UBSan reports.
+  auto &fields = task.template Cast<clio::run::admin::CreatePoolFields>();
+  config_ = fields->GetParamsAs<WtcConfig>();
   interposer_next_pool_ = config_.next_pool_id_;
   next_client_ = std::make_unique<clio::cte::core::Client>(CorePoolId());
   if (!config_.data_pool_.IsNull() && !config_.md_only_ &&
@@ -104,7 +110,7 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
          "core_shm_cache_writethru {}.{}: no segment; serving tasks only",
          pool_id_.major_, pool_id_.minor_);
   }
-  task->return_code_ = 0;
+  fields->SetReturnCode(0);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
