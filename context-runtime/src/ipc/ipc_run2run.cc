@@ -204,9 +204,14 @@ void IpcManagerRun2Run::SendInTransmitReplica(
       ipc_manager->GetOrCreateClient(target_host->ip_address, port);
 
   if (!lbm_transport) {
-    HLOG(kError, "[SendIn] Task {} FAILED: Could not get client for {}:{}",
+    // A failed DIAL is not a death: at startup a peer's address is not
+    // published until its runtime is up, and at 256 nodes runtimes come up
+    // seconds apart. Marking it dead rerouted this replica (for a pool-create
+    // broadcast: to a node that already had the pool, so the intended node
+    // never got it) and left the peer dead for the run. Retry the same node
+    // until the task's network timeout; a failed SEND still marks it dead.
+    HLOG(kWarning, "[SendIn] Task {}: no client for {}:{} yet; retrying",
          origin_task->task_id_, target_host->ip_address, port);
-    ipc_manager->SetDead(target_node_id);
     std::lock_guard<std::mutex> _rqlk(retry_queues_mutex_);
     send_in_retry_.push_back(
         {task_copy, target_node_id, std::chrono::steady_clock::now()});
@@ -495,9 +500,9 @@ int IpcManagerRun2Run::SendOutTransmit(
   }
 
   if (lbm_transport == nullptr) {
-    HLOG(kError, "[SendOut] Task {} FAILED: Could not get client for {}:{}",
+    // Not a death; see SendInTransmitReplica. Retry the same node.
+    HLOG(kWarning, "[SendOut] Task {}: no client for {}:{} yet; retrying",
          origin_task->task_id_, target_host->ip_address, port);
-    ipc_manager->SetDead(target_node_id);
     std::lock_guard<std::mutex> _rqlk(retry_queues_mutex_);
     send_out_retry_.push_back(
         {origin_task, target_node_id, std::chrono::steady_clock::now()});
