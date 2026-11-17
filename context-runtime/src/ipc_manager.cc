@@ -1937,33 +1937,43 @@ void IpcManager::SetDead(u64 node_id) {
   // rejoins and dies again is recoverable each time, while duplicate
   // coordinators within one epoch are still refused.
   membership_epoch_.fetch_add(1, std::memory_order_acq_rel);
-  std::shared_lock<std::shared_mutex> hl(hostfile_mu_);
-  auto it = hostfile_map_.find(node_id);
-  if (it == hostfile_map_.end()) return;
-  if (it->second.state == NodeState::kDead) return;  // Already dead
-  NoteLivenessChange(node_id);
+  // EXCLUSIVE, not shared: this mutates the node's state and dead_nodes_.
+  // Under a shared lock, several network send threads marking peers dead at
+  // once pushed into dead_nodes_ concurrently and corrupted the heap (256-node
+  // IO500: free(): invalid pointer / SIGSEGV inside SetDead).
+  std::string ip;
+  int port = 0;
+  {
+    std::unique_lock<std::shared_mutex> hl(hostfile_mu_);
+    auto it = hostfile_map_.find(node_id);
+    if (it == hostfile_map_.end()) return;
+    if (it->second.state == NodeState::kDead) return;  // Already dead
+    NoteLivenessChange(node_id);
 
-  SetNodeStateLocked(node_id, NodeState::kDead);
+    SetNodeStateLocked(node_id, NodeState::kDead);
 
-  // Record dead-node entry for retry tracking
-  DeadNodeEntry entry;
-  entry.node_id = node_id;
-  entry.detected_at = std::chrono::steady_clock::now();
-  dead_nodes_.push_back(entry);
-  dead_count_.fetch_add(1, std::memory_order_acq_rel);
+    // Record dead-node entry for retry tracking
+    DeadNodeEntry entry;
+    entry.node_id = node_id;
+    entry.detected_at = std::chrono::steady_clock::now();
+    dead_nodes_.push_back(entry);
+    dead_count_.fetch_add(1, std::memory_order_acq_rel);
 
-  // Remove cached client connections to the dead node
+    auto *config_manager = CLIO_CONFIG_MANAGER;
+    ip = it->second.ip_address;
+    port = static_cast<int>(it->second.PortOr(config_manager->GetPort()));
+  }
+
+  // Remove cached client connections to the dead node (hostfile_mu_ is
+  // released first, so this adds no hostfile -> client_pool lock order).
   {
     std::lock_guard<std::mutex> lock(client_pool_mutex_);
-    auto *config_manager = CLIO_CONFIG_MANAGER;
-    int port = static_cast<int>(it->second.PortOr(config_manager->GetPort()));
-    std::string key = it->second.ip_address + ":" + std::to_string(port);
+    std::string key = ip + ":" + std::to_string(port);
     client_pool_.erase(key);
     client_pool_.erase(key + "#resp");
   }
 
-  HLOG(kWarning, "IpcManager: Node {} ({}) marked as DEAD", node_id,
-       it->second.ip_address);
+  HLOG(kWarning, "IpcManager: Node {} ({}) marked as DEAD", node_id, ip);
 }
 
 bool IpcManager::NotePeerIncarnation(u64 node_id, u64 incarnation) {
@@ -2124,25 +2134,29 @@ void IpcManager::SetAlive(u64 node_id) {
   // rejoins and dies again is recoverable each time, while duplicate
   // coordinators within one epoch are still refused.
   membership_epoch_.fetch_add(1, std::memory_order_acq_rel);
-  std::shared_lock<std::shared_mutex> hl(hostfile_mu_);
-  auto it = hostfile_map_.find(node_id);
-  if (it == hostfile_map_.end()) return;
-  if (it->second.state == NodeState::kAlive) return;  // Already alive
-  // A dead node's rejoin adds no risk to unsynced data: whatever it held
-  // was lost when it died (recorded then, in SetDead), and writes made while
-  // it was down went to live successors.
+  std::string ip;
+  {
+    // EXCLUSIVE: mutates the node's state and dead_nodes_ (see SetDead).
+    std::unique_lock<std::shared_mutex> hl(hostfile_mu_);
+    auto it = hostfile_map_.find(node_id);
+    if (it == hostfile_map_.end()) return;
+    if (it->second.state == NodeState::kAlive) return;  // Already alive
+    // A dead node's rejoin adds no risk to unsynced data: whatever it held
+    // was lost when it died (recorded then, in SetDead), and writes made
+    // while it was down went to live successors.
 
-  SetNodeStateLocked(node_id, NodeState::kAlive);
+    SetNodeStateLocked(node_id, NodeState::kAlive);
 
-  // Remove from dead_nodes_ list
-  dead_nodes_.erase(std::remove_if(dead_nodes_.begin(), dead_nodes_.end(),
-                                   [node_id](const DeadNodeEntry &e) {
-                                     return e.node_id == node_id;
-                                   }),
-                    dead_nodes_.end());
+    // Remove from dead_nodes_ list
+    dead_nodes_.erase(std::remove_if(dead_nodes_.begin(), dead_nodes_.end(),
+                                     [node_id](const DeadNodeEntry &e) {
+                                       return e.node_id == node_id;
+                                     }),
+                      dead_nodes_.end());
+    ip = it->second.ip_address;
+  }
 
-  HLOG(kInfo, "IpcManager: Node {} ({}) marked as ALIVE", node_id,
-       it->second.ip_address);
+  HLOG(kInfo, "IpcManager: Node {} ({}) marked as ALIVE", node_id, ip);
 }
 
 NodeState IpcManager::GetNodeState(u64 node_id) const {
