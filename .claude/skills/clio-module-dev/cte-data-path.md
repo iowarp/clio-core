@@ -168,7 +168,12 @@ point at 564. Composition order: bottom first.
 Refuse (`kTooLong` / `kMiss` in md_only or with non-droppable flags /
 `kNoSpace` when the log is nearly full and the caller may not block); under
 the stripe lock find-or-insert the entry, check conflicts, ensure buffer
-capacity (evicting by frecency, `hits * 2^(-age/half_life)`), bump the
+capacity (evicting by frecency, `hits * 2^(-age/half_life)`; a **pinned**
+entry that must grow is refused with `kBusy`, untouched -- never wait for a
+pin under a stripe lock: the flusher's zero-copy pin drops only after the
+home acks, and the home's ack waits for an Invalidate here that needs that
+stripe lock; callers back off unlocked, bounded, then take the task path /
+write around), bump the
 generation and seqlock, pin; **copy the bytes outside the lock** (a pin, never
 a lock, protects the copy); unpin; `pushed_++` then push the dirty range to
 the log.
@@ -232,7 +237,7 @@ by reason (absent, nonres, range, busy).
 ### Stats at stop
 
 A stop hook logs (warning level) `[shm-cache stats] node= puts= put_MiB=
-refused: log= slot= buf= miss= waits= flush_batches= flush_ranges= flush_MiB=
+refused: log= slot= buf= busy= miss= waits= flush_batches= flush_ranges= flush_MiB=
 flush_skipped= fills= md_fills= get_hits= get_misses= (absent= nonres= range=
 busy=) invalidations= evictions=`
 (`WTC/src/core_shm_cache_writethru_runtime.cc:94-136`); clients read the same

@@ -39,6 +39,7 @@
  * goes down the chain.
  */
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -68,6 +69,48 @@ static constexpr double kNoSpacePollUs = 50.0;
 /** Waits for segment room before a put writes around the cache (~1 ms). A
  *  segment full of clean small buffers may never yield a large one. */
 static constexpr int kNoSpaceRetries = 20;
+/** Retries of a put refused because its entry is pinned (kBusy) before it
+ *  writes around the cache. The pin is an in-flight flush, released when
+ *  the blob's home acks (a network round trip). */
+static constexpr int kBusyRetries = 12;
+/** First back-off between kBusy retries (us); doubles per retry. */
+static constexpr double kBusyPollStartUs = 10.0;
+/** Back-off cap between kBusy retries (us); with the start above the whole
+ *  budget is ~6 ms of yields before the put writes around the cache. */
+static constexpr double kBusyPollMaxUs = 1000.0;
+
+clio::run::TaskResume Runtime::TryPutRetrying(const TagId &tag,
+                                              const std::string &name,
+                                              clio::run::u64 off,
+                                              clio::run::u64 size,
+                                              const char *src,
+                                              clio::run::u32 flags,
+                                              wtc::Status *st) {
+  CLIO_TASK_BODY_BEGIN
+  {
+    int nospace_tries = 0;
+    int busy_tries = 0;
+    double busy_us = kBusyPollStartUs;
+    while (true) {
+      *st = view_.TryPut(tag.major_, tag.minor_, name.c_str(), name.size(),
+                         off, size, src, flags, /*may_block=*/false);
+      if (*st == wtc::Status::kNoSpace && nospace_tries < kNoSpaceRetries) {
+        ++nospace_tries;
+        view_.GetRoot()->stats_.waits_.fetch_add(1);
+        CLIO_CO_AWAIT(clio::run::yield(kNoSpacePollUs));
+      } else if (*st == wtc::Status::kBusy && busy_tries < kBusyRetries) {
+        ++busy_tries;
+        view_.GetRoot()->stats_.waits_.fetch_add(1);
+        CLIO_CO_AWAIT(clio::run::yield(busy_us));
+        busy_us = std::min(busy_us * 2.0, kBusyPollMaxUs);
+      } else {
+        break;
+      }
+    }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
 
 clio::run::TaskResume Runtime::WaitBlobFlushed(const TagId &tag,
                                                const std::string &name) {
@@ -311,18 +354,11 @@ clio::run::TaskResume Runtime::PutBlob(
           CLIO_CO_RETURN;
         }
         wtc::Status st = wtc::Status::kNoSpace;
-        for (int tries = 0;
-             (st = view_.TryPut(task->tag_id_.major_, task->tag_id_.minor_,
-                                name.c_str(), name.size(),
-                                regions[i].blob_off_, regions[i].size_, src,
-                                task->flags_, /*may_block=*/false)) ==
-                 wtc::Status::kNoSpace &&
-             tries < kNoSpaceRetries;
-             ++tries) {
-          view_.GetRoot()->stats_.waits_.fetch_add(1);
-          CLIO_CO_AWAIT(clio::run::yield(kNoSpacePollUs));
-        }
-        // Not absorbed (a flags conflict, or still no room): the whole put
+        CLIO_CO_AWAIT(TryPutRetrying(task->tag_id_, name,
+                                     regions[i].blob_off_, regions[i].size_,
+                                     src, task->flags_, &st));
+        // Not absorbed (a flags conflict, still no room, or still pinned by
+        // a flush): the whole put
         // goes down the chain below, ordered after this blob's logged
         // ranges -- an earlier absorbed region lands again, unchanged.
         absorbed = st == wtc::Status::kOk;
@@ -449,19 +485,13 @@ clio::run::TaskResume Runtime::MultiPutBlob(
           continue;
         }
         wtc::Status st = wtc::Status::kNoSpace;
-        for (int tries = 0;
-             (st = view_.TryPut(d.tag_id_.major_, d.tag_id_.minor_,
-                                d.blob_name_.c_str(), d.blob_name_.size(),
-                                d.offset_, d.size_,
-                                batch.base_ + d.payload_off_, d.flags_,
-                                /*may_block=*/false)) == wtc::Status::kNoSpace &&
-             tries < kNoSpaceRetries;
-             ++tries) {
-          CLIO_CO_AWAIT(clio::run::yield(kNoSpacePollUs));
-        }
+        CLIO_CO_AWAIT(TryPutRetrying(d.tag_id_, d.blob_name_, d.offset_,
+                                     d.size_, batch.base_ + d.payload_off_,
+                                     d.flags_, &st));
         if (st != wtc::Status::kOk) {
-          // No room (kNoSpace), conflicting put flags (kMiss) or a name the
-          // segment cannot hold: write this record around the cache.
+          // No room (kNoSpace), still pinned by a flush (kBusy),
+          // conflicting put flags (kMiss) or a name the segment cannot
+          // hold: write this record around the cache.
           clio::run::u32 rc = 0;
           CLIO_CO_AWAIT(WriteAroundRecord(d.tag_id_, d.blob_name_, d.offset_,
                                           d.size_, batch.base_ + d.payload_off_,

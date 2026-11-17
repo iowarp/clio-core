@@ -488,6 +488,27 @@ class Runtime : public clio::cte::core::CoreInterposer {
   /** Leave a BeginChainWriteAll. */
   void EndChainWriteAll() { chain_writes_.fetch_sub(1); }
   /**
+   * Copy one put into the segment, retrying the refusals that clear on
+   * their own: kNoSpace (wait for the flusher to free room) and kBusy (the
+   * entry is pinned by an in-flight flush and must grow). Retries yield
+   * the coroutine and hold no lock, so the flush holding the pin (and the
+   * home's invalidation of this node it waits on) can finish. Bounded:
+   * after the budget the caller takes the non-cache path.
+   * @param tag    tag of the blob
+   * @param name   blob name
+   * @param off    offset within the blob
+   * @param size   bytes to write
+   * @param src    source bytes (stay valid until this completes)
+   * @param flags  put flags
+   * @param st     out: the last TryPut status (kOk when absorbed)
+   */
+  clio::run::TaskResume TryPutRetrying(const TagId &tag,
+                                       const std::string &name,
+                                       clio::run::u64 off,
+                                       clio::run::u64 size, const char *src,
+                                       clio::run::u32 flags,
+                                       clio::cte::core::wtc::Status *st);
+  /**
    * Write one record around the cache (segment full): drain the blob's
    * logged ranges, fence chain reads, drop the local copy, put down the
    * chain, then invalidate other nodes' copies.

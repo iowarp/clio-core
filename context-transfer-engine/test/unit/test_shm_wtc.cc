@@ -57,6 +57,8 @@
 #include <thread>
 #include <vector>
 
+#include <unistd.h>
+
 #include "simple_test.h"
 
 namespace fs = std::filesystem;
@@ -875,6 +877,174 @@ TEST_CASE("ShmWtc - extent mode keeps bytes in leased RAM-bdev granules",
     REQUIRE(back == want);
     REQUIRE(WaitFlushed(io));
     REQUIRE(CoreRead(tag, "p", 0, want.size()) == want);
+  }
+}
+
+/**
+ * Format a private segment for a View-only test (no runtime involved).
+ * @param view the view to format
+ * @param tag  distinguishes this test's segment name
+ */
+static void FormatPrivateView(wtc::View &view, const std::string &tag) {
+  const clio::run::u32 pid = static_cast<clio::run::u32>(getpid());
+  wtc::Limits lim;
+  lim.seg_size_ = 16ull << 20;
+  lim.max_blobs_ = 1024;
+  lim.log_depth_ = 1024;
+  const std::string name = "clio_wtc_viewtest_" + tag + "_" +
+                           std::to_string(pid);
+  const ctp::ipc::MemoryBackendId id(pid, 0x57550000u);
+  REQUIRE(view.Format(name, id, lim, /*node_id=*/0));
+  REQUIRE(view.Ready());
+}
+
+/**
+ * Write a blob through a View and take its slot off the dirty log, as the
+ * flusher does (the range stays pending until CompleteRanges).
+ * @return the blob's slot
+ */
+static clio::run::u32 PutAndPopSlot(wtc::View &view, const std::string &blob,
+                                    const std::string &bytes) {
+  REQUIRE(view.TryPut(1, 1, blob.data(), blob.size(), 0, bytes.size(),
+                      bytes.data(), 0, /*may_block=*/false) ==
+          wtc::Status::kOk);
+  wtc::DirtyRange r{};
+  REQUIRE(view.Log()->Pop(r));
+  return r.slot_;
+}
+
+/** Milliseconds since `t0`. */
+static double MsSince(std::chrono::steady_clock::time_point t0) {
+  return std::chrono::duration<double, std::milli>(
+             std::chrono::steady_clock::now() - t0)
+      .count();
+}
+
+TEST_CASE("ShmWtc - a pinned entry refuses growth (kBusy) and never blocks "
+          "the stripe lock",
+          "[cte][shm_wtc][pin][deadlock]") {
+  // The flusher pins a blob's bytes (zero-copy flush) until the home acks;
+  // the home acks only after invalidating this node, which needs the
+  // blob's stripe lock. A writer that grows the pinned blob must therefore
+  // refuse (kBusy) instead of waiting for the pin under that lock.
+  wtc::View view;
+  FormatPrivateView(view, "busy");
+  const wtc::Stats &st = view.GetRoot()->stats_;
+  const std::string blob = "pinned";
+  const std::string first = Payload(4096, 'p');
+  const clio::run::u32 slot = PutAndPopSlot(view, blob, first);
+
+  // The flush in flight: pin the logged range (pending stays 1).
+  clio::run::u64 size = first.size();
+  clio::run::u64 gen = 0;
+  REQUIRE(view.PinRange(slot, 0, &size, &gen) != nullptr);
+
+  // A write past the buffer's capacity (1 MiB + 47008 B, ior-hard style)
+  // must grow, i.e. move, the pinned buffer.
+  constexpr clio::run::u64 kGrowOff = 1ull << 20;
+  const std::string grow = Payload(47008, 'g');
+  constexpr double kPromptMs = 1000.0;     // a refusal never waits
+  constexpr double kDeadlineMs = 10000.0;  // writer gives up after this
+  std::atomic<int> first_status{-1};
+  std::atomic<double> first_ms{-1.0};
+  std::atomic<int> final_status{-1};
+  std::atomic<bool> writer_done{false};
+  std::thread writer([&] {
+    const auto t0 = std::chrono::steady_clock::now();
+    wtc::Status s = view.TryPut(1, 1, blob.data(), blob.size(), kGrowOff,
+                                grow.size(), grow.data(), 0, false);
+    first_ms.store(MsSince(t0));
+    first_status.store(static_cast<int>(s));
+    // Retry WITHOUT holding anything, as the callers do.
+    while (s == wtc::Status::kBusy && MsSince(t0) < kDeadlineMs) {
+      std::this_thread::sleep_for(std::chrono::microseconds(50));
+      s = view.TryPut(1, 1, blob.data(), blob.size(), kGrowOff, grow.size(),
+                      grow.data(), 0, false);
+    }
+    final_status.store(static_cast<int>(s));
+    writer_done.store(true);
+  });
+
+  // The first refusal arrives promptly.
+  const auto wait0 = std::chrono::steady_clock::now();
+  while (first_status.load() < 0 && MsSince(wait0) < kPromptMs) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  const bool prompt = first_status.load() >= 0;
+  if (!prompt) view.UnpinRange(slot);  // unblock a regressed writer
+  REQUIRE(prompt);
+  INFO("first TryPut took " << first_ms.load() << " ms");
+  REQUIRE(first_status.load() == static_cast<int>(wtc::Status::kBusy));
+  REQUIRE(first_ms.load() < kPromptMs);
+  REQUIRE(st.put_busy_.load() >= 1);
+
+  // The home's invalidation of this node, on the same stripe, completes
+  // while the writer is still being refused.
+  const clio::run::u64 inv0 = st.invalidations_.load();
+  std::atomic<bool> inv_done{false};
+  std::thread inval([&] {
+    view.Invalidate(1, 1, blob.data(), blob.size());
+    inv_done.store(true);
+  });
+  const auto inv_t0 = std::chrono::steady_clock::now();
+  while (!inv_done.load() && MsSince(inv_t0) < kPromptMs) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  const bool inv_prompt = inv_done.load();
+  if (!inv_prompt) view.UnpinRange(slot);
+  inval.join();
+  INFO("Invalidate took " << MsSince(inv_t0) << " ms");
+  REQUIRE(inv_prompt);
+  REQUIRE(st.invalidations_.load() == inv0 + 1);
+  REQUIRE_FALSE(writer_done.load());  // still pinned: still refused
+
+  // The flush lands: unpin. The writer's retry now succeeds.
+  view.UnpinRange(slot);
+  writer.join();
+  REQUIRE(final_status.load() == static_cast<int>(wtc::Status::kOk));
+  std::string back(grow.size(), '\0');
+  REQUIRE(view.TryGet(1, 1, blob.data(), blob.size(), kGrowOff, back.size(),
+                      back.data()) == wtc::Status::kOk);
+  REQUIRE(back == grow);
+  view.CompleteRanges(slot, 1);
+}
+
+TEST_CASE("ShmWtc - invalidate and drop of a pinned, flushed entry return "
+          "at once",
+          "[cte][shm_wtc][pin][deadlock]") {
+  // pending_ is 0 (the range completed) but a pin is still held: Invalidate
+  // and DropBlob must not wait for it under the stripe lock. Run on one
+  // thread: a wait here would never end.
+  wtc::View view;
+  FormatPrivateView(view, "drop");
+  const std::string bytes = Payload(8192, 'd');
+  for (const std::string blob : {"inv", "del"}) {
+    const clio::run::u32 slot = PutAndPopSlot(view, blob, bytes);
+    view.CompleteRanges(slot, 1);
+    clio::run::u64 size = bytes.size();
+    clio::run::u64 gen = 0;
+    REQUIRE(view.PinRange(slot, 0, &size, &gen) != nullptr);
+    const auto t0 = std::chrono::steady_clock::now();
+    if (blob == "inv") {
+      view.Invalidate(1, 1, blob.data(), blob.size());
+    } else {
+      view.DropBlob(1, 1, blob.data(), blob.size());
+    }
+    REQUIRE(MsSince(t0) < 1000.0);
+    std::string back(bytes.size(), '\0');
+    // Nothing stale is served, and no size is known.
+    REQUIRE(view.TryGet(1, 1, blob.data(), blob.size(), 0, back.size(),
+                        back.data()) == wtc::Status::kMiss);
+    clio::run::u64 sz = 0;
+    REQUIRE(view.TryGetSize(1, 1, blob.data(), blob.size(), &sz) ==
+            wtc::Status::kMiss);
+    view.UnpinRange(slot);
+    // The entry is writable again afterwards.
+    REQUIRE(view.TryPut(1, 1, blob.data(), blob.size(), 0, bytes.size(),
+                        bytes.data(), 0, false) == wtc::Status::kOk);
+    REQUIRE(view.TryGet(1, 1, blob.data(), blob.size(), 0, back.size(),
+                        back.data()) == wtc::Status::kOk);
+    REQUIRE(back == bytes);
   }
 }
 

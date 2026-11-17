@@ -50,6 +50,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -733,10 +734,7 @@ class Client : public clio::run::ContainerClient {
     if (src == nullptr) {
       return EINVAL;
     }
-    if (HasCache() &&
-        cache_->TryPut(tag_id.major_, tag_id.minor_, blob_name.data(),
-                       blob_name.size(), offset, size, src, flags,
-                       /*may_block=*/false) == wtc::Status::kOk) {
+    if (TryPutCached(tag_id, blob_name, offset, size, src, flags)) {
       return 0;
     }
     const Context none;
@@ -747,6 +745,52 @@ class Client : public clio::run::ContainerClient {
     }
     fut.Wait();
     return fut->GetReturnCode();
+  }
+
+  /** Client retries of a put refused with kBusy before the task path. */
+  static constexpr int kCacheBusyRetries = 8;
+  /** First back-off between kBusy retries (us); doubles per retry. */
+  static constexpr clio::run::u64 kCacheBusyBackoffStartUs = 4;
+  /** Back-off cap between kBusy retries (us). With the start above the
+   *  whole retry budget is under 1 ms before the task path takes over. */
+  static constexpr clio::run::u64 kCacheBusyBackoffMaxUs = 256;
+
+  /**
+   * The SHM cache half of PutBlob alone: copy a write into the segment or
+   * report that it cannot. A put refused because the blob's entry is
+   * pinned (kBusy: a flush in flight, its buffer must grow) is retried
+   * with a bounded exponential back-off, holding no lock while it sleeps,
+   * so the flush that holds the pin (and the home's invalidation it
+   * waits on) can finish. Any other refusal returns at once.
+   * @param tag_id tag of the blob
+   * @param blob_name blob name
+   * @param offset offset within the blob
+   * @param size bytes to write
+   * @param src source bytes
+   * @param flags put flags (kCtePut*)
+   * @return true if the segment took the write; false: use the task path
+   */
+  bool TryPutCached(const TagId &tag_id, const std::string &blob_name,
+                    clio::run::u64 offset, clio::run::u64 size,
+                    const char *src, clio::run::u32 flags) {
+    if (!HasCache()) {
+      return false;
+    }
+    clio::run::u64 backoff_us = kCacheBusyBackoffStartUs;
+    for (int attempt = 0;; ++attempt) {
+      const wtc::Status st =
+          cache_->TryPut(tag_id.major_, tag_id.minor_, blob_name.data(),
+                         blob_name.size(), offset, size, src, flags,
+                         /*may_block=*/false);
+      if (st == wtc::Status::kOk) {
+        return true;
+      }
+      if (st != wtc::Status::kBusy || attempt >= kCacheBusyRetries) {
+        return false;
+      }
+      std::this_thread::sleep_for(std::chrono::microseconds(backoff_us));
+      backoff_us = std::min(backoff_us * 2, kCacheBusyBackoffMaxUs);
+    }
   }
 
   /**

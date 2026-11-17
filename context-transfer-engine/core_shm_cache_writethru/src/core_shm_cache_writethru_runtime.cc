@@ -128,13 +128,13 @@ void Runtime::LogStats() {
   auto v = [](const std::atomic<clio::run::u64> &a) { return a.load(); };
   HLOG(kWarning,
        "[shm-cache stats] node={} puts={} put_MiB={} refused: log={} slot={} "
-       "buf={} miss={} waits={} flush_batches={} flush_ranges={} "
+       "buf={} busy={} miss={} waits={} flush_batches={} flush_ranges={} "
        "flush_MiB={} flush_skipped={} fills={} md_fills={} get_hits={} "
        "get_misses={} (absent={} nonres={} range={} busy={}) "
        "invalidations={} evictions={}",
        container_id_, v(st.puts_), v(st.put_bytes_) >> 20,
        v(st.put_full_log_), v(st.put_full_slot_), v(st.put_full_buf_),
-       v(st.put_miss_), v(st.waits_), v(st.flush_batches_),
+       v(st.put_busy_), v(st.put_miss_), v(st.waits_), v(st.flush_batches_),
        v(st.flush_ranges_), v(st.flush_bytes_) >> 20, v(st.flush_skipped_),
        v(st.fills_), v(st.md_fills_), v(st.get_hits_), v(st.get_misses_),
        v(st.miss_absent_), v(st.miss_nonres_), v(st.miss_range_),
