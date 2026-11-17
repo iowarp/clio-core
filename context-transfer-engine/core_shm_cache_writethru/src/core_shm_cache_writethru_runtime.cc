@@ -433,7 +433,12 @@ clio::run::TaskResume Runtime::SyncTag(
     while (!ReapTagNotes()) {
       CLIO_CO_AWAIT(clio::run::yield(kBarrierPollUs));
     }
+    // A put that failed for lack of space (any PutBlob no-space code) is
+    // the sync's ENOSPC, so fsync reports a full store, not an I/O error.
     sticky = view_.TakeTagError(task->tag_id_.major_, task->tag_id_.minor_);
+    if (clio::cte::core::PutRcIsNoSpace(sticky)) {
+      sticky = clio::cte::core::kSyncNoSpaceRc;
+    }
     homes = TakeSyncHomes(task->tag_id_);
     const char *tr = std::getenv("CLIO_WTC_TRACE");
     if (tr != nullptr && tr[0] == '1') {

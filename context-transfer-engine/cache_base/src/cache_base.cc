@@ -1884,8 +1884,10 @@ clio::run::TaskResume CacheBase::SyncTag(
       ev::Span(ev::kWbSyncAll, t1, ev::Now());
     }
     if (rc != 0) {
-      task->SetReturnCode(IsNoSpaceRc(rc) ? core::kSyncNoSpaceRc
-                                          : core::kSyncIoRc);
+      // Any put no-space code: a tier with no room or a device that refused
+      // the bytes (rc 28, e.g. a full DAOS pool) is ENOSPC, not EIO.
+      task->SetReturnCode(core::PutRcIsNoSpace(rc) ? core::kSyncNoSpaceRc
+                                                   : core::kSyncIoRc);
     } else {
       const unsigned long long t2 = ev::Now();
       CLIO_CO_AWAIT(ForwardToCore(Method::kSyncTag,

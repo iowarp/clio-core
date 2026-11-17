@@ -81,6 +81,7 @@ class WtcFixture {
     config_path_ = DataDir() + "/shm_wtc_config.yaml";
     restart_log_path_ = DataDir() + "/shm_wtc_restart.bin";
     Cleanup();
+    CleanupDeviceFilesOnce();
     WriteConfig();
     ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", config_path_.c_str(), 1);
     ctp::SystemInfo::Setenv("CLIO_RESTART_LOG", restart_log_path_.c_str(), 1);
@@ -97,6 +98,26 @@ class WtcFixture {
     if (fs::exists(config_path_)) fs::remove(config_path_);
     if (fs::exists(restart_log_path_)) fs::remove(restart_log_path_);
   }
+
+  /**
+   * Remove the full-device core's backing file, allocator log and marker
+   * left by an earlier run. Once per process, before the runtime opens the
+   * device: every test case builds a fixture, and the device stays open.
+   */
+  static void CleanupDeviceFilesOnce() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    std::error_code ec;
+    for (const auto &e : fs::directory_iterator(DataDir(), ec)) {
+      if (e.path().filename().string().rfind(kFullDeviceFile, 0) == 0) {
+        fs::remove(e.path(), ec);
+      }
+    }
+  }
+
+  /** Backing file name (in DataDir) of the full-device core's target. */
+  static constexpr const char *kFullDeviceFile = "shm_wtc_full.dat";
 
   void WriteConfig() {
     std::ofstream f(config_path_);
@@ -122,6 +143,23 @@ compose:
         score: 1.0
     dpe:
       dpe_type: "max_bw"
+
+  # A core over one file device, for the out-of-space case.
+  - mod_name: clio_cte_core
+    pool_name: shm_wtc_full_core
+    pool_query: local
+    pool_id: 513.0
+    targets:
+      neighborhood: 1
+      default_target_timeout_ms: 30000
+      poll_period_ms: 5000
+    storage:
+      - path: ")" << DataDir() << "/" << kFullDeviceFile << R"("
+        bdev_type: "file"
+        capacity_limit: "64MB"
+        score: 1.0
+    dpe:
+      dpe_type: "max_bw"
 )";
   }
 };
@@ -131,7 +169,9 @@ compose:
 static void CreateCache(const clio::run::PoolId &id, const std::string &name,
                         clio::run::u64 capacity, bool md_only = false,
                         clio::run::u64 data_capacity = 0,
-                        double flush_period_us = 0) {
+                        double flush_period_us = 0,
+                        const clio::run::PoolId &next =
+                            clio::cte::core::kCtePoolId) {
   clio::cte::shm_wtc::Client admin;
   clio::cte::shm_wtc::WtcConfig params;
   params.md_only_ = md_only;
@@ -139,7 +179,7 @@ static void CreateCache(const clio::run::PoolId &id, const std::string &name,
     params.data_pool_ = clio::run::PoolId(512, 0);  // this node's RAM tier
     params.data_capacity_ = data_capacity;
   }
-  params.next_pool_id_ = clio::cte::core::kCtePoolId;
+  params.next_pool_id_ = next;
   params.capacity_ = capacity;
   params.max_blobs_ = 4096;
   params.log_depth_ = 4096;
@@ -1046,6 +1086,81 @@ TEST_CASE("ShmWtc - invalidate and drop of a pinned, flushed entry return "
                         back.data()) == wtc::Status::kOk);
     REQUIRE(back == bytes);
   }
+}
+
+/** The core over one file device (WtcFixture) and a cache over it. */
+static const clio::run::PoolId kFullCorePool(513, 0);
+static const clio::run::PoolId kFullCachePool(577, 0);
+
+/**
+ * Make the full-device core's file target refuse every write with ENOSPC
+ * (the file bdev's TEST-ONLY `.nospace` marker), or work again.
+ * @param full true: the device is full; false: it has room again
+ */
+static void SetDeviceFull(bool full) {
+  auto *ipc = CLIO_IPC;
+  // The core registers a device on node N as `<path>_node<N>`.
+  const std::string marker = DataDir() + "/" + WtcFixture::kFullDeviceFile +
+                             "_node" + std::to_string(ipc->GetNodeId()) +
+                             ".nospace";
+  if (full) {
+    std::ofstream(marker).put('x');
+  } else {
+    fs::remove(marker);
+  }
+  // Longer than the file bdev's 100 ms marker re-check period.
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+}
+
+TEST_CASE("ShmWtc - a device out of space is ENOSPC, not an I/O error",
+          "[cte][shm_wtc][nospace]") {
+  // A full persistent device (a DAOS pool with no room left) used to fail
+  // PutBlob with rc 21, a generic write error: clio-fs reported EIO from
+  // write(2) and fsync(2). It must be the out-of-space code, so the
+  // filesystem returns ENOSPC.
+  WtcFixture fx;
+  CreateCache(kFullCachePool, "shm_wtc_full", 64ull << 20, false, 0, 0,
+              kFullCorePool);
+  const std::string val = Payload(64 * 1024, 'f');
+
+  // Task path, straight to the core: the device refuses the bytes.
+  clio::cte::core::Client core(kFullCorePool);
+  TagId tag = MakeTag(core, "wtc_full_task");
+  REQUIRE(core.PutBlob(tag, "p", 0, val.size(), val.data()) == 0);
+  SetDeviceFull(true);
+  for (clio::run::u64 off : {clio::run::u64(0), clio::run::u64(val.size())}) {
+    const clio::run::u32 rc =
+        core.PutBlob(tag, "p", off, val.size(), val.data());
+    INFO("PutBlob at " << off << " on a full device: rc " << rc);
+    REQUIRE(rc == clio::cte::core::kPutDeviceNoSpaceRc);
+    REQUIRE(clio::cte::core::PutRcIsNoSpace(rc));
+  }
+
+  // Cache path: the write is absorbed, its flush fails, and the fsync of
+  // the tag reports the full device.
+  clio::cte::core::Client io(kFullCachePool);
+  Connect(io, kFullCachePool);
+  TagId ctag = MakeTag(io, "wtc_full_cached");
+  REQUIRE(io.PutBlob(ctag, "c", 0, val.size(), val.data()) == 0);
+  REQUIRE(WaitFlushed(io));
+  auto sync = io.AsyncSyncTag(ctag, clio::run::PoolQuery::Local());
+  sync.Wait();
+  INFO("SyncTag after a failed flush: rc " << sync->GetReturnCode());
+  REQUIRE(sync->GetReturnCode() == clio::cte::core::kSyncNoSpaceRc);
+
+  // Room again: writes land.
+  SetDeviceFull(false);
+  REQUIRE(core.PutBlob(tag, "p", val.size(), val.size(), val.data()) == 0);
+  REQUIRE(io.PutBlob(ctag, "c", 0, val.size(), val.data()) == 0);
+  REQUIRE(WaitFlushed(io));
+  auto sync2 = io.AsyncSyncTag(ctag, clio::run::PoolQuery::Local());
+  sync2.Wait();
+  REQUIRE(sync2->GetReturnCode() == 0);
+  std::string back(val.size(), '\0');
+  auto get = core.AsyncGetBlob(ctag, "c", 0, back.size(), 0, back.data());
+  get.Wait();
+  REQUIRE(get->GetReturnCode() == 0);
+  REQUIRE(back == val);
 }
 
 SIMPLE_TEST_MAIN()

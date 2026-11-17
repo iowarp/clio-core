@@ -62,6 +62,7 @@ extern "C" void clio_cte_locate_register(
 #include <clio_cte/core/core_task_stats.h>
 #include <clio_cte/core/core_runtime.h>
 #include <clio_ctp/serialize/msgpack_wrapper.h>
+#include <clio_ctp/io/io_error.h>
 
 #include <algorithm>
 #include <set>
@@ -10636,16 +10637,22 @@ clio::run::TaskResume Runtime::ModifyExistingData(
       // LCOV_EXCL_STOP
     }
     if (task->bytes_written_ != expected_size) {
-      // LCOV_EXCL_START same issue-#705 race, after the settle gave up.
+      // The device failed the write (or the issue-#705 race outlived the
+      // settle). A device out of space (a full disk, a DAOS pool with no
+      // room: io_error_ kNoSpace) is reported as such, so a filesystem
+      // returns ENOSPC instead of EIO; anything else is an I/O error.
+      const bool no_space =
+          task->io_error_ ==
+          static_cast<clio::run::u32>(ctp::IoError::kNoSpace);
       HLOG(kError,
            "ModifyExistingData: WRITE FAILED - task[{}] wrote {} bytes, "
-           "expected {} (bdev pool {} offset {} rc={})",
+           "expected {} (bdev pool {} offset {} rc={} io_error={})",
            task_idx, task->bytes_written_, expected_size,
            write_targets[task_idx].first, write_targets[task_idx].second,
-           task->GetReturnCode());
-      error_code = 1;
+           task->GetReturnCode(),
+           ctp::IoErrorName(static_cast<ctp::IoError>(task->io_error_)));
+      error_code = no_space ? kPutWriteNoSpaceErr : kPutWriteIoErr;
       CLIO_CO_RETURN;
-      // LCOV_EXCL_STOP
     }
   }
   timer.Pause();

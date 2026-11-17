@@ -1048,6 +1048,19 @@ static constexpr clio::run::u32 kReplicaAbsentRc = 12;
 /** PutBlob could not place the bytes: every eligible tier is full (10 +
  *  ExtendBlob's out-of-space code). A filesystem reports it as ENOSPC. */
 static constexpr clio::run::u32 kPutNoSpaceRc = 13;
+/** PutBlob reports a failed data write (ModifyExistingData) as this base +
+ *  the write's code (kPutWriteIoErr, kPutWriteNoSpaceErr). */
+static constexpr clio::run::u32 kPutWriteRcBase = 20;
+/** ModifyExistingData: a device write failed (an I/O error): PutBlob rc 21. */
+static constexpr clio::run::u32 kPutWriteIoErr = 1;
+/** PutBlob rc of a write a device refused for lack of space (ENOSPC, EDQUOT,
+ *  EFBIG from the bdev: a full disk, a DAOS pool out of space). Placement
+ *  succeeded -- the bdev's capacity accounting had room -- but the storage
+ *  underneath did not. A filesystem reports it as ENOSPC, like kPutNoSpaceRc. */
+static constexpr clio::run::u32 kPutDeviceNoSpaceRc = 28;  // ENOSPC
+/** ModifyExistingData: the device refused the write for lack of space. */
+static constexpr clio::run::u32 kPutWriteNoSpaceErr =
+    kPutDeviceNoSpaceRc - kPutWriteRcBase;
 /**
  * Whether a task's return code means the node it ran on was lost with the
  * task in flight (kRun2RunNetworkTimeoutRC): the
@@ -1068,19 +1081,22 @@ static constexpr clio::run::u32 kReplicaPutRcBase = 30;
  * 10 + ExtendBlob's capacity codes (no target with space, no target able to
  * hold the request, tier exhausted), and 41-43 are the same codes from the
  * replication chimod's durable copy (kReplicaPutRcBase + 11-13) -- which is
- * what a full persistent tier returns when replication is on. A filesystem
+ * what a full persistent tier returns when replication is on. 28
+ * (kPutDeviceNoSpaceRc) is a device that refused the write itself, directly
+ * or through the replication chimod (kReplicaPutRcBase + 28). A filesystem
  * reports all of them as ENOSPC. (Replica-protocol UPDATE_ONLY writes reuse
  * 12 as kReplicaAbsentRc; this is for ordinary puts.)
  * @param rc PutBlob return code
  * @return true for an out-of-space failure
  */
 inline constexpr bool PutRcIsNoSpace(clio::run::u32 rc) {
-  // 28 (ENOSPC) is what the filesystem chimod's write task returns for a
-  // full store; the write-behind awaits those tasks too, and latched it as
+  // 28 (ENOSPC) is also what the filesystem chimod's write task returns for
+  // a full store; the write-behind awaits those tasks too, and latched it as
   // EIO -- a full store must stay ENOSPC (#1129).
-  return rc == 28 || (rc >= 11 && rc <= kPutNoSpaceRc) ||
+  return rc == kPutDeviceNoSpaceRc || (rc >= 11 && rc <= kPutNoSpaceRc) ||
          (rc >= kReplicaPutRcBase + 11 &&
-          rc <= kReplicaPutRcBase + kPutNoSpaceRc);
+          rc <= kReplicaPutRcBase + kPutNoSpaceRc) ||
+         rc == kReplicaPutRcBase + kPutDeviceNoSpaceRc;
 }
 /** PutBlob refused: kCtePutAppend was combined with a shape the append path
  *  cannot honour (with kCtePutReplace, on a replica-targeted put, or vectored).

@@ -356,28 +356,55 @@ class FsBdevTransport : public BdevTransport {
   bool GrowBackingFile(clio::run::u64 backed, clio::run::u64 target);
 
   /**
-   * TEST-ONLY fault injection. While a file named `<backing file>.fail`
-   * exists, every read, write and sync of this device fails with an I/O
-   * error (io_error_ = DeviceFault), as a dead disk would; deleting the file
-   * makes the device work again (a disk that comes back, or is replaced in
-   * place). Off unless the marker exists. The marker is stat'ed at most once
-   * per kFailMarkerPollNs per transport and the answer cached, so the I/O
-   * path pays one clock read, not a syscall.
+   * A TEST-ONLY fault-injection marker: a file whose presence changes how
+   * this device behaves. Off unless the file exists. It is stat'ed at most
+   * once per kFailMarkerPollNs per transport and the answer cached, so the
+   * I/O path pays one clock read, not a syscall.
    */
-  std::string fail_marker_path_;
-  /** Cached "marker present" answer from the last stat. */
-  std::atomic<bool> fail_marker_present_{false};
-  /** Steady-clock ns of the last marker stat (0 = never). */
-  std::atomic<clio::run::u64> fail_marker_checked_ns_{0};
+  struct InjectMarker {
+    std::string path_;                          ///< the marker file
+    std::atomic<bool> present_{false};          ///< answer of the last stat
+    std::atomic<clio::run::u64> checked_ns_{0}; ///< steady ns of it (0 = never)
+  };
+  /**
+   * `<backing file>.fail`: every read, write and sync of this device fails
+   * with an I/O error (io_error_ = DeviceFault), as a dead disk would;
+   * deleting the file makes the device work again (a disk that comes back,
+   * or is replaced in place).
+   */
+  InjectMarker fail_marker_;
+  /**
+   * `<backing file>.nospace`: every write fails with ENOSPC (io_error_ =
+   * NoSpace), as a full disk or a DAOS pool out of space would, while reads
+   * and syncs keep working; deleting the file frees the "space" again.
+   */
+  InjectMarker nospace_marker_;
   /** Marker re-check period: 100 ms. */
   static constexpr clio::run::u64 kFailMarkerPollNs = 100000000ull;
 
   /**
-   * Whether the TEST-ONLY fault-injection marker is present (see
-   * fail_marker_path_). Logs once on every transition.
+   * Whether a TEST-ONLY marker file is present (cached; see InjectMarker).
+   * Logs once on every transition.
+   * @param m the marker
+   * @param effect what the marker does, for the log
+   * @return true while the marker exists
+   */
+  bool MarkerPresent(InjectMarker &m, const char *effect);
+
+  /**
+   * Whether the TEST-ONLY dead-device marker is present (see fail_marker_).
    * @return true if every I/O of this device must fail
    */
-  bool FaultInjected();
+  bool FaultInjected() { return MarkerPresent(fail_marker_, "I/O fails"); }
+
+  /**
+   * Whether the TEST-ONLY full-device marker is present (see
+   * nospace_marker_).
+   * @return true if every write of this device must fail with ENOSPC
+   */
+  bool NoSpaceInjected() {
+    return MarkerPresent(nospace_marker_, "writes fail with ENOSPC");
+  }
 
   bool InitializeWorkerIOContexts();
   void CleanupWorkerIOContexts();
