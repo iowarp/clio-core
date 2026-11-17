@@ -1322,10 +1322,31 @@ bool DirectWronlyEnabled() {
   return v;
 }
 
+/**
+ * Whether O_DIRECT opens bypass the kernel page cache. Off by default: an
+ * O_DIRECT open normally takes the buffered path so a program can still mmap
+ * the fd (#597). CLIO_FUSE_ODIRECT=1 honors O_DIRECT instead, for benchmarks
+ * that must measure the filesystem rather than node memory (a timed reread
+ * otherwise reads the page cache at memory speed).
+ * @return true if O_DIRECT opens get per-file direct_io
+ */
+bool HonorODirect() {
+  static const bool v = [] {
+    const char *e = getenv("CLIO_FUSE_ODIRECT");
+    return e != nullptr && *e == '1';
+  }();
+  return v;
+}
+
 void MaybeDirectIo(struct fuse_file_info *fi) {
   if (DirectWronlyEnabled() && (fi->flags & O_ACCMODE) == O_WRONLY) {
     fi->direct_io = 1;
   }
+#ifdef O_DIRECT  // not defined on Windows, which builds this file too
+  if (HonorODirect() && (fi->flags & O_DIRECT) != 0) {
+    fi->direct_io = 1;
+  }
+#endif
 }
 
 // Synchronous barrier: process EVERY queued closer entry inline. Rename and
