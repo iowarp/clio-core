@@ -461,7 +461,8 @@ Where the code settled details the sections above left open.
 - **What the cache absorbs.** Client side: `Client::PutBlob` with no
   explicit score and no context, flags limited to `kCtePutDroppable`
   (`View::TryPut` refuses any other flag). Task side: puts with auto score,
-  a plain `Context` (`Runtime::PlainContext`) and the same flags. Droppability is a
+  a plain `Context` (`Runtime::PlainContext`; a `preallocate_` sizing hint
+  still counts as plain and is dropped at flush) and the same flags. Droppability is a
   per-blob property, so it is stored on the entry and carried to the chain
   in the new `MultiPutDesc::flags_`. Replace, append, explicit scores and
   any codec/replica/persistence context take the task path, which waits for

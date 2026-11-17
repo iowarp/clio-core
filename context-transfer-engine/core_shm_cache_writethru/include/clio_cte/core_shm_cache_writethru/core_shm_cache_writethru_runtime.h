@@ -290,11 +290,22 @@ class Runtime : public clio::cte::core::CoreInterposer {
     }
   }
 
+  /**
+   * Whether a put/get context can be served by the segment: nothing in it
+   * changes what bytes are stored or where they must go.
+   *
+   * `preallocate_` is ignored: it only sizes the core's block allocation and
+   * never changes the stored bytes. clio-fs passes it on every page write, so
+   * refusing it sent all file data around the segment and no read could hit.
+   * The flush lands the coalesced ranges without the hint.
+   * @param ctx the task's operation context
+   * @return true when the segment may absorb (or serve) the operation
+   */
   static bool PlainContext(const clio::cte::core::Context &ctx) {
     static const clio::cte::core::Context kDef;
     return ctx.persistence_target_ == kDef.persistence_target_ &&
            ctx.min_persistence_level_ == kDef.min_persistence_level_ &&
-           ctx.preallocate_ == 0 && !ctx.emulate_ &&
+           !ctx.emulate_ &&
            ctx.transform_flags_ == 0 && ctx.replica_ == 0 &&
            ctx.replica_flags_ == 0 && ctx.version_ == kDef.version_ &&
            !ctx.create_on_get_ && ctx.op_flags_ == 0 &&
