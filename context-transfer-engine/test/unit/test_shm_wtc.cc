@@ -57,7 +57,12 @@
 #include <thread>
 #include <vector>
 
-#include <unistd.h>
+#ifdef _WIN32
+#include <process.h>  // _getpid
+#define getpid _getpid
+#else
+#include <unistd.h>  // getpid
+#endif
 
 #include "simple_test.h"
 
