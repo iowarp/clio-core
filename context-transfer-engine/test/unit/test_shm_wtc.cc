@@ -491,13 +491,23 @@ TEST_CASE("ShmWtc - writes and reads complete in shared memory",
     REQUIRE(WaitFlushed(io));
     const clio::run::u64 batches0 = st->flush_batches_.load();
     const clio::run::u64 ranges0 = st->flush_ranges_.load();
+    const clio::run::u64 busy0 = st->put_busy_.load();
     for (int i = 0; i < 128; ++i) {
       std::string piece(512, static_cast<char>('a' + (i % 26)));
       std::memcpy(&want[i * 512], piece.data(), piece.size());
       REQUIRE(io.PutBlob(tag, "seq", i * 512, piece.size(), piece.data()) == 0);
     }
     REQUIRE(WaitFlushed(io));
-    REQUIRE(st->flush_ranges_.load() - ranges0 == 128);
+    // One flushed range per cached write. A write that grows the blob while
+    // the flusher has it pinned is refused busy and, past the client's short
+    // retry bound, goes down the task path instead of the cache, so it adds
+    // no range; that happens when a flush outlasts the bound (sanitizer
+    // builds). The count is exact unless writes were refused.
+    const clio::run::u64 ranges = st->flush_ranges_.load() - ranges0;
+    const clio::run::u64 busy = st->put_busy_.load() - busy0;
+    INFO("flushed ranges " + std::to_string(ranges) + ", busy refusals " +
+         std::to_string(busy));
+    REQUIRE((ranges == 128 || (ranges < 128 && busy > 0)));
     // Many ranges per batch: far fewer batches than writes.
     REQUIRE(st->flush_batches_.load() - batches0 < 64);
     REQUIRE(CoreRead(tag, "seq", 0, want.size()) == want);
@@ -813,6 +823,40 @@ TEST_CASE("ShmWtc - large puts displace a cache full of small buffers",
     REQUIRE(io.GetBlob(tag, "L" + std::to_string(i), 0, back.size(), back.data()) == 0);
     REQUIRE(back == vals[i]);
     REQUIRE(CoreRead(tag, "L" + std::to_string(i), 0, back.size()) ==
+            vals[i]);
+  }
+}
+
+TEST_CASE("ShmWtc - a put refused for room waits for the flush that makes it",
+          "[cte][shm_wtc][evict][flushwait]") {
+  // More dirty bytes than the heap holds: later puts fit only once earlier
+  // ones are flushed (clean, evictable). Cache-path writes do not wake the
+  // flusher, and an idle runtime's worker parks for up to max_sleep
+  // (50 ms), so a refused put must wake the flusher and wait for the
+  // ranges buffered before it, not write around after ~1 ms.
+  WtcFixture fx;
+  const clio::run::PoolId pool(578, 0);
+  CreateCache(pool, "shm_wtc_flushwait", 8ull << 20);  // ~5 MB of heap
+  clio::cte::core::Client io(pool);
+  Connect(io, pool);
+  const wtc::Stats *st = io.CacheStats();
+  TagId tag = MakeTag(io, "wtc_flushwait");
+
+  // Idle long enough for the flusher's worker to back off its park.
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  constexpr int kPuts = 8;  // 8 MB of 1 MB puts
+  const clio::run::u64 puts0 = st->puts_.load();
+  std::vector<std::string> vals;
+  for (int i = 0; i < kPuts; ++i) {
+    vals.push_back(Payload(1 << 20, static_cast<char>('A' + i)));
+    REQUIRE(io.PutBlob(tag, "W" + std::to_string(i), 0, vals.back().size(),
+                       vals.back().data()) == 0);
+  }
+  INFO("cached puts " << st->puts_.load() - puts0 << " of " << kPuts);
+  REQUIRE(st->puts_.load() - puts0 == static_cast<clio::run::u64>(kPuts));
+  REQUIRE(WaitFlushed(io));
+  for (int i = 0; i < kPuts; ++i) {
+    REQUIRE(CoreRead(tag, "W" + std::to_string(i), 0, vals[i].size()) ==
             vals[i]);
   }
 }

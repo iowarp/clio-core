@@ -359,6 +359,20 @@ bool RuntimeManager::ServerInit() {
     return false;
   }
 
+  // Start the control channel only now that every ChiMod is loaded. Its
+  // thread opens its own ZMQ context, which spawns ZMQ's I/O and reaper
+  // threads; started earlier, those pthread_create calls ran while this
+  // thread dlopen()ed the ChiMods. Under ASan that is a crash: libasan
+  // (GCC 14) allocates a new thread's context and the globals list of a
+  // dlopen()ed library from the same LowLevelAllocator under two different
+  // mutexes, so the two allocations can overlap, and the daemon died with
+  // "CHECK failed: sanitizer_thread_registry.cpp:161 ((tctx->status)) ==
+  // ((ThreadStatusInvalid))" in ControlChannelLoop -> zmq_socket while the
+  // main thread was loading a module (the shutdown-battletest flake).
+  // Nothing before this point needs the control channel: it carries only
+  // inter-node liveness pings.
+  ipc_manager->StartControlChannel();
+
   // Initialize work orchestrator before pool manager
   auto *work_orchestrator = CLIO_WORK_ORCHESTRATOR;
   if (!work_orchestrator->Init()) {

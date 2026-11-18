@@ -382,6 +382,7 @@ clio::run::TaskResume Runtime::DelTag(
   if (view_.Ready()) {
     const clio::run::u64 target = view_.PushedNow();
     while (!view_.FlushedThrough(target)) {
+      KickFlusher();
       CLIO_CO_AWAIT(clio::run::yield(kBarrierPollUs));
     }
   }
@@ -426,6 +427,7 @@ clio::run::TaskResume Runtime::SyncTag(
   if (view_.Ready()) {
     const clio::run::u64 target = view_.PushedNow();
     while (!view_.FlushedThrough(target)) {
+      KickFlusher();
       CLIO_CO_AWAIT(clio::run::yield(kBarrierPollUs));
     }
     // The landed writes' tag-metadata invalidations went out in the
@@ -478,6 +480,7 @@ clio::run::TaskResume Runtime::BarrierForward(
   if (view_.Ready()) {
     const clio::run::u64 target = view_.PushedNow();
     while (!view_.FlushedThrough(target)) {
+      KickFlusher();
       CLIO_CO_AWAIT(clio::run::yield(kBarrierPollUs));
     }
   }
@@ -526,6 +529,7 @@ clio::run::TaskResume Runtime::FetchTagAttrs(const TagId &tag,
     if (view_.Ready()) {
       const clio::run::u64 target = view_.PushedNow();
       while (!view_.FlushedThrough(target)) {
+        KickFlusher();
         CLIO_CO_AWAIT(clio::run::yield(kBarrierPollUs));
       }
       CLIO_CO_AWAIT(RegisterSharer(

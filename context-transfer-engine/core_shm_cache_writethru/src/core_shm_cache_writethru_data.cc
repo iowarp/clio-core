@@ -66,9 +66,15 @@ using clio::cte::core::BlobRegion;
 
 static constexpr double kBarrierPollUs = 10.0;
 static constexpr double kNoSpacePollUs = 50.0;
-/** Waits for segment room before a put writes around the cache (~1 ms). A
- *  segment full of clean small buffers may never yield a large one. */
+/** Waits for segment room before a put writes around the cache (~1 ms),
+ *  once no range buffered before the put's first refusal is still
+ *  unflushed. A segment full of clean small buffers may never yield a large
+ *  one. */
 static constexpr int kNoSpaceRetries = 20;
+/** Most a refused put waits (ms) for the ranges buffered before its first
+ *  refusal to land: once flushed they are clean and evictable, so room
+ *  follows. Writing around instead would take the same chain. */
+static constexpr double kNoSpaceFlushWaitMs = 250.0;
 /** Retries of a put refused because its entry is pinned (kBusy) before it
  *  writes around the cache. The pin is an in-flight flush, released when
  *  the blob's home acks (a network round trip). */
@@ -78,6 +84,15 @@ static constexpr double kBusyPollStartUs = 10.0;
 /** Back-off cap between kBusy retries (us); with the start above the whole
  *  budget is ~6 ms of yields before the put writes around the cache. */
 static constexpr double kBusyPollMaxUs = 1000.0;
+
+bool Runtime::RoomMayFollowFlush(
+    clio::run::u64 target, std::chrono::steady_clock::time_point t0) const {
+  if (view_.FlushedThrough(target)) return false;
+  const double waited_ms = std::chrono::duration<double, std::milli>(
+                               std::chrono::steady_clock::now() - t0)
+                               .count();
+  return waited_ms < kNoSpaceFlushWaitMs;
+}
 
 clio::run::TaskResume Runtime::TryPutRetrying(const TagId &tag,
                                               const std::string &name,
@@ -91,16 +106,34 @@ clio::run::TaskResume Runtime::TryPutRetrying(const TagId &tag,
     int nospace_tries = 0;
     int busy_tries = 0;
     double busy_us = kBusyPollStartUs;
+    bool waiting_room = false;
+    clio::run::u64 room_target = 0;
+    std::chrono::steady_clock::time_point room_t0;
     while (true) {
       *st = view_.TryPut(tag.major_, tag.minor_, name.c_str(), name.size(),
                          off, size, src, flags, /*may_block=*/false);
-      if (*st == wtc::Status::kNoSpace && nospace_tries < kNoSpaceRetries) {
+      if (*st == wtc::Status::kNoSpace && !waiting_room) {
+        waiting_room = true;
+        room_target = view_.PushedNow();
+        room_t0 = std::chrono::steady_clock::now();
+      }
+      // Room and pins come back only as the flusher lands buffered ranges:
+      // wake it if its worker is parked, else the wait outlasts the budget.
+      if (*st == wtc::Status::kNoSpace &&
+          RoomMayFollowFlush(room_target, room_t0)) {
+        view_.GetRoot()->stats_.waits_.fetch_add(1);
+        KickFlusher();
+        CLIO_CO_AWAIT(clio::run::yield(kNoSpacePollUs));
+      } else if (*st == wtc::Status::kNoSpace &&
+                 nospace_tries < kNoSpaceRetries) {
         ++nospace_tries;
         view_.GetRoot()->stats_.waits_.fetch_add(1);
+        KickFlusher();
         CLIO_CO_AWAIT(clio::run::yield(kNoSpacePollUs));
       } else if (*st == wtc::Status::kBusy && busy_tries < kBusyRetries) {
         ++busy_tries;
         view_.GetRoot()->stats_.waits_.fetch_add(1);
+        KickFlusher();
         CLIO_CO_AWAIT(clio::run::yield(busy_us));
         busy_us = std::min(busy_us * 2.0, kBusyPollMaxUs);
       } else {
@@ -118,6 +151,7 @@ clio::run::TaskResume Runtime::WaitBlobFlushed(const TagId &tag,
   if (view_.Ready()) {
     while (view_.BlobPending(tag.major_, tag.minor_, name.c_str(),
                              name.size()) != 0) {
+      KickFlusher();
       CLIO_CO_AWAIT(clio::run::yield(kBarrierPollUs));
     }
   }
@@ -139,6 +173,7 @@ clio::run::TaskResume Runtime::BeginChainRead(const TagId &tag,
     // holding the flusher off (it is what lands them).
     if (view_.Ready() && view_.BlobPending(tag.major_, tag.minor_,
                                            name.c_str(), name.size()) != 0) {
+      KickFlusher();
       CLIO_CO_AWAIT(clio::run::yield(kBarrierPollUs));
       continue;
     }

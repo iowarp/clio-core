@@ -467,18 +467,23 @@ inline long View::PickVictim(u64 want_bytes) {
   // cursor (reads here are unlocked hints, re-verified under the lock).
   // Bounded: with few clean entries an unbounded walk visits every slot of
   // a large table on each allocation attempt (holding a stripe lock).
-  for (u32 k = 0; k < scan && seen < want; ++k) {
+  // When the sample holds no buffer that alone fits the request, keep
+  // walking (same bound) for one: evicting it frees room at once, where a
+  // small victim needs a window eviction and a merge, which can fail.
+  for (u32 k = 0; k < scan && (seen < want || fit < 0); ++k) {
     u32 slot = static_cast<u32>((cursor + k) % n);
     BlobEntry *e = Slot(slot);
     if (e->state_ != kSlotLive || !(e->flags_ & kResident) ||
         e->pending_.load() != 0 || e->pins_.load() != 0) {
       continue;
     }
-    ++seen;
     double f = Frecency(e, now);
-    if (best < 0 || f < best_f) {
-      best = static_cast<long>(slot);
-      best_f = f;
+    if (seen < want) {
+      ++seen;
+      if (best < 0 || f < best_f) {
+        best = static_cast<long>(slot);
+        best_f = f;
+      }
     }
     if (e->cap_ >= want_bytes && (fit < 0 || f < fit_f)) {
       fit = static_cast<long>(slot);
@@ -520,7 +525,10 @@ inline u64 View::WindowSpan(u64 bytes) const {
   if (span > seg / 8) {
     span = seg / 8;
   }
-  return span < 2 * bytes ? 2 * bytes : span;
+  // Two requests' pages, each with its allocator header and a partial
+  // granule at the window's edge: exactly 2 * bytes holds only one.
+  const u64 two = 2 * (bytes + kMinBuffer);
+  return span < two ? two : span;
 }
 
 inline bool View::EvictWindow(u32 held_stripe, u64 start, u64 span) {

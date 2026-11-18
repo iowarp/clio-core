@@ -35,6 +35,7 @@
 #define CLIO_CTE_CORE_SHM_CACHE_WRITETHRU_RUNTIME_H_
 
 #include <atomic>
+#include <chrono>
 #include <deque>
 #include <map>
 #include <memory>
@@ -133,6 +134,26 @@ class Runtime : public clio::cte::core::CoreInterposer {
   clio::run::TaskResume SyncTag(
       clio::run::shared_ptr<clio::cte::core::SyncTagTask> &task);
   clio::run::TaskResume FlushLog(clio::run::shared_ptr<FlushLogTask> &task);
+  /**
+   * Wake the worker that runs the flusher when it is parked and the dirty
+   * log holds ranges. Cache-path writes push to the log without waking
+   * anyone, and a parked worker polls its periodic tasks only every 1 to
+   * max_sleep (50) ms (its idle backoff), so a task that waits on the
+   * flusher (for room, a pin, or a barrier) calls this on each poll. No
+   * syscall when the worker is running.
+   */
+  void KickFlusher();
+  /**
+   * Whether a put refused for room should keep waiting for the flusher:
+   * ranges buffered before its first refusal are still unflushed (once
+   * landed they are clean and evictable) and the wait is under
+   * kNoSpaceFlushWaitMs.
+   * @param target pushed-range count at the put's first refusal
+   * @param t0 time of the put's first refusal
+   * @return true to keep waiting without spending a no-space retry
+   */
+  bool RoomMayFollowFlush(clio::run::u64 target,
+                          std::chrono::steady_clock::time_point t0) const;
   clio::run::TaskResume Invalidate(clio::run::shared_ptr<InvalidateTask> &task);
   clio::run::TaskResume HomeFlush(clio::run::shared_ptr<HomeFlushTask> &task);
   /** Any other core method: drain the local log, then forward verbatim. */
@@ -539,6 +560,8 @@ class Runtime : public clio::cte::core::CoreInterposer {
   std::atomic<int> flush_active_{0};
   /** One FlushLog coroutine drains the log at a time. */
   std::atomic<bool> flush_running_{false};
+  /** Lane of the worker that last ran FlushLog (KickFlusher wakes it). */
+  std::atomic<clio::run::TaskLane *> flusher_lane_{nullptr};
   /** Chain reads backed off by an active flush: no new batch starts while
    *  one waits, so in-flight batches drain and the read gets in. */
   std::atomic<int> reads_waiting_{0};

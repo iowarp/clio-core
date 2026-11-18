@@ -1807,12 +1807,23 @@ static void OverlayWriteTime(const std::string &p, cte_stat_t *stbuf) {
  * Fill a stat buffer from a file's attributes as the chimod reported them,
  * overlaying what this mount knows and the chimod does not yet: sizes of
  * sizes reached by page puts not yet published, and their write times.
+ *
+ * The size overlay must be read BEFORE the attributes were requested and
+ * passed in as `hw_floor`: the lazy closer drops a path's hiwater as soon as
+ * the chimod acknowledges the size push, so a Getattr answered just before
+ * the push landed (size 0) and an overlay read just after it was dropped
+ * (nothing) together reported a freshly written file as empty -- and the
+ * kernel then served reads of it as EOF (xfstests generic/001 "corruption").
+ * A hiwater dropped before the request was sent was already acknowledged, so
+ * the reply carries that size.
  * @param a the attributes (a Getattr reply's, or a creating Open's)
  * @param p the path this mount's overlays are keyed by
  * @param stbuf the buffer to fill
+ * @param hw_floor HiwaterFor(p) taken before the attributes were requested
+ *        (0 when they come from no request)
  */
 static void FillStatFromAttrs(const StatAttrs &a, const std::string &p,
-                              cte_stat_t *stbuf) {
+                              cte_stat_t *stbuf, clio::run::u64 hw_floor) {
   const StatAttrs *t = &a;
   // Owner: a prior chown recorded an override (uid_/gid_ != 0xFFFFFFFF);
   // otherwise report the mounting user's uid/gid (files carry no stored owner).
@@ -1842,7 +1853,7 @@ static void FillStatFromAttrs(const StatAttrs &a, const std::string &p,
     stbuf->st_size = static_cast<cte_off_t>(t->size);
     // Direct page puts advance the chimod size only at close: overlay the
     // local hiwater in the meantime.
-    clio::run::u64 hw = HiwaterFor(p);
+    const clio::run::u64 hw = std::max(hw_floor, HiwaterFor(p));
     if (hw > static_cast<clio::run::u64>(stbuf->st_size)) {
       stbuf->st_size = static_cast<cte_off_t>(hw);
     }
@@ -1878,9 +1889,11 @@ static void FillStatFromAttrs(const StatAttrs &a, const std::string &p,
  * @param t the Getattr reply (exists_ != 0)
  * @param p the path this mount's overlays are keyed by
  * @param stbuf the buffer to fill
+ * @param hw_floor HiwaterFor(p) taken before the Getattr was sent
  */
 static void FillStatFromGetattr(clio::cte::filesystem::GetattrTask *t,
-                                const std::string &p, cte_stat_t *stbuf) {
+                                const std::string &p, cte_stat_t *stbuf,
+                                clio::run::u64 hw_floor) {
   StatAttrs a;
   a.is_dir = t->is_dir_ != 0;
   a.is_symlink = t->is_symlink_ != 0;
@@ -1893,7 +1906,7 @@ static void FillStatFromGetattr(clio::cte::filesystem::GetattrTask *t,
   a.gid = t->gid_;
   a.mode = t->mode_;
   a.nlink = t->nlink_;
-  FillStatFromAttrs(a, p, stbuf);
+  FillStatFromAttrs(a, p, stbuf, hw_floor);
 }
 
 /** How long attributes kept from a create may wait for the getattr of the
@@ -2014,6 +2027,8 @@ static int cte_fuse_getattr_stat_inner(const char *path, cte_stat_t *stbuf,
 
   if (PrefetchTake(p, stbuf)) return 0;
   // Delegate to the filesystem chimod: it owns exists/is-dir/logical-size.
+  // The size overlay is read first (see FillStatFromAttrs).
+  const clio::run::u64 hw_floor = HiwaterFor(p);
   auto t = cfs->AsyncGetattr(p);
   t.Wait();
   // A lookup that FAILED (its directory block's home unreachable, a timeout)
@@ -2025,7 +2040,7 @@ static int cte_fuse_getattr_stat_inner(const char *path, cte_stat_t *stbuf,
   if (t->exists_ == 0) {
     return -ENOENT;
   }
-  FillStatFromGetattr(t.get(), p, stbuf);
+  FillStatFromGetattr(t.get(), p, stbuf, hw_floor);
   if (S_ISDIR(stbuf->st_mode)) DirAttrStore(p, *stbuf);
   return 0;
 }
@@ -2192,13 +2207,14 @@ static int GetattrStatImpl(const char *path, cte_stat_t *stbuf,
       // The create that opened it returned these in this same request: no
       // task.
       memset(stbuf, 0, sizeof(*stbuf));
-      FillStatFromAttrs(kept, key, stbuf);
+      FillStatFromAttrs(kept, key, stbuf, 0);
     } else {
       clio::run::Future<clio::cte::filesystem::GetattrTask> t;
+      const clio::run::u64 hw_floor = HiwaterFor(key);
       rc = GetattrOpenHandle(handle, key, &t);
       if (rc == 0) {
         memset(stbuf, 0, sizeof(*stbuf));
-        FillStatFromGetattr(t.get(), key, stbuf);
+        FillStatFromGetattr(t.get(), key, stbuf, hw_floor);
       }
     }
   } else {
@@ -2207,10 +2223,11 @@ static int GetattrStatImpl(const char *path, cte_stat_t *stbuf,
       // The name was renamed over between the mirror check and the lookup:
       // the descriptor's own file is still there.
       clio::run::Future<clio::cte::filesystem::GetattrTask> t;
+      const clio::run::u64 hw_floor = HiwaterFor(key);
       rc = GetattrOpenHandle(handle, key, &t);
       if (rc == 0) {
         memset(stbuf, 0, sizeof(*stbuf));
-        FillStatFromGetattr(t.get(), key, stbuf);
+        FillStatFromGetattr(t.get(), key, stbuf, hw_floor);
       }
     }
   }
@@ -2568,24 +2585,32 @@ static void PrefetchChunkStats(const std::string &dir, size_t raw_entries,
   if (!pf_lk.owns_lock()) return;
   auto *cfs = CLIO_CFS_CLIENT;
   using GetattrFuture = decltype(cfs->AsyncGetattr(dir));
-  std::vector<std::pair<std::string, GetattrFuture>> inflight;
+  /** One prefetch in flight: its path, the size overlay read before it was
+   *  sent (see FillStatFromAttrs), and its Getattr. */
+  struct Inflight {
+    std::string path;
+    clio::run::u64 hw_floor;
+    GetattrFuture fut;
+  };
+  std::vector<Inflight> inflight;
   inflight.reserve(static_cast<size_t>(win));
   auto drain = [&]() {
-    for (auto &kv : inflight) {
-      kv.second.Wait();
-      if (kv.second->GetReturnCode() != 0 || kv.second->exists_ == 0) continue;
+    for (auto &in : inflight) {
+      in.fut.Wait();
+      if (in.fut->GetReturnCode() != 0 || in.fut->exists_ == 0) continue;
       cte_stat_t pst;
       memset(&pst, 0, sizeof(pst));
-      FillStatFromGetattr(kv.second.get(), kv.first, &pst);
+      FillStatFromGetattr(in.fut.get(), in.path, &pst, in.hw_floor);
       std::lock_guard<std::mutex> lk(g_pf_mtx);
-      g_pf[kv.first] = {pst, PfNowNs()};
+      g_pf[in.path] = {pst, PfNowNs()};
     }
     inflight.clear();
   };
   const int64_t pf_t0 = PfNowNs();
   for (const std::string &full : fulls) {
+    const clio::run::u64 hw_floor = HiwaterFor(full);
     auto f = cfs->AsyncGetattr(full);
-    inflight.emplace_back(full, std::move(f));
+    inflight.push_back(Inflight{full, hw_floor, std::move(f)});
     if (inflight.size() >= static_cast<size_t>(win)) drain();
   }
   drain();
@@ -4213,6 +4238,11 @@ static int ReadDirect(CfsHandle *handle, const std::string &hp,
   const unsigned long long ev_sz0 = ev::Now();
   // The descriptor's own file: after a rename over its name the path names
   // another file (or, mid-rename, none) and read 0 bytes.
+  // The local size overlay is read BEFORE the size lookup: the closer drops
+  // it as soon as the chimod acknowledges the size push, so read after a
+  // lookup answered just before the push landed, neither would cover the
+  // file's bytes and the read returned EOF (see FillStatFromAttrs).
+  const clio::run::u64 hw_floor = HiwaterFor(hp);
   clio::run::u64 fsize = 0;
   const int src = ReadClampSize(
       handle, hp, static_cast<clio::run::u64>(offset), size, &fsize);
@@ -4224,7 +4254,7 @@ static int ReadDirect(CfsHandle *handle, const std::string &hp,
   // The descriptor's own file is gone on the server: a silent EOF would
   // read as a truncated file. ESTALE, as NFS reports a vanished file.
   if (src == -ENOENT) return -kOpenVanishedErrno;
-  fsize = std::max(fsize, HiwaterFor(hp));
+  fsize = std::max({fsize, hw_floor, HiwaterFor(hp)});
   ev::Span(ev::kRdSize, ev_sz0, ev::Now());
   const clio::run::u64 off = static_cast<clio::run::u64>(offset);
   if (off >= fsize) return 0;

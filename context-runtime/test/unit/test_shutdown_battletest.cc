@@ -86,7 +86,18 @@
 
 namespace {
 
-constexpr unsigned kBtPort = 10600;
+/**
+ * @return the runtime port the battletest drives: CLIO_PORT (ctest sets
+ * 10600), so several copies can run side by side on private ports.
+ */
+unsigned BtPort() {
+  if (const char *env = std::getenv("CLIO_PORT")) {
+    int p = std::atoi(env);
+    if (p > 0 && p < 65536) return static_cast<unsigned>(p);
+  }
+  return 10600;
+}
+const unsigned kBtPort = BtPort();
 /** Exit code the runtime-side watchdog uses when graceful teardown wedges */
 constexpr int kWatchdogExitCode = 2;
 
@@ -297,6 +308,23 @@ void KillLoadClients(std::vector<pid_t> &pids) {
 }
 
 /**
+ * Fail the test unless the daemon becomes ready.
+ *
+ * WaitForReady fails early when the daemon exits during startup. Why it
+ * exited is in its wait status, its sanitizer report (which memcheck routes
+ * to a log_path file, not to the daemon's stderr) and its captured log -- all
+ * of which CI discards with the runner unless quoted in the failure message.
+ * @param server the just-started daemon
+ * @param cycle current cycle (for the failure message)
+ */
+void RequireReady(clio::run::test::RuntimeServer &server, int cycle) {
+  if (!server.WaitForReady()) {
+    FAIL("cycle " + std::to_string(cycle) +
+         ": daemon did not become ready\n" + server.StartupFailureReport());
+  }
+}
+
+/**
  * One start -> [load] -> stop -> assert-clean cycle.
  * @param cycle cycle index (failure messages)
  * @param stop_args clio_run stop arguments ("stop", "stop --force", ...)
@@ -308,13 +336,7 @@ void RunStopCycle(int cycle, const std::string &stop_args, int n_load_clients,
                   int load_ms, bool allow_watchdog) {
   clio::run::test::RuntimeServer server;
   REQUIRE(server.Start(kBtPort));
-  if (!server.WaitForReady()) {
-    // WaitForReady fails early when the daemon exits during startup; why it
-    // exited is only in its captured log, which CI discards with the runner.
-    FAIL("cycle " + std::to_string(cycle) +
-         ": daemon did not become ready (exited during startup?)\n" +
-         clio::run::test::RuntimeServer::LogTail());
-  }
+  RequireReady(server, cycle);
   AssertDeadOwnerEntriesReaped(cycle);
   const int pid = static_cast<int>(server.Pid());
 
@@ -426,7 +448,7 @@ TEST_CASE("ShutdownBattletest - Wedged Runtime", "[bt_wedged]") {
     INFO("wedged cycle " + std::to_string(cycle) + "/" + std::to_string(iters));
     clio::run::test::RuntimeServer server;
     REQUIRE(server.Start(kBtPort));
-    REQUIRE(server.WaitForReady());
+    RequireReady(server, cycle);
     const int pid = static_cast<int>(server.Pid());
 
     REQUIRE(kill(pid, SIGSTOP) == 0);
@@ -456,7 +478,7 @@ TEST_CASE("ShutdownBattletest - Crash Recovery", "[bt_crash]") {
     INFO("crash cycle " + std::to_string(cycle) + "/" + std::to_string(iters));
     clio::run::test::RuntimeServer server;
     REQUIRE(server.Start(kBtPort));
-    REQUIRE(server.WaitForReady());
+    RequireReady(server, cycle);
     const int pid = static_cast<int>(server.Pid());
 
     // status on a live runtime: RUNNING (exit 0)

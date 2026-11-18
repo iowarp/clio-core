@@ -730,7 +730,8 @@ bool IpcManager::ServerInit() {
   }
 
   is_initialized_ = true;
-  StartControlChannel();
+  // The control channel thread is NOT started here: RuntimeManager::ServerInit
+  // starts it once the ChiMods are loaded. See the note there.
 
   return true;
 }
