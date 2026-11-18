@@ -129,6 +129,18 @@ NP=$(( NN * PPN ))
 DATA_MB=$(( PPN * (EASY_MB + HARD_SEG * 47008 / 1048576) + PPN * MD_N * 3901 / 1048576 + 1 ))
 # BENCH=ior writes only the EASY_MB footprint (one pattern at a time).
 [ "${BENCH:-io500}" = ior ] && DATA_MB=$(( PPN * EASY_MB + 1 ))
+# BENCH=wfcommons writes one WfBench workflow (WF_JSON, made by
+# wfcommons/wfc_gen.py): its footprint (every file, staged inputs and task
+# outputs, each written once) spread over the nodes. Tasks run wherever
+# Parsl places them, so a node may hold more than its share: RAM_PCT /
+# DAOS_X give clio-fs the slack.
+if [ "${BENCH:-io500}" = wfcommons ]; then
+  WF_JSON=${WF_JSON:?BENCH=wfcommons needs WF_JSON}
+  WF_FOOT_MB=$(python3 -c 'import json,sys; s=json.load(open(sys.argv[1]))["workflow"]["specification"]; print(sum(f["sizeInBytes"] for f in s["files"]) // 2**20 + 1)' "$WF_JSON") \
+    || { echo "cannot read $WF_JSON"; exit 2; }
+  DATA_MB=$(( WF_FOOT_MB / NN + 1 ))
+  echo "=== wfcommons $(basename "$WF_JSON"): footprint ${WF_FOOT_MB} MB, ${DATA_MB} MB per node"
+fi
 RAM_PCT=${RAM_PCT:-25}
 DAOS_PCT=${DAOS_PCT:-50}
 # The Flare tier is the overflow: it only has to take the remaining
@@ -637,6 +649,80 @@ elif [ "${BENCH:-io500}" = mdtest ]; then
   run_md hard-delete -r -t -w 3901 -e 3901 -d "$DATADIR/md-hard"
   [ -n "$SP" ] && wait "$SP"
   rc=0
+elif [ "${BENCH:-io500}" = wfcommons ]; then
+  # BENCH=wfcommons: one WfBench workflow (WF_JSON) with its working
+  # directory on the system under test ($DATADIR/wf). Three timed steps:
+  #   stage   : the workflow's input files, written by WF_STAGE_PPN ranks
+  #             per node (wfcommons/wfc_stage.py)
+  #   run     : the workflow under Parsl, WF_WPN workers per node on every
+  #             node (wfcommons/wfc_run.py); makespan = first submit to last
+  #             task done, after K null tasks per node warmed the nodes
+  #   cleanup : rm -rf of the working directory
+  # WF_VENV holds wfcommons, parsl, wfbench and stress-ng.
+  # WF_LOCAL_VENV=1 (default): every node unpacks $WF_VENV.tar (a slim copy
+  # of the venv: no scipy/matplotlib/wfcommons) into node-local /tmp
+  # (tmpfs; /dev/shm is noexec, so extension modules fail to load there)
+  # and runs wfbench from it, so the thousands of Python start-ups per node
+  # do not go to Flare, whose metadata load would otherwise show up in
+  # every system's task times.
+  WF_VENV=${WF_VENV:-/lus/flare/projects/IOWarp/llogan/wfc-venv}
+  if [ "${WF_LOCAL_VENV:-1}" = 1 ]; then
+    t0=$(date +%s.%N)
+    mpiexec -n "$NN" -ppn 1 --cpu-bind none bash -c \
+      "rm -rf /tmp/$USER/wfc-venv; mkdir -p /tmp/$USER && tar -C /tmp/$USER -xf $WF_VENV.tar" \
+      || echo "=== venv unpack FAILED"
+    WF_VENV=/tmp/$USER/wfc-venv
+    echo "=== venv unpacked to $WF_VENV on $NN nodes in $(awk -v a="$t0" -v b="$(date +%s.%N)" 'BEGIN{printf "%.1f", b - a}') s"
+  fi
+  WF_PY=$WF_VENV/bin/python
+  WF_DIR=$DATADIR/wf
+  WF_NAME=$(basename "$WF_JSON" .json)
+  WF_OUT=$OUT/wf_$WF_NAME
+  mkdir -p "$WF_DIR" "$WF_OUT" || echo "=== cannot create $WF_DIR"
+  t0=$(date +%s.%N)
+  mpiexec -n $(( NN * ${WF_STAGE_PPN:-8} )) -ppn "${WF_STAGE_PPN:-8}" --cpu-bind none --envall \
+    "$WF_PY" "$HERE/wfcommons/wfc_stage.py" "$WF_JSON" "$WF_DIR" $(( NN * ${WF_STAGE_PPN:-8} )) > "$WF_OUT/stage.log" 2>&1
+  src=$?
+  t1=$(date +%s.%N)
+  st_b=$(awk '/^STAGE/{for(i=1;i<=NF;i++) if($i~/^bytes=/){split($i,a,"=");s+=a[2]}} END{print s+0}' "$WF_OUT/stage.log")
+  st_n=$(grep -c '^STAGE' "$WF_OUT/stage.log")
+  st_s=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.3f", b - a}')
+  echo "WFSTAGE tag=${RUN_TAG:-none} mode=$MODE nodes=$NN wf=$WF_NAME rc=$src ranks=$st_n bytes=$st_b secs=$st_s GBps=$(awk -v b="$st_b" -v s="$st_s" 'BEGIN{printf "%.3f", b / s / 1e9}')"
+  rc=$src
+  if [ "$src" = 0 ]; then
+    PATH=$WF_VENV/bin:$PATH timeout "${WF_TIMEOUT:-2400}" "$WF_PY" "$HERE/wfcommons/wfc_run.py" \
+      --json "$WF_JSON" --workdir "$WF_DIR" --out "$WF_OUT" --nodes "$NN" \
+      --wpn "${WF_WPN:-16}" --python "$WF_PY" ${WF_ADDRESS:+--address "$WF_ADDRESS"} \
+      > "$WF_OUT/run.log" 2>&1
+    rc=$?
+    grep -E '^=== ' "$WF_OUT/run.log"
+    tail -3 "$WF_OUT/run.log" | grep -v '^WFRESULT' | grep -v '^=== '
+    res=$(grep '^WFRESULT ' "$WF_OUT/run.log" | cut -d' ' -f2-)
+    if [ -n "$res" ]; then
+      echo "$res" | python3 -c '
+import json, sys
+s = json.loads(sys.stdin.read())
+print("WFCELL tag=%s mode=%s nodes=%s wf=%s rc=%s makespan_s=%s ok=%s failed=%s dep_failed=%s other_failed=%s read_GB=%.1f written_GB=%.1f agg_GBps=%s inputs_bad=%s outputs_bad=%s null_task_s=%s task_p50_s=%.2f task_p99_s=%.2f" % (
+    sys.argv[1], sys.argv[2], s["nodes"], sys.argv[3], sys.argv[4], s["makespan_s"], s["ok"], s["failed"],
+    s["dep_failed"], s["other_failed"], s["bytes_read"] / 1e9, s["bytes_written"] / 1e9, s["agg_GBps"],
+    s["inputs_bad"], s["outputs_bad"], s["null_task_median_s"], s["task_s_all"]["p50"] or 0, s["task_s_all"]["p99"] or 0))
+for k, v in s["task_s"].items():
+    print("WFCAT %s n=%d p50=%.2f p90=%.2f p99=%.2f max=%.2f" % (k, v["n"], v["p50"], v["p90"], v["p99"], v["max"]))
+' "${RUN_TAG:-none}" "$MODE" "$WF_NAME" "$rc"
+    else
+      echo "WFCELL tag=${RUN_TAG:-none} mode=$MODE nodes=$NN wf=$WF_NAME rc=$rc NO_RESULT"
+      tail -30 "$WF_OUT/run.log"
+    fi
+  fi
+  # Leftover Parsl worker pools (a timed-out driver) would keep running.
+  mpiexec -n "$NN" -ppn 1 --cpu-bind none bash -c \
+    'pkill -u "$USER" -f process_worker_pool; true' > /dev/null 2>&1
+  t0=$(date +%s.%N)
+  rm -rf "$WF_DIR"
+  rmrc=$?
+  [ "${WF_LOCAL_VENV:-1}" = 1 ] && mpiexec -n "$NN" -ppn 1 --cpu-bind none \
+    bash -c "rm -rf /tmp/$USER/wfc-venv" > /dev/null 2>&1
+  echo "WFCLEAN tag=${RUN_TAG:-none} mode=$MODE wf=$WF_NAME rm_rc=$rmrc secs=$(awk -v a="$t0" -v b="$(date +%s.%N)" 'BEGIN{printf "%.3f", b - a}')"
 else
 echo "=== IO500 start $(date)"
 # HANG_DUMP_S: if IO500 is still running after this many seconds, ask every
