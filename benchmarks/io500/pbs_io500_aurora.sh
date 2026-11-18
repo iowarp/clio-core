@@ -174,6 +174,25 @@ pool_space start
 # containers to drop first (the old shared io500_cliofs).
 DAOS_CONT=${DAOS_CONT:-io500_${NN}n}
 _cont_opts=${DAOS_CONT_OPTS:-}  # set -u safe; see DAOS_CONT_OPTS
+# node_snapshot <label>: min/median/max of MemAvailable, /tmp use and the
+# 1-minute load over every node, to see what a system's bring-up leaves.
+node_snapshot() {
+  mpiexec -n "$NN" -ppn 1 --cpu-bind none bash -c \
+    'echo "$(awk "/MemAvailable/{print int(\$2/1048576)}" /proc/meminfo) $(df -BG --output=used /tmp | tail -1 | tr -dc 0-9) $(cut -d" " -f1 /proc/loadavg)"' 2>/dev/null \
+    | sort -n | awk -v l="$1" '{m[NR]=$1; t[NR]=$2; d[NR]=$3} END{n=NR; if(n==0){print "=== node snapshot " l ": no data"; exit}
+      asort(t); asort(d); printf "=== node snapshot %s (%d nodes): MemAvailable GB min %d med %d max %d; /tmp used GB med %d max %d; load1 med %.1f max %.1f\n", l, n, m[1], m[int((n+1)/2)], m[n], t[int((n+1)/2)], t[n], d[int((n+1)/2)], d[n]}'
+}
+# BENCH=wfcommons: unpack the workflow venv into node-local /tmp BEFORE the
+# filesystem under test starts, so its runtime cannot slow or break the unpack
+# (a 256-node Context FS run took 810 s and failed when this ran after it).
+if [ "${BENCH:-io500}" = wfcommons ] && [ "${WF_LOCAL_VENV:-1}" = 1 ]; then
+  node_snapshot "before bring-up"
+  t0=$(date +%s.%N)
+  mpiexec -n "$NN" -ppn 1 --cpu-bind none bash -c \
+    "rm -rf /tmp/$USER/wfc-venv; mkdir -p /tmp/$USER && tar -C /tmp/$USER -xf ${WF_VENV:-/lus/flare/projects/IOWarp/llogan/wfc-venv}.tar" \
+    && WF_UNPACKED=1 || echo "=== venv unpack FAILED (before bring-up)"
+  echo "=== venv unpacked before bring-up on $NN nodes in $(awk -v a="$t0" -v b="$(date +%s.%N)" 'BEGIN{printf "%.1f", b - a}') s"
+fi
 if [ "$MODE" != flare ]; then
   _destroy=${DAOS_DESTROY:-}
   for c in ${_destroy//,/ }; do  # comma- or space-separated
@@ -240,7 +259,8 @@ if [ "$MODE" = cliofs ]; then
   echo "=== cache module ${CACHE:-1}; data per node ${DATA_MB}MB; tiers per node: DRAM ${RAM_GB}MB (${RAM_PCT}%)  DAOS ${DAOS_GB}MB (${DAOS_PCT}%)  Flare ${FL_GB}MB (overflow)"
   daos pool query "$DAOS_POOL" 2>&1 | grep -i -E 'total size|free' | head -4
   daos cont query "$DAOS_POOL" "$DAOS_CONT" > /dev/null 2>&1 \
-    || daos cont create "$DAOS_POOL" "$DAOS_CONT" --type POSIX ${_cont_opts//,/ } 2>&1 | grep -v ' ERR '
+    || { cc=$(daos cont create "$DAOS_POOL" "$DAOS_CONT" --type POSIX ${_cont_opts//,/ } 2>&1); \
+         echo "=== DAOS cont create $DAOS_CONT ${_cont_opts//,/ }: $(echo "$cc" | grep -v ' ERR ' | tail -2 | tr '\n' ' ')"; }
   mkdir -p "$FLARE/tiers/$JOB"
   find "$FLARE/tiers" -mindepth 1 -maxdepth 1 -mmin +120 ! -name "$JOB" -exec rm -rf {} + 2>/dev/null
   LR=/tmp/$USER/cliofs
@@ -445,7 +465,8 @@ EOF
   DATADIR=$LR/mnt/io500_$JOB
 elif [ "$MODE" = daos ]; then
   daos cont query "$DAOS_POOL" "$DAOS_CONT" > /dev/null 2>&1 \
-    || daos cont create "$DAOS_POOL" "$DAOS_CONT" --type POSIX ${_cont_opts//,/ } 2>&1 | grep -v ' ERR '
+    || { cc=$(daos cont create "$DAOS_POOL" "$DAOS_CONT" --type POSIX ${_cont_opts//,/ } 2>&1); \
+         echo "=== DAOS cont create $DAOS_CONT ${_cont_opts//,/ }: $(echo "$cc" | grep -v ' ERR ' | tail -2 | tr '\n' ' ')"; }
   mkdir -p ready logs
   mpiexec -n "$NN" -ppn 1 --no-vni --cpu-bind none --envall \
     env OUT="$OUT" DAOS_POOL="$DAOS_POOL" DAOS_CONT="$DAOS_CONT" \
@@ -666,7 +687,10 @@ elif [ "${BENCH:-io500}" = wfcommons ]; then
   # do not go to Flare, whose metadata load would otherwise show up in
   # every system's task times.
   WF_VENV=${WF_VENV:-/lus/flare/projects/IOWarp/llogan/wfc-venv}
-  if [ "${WF_LOCAL_VENV:-1}" = 1 ]; then
+  [ "${WF_UNPACKED:-0}" = 1 ] && node_snapshot "after bring-up"
+  if [ "${WF_LOCAL_VENV:-1}" = 1 ] && [ "${WF_UNPACKED:-0}" = 1 ]; then
+    WF_VENV=/tmp/$USER/wfc-venv
+  elif [ "${WF_LOCAL_VENV:-1}" = 1 ]; then
     t0=$(date +%s.%N)
     mpiexec -n "$NN" -ppn 1 --cpu-bind none bash -c \
       "rm -rf /tmp/$USER/wfc-venv; mkdir -p /tmp/$USER && tar -C /tmp/$USER -xf $WF_VENV.tar" \
