@@ -318,6 +318,19 @@ green — and can be present at the same time:
 | `PutBlob` rc=11, `available_targets` empty, `GetCapacity` 0 forever | stale build tree |
 | `RegisterTarget` rc=1, log shows `Permission denied` on a `/tmp` path | root-owned leftovers |
 
+#### Stale ChiMod libraries are skipped, not loaded
+
+The runtime loads every ChiMod `.so` it finds on its search path. Renaming
+or removing a module and then rebuilding incrementally leaves the old `.so`
+in `bin/`, built against older headers. Each ChiMod exports an ABI
+fingerprint, a hash of the runtime and CTP public headers, through
+`get_chimod_abi()`. `ModuleManager::LoadChiMod` skips any library whose
+fingerprint differs from the runtime's own and logs
+`Skipping ChiMod ... ABI fingerprint ... does not match`. Delete that file or
+rebuild it. `CLIO_CHIMOD_ABI_CHECK=0` turns the check off. Before the check,
+such a library corrupted the heap (`malloc.c:2594 (sysmalloc): assertion
+failed`) in every runtime test.
+
 #### Rebuild everything after touching a task struct
 
 Task structs (`PutBlobTask`, `EvictTask`, ...) cross the client/runtime boundary

@@ -55,6 +55,18 @@
 #include "clio_runtime/types.h"
 #include "clio_runtime/viz/viz_server.h"
 
+// ABI fingerprint of the headers this TU is compiled against (generated at
+// build time; see cmake/ClioAbiFingerprint.cmake). Exported by every ChiMod
+// through get_chimod_abi() so ModuleManager can refuse a stale module. The
+// fallback only matters for TUs outside the clio_run_cxx include set, which
+// never define a ChiMod; a ChiMod built with it is refused at load time.
+#if __has_include("clio_runtime/abi_fingerprint_generated.h")
+#include "clio_runtime/abi_fingerprint_generated.h"
+#endif
+#ifndef CLIO_RUNTIME_ABI_FINGERPRINT
+#define CLIO_RUNTIME_ABI_FINGERPRINT ""
+#endif
+
 // Forward declarations to avoid circular dependencies
 namespace clio::run {
 class WorkOrchestrator;
@@ -926,6 +938,7 @@ typedef clio::run::Container* (*new_chimod_t)(const clio::run::PoolId* pool_id,
                                         const char* pool_name);
 typedef const char* (*get_chimod_name_t)(void);
 typedef void (*destroy_chimod_t)(clio::run::Container* container);
+typedef const char* (*get_chimod_abi_t)(void);
 }
 
 /**
@@ -953,6 +966,8 @@ typedef void (*destroy_chimod_t)(clio::run::Container* container);
   void destroy_chimod(clio::run::Container* container) {                   \
     delete reinterpret_cast<CONTAINER_CLASS*>(container);            \
   }                                                                  \
+                                                                     \
+  const char* get_chimod_abi() { return CLIO_RUNTIME_ABI_FINGERPRINT; } \
                                                                      \
   static bool is_clio_chimod_ = true;                            \
   }
@@ -987,6 +1002,8 @@ typedef void (*destroy_chimod_t)(clio::run::Container* container);
   void destroy_chimod(clio::run::Container* container) {                   \
     delete reinterpret_cast<CONTAINER_CLASS*>(container);            \
   }                                                                  \
+                                                                     \
+  const char* get_chimod_abi() { return CLIO_RUNTIME_ABI_FINGERPRINT; } \
                                                                      \
   static bool is_clio_chimod_ = true;                            \
   }
