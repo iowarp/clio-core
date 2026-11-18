@@ -274,6 +274,56 @@ $ ls ~/clio-mnt/results
 </table>
 <p>DAOS writes one file per rank 3.6x faster than Context FS at 256 nodes and 6.2x at 512. Flare's run used a smaller footprint (about 400 GB against about 850 GB) because of its storage quota.</p>
 <p>Context FS's ior-hard deadlocked at 256 nodes: a write held a page lock while waiting for the flusher to release that page, and the flusher was waiting on an invalidation that needed the same lock. The fix (a pinned page refuses the write, which retries without the lock) is in PR #1376, and with it ior-hard completes on 8 nodes. The 512-node run with the fix did not finish ior-hard within the job's hour; whether it was slow or blocked is not yet known.</p>
+<h3>Scientific workflows on Aurora: WfCommons at 256 nodes</h3>
+<p>Three I/O-heavy workflows from <a href="https://wfcommons.org">WfCommons</a>, generated with WfBench from the recipes of real runs and executed by Parsl on 256 Aurora nodes (16 workers per node, 4,096 task slots). Every task does a token amount of CPU work, so the run time is the workflow's I/O and its dependencies. Each task checks the size of every file it reads and writes; all tasks completed on all three systems, with no short or stale files.</p>
+<table>
+  <tr><th>Workflow</th><th>Tasks</th><th>Files</th><th>Read by tasks</th><th>Written by tasks</th></tr>
+  <tr><td>Montage (astronomy mosaics)</td><td>15,986</td><td>31,930</td><td>1,544 GB</td><td>121 GB</td></tr>
+  <tr><td>Epigenomics (genome sequencing)</td><td>7,997</td><td>21,964</td><td>181 GB</td><td>41 GB</td></tr>
+  <tr><td>SRASearch (sequence search, file sizes scaled to one tenth)</td><td>3,997</td><td>6,064</td><td>194 GB</td><td>194 GB</td></tr>
+</table>
+<p>Context FS ran this module composition on every node, with the write-through cache:</p>
+<ul class="checks">
+  <li><strong>Filesystem</strong> (<code>clio_cte_filesystem</code>, pool 560): the FUSE mount's directories, inodes and file pages, writing through the shared-memory cache.</li>
+  <li><strong>Shared-memory cache</strong> (<code>core_shm_cache_writethru</code>, pool 568): a 32 GB segment holding file data, which every process on the node reads and writes directly; it flushes to the policy cache below, eight batches in flight.</li>
+  <li><strong>Write-through policy cache</strong> (<code>core_persist_write_thru</code>, pool 567): every write goes to both cores below before it completes.</li>
+  <li><strong>Volatile core</strong> (<code>clio_cte_core</code>, pool 540): DRAM, 512 MB reserved for filesystem metadata plus a data tier sized at eight times the node's share of the workflow.</li>
+  <li><strong>Persistent core</strong> (<code>clio_cte_core</code>, pool 512): a DAOS tier of the same size per node, reached natively through libdfs in the same pool DAOS dfuse used.</li>
+  <li><strong>Stream</strong> (<code>clio_cte_stream</code>, pool 565) for appends; nodes talk over Thallium on Slingshot (<code>ofi+cxi</code>).</li>
+</ul>
+<p>DAOS mounted a POSIX container of the same pool with <code>dfuse</code>, and Flare ran on Lustre directly. The build is the one merged in PR #1376 (2999d5b0e).</p>
+<div class="chart-grid">
+  <figure><figcaption>Montage, seconds (lower is better)</figcaption>
+<ul class="bars" aria-label="Montage, seconds (lower is better)">
+  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:52%"></i></span><span class="val">62.5</span></li>
+  <li><span>DAOS dfuse</span><span class="bar"><i style="width:60%"></i></span><span class="val">72.5</span></li>
+  <li><span>Flare (Lustre)</span><span class="bar"><i style="width:100%"></i></span><span class="val">119.9</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>Epigenomics, seconds (lower is better)</figcaption>
+<ul class="bars" aria-label="Epigenomics, seconds (lower is better)">
+  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:32%"></i></span><span class="val">29.6</span></li>
+  <li><span>DAOS dfuse</span><span class="bar"><i style="width:34%"></i></span><span class="val">31.1</span></li>
+  <li><span>Flare (Lustre)</span><span class="bar"><i style="width:100%"></i></span><span class="val">91.9</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>SRASearch, seconds (lower is better)</figcaption>
+<ul class="bars" aria-label="SRASearch, seconds (lower is better)">
+  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:5%"></i></span><span class="val">10.2</span></li>
+  <li><span>DAOS dfuse</span><span class="bar"><i style="width:5%"></i></span><span class="val">9.7</span></li>
+  <li><span>Flare (Lustre)</span><span class="bar"><i style="width:100%"></i></span><span class="val">186.4</span></li>
+</ul>
+  </figure>
+</div>
+<p>Time from the first task submitted to the last task done, in seconds; lower is better; one run each:</p>
+<table>
+  <tr><th>Workflow</th><th>Context FS</th><th>DAOS dfuse</th><th>Flare</th><th>Slowest 1% of tasks (Context FS / DAOS / Flare)</th></tr>
+  <tr><td>Montage</td><td><strong>62.5</strong></td><td>72.5</td><td>119.9</td><td>1.18 / 1.17 / 12.07 s</td></tr>
+  <tr><td>Epigenomics</td><td><strong>29.6</strong></td><td>31.1</td><td>91.9</td><td>0.91 / 0.98 / 57.71 s</td></tr>
+  <tr><td>SRASearch</td><td>10.2</td><td><strong>9.7</strong></td><td>186.4</td><td>— / 1.25 / 67 s</td></tr>
+</table>
+<p>Context FS finishes Montage 14% faster than DAOS and Epigenomics 5% faster, and SRASearch 5% slower. Against Flare it is 1.9x, 3.1x and 18x faster: Flare's slowest tasks take 12-67 seconds where the other two take about one, and that tail sets its run times. Each task also carries about 0.45 seconds of Parsl overhead, the same on all three systems.</p>
+<p>Removing each workflow's files afterwards took Context FS 96 and 26 seconds for Montage and SRASearch, against 460 and 99 for DAOS and 102 and 18 for Flare. WfBench never calls <code>fsync</code>, so on every system a file is complete when its task's process closes it.</p>
 <h3>Checkpointing a simulation through the tiers</h3>
 <p>From the Eternia paper's evaluation: Gray-Scott on 2 Aurora nodes, 8 steps, a checkpoint every 2 steps. Each checkpoint is a copy-on-write snapshot that CLIO Core drains down the tier stack in the background, in a layout the HDF5 VOL can read. It is compared with a conventional synchronous checkpoint, in which the simulation waits until the snapshot reaches persistent storage; in the Lustre-heavy composition that is a simulation writing its checkpoint to the parallel file system. Total runtime in seconds, lower is better.</p>
 <div class="chart-grid">
