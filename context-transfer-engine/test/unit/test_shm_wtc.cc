@@ -491,13 +491,23 @@ TEST_CASE("ShmWtc - writes and reads complete in shared memory",
     REQUIRE(WaitFlushed(io));
     const clio::run::u64 batches0 = st->flush_batches_.load();
     const clio::run::u64 ranges0 = st->flush_ranges_.load();
+    const clio::run::u64 busy0 = st->put_busy_.load();
     for (int i = 0; i < 128; ++i) {
       std::string piece(512, static_cast<char>('a' + (i % 26)));
       std::memcpy(&want[i * 512], piece.data(), piece.size());
       REQUIRE(io.PutBlob(tag, "seq", i * 512, piece.size(), piece.data()) == 0);
     }
     REQUIRE(WaitFlushed(io));
-    REQUIRE(st->flush_ranges_.load() - ranges0 == 128);
+    // One flushed range per cached write. A write that grows the blob while
+    // the flusher has it pinned is refused busy and, past the client's short
+    // retry bound, goes down the task path instead of the cache, so it adds
+    // no range; that happens when a flush outlasts the bound (sanitizer
+    // builds). The count is exact unless writes were refused.
+    const clio::run::u64 ranges = st->flush_ranges_.load() - ranges0;
+    const clio::run::u64 busy = st->put_busy_.load() - busy0;
+    INFO("flushed ranges " + std::to_string(ranges) + ", busy refusals " +
+         std::to_string(busy));
+    REQUIRE((ranges == 128 || (ranges < 128 && busy > 0)));
     // Many ranges per batch: far fewer batches than writes.
     REQUIRE(st->flush_batches_.load() - batches0 < 64);
     REQUIRE(CoreRead(tag, "seq", 0, want.size()) == want);
