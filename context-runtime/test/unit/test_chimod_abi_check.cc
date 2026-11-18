@@ -69,10 +69,10 @@ TEST_CASE("ChiMod without an ABI fingerprint is skipped",
 
 TEST_CASE("CLIO_CHIMOD_ABI_CHECK=0 loads a mismatched ChiMod",
           "[module_manager][abi]") {
-  setenv("CLIO_CHIMOD_ABI_CHECK", "0", 1);
+  SIMPLE_TEST_SETENV("CLIO_CHIMOD_ABI_CHECK", "0");
   clio::run::ModuleManager mm;
   bool loaded = mm.LoadChiMod(ABI_FAKE_STALE_LIB);
-  unsetenv("CLIO_CHIMOD_ABI_CHECK");
+  SIMPLE_TEST_SETENV("CLIO_CHIMOD_ABI_CHECK", "");  // any value but "0" checks
   REQUIRE(loaded);
   REQUIRE(mm.GetChiMod("abi_fake_stale") != nullptr);
 }

@@ -379,12 +379,13 @@ bool ModuleManager::IsAbiCompatible(ctp::SharedLibrary &lib,
   // dlsym on a library handle also searches the library's dependencies, and
   // every non-admin module runtime links libclio_admin_runtime, which has its
   // own get_chimod_abi(). Accept only a symbol defined in this very file.
-  std::error_code ec;
-  std::string own_path =
-      std::filesystem::weakly_canonical(lib_path, ec).string();
+  // Compare by file identity, not by string: Windows may spell the same
+  // path with other separators or letter case.
   std::string abi_path =
       ctp::SystemInfo::GetModulePathFor(reinterpret_cast<void *>(abi_func));
-  if (abi_path != own_path) {
+  std::error_code ec;
+  if (abi_path.empty() ||
+      !std::filesystem::equivalent(abi_path, lib_path, ec)) {
     HLOG(kWarning,
          "Skipping ChiMod {}: it has no ABI fingerprint of its own (the one "
          "found is in {}), so it was built against an older runtime. "

@@ -335,6 +335,7 @@ foreach(_mode_name IN ITEMS 0:match 1:stale 2:none)
   set_target_properties(${_tgt} PROPERTIES
     CXX_STANDARD 20
     CXX_STANDARD_REQUIRED ON
+    WINDOWS_EXPORT_ALL_SYMBOLS ON  # as add_clio_module_runtime does
     LIBRARY_OUTPUT_DIRECTORY ${_abi_fake_dir})
   string(TOUPPER ${_name} _upper)
   list(APPEND _abi_fake_defs
