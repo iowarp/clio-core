@@ -556,10 +556,25 @@ clio::run::TaskResume Runtime::LandOldest() {
   CLIO_TASK_BODY_END
 }
 
+void Runtime::KickFlusher() {
+  clio::run::TaskLane *lane = flusher_lane_.load(std::memory_order_acquire);
+  if (lane == nullptr || !view_.Ready() || view_.Log()->Empty()) return;
+  auto *ipc = CLIO_IPC;
+  ipc->AwakenWorker(lane);  // skipped (no syscall) while the worker runs
+}
+
 clio::run::TaskResume Runtime::FlushLog(clio::run::shared_ptr<FlushLogTask> &task) {
   CLIO_TASK_BODY_BEGIN
   task->ranges_ = 0;
   task->bytes_ = 0;
+  {
+    // Where waiters find the flusher; a periodic task may move to another
+    // worker (stalled-worker rescue), so republish on every run.
+    auto *worker = CLIO_CUR_WORKER;
+    if (worker != nullptr) {
+      flusher_lane_.store(worker->GetLane(), std::memory_order_release);
+    }
+  }
   if (!view_.Ready() || flush_running_.exchange(true)) {
     task->SetReturnCode(0);
     CLIO_CO_RETURN;

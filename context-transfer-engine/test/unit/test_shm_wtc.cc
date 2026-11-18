@@ -827,6 +827,40 @@ TEST_CASE("ShmWtc - large puts displace a cache full of small buffers",
   }
 }
 
+TEST_CASE("ShmWtc - a put refused for room waits for the flush that makes it",
+          "[cte][shm_wtc][evict][flushwait]") {
+  // More dirty bytes than the heap holds: later puts fit only once earlier
+  // ones are flushed (clean, evictable). Cache-path writes do not wake the
+  // flusher, and an idle runtime's worker parks for up to max_sleep
+  // (50 ms), so a refused put must wake the flusher and wait for the
+  // ranges buffered before it, not write around after ~1 ms.
+  WtcFixture fx;
+  const clio::run::PoolId pool(578, 0);
+  CreateCache(pool, "shm_wtc_flushwait", 8ull << 20);  // ~5 MB of heap
+  clio::cte::core::Client io(pool);
+  Connect(io, pool);
+  const wtc::Stats *st = io.CacheStats();
+  TagId tag = MakeTag(io, "wtc_flushwait");
+
+  // Idle long enough for the flusher's worker to back off its park.
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  constexpr int kPuts = 8;  // 8 MB of 1 MB puts
+  const clio::run::u64 puts0 = st->puts_.load();
+  std::vector<std::string> vals;
+  for (int i = 0; i < kPuts; ++i) {
+    vals.push_back(Payload(1 << 20, static_cast<char>('A' + i)));
+    REQUIRE(io.PutBlob(tag, "W" + std::to_string(i), 0, vals.back().size(),
+                       vals.back().data()) == 0);
+  }
+  INFO("cached puts " << st->puts_.load() - puts0 << " of " << kPuts);
+  REQUIRE(st->puts_.load() - puts0 == static_cast<clio::run::u64>(kPuts));
+  REQUIRE(WaitFlushed(io));
+  for (int i = 0; i < kPuts; ++i) {
+    REQUIRE(CoreRead(tag, "W" + std::to_string(i), 0, vals[i].size()) ==
+            vals[i]);
+  }
+}
+
 TEST_CASE("ShmWtc - extent mode keeps bytes in leased RAM-bdev granules",
           "[cte][shm_wtc][extents]") {
   WtcFixture fx;
