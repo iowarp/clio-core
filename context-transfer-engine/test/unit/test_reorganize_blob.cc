@@ -559,10 +559,8 @@ TEST_CASE("ReorganizeBlob - Pipelined reads survive extent reuse (#753)",
   std::memcpy(churn_buffer.ptr_, churn_data.data(), kBlobSize);
 
   // Seed the victim ON DISK, and in MANY SMALL BLOCKS. Both matter:
-  //  - Disk residency: a disk blob is not direct-readable, so every read takes
-  //    the RPC path into GetBlobImpl (a DRAM blob is served by the client-side
-  //    SHM fast path, which never enters the runtime read path and is
-  //    separately protected by placement_gen_ revalidation).
+  //  - Disk residency: the read-vs-reclaim window is in GetBlobImpl's
+  //    per-block bdev reads, which a disk blob spans.
   //  - Multi-block layout: ReadData issues one bdev read PER BLOCK, and the
   //    reader-vs-reclaim window exists between those awaits. A single-extent
   //    victim is read in ONE pread and the window is effectively zero — the
@@ -591,19 +589,16 @@ TEST_CASE("ReorganizeBlob - Pipelined reads survive extent reuse (#753)",
   // fallback by the DPE (rc still 0), so "put until rc!=0" would keep going
   // until BOTH tiers are exhausted — starving the move's re-place and driving
   // ReorganizeBlob into its data-losing triple-failure corner (#863). Verify
-  // each fill's placement via its SHM record and stop (deleting the spill) the
+  // each fill's placement via GetResidency and stop (deleting the spill) the
   // moment one leaves the file tier.
   auto fill_landed_on_disk = [&](const std::string &name) -> bool {
-    clio::cte::core::ShmBlobRecord rec{};
-    if (!cte_client->TryGetBlobRecordShm(tag_id, name, &rec)) return false;
-    if (rec.num_blocks_ == 0) return false;
-    for (clio::run::u32 b = 0; b < rec.num_blocks_ && b < clio::cte::core::kMaxInlineBlocks; ++b) {
-      if (rec.blocks_[b].bdev_type_ !=
-          static_cast<clio::run::u32>(clio::run::bdev::BdevType::kFile)) {
-        return false;
-      }
-    }
-    return true;
+    // GetResidency's direct_readable_ is 1 only when the blob's blocks are
+    // all on node-local RAM; with a RAM and a file tier only, a stored blob
+    // that is not direct-readable has (at least part of) its bytes on disk.
+    auto res = cte_client->AsyncGetResidency(tag_id, name);
+    res.Wait();
+    return res->GetReturnCode() == 0 && res->exists_ != 0 &&
+           res->present_bytes_ != 0 && res->direct_readable_ == 0;
   };
   int fills_created = 0;
   for (int f = 0; f < kFillMax; ++f) {
@@ -708,10 +703,9 @@ TEST_CASE("ReorganizeBlob - Pipelined reads survive extent reuse (#753)",
           // latter empties the blob, and a read of an empty blob "succeeds"
           // leaving the buffer untouched. #863 is tracked separately — skip
           // loudly rather than mislabel it as the race under test.
-          clio::cte::core::ShmBlobRecord vrec{};
-          const bool lost =
-              cte_client->TryGetBlobRecordShm(tag_id, blob_name, &vrec) &&
-              vrec.total_size_ == 0;
+          auto sz = cte_client->AsyncGetBlobSize(tag_id, blob_name);
+          sz.Wait();
+          const bool lost = sz->GetReturnCode() == 0 && sz->size_ == 0;
           if (lost) {
             std::printf("[753] SKIP round: reorganize hit the #863 data-loss "
                         "corner; not a reader-race failure\n");
@@ -732,14 +726,14 @@ TEST_CASE("ReorganizeBlob - Pipelined reads survive extent reuse (#753)",
           gets[i] = GetFuture();  // slot drained
         }
       }
-      // Post-clear trigger: ReorganizeBlob republishes the SHM mirror with the
-      // EMPTIED layout immediately after ClearBlob frees the old extents. The
-      // instant we observe it, the freed extents are on the file bdev's free
-      // list — fire the churn burst so they get re-allocated and scribbled.
+      // Post-clear trigger: ReorganizeBlob empties the blob's layout right
+      // after ClearBlob frees the old extents. The instant GetResidency sees
+      // no stored bytes, the freed extents are on the file bdev's free list —
+      // fire the churn burst so they get re-allocated and scribbled.
       if (!churn_fired && !move_done) {
-        clio::cte::core::ShmBlobRecord vrec{};
-        if (cte_client->TryGetBlobRecordShm(tag_id, blob_name, &vrec) &&
-            vrec.num_blocks_ == 0) {
+        auto res = cte_client->AsyncGetResidency(tag_id, blob_name);
+        res.Wait();
+        if (res->GetReturnCode() == 0 && res->present_bytes_ == 0) {
           // 4MB, deliberately HALF the freed capacity: a burst equal to the
           // whole 8MB can win the allocation race against the move's own
           // re-place and drive ReorganizeBlob into its triple-placement-
@@ -993,16 +987,13 @@ TEST_CASE("ReorganizeBlob - DelBlob under pipelined reads never yields garbage (
     }
   }
   auto fill_del_on_disk = [&](const std::string &name) -> bool {
-    clio::cte::core::ShmBlobRecord rec{};
-    if (!cte_client->TryGetBlobRecordShm(tag_id, name, &rec)) return false;
-    if (rec.num_blocks_ == 0) return false;
-    for (clio::run::u32 b = 0; b < rec.num_blocks_ && b < clio::cte::core::kMaxInlineBlocks; ++b) {
-      if (rec.blocks_[b].bdev_type_ !=
-          static_cast<clio::run::u32>(clio::run::bdev::BdevType::kFile)) {
-        return false;
-      }
-    }
-    return true;
+    // GetResidency's direct_readable_ is 1 only when the blob's blocks are
+    // all on node-local RAM; with a RAM and a file tier only, a stored blob
+    // that is not direct-readable has (at least part of) its bytes on disk.
+    auto res = cte_client->AsyncGetResidency(tag_id, name);
+    res.Wait();
+    return res->GetReturnCode() == 0 && res->exists_ != 0 &&
+           res->present_bytes_ != 0 && res->direct_readable_ == 0;
   };
   int fills_created = 0;
   for (int f = 0; f < 64; ++f) {

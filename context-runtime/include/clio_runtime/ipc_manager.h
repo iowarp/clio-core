@@ -987,9 +987,13 @@ class IpcManager {
 
   /**
    * Get the list of dead nodes for retry queue scanning
-   * @return Const reference to dead_nodes_ vector
+   * @return a snapshot of dead_nodes_, copied under hostfile_mu_ (SetDead
+   *         and SetAlive modify it from network threads)
    */
-  const std::vector<DeadNodeEntry> &GetDeadNodes() const { return dead_nodes_; }
+  std::vector<DeadNodeEntry> GetDeadNodes() const {
+    std::shared_lock<std::shared_mutex> hl(hostfile_mu_);
+    return dead_nodes_;
+  }
 
   /**
    * Add a new node to the internal hostfile

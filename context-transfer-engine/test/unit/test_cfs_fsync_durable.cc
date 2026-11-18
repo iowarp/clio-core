@@ -205,9 +205,8 @@ TEST_CASE("cfs fsync flushes a file's pages to the persistent core",
   REQUIRE(cfs->WriteFd(fd, data.data(), data.size()) ==
           static_cast<clio::cte::filesystem::FsSsize>(data.size()));
 
-  // Drain only: the pages are dirty in the volatile core and the persistent
-  // file tier has not seen them (so the check below is about fsync).
-  REQUIRE(cfs->Flush(path.substr(6)) == 0);
+  // write(2) has returned, so the pages are in the volatile core and the
+  // persistent file tier has not seen them (the check below is about fsync).
   const clio::run::u64 drained = TargetFreeBytes(cte, file_target);
   INFO("file tier free: before=" << before << " after drain=" << drained);
   REQUIRE(before - drained < kFileBytes);

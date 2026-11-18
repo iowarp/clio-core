@@ -10,18 +10,14 @@
  * FULL INTERPOSER STACK TESTS (issue #886)
  *
  * The whole chain composed at once — compressor(562) → replication(561) →
- * core(512) — driven by ONE plain clio::cte::core::Client at the top, with
- * the client-side SHM mirror attached. Verifies the three things only the
- * full stack can:
+ * core(512) — driven by ONE plain clio::cte::core::Client at the top.
+ * Verifies what only the full stack can:
  *   - the layers compose: a compressed put lands compressed on the core AND
  *     gains an (async) persistent replica of the STORED bytes; a dropped
  *     primary heals through replication and still decompresses on the way
  *     out of the compressor;
- *   - the zero-IPC SHM fast path stays FUNCTIONAL through the stack for
- *     untransformed blobs (the mirror serves them without any task);
- *   - the fast path REFUSES transformed blobs (#818) — a mirror-attached
- *     client must never be handed codec bytes that the task path (through
- *     the compressor) would have decompressed.
+ *   - reads of transformed blobs (#818) return ORIGINAL bytes through the
+ *     compressor, whole and partial.
  */
 
 #include <clio_ctp/compress/compress_factory.h>
@@ -200,18 +196,16 @@ TEST_CASE("InterposerStack - compressor over replication over core",
     REQUIRE(create->GetReturnCode() == 0);
   }
 
-  // ONE plain core client at the top of the stack, mirror attached so the
-  // zero-IPC fast path is live (the CLIO_CTE_POOL deployment configuration).
+  // ONE plain core client at the top of the stack (the CLIO_CTE_POOL
+  // deployment configuration); every request takes the task path.
   clio::cte::core::Client stack_io(kStackCompPoolId);
-  REQUIRE(stack_io.AttachShmCacheOf(clio::cte::core::kCtePoolId));
 
   clio::cte::core::Tag tag("stack_tag");
   const clio::cte::core::TagId tag_id = tag.GetTagId();
   const std::string val = CompressiblePayload(kValSize);
 
   // ======================================================================
-  // 1. UNCOMPRESSED blob through the stack: readable, replicated, and the
-  //    SHM fast path serves it with zero IPC.
+  // 1. UNCOMPRESSED blob through the stack: readable and replicated.
   // ======================================================================
   {
     auto put = stack_io.AsyncPutBlob(tag_id, "plain_blob", 0, kValSize,
@@ -230,21 +224,11 @@ TEST_CASE("InterposerStack - compressor over replication over core",
     REQUIRE(get->GetReturnCode() == 0);
     REQUIRE(std::memcmp(got.data(), val.data(), kValSize) == 0);
 
-    // The core is persistent (file tier only: a core may not mix
-    // durability classes), and the zero-IPC view serves only memory-tier
-    // blobs, so it must REFUSE here rather than hand out a view; the task
-    // path above served the bytes. Memory-tier views are covered by the
-    // volatile-core tests (test_cfs_shm_read, test_policy_cache).
-    const char *view = nullptr;
-    clio::run::u64 view_size = 0, gen = 0;
-    REQUIRE_FALSE(stack_io.TryGetBlobViewShm(tag_id, "plain_blob", &view,
-                                             &view_size, &gen));
   }
 
   // ======================================================================
   // 2. COMPRESSED blob through the stack: stored compressed on the core,
-  //    replica holds the STORED bytes, the fast path REFUSES it, and the
-  //    task path decompresses.
+  //    replica holds the STORED bytes, and the task path decompresses.
   // ======================================================================
   clio::run::u64 stored_size = 0;
   {
@@ -281,15 +265,8 @@ TEST_CASE("InterposerStack - compressor over replication over core",
       REQUIRE(std::memcmp(stored.data(), replica.data(), stored_size) == 0);
     }
 
-    // THE #818 GUARANTEE THROUGH THE STACK: the mirror-attached fast path
-    // must refuse the transformed blob — codec bytes must never short-cut
-    // past the compressor.
-    const char *view = nullptr;
-    clio::run::u64 view_size = 0, gen = 0;
-    REQUIRE_FALSE(stack_io.TryGetBlobViewShm(tag_id, "comp_blob", &view,
-                                             &view_size, &gen));
 
-    // And the task path (which the refusal forces) returns ORIGINAL bytes —
+    // And the task path returns ORIGINAL bytes —
     // full and partial (vectored covered by cte_compressor_interpose).
     std::vector<char> got(kValSize, 0);
     auto get = stack_io.AsyncGetBlob(tag_id, "comp_blob", 0, kValSize,
@@ -337,11 +314,6 @@ TEST_CASE("InterposerStack - compressor over replication over core",
       REQUIRE(psz->size_ == stored_size);
     }
 
-    // Still transformed, still refused by the fast path after the heal.
-    const char *view = nullptr;
-    clio::run::u64 view_size = 0, gen = 0;
-    REQUIRE_FALSE(stack_io.TryGetBlobViewShm(tag_id, "comp_blob", &view,
-                                             &view_size, &gen));
   }
 }
 

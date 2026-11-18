@@ -440,8 +440,9 @@ Where the code settled details the sections above left open.
 
 - **Files.** Segment layout and every SHM operation:
   `core/include/clio_cte/core/shm_wtc.h` (+ `shm_wtc_impl.h`), shared by
-  the client and the chimod. Client path: `core::Client::Wtc*` in
-  `core_client.h`. Chimod: `core_shm_cache_writethru/src/` (`_runtime.cc`
+  the client and the chimod. Client path: `core::Client::ConnectCache`,
+  `PutBlob`, `GetBlob`, `TryGetCached`, `GetBlobSize`, `GetOrCreateTag` in
+  `core_client.h` (the `Async*` methods are the task path only). Chimod: `core_shm_cache_writethru/src/` (`_runtime.cc`
   lifecycle/tags/sync, `_data.cc` task-path data verbs, `_flush.cc` flusher
   and coherence).
 - **Locking.** The blob table is 64 stripes; a key probes only inside its
@@ -450,10 +451,18 @@ Where the code settled details the sections above left open.
   stripe -> tag table -> allocator.
 - **Discovery.** The chimod publishes a `Locator` in the runtime metadata
   segment under its pool id; the segment name is derived from the runtime
-  pid and pool id. `CLIO_CTE_CLIENT_INIT` binds a process to pool 568.0
-  when it can map that segment (`CLIO_CTE_SHM_CACHE=0` opts out).
-- **What the cache absorbs.** Puts with auto score (`score < 0`), a plain
-  `Context`, and flags limited to `kCtePutDroppable`. Droppability is a
+  pid and pool id. The CTE core's Create (and a get-or-create of an
+  existing core pool, via `Container::FillExistingCreate`) returns
+  `CreateParams::cache_keys_`: the keys of the cache whose chain of next
+  pools ends at that core. `CLIO_CTE_CLIENT_INIT` binds the process to the
+  cache's entry pool and calls `Client::ConnectCache(keys)`; a client bound
+  with `Init()` calls `Client::ConnectCache()`, which gets the same keys
+  with a lookup-only Create of the canonical core pool.
+- **What the cache absorbs.** Client side: `Client::PutBlob` with no
+  explicit score and no context, flags limited to `kCtePutDroppable`
+  (`View::TryPut` refuses any other flag). Task side: puts with auto score,
+  a plain `Context` (`Runtime::PlainContext`; a `preallocate_` sizing hint
+  still counts as plain and is dropped at flush) and the same flags. Droppability is a
   per-blob property, so it is stored on the entry and carried to the chain
   in the new `MultiPutDesc::flags_`. Replace, append, explicit scores and
   any codec/replica/persistence context take the task path, which waits for

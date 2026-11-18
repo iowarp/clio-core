@@ -127,6 +127,13 @@ constexpr clio::run::u32 kUnbound = ~0u;
 /** Shared state, one per vector per GPU. */
 struct VecHeader {
   GPage *pages_;              // nsets_ * set_size_
+  /** ONE DIRTY WORD PER FRAME, parallel to pages_ (the Page record is a full
+   *  64 bytes). Non-zero when a device write hold touched the frame since it
+   *  was claimed, refilled or covered by a flush; the host-side checkpoint
+   *  flush (Vector::FlushResidentToCte) writes back only these frames.
+   *  Null when the host did not allocate one (every frame then counts as
+   *  dirty there). */
+  GV_G clio::run::u32 *dirty_;
   /** ONE TASK SET PER CUDA BLOCK, indexed by the LOGICAL block id. A block
    *  owns its MultiGet and MultiPut outright: two blocks staging into one
    *  slot would overwrite each other's records mid-transfer. Dimensioned by
@@ -1634,6 +1641,13 @@ class DeviceVector {
     return i < h_->set_size_ ? &tbl[i] : nullptr;
   }
 
+  /** Set or clear frame `p`'s dirty word (see VecHeader::dirty_).
+   *  @param p  the frame
+   *  @param v  1 = written since its last fill or covering flush, 0 = clean */
+  CTP_GPU_FUN void SetDirty(const GPage *p, clio::run::u32 v) const {
+    if (h_->dirty_ != nullptr) h_->dirty_[p - h_->pages_] = v;
+  }
+
   /** Drop a resident, unpinned, clean page. */
   CTP_GPU_FUN void Release(GPage *p) {
     // THE REGION GOES BACK TO ITS OWNER, not to the slot. A slot is a tag
@@ -1647,6 +1661,7 @@ class DeviceVector {
     p->valid_hi = 0u;
     p->generation = 0;
     p->score = kDefaultScore;
+    SetDirty(p, 0u);
     if (h_->stat_evicts_ != nullptr) atomicAdd(h_->stat_evicts_, 1ull);
   }
 
@@ -1751,6 +1766,7 @@ class DeviceVector {
     p->valid_lo = 0u;
     p->valid_hi = 0u;
     p->generation = 0;
+    SetDirty(p, 0u);
     // A COUNT, NOT A FLAG -- see PublishFetch. Several blocks fetch into one
     // frame; whoever publishes first must not clear the others' marks.
     atomicAdd(&p->fetching, 1u);
@@ -1878,6 +1894,9 @@ class DeviceVector {
     clio::run::u64 run = h_->elems_per_page_ - in;
     if (run > count) run = count;
     if (write && threadIdx.x == 0) {
+      // A write hold makes the frame dirty: the checkpoint flush must write
+      // it back. Set at the hold, before any byte is written.
+      SetDirty(p, 1u);
       // Writing defines these elements whether or not they were ever
       // fetched, so a first-touch page becomes valid without a transfer.
       // Conservative: the interval is unioned, so writing two disjoint
@@ -2123,6 +2142,7 @@ class DeviceVector {
             }
             p->valid_lo = 0u;                  // ours to refill, whole
             p->valid_hi = 0u;
+            SetDirty(p, 0u);
             is_new = true;
           }
         }
@@ -2269,6 +2289,7 @@ class DeviceVector {
         p->valid_lo = 0u;
         p->valid_hi = 0u;
         p->page_num = kNoPage;     // no identity: Find() cannot return it
+        SetDirty(p, 0u);
         __threadfence();
         atomicSub(&p->fetching, 1u);
         UnlockSet(set);
@@ -2383,6 +2404,13 @@ class DeviceVector {
         clio::run::u64 boff = 0, blen = 0;
         if (!ClipToPage(pn, lo[r], hi[r], &boff, &blen)) continue;
         const clio::run::u32 pn32 = static_cast<clio::run::u32>(pn);
+        // A flush covering every valid byte of the frame makes it clean (a
+        // later write hold sets it dirty again). A partial flush leaves the
+        // mark: other slices may still be unwritten-back.
+        if (boff <= static_cast<clio::run::u64>(p->valid_lo) * sizeof(T) &&
+            boff + blen >= static_cast<clio::run::u64>(p->valid_hi) * sizeof(T)) {
+          SetDirty(p, 0u);
+        }
         t->Add("", boff, blen,
                RawPtr(static_cast<char *>(p->data) + boff), kVectorBlobScore);
         t->reqs_[n].blob_name_.assign(reinterpret_cast<const char *>(&pn32),

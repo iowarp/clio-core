@@ -774,20 +774,6 @@ int main(int argc, char **argv) {
   }
 
   {
-    auto &p = clio::cte::filesystem::Client::Profile();
-    const double n = static_cast<double>(p.n.load());
-    if (n > 0) {
-      auto us = [&](const std::atomic<clio::run::u64> &a) {
-        return a.load() / n / 1000.0;
-      };
-      HIPRINT("\nSubmit-path profile ({} writes, us/write):", p.n.load());
-      HIPRINT("  staging={}  copy={}  send={}  register={}  window={}",
-              us(p.stage_ns), us(p.copy_ns), us(p.send_ns), us(p.reg_ns),
-              us(p.window_ns));
-    }
-  }
-
-  {
     std::vector<double> per_bucket(kNumBuckets, 0.0);
     for (size_t t = 0; t < cfg.threads; ++t) {
       for (size_t b = 0; b < kNumBuckets && b < ctxs[t].buckets.size(); ++b) {

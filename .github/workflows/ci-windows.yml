@@ -127,8 +127,8 @@ jobs:
             # a sparse file under %TEMP%/clio_$USERNAME (SystemInfo::
             # GetMemfdDir) and recreates that file on every shm_init. This is
             # outside the workspace, so the exclusion above does not cover it.
-            # CDash has caught intermittent cte_shm_metadata_cache_all
-            # failures there (Win32 error 1224, ERROR_USER_MAPPED_FILE) that
+            # CDash has caught intermittent shared-memory test failures
+            # there (first in the since-removed cte_shm_metadata_cache_all) (Win32 error 1224, ERROR_USER_MAPPED_FILE) that
             # look like the same real-time-scan-holds-the-file-open flake as
             # the link.exe case above, just on this directory instead.
             Add-MpPreference -ExclusionPath "$env:TEMP\clio_$env:USERNAME" -ErrorAction SilentlyContinue
@@ -371,8 +371,8 @@ jobs:
             # a sparse file under %TEMP%/clio_$USERNAME (SystemInfo::
             # GetMemfdDir) and recreates that file on every shm_init. This is
             # outside the workspace, so the exclusion above does not cover it.
-            # CDash has caught intermittent cte_shm_metadata_cache_all
-            # failures there (Win32 error 1224, ERROR_USER_MAPPED_FILE) that
+            # CDash has caught intermittent shared-memory test failures
+            # there (first in the since-removed cte_shm_metadata_cache_all) (Win32 error 1224, ERROR_USER_MAPPED_FILE) that
             # look like the same real-time-scan-holds-the-file-open flake as
             # the link.exe case above, just on this directory instead.
             Add-MpPreference -ExclusionPath "$env:TEMP\clio_$env:USERNAME" -ErrorAction SilentlyContinue
@@ -623,8 +623,8 @@ jobs:
             # a sparse file under %TEMP%/clio_$USERNAME (SystemInfo::
             # GetMemfdDir) and recreates that file on every shm_init. This is
             # outside the workspace, so the exclusion above does not cover it.
-            # CDash has caught intermittent cte_shm_metadata_cache_all
-            # failures there (Win32 error 1224, ERROR_USER_MAPPED_FILE) that
+            # CDash has caught intermittent shared-memory test failures
+            # there (first in the since-removed cte_shm_metadata_cache_all) (Win32 error 1224, ERROR_USER_MAPPED_FILE) that
             # look like the same real-time-scan-holds-the-file-open flake as
             # the link.exe case above, just on this directory instead.
             Add-MpPreference -ExclusionPath "$env:TEMP\clio_$env:USERNAME" -ErrorAction SilentlyContinue

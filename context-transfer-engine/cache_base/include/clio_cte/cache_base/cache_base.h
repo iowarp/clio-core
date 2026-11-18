@@ -34,6 +34,8 @@
 #ifndef CLIO_CTE_CACHE_BASE_CACHE_BASE_H_
 #define CLIO_CTE_CACHE_BASE_CACHE_BASE_H_
 
+#include <map>
+#include <set>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -118,10 +120,51 @@ class CacheBase : public clio::cte::core::DualTargetInterposer {
   explicit CacheBase(CachePolicy policy) : policy_(policy) {}
   ~CacheBase() override;
 
-  /** Size-driven cost estimate, same shape as the other interposers. */
+  /**
+   * Per-task cost estimate for every method a policy cache serves.
+   *
+   * Core verbs take the core's estimate (CoreInterposer::GetTaskStats). A
+   * write-through put writes the persistent chain AND refreshes the volatile
+   * copy, so it adds one memory-tier copy of the payload on top; a
+   * write-back put writes the volatile copy only (the flusher pays the
+   * persistent write later, under FlushData / SyncTag / DropTagCopies).
+   * kDropTagCopies flushes a tag's dirty copies (kCopiesFlush*) or just
+   * forgets them (kCopiesDiscard); its volume is unknown up front.
+   * @param task the task to estimate
+   * @return the task's cost features
+   */
   clio::run::TaskStat GetTaskStats(
       const clio::run::Task *task) const override {
-    return clio::cte::core::CoreInterposer::GetTaskStats(task);
+    namespace cost = clio::run::cost;
+    namespace core = clio::cte::core;
+    if (task == nullptr) {
+      return clio::run::TaskStat();
+    }
+    clio::run::TaskStat stat = core::CoreInterposer::GetTaskStats(task);
+    clio::run::u64 bytes = 0;
+    switch (task->method_) {
+      case kDropTagCopies: {
+        const auto *t = static_cast<const core::DelTagTask *>(task);
+        return t->posix_unlink_ == kCopiesDiscard ? cost::Fixed(20, 50.0f)
+                                                  : cost::Fixed(50, 500.0f);
+      }
+      case core::Method::kPutBlob:
+        bytes = core::CoreBlobBytes(static_cast<const core::PutBlobTask *>(task));
+        break;
+      case core::Method::kMultiPutBlob:
+        bytes = static_cast<const core::MultiPutBlobTask *>(task)->data_len_;
+        break;
+      default:
+        return stat;
+    }
+    if (!IsWriteBack()) {
+      const clio::run::TaskStat copy =
+          cost::Data(bytes, cost::kCopyBytesPerCpuUs,
+                     cost::kMemoryBytesPerWallUs, 0);
+      stat.compute_ += copy.compute_;
+      stat.wall_time_ += copy.wall_time_;
+    }
+    return stat;
   }
 
   /** Owner routing for blob verbs; FlushData and DropTagCopies stay put. */
@@ -285,6 +328,8 @@ class CacheBase : public clio::cte::core::DualTargetInterposer {
   /** Keys of this container's copies (of one tag, or all). */
   std::vector<std::string> KeysOf(const TagId *tag);
   /**
+   * Continuous flush trigger (flush_dirty_mb): once that much new dirty
+   * data arrived since the last triggered flush started, start another.
    * Fill-level flush trigger (flush_fill_pct): when there is unflushed
    * data and the volatile core is at least that full, start one flush of
    * every dirty copy on this container. Called after writes; it asks the
@@ -295,18 +340,106 @@ class CacheBase : public clio::cte::core::DualTargetInterposer {
    *  tag, or all), sorted by key. */
   std::vector<std::pair<std::string, clio::run::u64>> DirtyKeysOf(
       const TagId *tag);
+  /** One dirty range of a flush in flight (FlushAll). */
+  struct FlushOp {
+    size_t key_ = 0;  ///< index into the flush's FlushKey list
+    TagId tag_;
+    std::string name_;
+    Extent ext_;
+    ctp::ipc::FullPtr<char> buf_;
+    clio::run::u32 owner_ = 0;  ///< the blob's owner (where it lands)
+    clio::run::Future<core::GetBlobTask> get_;
+    clio::run::Future<core::PutBlobTask> put_;            ///< owned here
+    clio::run::Future<core::MultiPutBlobTask> land_;      ///< owned elsewhere
+  };
+  /** A blob of a flush in flight: its lock is held until left_ reaches 0. */
+  struct FlushKey {
+    std::string key_;
+    size_t left_ = 0;         ///< its ranges not yet landed
+    clio::run::u32 rc_ = 0;   ///< first failure among its ranges
+    bool foreign_ = false;    ///< another node owns it: drop once landed
+    clio::run::u32 owner_ = 0;  ///< its owner
+  };
+  /** Ranges of several blobs landing together on one owner (FlushAway). */
+  struct LandBatch {
+    ctp::ipc::FullPtr<char> buf_;              ///< the ranges' bytes
+    clio::run::u64 cap_ = 0;                   ///< buf_'s size
+    clio::run::u64 used_ = 0;                  ///< bytes placed in buf_
+    std::vector<core::MultiPutDesc> descs_;    ///< one per range
+    std::vector<size_t> keys_;                 ///< FlushKeys it carries
+    clio::run::Future<core::MultiPutBlobTask> fut_;
+  };
   /**
-   * Write the dirty ranges of several blobs to persistent at once (every
-   * key's lock held): all reads from volatile are issued together, then
-   * all writes to persistent.
-   * @param keys the blobs to flush
+   * Flush blobs other containers own: their ranges land on each owner in
+   * batches of up to kLandBatchBytes (see FlushAll).
+   * @param keys the blobs, in key order; their rc_ receive the results
+   */
+  clio::run::TaskResume FlushAway(std::vector<FlushKey> *keys);
+  /**
+   * Send a batch of ranges to their owner, which writes them through.
+   * @param b the batch (its buffer and descriptors filled)
+   * @param owner the owner
+   */
+  void LandSend(LandBatch *b, clio::run::u32 owner);
+  /**
+   * A batch landed (or failed): free its buffer and account it to each of
+   * its blobs (FlushRangeDone).
+   * @param keys the flush's blobs
+   * @param b the batch
+   * @param rc its result
+   */
+  void LandBatchDone(std::vector<FlushKey> *keys, LandBatch *b,
+                     clio::run::u32 rc);
+  /**
+   * Write-back batch put, common case: lock every record's blob, ask for
+   * all sizes at once, put every record into volatile at once, and log
+   * them dirty. Anything else (a special put, a full volatile tier, a
+   * partial write that needs persistent's other bytes, a failed put)
+   * leaves *done false and the caller takes the per-record path.
+   * @param task the batch
+   * @param done set true when the whole batch was absorbed here
+   */
+  clio::run::TaskResume AbsorbBatchFast(
+      clio::run::shared_ptr<core::MultiPutBlobTask> task, bool *done);
+  /**
+   * Lock a dirty blob of a flush and queue its dirty ranges. A blob with
+   * nothing dirty by then is unlocked again at once.
+   * @param keys the flush's blobs
+   * @param i the blob to open
+   * @param queued receives its ranges
+   */
+  clio::run::TaskResume FlushOpenKey(std::vector<FlushKey> *keys, size_t i,
+                                     std::deque<FlushOp> *queued);
+  /**
+   * Account one landed (or failed) range of a flush. When it was the blob's
+   * last, a blob whose ranges all landed is marked clean, and its lock is
+   * released either way (a failed blob stays dirty for the next flush).
+   * @param keys the flush's blobs
+   * @param i the range's blob
+   * @param rc the range's result
+   */
+  void FlushRangeDone(std::vector<FlushKey> *keys, size_t i, clio::run::u32 rc);
+  /**
+   * Flush every dirty copy of a tag (or all) on this container through a
+   * window of ranges in flight: as one range lands the next starts, so
+   * the persistent tier always has up to kFlushInflightOps writes.
+   * @param tag the tag (ignored with all_tags)
+   * @param all_tags flush every tag
    * @param rc set to the first failure, else 0
    */
-  clio::run::TaskResume FlushBatch(std::vector<std::string> keys,
-                                   clio::run::u32 *rc);
-  /** Flush every dirty copy of a tag (or all) on this container, several
-   *  blobs at a time. */
   clio::run::TaskResume FlushAll(TagId tag, bool all_tags, clio::run::u32 *rc);
+  /**
+   * Flush blobs through a window of ranges in flight (see FlushAll). Blobs
+   * another container owns (FlushKey::foreign_) land on their owner; the
+   * others are written to persistent here.
+   * @param keys the blobs, in key order; their rc_ receive the results
+   */
+  clio::run::TaskResume FlushWindow(std::vector<FlushKey> *keys);
+  /**
+   * @param key a cached blob
+   * @return the container that owns it (this one when it is not cached)
+   */
+  clio::run::u32 KeyOwner(const std::string &key);
   /**
    * Flush this container's dirty copies of one tag; concurrent callers
    * share one flush (see JoinRound).
@@ -338,6 +471,48 @@ class CacheBase : public clio::cte::core::DualTargetInterposer {
    * -- and are sent on to the owner, which holds the blob's only copy.
    */
   clio::run::u32 OwnerOf(const TagId &tag, const std::string &name);
+  /**
+   * Write a put through: into persistent here when this container owns the
+   * blob, else to its owner.
+   * @param task the put
+   * @param owner the blob's owner
+   */
+  clio::run::TaskResume PutThrough(
+      clio::run::shared_ptr<clio::cte::core::PutBlobTask> task,
+      clio::run::u32 owner);
+  /**
+   * Write-back: land this container's buffered copy of a blob another
+   * container owns (flush it to the owner) and drop it, so the owner serves
+   * what this node wrote. Takes the blob's lock.
+   * @param key the blob
+   * @param rc set to the flush's failure, else 0
+   */
+  clio::run::TaskResume PublishBuffered(std::string key, clio::run::u32 *rc);
+  /**
+   * Send one dirty range of a blob another container owns to that owner,
+   * which writes it through (see MultiPutBlob's land path).
+   * @param tag the blob's tag
+   * @param name the blob's name
+   * @param x the range
+   * @param buf the range's bytes
+   * @param owner the blob's owner
+   * @return the landing's future
+   */
+  clio::run::Future<clio::cte::core::MultiPutBlobTask> SendLand(
+      const TagId &tag, const std::string &name, const Extent &x,
+      const ctp::ipc::FullPtr<char> &buf, clio::run::u32 owner);
+  /**
+   * The result of a landing: its return code, else its first record's.
+   * @param f the landing's (completed) future
+   * @return 0 when the range landed
+   */
+  static clio::run::u32 LandRc(
+      clio::run::Future<clio::cte::core::MultiPutBlobTask> &f);
+  /**
+   * @param key a blob
+   * @return true when this container holds a copy of it with nothing dirty
+   */
+  bool CopyClean(const std::string &key);
   /** Send a put (regions one by one when vectored) to the blob's owner. */
   clio::run::TaskResume PutAtOwner(
       clio::run::shared_ptr<clio::cte::core::PutBlobTask> task,
@@ -358,9 +533,37 @@ class CacheBase : public clio::cte::core::DualTargetInterposer {
   clio::cte::core::Client self_client_;  ///< this cache's pool (to owners)
   clio::cte::core::Client vol_client_;   ///< volatile core (owner-local)
   clio::cte::core::Client pers_client_;  ///< persistent chain (owner-local)
+  clio::cte::core::Client flush_client_;  ///< where flushed ranges land
   std::mutex mu_;                         ///< guards entries_ / busy_
   std::unordered_map<std::string, Entry> entries_;
   std::unordered_set<std::string> busy_;
+  /** (tag major, tag minor): the key the dirty index groups copies by. */
+  using TagKey = std::pair<clio::run::u32, clio::run::u32>;
+  /**
+   * Keys of the copies with dirty ranges, by tag, in key order. A sync of
+   * one tag reads its set instead of scanning every entry under mu_ (512
+   * ranks' fsyncs each asked every node, and every ask scanned the whole
+   * cache). Guarded by mu_; kept by IndexDirty / UnindexDirty.
+   */
+  std::map<TagKey, std::set<std::string>> dirty_tags_;
+  /**
+   * Record in the dirty index whether a copy has dirty ranges. Call with
+   * mu_ held after any change to the entry's dirty_.
+   * @param key the copy's key
+   * @param e its entry
+   */
+  void IndexDirty(const std::string &key, const Entry &e);
+  /**
+   * Take a copy out of the dirty index. Call with mu_ held before the
+   * entry is erased.
+   * @param key the copy's key
+   */
+  void UnindexDirty(const std::string &key);
+  /**
+   * @param tag a tag
+   * @return true when this container holds a dirty copy of one of its blobs
+   */
+  bool TagDirty(const TagId &tag);
   /** Copies kept on the eviction list between scans. */
   static constexpr size_t kVictimQueue = 256;
   /** Eviction list (RefillVictims / TakeVictim). Guarded by mu_. */
@@ -380,9 +583,15 @@ class CacheBase : public clio::cte::core::DualTargetInterposer {
   std::atomic<clio::run::u64> flushed_gen_{0};
   /** When the fill level was last asked for (ns). */
   std::atomic<clio::run::u64> fill_check_ns_{0};
-  /** A fill-level flush has been sent and has not finished. */
+  /** A fill-level or continuous flush has been sent and has not finished. */
   std::atomic<bool> fill_flush_pending_{false};
-  /** One kind of shared work (JoinRound). Guarded by mu_. */
+  /** Dirty bytes written since the last triggered flush started
+   *  (flush_dirty_mb). */
+  std::atomic<clio::run::u64> dirty_since_flush_{0};
+  /** Guards rounds_ only: waiters poll it, and must not hold up the
+   *  entry map (mu_) while they do. */
+  std::mutex round_mu_;
+  /** One kind of shared work (JoinRound). Guarded by round_mu_. */
   struct Round {
     clio::run::u64 started_ = 0;  ///< rounds started
     clio::run::u64 done_ = 0;     ///< rounds completed

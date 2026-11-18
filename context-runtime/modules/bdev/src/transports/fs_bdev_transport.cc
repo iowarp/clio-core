@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <initializer_list>
 #include <system_error>
 #include <clio_runtime/bdev/transports/fs_bdev_transport.h>
 #include <clio_ctp/introspect/system_info.h>
@@ -264,9 +265,12 @@ bool FsBdevTransport::Init(const CreateParams& params,
   // The pool name doubles as the backing file path.
   file_path_ = pool_name;
   io_depth_ = params.io_depth_;
-  fail_marker_path_ = file_path_ + ".fail";
-  fail_marker_checked_ns_.store(0, std::memory_order_relaxed);
-  fail_marker_present_.store(false, std::memory_order_relaxed);
+  fail_marker_.path_ = file_path_ + ".fail";
+  nospace_marker_.path_ = file_path_ + ".nospace";
+  for (InjectMarker *m : {&fail_marker_, &nospace_marker_}) {
+    m->checked_ns_.store(0, std::memory_order_relaxed);
+    m->present_.store(false, std::memory_order_relaxed);
+  }
 
   stripe_ = LoadStripeLayout();
   if (stripe_.IsStriped()) {
@@ -614,27 +618,26 @@ bool FsBdevTransport::OpenAllocLog(const CreateParams& params) {
   return true;
 }
 
-bool FsBdevTransport::FaultInjected() {
+bool FsBdevTransport::MarkerPresent(InjectMarker &m, const char *effect) {
   const clio::run::u64 now_ns = static_cast<clio::run::u64>(
       std::chrono::duration_cast<std::chrono::nanoseconds>(
           std::chrono::steady_clock::now().time_since_epoch()).count());
-  clio::run::u64 last = fail_marker_checked_ns_.load(std::memory_order_relaxed);
+  clio::run::u64 last = m.checked_ns_.load(std::memory_order_relaxed);
   if (last != 0 && now_ns - last < kFailMarkerPollNs) {
-    return fail_marker_present_.load(std::memory_order_relaxed);
+    return m.present_.load(std::memory_order_relaxed);
   }
   // One caller per period re-checks; the others keep the cached answer.
-  if (!fail_marker_checked_ns_.compare_exchange_strong(
-          last, now_ns, std::memory_order_relaxed)) {
-    return fail_marker_present_.load(std::memory_order_relaxed);
+  if (!m.checked_ns_.compare_exchange_strong(last, now_ns,
+                                             std::memory_order_relaxed)) {
+    return m.present_.load(std::memory_order_relaxed);
   }
   std::error_code ec;
-  const bool present = std::filesystem::exists(fail_marker_path_, ec);
-  const bool was = fail_marker_present_.exchange(present,
-                                                 std::memory_order_relaxed);
+  const bool present = std::filesystem::exists(m.path_, ec);
+  const bool was = m.present_.exchange(present, std::memory_order_relaxed);
   if (present != was) {
-    HLOG(kWarning, "bdev {}: fault-injection marker {} {}; I/O now {}",
-         file_path_, fail_marker_path_, present ? "present" : "removed",
-         present ? "FAILS" : "works");
+    HLOG(kWarning, "bdev {}: fault-injection marker {} {}; {}", file_path_,
+         m.path_, present ? "present" : "removed",
+         present ? effect : "I/O works");
   }
   return present;
 }
@@ -1076,9 +1079,17 @@ clio::run::TaskResume FsBdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask> 
   task->io_error_ = static_cast<clio::run::u32>(ctp::IoError::kOk);
 
   if (FaultInjected()) {
-    // TEST-ONLY: the device is "dead" (see fail_marker_path_).
+    // TEST-ONLY: the device is "dead" (see fail_marker_).
     task->return_code_ = 4;
     task->io_error_ = static_cast<clio::run::u32>(ctp::IoError::kDeviceFault);
+    task->bytes_written_ = 0;
+    CLIO_CO_RETURN;
+  }
+  if (NoSpaceInjected()) {
+    // TEST-ONLY: the device is "full" (see nospace_marker_), as a write the
+    // storage refuses with ENOSPC reports itself.
+    task->return_code_ = 4;
+    task->io_error_ = static_cast<clio::run::u32>(ctp::IoError::kNoSpace);
     task->bytes_written_ = 0;
     CLIO_CO_RETURN;
   }
@@ -1174,7 +1185,7 @@ clio::run::TaskResume FsBdevTransport::ReadBlocks(ctp::ipc::FullPtr<ReadTask> ta
   task->io_error_ = static_cast<clio::run::u32>(ctp::IoError::kOk);
 
   if (FaultInjected()) {
-    // TEST-ONLY: the device is "dead" (see fail_marker_path_).
+    // TEST-ONLY: the device is "dead" (see fail_marker_).
     task->return_code_ = 4;
     task->io_error_ = static_cast<clio::run::u32>(ctp::IoError::kDeviceFault);
     task->bytes_read_ = 0;

@@ -149,9 +149,6 @@ class Fixture {
     std::this_thread::sleep_for(200ms);
 
     if (!RegisterRamTarget()) return false;
-    // Best-effort: attach the SHM metadata cache so the zero-IPC read-back
-    // path can run where available.
-    (void)CLIO_CTE_CLIENT->AttachShmCache();
     return true;
   }
 
@@ -206,7 +203,6 @@ class Fixture {
     if (!RegisterRamTarget()) {
       return false;
     }
-    (void)CLIO_CTE_CLIENT->AttachShmCache();
     return true;
   }
 };

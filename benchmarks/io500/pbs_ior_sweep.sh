@@ -22,11 +22,18 @@ window4g CLIO_FUSE_WRITE_INFLIGHT_MB=4096
 cache CACHE=1
 wal PERSIST=temporary
 ramonly RAM_ONLY=1 RAM_PCT=400"}
+# CONFIGS_FILE: read the configurations from a file instead. A line
+# "@defaults <VAR=value>..." there replaces the built-in defaults
+# (CACHE=0 PERSIST=volatile FUSE_PROFILE=0) for the lines after it.
+[ -n "${CONFIGS_FILE:-}" ] && CONFIGS=$(cat "$CONFIGS_FILE")
+DEFAULTS="CACHE=0 PERSIST=volatile FUSE_PROFILE=0"
 while read -r tag vars; do
   [ -z "$tag" ] && continue
+  case $tag in \#*) continue ;; esac
+  if [ "$tag" = @defaults ]; then DEFAULTS=$vars; continue; fi
   echo "##### $tag: $vars"
   # shellcheck disable=SC2086
-  env MODE=cliofs BENCH=ior CACHE=0 PERSIST=volatile FUSE_PROFILE=0 \
+  env MODE=cliofs BENCH=ior $DEFAULTS \
       RUN_TAG="$tag" $vars bash "$HERE/pbs_io500_aurora.sh" < /dev/null 2>&1 \
-    | grep -E 'IORCELL|MDCELL|===|FAILED|rc='
+    | grep -E 'IORCELL|MDCELL|IO500CELL|WFSTAGE|WFCELL|WFCAT|WFCLEAN|RESULT|SCORE|===|FAILED|rc='
 done <<< "$CONFIGS"

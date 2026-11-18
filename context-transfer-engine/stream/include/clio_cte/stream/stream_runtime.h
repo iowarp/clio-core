@@ -100,6 +100,54 @@ class Runtime : public clio::run::Container {
   Runtime() = default;
   ~Runtime() override = default;
 
+  /**
+   * Per-task cost estimate for the scheduler (see Container::GetTaskStats).
+   *
+   * Append stages its payload as one blob (a copy + a storage write); Plan
+   * copies a batch's carried payload into the stream's page blobs (plus a
+   * small per-entry ordering cost). Size operations are a map update, except
+   * kSync which fsyncs the size log. Every method is explicit.
+   * @param task the task to estimate
+   * @return the task's cost features
+   */
+  clio::run::TaskStat GetTaskStats(
+      const clio::run::Task *task) const override {
+    namespace cost = clio::run::cost;
+    if (task == nullptr) {
+      return clio::run::TaskStat();
+    }
+    switch (task->method_) {
+      case Method::kAppend:
+        return cost::Data(static_cast<const AppendTask *>(task)->size_);
+      case Method::kPlan: {
+        const auto *t = static_cast<const PlanTask *>(task);
+        const clio::run::u64 n = t->entries_.size();
+        return cost::Data(t->payload_.size(), cost::kCopyBytesPerCpuUs,
+                          cost::kStorageBytesPerWallUs,
+                          cost::kDataBaseComputeUs + 3 * n,
+                          5.0f * static_cast<float>(n));
+      }
+      case Method::kSizeOp: {
+        const auto *t = static_cast<const SizeOpTask *>(task);
+        return t->op_ == static_cast<clio::run::u32>(StreamSizeOp::kSync)
+                   ? cost::DeviceSync()
+                   : cost::Metadata();
+      }
+      case Method::kFlush:
+        return cost::Fixed(10, 50.0f);  // waits for this node's merges
+      case Method::kSequence:
+        return cost::Fixed(10, 20.0f);  // periodic: ship queued appends
+      case Method::kCreate:
+        return cost::ContainerCreate();  // opens and replays the log
+      case Method::kDestroy:
+        return cost::ContainerDestroy();
+      case Method::kMonitor:
+        return cost::Fixed(5, 10.0f);
+      default:
+        return cost::Metadata();
+    }
+  }
+
   // ---- Method handlers ----
   /** Bind the data client, open/replay the log, recover staged appends. */
   clio::run::TaskResume Create(clio::run::shared_ptr<CreateTask> &task);

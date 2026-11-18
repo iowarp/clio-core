@@ -85,6 +85,11 @@ using WtcAlloc = CLIO_TASK_ALLOC_T;
 /** Pool id of the default-compose shm write-through cache. */
 inline const clio::run::PoolId kDefaultPoolId(568, 0);
 
+/** Put flags the segment can carry: per-blob properties only (equals
+ *  kCtePutDroppable). Replace/append depend on the chain's state, so a put
+ *  with any other flag is refused (kMiss) and takes the task path. */
+static constexpr u32 kPerBlobPutFlags = 0x2u;
+
 /** Longest blob name the segment can hold; longer names take the task path. */
 static constexpr u32 kMaxBlobName = 200;
 /** Independent lock regions of the blob table. */
@@ -189,6 +194,13 @@ enum class Status : u32 {
   kMiss = 1,      /**< not servable here; use the task path */
   kNoSpace = 2,   /**< no buffer or slot could be made; wait for the flusher */
   kTooLong = 3,   /**< blob name too long for the segment */
+  /** The entry is pinned (a flush in flight or a copy in progress) and the
+   *  write needs its buffer to grow or move. Nothing was modified; retry
+   *  WITHOUT holding any stripe lock, then fall back to the task path. A
+   *  writer never waits for a pin under a stripe lock: a flush pin is
+   *  released only after the home acks, and the home's ack waits for an
+   *  Invalidate on this node that needs that very stripe lock. */
+  kBusy = 4,
 };
 
 /**
@@ -290,12 +302,18 @@ struct Stats {
   std::atomic<u64> miss_nonres_;    /**< get miss: entry holds no bytes */
   std::atomic<u64> miss_range_;     /**< get miss: bytes not known current */
   std::atomic<u64> miss_busy_;      /**< get miss: writer mid-copy / torn */
+  std::atomic<u64> put_full_log_;   /**< put refused: dirty log near full */
+  std::atomic<u64> put_full_slot_;  /**< put refused: no blob entry free */
+  std::atomic<u64> put_full_buf_;   /**< put refused: no buffer space */
+  std::atomic<u64> put_miss_;       /**< put refused: md_only / put flags */
+  std::atomic<u64> put_busy_;       /**< put refused: entry pinned, needed to
+                                         grow its buffer (kBusy) */
 };
 
 /** Segment root: the first allocation in the segment. */
 struct Root {
   static constexpr u64 kMagic = 0x3143544357534C43ull;  // "CLSWCTC1"
-  static constexpr u32 kVersion = 8;
+  static constexpr u32 kVersion = 10;
 
   u64 magic_;
   u32 version_;
@@ -475,8 +493,10 @@ class View {
    *        flusher drains it. false (runtime workers, which must never spin:
    *        the flusher needs a worker to drain the log): return kNoSpace
    *        instead when the log is within kLogHeadroom of full.
-   * @return kOk, kMiss (use the task path), kTooLong, or kNoSpace (nothing
-   *         written; caller waits)
+   * @return kOk, kMiss (use the task path), kTooLong, kNoSpace (nothing
+   *         written; caller waits) or kBusy (nothing written: the entry is
+   *         pinned and its buffer must grow; caller backs off without
+   *         holding any lock and retries, then takes the task path)
    */
   Status TryPut(u32 tag_major, u32 tag_minor, const char *name, size_t name_len,
                 u64 off, u64 size, const char *src, u32 put_flags = 0,
@@ -597,6 +617,22 @@ class View {
   void DropTagBlobs(u32 major, u32 minor);
 
   /**
+   * Zero-copy flusher read of a logged range: the address of the CURRENT
+   * bytes of [off, off+size) of the blob in `slot`, pinned (the buffer is
+   * neither freed nor moved) until UnpinRange. Writes may still change the
+   * bytes while pinned; a later flush of the newer range lands after this
+   * one. Segment mode only.
+   * @param size in/out: clamped to the bytes the buffer holds
+   * @param copied_gen out: as ReadRange's
+   * @return the address, or nullptr in extent mode or when the slot holds
+   *         no live resident entry (then nothing is pinned)
+   */
+  const char *PinRange(u32 slot, u64 off, u64 *size, u64 *copied_gen);
+
+  /** Release a PinRange pin of `slot`. */
+  void UnpinRange(u32 slot);
+
+  /**
    * Flusher read of a logged range: copy the CURRENT bytes of [off, off+size)
    * of the blob in `slot`, and report its key.
    * @param dst destination (size bytes)
@@ -684,8 +720,17 @@ class View {
   static constexpr u64 kAnyGranule = ~0ull;
   /** Release an entry's buffer (lock held, unpinned, nothing pending). */
   void ReleaseBufferLocked(BlobEntry *e);
-  /** Grow (or create) an entry's buffer to `need` bytes (lock held). */
-  bool EnsureCapacityLocked(BlobEntry *e, u64 need, u32 stripe);
+  /**
+   * Grow (or create) an entry's buffer to `need` bytes (stripe lock held).
+   * Never waits for a pin: growing a pinned entry would free or move bytes
+   * a flush or copy still reads, so a pinned entry is refused untouched.
+   * @param e      the entry (its stripe lock is held)
+   * @param need   bytes the buffer must hold
+   * @param stripe the stripe whose lock the caller holds
+   * @return kOk (buffer holds `need` bytes), kBusy (pinned; nothing
+   *         changed) or kNoSpace (no buffer could be made)
+   */
+  Status EnsureCapacityLocked(BlobEntry *e, u64 need, u32 stripe);
   /** Frecency of an entry. */
   double Frecency(const BlobEntry *e, u64 now) const;
   /** Pointer into the segment. */
@@ -696,8 +741,22 @@ class View {
   NameSlot *FindNameLocked(u64 h, const char *name, size_t len, bool insert);
   /** Remove a tag's name from the name index (tag lock held). */
   void UnindexNameLocked(TagEntry *t);
-  /** Wait until an entry has no pins (lock held; unpins need no lock). */
-  static void WaitUnpinned(BlobEntry *e);
+  /**
+   * Release an entry's buffer if nothing pins it (stripe lock held). Never
+   * waits: a pinned buffer stays allocated, and the caller has already made
+   * it unservable (flags and valid range cleared); eviction reclaims it
+   * once the pin drops.
+   * @param e the entry (its stripe lock is held; no pending ranges)
+   * @return true if the buffer was released
+   */
+  bool ReleaseIfUnpinnedLocked(BlobEntry *e);
+  /**
+   * Drop a deleted blob's entry (stripe lock held, no pending ranges):
+   * release its buffer and tombstone the slot, or, if a reader still pins
+   * it, leave it live but empty for eviction. Never waits for a pin.
+   * @param e the entry (its stripe lock is held)
+   */
+  void DropUnpendingLocked(BlobEntry *e);
 
   // ---- extent mode (blob bytes in leased RAM-bdev granules) ----
   /** True when blob bytes live in leased RAM-bdev extents. */

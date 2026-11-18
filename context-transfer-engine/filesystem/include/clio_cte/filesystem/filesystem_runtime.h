@@ -93,74 +93,61 @@ class Runtime : public clio::run::Container {
    * (clio_cte_reliability_bench, 1 client thread): stat ~31us, readdir ~255us
    * for 10 entries and ~592us for 100, rename ~568us. They only need to be the
    * right ORDER of magnitude — ReinforceCpuModel/ReinforceWallModel converge
-   * the coefficient from the first few completions.
+   * the coefficient from the first few completions. Every method returns an
+   * explicit estimate (clio_runtime/task_cost.h).
+   * @param task the task to estimate
+   * @return the task's cost features
    */
   clio::run::TaskStat GetTaskStats(const clio::run::Task *task) const override {
-    clio::run::TaskStat stat;
+    namespace cost = clio::run::cost;
     if (task == nullptr) {
-      return stat;
+      return clio::run::TaskStat();
     }
-    // Payload copy runs at roughly 10 GB/s, i.e. ~10 KB per CPU microsecond.
-    constexpr float kBytesPerComputeUs = 10000.0f;
-    constexpr float kBytesPerWallUs = 500.0f;  // ~500 MB/s, house convention
+    // A MultiCreate record is a path plus mode/flags: ~64 bytes encoded.
+    constexpr clio::run::u64 kCreateRecordBytes = 64;
     switch (task->method_) {
-      case Method::kRead: {
-        const auto *t = static_cast<const ReadTask *>(task);
-        stat.io_size_ = t->size_;
-        stat.compute_ =
-            static_cast<size_t>(t->size_ / kBytesPerComputeUs) + 2;
-        stat.wall_time_ = static_cast<float>(t->size_) / kBytesPerWallUs;
-        return stat;
-      }
-      case Method::kWrite: {
-        const auto *t = static_cast<const WriteTask *>(task);
-        stat.io_size_ = t->size_;
-        stat.compute_ =
-            static_cast<size_t>(t->size_ / kBytesPerComputeUs) + 2;
-        stat.wall_time_ = static_cast<float>(t->size_) / kBytesPerWallUs;
-        return stat;
-      }
+      case Method::kRead:
+        // Payload copy ~10 KB per CPU us; wall at the ~500 MB/s convention.
+        return cost::Data(static_cast<const ReadTask *>(task)->size_);
+      case Method::kWrite:
+        return cost::Data(static_cast<const WriteTask *>(task)->size_);
       case Method::kReaddir:
       case Method::kReaddirRange:
         // A listing is a trigram regex query over the tag index plus one
         // result marshalled per entry — CPU-bound, and by far the most
         // expensive metadata call. The entry count is not known until the
         // query returns, so this seeds the fixed part.
-        stat.compute_ = 200;
-        stat.wall_time_ = 250.0f;
-        return stat;
+        return cost::Fixed(200, 250.0f);
       case Method::kRename:
         // Two index searches (self + descendants) plus the re-key.
-        stat.compute_ = 400;
-        stat.wall_time_ = 500.0f;
-        return stat;
+        return cost::Fixed(400, 500.0f);
       case Method::kStatSize:
       case Method::kGetattr:
         // Resolved through the O(1) name hash when the path is cached.
-        stat.compute_ = 20;
-        stat.wall_time_ = 30.0f;
-        return stat;
-      case Method::kOpen:
-      case Method::kClose:
-      case Method::kMkdir:
-      case Method::kRmdir:
-      case Method::kUnlink:
-      case Method::kTruncate:
-      case Method::kLink:
-      case Method::kSymlink:
-      case Method::kReadlink:
-      case Method::kUtimens:
-      case Method::kChown:
-      case Method::kSetxattr:
-      case Method::kGetxattr:
-      case Method::kListxattr:
-      case Method::kRemovexattr:
-        // Single metadata mutation/lookup against the tag map.
-        stat.compute_ = 15;
-        stat.wall_time_ = 25.0f;
-        return stat;
+        return cost::Fixed(20, 30.0f);
+      case Method::kMultiCreate: {
+        // One create per packed record.
+        const auto *t = static_cast<const MultiCreateTask *>(task);
+        return cost::PerItem(t->packed_.size() / kCreateRecordBytes + 1, 10,
+                             15, 20.0f, 25.0f);
+      }
+      case Method::kShardOp:
+        // One encoded namespace-shard step (lookup/insert/remove).
+        return cost::Fixed(30, 50.0f);
+      case Method::kSyncMeta:
+        // fsync of this container's namespace log.
+        return cost::DeviceSync();
+      case Method::kCreate:
+        return cost::ContainerCreate();  // opens and replays the namespace log
+      case Method::kDestroy:
+        return cost::ContainerDestroy();
+      case Method::kMonitor:
+        return cost::Fixed(5, 10.0f);
       default:
-        return stat;
+        // Open, Close, Mkdir, Rmdir, Unlink, Truncate, Link, Symlink,
+        // Readlink, Utimens, Chown, the xattr verbs and AdvanceSize: a single
+        // metadata mutation/lookup against the tag map.
+        return cost::Fixed(15, 25.0f);
     }
   }
 

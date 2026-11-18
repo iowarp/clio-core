@@ -146,23 +146,22 @@ int main(int, char **) {
             rank, us.front(), us[8], us.back());
   }
 
-  // ---- WRITE own file via the DEFER pipeline ----
-  // AsyncPutBlobDefer is THE intended write path (clio-fs, YCSB, lmcache
-  // all write through it): it owns a copy of the bytes at submit, batches
-  // and pipelines internally, and flow-controls on SHM staging. The timed
-  // region includes the full drain — these are DURABLE-acked bytes/sec.
+  // ---- WRITE own file via Client::PutBlob ----
+  // PutBlob is the synchronous write path: a copy into the shm cache segment
+  // when the client is connected to one, else a task it waits on. The timed
+  // region ends with a SyncTag, so these are DURABLE-acked bytes/sec.
   {
     auto t0 = std::chrono::steady_clock::now();
     std::vector<double> submit_us(kBlobsPerRank, 0);
     for (int i = 0; i < kBlobsPerRank; ++i) {
       std::memset(buf.data(), 'a' + ((rank + i) % 26), kBlobSize);
       auto s0 = std::chrono::steady_clock::now();
-      int rc = Cte()->AsyncPutBlobDefer(my_id, "page_" + std::to_string(i), 0,
-                                        kBlobSize, buf.data());
+      const clio::run::u32 rc = Cte()->PutBlob(
+          my_id, "page_" + std::to_string(i), 0, kBlobSize, buf.data());
       submit_us[i] = std::chrono::duration<double, std::micro>(
                          std::chrono::steady_clock::now() - s0).count();
       if (rc != 0) {
-        fprintf(stderr, "BENCH write submit FAILED rank=%d blob=%d rc=%d\n",
+        fprintf(stderr, "BENCH write submit FAILED rank=%d blob=%d rc=%u\n",
                 rank, i, rc);
         return 4;
       }
@@ -177,10 +176,11 @@ int main(int, char **) {
     }
     double submit_s = std::chrono::duration<double>(
                           std::chrono::steady_clock::now() - t0).count();
-    clio::cte::core::Client::AwaitPutsUntilSpace(0);
-    if (clio::cte::core::Client::DeferErrorCount() != 0) {
-      fprintf(stderr, "BENCH write FAILED rank=%d defer_errors=%llu\n", rank,
-              (unsigned long long)clio::cte::core::Client::DeferErrorCount());
+    auto sync = Cte()->AsyncSyncTag(my_id);
+    sync.Wait();
+    if (sync->GetReturnCode() != 0) {
+      fprintf(stderr, "BENCH write FAILED rank=%d sync_rc=%u\n", rank,
+              sync->GetReturnCode());
       return 4;
     }
     double s = std::chrono::duration<double>(
@@ -193,9 +193,9 @@ int main(int, char **) {
   }
   if (!Barrier(bar_id)) return 3;
 
-  // Windowed DEFER reads (read-your-writes-consistent AsyncGetBlobDefer —
-  // the intended read path): kDepth outstanding gets, each with its own
-  // destination buffer, verified on completion.
+  // Windowed task-path reads (private-memory AsyncGetBlob): kDepth
+  // outstanding gets, each with its own destination buffer, verified on
+  // completion.
   auto read_phase = [&](const char *label, const clio::cte::core::TagId &tid,
                         int seed_rank, bool verify) -> bool {
     std::vector<std::vector<char>> bufs(kDepth,
@@ -225,8 +225,8 @@ int main(int, char **) {
     for (int i = 0; i < kBlobsPerRank; ++i) {
       if ((int)win.size() == kDepth && !complete_front()) return false;
       win.emplace_back(
-          Cte()->AsyncGetBlobDefer(tid, "page_" + std::to_string(i), 0,
-                                   kBlobSize, bufs[i % kDepth].data()),
+          Cte()->AsyncGetBlob(tid, "page_" + std::to_string(i), 0, kBlobSize,
+                              0, bufs[i % kDepth].data()),
           i);
     }
     while (!win.empty()) {

@@ -73,6 +73,10 @@ inline bool View::Format(const std::string &name,
   if (!backend_.shm_init(backend_id, seg_size_, name)) {
     return false;
   }
+  // Map every page of the segment now (MADV_POPULATE_WRITE: maps, never
+  // alters contents): otherwise each first write to a 4 KiB page faults in
+  // the writing client, ~256 faults per MiB absorbed.
+  ctp::SystemInfo::BulkFault(backend_.data_, backend_.data_capacity_);
   owner_ = true;
   mapped_ = true;
   alloc_ = backend_.MakeAlloc<WtcAlloc>();
@@ -302,15 +306,26 @@ inline void View::Detach() {
   names_ = nullptr;
 }
 
-inline void View::WaitUnpinned(BlobEntry *e) {
-  u32 spins = 0;
-  while (e->pins_.load(std::memory_order_acquire) != 0) {
-    if (++spins < 64) {
-      ctp::CpuRelax();
-    } else {
-      std::this_thread::yield();
-    }
+inline bool View::ReleaseIfUnpinnedLocked(BlobEntry *e) {
+  // Pins are only ever added under the entry's stripe lock (TryPut, TryGet,
+  // ReadRange, PinRange), which the caller holds: zero here stays zero.
+  if (e->pins_.load(std::memory_order_acquire) != 0) {
+    return false;
   }
+  ReleaseBufferLocked(e);
+  return true;
+}
+
+inline void View::DropUnpendingLocked(BlobEntry *e) {
+  if (ReleaseIfUnpinnedLocked(e)) {
+    e->state_ = kSlotTomb;
+    return;
+  }
+  // A reader still copies out of the buffer: the slot cannot be reused yet.
+  // Keep it live but empty (nothing served, no size known); eviction
+  // reclaims it once the pin drops.
+  e->flags_ &= ~(kComplete | kSizeKnown);
+  e->size_ = 0;
 }
 
 inline double View::Frecency(const BlobEntry *e, u64 now) const {
@@ -581,11 +596,18 @@ inline u64 View::AllocBuffer(u64 bytes, u32 held_stripe, u32 owner) {
   return off;
 }
 
-inline bool View::EnsureCapacityLocked(BlobEntry *e, u64 need, u32 stripe) {
+inline Status View::EnsureCapacityLocked(BlobEntry *e, u64 need,
+                                         u32 stripe) {
   if ((e->flags_ & kResident) && e->cap_ >= need) {
-    return true;
+    return Status::kOk;
   }
-  WaitUnpinned(e);
+  // Never wait for the pin here: the flusher's zero-copy pin is released
+  // only after the blob's home acks, and the home acks only after an
+  // Invalidate on this node takes this stripe lock (a distributed
+  // deadlock). Refuse untouched; the caller retries without the lock.
+  if (e->pins_.load(std::memory_order_acquire) != 0) {
+    return Status::kBusy;
+  }
   if (Extents()) {
     // Grow by appending runs: the bytes already held never move.
     if (!(e->flags_ & kResident)) {
@@ -600,12 +622,12 @@ inline bool View::EnsureCapacityLocked(BlobEntry *e, u64 need, u32 stripe) {
     const bool ok = AllocRunsEvicting(e, add, stripe);
     e->pins_.fetch_sub(1, std::memory_order_acq_rel);
     if (!ok) {
-      return false;
+      return Status::kNoSpace;
     }
     // Holes read as zeros, exactly what the chain returns for unwritten bytes.
     ZeroRange(e, have, e->cap_);
     e->flags_ |= kResident;
-    return true;
+    return Status::kOk;
   }
   u64 cap = RoundBuffer(need < kMinBuffer ? kMinBuffer : need);
   if (e->flags_ & kResident) {
@@ -617,7 +639,7 @@ inline bool View::EnsureCapacityLocked(BlobEntry *e, u64 need, u32 stripe) {
   u64 off = AllocBuffer(cap, stripe, static_cast<u32>(e - blobs_));
   e->pins_.fetch_sub(1, std::memory_order_acq_rel);
   if (off == 0) {
-    return false;
+    return Status::kNoSpace;
   }
   u64 keep = 0;
   if (e->flags_ & kResident) {
@@ -630,7 +652,7 @@ inline bool View::EnsureCapacityLocked(BlobEntry *e, u64 need, u32 stripe) {
   e->buf_off_ = off;
   e->cap_ = cap;
   e->flags_ |= kResident;
-  return true;
+  return Status::kOk;
 }
 
 inline u64 View::NextFreeLocked(u64 from) const {
@@ -834,13 +856,15 @@ inline Status View::TryPut(u32 tag_major, u32 tag_minor, const char *name,
   if (name_len > kMaxBlobName) {
     return Status::kTooLong;
   }
-  if (MdOnly()) {
-    return Status::kMiss;  // bytes are not cached here: take the task path
+  if (MdOnly() || (put_flags & ~kPerBlobPutFlags) != 0) {
+    root_->stats_.put_miss_.fetch_add(1, std::memory_order_relaxed);
+    return Status::kMiss;  // not expressible here: take the task path
   }
   if (!may_block) {
     const u64 cap = log_->Capacity();
     const u64 room = kLogHeadroom < cap / 4 ? kLogHeadroom : cap / 4;
     if (log_->Size() + room >= cap) {
+      root_->stats_.put_full_log_.fetch_add(1, std::memory_order_relaxed);
       return Status::kNoSpace;  // nothing touched; caller yields and retries
     }
   }
@@ -859,6 +883,7 @@ inline Status View::TryPut(u32 tag_major, u32 tag_minor, const char *name,
                              &inserted);
     }
     if (s < 0) {
+      root_->stats_.put_full_slot_.fetch_add(1, std::memory_order_relaxed);
       return Status::kNoSpace;
     }
     slot = static_cast<u32>(s);
@@ -872,7 +897,13 @@ inline Status View::TryPut(u32 tag_major, u32 tag_minor, const char *name,
       e->put_flags_ = put_flags;  // metadata-only entry: adopt
     }
     u64 need = off + size;
-    if (!EnsureCapacityLocked(e, need, stripe)) {
+    const Status cap_st = EnsureCapacityLocked(e, need, stripe);
+    if (cap_st == Status::kBusy) {
+      root_->stats_.put_busy_.fetch_add(1, std::memory_order_relaxed);
+      return Status::kBusy;  // pinned: nothing touched, retry unlocked
+    }
+    if (cap_st != Status::kOk) {
+      root_->stats_.put_full_buf_.fetch_add(1, std::memory_order_relaxed);
       return Status::kNoSpace;
     }
     // Lock order is always stripe -> tag; nothing takes them the other way.
@@ -1072,6 +1103,7 @@ inline u32 View::TakeTagError(u32 major, u32 minor) {
 }
 
 inline void View::DropTag(u32 major, u32 minor) {
+  if (root_ == nullptr) return;  // no segment: nothing cached
   Guard g(root_->tag_lock_);
   root_->tag_inval_seq_.fetch_add(1, std::memory_order_acq_rel);
   TagEntry *t = FindTagLocked(major, minor, false);
@@ -1195,6 +1227,7 @@ inline bool View::LookupTagName(u32 major, u32 minor, std::string *name) {
 }
 
 inline void View::DropTagMeta(u32 major, u32 minor) {
+  if (root_ == nullptr) return;  // no segment: nothing cached
   Guard g(root_->tag_lock_);
   root_->tag_inval_seq_.fetch_add(1, std::memory_order_acq_rel);
   TagEntry *t = FindTagLocked(major, minor, false);
@@ -1286,11 +1319,14 @@ inline bool View::Fill(u32 tag_major, u32 tag_minor, const char *name,
       e->inval_epoch_.load() != inval_epoch || e->pending_.load() != 0) {
     return false;  // a local write or an invalidation raced the fetch
   }
-  WaitUnpinned(e);
+  if (e->pins_.load(std::memory_order_acquire) != 0) {
+    return false;  // a reader is mid-copy: skip this optional fill, never
+                   // wait for a pin under the stripe lock
+  }
   e->flags_ &= ~kComplete;
   e->valid_lo_ = e->valid_hi_ = 0;
   e->size_ = 0;
-  if (!EnsureCapacityLocked(e, size == 0 ? 1 : size, stripe)) {
+  if (EnsureCapacityLocked(e, size == 0 ? 1 : size, stripe) != Status::kOk) {
     return false;
   }
   CopyIn(e, 0, data, size);
@@ -1332,6 +1368,7 @@ inline bool View::FillSize(u32 tag_major, u32 tag_minor, const char *name,
 
 inline void View::Invalidate(u32 tag_major, u32 tag_minor, const char *name,
                              size_t name_len) {
+  if (root_ == nullptr) return;  // no segment: nothing cached
   if (name_len == kTagMetaNameLen &&
       std::memcmp(name, kTagMetaName, kTagMetaNameLen) == 0) {
     DropTagMeta(tag_major, tag_minor);
@@ -1351,14 +1388,16 @@ inline void View::Invalidate(u32 tag_major, u32 tag_minor, const char *name,
   e->valid_lo_ = e->valid_hi_ = 0;  // pending bytes still flush, never serve
   e->inval_epoch_.fetch_add(1, std::memory_order_acq_rel);
   if (e->pending_.load() == 0) {
-    WaitUnpinned(e);
-    ReleaseBufferLocked(e);
+    // A pinned buffer is left to eviction: it is unservable already, and
+    // waiting for the pin under this lock is what deadlocks.
+    ReleaseIfUnpinnedLocked(e);
   }
   root_->stats_.invalidations_.fetch_add(1, std::memory_order_relaxed);
 }
 
 inline void View::DropBlob(u32 tag_major, u32 tag_minor, const char *name,
                            size_t name_len) {
+  if (root_ == nullptr) return;  // no segment: nothing cached
   if (name_len > kMaxBlobName) {
     return;
   }
@@ -1375,12 +1414,11 @@ inline void View::DropBlob(u32 tag_major, u32 tag_minor, const char *name,
   if (e->pending_.load() != 0) {
     return;  // a racing write logged after the caller's barrier keeps it
   }
-  WaitUnpinned(e);
-  ReleaseBufferLocked(e);
-  e->state_ = kSlotTomb;
+  DropUnpendingLocked(e);
 }
 
 inline void View::DropTagBlobs(u32 major, u32 minor) {
+  if (root_ == nullptr) return;  // no segment: nothing cached
   u32 sps = root_->slots_per_stripe_;
   for (u32 stripe = 0; stripe < kStripes; ++stripe) {
     Guard g(root_->stripes_[stripe]);
@@ -1396,9 +1434,7 @@ inline void View::DropTagBlobs(u32 major, u32 minor) {
       if (e->pending_.load() != 0) {
         continue;
       }
-      WaitUnpinned(e);
-      ReleaseBufferLocked(e);
-      e->state_ = kSlotTomb;
+      DropUnpendingLocked(e);
     }
   }
 }
@@ -1440,6 +1476,33 @@ inline bool View::ReadRange(u32 slot, u64 off, u64 *size, char *dst,
   }
   e->pins_.fetch_sub(1, std::memory_order_acq_rel);
   return true;
+}
+
+inline const char *View::PinRange(u32 slot, u64 off, u64 *size,
+                                  u64 *copied_gen) {
+  if (Extents() || slot >= NumSlots()) {
+    return nullptr;
+  }
+  u32 stripe = slot / root_->slots_per_stripe_;
+  BlobEntry *e = Slot(slot);
+  Guard g(root_->stripes_[stripe]);
+  if (e->state_ != kSlotLive || !(e->flags_ & kResident)) {
+    return nullptr;
+  }
+  u64 end = off + *size;
+  if (end > e->cap_) {
+    end = e->cap_;
+  }
+  *size = end > off ? end - off : 0;
+  bool quiet = e->wbegin_.load(std::memory_order_acquire) ==
+               e->wend_.load(std::memory_order_acquire);
+  *copied_gen = quiet ? e->write_gen_.load(std::memory_order_acquire) : 0;
+  e->pins_.fetch_add(1, std::memory_order_acq_rel);
+  return base_ + e->buf_off_ + off;
+}
+
+inline void View::UnpinRange(u32 slot) {
+  Slot(slot)->pins_.fetch_sub(1, std::memory_order_acq_rel);
 }
 
 inline u64 View::RangeGen(const DirtyRange &r) const {

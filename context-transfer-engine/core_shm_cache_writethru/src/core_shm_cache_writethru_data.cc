@@ -39,6 +39,7 @@
  * goes down the chain.
  */
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -49,6 +50,9 @@
 #include <clio_cte/core_shm_cache_writethru/core_shm_cache_writethru_runtime.h>
 
 namespace clio::cte::shm_wtc {
+
+/** Poll period of a write waiting for its invalidation batch (us). */
+static constexpr double kInvPollUs = 20.0;
 
 /** Wall-clock ms (CLOCK_REALTIME) for cross-node trace ordering. */
 static double WallMs() {
@@ -65,6 +69,48 @@ static constexpr double kNoSpacePollUs = 50.0;
 /** Waits for segment room before a put writes around the cache (~1 ms). A
  *  segment full of clean small buffers may never yield a large one. */
 static constexpr int kNoSpaceRetries = 20;
+/** Retries of a put refused because its entry is pinned (kBusy) before it
+ *  writes around the cache. The pin is an in-flight flush, released when
+ *  the blob's home acks (a network round trip). */
+static constexpr int kBusyRetries = 12;
+/** First back-off between kBusy retries (us); doubles per retry. */
+static constexpr double kBusyPollStartUs = 10.0;
+/** Back-off cap between kBusy retries (us); with the start above the whole
+ *  budget is ~6 ms of yields before the put writes around the cache. */
+static constexpr double kBusyPollMaxUs = 1000.0;
+
+clio::run::TaskResume Runtime::TryPutRetrying(const TagId &tag,
+                                              const std::string &name,
+                                              clio::run::u64 off,
+                                              clio::run::u64 size,
+                                              const char *src,
+                                              clio::run::u32 flags,
+                                              wtc::Status *st) {
+  CLIO_TASK_BODY_BEGIN
+  {
+    int nospace_tries = 0;
+    int busy_tries = 0;
+    double busy_us = kBusyPollStartUs;
+    while (true) {
+      *st = view_.TryPut(tag.major_, tag.minor_, name.c_str(), name.size(),
+                         off, size, src, flags, /*may_block=*/false);
+      if (*st == wtc::Status::kNoSpace && nospace_tries < kNoSpaceRetries) {
+        ++nospace_tries;
+        view_.GetRoot()->stats_.waits_.fetch_add(1);
+        CLIO_CO_AWAIT(clio::run::yield(kNoSpacePollUs));
+      } else if (*st == wtc::Status::kBusy && busy_tries < kBusyRetries) {
+        ++busy_tries;
+        view_.GetRoot()->stats_.waits_.fetch_add(1);
+        CLIO_CO_AWAIT(clio::run::yield(busy_us));
+        busy_us = std::min(busy_us * 2.0, kBusyPollMaxUs);
+      } else {
+        break;
+      }
+    }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
 
 clio::run::TaskResume Runtime::WaitBlobFlushed(const TagId &tag,
                                                const std::string &name) {
@@ -172,14 +218,104 @@ clio::run::TaskResume Runtime::FanoutInvalidate(const TagId &tag,
                                                 const std::string &name) {
   CLIO_TASK_BODY_BEGIN
   if (CLIO_IPC->GetNumHosts() > 1) {
+    // A named local, not a braced temporary inside the co_await: GCC 16.2
+    // hits an internal compiler error (build_special_member_call) on the
+    // temporary initializer_list in a coroutine await expression.
+    std::vector<BlobKey> keys{BlobKey{tag.major_, tag.minor_, name}};
+    CLIO_CO_AWAIT(FanoutBatched(std::move(keys)));
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::FanoutBatched(std::vector<BlobKey> keys) {
+  CLIO_TASK_BODY_BEGIN
+  {
+    /** One key of this call: its home and the batch it was queued into. */
+    struct Wait {
+      clio::run::u32 home_;
+      clio::run::u64 seq_;
+    };
+    std::vector<Wait> waits;
+    {
+      std::lock_guard<std::mutex> lk(inv_mtx_);
+      for (BlobKey &k : keys) {
+        const clio::run::u32 home =
+            HomeOf(TagId(k.major_, k.minor_), k.name_);
+        InvLane &lane = inv_lanes_[home];
+        bool dup = false;
+        for (const BlobKey &p : lane.pending_) {
+          dup = dup || (p.major_ == k.major_ && p.minor_ == k.minor_ &&
+                        p.name_ == k.name_);
+        }
+        if (!dup) lane.pending_.push_back(std::move(k));
+        waits.push_back(Wait{home, lane.open_seq_});
+      }
+    }
     auto *ipc = CLIO_IPC;
-    BlobKey k{tag.major_, tag.minor_, name};
-    auto inv = ipc->NewTask<InvalidateTask>(
-        clio::run::CreateTaskId(), pool_id_,
-        clio::run::PoolQuery::DirectId(HomeOf(tag, name)), kInvalidateFanout,
-        container_id_, PackKeys({k}));
-    auto fut = ipc->Send(inv);
-    CLIO_CO_AWAIT(fut);
+    while (!waits.empty()) {
+      // Drop the keys already delivered; lead the first lane that is idle
+      // with this call's batch next in line.
+      std::vector<BlobKey> batch;
+      Wait led{0, 0};
+      {
+        std::lock_guard<std::mutex> lk(inv_mtx_);
+        for (size_t i = 0; i < waits.size();) {
+          InvLane &lane = inv_lanes_[waits[i].home_];
+          if (lane.done_seq_ >= waits[i].seq_) {
+            waits[i] = waits.back();
+            waits.pop_back();
+            continue;
+          }
+          if (batch.empty() && !lane.busy_ &&
+              lane.open_seq_ == waits[i].seq_) {
+            lane.busy_ = true;
+            batch.swap(lane.pending_);
+            ++lane.open_seq_;
+            led = waits[i];
+          }
+          ++i;
+        }
+      }
+      if (batch.empty()) {
+        if (!waits.empty()) CLIO_CO_AWAIT(clio::run::yield(kInvPollUs));
+        continue;
+      }
+      auto inv = ipc->NewTask<InvalidateTask>(
+          clio::run::CreateTaskId(), pool_id_,
+          clio::run::PoolQuery::DirectId(led.home_), kInvalidateFanout,
+          container_id_, PackKeys(batch));
+      auto fut = ipc->Send(inv);
+      CLIO_CO_AWAIT(fut);
+      std::lock_guard<std::mutex> lk(inv_mtx_);
+      InvLane &lane = inv_lanes_[led.home_];
+      lane.done_seq_ = led.seq_;
+      lane.busy_ = false;
+    }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::FanoutInvalidateWrite(
+    const TagId &tag, const std::string &name) {
+  CLIO_TASK_BODY_BEGIN
+  {
+    const bool meta = view_.Ready() && !tag.IsNull();
+    if (meta) view_.NoteLocalWrite();
+    // invalidate_on_flush: the write-back cache below sends nothing until it
+    // flushes, and its flush lands through this pool on the home, which
+    // invalidates then (MultiPutBlob). Deletes still invalidate at once.
+    if (CLIO_IPC->GetNumHosts() > 1 && !config_.invalidate_on_flush_) {
+      std::vector<BlobKey> keys;
+      keys.push_back(BlobKey{tag.major_, tag.minor_, name});
+      if (meta) {
+        keys.push_back(BlobKey{
+            tag.major_, tag.minor_,
+            std::string(wtc::kTagMetaName, wtc::kTagMetaNameLen)});
+      }
+      CLIO_CO_AWAIT(FanoutBatched(std::move(keys)));
+    }
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -196,7 +332,7 @@ clio::run::TaskResume Runtime::PutBlob(
     const std::string name = task->GetBlobName();
     const bool plain =
         view_.Ready() &&
-        clio::cte::core::Client::WtcAbsorbableFlags(task->flags_) &&
+        (task->flags_ & ~wtc::kPerBlobPutFlags) == 0 &&
         task->score_ < 0.0f && PlainContext(task->context_) &&
         name.size() <= wtc::kMaxBlobName;
     bool absorbed = plain;
@@ -218,18 +354,11 @@ clio::run::TaskResume Runtime::PutBlob(
           CLIO_CO_RETURN;
         }
         wtc::Status st = wtc::Status::kNoSpace;
-        for (int tries = 0;
-             (st = view_.TryPut(task->tag_id_.major_, task->tag_id_.minor_,
-                                name.c_str(), name.size(),
-                                regions[i].blob_off_, regions[i].size_, src,
-                                task->flags_, /*may_block=*/false)) ==
-                 wtc::Status::kNoSpace &&
-             tries < kNoSpaceRetries;
-             ++tries) {
-          view_.GetRoot()->stats_.waits_.fetch_add(1);
-          CLIO_CO_AWAIT(clio::run::yield(kNoSpacePollUs));
-        }
-        // Not absorbed (a flags conflict, or still no room): the whole put
+        CLIO_CO_AWAIT(TryPutRetrying(task->tag_id_, name,
+                                     regions[i].blob_off_, regions[i].size_,
+                                     src, task->flags_, &st));
+        // Not absorbed (a flags conflict, still no room, or still pinned by
+        // a flush): the whole put
         // goes down the chain below, ordered after this blob's logged
         // ranges -- an earlier absorbed region lands again, unchanged.
         absorbed = st == wtc::Status::kOk;
@@ -274,8 +403,7 @@ clio::run::TaskResume Runtime::PutBlob(
                        name.c_str(), name.size());
     }
     EndChainWrite(task->tag_id_, name);
-    CLIO_CO_AWAIT(FanoutInvalidate(task->tag_id_, name));
-    CLIO_CO_AWAIT(NoteTagsWritten({task->tag_id_}));
+    CLIO_CO_AWAIT(FanoutInvalidateWrite(task->tag_id_, name));
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -304,8 +432,7 @@ clio::run::TaskResume Runtime::WriteAroundRecord(
     view_.Invalidate(tag.major_, tag.minor_, name.c_str(), name.size());
   }
   EndChainWrite(tag, name);
-  CLIO_CO_AWAIT(FanoutInvalidate(tag, name));
-  CLIO_CO_AWAIT(NoteTagsWritten({tag}));
+  CLIO_CO_AWAIT(FanoutInvalidateWrite(tag, name));
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
@@ -332,10 +459,20 @@ clio::run::TaskResume Runtime::MultiPutBlob(
       for (const BlobKey &k : keys) {
         view_.Invalidate(k.major_, k.minor_, k.name_.c_str(), k.name_.size());
       }
-      for (const BlobKey &k : keys) {
-        CLIO_CO_AWAIT(FanoutInvalidate(TagId(k.major_, k.minor_), k.name_));
+      // The records' blobs and their tags' cached metadata, invalidated at
+      // their homes together (one batch per home).
+      if (view_.Ready() && !tags.empty()) view_.NoteLocalWrite();
+      if (CLIO_IPC->GetNumHosts() > 1) {
+        const std::string meta(wtc::kTagMetaName, wtc::kTagMetaNameLen);
+        std::set<std::pair<clio::run::u32, clio::run::u32>> seen;
+        for (const TagId &t : tags) {
+          if (view_.Ready() && !t.IsNull() &&
+              seen.insert({t.major_, t.minor_}).second) {
+            keys.push_back(BlobKey{t.major_, t.minor_, meta});
+          }
+        }
+        CLIO_CO_AWAIT(FanoutBatched(std::move(keys)));
       }
-      CLIO_CO_AWAIT(NoteTagsWritten(tags));
       CLIO_CO_RETURN;
     }
     if (view_.Ready() && attached && PlainContext(task->context_)) {
@@ -348,19 +485,13 @@ clio::run::TaskResume Runtime::MultiPutBlob(
           continue;
         }
         wtc::Status st = wtc::Status::kNoSpace;
-        for (int tries = 0;
-             (st = view_.TryPut(d.tag_id_.major_, d.tag_id_.minor_,
-                                d.blob_name_.c_str(), d.blob_name_.size(),
-                                d.offset_, d.size_,
-                                batch.base_ + d.payload_off_, d.flags_,
-                                /*may_block=*/false)) == wtc::Status::kNoSpace &&
-             tries < kNoSpaceRetries;
-             ++tries) {
-          CLIO_CO_AWAIT(clio::run::yield(kNoSpacePollUs));
-        }
+        CLIO_CO_AWAIT(TryPutRetrying(d.tag_id_, d.blob_name_, d.offset_,
+                                     d.size_, batch.base_ + d.payload_off_,
+                                     d.flags_, &st));
         if (st != wtc::Status::kOk) {
-          // No room (kNoSpace), conflicting put flags (kMiss) or a name the
-          // segment cannot hold: write this record around the cache.
+          // No room (kNoSpace), still pinned by a flush (kBusy),
+          // conflicting put flags (kMiss) or a name the segment cannot
+          // hold: write this record around the cache.
           clio::run::u32 rc = 0;
           CLIO_CO_AWAIT(WriteAroundRecord(d.tag_id_, d.blob_name_, d.offset_,
                                           d.size_, batch.base_ + d.payload_off_,
@@ -400,8 +531,7 @@ clio::run::TaskResume Runtime::DelBlob(
     CLIO_CO_AWAIT(f);
     EndChainWrite(task->tag_id_, name);
     task->SetReturnCode(f->GetReturnCode());
-    CLIO_CO_AWAIT(FanoutInvalidate(task->tag_id_, name));
-    CLIO_CO_AWAIT(NoteTagsWritten({task->tag_id_}));
+    CLIO_CO_AWAIT(FanoutInvalidateWrite(task->tag_id_, name));
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END

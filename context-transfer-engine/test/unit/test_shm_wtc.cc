@@ -36,8 +36,9 @@
  * path (context-transfer-engine/core_shm_cache_writethru/DESIGN.md).
  *
  * Chain under test: core_shm_cache_writethru (568.0) -> core (512.0). `io` is a
- * core client bound to the cache pool (SHM path); `core` reads the chain
- * directly to check what actually landed.
+ * core client bound to the cache pool and connected to its segment (the shm
+ * cache path of PutBlob/GetBlob/GetBlobSize); `core` is bound to the core
+ * pool (task path) and reads the chain directly to check what landed.
  */
 
 #include <clio_runtime/clio_runtime.h>
@@ -49,10 +50,19 @@
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <map>
+#include <memory>
 #include <fstream>
 #include <string>
 #include <thread>
 #include <vector>
+
+#ifdef _WIN32
+#include <process.h>  // _getpid
+#define getpid _getpid
+#else
+#include <unistd.h>  // getpid
+#endif
 
 #include "simple_test.h"
 
@@ -76,6 +86,7 @@ class WtcFixture {
     config_path_ = DataDir() + "/shm_wtc_config.yaml";
     restart_log_path_ = DataDir() + "/shm_wtc_restart.bin";
     Cleanup();
+    CleanupDeviceFilesOnce();
     WriteConfig();
     ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", config_path_.c_str(), 1);
     ctp::SystemInfo::Setenv("CLIO_RESTART_LOG", restart_log_path_.c_str(), 1);
@@ -92,6 +103,26 @@ class WtcFixture {
     if (fs::exists(config_path_)) fs::remove(config_path_);
     if (fs::exists(restart_log_path_)) fs::remove(restart_log_path_);
   }
+
+  /**
+   * Remove the full-device core's backing file, allocator log and marker
+   * left by an earlier run. Once per process, before the runtime opens the
+   * device: every test case builds a fixture, and the device stays open.
+   */
+  static void CleanupDeviceFilesOnce() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    std::error_code ec;
+    for (const auto &e : fs::directory_iterator(DataDir(), ec)) {
+      if (e.path().filename().string().rfind(kFullDeviceFile, 0) == 0) {
+        fs::remove(e.path(), ec);
+      }
+    }
+  }
+
+  /** Backing file name (in DataDir) of the full-device core's target. */
+  static constexpr const char *kFullDeviceFile = "shm_wtc_full.dat";
 
   void WriteConfig() {
     std::ofstream f(config_path_);
@@ -117,6 +148,23 @@ compose:
         score: 1.0
     dpe:
       dpe_type: "max_bw"
+
+  # A core over one file device, for the out-of-space case.
+  - mod_name: clio_cte_core
+    pool_name: shm_wtc_full_core
+    pool_query: local
+    pool_id: 513.0
+    targets:
+      neighborhood: 1
+      default_target_timeout_ms: 30000
+      poll_period_ms: 5000
+    storage:
+      - path: ")" << DataDir() << "/" << kFullDeviceFile << R"("
+        bdev_type: "file"
+        capacity_limit: "64MB"
+        score: 1.0
+    dpe:
+      dpe_type: "max_bw"
 )";
   }
 };
@@ -126,7 +174,9 @@ compose:
 static void CreateCache(const clio::run::PoolId &id, const std::string &name,
                         clio::run::u64 capacity, bool md_only = false,
                         clio::run::u64 data_capacity = 0,
-                        double flush_period_us = 0) {
+                        double flush_period_us = 0,
+                        const clio::run::PoolId &next =
+                            clio::cte::core::kCtePoolId) {
   clio::cte::shm_wtc::Client admin;
   clio::cte::shm_wtc::WtcConfig params;
   params.md_only_ = md_only;
@@ -134,7 +184,7 @@ static void CreateCache(const clio::run::PoolId &id, const std::string &name,
     params.data_pool_ = clio::run::PoolId(512, 0);  // this node's RAM tier
     params.data_capacity_ = data_capacity;
   }
-  params.next_pool_id_ = clio::cte::core::kCtePoolId;
+  params.next_pool_id_ = next;
   params.capacity_ = capacity;
   params.max_blobs_ = 4096;
   params.log_depth_ = 4096;
@@ -152,9 +202,69 @@ static std::string Payload(size_t n, char seed) {
   return v;
 }
 
+/**
+ * The keys of one cache pool, read from its Locator in the metadata
+ * directory. TEST-ONLY: a test composes several caches over the same core,
+ * and the core's Create names one of them; production clients take the keys
+ * from the CTE Create (see the "keys come from the CTE Create" case).
+ * @param pool the cache pool
+ * @return the keys (invalid when the pool published no Locator)
+ */
+static clio::cte::core::ShmCacheKeys KeysOf(const clio::run::PoolId &pool) {
+  clio::cte::core::ShmCacheKeys keys;
+  auto *ipc = CLIO_IPC;
+  auto *meta = ipc->GetMetadataAllocator();
+  auto *dir = ipc->GetMetadataDirectory();
+  if (meta == nullptr || dir == nullptr) return keys;
+  const clio::run::u64 off = dir->FindRoot(pool.ToU64());
+  if (off == 0) return keys;
+  const auto *loc = reinterpret_cast<const wtc::Locator *>(
+      reinterpret_cast<const char *>(meta) + off);
+  if (loc->magic_ != wtc::Locator::kMagic || loc->ready_.load() != 1) {
+    return keys;
+  }
+  keys.runtime_pid_ = loc->runtime_pid_;
+  keys.cache_pool_ = pool.ToU64();
+  keys.root_off_ = loc->root_off_;
+  keys.entry_pool_ = loc->entry_pool_;
+  return keys;
+}
+
+/**
+ * The test's own mapping of a cache segment, for the flush barrier and for
+ * invalidations a client never issues. One per pool, for the process.
+ * @param keys keys of the cache
+ * @return the view, or nullptr when the segment cannot be mapped
+ */
+static wtc::View *TestView(const clio::cte::core::ShmCacheKeys &keys) {
+  static std::map<clio::run::u64, std::unique_ptr<wtc::View>> views;
+  auto it = views.find(keys.cache_pool_);
+  if (it != views.end()) return it->second.get();
+  auto v = std::make_unique<wtc::View>();
+  if (!v->Attach(wtc::SegmentName(keys.runtime_pid_,
+                                  clio::run::PoolId::FromU64(keys.cache_pool_)),
+                 keys.root_off_)) {
+    return nullptr;
+  }
+  wtc::View *raw = v.get();
+  views[keys.cache_pool_] = std::move(v);
+  return raw;
+}
+
+/**
+ * Connect a client bound to a cache pool to that cache's segment.
+ * @param io client bound to the cache pool
+ * @param pool the cache pool
+ */
+static void Connect(clio::cte::core::Client &io,
+                    const clio::run::PoolId &pool) {
+  REQUIRE(io.ConnectCache(KeysOf(pool)));
+  REQUIRE(io.HasCache());
+}
+
 /** Wait (bounded) until the cache has flushed every range pushed so far. */
 static bool WaitFlushed(clio::cte::core::Client &io) {
-  wtc::View *view = io.Wtc();
+  wtc::View *view = TestView(io.CacheKeys());
   if (view == nullptr) return false;
   for (int i = 0; i < 2000; ++i) {
     const wtc::Root *root = view->GetRoot();
@@ -185,37 +295,129 @@ static TagId MakeTag(clio::cte::core::Client &c, const std::string &name) {
 
 static const clio::run::PoolId kPool(568, 0);
 
+/** @return the next task id this thread would take (CreateTaskId's
+ *  per-thread counter): the difference between two marks, minus one for the
+ *  second mark itself, is the number of tasks this thread created between
+ *  them. */
+static clio::run::u32 TaskMark() { return clio::run::CreateTaskId().major_; }
+
+/** Create the default cache (568.0) over the core. */
+static void CreateMainCache() {
+  CreateCache(kPool, "shm_wtc_main", 64ull << 20);
+}
+
+TEST_CASE("ShmWtc - the cache keys come from the CTE Create",
+          "[cte][shm_wtc][keys]") {
+  WtcFixture fx;
+  CreateMainCache();
+  // Get-or-create of the (existing) core pool: its OUT params carry the keys
+  // of the cache fronting it on this node.
+  clio::cte::core::Client probe;
+  auto create = probe.AsyncCreate(clio::run::PoolQuery::Local(),
+                                  std::string(clio::cte::core::kCtePoolName),
+                                  clio::cte::core::kCtePoolId,
+                                  clio::cte::core::CreateParams());
+  create.Wait();
+  REQUIRE(create->GetReturnCode() == 0);
+  const clio::cte::core::ShmCacheKeys keys =
+      clio::run::Task::Deserialize<clio::cte::core::CreateParams>(
+          create->chimod_params_)
+          .cache_keys_;
+  REQUIRE(keys.Valid());
+  REQUIRE(keys.cache_pool_ == kPool.ToU64());
+  REQUIRE(keys.root_off_ == KeysOf(kPool).root_off_);
+
+  // Connecting needs a client whose tasks pass the cache.
+  clio::cte::core::Client core(clio::cte::core::kCtePoolId);
+  REQUIRE_FALSE(core.ConnectCache(keys));
+  REQUIRE_FALSE(core.HasCache());
+  clio::cte::core::Client io(kPool);
+  REQUIRE(io.ConnectCache(keys));
+  REQUIRE(io.HasCache());
+}
+
+TEST_CASE("ShmWtc - a connected PutBlob creates no task",
+          "[cte][shm_wtc][paths]") {
+  WtcFixture fx;
+  CreateMainCache();
+  clio::cte::core::Client io(kPool);
+  Connect(io, kPool);
+  const wtc::Stats *st = io.CacheStats();
+  REQUIRE(st != nullptr);
+  TagId tag = MakeTag(io, "wtc_no_task");
+  const std::string val = Payload(64 * 1024, 'n');
+
+  const clio::run::u64 puts0 = st->puts_.load();
+  const clio::run::u32 m0 = TaskMark();
+  REQUIRE(io.PutBlob(tag, "nt", 0, val.size(), val.data()) == 0);
+  REQUIRE(TaskMark() == m0 + 1);  // no task between the marks
+  REQUIRE(st->puts_.load() == puts0 + 1);
+
+  // The bytes are readable from the segment, again with no task.
+  std::string back(val.size(), '\0');
+  const clio::run::u32 m1 = TaskMark();
+  REQUIRE(io.TryGetCached(tag, "nt", 0, back.size(), back.data()));
+  clio::run::u64 size = 0;
+  REQUIRE(io.GetBlobSize(tag, "nt", &size) == 0);
+  REQUIRE(TaskMark() == m1 + 1);
+  REQUIRE(back == val);
+  REQUIRE(size == val.size());
+
+  // And the flusher carries them down the chain.
+  REQUIRE(WaitFlushed(io));
+  REQUIRE(CoreRead(tag, "nt", 0, val.size()) == val);
+}
+
+TEST_CASE("ShmWtc - without a cache, PutBlob/GetBlob take the task path",
+          "[cte][shm_wtc][paths]") {
+  WtcFixture fx;
+  CreateMainCache();
+  clio::cte::core::Client core(clio::cte::core::kCtePoolId);
+  REQUIRE_FALSE(core.HasCache());
+  REQUIRE(core.CacheStats() == nullptr);
+  TagId tag = MakeTag(core, "wtc_task_path");
+  const std::string val = Payload(32 * 1024, 't');
+
+  const clio::run::u32 m0 = TaskMark();
+  REQUIRE(core.PutBlob(tag, "tp", 0, val.size(), val.data()) == 0);
+  REQUIRE(TaskMark() > m0 + 1);  // a PutBlob task was created
+
+  std::string back(val.size(), '\0');
+  REQUIRE_FALSE(core.TryGetCached(tag, "tp", 0, back.size(), back.data()));
+  REQUIRE(core.GetBlob(tag, "tp", 0, back.size(), back.data()) == 0);
+  REQUIRE(back == val);
+  clio::run::u64 size = 0;
+  REQUIRE(core.GetBlobSize(tag, "tp", &size) == 0);
+  REQUIRE(size == val.size());
+  REQUIRE(CoreRead(tag, "tp", 0, val.size()) == val);
+}
+
 TEST_CASE("ShmWtc - writes and reads complete in shared memory",
           "[cte][shm_wtc]") {
   WtcFixture fx;
-  CreateCache(kPool, "shm_wtc_main", 64ull << 20);
+  CreateMainCache();
   clio::cte::core::Client io(kPool);
-  REQUIRE(io.HasWtc());
-  const wtc::Stats *st = io.WtcStats();
+  Connect(io, kPool);
+  const wtc::Stats *st = io.CacheStats();
   REQUIRE(st != nullptr);
 
   SECTION("put/get round trip without tasks, then write-through") {
     TagId tag = MakeTag(io, "wtc_roundtrip");
     const std::string val = Payload(256 * 1024, 'a');
     const clio::run::u64 puts0 = st->puts_.load();
-    auto put = io.AsyncPutBlob(tag, "b0", 0, val.size(), val.data());
-    put.Wait();
-    REQUIRE(put->GetReturnCode() == 0);
+    REQUIRE(io.PutBlob(tag, "b0", 0, val.size(), val.data()) == 0);
     REQUIRE(st->puts_.load() == puts0 + 1);
 
     // A brand-new blob of a brand-new tag is complete in the cache.
     std::string back(val.size(), '\0');
     const clio::run::u64 hits0 = st->get_hits_.load();
-    auto get = io.AsyncGetBlob(tag, "b0", 0, back.size(), 0, back.data());
-    get.Wait();
-    REQUIRE(get->GetReturnCode() == 0);
+    REQUIRE(io.GetBlob(tag, "b0", 0, back.size(), back.data()) == 0);
     REQUIRE(back == val);
     REQUIRE(st->get_hits_.load() == hits0 + 1);
 
-    auto sz = io.AsyncGetBlobSize(tag, "b0");
-    sz.Wait();
-    REQUIRE(sz->GetReturnCode() == 0);
-    REQUIRE(sz->size_ == val.size());
+    clio::run::u64 size = 0;
+    REQUIRE(io.GetBlobSize(tag, "b0", &size) == 0);
+    REQUIRE(size == val.size());
 
     // The flusher lands the bytes in the chain.
     REQUIRE(WaitFlushed(io));
@@ -234,8 +436,8 @@ TEST_CASE("ShmWtc - writes and reads complete in shared memory",
 
     const std::string a(4096, 'A');
     const std::string b(4096, 'B');
-    io.AsyncPutBlob(tag, "r", 0, a.size(), a.data()).Wait();
-    io.AsyncPutBlob(tag, "r", 64 * 1024, b.size(), b.data()).Wait();
+    REQUIRE(io.PutBlob(tag, "r", 0, a.size(), a.data()) == 0);
+    REQUIRE(io.PutBlob(tag, "r", 64 * 1024, b.size(), b.data()) == 0);
     REQUIRE(WaitFlushed(io));
 
     std::string want = base;
@@ -245,9 +447,7 @@ TEST_CASE("ShmWtc - writes and reads complete in shared memory",
 
     // Reads of a partially cached blob go to the chain (and fill).
     std::string back(want.size(), '\0');
-    auto g = io.AsyncGetBlob(tag, "r", 0, back.size(), 0, back.data());
-    g.Wait();
-    REQUIRE(g->GetReturnCode() == 0);
+    REQUIRE(io.GetBlob(tag, "r", 0, back.size(), back.data()) == 0);
     REQUIRE(back == want);
   }
 
@@ -260,30 +460,28 @@ TEST_CASE("ShmWtc - writes and reads complete in shared memory",
     const std::string base(128 * 1024, 'x');
     core.AsyncPutBlob(tag, "v", 0, base.size(), base.data()).Wait();
     const std::string a(8192, 'A');
-    io.AsyncPutBlob(tag, "v", 4096, a.size(), a.data()).Wait();
+    REQUIRE(io.PutBlob(tag, "v", 4096, a.size(), a.data()) == 0);
 
     std::string back(4096, '\0');
     const clio::run::u64 hits0 = st->get_hits_.load();
     const clio::run::u64 fills0 = st->fills_.load();
-    io.AsyncGetBlob(tag, "v", 8192, back.size(), 0, back.data()).Wait();
+    REQUIRE(io.GetBlob(tag, "v", 8192, back.size(), back.data()) == 0);
     REQUIRE(back == std::string(4096, 'A'));
     REQUIRE(st->get_hits_.load() == hits0 + 1);  // served from the segment
     REQUIRE(st->fills_.load() == fills0);         // no trip to the chain
 
     // A read touching bytes the cache never saw is the chain's (not zeros).
     std::string span(8192, '\0');
-    auto g = io.AsyncGetBlob(tag, "v", 0, span.size(), 0, span.data());
-    g.Wait();
-    REQUIRE(g->GetReturnCode() == 0);
+    REQUIRE(io.GetBlob(tag, "v", 0, span.size(), span.data()) == 0);
     REQUIRE(span == std::string(4096, 'x') + std::string(4096, 'A'));
 
     // Another writer's invalidation: the written range no longer serves.
     const std::string c(8192, 'C');
-    io.AsyncPutBlob(tag, "v", 4096, c.size(), c.data()).Wait();
+    REQUIRE(io.PutBlob(tag, "v", 4096, c.size(), c.data()) == 0);
     REQUIRE(WaitFlushed(io));
-    io.Wtc()->Invalidate(tag.major_, tag.minor_, "v", 1);
+    TestView(io.CacheKeys())->Invalidate(tag.major_, tag.minor_, "v", 1);
     core.AsyncPutBlob(tag, "v", 4096, a.size(), a.data()).Wait();
-    io.AsyncGetBlob(tag, "v", 8192, back.size(), 0, back.data()).Wait();
+    REQUIRE(io.GetBlob(tag, "v", 8192, back.size(), back.data()) == 0);
     REQUIRE(back == std::string(4096, 'A'));  // the chain's newer bytes
   }
 
@@ -296,9 +494,7 @@ TEST_CASE("ShmWtc - writes and reads complete in shared memory",
     for (int i = 0; i < 128; ++i) {
       std::string piece(512, static_cast<char>('a' + (i % 26)));
       std::memcpy(&want[i * 512], piece.data(), piece.size());
-      auto p = io.AsyncPutBlob(tag, "seq", i * 512, piece.size(), piece.data());
-      p.Wait();
-      REQUIRE(p->GetReturnCode() == 0);
+      REQUIRE(io.PutBlob(tag, "seq", i * 512, piece.size(), piece.data()) == 0);
     }
     REQUIRE(WaitFlushed(io));
     REQUIRE(st->flush_ranges_.load() - ranges0 == 128);
@@ -317,17 +513,13 @@ TEST_CASE("ShmWtc - writes and reads complete in shared memory",
 
     const clio::run::u64 fills0 = st->fills_.load();
     std::string back(val.size(), '\0');
-    auto g1 = io.AsyncGetBlob(tag, "cold", 0, back.size(), 0, back.data());
-    g1.Wait();
-    REQUIRE(g1->GetReturnCode() == 0);
+    REQUIRE(io.GetBlob(tag, "cold", 0, back.size(), back.data()) == 0);
     REQUIRE(back == val);
     REQUIRE(st->fills_.load() == fills0 + 1);
 
     const clio::run::u64 hits0 = st->get_hits_.load();
     std::string back2(4096, '\0');
-    auto g2 = io.AsyncGetBlob(tag, "cold", 8192, back2.size(), 0, back2.data());
-    g2.Wait();
-    REQUIRE(g2->GetReturnCode() == 0);
+    REQUIRE(io.GetBlob(tag, "cold", 8192, back2.size(), back2.data()) == 0);
     REQUIRE(back2 == val.substr(8192, 4096));
     REQUIRE(st->get_hits_.load() == hits0 + 1);
   }
@@ -336,31 +528,26 @@ TEST_CASE("ShmWtc - writes and reads complete in shared memory",
     TagId tag = MakeTag(io, "wtc_taskpath");
     const std::string v1(8192, '1');
     const std::string v2(8192, '2');
-    io.AsyncPutBlob(tag, "t", 0, v1.size(), v1.data()).Wait();
+    REQUIRE(io.PutBlob(tag, "t", 0, v1.size(), v1.data()) == 0);
     // An explicit score is not expressible in the cache: task path, after
     // the buffered write lands.
-    auto p2 = io.AsyncPutBlob(tag, "t", 0, v2.size(), v2.data(), 0.75f);
-    p2.Wait();
-    REQUIRE(p2->GetReturnCode() == 0);
+    REQUIRE(io.PutBlob(tag, "t", 0, v2.size(), v2.data(), 0.75f) == 0);
     REQUIRE(WaitFlushed(io));
     REQUIRE(CoreRead(tag, "t", 0, v2.size()) == v2);
     std::string back(v2.size(), '\0');
-    auto g = io.AsyncGetBlob(tag, "t", 0, back.size(), 0, back.data());
-    g.Wait();
-    REQUIRE(g->GetReturnCode() == 0);
+    REQUIRE(io.GetBlob(tag, "t", 0, back.size(), back.data()) == 0);
     REQUIRE(back == v2);
   }
 
   SECTION("DelBlob removes the cached copy and the chain's") {
     TagId tag = MakeTag(io, "wtc_del");
     const std::string v(4096, 'd');
-    io.AsyncPutBlob(tag, "gone", 0, v.size(), v.data()).Wait();
+    REQUIRE(io.PutBlob(tag, "gone", 0, v.size(), v.data()) == 0);
     auto d = io.AsyncDelBlob(tag, "gone");
     d.Wait();
     REQUIRE(d->GetReturnCode() == 0);
-    auto sz = io.AsyncGetBlobSize(tag, "gone");
-    sz.Wait();
-    REQUIRE(sz->GetReturnCode() != 0);
+    clio::run::u64 size = 0;
+    REQUIRE(io.GetBlobSize(tag, "gone", &size) != 0);
   }
 
   SECTION("concurrent writers and readers") {
@@ -373,12 +560,10 @@ TEST_CASE("ShmWtc - writes and reads complete in shared memory",
           const std::string name = "mt_" + std::to_string(t) + "_" +
                                    std::to_string(i);
           const std::string v = Payload(16 * 1024 + i, static_cast<char>('a' + t));
-          auto p = io.AsyncPutBlob(tag, name, 0, v.size(), v.data());
-          p.Wait();
+          const clio::run::u32 p_rc = io.PutBlob(tag, name, 0, v.size(), v.data());
           std::string back(v.size(), '\0');
-          auto g = io.AsyncGetBlob(tag, name, 0, back.size(), 0, back.data());
-          g.Wait();
-          if (p->GetReturnCode() != 0 || g->GetReturnCode() != 0 || back != v) {
+          const clio::run::u32 g_rc = io.GetBlob(tag, name, 0, back.size(), back.data());
+          if (p_rc != 0 || g_rc != 0 || back != v) {
             ++bad;
           }
         }
@@ -398,27 +583,21 @@ TEST_CASE("ShmWtc - eviction keeps a small cache writable",
   const clio::run::PoolId pool(569, 0);
   CreateCache(pool, "shm_wtc_small", 8ull << 20);  // 8 MB segment
   clio::cte::core::Client io(pool);
-  REQUIRE(io.HasWtc());
-  const wtc::Stats *st = io.WtcStats();
+  Connect(io, pool);
+  const wtc::Stats *st = io.CacheStats();
   TagId tag = MakeTag(io, "wtc_evict");
 
   // 48 MB through an 8 MB cache: only possible if clean buffers are evicted.
   std::vector<std::string> vals;
   for (int i = 0; i < 48; ++i) {
     vals.push_back(Payload(1 << 20, static_cast<char>('A' + (i % 26))));
-    auto p = io.AsyncPutBlob(tag, "e" + std::to_string(i), 0, vals.back().size(),
-                             vals.back().data());
-    p.Wait();
-    REQUIRE(p->GetReturnCode() == 0);
+    REQUIRE(io.PutBlob(tag, "e" + std::to_string(i), 0, vals.back().size(), vals.back().data()) == 0);
   }
   REQUIRE(WaitFlushed(io));
   REQUIRE(st->evictions_.load() > 0);
   for (int i = 0; i < 48; ++i) {
     std::string back(1 << 20, '\0');
-    auto g = io.AsyncGetBlob(tag, "e" + std::to_string(i), 0, back.size(), 0,
-                             back.data());
-    g.Wait();
-    REQUIRE(g->GetReturnCode() == 0);
+    REQUIRE(io.GetBlob(tag, "e" + std::to_string(i), 0, back.size(), back.data()) == 0);
     REQUIRE(back == vals[i]);
   }
 }
@@ -432,8 +611,8 @@ TEST_CASE("ShmWtc - overwrites flush once and the last write wins",
   const clio::run::PoolId kDedupPool(576, 0);
   CreateCache(kDedupPool, "shm_wtc_dedup", 64ull << 20, false, 0, 100000.0);
   clio::cte::core::Client io(kDedupPool);
-  REQUIRE(io.HasWtc());
-  const wtc::Stats *st = io.WtcStats();
+  Connect(io, kDedupPool);
+  const wtc::Stats *st = io.CacheStats();
   TagId tag = MakeTag(io, "wtc_dedup");
   REQUIRE(WaitFlushed(io));
   const clio::run::u64 skipped0 = st->flush_skipped_.load();
@@ -446,18 +625,13 @@ TEST_CASE("ShmWtc - overwrites flush once and the last write wins",
   for (int r = 0; r < kRounds; ++r) {
     for (int b = 0; b < kBlobs; ++b) {
       last[b] = Payload(64 << 10, static_cast<char>('a' + (r + b) % 26));
-      auto p = io.AsyncPutBlob(tag, "d" + std::to_string(b), 0,
-                               last[b].size(), last[b].data());
-      p.Wait();
-      REQUIRE(p->GetReturnCode() == 0);
+      REQUIRE(io.PutBlob(tag, "d" + std::to_string(b), 0, last[b].size(), last[b].data()) == 0);
     }
   }
   // A partial overwrite after all that must not be skipped.
   std::string tail = Payload(4096, 'Z');
   {
-    auto p = io.AsyncPutBlob(tag, "d0", 8192, tail.size(), tail.data());
-    p.Wait();
-    REQUIRE(p->GetReturnCode() == 0);
+    REQUIRE(io.PutBlob(tag, "d0", 8192, tail.size(), tail.data()) == 0);
     std::memcpy(&last[0][8192], tail.data(), tail.size());
   }
   REQUIRE(WaitFlushed(io));
@@ -472,10 +646,9 @@ TEST_CASE("ShmWtc - overwrites flush once and the last write wins",
 /** Size of a blob through a client (served from SHM when cached). */
 static clio::run::u64 SizeOf(clio::cte::core::Client &io, const TagId &tag,
                              const std::string &name) {
-  auto f = io.AsyncGetBlobSize(tag, name);
-  f.Wait();
-  REQUIRE(f->GetReturnCode() == 0);
-  return f->size_;
+  clio::run::u64 size = 0;
+  REQUIRE(io.GetBlobSize(tag, name, &size) == 0);
+  return size;
 }
 
 TEST_CASE("ShmWtc - md_only caches blob sizes and drops them on change",
@@ -484,15 +657,13 @@ TEST_CASE("ShmWtc - md_only caches blob sizes and drops them on change",
   const clio::run::PoolId pool(571, 0);
   CreateCache(pool, "shm_wtc_md", 32ull << 20, /*md_only=*/true);
   clio::cte::core::Client io(pool);
-  REQUIRE(io.HasWtc());
-  const wtc::Stats *st = io.WtcStats();
+  Connect(io, pool);
+  const wtc::Stats *st = io.CacheStats();
   TagId tag = MakeTag(io, "wtc_md");
 
   // Bytes are not cached: a put takes the task path and lands in the core.
   const std::string v1 = Payload(1000, 'a');
-  auto p = io.AsyncPutBlob(tag, "m", 0, v1.size(), v1.data());
-  p.Wait();
-  REQUIRE(p->GetReturnCode() == 0);
+  REQUIRE(io.PutBlob(tag, "m", 0, v1.size(), v1.data()) == 0);
   REQUIRE(st->puts_.load() == 0);
   REQUIRE(CoreRead(tag, "m", 0, v1.size()) == v1);
 
@@ -505,18 +676,14 @@ TEST_CASE("ShmWtc - md_only caches blob sizes and drops them on change",
 
   // A growing write, then a truncate: the cached size never goes stale.
   const std::string v2 = Payload(3000, 'b');
-  p = io.AsyncPutBlob(tag, "m", 0, v2.size(), v2.data());
-  p.Wait();
-  REQUIRE(p->GetReturnCode() == 0);
+  REQUIRE(io.PutBlob(tag, "m", 0, v2.size(), v2.data()) == 0);
   REQUIRE(SizeOf(io, tag, "m") == 3000);
   auto t = io.AsyncTruncateBlob(tag, "m", 700);
   t.Wait();
   REQUIRE(t->GetReturnCode() == 0);
   REQUIRE(SizeOf(io, tag, "m") == 700);
   std::string back(700, '\0');
-  auto g = io.AsyncGetBlob(tag, "m", 0, back.size(), 0, back.data());
-  g.Wait();
-  REQUIRE(g->GetReturnCode() == 0);
+  REQUIRE(io.GetBlob(tag, "m", 0, back.size(), back.data()) == 0);
   REQUIRE(back == v2.substr(0, 700));
 }
 
@@ -530,13 +697,11 @@ static clio::run::u64 TagSizeOf(clio::cte::core::Client &io, const TagId &tag) {
 
 /** Tag attributes and open-by-name, served from SHM and never stale. */
 static void TagMetaScenario(clio::cte::core::Client &io, const char *tname) {
-  const wtc::Stats *st = io.WtcStats();
+  const wtc::Stats *st = io.CacheStats();
   TagId tag = MakeTag(io, tname);
   auto put = [&](const std::string &name, size_t n, char c) {
     const std::string v = Payload(n, c);
-    auto p = io.AsyncPutBlob(tag, name, 0, v.size(), v.data());
-    p.Wait();
-    REQUIRE(p->GetReturnCode() == 0);
+    REQUIRE(io.PutBlob(tag, name, 0, v.size(), v.data()) == 0);
   };
   put("a", 1000, 'a');
   REQUIRE(TagSizeOf(io, tag) == 1000);  // read-your-writes (absorbed or not)
@@ -556,11 +721,11 @@ static void TagMetaScenario(clio::cte::core::Client &io, const char *tname) {
   REQUIRE(o1->tag_id_ == tag);
   REQUIRE(TagSizeOf(io, tag) == 600);
   const clio::run::u64 hits2 = st->tag_hits_.load();
-  auto o2 = io.AsyncGetOrCreateTag(tname);
-  o2.Wait();
-  REQUIRE(o2->GetReturnCode() == 0);
-  REQUIRE(o2->tag_id_ == tag);
-  REQUIRE(o2->tag_size_ == 600);
+  TagId o2;
+  clio::run::u64 o2_size = 0;
+  REQUIRE(io.GetOrCreateTag(tname, &o2, &o2_size) == 0);
+  REQUIRE(o2 == tag);
+  REQUIRE(o2_size == 600);
   REQUIRE(st->tag_hits_.load() > hits2);
   // Delete the tag: the name no longer maps to the old id.
   auto d = io.AsyncDelTag(tag);
@@ -576,7 +741,7 @@ TEST_CASE("ShmWtc - tag attributes and opens are cached and exact (data)",
           "[cte][shm_wtc][tagmeta]") {
   WtcFixture fx;
   clio::cte::core::Client io(kPool);
-  REQUIRE(io.HasWtc());
+  Connect(io, kPool);
   TagMetaScenario(io, "wtc_tagmeta_data");
 }
 
@@ -586,7 +751,7 @@ TEST_CASE("ShmWtc - tag attributes and opens are cached and exact (md_only)",
   const clio::run::PoolId pool(572, 0);
   CreateCache(pool, "shm_wtc_md2", 32ull << 20, /*md_only=*/true);
   clio::cte::core::Client io(pool);
-  REQUIRE(io.HasWtc());
+  Connect(io, pool);
   TagMetaScenario(io, "wtc_tagmeta_md");
 }
 
@@ -594,21 +759,17 @@ TEST_CASE("ShmWtc - truncate through the cache drops cached bytes",
           "[cte][shm_wtc][truncate]") {
   WtcFixture fx;
   clio::cte::core::Client io(kPool);
-  REQUIRE(io.HasWtc());
+  Connect(io, kPool);
   TagId tag = MakeTag(io, "wtc_trunc");
   const std::string v = Payload(8192, 'q');
-  auto p = io.AsyncPutBlob(tag, "t", 0, v.size(), v.data());
-  p.Wait();
-  REQUIRE(p->GetReturnCode() == 0);
+  REQUIRE(io.PutBlob(tag, "t", 0, v.size(), v.data()) == 0);
   REQUIRE(SizeOf(io, tag, "t") == 8192);  // cached with its bytes
   auto t = io.AsyncTruncateBlob(tag, "t", 100);
   t.Wait();
   REQUIRE(t->GetReturnCode() == 0);
   REQUIRE(SizeOf(io, tag, "t") == 100);
   std::string back(100, '\0');
-  auto g = io.AsyncGetBlob(tag, "t", 0, back.size(), 0, back.data());
-  g.Wait();
-  REQUIRE(g->GetReturnCode() == 0);
+  REQUIRE(io.GetBlob(tag, "t", 0, back.size(), back.data()) == 0);
   REQUIRE(back == v.substr(0, 100));
 }
 
@@ -618,8 +779,8 @@ TEST_CASE("ShmWtc - large puts displace a cache full of small buffers",
   const clio::run::PoolId pool(570, 0);
   CreateCache(pool, "shm_wtc_frag", 8ull << 20);  // 8 MB segment
   clio::cte::core::Client io(pool);
-  REQUIRE(io.HasWtc());
-  const wtc::Stats *st = io.WtcStats();
+  Connect(io, pool);
+  const wtc::Stats *st = io.CacheStats();
   TagId tag = MakeTag(io, "wtc_frag");
 
   // Fill the segment with clean 4 KB buffers: freeing any one of them never
@@ -627,10 +788,7 @@ TEST_CASE("ShmWtc - large puts displace a cache full of small buffers",
   // free.
   const std::string small = Payload(4096, 's');
   for (int i = 0; i < 4000; ++i) {
-    auto p = io.AsyncPutBlob(tag, "s" + std::to_string(i), 0, small.size(),
-                             small.data());
-    p.Wait();
-    REQUIRE(p->GetReturnCode() == 0);
+    REQUIRE(io.PutBlob(tag, "s" + std::to_string(i), 0, small.size(), small.data()) == 0);
   }
   REQUIRE(WaitFlushed(io));
 
@@ -641,10 +799,7 @@ TEST_CASE("ShmWtc - large puts displace a cache full of small buffers",
   auto t0 = std::chrono::steady_clock::now();
   for (int i = 0; i < 4; ++i) {
     vals.push_back(Payload(1 << 20, static_cast<char>('a' + i)));
-    auto p = io.AsyncPutBlob(tag, "L" + std::to_string(i), 0,
-                             vals.back().size(), vals.back().data());
-    p.Wait();
-    REQUIRE(p->GetReturnCode() == 0);
+    REQUIRE(io.PutBlob(tag, "L" + std::to_string(i), 0, vals.back().size(), vals.back().data()) == 0);
   }
   double ms = std::chrono::duration<double, std::milli>(
                   std::chrono::steady_clock::now() - t0)
@@ -655,10 +810,7 @@ TEST_CASE("ShmWtc - large puts displace a cache full of small buffers",
   REQUIRE(WaitFlushed(io));
   for (int i = 0; i < 4; ++i) {
     std::string back(1 << 20, '\0');
-    auto g = io.AsyncGetBlob(tag, "L" + std::to_string(i), 0, back.size(), 0,
-                             back.data());
-    g.Wait();
-    REQUIRE(g->GetReturnCode() == 0);
+    REQUIRE(io.GetBlob(tag, "L" + std::to_string(i), 0, back.size(), back.data()) == 0);
     REQUIRE(back == vals[i]);
     REQUIRE(CoreRead(tag, "L" + std::to_string(i), 0, back.size()) ==
             vals[i]);
@@ -672,8 +824,8 @@ TEST_CASE("ShmWtc - extent mode keeps bytes in leased RAM-bdev granules",
   // 8 MiB of metadata segment, 16 MiB of leased RAM-bdev extents.
   CreateCache(kExtPool, "shm_wtc_extents", 8ull << 20, false, 16ull << 20);
   clio::cte::core::Client io(kExtPool);
-  REQUIRE(io.HasWtc());
-  const wtc::Stats *st = io.WtcStats();
+  Connect(io, kExtPool);
+  const wtc::Stats *st = io.CacheStats();
   REQUIRE(st != nullptr);
 
   SECTION("sizes that are not powers of two round trip and flush") {
@@ -683,14 +835,10 @@ TEST_CASE("ShmWtc - extent mode keeps bytes in leased RAM-bdev granules",
     for (size_t i = 0; i < sizes.size(); ++i) {
       const std::string name = "s" + std::to_string(i);
       const std::string v = Payload(sizes[i], static_cast<char>('a' + i));
-      auto put = io.AsyncPutBlob(tag, name, 0, v.size(), v.data());
-      put.Wait();
-      REQUIRE(put->GetReturnCode() == 0);
+      REQUIRE(io.PutBlob(tag, name, 0, v.size(), v.data()) == 0);
       std::string back(v.size(), '\0');
       const clio::run::u64 hits0 = st->get_hits_.load();
-      auto get = io.AsyncGetBlob(tag, name, 0, back.size(), 0, back.data());
-      get.Wait();
-      REQUIRE(get->GetReturnCode() == 0);
+      REQUIRE(io.GetBlob(tag, name, 0, back.size(), back.data()) == 0);
       REQUIRE(back == v);
       REQUIRE(st->get_hits_.load() == hits0 + 1);  // served from the bdev
     }
@@ -706,14 +854,11 @@ TEST_CASE("ShmWtc - extent mode keeps bytes in leased RAM-bdev granules",
     std::string want;
     for (int k = 0; k < 6; ++k) {  // 6 appends of 300 KiB at the tail
       const std::string piece = Payload(300 * 1024, static_cast<char>('A' + k));
-      auto put = io.AsyncPutBlob(tag, "g", want.size(), piece.size(),
-                                 piece.data());
-      put.Wait();
-      REQUIRE(put->GetReturnCode() == 0);
+      REQUIRE(io.PutBlob(tag, "g", want.size(), piece.size(), piece.data()) == 0);
       want += piece;
     }
     std::string back(want.size(), '\0');
-    io.AsyncGetBlob(tag, "g", 0, back.size(), 0, back.data()).Wait();
+    REQUIRE(io.GetBlob(tag, "g", 0, back.size(), back.data()) == 0);
     REQUIRE(back == want);
     REQUIRE(WaitFlushed(io));
     REQUIRE(CoreRead(tag, "g", 0, want.size()) == want);
@@ -724,19 +869,13 @@ TEST_CASE("ShmWtc - extent mode keeps bytes in leased RAM-bdev granules",
     const int kBlobs = 40;  // 40 MiB through a 16 MiB lease
     for (int k = 0; k < kBlobs; ++k) {
       const std::string v = Payload(1u << 20, static_cast<char>(k));
-      auto put = io.AsyncPutBlob(tag, "e" + std::to_string(k), 0, v.size(),
-                                 v.data());
-      put.Wait();
-      REQUIRE(put->GetReturnCode() == 0);
+      REQUIRE(io.PutBlob(tag, "e" + std::to_string(k), 0, v.size(), v.data()) == 0);
     }
     REQUIRE(WaitFlushed(io));
     for (int k = 0; k < kBlobs; ++k) {
       const std::string v = Payload(1u << 20, static_cast<char>(k));
       std::string back(v.size(), '\0');
-      auto get = io.AsyncGetBlob(tag, "e" + std::to_string(k), 0, back.size(),
-                                 0, back.data());
-      get.Wait();
-      REQUIRE(get->GetReturnCode() == 0);
+      REQUIRE(io.GetBlob(tag, "e" + std::to_string(k), 0, back.size(), back.data()) == 0);
       REQUIRE(back == v);
     }
     REQUIRE(st->evictions_.load() > 0);
@@ -748,20 +887,14 @@ TEST_CASE("ShmWtc - extent mode keeps bytes in leased RAM-bdev granules",
     // one frees one scattered granule, never a run a 1 MiB blob can use.
     const std::string small = Payload(4096, 's');
     for (int i = 0; i < 4200; ++i) {
-      auto p = io.AsyncPutBlob(tag, "s" + std::to_string(i), 0, small.size(),
-                               small.data());
-      p.Wait();
-      REQUIRE(p->GetReturnCode() == 0);
+      REQUIRE(io.PutBlob(tag, "s" + std::to_string(i), 0, small.size(), small.data()) == 0);
     }
     REQUIRE(WaitFlushed(io));
     const clio::run::u64 puts0 = st->puts_.load();
     auto t0 = std::chrono::steady_clock::now();
     for (int i = 0; i < 4; ++i) {
       const std::string v = Payload(1 << 20, static_cast<char>('a' + i));
-      auto p = io.AsyncPutBlob(tag, "L" + std::to_string(i), 0, v.size(),
-                               v.data());
-      p.Wait();
-      REQUIRE(p->GetReturnCode() == 0);
+      REQUIRE(io.PutBlob(tag, "L" + std::to_string(i), 0, v.size(), v.data()) == 0);
     }
     const double ms = std::chrono::duration<double, std::milli>(
                           std::chrono::steady_clock::now() - t0).count();
@@ -781,15 +914,258 @@ TEST_CASE("ShmWtc - extent mode keeps bytes in leased RAM-bdev granules",
     const std::string base(128 * 1024, 'x');
     core.AsyncPutBlob(tag, "p", 0, base.size(), base.data()).Wait();
     const std::string a(5000, 'A');
-    io.AsyncPutBlob(tag, "p", 70000, a.size(), a.data()).Wait();
+    REQUIRE(io.PutBlob(tag, "p", 70000, a.size(), a.data()) == 0);
     std::string want = base;
     std::memcpy(&want[70000], a.data(), a.size());
     std::string back(want.size(), '\0');
-    io.AsyncGetBlob(tag, "p", 0, back.size(), 0, back.data()).Wait();
+    REQUIRE(io.GetBlob(tag, "p", 0, back.size(), back.data()) == 0);
     REQUIRE(back == want);
     REQUIRE(WaitFlushed(io));
     REQUIRE(CoreRead(tag, "p", 0, want.size()) == want);
   }
+}
+
+/**
+ * Format a private segment for a View-only test (no runtime involved).
+ * @param view the view to format
+ * @param tag  distinguishes this test's segment name
+ */
+static void FormatPrivateView(wtc::View &view, const std::string &tag) {
+  const clio::run::u32 pid = static_cast<clio::run::u32>(getpid());
+  wtc::Limits lim;
+  lim.seg_size_ = 16ull << 20;
+  lim.max_blobs_ = 1024;
+  lim.log_depth_ = 1024;
+  const std::string name = "clio_wtc_viewtest_" + tag + "_" +
+                           std::to_string(pid);
+  const ctp::ipc::MemoryBackendId id(pid, 0x57550000u);
+  REQUIRE(view.Format(name, id, lim, /*node_id=*/0));
+  REQUIRE(view.Ready());
+}
+
+/**
+ * Write a blob through a View and take its slot off the dirty log, as the
+ * flusher does (the range stays pending until CompleteRanges).
+ * @return the blob's slot
+ */
+static clio::run::u32 PutAndPopSlot(wtc::View &view, const std::string &blob,
+                                    const std::string &bytes) {
+  REQUIRE(view.TryPut(1, 1, blob.data(), blob.size(), 0, bytes.size(),
+                      bytes.data(), 0, /*may_block=*/false) ==
+          wtc::Status::kOk);
+  wtc::DirtyRange r{};
+  REQUIRE(view.Log()->Pop(r));
+  return r.slot_;
+}
+
+/** Milliseconds since `t0`. */
+static double MsSince(std::chrono::steady_clock::time_point t0) {
+  return std::chrono::duration<double, std::milli>(
+             std::chrono::steady_clock::now() - t0)
+      .count();
+}
+
+TEST_CASE("ShmWtc - a pinned entry refuses growth (kBusy) and never blocks "
+          "the stripe lock",
+          "[cte][shm_wtc][pin][deadlock]") {
+  // The flusher pins a blob's bytes (zero-copy flush) until the home acks;
+  // the home acks only after invalidating this node, which needs the
+  // blob's stripe lock. A writer that grows the pinned blob must therefore
+  // refuse (kBusy) instead of waiting for the pin under that lock.
+  wtc::View view;
+  FormatPrivateView(view, "busy");
+  const wtc::Stats &st = view.GetRoot()->stats_;
+  const std::string blob = "pinned";
+  const std::string first = Payload(4096, 'p');
+  const clio::run::u32 slot = PutAndPopSlot(view, blob, first);
+
+  // The flush in flight: pin the logged range (pending stays 1).
+  clio::run::u64 size = first.size();
+  clio::run::u64 gen = 0;
+  REQUIRE(view.PinRange(slot, 0, &size, &gen) != nullptr);
+
+  // A write past the buffer's capacity (1 MiB + 47008 B, ior-hard style)
+  // must grow, i.e. move, the pinned buffer.
+  constexpr clio::run::u64 kGrowOff = 1ull << 20;
+  const std::string grow = Payload(47008, 'g');
+  constexpr double kPromptMs = 1000.0;     // a refusal never waits
+  constexpr double kDeadlineMs = 10000.0;  // writer gives up after this
+  std::atomic<int> first_status{-1};
+  std::atomic<double> first_ms{-1.0};
+  std::atomic<int> final_status{-1};
+  std::atomic<bool> writer_done{false};
+  std::thread writer([&] {
+    const auto t0 = std::chrono::steady_clock::now();
+    wtc::Status s = view.TryPut(1, 1, blob.data(), blob.size(), kGrowOff,
+                                grow.size(), grow.data(), 0, false);
+    first_ms.store(MsSince(t0));
+    first_status.store(static_cast<int>(s));
+    // Retry WITHOUT holding anything, as the callers do.
+    while (s == wtc::Status::kBusy && MsSince(t0) < kDeadlineMs) {
+      std::this_thread::sleep_for(std::chrono::microseconds(50));
+      s = view.TryPut(1, 1, blob.data(), blob.size(), kGrowOff, grow.size(),
+                      grow.data(), 0, false);
+    }
+    final_status.store(static_cast<int>(s));
+    writer_done.store(true);
+  });
+
+  // The first refusal arrives promptly.
+  const auto wait0 = std::chrono::steady_clock::now();
+  while (first_status.load() < 0 && MsSince(wait0) < kPromptMs) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  const bool prompt = first_status.load() >= 0;
+  if (!prompt) view.UnpinRange(slot);  // unblock a regressed writer
+  REQUIRE(prompt);
+  INFO("first TryPut took " << first_ms.load() << " ms");
+  REQUIRE(first_status.load() == static_cast<int>(wtc::Status::kBusy));
+  REQUIRE(first_ms.load() < kPromptMs);
+  REQUIRE(st.put_busy_.load() >= 1);
+
+  // The home's invalidation of this node, on the same stripe, completes
+  // while the writer is still being refused.
+  const clio::run::u64 inv0 = st.invalidations_.load();
+  std::atomic<bool> inv_done{false};
+  std::thread inval([&] {
+    view.Invalidate(1, 1, blob.data(), blob.size());
+    inv_done.store(true);
+  });
+  const auto inv_t0 = std::chrono::steady_clock::now();
+  while (!inv_done.load() && MsSince(inv_t0) < kPromptMs) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  const bool inv_prompt = inv_done.load();
+  if (!inv_prompt) view.UnpinRange(slot);
+  inval.join();
+  INFO("Invalidate took " << MsSince(inv_t0) << " ms");
+  REQUIRE(inv_prompt);
+  REQUIRE(st.invalidations_.load() == inv0 + 1);
+  REQUIRE_FALSE(writer_done.load());  // still pinned: still refused
+
+  // The flush lands: unpin. The writer's retry now succeeds.
+  view.UnpinRange(slot);
+  writer.join();
+  REQUIRE(final_status.load() == static_cast<int>(wtc::Status::kOk));
+  std::string back(grow.size(), '\0');
+  REQUIRE(view.TryGet(1, 1, blob.data(), blob.size(), kGrowOff, back.size(),
+                      back.data()) == wtc::Status::kOk);
+  REQUIRE(back == grow);
+  view.CompleteRanges(slot, 1);
+}
+
+TEST_CASE("ShmWtc - invalidate and drop of a pinned, flushed entry return "
+          "at once",
+          "[cte][shm_wtc][pin][deadlock]") {
+  // pending_ is 0 (the range completed) but a pin is still held: Invalidate
+  // and DropBlob must not wait for it under the stripe lock. Run on one
+  // thread: a wait here would never end.
+  wtc::View view;
+  FormatPrivateView(view, "drop");
+  const std::string bytes = Payload(8192, 'd');
+  for (const std::string blob : {"inv", "del"}) {
+    const clio::run::u32 slot = PutAndPopSlot(view, blob, bytes);
+    view.CompleteRanges(slot, 1);
+    clio::run::u64 size = bytes.size();
+    clio::run::u64 gen = 0;
+    REQUIRE(view.PinRange(slot, 0, &size, &gen) != nullptr);
+    const auto t0 = std::chrono::steady_clock::now();
+    if (blob == "inv") {
+      view.Invalidate(1, 1, blob.data(), blob.size());
+    } else {
+      view.DropBlob(1, 1, blob.data(), blob.size());
+    }
+    REQUIRE(MsSince(t0) < 1000.0);
+    std::string back(bytes.size(), '\0');
+    // Nothing stale is served, and no size is known.
+    REQUIRE(view.TryGet(1, 1, blob.data(), blob.size(), 0, back.size(),
+                        back.data()) == wtc::Status::kMiss);
+    clio::run::u64 sz = 0;
+    REQUIRE(view.TryGetSize(1, 1, blob.data(), blob.size(), &sz) ==
+            wtc::Status::kMiss);
+    view.UnpinRange(slot);
+    // The entry is writable again afterwards.
+    REQUIRE(view.TryPut(1, 1, blob.data(), blob.size(), 0, bytes.size(),
+                        bytes.data(), 0, false) == wtc::Status::kOk);
+    REQUIRE(view.TryGet(1, 1, blob.data(), blob.size(), 0, back.size(),
+                        back.data()) == wtc::Status::kOk);
+    REQUIRE(back == bytes);
+  }
+}
+
+/** The core over one file device (WtcFixture) and a cache over it. */
+static const clio::run::PoolId kFullCorePool(513, 0);
+static const clio::run::PoolId kFullCachePool(577, 0);
+
+/**
+ * Make the full-device core's file target refuse every write with ENOSPC
+ * (the file bdev's TEST-ONLY `.nospace` marker), or work again.
+ * @param full true: the device is full; false: it has room again
+ */
+static void SetDeviceFull(bool full) {
+  auto *ipc = CLIO_IPC;
+  // The core registers a device on node N as `<path>_node<N>`.
+  const std::string marker = DataDir() + "/" + WtcFixture::kFullDeviceFile +
+                             "_node" + std::to_string(ipc->GetNodeId()) +
+                             ".nospace";
+  if (full) {
+    std::ofstream(marker).put('x');
+  } else {
+    fs::remove(marker);
+  }
+  // Longer than the file bdev's 100 ms marker re-check period.
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+}
+
+TEST_CASE("ShmWtc - a device out of space is ENOSPC, not an I/O error",
+          "[cte][shm_wtc][nospace]") {
+  // A full persistent device (a DAOS pool with no room left) used to fail
+  // PutBlob with rc 21, a generic write error: clio-fs reported EIO from
+  // write(2) and fsync(2). It must be the out-of-space code, so the
+  // filesystem returns ENOSPC.
+  WtcFixture fx;
+  CreateCache(kFullCachePool, "shm_wtc_full", 64ull << 20, false, 0, 0,
+              kFullCorePool);
+  const std::string val = Payload(64 * 1024, 'f');
+
+  // Task path, straight to the core: the device refuses the bytes.
+  clio::cte::core::Client core(kFullCorePool);
+  TagId tag = MakeTag(core, "wtc_full_task");
+  REQUIRE(core.PutBlob(tag, "p", 0, val.size(), val.data()) == 0);
+  SetDeviceFull(true);
+  for (clio::run::u64 off : {clio::run::u64(0), clio::run::u64(val.size())}) {
+    const clio::run::u32 rc =
+        core.PutBlob(tag, "p", off, val.size(), val.data());
+    INFO("PutBlob at " << off << " on a full device: rc " << rc);
+    REQUIRE(rc == clio::cte::core::kPutDeviceNoSpaceRc);
+    REQUIRE(clio::cte::core::PutRcIsNoSpace(rc));
+  }
+
+  // Cache path: the write is absorbed, its flush fails, and the fsync of
+  // the tag reports the full device.
+  clio::cte::core::Client io(kFullCachePool);
+  Connect(io, kFullCachePool);
+  TagId ctag = MakeTag(io, "wtc_full_cached");
+  REQUIRE(io.PutBlob(ctag, "c", 0, val.size(), val.data()) == 0);
+  REQUIRE(WaitFlushed(io));
+  auto sync = io.AsyncSyncTag(ctag, clio::run::PoolQuery::Local());
+  sync.Wait();
+  INFO("SyncTag after a failed flush: rc " << sync->GetReturnCode());
+  REQUIRE(sync->GetReturnCode() == clio::cte::core::kSyncNoSpaceRc);
+
+  // Room again: writes land.
+  SetDeviceFull(false);
+  REQUIRE(core.PutBlob(tag, "p", val.size(), val.size(), val.data()) == 0);
+  REQUIRE(io.PutBlob(ctag, "c", 0, val.size(), val.data()) == 0);
+  REQUIRE(WaitFlushed(io));
+  auto sync2 = io.AsyncSyncTag(ctag, clio::run::PoolQuery::Local());
+  sync2.Wait();
+  REQUIRE(sync2->GetReturnCode() == 0);
+  std::string back(val.size(), '\0');
+  auto get = core.AsyncGetBlob(ctag, "c", 0, back.size(), 0, back.data());
+  get.Wait();
+  REQUIRE(get->GetReturnCode() == 0);
+  REQUIRE(back == val);
 }
 
 SIMPLE_TEST_MAIN()

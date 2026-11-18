@@ -127,7 +127,8 @@ GLOBAL_CROSS_CONST clio::run::u32 kMultiDelBlob = 60;
 /** Delete a set of tags (by id) in one task (each container its share). */
 GLOBAL_CROSS_CONST clio::run::u32 kMultiDelTag = 61;
 
-GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 62;
+GLOBAL_CROSS_CONST clio::run::u32 kCowLink = 62;
+GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 63;
 
 inline const std::vector<std::string>& GetMethodNames() {
   static const std::vector<std::string> names = [] {
@@ -177,6 +178,7 @@ inline const std::vector<std::string>& GetMethodNames() {
     v[48] = "MultiPutBlob";
     v[60] = "MultiDelBlob";
     v[61] = "MultiDelTag";
+    v[62] = "CowLink";
     v[49] = "RegisterReplicaContainer";
     v[50] = "GetResidency";
     v[51] = "PodMultiPutBlob";

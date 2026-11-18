@@ -4161,6 +4161,87 @@ clio::run::TaskResume Runtime::MultiPutBlob(
   CLIO_TASK_BODY_END
 }
 
+bool Runtime::PutWillCompress(
+    const clio::cte::core::PutBlobTask *task) const {
+  clio::cte::core::Context ctx = task->context_;
+  ApplyDefaultCodec(ctx);
+  const bool codec = ctx.compress_lib_ > 0 ||
+                     ctx.dynamic_compress_ == clio::cte::core::kCompressDynamic;
+  const bool is_append = (task->flags_ & clio::cte::core::kCtePutAppend) != 0;
+  const bool whole_blob =
+      task->segments_.empty() && task->offset_ == 0 && !is_append;
+  return codec && whole_blob && ctx.replica_ == 0 && !ctx.emulate_;
+}
+
+bool Runtime::BatchWillCompress(const clio::cte::core::Context &ctx) const {
+  clio::cte::core::Context c = ctx;
+  ApplyDefaultCodec(c);
+  const bool codec = c.compress_lib_ > 0 ||
+                     c.dynamic_compress_ == clio::cte::core::kCompressDynamic;
+  return codec && c.replica_ == 0 && !c.emulate_;
+}
+
+clio::run::TaskStat Runtime::GetTaskStats(const clio::run::Task *task) const {
+  namespace cost = clio::run::cost;
+  namespace core = clio::cte::core;
+  if (task == nullptr) {
+    return clio::run::TaskStat();
+  }
+  // Codec work: CPU at codec speed, wall at codec speed plus the storage
+  // write of (at most) the same bytes.
+  auto codec_stat = [](clio::run::u64 bytes, float cpu_rate) {
+    clio::run::TaskStat s = cost::Data(bytes, cpu_rate, cpu_rate, 5);
+    s.wall_time_ += static_cast<float>(bytes) / cost::kStorageBytesPerWallUs;
+    return s;
+  };
+  switch (task->method_) {
+    case Method::kCompress:
+      return codec_stat(static_cast<const CompressTask *>(task)->size_,
+                        cost::kCompressBytesPerCpuUs);
+    case Method::kDynamicSchedule:
+      // Codec selection (model inference over a sample) + the Compress.
+      return codec_stat(static_cast<const DynamicScheduleTask *>(task)->size_,
+                        cost::kCompressBytesPerCpuUs);
+    case Method::kDecompress:
+      return codec_stat(static_cast<const DecompressTask *>(task)->size_,
+                        cost::kDecompressBytesPerCpuUs);
+    case Method::kPollNodeLoad:
+      // /proc CPU sample + a walk over this node's workers.
+      return cost::Fixed(20, 30.0f);
+    case Method::kPollConsumers:
+      // Periodic: one PollNodeLoad per tracked consumer node; idle when
+      // tracking is off.
+      return cost::IdlePeriodic();
+    case core::Method::kPutBlob: {
+      const auto *t = static_cast<const core::PutBlobTask *>(task);
+      if (PutWillCompress(t)) {
+        return codec_stat(core::CoreBlobBytes(t), cost::kCompressBytesPerCpuUs);
+      }
+      break;
+    }
+    case core::Method::kMultiPutBlob: {
+      const auto *t = static_cast<const core::MultiPutBlobTask *>(task);
+      if (BatchWillCompress(t->context_)) {
+        return codec_stat(t->data_len_, cost::kCompressBytesPerCpuUs);
+      }
+      break;
+    }
+    case core::Method::kGetBlob:
+      // A read decompresses whatever codec the blob was stored with; that is
+      // only known from blob metadata, so assume compressed data whenever
+      // this pool compresses by default.
+      if (default_mode_ != core::kCompressSkip) {
+        return codec_stat(
+            core::CoreBlobBytes(static_cast<const core::GetBlobTask *>(task)),
+            cost::kDecompressBytesPerCpuUs);
+      }
+      break;
+    default:
+      break;
+  }
+  return core::CoreInterposer::GetTaskStats(task);
+}
+
 }  // namespace clio::cte::compressor
 
 // Define ChiMod entry points using CLIO_TASK_CC macro

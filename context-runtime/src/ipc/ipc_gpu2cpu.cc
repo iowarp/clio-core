@@ -93,7 +93,7 @@ constexpr double kEvBucketUs[EvChan::kBuckets - 1] = {
 // 61-76: the clio-fs file read / write data path (same header).
 // 77-79: the FUSE adapter's sequential read-ahead (same header).
 // 80-82: the stages of one native DAOS bdev block I/O (same header).
-constexpr int kNumEvChan = 86;
+constexpr int kNumEvChan = 89;
 EvChan g_chan[kNumEvChan];
 const char *g_chan_name[] = {"multi_total", "multi_await", "get_total",
                               "bdev_h2d",   "read_await",  "get_meta",
@@ -127,7 +127,8 @@ const char *g_chan_name[] = {"multi_total", "multi_await", "get_total",
                               "pb_bdev",
                               "ra_hit", "ra_wait", "ra_miss",
                               "daos_q", "daos_io", "daos_done",
-                              "wb_sync_loc", "wb_sync_all", "wb_sync_core"};
+                              "wb_sync_loc", "wb_sync_all", "wb_sync_core",
+                              "wtc_land", "wtc_note", "wtc_home"};
 // A name for every channel: a missing initializer would be a null %s.
 static_assert(sizeof(g_chan_name) / sizeof(g_chan_name[0]) == kNumEvChan,
               "g_chan_name must name every channel");
@@ -255,6 +256,21 @@ extern "C" double clio_evlat_cycles_per_us() { return g_cyc_per_us; }
  * @param which channel index
  * @param n the number to record
  */
+namespace {
+/** Remote sends by pool major (below kOpMajors) and method (below
+ *  kOpMethods); zero-initialized (static storage). */
+constexpr unsigned kOpMajors = 1024;
+constexpr unsigned kOpMethods = 128;
+std::atomic<unsigned long long> g_remote_ops[kOpMajors * kOpMethods];
+}  // namespace
+
+extern "C" void clio_evlat_remote_op(unsigned major, unsigned method) {
+  if (major < kOpMajors && method < kOpMethods) {
+    g_remote_ops[major * kOpMethods + method].fetch_add(
+        1, std::memory_order_relaxed);
+  }
+}
+
 extern "C" void clio_evlat_count(int which, unsigned long long n) {
   clio_evlat_add(which, static_cast<unsigned long long>(
                             static_cast<double>(n) * g_cyc_per_us + 0.5));
@@ -310,6 +326,12 @@ void EvChanReport() {
       fprintf(stderr, " %llu", g_chan[i].hist[b].load());
     }
     fprintf(stderr, "  (<10us <20 <50 <100 <200 <500 <1ms <2 <5 <10 <20 <50 >=50ms)\n");
+  }
+  for (unsigned i = 0; i < kOpMajors * kOpMethods; ++i) {
+    const unsigned long long n = g_remote_ops[i].load();
+    if (n == 0) continue;
+    fprintf(stderr, "clio-evremote pool=%u method=%u n=%llu\n",
+            i / kOpMethods, i % kOpMethods, n);
   }
 }
 

@@ -216,6 +216,64 @@ $ ls ~/clio-mnt/results
 </table>
 <p>Context FS scores 1.82x DAOS dfuse overall (38.69-39.28 against 21.02-21.78 across the runs). The lead comes from metadata: stat, read, delete and find are 2-64x faster, and the metadata score is 5.8x. Two of those ratios are less settled than the rest, because Context FS varied between runs on mdtest-easy stat (383-780 thousand per second) and find (217-325); it led by a wide margin in every run.</p>
 <p>DAOS dfuse leads on bandwidth, 42.18 against 23.86 GiB/s. It writes the file-per-process ior-easy data 4.4x faster and reads the shared ior-hard file 2.5x faster; Context FS matches it on ior-easy read and is 12% ahead on ior-hard write. dfuse also creates files faster (mdtest easy and hard write, 0.62x and 0.69x). Context FS acknowledges a write once it is in the DRAM tier and makes it durable at <code>fsync</code>; each IOR write phase ends with an <code>fsync</code>, so the data is on DAOS when the phase's clock stops.</p>
+<h3>Against DAOS and Flare on Aurora: IOR bandwidth at 128 nodes</h3>
+<p>IOR on 128 compute nodes of Aurora, 16 ranks per node (2,048 ranks), in four access patterns. Every phase uses direct I/O (<code>--posix.odirect</code>), so the kernel page cache serves nothing and each system is measured on its own data path.</p>
+<ul class="checks">
+  <li><strong>Context FS</strong>: build of <code>clio-cache-cow-cost-models</code> (PR #1376, 33fedf5de). The shared-memory cache holds file data over write-through, with a DRAM tier twice the size of the data over a DAOS tier reached natively through libdfs. <code>CLIO_FUSE_ODIRECT=1</code> makes the FUSE mount honor <code>O_DIRECT</code>.</li>
+  <li><strong>DAOS</strong>: a POSIX container in the same pool, mounted with <code>dfuse</code>.</li>
+  <li><strong>Context FS and DAOS</strong> each write a 256 GiB footprint once (with <code>fsync</code>), then read it for 60 seconds; each rank reads another node's data. The write phases last 1-33 seconds, so they include fixed start-up and <code>fsync</code> costs.</li>
+  <li><strong>Flare</strong> (Lustre) ran in a separate job with a 96 GiB footprint, rewritten and then read for 60 seconds each, because of the project's storage quota. Its numbers are a rough comparison, not a matched one.</li>
+</ul>
+<div class="chart-grid">
+  <figure><figcaption>Read, file per process 2 MiB, GiB/s</figcaption>
+<ul class="bars" aria-label="Read, file per process 2 MiB, GiB/s">
+  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:100%"></i></span><span class="val">2,484.2</span></li>
+  <li><span>DAOS dfuse</span><span class="bar"><i style="width:25%"></i></span><span class="val">619.0</span></li>
+  <li><span>Flare (Lustre)</span><span class="bar"><i style="width:29%"></i></span><span class="val">731.1</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>Read, shared file 16 MiB, GiB/s</figcaption>
+<ul class="bars" aria-label="Read, shared file 16 MiB, GiB/s">
+  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:100%"></i></span><span class="val">2,043.6</span></li>
+  <li><span>DAOS dfuse</span><span class="bar"><i style="width:25%"></i></span><span class="val">520.0</span></li>
+  <li><span>Flare (Lustre)</span><span class="bar"><i style="width:1%"></i></span><span class="val">6.2</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>Write, file per process 2 MiB, GiB/s</figcaption>
+<ul class="bars" aria-label="Write, file per process 2 MiB, GiB/s">
+  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:24%"></i></span><span class="val">64.1</span></li>
+  <li><span>DAOS dfuse</span><span class="bar"><i style="width:91%"></i></span><span class="val">237.3</span></li>
+  <li><span>Flare (Lustre)</span><span class="bar"><i style="width:100%"></i></span><span class="val">262.1</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>Write, shared file 64 KiB, GiB/s</figcaption>
+<ul class="bars" aria-label="Write, shared file 64 KiB, GiB/s">
+  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:100%"></i></span><span class="val">12.1</span></li>
+  <li><span>DAOS dfuse</span><span class="bar"><i style="width:65%"></i></span><span class="val">7.9</span></li>
+  <li><span>Flare (Lustre)</span><span class="bar"><i style="width:1%"></i></span><span class="val">0.04</span></li>
+</ul>
+  </figure>
+</div>
+<p>Every pattern (GiB/s, higher is better; one run each):</p>
+<table>
+  <tr><th>Pattern</th><th>Context FS write</th><th>DAOS write</th><th>Flare write</th><th>Context FS read</th><th>DAOS read</th><th>Flare read</th></tr>
+  <tr><td>File per process, 2 MiB</td><td>64.1</td><td>237.3</td><td><strong>262.1</strong></td><td><strong>2,484.2</strong></td><td>619.0</td><td>731.1</td></tr>
+  <tr><td>File per process, 64 KiB</td><td>44.2</td><td><strong>106.0</strong></td><td>33.3</td><td><strong>1,673.8</strong></td><td>390.7</td><td>122.5</td></tr>
+  <tr><td>Shared file, 16 MiB</td><td><strong>96.0</strong></td><td>86.3</td><td>3.8</td><td><strong>2,043.6</strong></td><td>520.0</td><td>6.2</td></tr>
+  <tr><td>Shared file, 64 KiB</td><td><strong>12.1</strong></td><td>7.9</td><td>0.04</td><td><strong>1,844.2</strong></td><td>376.6</td><td>—</td></tr>
+</table>
+<p>Context FS reads 3.9-4.9x faster than DAOS in every pattern. The data fits in its DRAM tier, so each rank's reads come from another node's memory, about 19 GiB/s per node; DAOS reads from its storage servers. On the shared file Context FS also reads about 300x faster than Flare (16 MiB transfers). Flare's 64 KiB shared-file read failed on one rank.</p>
+<p>On writes DAOS leads with one file per process (3.7x on 2 MiB transfers, 2.4x on 64 KiB), and Context FS leads on the shared file (1.1x on 16 MiB, 1.5x on 64 KiB). Flare writes one file per process at 262 GiB/s, but a shared file at 3.8 and 0.04 GiB/s.</p>
+<p>With a 1 TB footprint, Context FS wrote one file per process (2 MiB) at 145.5 GiB/s and read it at 2,456.7 GiB/s. The next pattern in that job reused the same DAOS space and ran the pool out of space: DAOS keeps every overwritten version until it reclaims it, and the Context FS DAOS tier overwrites its blocks in place. That interaction is an open issue, so the 1 TB set is incomplete.</p>
+<h3>IOR easy and hard at 256 and 512 nodes</h3>
+<p>The ior-easy and ior-hard write phases of IO500 on 256 and 512 Aurora nodes (16 ranks per node), with work per rank capped so each run writes under 1 TB. ior-easy writes one file per rank in 2 MiB transfers; ior-hard writes 47,008-byte pieces interleaved into one shared file. GiB/s, higher is better; one run each.</p>
+<table>
+  <tr><th>Phase</th><th>Context FS, 256</th><th>DAOS, 256</th><th>Context FS, 512</th><th>DAOS, 512</th><th>Flare, 512</th></tr>
+  <tr><td>ior easy write</td><td>94.9</td><td><strong>344.9</strong></td><td>50.8</td><td><strong>313.5</strong></td><td>203.1</td></tr>
+  <tr><td>ior hard write</td><td>did not finish</td><td><strong>15.7</strong></td><td>did not finish</td><td><strong>5.8</strong></td><td>0.07</td></tr>
+</table>
+<p>DAOS writes one file per rank 3.6x faster than Context FS at 256 nodes and 6.2x at 512. Flare's run used a smaller footprint (about 400 GB against about 850 GB) because of its storage quota.</p>
+<p>Context FS's ior-hard deadlocked at 256 nodes: a write held a page lock while waiting for the flusher to release that page, and the flusher was waiting on an invalidation that needed the same lock. The fix (a pinned page refuses the write, which retries without the lock) is in PR #1376, and with it ior-hard completes on 8 nodes. The 512-node run with the fix did not finish ior-hard within the job's hour; whether it was slow or blocked is not yet known.</p>
 <h3>Checkpointing a simulation through the tiers</h3>
 <p>From the Eternia paper's evaluation: Gray-Scott on 2 Aurora nodes, 8 steps, a checkpoint every 2 steps. Each checkpoint is a copy-on-write snapshot that CLIO Core drains down the tier stack in the background, in a layout the HDF5 VOL can read. It is compared with a conventional synchronous checkpoint, in which the simulation waits until the snapshot reaches persistent storage; in the Lustre-heavy composition that is a simulation writing its checkpoint to the parallel file system. Total runtime in seconds, lower is better.</p>
 <div class="chart-grid">

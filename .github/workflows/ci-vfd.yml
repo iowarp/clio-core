@@ -124,8 +124,12 @@ jobs:
               # Both test binaries must be named here. ctest below selects by
               # name (-R vfd), so any target left out is still selected and then
               # reported as "Not Run" 
+              # The adapter test config composes the shm cache (pool 568), a
+              # runtime module the test binaries do not link, so build it too.
               cmake --build build-vfd -j"$(nproc)" \
-                --target clio_cte_vfd_unit_tests clio_cte_vfd_no_runtime_tests
+                --target clio_cte_vfd_unit_tests clio_cte_vfd_no_runtime_tests \
+                         clio_cte_core_shm_cache_writethru_runtime \
+                         clio_cte_core_shm_cache_writethru_client
               # ABI gate: the VFD MUST link the same libhdf5 the tools use.
               echo "== VFD libhdf5 linkage =="
               ldd build-vfd/bin/libclio_vfd.so | grep -i hdf5

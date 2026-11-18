@@ -99,17 +99,14 @@ bool Barrier(const TagId &tag) {
   char one = 1;
   const std::string mine =
       "barrier_" + std::to_string(epoch) + "_" + std::to_string(Rank());
-  auto put = Io()->AsyncPutBlob(tag, mine, 0, 1, &one);
-  put.Wait();
-  if (put->GetReturnCode() != 0 || !Sync(tag)) return false;
+  if (Io()->PutBlob(tag, mine, 0, 1, &one) != 0 || !Sync(tag)) return false;
   auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);
   for (int r = 0; r < NumNodes(); ++r) {
     const std::string name =
         "barrier_" + std::to_string(epoch) + "_" + std::to_string(r);
     while (true) {
-      auto sz = Io()->AsyncGetBlobSize(tag, name);
-      sz.Wait();
-      if (sz->GetReturnCode() == 0 && sz->size_ == 1) break;
+      u64 sz = 0;
+      if (Io()->GetBlobSize(tag, name, &sz) == 0 && sz == 1) break;
       if (std::chrono::steady_clock::now() > deadline) {
         fprintf(stderr, "[BARRIER-TIMEOUT] rank=%d epoch=%d waiting_on=%s\n",
                 Rank(), epoch, name.c_str());
@@ -123,9 +120,7 @@ bool Barrier(const TagId &tag) {
 
 /** Read a whole blob through the cache. */
 bool Read(const TagId &tag, const std::string &name, std::string *out) {
-  auto get = Io()->AsyncGetBlob(tag, name, 0, out->size(), 0, out->data());
-  get.Wait();
-  return get->GetReturnCode() == 0;
+  return Io()->GetBlob(tag, name, 0, out->size(), out->data()) == 0;
 }
 
 /** Shared tag (every rank resolves the same id). */
@@ -140,15 +135,13 @@ TagId SharedTag(const std::string &name) {
 
 TEST_CASE("ShmWtc coherence - every node reads every node's writes",
           "[shm_wtc][coherence]") {
-  REQUIRE(Io()->HasWtc());
+  REQUIRE(Io()->HasCache());
   const TagId tag = SharedTag("wtc_coh_porm");
   const int rank = Rank();
   const u64 size = 256 * 1024;
   const std::string mine = Pattern(size, rank, 0);
-  auto put = Io()->AsyncPutBlob(tag, "rank_" + std::to_string(rank), 0, size,
-                                mine.data());
-  put.Wait();
-  REQUIRE(put->GetReturnCode() == 0);
+  REQUIRE(Io()->PutBlob(tag, "rank_" + std::to_string(rank), 0, size,
+                        mine.data()) == 0);
   REQUIRE(Sync(tag));
   REQUIRE(Barrier(tag));
   for (int r = 0; r < NumNodes(); ++r) {
@@ -170,9 +163,7 @@ TEST_CASE("ShmWtc coherence - an overwrite invalidates other nodes' copies",
   const u64 size = 128 * 1024;
   if (rank == 0) {
     const std::string v0 = Pattern(size, 0, 0);
-    auto p = Io()->AsyncPutBlob(tag, "hot", 0, size, v0.data());
-    p.Wait();
-    REQUIRE(p->GetReturnCode() == 0);
+    REQUIRE(Io()->PutBlob(tag, "hot", 0, size, v0.data()) == 0);
     REQUIRE(Sync(tag));
   }
   REQUIRE(Barrier(tag));
@@ -185,9 +176,7 @@ TEST_CASE("ShmWtc coherence - an overwrite invalidates other nodes' copies",
     const int writer = round % NumNodes();
     if (rank == writer) {
       const std::string v = Pattern(size, writer, round);
-      auto p = Io()->AsyncPutBlob(tag, "hot", 0, size, v.data());
-      p.Wait();
-      REQUIRE(p->GetReturnCode() == 0);
+      REQUIRE(Io()->PutBlob(tag, "hot", 0, size, v.data()) == 0);
       REQUIRE(Sync(tag));
     }
     REQUIRE(Barrier(tag));
@@ -211,10 +200,8 @@ TEST_CASE("ShmWtc coherence - N-1 writers to disjoint ranges of one blob",
   // Each rank writes its segment in 4 KB pieces (many small writes).
   const std::string mine = Pattern(seg, rank, 1);
   for (u64 off = 0; off < seg; off += 4096) {
-    auto p = Io()->AsyncPutBlob(tag, "shared", rank * seg + off, 4096,
-                                mine.data() + off);
-    p.Wait();
-    REQUIRE(p->GetReturnCode() == 0);
+    REQUIRE(Io()->PutBlob(tag, "shared", rank * seg + off, 4096,
+                          mine.data() + off) == 0);
   }
   REQUIRE(Sync(tag));
   REQUIRE(Barrier(tag));
@@ -233,9 +220,7 @@ TEST_CASE("ShmWtc coherence - a delete is seen everywhere",
   const u64 size = 32 * 1024;
   if (rank == 0) {
     const std::string v = Pattern(size, 0, 2);
-    auto p = Io()->AsyncPutBlob(tag, "doomed", 0, size, v.data());
-    p.Wait();
-    REQUIRE(p->GetReturnCode() == 0);
+    REQUIRE(Io()->PutBlob(tag, "doomed", 0, size, v.data()) == 0);
     REQUIRE(Sync(tag));
   }
   REQUIRE(Barrier(tag));
@@ -248,9 +233,8 @@ TEST_CASE("ShmWtc coherence - a delete is seen everywhere",
     REQUIRE(d->GetReturnCode() == 0);
   }
   REQUIRE(Barrier(tag));
-  auto sz = Io()->AsyncGetBlobSize(tag, "doomed");
-  sz.Wait();
-  REQUIRE(sz->GetReturnCode() != 0);
+  u64 gone = 0;
+  REQUIRE(Io()->GetBlobSize(tag, "doomed", &gone) != 0);
   REQUIRE(Barrier(tag));
 }
 
@@ -264,7 +248,7 @@ int main(int argc, char *argv[]) {
     return 2;
   }
   fprintf(stderr, "shm_wtc coherence: rank %d ready (cache %s)\n", Rank(),
-          Io()->HasWtc() ? "attached" : "NOT attached");
+          Io()->HasCache() ? "attached" : "NOT attached");
   std::string filter = argc > 1 ? argv[1] : "";
   int result = SimpleTest::run_all_tests(filter);
   if (SimpleTest::g_test_finalize) SimpleTest::g_test_finalize();

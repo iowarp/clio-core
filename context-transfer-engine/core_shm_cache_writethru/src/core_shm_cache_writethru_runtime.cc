@@ -72,7 +72,13 @@ static constexpr double kBarrierPollUs = 10.0;
 
 clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   CLIO_TASK_BODY_BEGIN
-  config_ = task->GetParams();
+  // The task is NOT a CreateTask, whatever the parameter says: compose hands
+  // this ChiMod a ComposeTask<PoolConfig>, a direct caller its own
+  // instantiation. All of them ARE a CreatePoolFields, so every read and write
+  // goes through that (see CreatePoolFields::GetParamsAs). Calling a member
+  // through `task` is undefined behaviour, which UBSan reports.
+  auto &fields = task.template Cast<clio::run::admin::CreatePoolFields>();
+  config_ = fields->GetParamsAs<WtcConfig>();
   interposer_next_pool_ = config_.next_pool_id_;
   next_client_ = std::make_unique<clio::cte::core::Client>(CorePoolId());
   if (!config_.data_pool_.IsNull() && !config_.md_only_ &&
@@ -91,6 +97,10 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
     flush->SetPeriod(config_.flush_period_us_, clio::run::kMicro);
     flush->SetFlags(TASK_PERIODIC);
     ipc->Send(flush);
+    auto *manager = CLIO_RUNTIME_MANAGER;
+    if (manager != nullptr) {
+      stats_hook_id_ = manager->AddStopHook([this]() { LogStats(); });
+    }
     HLOG(kInfo,
          "core_shm_cache_writethru {}.{}: segment {} MB, log {} ranges, next {}.{}",
          pool_id_.major_, pool_id_.minor_, config_.capacity_ >> 20,
@@ -100,9 +110,35 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
          "core_shm_cache_writethru {}.{}: no segment; serving tasks only",
          pool_id_.major_, pool_id_.minor_);
   }
-  task->return_code_ = 0;
+  fields->SetReturnCode(0);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
+}
+
+Runtime::~Runtime() {
+  if (stats_hook_id_ != 0) {
+    auto *manager = CLIO_RUNTIME_MANAGER;
+    if (manager != nullptr) manager->RemoveStopHook(stats_hook_id_);
+  }
+}
+
+void Runtime::LogStats() {
+  if (!view_.Ready()) return;
+  const wtc::Stats &st = view_.GetRoot()->stats_;
+  auto v = [](const std::atomic<clio::run::u64> &a) { return a.load(); };
+  HLOG(kWarning,
+       "[shm-cache stats] node={} puts={} put_MiB={} refused: log={} slot={} "
+       "buf={} busy={} miss={} waits={} flush_batches={} flush_ranges={} "
+       "flush_MiB={} flush_skipped={} fills={} md_fills={} get_hits={} "
+       "get_misses={} (absent={} nonres={} range={} busy={}) "
+       "invalidations={} evictions={}",
+       container_id_, v(st.puts_), v(st.put_bytes_) >> 20,
+       v(st.put_full_log_), v(st.put_full_slot_), v(st.put_full_buf_),
+       v(st.put_busy_), v(st.put_miss_), v(st.waits_), v(st.flush_batches_),
+       v(st.flush_ranges_), v(st.flush_bytes_) >> 20, v(st.flush_skipped_),
+       v(st.fills_), v(st.md_fills_), v(st.get_hits_), v(st.get_misses_),
+       v(st.miss_absent_), v(st.miss_nonres_), v(st.miss_range_),
+       v(st.miss_busy_), v(st.invalidations_), v(st.evictions_));
 }
 
 bool Runtime::OpenSegment() {
@@ -170,6 +206,7 @@ bool Runtime::OpenSegment() {
                          ? 0
                          : config_.entry_pool_id_.ToU64();
   loc->ready_.store(1, std::memory_order_release);
+  locator_ = loc;
   const clio::run::u64 off = static_cast<clio::run::u64>(
       reinterpret_cast<char *>(loc) - reinterpret_cast<char *>(meta));
   if (!dir->RegisterRoot(pool_id_.ToU64(), off)) {
@@ -207,6 +244,10 @@ clio::run::TaskResume Runtime::LeaseExtents() {
 
 clio::run::TaskResume Runtime::Destroy(clio::run::shared_ptr<DestroyTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  if (locator_ != nullptr) {
+    locator_->ready_.store(0, std::memory_order_release);
+    locator_ = nullptr;
+  }
   view_.Detach();
   if (!leased_.empty()) {
     clio::run::bdev::Client bdev(config_.data_pool_);
@@ -387,7 +428,17 @@ clio::run::TaskResume Runtime::SyncTag(
     while (!view_.FlushedThrough(target)) {
       CLIO_CO_AWAIT(clio::run::yield(kBarrierPollUs));
     }
+    // The landed writes' tag-metadata invalidations went out in the
+    // background: a sync returns only after every one finished.
+    while (!ReapTagNotes()) {
+      CLIO_CO_AWAIT(clio::run::yield(kBarrierPollUs));
+    }
+    // A put that failed for lack of space (any PutBlob no-space code) is
+    // the sync's ENOSPC, so fsync reports a full store, not an I/O error.
     sticky = view_.TakeTagError(task->tag_id_.major_, task->tag_id_.minor_);
+    if (clio::cte::core::PutRcIsNoSpace(sticky)) {
+      sticky = clio::cte::core::kSyncNoSpaceRc;
+    }
     homes = TakeSyncHomes(task->tag_id_);
     const char *tr = std::getenv("CLIO_WTC_TRACE");
     if (tr != nullptr && tr[0] == '1') {
@@ -493,6 +544,53 @@ clio::run::TaskResume Runtime::FetchTagAttrs(const TagId &tag,
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
+}
+
+clio::run::Future<InvalidateTask> Runtime::SendTagNote(const TagId &tag) {
+  auto *ipc = CLIO_IPC;
+  const std::string meta(wtc::kTagMetaName, wtc::kTagMetaNameLen);
+  auto inv = ipc->NewTask<InvalidateTask>(
+      clio::run::CreateTaskId(), pool_id_,
+      clio::run::PoolQuery::DirectId(HomeOf(tag, meta)), kInvalidateFanout,
+      container_id_, PackKeys({BlobKey{tag.major_, tag.minor_, meta}}));
+  return ipc->Send(inv);
+}
+
+void Runtime::NoteTagsLanded(const std::vector<TagId> &tags) {
+  if (!view_.Ready() || CLIO_IPC->GetNumHosts() <= 1) return;
+  std::lock_guard<std::mutex> lk(notes_mtx_);
+  for (const TagId &t : tags) {
+    if (t.IsNull()) continue;
+    const clio::run::u64 key =
+        (static_cast<clio::run::u64>(t.major_) << 32) | t.minor_;
+    auto it = tag_notes_.find(key);
+    if (it != tag_notes_.end()) {
+      it->second.again_ = true;  // one more after the one in flight
+      continue;
+    }
+    TagNote &n = tag_notes_[key];
+    n.fut_ = SendTagNote(t);
+  }
+}
+
+bool Runtime::ReapTagNotes() {
+  std::lock_guard<std::mutex> lk(notes_mtx_);
+  for (auto it = tag_notes_.begin(); it != tag_notes_.end();) {
+    if (!it->second.fut_.IsComplete()) {
+      ++it;
+      continue;
+    }
+    if (it->second.again_) {
+      const TagId t(static_cast<clio::run::u32>(it->first >> 32),
+                    static_cast<clio::run::u32>(it->first & 0xffffffffu));
+      it->second.fut_ = SendTagNote(t);
+      it->second.again_ = false;
+      ++it;
+      continue;
+    }
+    it = tag_notes_.erase(it);
+  }
+  return tag_notes_.empty();
 }
 
 clio::run::TaskResume Runtime::NoteTagsWritten(const std::vector<TagId> &tags,

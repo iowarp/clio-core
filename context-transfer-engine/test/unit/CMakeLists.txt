@@ -1050,65 +1050,6 @@ set_tests_properties(
         ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
 )
 
-# Deferred-put pipeline + multiput batches (issue #862)
-add_executable(test_multiput_defer test_multiput_defer.cc)
-target_link_libraries(test_multiput_defer
-    clio_cte_core_runtime
-    clio_cte_core_client
-    clio::run::admin_runtime
-    clio::run::admin_client
-    clio::run::bdev_runtime
-    clio::run::bdev_client
-    ctp::cxx
-    ${CMAKE_THREAD_LIBS_INIT}
-)
-
-add_test(NAME cte_multiput_defer
-    COMMAND test_multiput_defer)
-
-set_tests_properties(
-    cte_multiput_defer
-    PROPERTIES
-        TIMEOUT 300
-        LABELS "unit;multiput;cte"
-        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
-)
-
-# Client-side data sieving (issue #1007). The same binary runs twice: once
-# with the sieve (default-on) and once with CLIO_CTE_PUT_SIEVE=0, so every
-# case is also a kill-switch parity check against the plain batch pipeline.
-add_executable(test_put_sieve test_put_sieve.cc)
-target_link_libraries(test_put_sieve
-    clio_cte_core_runtime
-    clio_cte_core_client
-    clio::run::admin_runtime
-    clio::run::admin_client
-    clio::run::bdev_runtime
-    clio::run::bdev_client
-    ctp::cxx
-    ${CMAKE_THREAD_LIBS_INIT}
-)
-
-add_test(NAME cte_put_sieve
-    COMMAND test_put_sieve)
-add_test(NAME cte_put_sieve_disabled
-    COMMAND test_put_sieve)
-
-set_tests_properties(
-    cte_put_sieve
-    PROPERTIES
-        TIMEOUT 300
-        LABELS "unit;sieve;cte"
-        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
-)
-set_tests_properties(
-    cte_put_sieve_disabled
-    PROPERTIES
-        TIMEOUT 300
-        LABELS "unit;sieve;cte"
-        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1;CLIO_CTE_PUT_SIEVE=0"
-)
-
 # Blob replicas + replication chimod (issue #886). Gated on the module: the
 # mechanism tests also exercise the policy verbs, and the module is ON by
 # default, so the gate only matters for trimmed builds.
@@ -1414,6 +1355,38 @@ set_tests_properties(
     PROPERTIES
         TIMEOUT 300
         LABELS "unit;checkpoint;cte"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
+)
+
+# Copy-on-write (lazy checkpoints): a copy taken with vector.Copy(sync=false)
+# holds the source's bytes as of the copy, however the source is overwritten
+# or deleted afterwards.
+add_executable(test_checkpoint_cow test_checkpoint_cow.cc)
+target_include_directories(test_checkpoint_cow PRIVATE
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+    ${CMAKE_SOURCE_DIR}/context-transfer-engine/checkpoint/include
+)
+target_link_libraries(test_checkpoint_cow
+    clio_cte_core_runtime
+    clio_cte_core_client
+    clio_cte_checkpoint_runtime
+    clio_cte_checkpoint_client
+    clio::run::admin_runtime
+    clio::run::admin_client
+    clio::run::bdev_runtime
+    clio::run::bdev_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+add_test(NAME cte_checkpoint_cow
+    COMMAND test_checkpoint_cow)
+
+set_tests_properties(
+    cte_checkpoint_cow
+    PROPERTIES
+        TIMEOUT 300
+        LABELS "unit;checkpoint;cte;cow"
         ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
 )
 endif()  # TARGET clio_cte_checkpoint_client
@@ -1978,105 +1951,9 @@ set_tests_properties(
         ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1"
 )
 
-# ------------------------------------------------------------------------------
-# GPU metadata cache unit tests — pure POD header, CPU-testable
-# ------------------------------------------------------------------------------
-add_executable(test_cte_shm_metadata_cache
-    test_cte_shm_metadata_cache.cc
-)
-
-target_link_libraries(test_cte_shm_metadata_cache
-    clio_cte_core_runtime
-    clio_cte_core_client
-    clio::run::admin_runtime
-    clio::run::admin_client
-    clio::run::bdev_runtime
-    clio::run::bdev_client
-    ctp::cxx
-    ${CMAKE_THREAD_LIBS_INIT}
-)
-
-add_test(NAME cte_shm_metadata_cache_all
-    COMMAND test_cte_shm_metadata_cache)
-
-set_tests_properties(
-    cte_shm_metadata_cache_all
-    PROPERTIES TIMEOUT 120
-)
-
-# ------------------------------------------------------------------------------
-# clio-fs zero-IPC read path (issue #817): correctness + latency
-#
-# UNIX-only, but no longer because of the descriptor layer: that has a Windows
-# port now (FsOff/FsSsize via posix_compat.h) and is compiled on every platform.
-# What keeps this binary UNIX-only is its own harness -- RuntimeServer forks a
-# real clio_run daemon through unistd.h/sys/wait.h, which is the whole point of
-# the test (see the InitRuntime comment).
-# ------------------------------------------------------------------------------
-if(UNIX)
-add_executable(test_cfs_shm_read
-    test_cfs_shm_read.cc
-)
-
-target_include_directories(test_cfs_shm_read PRIVATE
-    ${CMAKE_SOURCE_DIR}/context-runtime/test
-)
-
-# Spawns its own clio_run daemon (RuntimeServer) and composes it from YAML, so
-# the fast path is exercised across a real process boundary. A co-located
-# runtime cannot prove that -- it shares the address space and hand-registers
-# its targets, which is precisely how the production-dead locality check
-# (issue #817) stayed invisible.
-target_compile_definitions(test_cfs_shm_read PRIVATE
-    CLIO_RUN_EXE="$<TARGET_FILE:clio_run>")
-
-target_link_libraries(test_cfs_shm_read
-    clio_cte_filesystem_client  # descriptor layer + chimod client
-    clio_cte_filesystem_client
-    clio_cte_core_client
-    # The client library's Config helpers are defined in the RUNTIME library,
-    # so it has to come after the client on the link line: this binary calls
-    # nothing in it directly, and --as-needed would otherwise drop it before
-    # the client's undefined reference is even seen.
-    clio_cte_core_runtime
-    clio::run::admin_client
-    clio::run::bdev_client
-    ctp::cxx
-    ${CMAKE_THREAD_LIBS_INIT}
-)
-
-# The co-located runtime dlopens the chimods from CLIO_REPO_PATH.
-add_dependencies(test_cfs_shm_read
-    clio_run
-    clio_cte_core_runtime
-    clio_cte_filesystem_runtime
-    clio_bdev_runtime
-    clio_admin_runtime)
-
-add_test(NAME cfs_shm_read
-    COMMAND test_cfs_shm_read
-    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
-
-# This test spawns a live daemon, so it inherits the macOS caveat from the CLI
-# live-runtime tests (issue #482): the local ZMQ DEALER->ROUTER control plane
-# does not deliver ClientConnect replies on the macOS runners, so drive the
-# client over the unix-socket IPC transport there.
-set(_cfs_shm_read_env
-    "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1")
-if(APPLE)
-  string(APPEND _cfs_shm_read_env ";CLIO_IPC_MODE=ipc")
-endif()
-
-set_tests_properties(cfs_shm_read PROPERTIES
-    ENVIRONMENT "${_cfs_shm_read_env}"
-    RESOURCE_LOCK "clio_runtime"
-    TIMEOUT 180
-    LABELS "unit;cte;cfs;msan_skip")
-endif()  # UNIX
-
 # Private-memory AsyncGetBlob (issue #823). UNIX-only because the "separate"
 # configuration forks a real clio_run daemon (RuntimeServer / unistd.h), the
-# same shape the cfs_shm_read test uses. The two ctest entries below run the
+# same shape the other daemon-spawning tests use. The two ctest entries below run the
 # SAME binary in the two runtime configurations the issue calls for: inline
 # (co-located runtime -> direct write into private memory) and separate (pure
 # client -> SHM staging + PostWait copy).
@@ -2095,7 +1972,7 @@ target_compile_definitions(test_getblob_priv PRIVATE
 target_link_libraries(test_getblob_priv
     clio_cte_core_client
     # Config helpers used by the client live in the runtime library; keep it
-    # after the client on the link line (see the cfs_shm_read note above).
+    # after the client on the link line (--as-needed would otherwise drop it).
     clio_cte_core_runtime
     clio::run::admin_client
     clio::run::bdev_client
@@ -2410,7 +2287,7 @@ set_tests_properties(cte_well_known_pool_ids PROPERTIES
 
 # fsync through the descriptor layer must reach a persistent tier (#1188).
 # Spawns its own clio_run daemon, composed with a RAM tier over a file tier;
-# UNIX-only for the same reason as cfs_shm_read (RuntimeServer).
+# UNIX-only: it forks a daemon through RuntimeServer (unistd.h).
 if(UNIX)
 add_executable(test_cfs_fsync_durable
     test_cfs_fsync_durable.cc
@@ -2423,8 +2300,8 @@ target_compile_definitions(test_cfs_fsync_durable PRIVATE
 target_link_libraries(test_cfs_fsync_durable
     clio_cte_filesystem_client
     clio_cte_core_client
-    # Config helpers of the client live in the runtime library (see
-    # test_cfs_shm_read above).
+    # Config helpers of the client live in the runtime library; keep it after
+    # the client on the link line.
     clio_cte_core_runtime
     clio::run::admin_client
     clio::run::bdev_client
@@ -2442,10 +2319,17 @@ add_dependencies(test_cfs_fsync_durable
 add_test(NAME cfs_fsync_durable
     COMMAND test_cfs_fsync_durable
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+# Drive the client over the unix-socket IPC transport on macOS, where the
+# local ZMQ control plane does not deliver ClientConnect replies (#482).
+set(_cfs_fsync_durable_env
+    "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1")
+if(APPLE)
+  string(APPEND _cfs_fsync_durable_env ";CLIO_IPC_MODE=ipc")
+endif()
 set_tests_properties(cfs_fsync_durable PROPERTIES
     RESOURCE_LOCK "clio_runtime"
     TIMEOUT 180
-    ENVIRONMENT "${_cfs_shm_read_env}"
+    ENVIRONMENT "${_cfs_fsync_durable_env}"
     LABELS "unit;cte;cfs;msan_skip")
 endif()  # UNIX
 

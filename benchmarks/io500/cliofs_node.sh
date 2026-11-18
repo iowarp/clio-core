@@ -3,6 +3,10 @@
 # dfuse, start clio_run with this node's config, mount clio_cte_fuse at
 # $LR/mnt, report $OUT/ready/<host>, wait for $OUT/stop, tear down.
 # EMBED=1 runs the runtime inside clio_cte_fuse instead of a separate clio_run.
+# Core dumps: a crashed runtime writes several GB per node into the run
+# directory on Flare; at hundreds of nodes that exceeds the project quota
+# and kills every run after it. CORE_DUMPS=1 keeps them for debugging.
+[ "${CORE_DUMPS:-0}" = 1 ] || ulimit -c 0
 set -u
 H=$(hostname)
 LOG=$OUT/logs/$H
@@ -13,6 +17,13 @@ pkill -9 -u "$USER" -f '[c]lio_cte_fuse' ; pkill -9 -u "$USER" -f '[c]lio_run' ;
 fusermount3 -u -z "$LR/mnt" 2>/dev/null
 rm -rf "$LR"; mkdir -p "$LR/mnt" "$LR/conf" "$LR/memfd" "$LR/meta" "$DM"
 
+# A dfuse that died with an earlier job (or run) leaves a dead mount: stat
+# fails with EINVAL / ENOTCONN, mkdir cannot create the path and every new
+# dfuse fails "Error resolving mount point". Lazily unmount it first.
+stat "$DM" > /dev/null 2>&1 || fusermount3 -u -z "$DM" 2>/dev/null
+# dfuse processes of an earlier run whose mount is gone hold the container
+# open; end them so the mount below starts clean.
+mountpoint -q "$DM" || pkill -u "$USER" -f "dfuse .*-m $DM" 2>/dev/null
 for t in 1 2 3 4 5; do
   mountpoint -q "$DM" && break
   # Caching ON: each node's DAOS tier file is private to that node, so there
@@ -110,5 +121,5 @@ timeout 30 fusermount3 -u "$LR/mnt" 2>/dev/null || fusermount3 -u -z "$LR/mnt"
 [ -n "$RT" ] && timeout 60 "$BUILD_DIR/bin/clio_run" stop >/dev/null 2>&1
 kill -9 $FU $RT 2>/dev/null
 rm -rf "$DM/tiers/$JOB"
-fusermount3 -u "$DM" 2>/dev/null
+fusermount3 -u "$DM" 2>/dev/null || fusermount3 -u -z "$DM" 2>/dev/null
 log "down"

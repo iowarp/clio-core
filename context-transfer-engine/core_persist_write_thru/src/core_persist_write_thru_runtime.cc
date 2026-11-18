@@ -41,14 +41,20 @@ namespace clio::cte::core_persist_write_thru {
 clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   CLIO_TASK_BODY_BEGIN
   {
-    const WriteThruCacheConfig params = task->GetParams();
+    // The task is NOT a CreateTask, whatever the parameter says: compose
+    // hands this ChiMod a ComposeTask<PoolConfig>, a direct caller its own
+    // instantiation. All of them ARE a CreatePoolFields, so every read and
+    // write goes through that (see CreatePoolFields::GetParamsAs). Calling a
+    // member through `task` is undefined behaviour, which UBSan reports.
+    auto &fields = task.template Cast<clio::run::admin::CreatePoolFields>();
+    const WriteThruCacheConfig params = fields->GetParamsAs<WriteThruCacheConfig>();
     if (params.volatile_pool_.IsNull()) {
       HLOG(kError, "clio_cte_core_persist_write_thru: next_volatile is required");
-      task->return_code_ = 1;
+      fields->SetReturnCode(1);
       CLIO_CO_RETURN;
     }
-    InitCache(params, task->new_pool_id_);
-    task->return_code_ = 0;
+    InitCache(params, fields->new_pool_id_);
+    fields->SetReturnCode(0);
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END

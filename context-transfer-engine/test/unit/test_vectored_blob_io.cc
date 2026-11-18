@@ -402,20 +402,20 @@ TEST_CASE("Vectored put/get honor the blob-transform bit",
   put_vectored("vt_transformed", clio::cte::core::kBlobTransformed |
                                      clio::cte::core::kBlobTransformCompressed);
 
-  // The mark reaches the cache record, and only for the declared blob.
-  if (cte->HasShmCache()) {
-    clio::cte::core::ShmBlobRecord raw_rec, xf_rec;
-    REQUIRE(cte->TryGetBlobRecordShm(tag_id, "vt_raw", &raw_rec));
-    REQUIRE(cte->TryGetBlobRecordShm(tag_id, "vt_transformed", &xf_rec));
-    REQUIRE_FALSE(raw_rec.IsTransformed());
-    REQUIRE(xf_rec.IsTransformed());
-    REQUIRE_FALSE(xf_rec.IsDirectReadable());
-    REQUIRE((xf_rec.flags_ & clio::cte::core::kShmBlobDirectReadable) == 0);
+  // The mark reaches the blob's metadata, and only for the declared blob:
+  // GetResidency never calls a transformed blob direct-readable.
+  {
+    auto raw = cte->AsyncGetResidency(tag_id, "vt_raw");
+    raw.Wait();
+    auto xf = cte->AsyncGetResidency(tag_id, "vt_transformed");
+    xf.Wait();
+    REQUIRE(raw->GetReturnCode() == 0);
+    REQUIRE(xf->GetReturnCode() == 0);
+    REQUIRE(xf->exists_ == 1);
+    REQUIRE(xf->direct_readable_ == 0);
     // CONTROL: the raw blob on the same tier IS direct-readable, so the
     // refusal above is attributable to the bit and not to placement.
-    REQUIRE(raw_rec.IsDirectReadable());
-  } else {
-    std::printf("[#818] SHM cache unavailable; record assertions skipped\n");
+    REQUIRE(raw->direct_readable_ == 1);
   }
 
   // A vectored get of the transformed blob must still return the stored

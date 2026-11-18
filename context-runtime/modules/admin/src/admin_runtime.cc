@@ -2420,30 +2420,158 @@ clio::run::TaskResume Runtime::ProbeRequest(clio::run::shared_ptr<ProbeRequestTa
   CLIO_TASK_BODY_END
 }
 
+namespace {
+
+/**
+ * Cost of the admin's network periodics (Send/Recv/ClientSend/ClientRecv).
+ *
+ * They carry no payload of their own: compute_ is the current net_queue
+ * backlog across priorities (each queued task is roughly one microsecond of
+ * marshalling), wall_time_ adds a fixed poll cost on top, and io_size_ is a
+ * 1 MiB stand-in so the scheduler never treats them as zero-cost metadata.
+ * @return the task's cost features
+ */
+clio::run::TaskStat AdminNetStats() {
+  clio::run::TaskStat stat;
+  auto *net_queue = CLIO_IPC->GetNetQueue();
+  size_t total = 0;
+  if (net_queue) {
+    for (clio::run::u32 p = 0; p < 4; ++p) {
+      total += net_queue->GetLane(0, p).Size();
+    }
+  }
+  stat.compute_ = total;
+  stat.wall_time_ = 5.0f + static_cast<float>(total);
+  stat.io_size_ = 1024 * 1024;
+  return stat;
+}
+
+/**
+ * Cost of a SubmitBatch: deserializing and submitting every packed task.
+ * @param task the SubmitBatchTask
+ * @return io_size_ = serialized bytes, plus ~2 us CPU per packed task
+ */
+clio::run::TaskStat SubmitBatchStats(const SubmitBatchTask *task) {
+  namespace cost = clio::run::cost;
+  const size_t n = task->task_infos_.size();
+  return cost::Data(task->serialized_data_.size(), cost::kCopyBytesPerCpuUs,
+                    cost::kMemoryBytesPerWallUs, 5 + 2 * n,
+                    10.0f + 3.0f * static_cast<float>(n));
+}
+
+/**
+ * Cost of the admin's cluster-membership and recovery verbs.
+ * @param method the admin method id
+ * @param stat output; set when the method is one of these verbs
+ * @return true if `method` was handled
+ */
+bool AdminClusterStats(clio::run::u32 method, clio::run::TaskStat *stat) {
+  namespace cost = clio::run::cost;
+  switch (method) {
+    case Method::kAddNode:
+      *stat = cost::Fixed(100, 1000.0f);  // hostfile + address-table update
+      return true;
+    case Method::kChangeAddressTable:
+    case Method::kAnnounceShutdown:
+    case Method::kRegisterGpuContainer:
+    case Method::kQueryTaskProgress:
+      *stat = cost::Metadata();  // one table/map update or lookup
+      return true;
+    case Method::kMigrateContainers:
+      *stat = cost::Fixed(500, 5000.0f);  // move containers between nodes
+      return true;
+    case Method::kRestartContainers:
+    case Method::kRecoverContainers:
+      *stat = cost::Fixed(1000, 10000.0f);  // re-create containers from logs
+      return true;
+    case Method::kHeartbeat:
+      *stat = cost::Trivial();  // answer "alive"
+      return true;
+    case Method::kHeartbeatProbe:
+      *stat = cost::IdlePeriodic();  // SWIM probe round, usually idle
+      return true;
+    case Method::kProbeRequest:
+      *stat = cost::Fixed(10, 50.0f);  // indirect probe of one node
+      return true;
+    default:
+      return false;
+  }
+}
+
+/**
+ * Cost of the admin's pool, client and housekeeping verbs.
+ * @param method the admin method id
+ * @param stat output; set when the method is one of these verbs
+ * @return true if `method` was handled
+ */
+bool AdminControlStats(clio::run::u32 method, clio::run::TaskStat *stat) {
+  namespace cost = clio::run::cost;
+  switch (method) {
+    case Method::kCreate:
+    case Method::kGetOrCreatePool:
+      *stat = cost::ContainerCreate();  // loads the chimod, runs its Create
+      return true;
+    case Method::kDestroy:
+    case Method::kDestroyPool:
+      *stat = cost::ContainerDestroy();
+      return true;
+    case Method::kStopRuntime:
+      *stat = cost::Fixed(100, 1000.0f);
+      return true;
+    case Method::kFlush:
+      *stat = cost::Fixed(20, 50.0f);  // polls work remaining per container
+      return true;
+    case Method::kClientConnect:
+      *stat = cost::Fixed(20, 50.0f);  // fills the connect response
+      return true;
+    case Method::kWreapDeadIpcs:
+      *stat = cost::Fixed(20, 100.0f);  // periodic scan of the memfd dir
+      return true;
+    case Method::kRegisterMemory:
+      *stat = cost::Fixed(50, 500.0f);  // attach (mmap) a client segment
+      return true;
+    case Method::kSystemMonitor:
+      *stat = cost::Fixed(50, 200.0f);  // /proc sampling + model flush
+      return true;
+    case Method::kListContainers:
+      *stat = cost::Fixed(20, 30.0f);
+      return true;
+    case Method::kMonitor:
+      *stat = cost::Fixed(10, 15.0f);
+      return true;
+    default:
+      return false;
+  }
+}
+
+}  // namespace
+
+/**
+ * Per-task cost estimate for the scheduler (see Container::GetTaskStats).
+ * Every admin method gets an explicit estimate; see AdminNetStats,
+ * SubmitBatchStats, AdminClusterStats and AdminControlStats.
+ * @param task the task to estimate
+ * @return the task's cost features
+ */
 clio::run::TaskStat Runtime::GetTaskStats(const clio::run::Task *task) const {
   if (!task) return clio::run::TaskStat();
   switch (task->method_) {
     case Method::kSend:
     case Method::kRecv:
     case Method::kClientRecv:
-    case Method::kClientSend: {
-      // Admin net periodics don't carry a variable payload of their own;
-      // io_size_ here is just a stand-in so the scheduler doesn't route
-      // them as zero-cost metadata. compute_ reflects the current
-      // net_queue backlog so periodic schedulers can throttle if needed.
-      clio::run::TaskStat stat;
-      auto *net_queue = CLIO_IPC->GetNetQueue();
-      size_t total = 0;
-      if (net_queue) {
-        for (clio::run::u32 p = 0; p < 4; ++p)
-          total += net_queue->GetLane(0, p).Size();
-      }
-      stat.compute_ = total;
-      stat.io_size_ = 1024 * 1024;
-      return stat;
-    }
-    default: return clio::run::TaskStat();
+    case Method::kClientSend:
+      return AdminNetStats();
+    case Method::kSubmitBatch:
+      return SubmitBatchStats(static_cast<const SubmitBatchTask *>(task));
+    default:
+      break;
   }
+  clio::run::TaskStat stat;
+  if (AdminClusterStats(task->method_, &stat) ||
+      AdminControlStats(task->method_, &stat)) {
+    return stat;
+  }
+  return clio::run::cost::Metadata();
 }
 
 clio::run::u64 Runtime::GetWorkRemaining() const {

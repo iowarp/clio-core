@@ -85,7 +85,14 @@ inline bool ParsePoolIdString(const std::string &s, clio::run::PoolId *out) {
  *   flush_period_ms: 10000         # write-back only; 0 = no periodic flush
  *   flush_fill_pct: 80             # write-back only; flush when the volatile
  *                                  #   core is this full; 0 = timer only
+ *   flush_dirty_mb: 256            # write-back only; flush continuously:
+ *                                  #   start a flush whenever this much new
+ *                                  #   dirty data arrived since the last one
+ *                                  #   started; 0 = off
  *   fallback_to_persistent: true   # write-back: write around when full
+ *   flush_pool: "568.0"            # write-back: the pool a flushed range
+ *                                  #   lands at on its owner (default: this
+ *                                  #   cache's own pool)
  */
 struct PolicyCacheParams {
   clio::run::PoolId volatile_pool_;    ///< next_volatile
@@ -101,11 +108,22 @@ struct PolicyCacheParams {
    *  core is at least this full (percent of its capacity), without waiting
    *  for the period. 0 = off. */
   clio::run::u32 flush_fill_pct_ = 80;
+  /** Write-back: continuous flushing. A flush starts whenever this many MiB
+   *  of new dirty data arrived since the last flush started, so flushing
+   *  keeps pace with the writes instead of waiting for the period (or an
+   *  fsync). 0 = off. */
+  clio::run::u32 flush_dirty_mb_ = 256;
   bool fallback_to_persistent_ = true;
+  /** Write-back: the pool a flushed range of another node's blob is sent to
+   *  on that blob's owner. A cache above this one (the shm cache) lands it
+   *  there and invalidates the nodes caching its metadata, once per flushed
+   *  range instead of once per write. Null: this cache's own pool. */
+  clio::run::PoolId flush_pool_;
 
   PolicyCacheParams()
       : volatile_pool_(clio::run::PoolId::GetNull()),
-        persistent_pool_(clio::run::PoolId::GetNull()) {}
+        persistent_pool_(clio::run::PoolId::GetNull()),
+        flush_pool_(clio::run::PoolId::GetNull()) {}
 
   /** Fill mode as an enum. */
   FillMode Fill() const { return static_cast<FillMode>(fill_mode_); }
@@ -118,7 +136,7 @@ struct PolicyCacheParams {
     // in the older interposers bought).
     ar(volatile_pool_, persistent_pool_, fill_mode_, fill_hits_,
        evict_mode_, flush_period_ms_, fallback_to_persistent_,
-       flush_fill_pct_);
+       flush_fill_pct_, flush_dirty_mb_, flush_pool_);
   }
 
   /**
@@ -171,6 +189,11 @@ struct PolicyCacheParams {
                              &persistent_pool_)) {
         HLOG(kError, "policy cache: malformed next_persistent");
       }
+      if (node["flush_pool"] &&
+          !ParsePoolIdString(node["flush_pool"].as<std::string>(),
+                             &flush_pool_)) {
+        HLOG(kError, "policy cache: malformed flush_pool");
+      }
       if (node["fill"] && !ParseFill(node["fill"].as<std::string>())) {
         HLOG(kError,
              "policy cache: fill must be on_read_miss, none or "
@@ -188,6 +211,9 @@ struct PolicyCacheParams {
       }
       if (node["flush_period_ms"]) {
         flush_period_ms_ = node["flush_period_ms"].as<clio::run::u32>();
+      }
+      if (node["flush_dirty_mb"]) {
+        flush_dirty_mb_ = node["flush_dirty_mb"].as<clio::run::u32>();
       }
       if (node["flush_fill_pct"]) {
         flush_fill_pct_ = node["flush_fill_pct"].as<clio::run::u32>();

@@ -230,6 +230,13 @@ class Cluster:
     for k, v in os.environ.items():
       if k.startswith('CLIO_SUITE_PASS_'):
         e[k[len('CLIO_SUITE_PASS_'):]] = v
+    # Write-back is eventually consistent: data a node wrote is visible on
+    # the others once flushed, and fsync is how a workload asks for that.
+    # The agents then behave like such a workload: every file they wrote is
+    # fsynced before it is closed. Write-through needs no fsync (its writes
+    # are visible at once), so those runs keep checking that.
+    if self.cache == 'write_back':
+      e['CLIO_SUITE_FSYNC_ON_CLOSE'] = '1'
     e.update(self.extra_env)
     return e
 

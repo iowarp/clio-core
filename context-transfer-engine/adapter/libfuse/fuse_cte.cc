@@ -147,9 +147,6 @@ static clio::run::u64 PackTag(const clio::cte::core::TagId &tag);
 // read path; RaInit reads the setting at mount.
 struct RaCache;
 static void RaInit();
-// Defined below; used by the closer's background publish on ENOSPC.
-static void ShrinkAfterNoSpace(const std::string &hp,
-                               clio::run::u64 first_bad);
 
 namespace {
 /** The attributes a stat is built from (FillStatFromAttrs): a Getattr
@@ -184,8 +181,8 @@ struct CfsHandle {
   clio::run::u64 fh = 0;
   std::string path;
   // The file's CTE tag (null when unknown): lets data ops drive page blobs
-  // through the CTE client directly — writes into the sieve buffer, reads
-  // through the tiered RYW/SHM/RPC path — instead of a chimod task per op.
+  // through the CTE client directly (Client::PutBlob / GetBlob: the shm
+  // cache when connected, else a task) instead of a chimod task per op.
   clio::cte::core::TagId tag = clio::cte::core::TagId::GetNull();
   // Guards `path`, which follows renames of the open file (see HandlePath).
   std::mutex path_mu;
@@ -203,9 +200,6 @@ struct CfsHandle {
   // The open-file record of the libfuse node it was opened on (null: not
   // registered; see RegisterOpenFile).
   std::shared_ptr<struct OpenNode> open_node;
-  // Client no-space epoch this handle last checked (#1129, see
-  // CheckWriteBehindNoSpace).
-  std::atomic<clio::run::u64> nospace_seen{0};
   // The attributes the Open that CREATED this file returned with it. They
   // answer the one getattr(path, fi) the FUSE layer makes inside the same
   // create request, which otherwise costs a round trip to the inode's home
@@ -301,9 +295,6 @@ struct CacheKeyLess {
 struct OpenNode {
   std::string path;  ///< the node's current path (follows renames)
   std::unordered_map<clio::run::u64, clio::run::u32> files;  ///< id -> opens
-  /// Opens with no server handle (a minted create): the server keeps no open
-  /// count for them, so it would destroy the file at its unlink.
-  clio::run::u32 unanchored = 0;
 };
 
 // Files open on this mount, per libfuse node (keyed by its current path).
@@ -348,7 +339,6 @@ static void RegisterOpenFile(CfsHandle *h, struct fuse_file_info *fi) {
     }
   }
   ++node->files[id];
-  if (h->fh == 0) ++node->unanchored;
   h->open_node = node;
 }
 
@@ -364,7 +354,6 @@ static void UnregisterOpenFile(CfsHandle *h) {
   auto &node = h->open_node;
   auto ft = node->files.find(id);
   if (ft != node->files.end() && --ft->second == 0) node->files.erase(ft);
-  if (h->fh == 0 && node->unanchored > 0) --node->unanchored;
   if (node->files.empty()) {
     auto it = g_open_files.find(node->path);
     if (it != g_open_files.end() && it->second == node) g_open_files.erase(it);
@@ -505,38 +494,6 @@ static std::string OpPath(const char *path, struct fuse_file_info *fi) {
   return h != nullptr ? HandlePath(h, nullptr) : std::string();
 }
 
-// Sieve-direct data path (user directive: writes belong in the sieve
-// buffer; only namespace ops should need chimod tasks). CLIO_FUSE_SIEVE=0
-// falls back to the chimod Write/Read tasks wholesale.
-bool SieveDataEnabled() {
-  static const bool v = [] {
-    const char *e = getenv("CLIO_FUSE_SIEVE");
-    return e == nullptr || *e != '0';
-  }();
-  return v;
-}
-
-/**
- * Write data that may be in flight to the store at once (bytes).
- *
- * Writes are copied into client shared memory and shipped as deferred puts;
- * with no window a burst of writes queued there as fast as applications
- * wrote, and client shared-memory segments are never released: a Steam
- * install (48 GB, ~9 writers) grew the adapter to 64 segments / 8 GB.
- * Past the window a write first awaits the oldest puts.
- * CLIO_FUSE_WRITE_INFLIGHT_MB overrides the 256 MiB default; 0 = no window.
- * @return the window in bytes (0 = unbounded)
- */
-clio::run::u64 WriteInflightBytes() {
-  static const clio::run::u64 v = [] {
-    const char *e = getenv("CLIO_FUSE_WRITE_INFLIGHT_MB");
-    const clio::run::u64 mb =
-        e != nullptr && e[0] != 0 ? std::strtoull(e, nullptr, 10) : 256;
-    return mb << 20;
-  }();
-  return v;
-}
-
 /**
  * Score rule for the file data pages this adapter puts itself (the
  * filesystem module's `data_score` / `data_score_head_pages`). Fetched from
@@ -549,8 +506,7 @@ clio::cte::core::PageScorePolicy g_page_score;
  * True when this mount is one of several nodes sharing a namespace.
  *
  * Several fast paths here are sound only when this process sees every
- * mutation of the namespace: the sieve-create shortcut trusts the kernel's
- * negative lookup for O_EXCL, and the asynchronous release publishes a file's
+ * mutation of the namespace: the asynchronous release publishes a file's
  * size after close(2) has returned. Neither holds when another node's mount
  * creates, reads or writes the same files, so they are disabled there.
  * Decided from the runtime's hostfile (more than one line); the environment
@@ -778,36 +734,15 @@ static int SyncDurable(const clio::cte::core::TagId &tag,
   return cfs->SyncMetaDurable();  // the directory journal
 }
 
-/**
- * Whether O_EXCL creates may take the SIEVE-CREATE shortcut (mint the tag
- * locally, create it on the server later in a MultiCreate batch).
- *
- * On by default (CLIO_FUSE_SIEVE_CREATE=0 disables); never on a multi-node
- * mount, where O_EXCL would rest on this mount's negative lookup alone.
- * Two defects once made it unsafe for git, both fixed: link() did not wait
- * for the source's queued close-to-open work (git's close, link(tmp, obj),
- * unlink(tmp) left loose objects empty or missing), and the server's
- * MultiCreate published no mirror record, so once the batch landed a stat
- * of the new file inside a mirror-complete directory was answered ENOENT.
- * @return true when the shortcut may be used
- */
-bool SieveCreateEnabled() {
-  static const bool v = [] {
-    const char *e = getenv("CLIO_FUSE_SIEVE_CREATE");
-    return e == nullptr || *e != '0';
-  }();
-  return v && SieveDataEnabled() && !MultiNode();
-}
-
-// Logical-size high-water for files with UNFLUSHED sieve writes: the chimod// Logical-size high-water for files with UNFLUSHED sieve writes: the chimod
+// Logical-size high-water for files written through direct page puts: the chimod
 // only learns the size at close (CloseTask::advance_size_), so getattr and
 // read-clamping consult this in the meantime. Path-keyed; renames move the
 // entry, the closer erases it once the size-carrying close has been sent.
 std::mutex g_hw_mtx;
 PathMap<clio::run::u64> g_hiwater;
 // Wall-clock time (ns) of the last write(2) this mount accepted per path,
-// kept alongside the hiwater: sieved bytes reach the chimod -- and so the
-// tag's mtime -- only when their page ships, so a stat right after write(2)
+// kept alongside the hiwater: page puts bypass the chimod, so the tag's mtime
+// moves only when the size is published, and a stat right after write(2)
 // reported the PRE-write mtime (make and rsync compare exactly that).
 PathMap<clio::run::u64> g_wtime;
 // A write time an explicit utimens took off the stat overlay (the caller's
@@ -1049,162 +984,14 @@ void HiwaterRename(const std::string &from, const std::string &to) {
   }
 }
 
-// Per-tag extent of page writes not yet drained. Unlike the hiwater overlay
-// (a SIZE hint that a lazy closer may erase once the size is published),
-// only a drain clears this, so a drain never skips a page a handle wrote:
-// a write, fsync, O_TRUNC sequence whose previous open's closer erased the
-// hiwater left the write in the sieve, and it landed after the truncate.
-std::mutex g_dirty_mtx;
-std::unordered_map<clio::run::u64, clio::run::u64> g_dirty_end;
-
-/**
- * Record that page writes of `tag` reach `end` bytes.
- * @param tag the file's tag
- * @param end byte offset one past the write
- */
-void DirtyRaise(const clio::cte::core::TagId &tag, clio::run::u64 end) {
-  const clio::run::u64 k =
-      (static_cast<clio::run::u64>(tag.major_) << 32) | tag.minor_;
-  std::lock_guard<std::mutex> lk(g_dirty_mtx);
-  auto &v = g_dirty_end[k];
-  if (end > v) v = end;
-}
-
-/**
- * Take (and clear) the undrained write extent of `tag`. Taken BEFORE the
- * drain, so a write racing the drain re-records itself.
- * @param tag the file's tag
- * @return the extent, 0 if nothing was written since the last drain
- */
-clio::run::u64 DirtyTake(const clio::cte::core::TagId &tag) {
-  const clio::run::u64 k =
-      (static_cast<clio::run::u64>(tag.major_) << 32) | tag.minor_;
-  std::lock_guard<std::mutex> lk(g_dirty_mtx);
-  auto it = g_dirty_end.find(k);
-  if (it == g_dirty_end.end()) return 0;
-  const clio::run::u64 v = it->second;
-  g_dirty_end.erase(it);
-  return v;
-}
-
-// Drain every page-blob key of `path`'s file (sieve writes register under
-// (tag, page-name), NOT under the cfs FileKey) up to `hiwater` bytes, or
-// further if the file's page writes reached further (see DirtyRaise).
-/**
- * Land every deferred page write of a file and report whether any failed.
- *
- * Failed page puts latch their error under the PAGE key; nothing ever read
- * those latches, so a write the store rejected (tier full, bdev write
- * failure) was acknowledged to write(2), fsync(2) and close(2) alike and the
- * bytes silently read back as zeros (8-node shared-file run, full RAM tier).
- * @param tag     the file's tag
- * @param hiwater extent of the writes to drain
- * @return 0, or the first errno-style error latched by a page write
- */
-/**
- * DrainSievePages with options: land every deferred page write of a file
- * and report whether any failed.
- * @param tag the file's tag
- * @param hiwater extent of the writes to drain
- * @param take consume the latched errors (fsync/close) or only peek
- *        (write(2), which must leave them owed to fsync/close)
- * @param first_bad when non-null, receives the offset of the first page the
- *        store refused for lack of space (~0 if none)
- * @return 0, or the first errno-style error latched by a page write
- */
-int DrainSievePagesEx(const clio::cte::core::TagId &tag,
-                      clio::run::u64 hiwater, bool take,
-                      clio::run::u64 *first_bad) {
-  if (first_bad != nullptr) *first_bad = ~0ull;
-  if (tag.IsNull()) return 0;
-  if (take) hiwater = std::max(hiwater, DirtyTake(tag));
-  if (hiwater == 0) return 0;
-  int first_err = 0;
-  for (clio::run::u64 off = 0; off < hiwater;
-       off += clio::cte::filesystem::kFsPageSize) {
-    const std::string page = clio::cte::filesystem::PageName(off);
-    clio::cte::core::Client::AwaitPendingPuts(tag, page);
-    const clio::run::u64 key = clio::cte::core::Client::DeferKeyHash(tag, page);
-    int e = take ? clio::cte::core::Client::DeferTakeKeyError(key)
-                 : clio::cte::core::Client::DeferPeekKeyError(key);
-    // Page latches hold store return codes: a full store is ENOSPC, as on
-    // ext4, not the EIO every other failure becomes.
-    if (e > 0 && clio::cte::core::PutRcIsNoSpace(static_cast<clio::run::u32>(e))) {
-      e = ENOSPC;
-    }
-    if (e == ENOSPC && first_bad != nullptr && off < *first_bad) {
-      *first_bad = off;
-    }
-    if (e != 0 && first_err == 0) first_err = e;
-  }
-  return first_err;
-}
-
-int DrainSievePages(const clio::cte::core::TagId &tag,
-                    clio::run::u64 hiwater) {
-  return DrainSievePagesEx(tag, hiwater, /*take=*/true, nullptr);
-}
-
-
 CfsHandle *GetHandle(struct fuse_file_info *fi) {
   return reinterpret_cast<CfsHandle *>(fi->fh);
 }
 
-// Lazy closer (deferred writes x async close): a CloseTask that reaches the
-// chimod while the file's deferred WriteTasks are still in flight races them
-// — scheduler order decides whether a write lands on a closed handle and is
-// DROPPED (this corrupted git index-pack output). release() therefore hands
-// write-pending handles to this thread, which drains the file's writes and
-// only then sends the (fire-and-forget) close. Handles with nothing pending
-// skip the queue and close detached immediately — the common case for
+// Lazy closer: a release whose file this mount wrote carries the file's
+// size (the hiwater) to the chimod off the caller's path. Handles with
+// nothing to publish close detached immediately -- the common case for
 // read-only opens.
-// ==========================================================================
-// Batched, sieve-flushed CREATION (user directive: creation joins the data
-// sieve). An O_EXCL create mints the file's TagId client-side (top-bit minor
-// partition — the server generator never mints there), records the creation,
-// and returns immediately with a stable inode; the closer thread flushes
-// accumulated creations every tick as ONE MultiCreateTask whose tag chains
-// adopt the minted ids. Safe under O_EXCL because the kernel's just-finished
-// authoritative negative LOOKUP precedes every CREATE it sends, and the
-// kernel serializes same-path creation.
-// ==========================================================================
-struct PendingCreate {
-  clio::cte::core::TagId tag;
-  clio::run::u32 mode = 0644;
-  clio::run::u64 ctime_ns = 0;  // synthesized attrs until the flush lands
-};
-std::mutex g_pc_mtx;
-std::mutex g_flush_mtx;  // held across an ENTIRE flush (swap + Wait + retire)
-PathMap<PendingCreate> g_pending_creates;
-std::vector<clio::cte::filesystem::MultiCreateEnt> g_create_queue;
-
-/**
- * Mint a file id client-side for sieve create. The id names its inode's home
- * -- a hash of the file's own path (FsInodeHomeFor, #1158), so the files of
- * one directory spread over every container -- plus this node, and its minor
- * starts at a per-process epoch so a restarted FUSE daemon does not reissue
- * the ids of its previous life.
- * @param path the file being created
- * @return the minted id
- */
-clio::cte::core::TagId MintTagId(const std::string &path) {
-  static const clio::run::u32 epoch = static_cast<clio::run::u32>(
-      std::chrono::duration_cast<std::chrono::seconds>(
-          std::chrono::system_clock::now().time_since_epoch())
-          .count());
-  static std::atomic<clio::run::u32> counter{0};
-  auto *ipc = CLIO_IPC;
-  const clio::run::u32 node = ipc != nullptr ? ipc->GetNodeId() : 0;
-  const clio::run::u32 hosts =
-      ipc != nullptr ? static_cast<clio::run::u32>(ipc->GetNumHosts()) : 1;
-  const clio::run::u32 home =
-      clio::cte::filesystem::FsInodeHomeFor(path, hosts);
-  const clio::run::u32 major = clio::cte::filesystem::kFsClientIdFlag |
-                               ((node & 0x3FFFu) << 16) |
-                               (home & clio::cte::filesystem::kFsHomeMask);
-  return clio::cte::core::TagId(
-      major, (epoch << 20) + counter.fetch_add(1, std::memory_order_relaxed));
-}
 
 /**
  * Map a filesystem task's return code to a FUSE result. The chimod answers
@@ -1378,125 +1165,15 @@ bool TimesOverlayGet(const std::string &p, TimesOverlay *out) {
   return true;
 }
 
-bool PendingCreateLookup(const std::string &path, PendingCreate *out) {
-  std::lock_guard<std::mutex> lk(g_pc_mtx);
-  auto it = g_pending_creates.find(path);
-  if (it == g_pending_creates.end()) return false;
-  *out = it->second;
-  return true;
-}
-
-// Creations a MultiCreate batch could not make (e.g. the parent vanished):
-// path -> errno. The open() that "created" such a file already returned, so
-// the failure is owed to that file's fsync/close, like a failed write-back.
-std::mutex g_create_err_mtx;
-PathMap<int> g_create_errors;
-
-/**
- * Record the entries of a MultiCreate batch that failed (the task's failed_
- * list of (index, errno) pairs) against their paths.
- * @param batch the batch as sent
- * @param t the completed task (may be null)
- */
-void RecordCreateFailures(
-    const std::vector<clio::cte::filesystem::MultiCreateEnt> &batch,
-    clio::cte::filesystem::MultiCreateTask *t) {
-  if (t == nullptr) return;
-  if (t->GetReturnCode() != 0) {
-    // The whole batch was refused (undecodable): every entry failed.
-    std::lock_guard<std::mutex> lk(g_create_err_mtx);
-    for (const auto &e : batch) g_create_errors[e.path_] = EIO;
-    HLOG(kError, "clio_cte_fuse: a batch of {} creates failed (rc {})",
-         batch.size(), t->GetReturnCode());
-    return;
-  }
-  const std::string failed = t->failed_.str();
-  clio::cte::filesystem::FsDec d(failed.data(), failed.size());
-  clio::run::u32 idx = 0, rc = 0;
-  std::lock_guard<std::mutex> lk(g_create_err_mtx);
-  while (d.U32(&idx) && d.U32(&rc)) {
-    if (idx >= batch.size()) continue;
-    const int err = (rc > 0 && rc < 4096) ? static_cast<int>(rc) : EIO;
-    g_create_errors[batch[idx].path_] = err;
-    HLOG(kError, "clio_cte_fuse: creating {} failed (errno {}); its "
-         "fsync/close will report it", batch[idx].path_, err);
-  }
-}
-
-/**
- * Take (report once) a failed batched create of `path`.
- * @param path the file's path
- * @return a negative errno, or 0 when its creation did not fail
- */
-int TakeCreateError(const std::string &path) {
-  std::lock_guard<std::mutex> lk(g_create_err_mtx);
-  auto it = g_create_errors.find(path);
-  if (it == g_create_errors.end()) return 0;
-  const int err = it->second;
-  g_create_errors.erase(it);
-  return -err;
-}
-
-// Ship every queued creation as one MultiCreateTask and WAIT for it, then
-// retire the pending entries (their mirror records now answer getattr).
-void FlushCreates() {
-  // g_flush_mtx spans swap -> Wait -> retire. Without it, a barrier caller
-  // (rename's EnsureCreated) that arrives mid-flight sees an EMPTY queue and
-  // sails on while the MultiCreate is still airborne; the late-landing create
-  // then resurrects the just-renamed source path as a ghost (EEXIST on the
-  // next O_EXCL create) and the rename misses the tag (zeros on read-back).
-  std::lock_guard<std::mutex> fl(g_flush_mtx);
-  std::vector<clio::cte::filesystem::MultiCreateEnt> batch;
-  {
-    std::lock_guard<std::mutex> lk(g_pc_mtx);
-    if (g_create_queue.empty()) return;
-    batch.swap(g_create_queue);
-  }
-  auto t = CLIO_CFS_CLIENT->AsyncMultiCreate(
-      clio::cte::filesystem::EncodeMultiCreate(batch));
-  t.Wait();
-  RecordCreateFailures(batch, t.get());
-  // Retire ONLY after the server owns the metadata: a getattr between
-  // retirement and the flush landing would miss both sources. Retire is
-  // TAG-MATCHED: if the same path was re-created while this batch flew,
-  // the registry holds the NEWER creation, which must survive.
-  std::lock_guard<std::mutex> lk(g_pc_mtx);
-  for (const auto &e : batch) {
-    auto it = g_pending_creates.find(e.path_);
-    if (it != g_pending_creates.end() &&
-        ((static_cast<clio::run::u64>(it->second.tag.major_) << 32) |
-         static_cast<clio::run::u64>(it->second.tag.minor_)) == e.tag_packed_) {
-      g_pending_creates.erase(it);
-    }
-  }
-}
-
-// Barrier for ops that need the path authoritative server-side (rename,
-// unlink, task-path getattr of a pending path): flush now, synchronously.
-void EnsureCreated(const std::string &path) {
-  // Loop: FlushCreates serializes behind any in-flight flush (g_flush_mtx),
-  // so one more pass after it returns proves the entry retired — or flushes
-  // it ourselves if it was re-queued.
-  for (;;) {
-    {
-      std::lock_guard<std::mutex> lk(g_pc_mtx);
-      if (g_pending_creates.find(path) == g_pending_creates.end()) return;
-    }
-    FlushCreates();
-  }
-}
-
+/** One entry of the lazy closer's queue. */
 struct PendingClose {
-  // kPublish: close-to-open publish queued by flush (drain + size push,
-  // no server handle involved); see cte_fuse_flush.
-  enum Kind { kClose, kUtimens, kPublish };
+  // kPublish: close-to-open size publish queued by flush (no server handle
+  // involved); see cte_fuse_flush.
+  enum Kind { kClose, kPublish };
   Kind kind = kClose;
   clio::run::u64 fh = 0;
   std::string path;
-  clio::run::u64 atime_ns = 0;  // kUtimens payload
-  clio::run::u64 mtime_ns = 0;
-  clio::run::u32 flags = 0;
-  clio::cte::core::TagId tag = clio::cte::core::TagId::GetNull();  // kClose
+  clio::cte::core::TagId tag = clio::cte::core::TagId::GetNull();
   clio::run::u64 hiwater = 0;  // kClose: size to advance to (0 = none)
   // Time of the last write the hiwater covers, captured when the entry is
   // queued: by the time the closer runs it, an earlier entry's publish may
@@ -1513,22 +1190,6 @@ bool g_closer_started = false;
 bool g_closer_stop = false;
 bool g_closer_busy = false;  // CloserMain is executing a popped entry
 std::string g_closer_busy_path;  // the path of that entry (g_closer_busy)
-
-bool CreateQueueNonEmpty() {
-  std::lock_guard<std::mutex> lk(g_pc_mtx);
-  return !g_create_queue.empty();
-}
-
-/**
- * True while any creation is not yet retired: queued, or in a batch the
- * closer thread has already swapped out and is still waiting on. A batch in
- * flight leaves the queue empty, so CreateQueueNonEmpty misses it.
- * @return true if some created path is not yet known to the server
- */
-bool AnyCreateUnretired() {
-  std::lock_guard<std::mutex> lk(g_pc_mtx);
-  return !g_pending_creates.empty();
-}
 
 // Failures of a background publish (kPublish), by path: the next flush or
 // fsync of the path reports them, as a write-back error surfaces at fsync on
@@ -1557,29 +1218,12 @@ int TakePublishError(const std::string &path) {
 }
 
 /**
- * Publish one file for close-to-open from the closer: land its buffered
- * pages, make sure its batched creation landed, then push its size. Errors
- * are latched for the next flush/fsync of the path.
+ * Publish one file for close-to-open from the closer: push the size its
+ * page puts reached to the chimod. Its pages already landed: page puts are
+ * synchronous. Errors are latched for the next flush/fsync of the path.
  * @param pc the kPublish entry
  */
 void RunPublish(const PendingClose &pc) {
-  clio::run::u64 first_bad = ~0ull;
-  const int werr =
-      DrainSievePagesEx(pc.tag, pc.hiwater, /*take=*/true, &first_bad);
-  if (werr == ENOSPC) {
-    ShrinkAfterNoSpace(pc.path, first_bad);
-    LatchPublishError(pc.path, -ENOSPC);
-    return;
-  }
-  if (werr != 0) {
-    HLOG(kError, "clio_cte_fuse: write-back of {} failed (latched code {}); "
-         "reporting EIO", pc.path, werr);
-    LatchPublishError(pc.path, -EIO);
-    return;
-  }
-  // A batched creation must land before the size push (tag-keyed, so a
-  // rename since the flush is harmless: rename barriers on this queue).
-  EnsureCreated(pc.path);
   if (pc.hiwater == 0 || pc.tag.IsNull()) return;
   auto t = CLIO_CFS_CLIENT->AsyncAdvanceSize(
       (static_cast<clio::run::u64>(pc.tag.major_) << 32) |
@@ -1595,90 +1239,44 @@ void RunPublish(const PendingClose &pc) {
   HiwaterEraseIfCovered(pc.path, pc.hiwater);
 }
 
-/**
- * Execute one closer entry: order it after the file's in-flight writes, then
- * apply it. Shared by the closer thread and the synchronous barrier.
- * @param pc the entry
- */
 // Depth of RunCloserEntry on this thread. An entry can call back into a
-// hook that drains the closer (a refused write-behind shrinks the file
-// through cte_fuse_truncate): waiting for the closer there waited for this
-// very entry, and every later close and truncate hung behind it.
+// hook that drains the closer (a truncate): waiting for the closer there
+// waited for this very entry, and every later close and truncate hung
+// behind it.
 thread_local int t_closer_entry_depth = 0;
 
+/**
+ * Execute one closer entry: a size publish, or a close carrying the size
+ * this mount's page puts reached. Shared by the closer thread and the
+ * synchronous barrier.
+ * @param pc the entry
+ */
 void RunCloserEntry(const PendingClose &pc) {
   struct DepthGuard {
     DepthGuard() { ++t_closer_entry_depth; }
     ~DepthGuard() { --t_closer_entry_depth; }
   } depth_guard;
-  // Order the metadata op AFTER the file's in-flight writes land. A
-  // fire-and-forget task racing them is how a detached close dropped
-  // writes on a dead handle, and how a detached utimens republished the
-  // mirror with a size read BEFORE a concurrent write advanced it —
-  // regressing the published size and truncating subsequent reads
-  // (git's .git/config came back garbage).
-  clio::cte::core::Client::DeferAwaitKey(
-      clio::cte::core::Client::DeferKeyHashName(pc.path));
   if (pc.kind == PendingClose::kPublish) {
     RunPublish(pc);
     return;
   }
-  if (pc.kind == PendingClose::kUtimens) {
-    EnsureCreated(pc.path);
-    CLIO_CFS_CLIENT->AsyncUtimensDetached(pc.path, pc.atime_ns, pc.mtime_ns,
-                                          pc.flags);
+  if (pc.hiwater == 0) {
+    CLIO_CFS_CLIENT->AsyncCloseDetached(pc.fh);
     return;
   }
-  DrainSievePages(pc.tag, pc.hiwater);
-  if (pc.fh == 0) {
-    // Minted-create file: no server handle. The creation must land
-    // before the size push, and the push is TAG-VERIFIED: a FUSE
-    // release can be delivered after the app already renamed the path
-    // (release is asynchronous), and a path-keyed truncate then
-    // RESURRECTS the old name as a ghost file — cfs Truncate
-    // deliberately materializes missing paths — which a later rename
-    // resolves instead of the real file (observed as git's config
-    // reading zeros under a ghost inode). On mismatch the hiwater
-    // overlay simply stays authoritative for the renamed name.
-    EnsureCreated(pc.path);
-    if (pc.hiwater != 0) {
-      auto t = CLIO_CFS_CLIENT->AsyncAdvanceSize(
-          (static_cast<clio::run::u64>(pc.tag.major_) << 32) |
-              static_cast<clio::run::u64>(pc.tag.minor_),
-          pc.hiwater, pc.wtime);
-      t.Wait();
-      // Only on success (see RunPublish): erasing on a FAILED push (e.g. the
-      // inode's home unreachable mid-partition) discarded the one record
-      // that a size update was still pending, with nothing left to retry it
-      // from -- the file was stuck reporting size 0 forever, even after the
-      // partition healed (safe_partition_during_writes: fsynced data lost).
-      // release()'s return is not delivered to close(2) either way, so this
-      // failure is otherwise silent; latch it for the next fsync/flush/stat.
-      if (t->GetReturnCode() == 0) {
-        HiwaterEraseIfCovered(pc.path, pc.hiwater);
-      } else {
-        HLOG(kError, "clio_cte_fuse: closer publishing the size of {} failed "
-             "(rc {}); keeping the hiwater overlay for the next push",
-             pc.path, t->GetReturnCode());
-        LatchPublishError(pc.path, -EIO);
-      }
-    }
-  } else if (pc.hiwater != 0) {
-    // AWAITED: the hiwater entry may only be dropped once the chimod
-    // has durably adopted the size, or a getattr in the gap would read
-    // the stale pre-close size.
-    auto t = CLIO_CFS_CLIENT->AsyncClose(pc.fh, pc.hiwater);
-    t.Wait();
-    if (t->GetReturnCode() == 0) {
-      HiwaterEraseIfCovered(pc.path, pc.hiwater);
-    } else {
-      HLOG(kError, "clio_cte_fuse: closer publishing the size of {} failed "
-           "(rc {}); keeping the hiwater overlay for the next push",
-           pc.path, t->GetReturnCode());
-      LatchPublishError(pc.path, -EIO);
-    }
+  // AWAITED: the hiwater entry may only be dropped once the chimod has
+  // durably adopted the size, or a getattr in the gap would read the stale
+  // pre-close size. Erased only on success: a failed push (e.g. the inode's
+  // home unreachable mid-partition) must leave the overlay to retry from.
+  auto t = CLIO_CFS_CLIENT->AsyncClose(pc.fh, pc.hiwater);
+  t.Wait();
+  if (t->GetReturnCode() == 0) {
+    HiwaterEraseIfCovered(pc.path, pc.hiwater);
   } else {
-    CLIO_CFS_CLIENT->AsyncCloseDetached(pc.fh);
+    HLOG(kError, "clio_cte_fuse: closer publishing the size of {} failed "
+         "(rc {}); keeping the hiwater overlay for the next push",
+         pc.path, t->GetReturnCode());
+    LatchPublishError(pc.path, -EIO);
   }
 }
 
@@ -1689,17 +1287,6 @@ void CloserMain() {
   std::unique_lock<std::mutex> lk(g_closer_mtx);
   while (!g_closer_stop) {
     if (g_closer_q.empty()) {
-      if (CreateQueueNonEmpty()) {
-        // Tick-flush creations even when no closes are queued (the create
-        // sieve's analog of the page flusher's 500 us cadence).
-        g_closer_cv.wait_for(lk, std::chrono::microseconds(500),
-                             [] { return g_closer_stop; });
-        if (g_closer_stop) break;
-        lk.unlock();
-        FlushCreates();
-        lk.lock();
-        continue;
-      }
       g_closer_cv.wait_for(lk, std::chrono::milliseconds(50), [] {
         return g_closer_stop || !g_closer_q.empty();
       });
@@ -1735,10 +1322,31 @@ bool DirectWronlyEnabled() {
   return v;
 }
 
+/**
+ * Whether O_DIRECT opens bypass the kernel page cache. Off by default: an
+ * O_DIRECT open normally takes the buffered path so a program can still mmap
+ * the fd (#597). CLIO_FUSE_ODIRECT=1 honors O_DIRECT instead, for benchmarks
+ * that must measure the filesystem rather than node memory (a timed reread
+ * otherwise reads the page cache at memory speed).
+ * @return true if O_DIRECT opens get per-file direct_io
+ */
+bool HonorODirect() {
+  static const bool v = [] {
+    const char *e = getenv("CLIO_FUSE_ODIRECT");
+    return e != nullptr && *e == '1';
+  }();
+  return v;
+}
+
 void MaybeDirectIo(struct fuse_file_info *fi) {
   if (DirectWronlyEnabled() && (fi->flags & O_ACCMODE) == O_WRONLY) {
     fi->direct_io = 1;
   }
+#ifdef O_DIRECT  // not defined on Windows, which builds this file too
+  if (HonorODirect() && (fi->flags & O_DIRECT) != 0) {
+    fi->direct_io = 1;
+  }
+#endif
 }
 
 // Synchronous barrier: process EVERY queued closer entry inline. Rename and
@@ -2036,7 +1644,7 @@ static void *cte_fuse_init(struct fuse_conn_info *conn,
     fprintf(stderr, "clio_cte_fuse: data pool %u.%u (filesystem chain)\n",
             data_pool.major_, data_pool.minor_);
   }
-  // The sieve write path puts page blobs itself, so it applies the
+  // The write path puts page blobs itself, so it applies the
   // filesystem module's data-score rule itself; the module's yaml is the one
   // source of the setting.
   {
@@ -2117,22 +1725,10 @@ static inline void NsBitsToTimespec(clio::run::u64 bits, time_t &sec,
 }
 
 // ---------------------------------------------------------------------------
-// Windows compatibility: the cfs SYNC fast-path helpers (Read/Write/Flush/
-// GetAttr) live in filesystem_client.h's Linux-only region. MSVC builds
+// Windows compatibility: the cfs SYNC helpers (Read/Write/GetAttr) live in filesystem_client.h's Linux-only region. MSVC builds
 // (only the wheels pipeline compiles this TU with WinFsp) route through the
 // awaited async tasks — slower, but the SHM fast paths never existed there.
 // ---------------------------------------------------------------------------
-static inline int CfsFlushCompat(clio::cte::filesystem::Client *cfs,
-                                 const std::string &p) {
-#ifndef _WIN32
-  return cfs->Flush(p);
-#else
-  (void)cfs;
-  (void)p;
-  return 0;  // write-behind is Linux-only; nothing buffered client-side
-#endif
-}
-
 static inline void CfsGetAttrCompat(clio::cte::filesystem::Client *cfs,
                                     const std::string &p, bool *exists,
                                     clio::run::u64 *size) {
@@ -2210,7 +1806,7 @@ static void OverlayWriteTime(const std::string &p, cte_stat_t *stbuf) {
 /**
  * Fill a stat buffer from a file's attributes as the chimod reported them,
  * overlaying what this mount knows and the chimod does not yet: sizes of
- * writes still queued or in the sieve, and their write times.
+ * sizes reached by page puts not yet published, and their write times.
  * @param a the attributes (a Getattr reply's, or a creating Open's)
  * @param p the path this mount's overlays are keyed by
  * @param stbuf the buffer to fill
@@ -2244,16 +1840,7 @@ static void FillStatFromAttrs(const StatAttrs &a, const std::string &p,
     stbuf->st_nlink = static_cast<nlink_t>(t->nlink);
     // cte_off_t is off_t on Linux; the WinFsp shim maps it for Windows.
     stbuf->st_size = static_cast<cte_off_t>(t->size);
-    // A deferred write that extended the file may not have advanced the
-    // published size yet, but the write(2) it came from already returned —
-    // stat must see it. High-water pending end, no drain (same rule as the
-    // cfs client's GetAttr).
-    clio::run::u64 pend = clio::cte::core::Client::DeferMaxPendingEnd(
-        clio::cte::core::Client::DeferKeyHashName(p));
-    if (pend > static_cast<clio::run::u64>(stbuf->st_size)) {
-      stbuf->st_size = static_cast<cte_off_t>(pend);
-    }
-    // Sieve-path writes advance the chimod size only at close: overlay the
+    // Direct page puts advance the chimod size only at close: overlay the
     // local hiwater in the meantime.
     clio::run::u64 hw = HiwaterFor(p);
     if (hw > static_cast<clio::run::u64>(stbuf->st_size)) {
@@ -2379,111 +1966,15 @@ static int cte_fuse_getattr_stat_inner(const char *path, cte_stat_t *stbuf,
     return 0;
   }
 
-  // PENDING-CREATE stat: a minted file whose MultiCreate has not flushed
-  // yet has no record anywhere server-side; its identity lives here.
-  {
-    PendingCreate pc;
-    if (PendingCreateLookup(p, &pc)) {
-      stbuf->st_uid = getuid();
-      stbuf->st_gid = getgid();
-      stbuf->st_ino = static_cast<ino_t>(
-          (static_cast<clio::run::u64>(pc.tag.major_) << 32) |
-          static_cast<clio::run::u64>(pc.tag.minor_));
-      stbuf->st_mode = S_IFREG | (pc.mode & 07777u);
-      stbuf->st_nlink = 1;
-      stbuf->st_size = static_cast<cte_off_t>(HiwaterFor(p));
-      stbuf->st_blksize = static_cast<decltype(stbuf->st_blksize)>(4096);
-      stbuf->st_blocks = static_cast<decltype(stbuf->st_blocks)>(
-          (static_cast<uint64_t>(stbuf->st_size) + 511) / 512);
-      NsBitsToTimespec(pc.ctime_ns, stbuf->st_ctim.tv_sec,
-                       stbuf->st_ctim.tv_nsec);
-      NsBitsToTimespec(pc.ctime_ns, stbuf->st_mtim.tv_sec,
-                       stbuf->st_mtim.tv_nsec);
-      NsBitsToTimespec(pc.ctime_ns, stbuf->st_atim.tv_sec,
-                       stbuf->st_atim.tv_nsec);
-      // Writes since the create: the size push will make their time the
-      // file's mtime, so report it now (git records this stat).
-      OverlayWriteTime(p, stbuf);
-      return 0;
-    }
-  }
-
   if (DirAttrLookup(p, stbuf)) return 0;
 
-  // MIRROR-FIRST stat (user directive): build the full stat from the SHM
-  // mirrors — file record (identity, size, overrides) + tag record (natural
-  // timestamps) — with no task at all. Records that are absent, refused
-  // (hardlink targets, pending appends), or missing their tag record fall
-  // through to the chimod task; a tombstone answers ENOENT immediately.
+  // A tombstone in the filesystem's path mirror answers ENOENT with no task.
   auto *cfs = CLIO_CFS_CLIENT;
   {
-    auto *cte0 = CLIO_CFS_CLIENT->Cte();
     clio::cte::filesystem::ShmFileRecord mrec;
-    // TryGetFileRecordShm does NOT self-attach: without this the whole
-    // mirror-first path silently returns false on every call until some
-    // OTHER path (the read fast path) attaches — which a checkout-shaped
-    // workload never does early. Attach is one-time and cheap to re-check.
-    if (cfs != nullptr && cte0 != nullptr &&
-        (cfs->HasShmCache() || cfs->AttachShmCache()) &&
-        cfs->TryGetFileRecordShm(p, &mrec)) {
-      if (!mrec.Exists()) {
-        return -ENOENT;  // tombstone: authoritative absence, no task
-      }
-      if (!(mrec.flags_ & (clio::cte::filesystem::kShmFileNoFastPath |
-                           clio::cte::filesystem::kShmFilePendingAppend |
-                           clio::cte::filesystem::kShmFileIsDir))) {
-        clio::cte::core::ShmTagRecord trec;
-        clio::cte::core::TagId mtag(mrec.tag_id_.major_, mrec.tag_id_.minor_);
-        if (cte0->TryGetTagRecordShm(mtag, &trec)) {
-          stbuf->st_uid = (mrec.uid_ != clio::cte::filesystem::kShmFileNoOverride)
-                              ? static_cast<uid_t>(mrec.uid_) : getuid();
-          stbuf->st_gid = (mrec.gid_ != clio::cte::filesystem::kShmFileNoOverride)
-                              ? static_cast<gid_t>(mrec.gid_) : getgid();
-          stbuf->st_ino = static_cast<ino_t>(mrec.ino_);
-          const bool m_have_mode =
-              (mrec.mode_ != clio::cte::filesystem::kShmFileNoOverride);
-          const unsigned int m_perm = mrec.mode_ & 07777u;
-          if (mrec.IsDir()) {
-            stbuf->st_mode = S_IFDIR | (m_have_mode ? m_perm : 0755u);
-            stbuf->st_nlink = 2;
-            stbuf->st_size = 0;
-          } else {
-            stbuf->st_mode = S_IFREG | (m_have_mode ? m_perm : 0644u);
-            stbuf->st_nlink = 1;  // hardlinked records are refused above
-            clio::run::u64 sz = mrec.size_;
-            clio::run::u64 pend = clio::cte::core::Client::DeferMaxPendingEnd(
-                clio::cte::core::Client::DeferKeyHashName(p));
-            if (pend > sz) sz = pend;
-            clio::run::u64 hw = HiwaterFor(p);
-            if (hw > sz) sz = hw;
-            stbuf->st_size = static_cast<cte_off_t>(sz);
-          }
-          stbuf->st_blksize =
-              static_cast<decltype(stbuf->st_blksize)>(4096);
-          stbuf->st_blocks = static_cast<decltype(stbuf->st_blocks)>(
-              (static_cast<uint64_t>(stbuf->st_size) + 511) / 512);
-          // Natural times from the tag record; utimens overrides win for
-          // atime/mtime, ctime can only advance (same rules as the task
-          // path).
-          clio::run::u64 m_ct = trec.last_changed_;
-          clio::run::u64 m_mt = trec.last_modified_;
-          clio::run::u64 m_at = trec.last_read_;
-          if (mrec.ov_mtime_ns_ != 0) m_mt = mrec.ov_mtime_ns_;
-          if (mrec.ov_atime_ns_ != 0) m_at = mrec.ov_atime_ns_;
-          if (mrec.ov_ctime_ns_ > m_ct) m_ct = mrec.ov_ctime_ns_;
-          if (m_ct != 0)
-            NsBitsToTimespec(m_ct, stbuf->st_ctim.tv_sec,
-                             stbuf->st_ctim.tv_nsec);
-          if (m_mt != 0)
-            NsBitsToTimespec(m_mt, stbuf->st_mtim.tv_sec,
-                             stbuf->st_mtim.tv_nsec);
-          if (m_at != 0)
-            NsBitsToTimespec(m_at, stbuf->st_atim.tv_sec,
-                             stbuf->st_atim.tv_nsec);
-          OverlayWriteTime(p, stbuf);  // after the mirror times
-          return 0;
-        }
-      }
+    if (cfs != nullptr && (cfs->HasShmCache() || cfs->AttachShmCache()) &&
+        cfs->TryGetFileRecordShm(p, &mrec) && !mrec.Exists()) {
+      return -ENOENT;
     }
   }
 
@@ -2568,16 +2059,14 @@ static bool PathStillNamesHandle(CfsHandle *h, const std::string &hp) {
  * reader of a file being replaced by write-temp + rename saw ENOENT or
  * another file's size).
  * @param h the open file (its tag set)
- * @param hp its current path (keys this mount's overlays: queued writes)
+ * @param hp its current path (unused: the lookup is by inode id)
  * @param t out: the reply
  * @return 0, -ENOENT (the inode is gone) or -EIO
  */
 static int GetattrOpenHandle(CfsHandle *h, const std::string &hp,
                              clio::run::Future<
                                  clio::cte::filesystem::GetattrTask> *t) {
-  // Queued writes through this mount must land before the size is read.
-  clio::cte::core::Client::DeferAwaitKey(
-      clio::cte::core::Client::DeferKeyHashName(hp));
+  (void)hp;
   *t = CLIO_CFS_CLIENT->AsyncGetattr(
       clio::cte::filesystem::FsIdStatPath(PackTag(h->tag)));
   t->Wait();
@@ -2695,16 +2184,13 @@ static int GetattrStatImpl(const char *path, cte_stat_t *stbuf,
   StatAttrs kept;
   const bool have_kept = handle != nullptr && TakeOpenAttrs(handle, &kept);
   int rc = 0;
-  PendingCreate pc;
   if (handle != nullptr && !handle->tag.IsNull() &&
-      !PendingCreateLookup(key, &pc) && !PathStillNamesHandle(handle, key)) {
+      !PathStillNamesHandle(handle, key)) {
     // fstat: the descriptor's own file, even if its name now leads
     // elsewhere (renamed over) or nowhere (unlinked while open).
     if (have_kept) {
       // The create that opened it returned these in this same request: no
-      // task. Queued writes under this name are waited out as for a task.
-      clio::cte::core::Client::DeferAwaitKey(
-          clio::cte::core::Client::DeferKeyHashName(key));
+      // task.
       memset(stbuf, 0, sizeof(*stbuf));
       FillStatFromAttrs(kept, key, stbuf);
     } else {
@@ -2717,8 +2203,7 @@ static int GetattrStatImpl(const char *path, cte_stat_t *stbuf,
     }
   } else {
     rc = cte_fuse_getattr_stat_inner(key.c_str(), stbuf, fi);
-    if (rc == -ENOENT && handle != nullptr && !handle->tag.IsNull() &&
-        !PendingCreateLookup(key, &pc)) {
+    if (rc == -ENOENT && handle != nullptr && !handle->tag.IsNull()) {
       // The name was renamed over between the mirror check and the lookup:
       // the descriptor's own file is still there.
       clio::run::Future<clio::cte::filesystem::GetattrTask> t;
@@ -2918,21 +2403,7 @@ int cte_fuse_utimens(const char *path_in, const cte_timespec_t tv[2],
   }();
   if (async_utimens) {
     std::string p(path);
-    if (clio::cte::core::Client::DeferKeyPending(
-            clio::cte::core::Client::DeferKeyHashName(p))) {
-      // Writes in flight: the stamp must EXECUTE after they land (see
-      // CloserMain) — but this caller need not wait for that.
-      PendingClose pc;
-      pc.kind = PendingClose::kUtimens;
-      pc.path = p;
-      pc.atime_ns = atime_ns;
-      pc.mtime_ns = mtime_ns;
-      pc.flags = flags;
-      EnqueueDrainOrdered(std::move(pc));
-    } else {
-      EnsureCreated(p);
-      cfs->AsyncUtimensDetached(p, atime_ns, mtime_ns, flags);
-    }
+    cfs->AsyncUtimensDetached(p, atime_ns, mtime_ns, flags);
     {
       clio::run::u64 now_ns = static_cast<clio::run::u64>(
           std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -2945,7 +2416,6 @@ int cte_fuse_utimens(const char *path_in, const cte_timespec_t tv[2],
     }
     return 0;
   }
-  EnsureCreated(std::string(path));
   auto t = cfs->AsyncUtimens(std::string(path), atime_ns, mtime_ns, flags);
   t.Wait();
   int rc = static_cast<int>(t->GetReturnCode());
@@ -2965,25 +2435,6 @@ int cte_fuse_chmod(const char *path, cte_mode_t mode,
   auto *cfs = CLIO_CFS_CLIENT;
   std::string p = OpPath(path, fi);
   if (p.empty()) return -EBADF;
-  // PENDING-CREATE chmod: the file's identity still lives client-side (git
-  // chmods config.lock right after the minted create). Rewrite the mode in
-  // the registry AND the queued batch entry so the flush carries it; if the
-  // batch entry already swapped into an in-flight flush, fall through to the
-  // barrier + task path.
-  {
-    std::lock_guard<std::mutex> lk(g_pc_mtx);
-    auto it = g_pending_creates.find(p);
-    if (it != g_pending_creates.end()) {
-      it->second.mode = static_cast<clio::run::u32>(mode) & 07777u;
-      for (auto &e : g_create_queue) {
-        if (e.path_ == p) {
-          e.mode_ = it->second.mode;
-          return 0;
-        }
-      }
-    }
-  }
-  EnsureCreated(p);
   // Probe existence first: the chmod path resolves via GetOrCreateTag, so a
   // missing target would otherwise be silently created. chmod(2) must ENOENT.
   auto g = cfs->AsyncGetattr(p);
@@ -3006,7 +2457,6 @@ int cte_fuse_chown(const char *path, uid_t uid, gid_t gid,
   auto *cfs = CLIO_CFS_CLIENT;
   const std::string p = OpPath(path, fi);
   if (p.empty()) return -EBADF;
-  EnsureCreated(p);
   auto t = cfs->AsyncChown(p,
                            static_cast<clio::run::u32>(uid),
                            static_cast<clio::run::u32>(gid));
@@ -3023,20 +2473,6 @@ using ClioFuseFillDirT = fuse_darwin_fill_dir_t;
 #else
 using ClioFuseFillDirT = fuse_fill_dir_t;
 #endif
-
-int cte_fuse_readdir_flush_guard() {
-  // Pending minted creates are invisible to the chimod's listing until their
-  // batch flushes; readdir callers (rm -r, ls) must see every child or they
-  // act on a partial view (generic/070: rm -r left "non-empty" dirs whose
-  // remaining children it was never shown). Test the unretired set, not the
-  // queue: a batch in flight has emptied the queue, and FlushCreates waits
-  // for it (g_flush_mtx). Git for Windows' fscache lists the parent to stat
-  // a file it just wrote, and missed ones still in flight.
-  if (AnyCreateUnretired()) {
-    FlushCreates();
-  }
-  return 0;
-}
 
 /**
  * File-type bits (S_IFMT) for a directory entry of the given filesystem type.
@@ -3366,7 +2802,6 @@ int cte_fuse_readdir(const char *path, void *buf,
                             enum fuse_readdir_flags flags) {
   using clio::cte::filesystem::kDirOffEnd;
   using clio::cte::filesystem::kDirOffFirst;
-  cte_fuse_readdir_flush_guard();
   (void)flags;
   const clio::run::u64 off =
       offset < 0 ? 0 : static_cast<clio::run::u64>(offset);
@@ -3439,7 +2874,6 @@ int cte_fuse_mkdir(const char *path, cte_mode_t mode) {
 
 int cte_fuse_rmdir(const char *path) {
   DirAttrInvalidate(path);
-  cte_fuse_readdir_flush_guard();  // children may still be pending creates
   auto *cfs = CLIO_CFS_CLIENT;
   auto t = cfs->AsyncRmdir(std::string(path));
   t.Wait();
@@ -3487,21 +2921,6 @@ int cte_fuse_truncate(const char *path, cte_off_t size,
                       struct fuse_file_info *fi);
 
 /**
- * A page put the store had no room for (#1129): the bytes from that page on
- * were never stored, so the file must not claim them -- cut it back to the
- * first refused page instead of letting it read back as zeros.
- * @param hp the file's path
- * @param first_bad offset of the first refused page (~0: none)
- */
-static void ShrinkAfterNoSpace(const std::string &hp,
-                               clio::run::u64 first_bad) {
-  if (first_bad == ~0ull) return;
-  HLOG(kWarning, "clio_cte_fuse: {}: the store had no room for the write at "
-       "offset {}; the file ends there (ENOSPC)", hp, first_bad);
-  cte_fuse_truncate(hp.c_str(), static_cast<cte_off_t>(first_bad), nullptr);
-}
-
-/**
  * Apply an open's O_TRUNC to a file that already existed.
  *
  * A file the Open just created (`created`) is empty by construction, so its
@@ -3526,9 +2945,9 @@ static inline void MaybeTruncateOnOpen(clio::cte::filesystem::Client *cfs,
   }
   if (flags & O_TRUNC) {
     // The FULL truncate hook, not a raw AsyncTruncate: O_TRUNC on reopen
-    // must drain the file's deferred pipelines (closer AND sieve pages)
-    // before the truncate lands, or a still-pending write from the last
-    // open session lands AFTER it and resurrects the old bytes —
+    // must drain the asynchronous closer before the truncate lands, or a
+    // queued size push from the last open session lands AFTER it and
+    // resurrects the old length —
     // generic/729's dio write@0 + fsync + close + O_TRUNC reopen read the
     // previous phase's page back out of the "empty" file.
     (void)cfs;
@@ -3542,66 +2961,6 @@ int cte_fuse_create(const char *path, cte_mode_t mode,
   if (NameTooLong(path)) return -ENAMETOOLONG;
   std::string p(path);
   auto *cfs = CLIO_CFS_CLIENT;
-  // SIEVE-CREATE fast path (O_EXCL only): mint the TagId, record the
-  // creation for the flusher's MultiCreate batch, and return immediately —
-  // no task. The kernel's authoritative negative LOOKUP just preceded this
-  // CREATE, and the kernel serializes same-path creation, so exclusivity
-  // holds without asking the chimod.
-  if (SieveCreateEnabled() && (fi->flags & O_EXCL) &&
-      CLIO_CFS_CLIENT->Cte() != nullptr) {
-#ifdef _WIN32
-    {
-      // WinFsp sends an exclusive create without looking the name up first
-      // (on Linux the kernel's negative lookup is what makes this path
-      // exclusive). Unchecked, a second create of an existing name
-      // "succeeded" and its data was dropped when the batched create failed.
-      // A miss under a complete directory is answered locally.
-      cte_stat_t st;
-      const int grc = cte_fuse_getattr_stat(path, &st, nullptr);
-      if (grc == 0) return -EEXIST;
-      if (grc != -ENOENT) return grc;
-    }
-#endif
-    auto *handle = new CfsHandle();
-    handle->fh = 0;  // no server handle; data ops key off the tag
-    handle->path = p;
-    handle->tag = MintTagId(p);
-    {
-      PendingCreate pc;
-      pc.tag = handle->tag;
-      pc.mode = static_cast<clio::run::u32>(mode);
-      pc.ctime_ns = static_cast<clio::run::u64>(
-          std::chrono::duration_cast<std::chrono::nanoseconds>(
-              std::chrono::system_clock::now().time_since_epoch()).count());
-      std::lock_guard<std::mutex> lk(g_pc_mtx);
-      g_pending_creates[p] = pc;
-      clio::cte::filesystem::MultiCreateEnt e;
-      e.path_ = p;
-      e.tag_packed_ =
-          (static_cast<clio::run::u64>(handle->tag.major_) << 32) |
-          static_cast<clio::run::u64>(handle->tag.minor_);
-      e.mode_ = pc.mode;
-      e.ctime_ns_ = pc.ctime_ns;
-      g_create_queue.push_back(std::move(e));
-    }
-    g_closer_cv.notify_one();
-    {
-      // Ensure the flusher thread exists even before the first close.
-      std::lock_guard<std::mutex> lk(g_closer_mtx);
-      if (!g_closer_started) {
-        g_closer_started = true;
-        g_closer = std::thread(CloserMain);
-        g_closer.detach();
-      }
-    }
-    handle->append = (fi->flags & O_APPEND) != 0;
-    handle->atime_done = (fi->flags & O_NOATIME) != 0;
-    if (handle->append && MultiNode()) fi->direct_io = 1;  // offset is ours
-  fi->fh = reinterpret_cast<uint64_t>(handle);
-  RegisterOpenFile(handle, fi);
-    MaybeDirectIo(fi);
-    return 0;
-  }
   // O_EXCL goes to the chimod, which decides it against every node's
   // creates (the kernel's negative lookup only covers this mount).
   auto t = cfs->AsyncOpen(p, O_CREAT | O_RDWR | (fi->flags & O_EXCL),
@@ -3637,25 +2996,6 @@ int cte_fuse_open(const char *path, struct fuse_file_info *fi) {
   if (IsHiddenName(path)) return -kOpenVanishedErrno;
   std::string p(path);
   auto *cfs = CLIO_CFS_CLIENT;
-  // A minted create that has not flushed yet is invisible to the chimod; a
-  // reopen inside that window must resolve locally or it would ENOENT.
-  {
-    PendingCreate pc;
-    if (PendingCreateLookup(p, &pc)) {
-      auto *handle = new CfsHandle();
-      handle->fh = 0;
-      handle->path = p;
-      handle->tag = pc.tag;
-      handle->append = (fi->flags & O_APPEND) != 0;
-      handle->atime_done = (fi->flags & O_NOATIME) != 0;
-      if (handle->append && MultiNode()) fi->direct_io = 1;  // offset is ours
-  fi->fh = reinterpret_cast<uint64_t>(handle);
-  RegisterOpenFile(handle, fi);
-      MaybeDirectIo(fi);
-      if (fi->flags & O_TRUNC) HiwaterClamp(p, 0);
-      return 0;
-    }
-  }
   // The chimod honors O_CREAT: a plain open of a missing file returns
   // handle==0 so we can surface ENOENT.
   auto t = cfs->AsyncOpen(p, static_cast<clio::run::u32>(fi->flags), 0644);
@@ -3752,9 +3092,9 @@ static clio::run::u64 PackTag(const clio::cte::core::TagId &tag) {
 // g_ra_pages pages fetched, or in flight, in buffers of its own, so the
 // kernel's next read-ahead request is answered by a memcpy and the fetches
 // of several pages -- each a round trip to another node on a multi-node
-// mount -- overlap. Pages are fetched whole with the same client call the
-// read path uses (AsyncGetBlobDefer), never past the size the read that
-// started them clamped to.
+// mount -- overlap. Pages are fetched whole from the shm cache when it holds
+// them, else with a GetBlob task (the read path's two paths), never past
+// the size the read that started them clamped to.
 //
 // What a cached page may be stale against, and how each is bounded:
 //  - writes, appends, truncates and fallocates through THIS mount, on any
@@ -4220,11 +3560,17 @@ static void RaIssueLocked(RaCache &c, CfsHandle *h, clio::run::u64 page,
   lk.unlock();
   // Holes and short pages read as zeros, as in the uncached read.
   std::memset(pg->buf.get(), 0, len);
-  auto fut = CLIO_CFS_CLIENT->Cte()->AsyncGetBlobDefer(
-      h->tag,
-      clio::cte::filesystem::PageName(page *
-                                      clio::cte::filesystem::kFsPageSize),
-      0, len, pg->buf.get());
+  auto *cte = CLIO_CFS_CLIENT->Cte();
+  const std::string name =
+      clio::cte::filesystem::PageName(page * clio::cte::filesystem::kFsPageSize);
+  if (cte->TryGetCached(h->tag, name, 0, len, pg->buf.get())) {
+    lk.lock();
+    pg->state = RaPage::State::kReady;  // served by the shm cache: no task
+    c.cv.notify_all();
+    RaUnpinLocked(c, pg);
+    return;
+  }
+  auto fut = cte->AsyncGetBlob(h->tag, name, 0, len, 0, pg->buf.get());
   lk.lock();
   if (fut.IsNull()) {
     pg->state = RaPage::State::kFailed;  // no staging memory: not sent
@@ -4391,10 +3737,11 @@ static std::set<clio::run::u64> g_unmerged_appends;
  * Wait until this handle's deferred appends are merged into the file, then
  * stamp the file's mtime at its inode home. No-op without pending appends.
  * @param handle open file
- * @param hp the handle's current path
+ * @param hp the handle's current path (unused: the merge is keyed by tag)
  * @return 0 or -errno
  */
 static int FlushAppends(CfsHandle *handle, const std::string &hp) {
+  (void)hp;
   if (!handle->appended.exchange(false)) return 0;
   const clio::run::u64 packed = PackTag(handle->tag);
   const clio::run::u64 ra_mark = RaAppendMark(handle->tag);
@@ -4413,7 +3760,6 @@ static int FlushAppends(CfsHandle *handle, const std::string &hp) {
     return -EIO;
   }
   RaAppendsFlushed(handle->tag, ra_mark);  // the merge changed the file
-  if (handle->fh == 0) EnsureCreated(hp);
   auto t = CLIO_CFS_CLIENT->AsyncAdvanceSize(packed, f->size_);
   t.Wait();
   return t->GetReturnCode() == 0 ? 0 : -EIO;
@@ -4470,64 +3816,46 @@ static int MergeAppendsBeforeTruncate(const clio::cte::core::TagId &tag) {
   return -EIO;
 }
 
+/**
+ * Close-to-open publish of a file, synchronously: merge its deferred
+ * appends, push the size its page puts reached to the chimod, and wait for
+ * the replication barrier. The pages themselves already landed: page puts
+ * are synchronous (in the shm cache, or acknowledged by their task).
+ * @param handle the open file
+ * @param hp its current path
+ * @return 0, or a negative errno if the size (or the replication barrier)
+ *         could not be published
+ */
 static int PublishOnClose(CfsHandle *handle, const std::string &hp) {
   auto *cfs = CLIO_CFS_CLIENT;
-  clio::cte::core::Client::DeferAwaitKey(
-      clio::cte::core::Client::DeferKeyHashName(hp));
   const clio::run::u64 hiwater = HiwaterFor(hp);
-  clio::run::u64 first_bad = ~0ull;
-  const int werr =
-      DrainSievePagesEx(handle->tag, hiwater, /*take=*/true, &first_bad);
-  if (werr != 0) {
-    // A lost write must fail fsync/close. Latched codes are a mix of errno
-    // values and store return codes, so only ENOSPC is passed through --
-    // with the file cut back to what was stored (#1129).
-    if (werr == ENOSPC) {
-      ShrinkAfterNoSpace(hp, first_bad);
-      return -ENOSPC;
-    }
-    HLOG(kError, "clio_cte_fuse: write-back of {} failed (latched code {}); "
-         "reporting EIO", hp, werr);
-    return -EIO;
-  }
-  if (handle->fh == 0) {
-    EnsureCreated(hp);
-    const int cerr = TakeCreateError(hp);
-    if (cerr != 0) return cerr;
-  }
   const int aerr = FlushAppends(handle, hp);
   if (aerr != 0) return aerr;
-  if (hiwater != 0 && !handle->tag.IsNull()) {
-    auto t = cfs->AsyncAdvanceSize(
-        (static_cast<clio::run::u64>(handle->tag.major_) << 32) |
-            static_cast<clio::run::u64>(handle->tag.minor_),
-        hiwater, PushTimeFor(hp));
-    t.Wait();
-    if (t->GetReturnCode() != 0) {
-      HLOG(kError, "clio_cte_fuse: publishing the size of {} failed (rc {}); "
-           "reporting EIO", hp, t->GetReturnCode());
-      return -EIO;
-    }
-    // fsync's durability contract covers only what THIS handle wrote
-    // (hiwater != 0), and only once the sieve drain above landed it on the
-    // primary -- the barrier now waits for the async replica sweep to catch
-    // up to that same primary state. A no-op call (see
-    // NeedsReplicationFlushBarrier) when replication is absent or already
-    // synchronous.
-    int berr = FlushReplicationBarrier(handle->tag);
-    if (berr != 0) {
-      HLOG(kError, "clio_cte_fuse: replication barrier for {} failed ({})",
-           hp, berr);
-      return berr;
-    }
-    // The chimod now holds this size: drop the overlay, as RunPublish and
-    // the closer do. Kept, it outlived a truncate from ANOTHER node (whose
-    // clamp only touches its own overlay): this node's getattr kept
-    // reporting the pre-truncate size, and release() queued a close that
-    // re-pushed it to the chimod (xnode_fsx: size 3760749 != model 3759753
-    // right after a remote truncate).
-    HiwaterEraseIfCovered(hp, hiwater);
+  if (hiwater == 0 || handle->tag.IsNull()) return 0;
+  auto t = cfs->AsyncAdvanceSize(
+      (static_cast<clio::run::u64>(handle->tag.major_) << 32) |
+          static_cast<clio::run::u64>(handle->tag.minor_),
+      hiwater, PushTimeFor(hp));
+  t.Wait();
+  if (t->GetReturnCode() != 0) {
+    HLOG(kError, "clio_cte_fuse: publishing the size of {} failed (rc {}); "
+         "reporting EIO", hp, t->GetReturnCode());
+    return -EIO;
   }
+  // fsync's durability contract covers only what THIS handle wrote: the
+  // barrier waits for the async replica sweep to catch up to the primary.
+  // A no-op (see NeedsReplicationFlushBarrier) when replication is absent
+  // or already synchronous.
+  const int berr = FlushReplicationBarrier(handle->tag);
+  if (berr != 0) {
+    HLOG(kError, "clio_cte_fuse: replication barrier for {} failed ({})",
+         hp, berr);
+    return berr;
+  }
+  // The chimod now holds this size: drop the overlay, as RunPublish and the
+  // closer do. Kept, it outlived a truncate from ANOTHER node (whose clamp
+  // only touches its own overlay) and release() re-pushed the stale size.
+  HiwaterEraseIfCovered(hp, hiwater);
   return 0;
 }
 
@@ -4549,8 +3877,8 @@ static bool AsyncFlushEnabled() {
  * file, and queue -- not await -- the close-to-open publish of what THIS
  * handle wrote. Close-to-open still holds because every operation that could
  * observe the file other than through this daemon's own overlays (hiwater
- * size, sieve read-your-writes, pending-create table) waits for the path's
- * queued entries first: link, rename, unlink, truncate and fsync do. A handle
+ * size) waits for the path's queued entries first: link, rename, unlink,
+ * truncate and fsync do. A handle
  * that wrote nothing (a reader, or a virus scanner re-opening a fresh file)
  * publishes nothing.
  * @param handle the closing handle
@@ -4560,10 +3888,6 @@ static bool AsyncFlushEnabled() {
 static int FlushAsync(CfsHandle *handle, const std::string &p) {
   const int perr = TakePublishError(p);
   if (perr != 0) return perr;
-  if (handle->fh == 0) {
-    const int cerr = TakeCreateError(p);  // a batched create that failed
-    if (cerr != 0) return cerr;
-  }
   if (handle->wrote.exchange(false)) {
     PendingClose pc;
     pc.kind = PendingClose::kPublish;
@@ -4575,16 +3899,16 @@ static int FlushAsync(CfsHandle *handle, const std::string &p) {
     // The kernel caches each NAME separately (see the awaited path below).
     for (const auto &sib : LinkGroupSiblings(p)) InvalidatePath(sib);
   }
-  const int err = clio::cte::core::Client::DeferTakeKeyError(
-      clio::cte::core::Client::DeferKeyHashName(p));
-  return err != 0 ? -err : 0;
+  return 0;
 }
 
-// Writes are DEFERRED through the cfs client's write-behind pipeline (see
-// cte_fuse_write): fsync is the durability point that drains them; flush
-// (close(2)) deliberately does NOT drain — the kernel page cache makes the
-// same trade — but it does surface any failure a completed deferred write
-// already latched against the file.
+/**
+ * close(2): publish what this handle wrote (its size; page puts are
+ * synchronous, so their errors were already returned by write(2)).
+ * @param path libfuse's path
+ * @param fi the open file
+ * @return 0 or a negative errno
+ */
 int cte_fuse_flush(const char *path, struct fuse_file_info *fi) {
   auto *handle = GetHandle(fi);
   const std::string p =
@@ -4597,19 +3921,12 @@ int cte_fuse_flush(const char *path, struct fuse_file_info *fi) {
       !handle->appended.load() && LinkGroupSiblings(p).empty()) {
     return FlushAsync(handle, p);
   }
-  if (handle != nullptr && handle->fh == 0) {
-    // A batched create (no server handle): its creation may have failed
-    // after open() returned. Surface it even for a file never written to.
-    EnsureCreated(p);
-    const int cerr = TakeCreateError(p);
-    if (cerr != 0) return cerr;
-  }
   if (handle != nullptr &&
       (MultiNode() || HiwaterFor(p) != 0 || handle->appended.load())) {
     // CLOSE-TO-OPEN: once close(2) returns, an open on ANY node -- or any
     // later operation on THIS one -- must see the file's bytes and size.
     // release() is delivered after close(2) has already returned (and is
-    // asynchronous here), so the drain + size push happens in flush, which
+    // asynchronous here), so the size push happens in flush, which
     // close(2) awaits. Only files this handle wrote pay for it. Leaving it
     // to the lazy closer let git's close -> link(tmp, obj) -> unlink(tmp)
     // outrun the size push: `git add` of a source tree left loose objects
@@ -4621,9 +3938,7 @@ int cte_fuse_flush(const char *path, struct fuse_file_info *fi) {
     // pages and attrs are dropped (write via b, read via a saw the old file).
     for (const auto &sib : LinkGroupSiblings(p)) InvalidatePath(sib);
   }
-  int err = clio::cte::core::Client::DeferTakeKeyError(
-      clio::cte::core::Client::DeferKeyHashName(p));
-  return err != 0 ? -err : 0;
+  return 0;
 }
 
 int cte_fuse_fsync(const char *path, int /*datasync*/,
@@ -4639,21 +3954,13 @@ int cte_fuse_fsync(const char *path, int /*datasync*/,
     const int perr = TakePublishError(p);
     if (perr != 0) return perr;
   }
-  // Sieve-path durability: drain the file's page-blob keys AND publish the
-  // logical size. fsync is the durability point: a size that only traveled
-  // on close was lost with the process (a crash after fsync left the file's
-  // bytes stored but its size -- and on another node, its visibility --
-  // behind the unpublished hiwater overlay).
+  // Publish the logical size. fsync is the durability point: a size that
+  // only traveled on close was lost with the process (a crash after fsync
+  // left the file's bytes stored but its size -- and on another node, its
+  // visibility -- behind the unpublished hiwater overlay).
   if (handle != nullptr) {
     int rc = PublishOnClose(handle, p);
     if (rc != 0) return rc;
-  }
-  auto *cfs = CLIO_CFS_CLIENT;
-  if (CfsFlushCompat(cfs, p) != 0) {
-    const int e = errno;
-    HLOG(kError, "clio_cte_fuse: fsync of {}: flushing the write-behind "
-         "failed (errno {})", p, e);
-    return -e;
   }
   // Everything above landed the bytes on the store; fsync's contract is
   // that they are ON A PERSISTENT DEVICE when it returns.
@@ -4698,15 +4005,10 @@ int cte_fuse_release(const char *path, struct fuse_file_info *fi) {
   }();
   int rc = 0;
   const clio::run::u64 hiwater = HiwaterFor(handle->path);
-  const bool minted = (handle->fh == 0);
   if (async_close) {
-    // Ordering: the close (and the size push it carries) must EXECUTE after
-    // the file's in-flight writes land — cfs-path writes under FileKey,
-    // sieve writes under the page keys — but release() need not wait: the
-    // lazy closer does, off the caller's path.
-    if (minted || hiwater != 0 ||
-        clio::cte::core::Client::DeferKeyPending(
-            clio::cte::core::Client::DeferKeyHashName(handle->path))) {
+    // The close carrying a size push runs off the caller's path, on the
+    // lazy closer; a close with nothing to publish goes detached.
+    if (hiwater != 0) {
       PendingClose pc;
       pc.kind = PendingClose::kClose;
       pc.fh = handle->fh;
@@ -4719,37 +4021,14 @@ int cte_fuse_release(const char *path, struct fuse_file_info *fi) {
       cfs->AsyncCloseDetached(handle->fh);
     }
   } else {
-    clio::cte::core::Client::DeferAwaitKey(
-        clio::cte::core::Client::DeferKeyHashName(handle->path));
-    DrainSievePages(handle->tag, hiwater);
-    if (minted) {
-      EnsureCreated(handle->path);
-      if (hiwater != 0) {
-        auto tt = cfs->AsyncAdvanceSize(
-            (static_cast<clio::run::u64>(handle->tag.major_) << 32) |
-                static_cast<clio::run::u64>(handle->tag.minor_),
-            hiwater, PushTimeFor(handle->path));
-        tt.Wait();
-        // Same fix as RunCloserEntry/RunPublish: erase only once the push is
-        // known durable, so a failed push (e.g. during a partition) still
-        // leaves the overlay to retry from instead of stranding the file at
-        // size 0 forever.
-        if (tt->GetReturnCode() == 0) {
-          HiwaterEraseIfCovered(handle->path, hiwater);
-        } else {
-          LatchPublishError(handle->path, -EIO);
-        }
-      }
-    } else {
-      auto t = cfs->AsyncClose(handle->fh, hiwater);
-      t.Wait();
-      rc = (t->GetReturnCode() == 0) ? 0 : -EIO;
-      if (hiwater != 0) {
-        if (rc == 0) {
-          HiwaterEraseIfCovered(handle->path, hiwater);
-        } else {
-          LatchPublishError(handle->path, -EIO);
-        }
+    auto t = cfs->AsyncClose(handle->fh, hiwater);
+    t.Wait();
+    rc = (t->GetReturnCode() == 0) ? 0 : -EIO;
+    if (hiwater != 0) {
+      if (rc == 0) {
+        HiwaterEraseIfCovered(handle->path, hiwater);
+      } else {
+        LatchPublishError(handle->path, -EIO);
       }
     }
   }
@@ -4803,6 +4082,204 @@ static void TouchAtimeOnRead(CfsHandle *handle, const std::string &hp) {
   t.Wait();
 }
 
+/**
+ * Read one range of one page blob into `dst`: from the shm cache when the
+ * CTE client is connected and holds it, else a GetBlob task. The task is
+ * waited in slices so a read whose completion never arrives is named in the
+ * log; it still waits for the completion, since the runtime may yet write
+ * into dst.
+ * @param cte the CTE client of the file's data chain
+ * @param tag the file's tag
+ * @param page the page blob name
+ * @param page_off offset inside the page
+ * @param n bytes to read
+ * @param dst destination
+ * @return the GetBlob return code (0 read, 1 the page does not exist),
+ *         ENOMEM when the task could not stage the read
+ */
+static int ReadPageOnce(clio::cte::core::Client *cte,
+                        const clio::cte::core::TagId &tag,
+                        const std::string &page, clio::run::u64 page_off,
+                        clio::run::u64 n, char *dst) {
+  if (cte->TryGetCached(tag, page, page_off, n, dst)) return 0;
+  auto g = cte->AsyncGetBlob(tag, page, page_off, n, 0, dst);
+  if (g.get() == nullptr) return ENOMEM;
+  for (int slice = 1; !g.Wait(30.0f); ++slice) {
+    HLOG(kWarning, "clio_cte_fuse: read of tag {}.{} page {} (off {} len {}) "
+         "still outstanding after {} s", tag.major_, tag.minor_, page,
+         page_off, n, slice * 30);
+  }
+  return static_cast<int>(g->GetReturnCode());
+}
+
+/**
+ * Read one page range, retrying the transient answers of a page whose owner
+ * was just declared dead: sent again it routes to the stand-in, which
+ * serves it. Only after the retries is it an error.
+ * @param cte the CTE client of the file's data chain
+ * @param tag the file's tag
+ * @param cur file offset of the range
+ * @param page_off offset inside the page
+ * @param n bytes to read
+ * @param dst destination
+ * @return the final GetBlob return code (0 read, 1 a hole, else an error)
+ */
+static int ReadPageRetrying(clio::cte::core::Client *cte,
+                            const clio::cte::core::TagId &tag,
+                            clio::run::u64 cur, clio::run::u64 page_off,
+                            clio::run::u64 n, char *dst) {
+  const std::string page = clio::cte::filesystem::PageName(cur);
+  const auto read_t0 = std::chrono::steady_clock::now();
+  int grc = 0;
+  int attempt = 0;
+  for (;; ++attempt) {
+    grc = ReadPageOnce(cte, tag, page, page_off, n, dst);
+    // Owner-down from a stand-in (#1280) can be as transient as node-lost:
+    // the stand-in's liveness view lags the router's until it too declares
+    // the owner dead and serves its copies.
+    const bool transient =
+        clio::cte::core::IsNodeLostRc(static_cast<clio::run::u32>(grc)) ||
+        static_cast<clio::run::u32>(grc) == clio::cte::core::kBlobOwnerDownRc;
+    if (!transient || attempt >= kReadNodeLostRetries) break;
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(kReadNodeLostRetryMs));
+  }
+  if (attempt > 0) {
+    // Where a slow failing read spent its time (#1169). Rate-limited: with
+    // a node down every page read of that node lands here.
+    static std::atomic<clio::run::u64> logged{0};
+    const clio::run::u64 k = logged.fetch_add(1, std::memory_order_relaxed);
+    if (k < 8 || k % 256 == 0) {
+      const double ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - read_t0)
+                            .count();
+      HLOG(kWarning, "clio_cte_fuse: read of tag {}.{} page {} got the "
+           "node-lost code {} time(s) over {} ms; final rc {} ({} such "
+           "reads so far)", tag.major_, tag.minor_, page, attempt, ms, grc,
+           k + 1);
+    }
+  }
+  return grc;
+}
+
+/**
+ * Log a read that took more than 2 s, with where it spent its time (#1169).
+ * Rate-limited.
+ * @param tag the file's tag
+ * @param offset read offset
+ * @param size read size
+ * @param total_ms the read's time (ms)
+ * @param size_ms time of its size lookup (ms)
+ * @param pages pages read
+ * @param rc the read's result
+ */
+static void LogSlowRead(const clio::cte::core::TagId &tag, cte_off_t offset,
+                        size_t size, double total_ms, double size_ms,
+                        clio::run::u64 pages, int rc) {
+  if (total_ms < 2000.0) return;
+  static std::atomic<clio::run::u64> logged{0};
+  const clio::run::u64 k = logged.fetch_add(1, std::memory_order_relaxed);
+  if (k < 8 || k % 256 == 0) {
+    HLOG(kWarning, "clio_cte_fuse: slow read of tag {}.{} [{}, +{}): {} ms "
+         "(size lookup {} ms, {} page read(s)); rc {} ({} such reads so far)",
+         tag.major_, tag.minor_, offset, size, total_ms, size_ms, pages, rc,
+         k + 1);
+  }
+}
+
+/**
+ * Read pages of a file through the CTE client (cache first, then tasks).
+ * EOF clamps against the chimod size raised by the local hiwater (bytes
+ * acknowledged to write(2) but not yet carried to the chimod by close).
+ * @param handle the open file (its tag set)
+ * @param hp its current path
+ * @param cte the CTE client of the file's data chain
+ * @param buf destination
+ * @param size bytes requested
+ * @param offset file offset
+ * @return bytes read or a negative errno
+ */
+static int ReadDirect(CfsHandle *handle, const std::string &hp,
+                      clio::cte::core::Client *cte, char *buf, size_t size,
+                      cte_off_t offset) {
+  namespace ev = clio::run::evlat;
+  using clio::cte::filesystem::kFsPageSize;
+  const auto read_t0 = std::chrono::steady_clock::now();
+  auto ms_since_start = [&read_t0] {
+    return std::chrono::duration<double, std::milli>(
+               std::chrono::steady_clock::now() - read_t0)
+        .count();
+  };
+  const unsigned long long ev_sz0 = ev::Now();
+  // The descriptor's own file: after a rename over its name the path names
+  // another file (or, mid-rename, none) and read 0 bytes.
+  clio::run::u64 fsize = 0;
+  const int src = ReadClampSize(
+      handle, hp, static_cast<clio::run::u64>(offset), size, &fsize);
+  const double size_ms = ms_since_start();
+  if (src == -EIO) {
+    LogSlowRead(handle->tag, offset, size, ms_since_start(), size_ms, 0, -EIO);
+    return -EIO;
+  }
+  // The descriptor's own file is gone on the server: a silent EOF would
+  // read as a truncated file. ESTALE, as NFS reports a vanished file.
+  if (src == -ENOENT) return -kOpenVanishedErrno;
+  fsize = std::max(fsize, HiwaterFor(hp));
+  ev::Span(ev::kRdSize, ev_sz0, ev::Now());
+  const clio::run::u64 off = static_cast<clio::run::u64>(offset);
+  if (off >= fsize) return 0;
+  const clio::run::u64 want = std::min<clio::run::u64>(size, fsize - off);
+  std::memset(buf, 0, want);  // holes / short pages read as zeros
+  // Sequential read-ahead (CLIO_FUSE_READAHEAD_PAGES; off: one check).
+  RaCache *ra = g_ra_pages != 0 ? RaPrepare(handle, off, want, fsize)
+                                : nullptr;
+  clio::run::u64 done = 0;
+  clio::run::u64 ev_pages = 0;
+  while (done < want) {
+    const clio::run::u64 cur = off + done;
+    const clio::run::u64 page_off = cur % kFsPageSize;
+    const clio::run::u64 n =
+        std::min<clio::run::u64>(kFsPageSize - page_off, want - done);
+    if (ra != nullptr && RaServe(ra, handle, cur, page_off, n, buf + done)) {
+      done += n;  // answered from the handle's read-ahead cache
+      continue;
+    }
+    const unsigned long long ev_pg0 = ev::Now();
+    ++ev_pages;
+    const int grc =
+        ReadPageRetrying(cte, handle->tag, cur, page_off, n, buf + done);
+    ev::Span(ev::kRdPage, ev_pg0, ev::Now());
+    // 0 = read, 1 = the page does not exist (a hole: the pre-zeroed buffer
+    // is the right answer). Anything else -- above all the network-timeout
+    // code a page on a DEAD node completes with -- is an I/O error, never
+    // zeros with success.
+    if (grc != 0 && grc != 1) {
+      HLOG(kError, "clio_cte_fuse: read of tag {}.{} page {} failed rc {}; "
+           "reporting EIO", handle->tag.major_, handle->tag.minor_,
+           clio::cte::filesystem::PageName(cur), grc);
+      LogSlowRead(handle->tag, offset, size, ms_since_start(), size_ms,
+                  done / kFsPageSize + 1, -EIO);
+      return -EIO;
+    }
+    done += n;
+  }
+  LogSlowRead(handle->tag, offset, size, ms_since_start(), size_ms,
+              (want + kFsPageSize - 1) / kFsPageSize, 0);
+  ev::Count(ev::kRdPages, ev_pages);
+  ev::Count(ev::kRdBytes, (want + 512) / 1024);
+  return static_cast<int>(want);
+}
+
+/**
+ * read(2): page blobs through the CTE client when the file's tag is known,
+ * else the filesystem client's read.
+ * @param path libfuse's path
+ * @param buf destination
+ * @param size bytes requested
+ * @param offset file offset
+ * @param fi the open file
+ * @return bytes read or a negative errno
+ */
 int cte_fuse_read(const char *path, char *buf, size_t size,
                          cte_off_t offset, struct fuse_file_info *fi) {
   namespace ev = clio::run::evlat;
@@ -4819,179 +4296,71 @@ int cte_fuse_read(const char *path, char *buf, size_t size,
   const int aerr = FlushAppends(handle, hp);
   if (aerr != 0) return aerr;
 
-  // SIEVE-DIRECT read: page-wise AsyncGetBlobDefer — sieve/pending bytes
-  // served from their staging (RYW, no wait), settled bytes from the SHM
-  // mirror (zero IPC), RPC as the fallback. EOF clamps against the chimod
-  // size raised by the local hiwater (bytes acknowledged to write(2) but
-  // not yet carried to the chimod by close).
   auto *cte = CLIO_CFS_CLIENT->Cte();
-  auto *cfs = CLIO_CFS_CLIENT;
-  if (SieveDataEnabled() && cte != nullptr && !handle->tag.IsNull()) {
-    clio::run::u64 fsize = 0;
-    PendingCreate pc_probe;
-    // Where a slow read spent its time (#1169): the size lookup at the
-    // inode's home, or the page reads. Logged, rate-limited, past 2 s.
-    const auto read_t0 = std::chrono::steady_clock::now();
-    double size_ms = 0;
-    auto slow_read = [&](int rc, clio::run::u64 pages) {
-      const double total_ms = std::chrono::duration<double, std::milli>(
-                                  std::chrono::steady_clock::now() - read_t0)
-                                  .count();
-      if (total_ms < 2000.0) return;
-      static std::atomic<clio::run::u64> logged{0};
-      const clio::run::u64 k = logged.fetch_add(1, std::memory_order_relaxed);
-      if (k < 8 || k % 256 == 0) {
-        HLOG(kWarning, "clio_cte_fuse: slow read of tag {}.{} [{}, +{}): {} ms "
-             "(size lookup {} ms, {} page read(s)); rc {} ({} such reads so "
-             "far)", handle->tag.major_, handle->tag.minor_, offset, size,
-             total_ms, size_ms, pages, rc, k + 1);
-      }
-    };
-    const unsigned long long ev_sz0 = ev::Now();
-    if (!PendingCreateLookup(hp, &pc_probe)) {
-      // A pending minted create's whole size story is local; only ask the
-      // chimod once the file exists server-side.
-      // The descriptor's own file: after a rename over its name the path
-      // names another file (or, mid-rename, none) and read 0 bytes.
-      const int src = ReadClampSize(
-          handle, hp, static_cast<clio::run::u64>(offset), size, &fsize);
-      size_ms = std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - read_t0)
-                    .count();
-      if (src == -EIO) {
-        slow_read(-EIO, 0);
-        return -EIO;
-      }
-      // The descriptor's own file is gone on the server: a silent EOF would
-      // read as a truncated file. ESTALE, as NFS reports a vanished file.
-      if (src == -ENOENT) return -kOpenVanishedErrno;
-    }
-    clio::run::u64 hw = HiwaterFor(hp);
-    if (hw > fsize) fsize = hw;
-    ev::Span(ev::kRdSize, ev_sz0, ev::Now());
-    clio::run::u64 off = static_cast<clio::run::u64>(offset);
-    if (off >= fsize) return 0;
-    clio::run::u64 want = std::min<clio::run::u64>(size, fsize - off);
-    std::memset(buf, 0, want);  // holes / short pages read as zeros
-    // Sequential read-ahead (CLIO_FUSE_READAHEAD_PAGES; off: one check).
-    RaCache *ra = g_ra_pages != 0 ? RaPrepare(handle, off, want, fsize)
-                                  : nullptr;
-    clio::run::u64 done = 0;
-    clio::run::u64 ev_pages = 0;
-    while (done < want) {
-      clio::run::u64 cur = off + done;
-      clio::run::u64 page_off = cur % clio::cte::filesystem::kFsPageSize;
-      clio::run::u64 n = std::min<clio::run::u64>(
-          clio::cte::filesystem::kFsPageSize - page_off, want - done);
-      if (ra != nullptr && RaServe(ra, handle, cur, page_off, n, buf + done)) {
-        done += n;  // answered from the handle's read-ahead cache
-        continue;
-      }
-      const unsigned long long ev_pg0 = ev::Now();
-      ++ev_pages;
-      // A page sent to its owner just before the owner was declared dead
-      // completes with the node-lost code; sent again it routes to the
-      // stand-in, which serves it. Only after the retries is it EIO.
-      int grc = 0;
-      const auto read_t0 = std::chrono::steady_clock::now();
-      int attempt = 0;
-      for (;; ++attempt) {
-        auto g = cte->AsyncGetBlobDefer(
-            handle->tag, clio::cte::filesystem::PageName(cur), page_off, n,
-            buf + done);
-        // Waited in slices so a read whose completion never arrives is
-        // named in the log (an unbounded wait hung the dirs_crash_restart
-        // audit for 15+ min with nothing logged). It still waits for the
-        // completion: the runtime may yet write into buf.
-        for (int slice = 1; !g.Wait(30.0f); ++slice) {
-          HLOG(kWarning, "clio_cte_fuse: read of tag {}.{} page {} "
-               "(off {} len {}) still outstanding after {} s",
-               handle->tag.major_, handle->tag.minor_,
-               clio::cte::filesystem::PageName(cur), page_off, n,
-               slice * 30);
-        }
-        grc = static_cast<int>(g->GetReturnCode());
-        // Owner-down from a stand-in (#1280) can be as transient as
-        // node-lost: the stand-in's liveness view lags the router's until it
-        // too declares the owner dead and serves its copies. Retried within
-        // the same bound; after it, still EIO (never zeros).
-        const bool transient =
-            clio::cte::core::IsNodeLostRc(static_cast<clio::run::u32>(grc)) ||
-            static_cast<clio::run::u32>(grc) ==
-                clio::cte::core::kBlobOwnerDownRc;
-        if (!transient || attempt >= kReadNodeLostRetries) {
-          break;
-        }
-        std::this_thread::sleep_for(
-            std::chrono::milliseconds(kReadNodeLostRetryMs));
-      }
-      ev::Span(ev::kRdPage, ev_pg0, ev::Now());
-      if (attempt > 0) {
-        // Where a slow failing read spent its time (#1169): how many
-        // node-lost answers it retried and what it ended with. Rate-limited:
-        // with a node down every page read of that node lands here.
-        static std::atomic<clio::run::u64> logged{0};
-        const clio::run::u64 k = logged.fetch_add(1, std::memory_order_relaxed);
-        if (k < 8 || k % 256 == 0) {
-          const double ms = std::chrono::duration<double, std::milli>(
-                                std::chrono::steady_clock::now() - read_t0)
-                                .count();
-          HLOG(kWarning, "clio_cte_fuse: read of tag {}.{} page {} got the "
-               "node-lost code {} time(s) over {} ms; final rc {} ({} such "
-               "reads so far)", handle->tag.major_, handle->tag.minor_,
-               clio::cte::filesystem::PageName(cur), attempt, ms, grc, k + 1);
-        }
-      }
-      // 0 = read, 1 = the page does not exist (a hole: the pre-zeroed
-      // buffer is the right answer). Anything else -- above all the
-      // network-timeout code a page on a DEAD node completes with -- is an
-      // I/O error. Treating it as a hole returned zeros with success: a
-      // reader got silently corrupted data while a node was down.
-      if (grc != 0 && grc != 1) {
-        HLOG(kError, "clio_cte_fuse: read of tag {}.{} page {} failed rc {} "
-             "after {} attempt(s); reporting EIO", handle->tag.major_,
-             handle->tag.minor_, clio::cte::filesystem::PageName(cur), grc,
-             attempt + 1);
-        slow_read(-EIO, done / clio::cte::filesystem::kFsPageSize + 1);
-        return -EIO;
-      }
-      done += n;
-    }
-    slow_read(0, (want + clio::cte::filesystem::kFsPageSize - 1) /
-                     clio::cte::filesystem::kFsPageSize);
-    ev::Count(ev::kRdPages, ev_pages);
-    ev::Count(ev::kRdBytes, (want + 512) / 1024);
-    return static_cast<int>(want);
+  if (cte != nullptr && !handle->tag.IsNull()) {
+    return ReadDirect(handle, hp, cte, buf, size, offset);
   }
-  // cfs tiered read fallback.
-  ssize_t got = CfsReadCompat(cfs, handle->fh, hp,
+  ssize_t got = CfsReadCompat(CLIO_CFS_CLIENT, handle->fh, hp,
                               static_cast<clio::run::u64>(offset), buf, size);
   if (got < 0) return -EIO;
   return static_cast<int>(got);
 }
 
 /**
- * write(2)'s view of earlier write-behind puts (#1129): when the client has
- * seen a put refused for lack of space since this handle last looked, find
- * out whether it was one of this file's pages; if so the write fails with
- * ENOSPC and the file is cut back to the refused page.
- * @param handle the open file
- * @param hp its path
- * @return 0, or -ENOSPC
+ * write(2) through page blobs: each page range is a synchronous
+ * Client::PutBlob -- a copy into the shm cache when the CTE client is
+ * connected (no task, no wait), else a PutBlob task. Errors return here;
+ * nothing is left to latch. The logical size rides the hiwater map until
+ * close carries it to the chimod.
+ * @param handle the open file (its tag set)
+ * @param hp its current path
+ * @param cte the CTE client of the file's data chain
+ * @param buf source
+ * @param size bytes
+ * @param offset file offset
+ * @return bytes written or a negative errno
  */
-static int CheckWriteBehindNoSpace(CfsHandle *handle, const std::string &hp) {
-  const clio::run::u64 ep = clio::cte::core::Client::DeferNoSpaceEpoch();
-  if (ep == handle->nospace_seen.load(std::memory_order_relaxed)) return 0;
-  handle->nospace_seen.store(ep, std::memory_order_relaxed);
-  clio::run::u64 first_bad = ~0ull;
-  // Peek, not take: any other latched error is still owed to fsync/close.
-  const int e = DrainSievePagesEx(handle->tag, HiwaterFor(hp), /*take=*/false,
-                                  &first_bad);
-  if (e != ENOSPC) return 0;
-  ShrinkAfterNoSpace(hp, first_bad);
-  return -ENOSPC;
+static int WriteDirect(CfsHandle *handle, const std::string &hp,
+                       clio::cte::core::Client *cte, const char *buf,
+                       size_t size, cte_off_t offset) {
+  namespace ev = clio::run::evlat;
+  using clio::cte::filesystem::kFsPageSize;
+  size_t done = 0;
+  while (done < size) {
+    const clio::run::u64 cur = static_cast<clio::run::u64>(offset) + done;
+    const clio::run::u64 page_off = cur % kFsPageSize;
+    const clio::run::u64 n =
+        std::min<clio::run::u64>(kFsPageSize - page_off, size - done);
+    const unsigned long long ev_pg0 = ev::Now();
+    const clio::run::u32 rc = cte->PutBlob(
+        handle->tag, clio::cte::filesystem::PageName(cur), page_off, n,
+        buf + done, g_page_score.ScoreOf(cur / kFsPageSize));
+    ev::Span(ev::kWrPage, ev_pg0, ev::Now());
+    if (rc != 0) {
+      // Bytes already stored by earlier pages of this write are kept: the
+      // file grows to them, and write(2) reports what was stored.
+      if (done > 0) break;
+      // A full store is ENOSPC (as on ext4); anything else is EIO.
+      if (clio::cte::core::PutRcIsNoSpace(rc)) return -ENOSPC;
+      return rc == ENOMEM ? -ENOMEM : -EIO;
+    }
+    done += n;
+  }
+  UnsyncedNote(handle->tag);
+  HiwaterRaise(hp, static_cast<clio::run::u64>(offset) + done);
+  return static_cast<int>(done);
 }
 
+/**
+ * write(2): O_APPEND placement, then page blobs through the CTE client
+ * (WriteDirect) when the file's tag is known, else the filesystem client.
+ * @param path libfuse's path
+ * @param buf source
+ * @param size bytes
+ * @param offset file offset (O_APPEND may move it)
+ * @param fi the open file
+ * @return bytes written or a negative errno
+ */
 int cte_fuse_write(const char *path, const char *buf, size_t size,
                           cte_off_t offset, struct fuse_file_info *fi) {
   namespace ev = clio::run::evlat;
@@ -5008,18 +4377,9 @@ int cte_fuse_write(const char *path, const char *buf, size_t size,
   RaTagGuard ra_guard(handle->tag);
   handle->wrote.store(true, std::memory_order_relaxed);
   handle->open_attr_ok.store(false, std::memory_order_relaxed);
-  {
-    // A page of this file the store refused earlier fails this write.
-    const int nospc = CheckWriteBehindNoSpace(handle, hp);
-    if (nospc != 0) return nospc;
-  }
 
-  // SIEVE-DIRECT (user directive): the write is a memcpy into the CTE
-  // sieve's page buffer — no task at all until a 64 KiB page fills and
-  // ships. Read-your-writes comes from the sieve's registered extents; the
-  // logical size rides the hiwater map until close carries it to the
-  // chimod. Falls back to the cfs deferred WriteTask pipeline when the tag
-  // is unknown or CLIO_FUSE_SIEVE=0.
+  // Page writes go straight to the file's page blobs (WriteDirect); the
+  // filesystem client's write is the fallback when the tag is unknown.
   // O_APPEND across nodes: the kernel derived `offset` from ITS cached size,
   // which another node's appends have already moved past -- two nodes each
   // appending 200 records lost half of them. Either stage the bytes for the
@@ -5042,37 +4402,9 @@ int cte_fuse_write(const char *path, const char *buf, size_t size,
     offset = static_cast<cte_off_t>(r->old_size_);
   }
   auto *cte = CLIO_CFS_CLIENT->Cte();
-  if (SieveDataEnabled() && cte != nullptr && !handle->tag.IsNull()) {
-    size_t done = 0;
-    while (done < size) {
-      clio::run::u64 cur = static_cast<clio::run::u64>(offset) + done;
-      clio::run::u64 page_off = cur % clio::cte::filesystem::kFsPageSize;
-      clio::run::u64 n = std::min<clio::run::u64>(
-          clio::cte::filesystem::kFsPageSize - page_off, size - done);
-      const unsigned long long ev_pg0 = ev::Now();
-      int rc = cte->AsyncPutBlobDefer(
-          handle->tag, clio::cte::filesystem::PageName(cur), page_off, n,
-          buf + done,
-          g_page_score.ScoreOf(cur / clio::cte::filesystem::kFsPageSize),
-          clio::cte::core::Context(), 0,
-          clio::run::PoolQuery::Dynamic(), WriteInflightBytes());
-      ev::Span(ev::kWrPage, ev_pg0, ev::Now());
-      if (rc != 0) {
-        // A full store is ENOSPC (as on ext4); anything else is EIO.
-        return (rc > 0 && clio::cte::core::PutRcIsNoSpace(
-                              static_cast<clio::run::u32>(rc)))
-                   ? -ENOSPC
-                   : -EIO;
-      }
-      done += n;
-    }
-    UnsyncedNote(handle->tag);
-    DirtyRaise(handle->tag, static_cast<clio::run::u64>(offset) + size);
-    HiwaterRaise(hp, static_cast<clio::run::u64>(offset) + size);
-    return static_cast<int>(size);
+  if (cte != nullptr && !handle->tag.IsNull()) {
+    return WriteDirect(handle, hp, cte, buf, size, offset);
   }
-  // Deferred write-behind through the cfs client (staging pool, RYW
-  // registration, fsync drain) — one submit, no wait.
   auto *cfs = CLIO_CFS_CLIENT;
   UnsyncedNote(handle->tag);
   ssize_t wrote = CfsWriteCompat(cfs, handle->fh, hp,
@@ -5096,13 +4428,9 @@ int cte_fuse_unlink(const char *path) {
     if (g_server_hidden.erase(path) == 0) return 0;
   }
   auto *cfs = CLIO_CFS_CLIENT;
-  // Deferred writes racing the unlink would land on a deleted file and latch
-  // spurious errors; drain first (no-op unless this file has writes in
-  // flight, which an unlink-after-write pattern rarely does).
+  // A queued close-to-open publish racing the unlink would land on a deleted
+  // file; run the closer's entries first.
   CloserBarrier();
-  clio::cte::core::Client::DeferAwaitKey(
-      clio::cte::core::Client::DeferKeyHashName(std::string(path)));
-  EnsureCreated(std::string(path));
   HiwaterErase(std::string(path));
   auto t = cfs->AsyncUnlink(std::string(path));
   t.Wait();
@@ -5125,11 +4453,9 @@ int cte_fuse_truncate(const char *path_in, cte_off_t size,
   if (path_s.empty()) return -EBADF;
   const char *path = path_s.c_str();
   auto *cfs = CLIO_CFS_CLIENT;
-  // Order against in-flight deferred writes: a truncate applied before a
-  // pending write lands would resurrect the truncated range (or vice versa).
-  // Sieve-path writes live under the file's page-blob keys; drain them too
-  // (tag resolved via the SHM mirror, best-effort) and clamp the hiwater
-  // overlay so stat reflects the truncation immediately.
+  // Page writes are synchronous, so nothing of this file is in flight; the
+  // tag is resolved for the appends merge and the truncate itself, and the
+  // hiwater overlay is clamped so stat reflects the truncation immediately.
   clio::cte::core::TagId tr_tag = clio::cte::core::TagId::GetNull();
   clio::run::u64 tr_old_extent = 0;
   {
@@ -5140,18 +4466,11 @@ int cte_fuse_truncate(const char *path_in, cte_off_t size,
     // truncate: wrote 1000, truncated to 100, stat said 1000). Drain the
     // closer first, exactly like rename and unlink.
     CloserBarrier();
-    // Resolve the tag from EVERY identity source, not just the mirror: an
-    // ftruncate arrives with the open handle (fi), and a minted file whose
-    // MultiCreate has not flushed has its tag only in the pending table — the
-    // mirror-only lookup skipped the sieve drain for both, and pages flushed
-    // AFTER the truncate resurrected the dropped bytes (xfstests fsx).
+    // Resolve the tag from every identity source: an ftruncate arrives with
+    // the open handle (fi); otherwise the mirror, then the name's owner.
     if (fi != nullptr) {
       auto *h = GetHandle(fi);
       if (h != nullptr) tr_tag = h->tag;
-    }
-    if (tr_tag.IsNull()) {
-      PendingCreate pc;
-      if (PendingCreateLookup(p, &pc)) tr_tag = pc.tag;
     }
     if (tr_tag.IsNull()) {
       clio::cte::filesystem::ShmFileRecord rec;
@@ -5160,11 +4479,9 @@ int cte_fuse_truncate(const char *path_in, cte_off_t size,
       }
     }
     if (tr_tag.IsNull()) {
-      // Authoritative fallback (generic/729 residue): a refused/absent
-      // mirror record left the tag unresolved, the sieve drain silently
-      // skipped, and a pending write from the file's previous open session
-      // landed AFTER the truncate. Ask the owner of the name (its inode
-      // number IS the packed id).
+      // Authoritative fallback: a refused/absent mirror record leaves the
+      // tag unresolved, and the appends merge below needs it. Ask the owner
+      // of the name (its inode number IS the packed id).
       auto g = cfs->AsyncGetattr(p);
       g.Wait();
       if (g->GetReturnCode() == 0 && g->exists_ && !g->is_dir_ &&
@@ -5172,11 +4489,7 @@ int cte_fuse_truncate(const char *path_in, cte_off_t size,
         tr_tag = clio::cte::filesystem::FsUnpack(g->ino_);
       }
     }
-    EnsureCreated(p);
-    clio::cte::core::Client::DeferAwaitKey(
-        clio::cte::core::Client::DeferKeyHashName(p));
     if (!tr_tag.IsNull()) {
-      DrainSievePages(tr_tag, HiwaterFor(p));
       const int aerr = MergeAppendsBeforeTruncate(tr_tag);
       if (aerr != 0) return aerr;
     }
@@ -5202,12 +4515,10 @@ int cte_fuse_truncate(const char *path_in, cte_off_t size,
 // negative errno.
 static int cte_fuse_write_zeros(const char *path, struct fuse_file_info *fi,
                                 cte_off_t off, cte_off_t len) {
-  // Zeros MUST take the exact same path as write(2) — with the sieve-direct
-  // adapter that is AsyncPutBlobDefer on the file's TAG, not the cfs handle
-  // pipeline. The old cfs->AsyncWrite(handle->fh, ...) route (a) wrote via a
-  // handle that is 0 for minted files and (b) created a SECOND data path
-  // whose bytes the sieve's read-your-writes extents then overrode —
-  // generic/008's zeroed first byte read back as its old value.
+  // Zeros MUST take the exact same path as write(2) -- page puts on the
+  // file's TAG, not the cfs handle pipeline: a second data path for the same
+  // bytes let one overwrite the other (generic/008's zeroed first byte read
+  // back as its old value).
   constexpr size_t kChunk = 64 * 1024;
   std::unique_ptr<char[]> zbuf(new char[kChunk]());
   for (cte_off_t done = 0; done < len;) {
@@ -5271,12 +4582,11 @@ static int cte_fuse_fallocate(const char *path, int mode, cte_off_t offset,
     rc = cte_fuse_write_zeros(path, fi, offset, length);
     if (rc != 0) return rc;
     if ((mode & FALLOC_FL_KEEP_SIZE) && (offset + length) > st.st_size) {
-      // Restore EOF through the REAL truncate hook: it drains the deferred
-      // write pipelines (path-keyed cfs writes AND sieve pages) before the
-      // task. The raw AsyncTruncate raced the still-in-flight zero writes,
-      // which then re-extended the file — fstat right after a
-      // ZERO_RANGE|KEEP_SIZE reported the zero op's end as the size (fsx,
-      // sieve-off mode).
+      // Restore EOF through the REAL truncate hook: it runs the closer's
+      // queued size pushes and clamps the hiwater overlay the zero writes
+      // raised -- the raw AsyncTruncate left that overlay in place, so fstat
+      // right after a ZERO_RANGE|KEEP_SIZE reported the zero op's end as the
+      // size (fsx).
       int trc = cte_fuse_truncate(path, st.st_size, fi);
       if (trc != 0) return trc;
     }
@@ -5322,8 +4632,6 @@ int cte_fuse_link(const char *from, const char *to) {
   if (CloserPendingFor(std::string(from)) || CloserPendingFor(std::string(to))) {
     CloserBarrier();
   }
-  EnsureCreated(std::string(from));
-  EnsureCreated(std::string(to));
   // Hard link `to` -> existing file `from`. The chimod binds both names to the
   // same CTE tag (a tag-level alias), so they share all data.
   auto *cfs = CLIO_CFS_CLIENT;
@@ -5369,12 +4677,10 @@ int cte_fuse_readlink(const char *path, char *buf, size_t size) {
   return 0;
 }
 
-static int cte_fuse_setxattr_ensure(const std::string &p) { EnsureCreated(p); return 0; }
 static int cte_fuse_setxattr(const char *path, const char *name,
                              const char *value, size_t size, int flags) {
   std::string hidden;
   if (const int hrc = MapHiddenPath(&path, &hidden)) return hrc;
-  cte_fuse_setxattr_ensure(std::string(path));
   // Set xattr `name` on `path`. `value` is raw bytes (may contain NULs), so
   // preserve its length rather than treating it as a C string. `flags` carries
   // XATTR_CREATE(1) / XATTR_REPLACE(2), matching the runtime's bit checks.
@@ -5412,12 +4718,6 @@ static int cte_fuse_getxattr(const char *path, const char *name, char *value,
   }
   if (strncmp(name, "security.", 9) == 0 || strncmp(name, "system.", 7) == 0) {
     return -ENODATA;
-  }
-  {
-    // A pending minted create has no server record yet; it also has no
-    // xattrs. Answer locally — the task path would say ENOENT.
-    PendingCreate pc;
-    if (PendingCreateLookup(std::string(path), &pc)) return -ENODATA;
   }
   auto *cfs = CLIO_CFS_CLIENT;
   auto t = cfs->AsyncGetxattr(std::string(path), std::string(name));
@@ -5492,7 +4792,6 @@ static int cte_fuse_listxattr(const char *path, char *list, size_t size) {
 static int cte_fuse_removexattr(const char *path, const char *name) {
   std::string hidden;
   if (const int hrc = MapHiddenPath(&path, &hidden)) return hrc;
-  EnsureCreated(std::string(path));
   auto *cfs = CLIO_CFS_CLIENT;
   auto t = cfs->AsyncRemovexattr(std::string(path), std::string(name));
   t.Wait();
@@ -5518,8 +4817,6 @@ static int cte_fuse_removexattr(const char *path, const char *name) {
  * The server already keeps an unlinked file alive while any node has it
  * open, so the hidden name needs no server state: `from` is unlinked there,
  * and `to` stays local, mapped to this node's open files (HiddenIdPath).
- * Not for a node with an open the server holds no count for (a minted
- * create): unlinked, that file would be destroyed under its descriptor.
  * @param from the name being hidden
  * @param to libfuse's hidden name
  * @param rc out: 0, or a negative errno from the unlink
@@ -5529,7 +4826,7 @@ static bool HideOpenFile(const char *from, const char *to, int *rc) {
   {
     std::lock_guard<std::mutex> g(g_open_files_mu);
     auto it = g_open_files.find(from);
-    if (it == g_open_files.end() || it->second->unanchored > 0) return false;
+    if (it == g_open_files.end()) return false;
   }
   *rc = cte_fuse_unlink(from);
   // Another node removed or replaced the name first: it is gone either way.
@@ -5549,27 +4846,12 @@ int cte_fuse_rename(const char *from, const char *to,
   if (NameTooLong(to)) return -ENAMETOOLONG;
   if (IsHiddenName(from)) return -ENOENT;  // only libfuse knows these names
   auto *cfs = CLIO_CFS_CLIENT;
-  // Deferred writes are keyed by PATH; a rename racing them would let the
-  // writes land under the old name. Drain `from` first (git's
-  // write-tmp-then-rename pattern hits this on every object file). Sieve
-  // writes are keyed by (tag, page) and the tag survives the rename, so
-  // they need no drain — but the hiwater overlay is path-keyed and moves.
+  // Queued closer entries are keyed by PATH; one running after the rename
+  // would publish under the old name. Run them first (git's
+  // write-tmp-then-rename pattern hits this on every object file). Page
+  // writes are keyed by (tag, page) and are synchronous, so they need
+  // nothing -- but the hiwater overlay is path-keyed and moves.
   CloserBarrier();
-  clio::cte::core::Client::DeferAwaitKey(
-      clio::cte::core::Client::DeferKeyHashName(std::string(from)));
-  EnsureCreated(std::string(from));
-  {
-    // The source's sieve pages (keyed by its tag) must land before the tag
-    // graph mutates under the rename — especially when the destination's
-    // old tag gets unlinked.
-    const std::string fp(from);
-    clio::cte::filesystem::ShmFileRecord frec;
-    if (cfs->TryGetFileRecordShm(fp, &frec) && !frec.tag_id_.IsNull()) {
-      DrainSievePages(clio::cte::core::TagId(frec.tag_id_.major_,
-                                             frec.tag_id_.minor_),
-                      HiwaterFor(fp));
-    }
-  }
   HiwaterRename(std::string(from), std::string(to));
   bool server_hide = false;
   if (IsHiddenName(to)) {
@@ -5584,13 +4866,6 @@ int cte_fuse_rename(const char *from, const char *to,
   // RENAME_WHITEOUT need chimod-level atomic swap / whiteout support and stay
   // EINVAL so callers fall back cleanly.
   if (flags & RENAME_NOREPLACE) {
-    // A pending minted create is invisible to the chimod until its batch
-    // flushes — probe the client-side registry FIRST or NOREPLACE onto a
-    // just-created file wrongly succeeds (generic/024).
-    {
-      PendingCreate pc;
-      if (PendingCreateLookup(std::string(to), &pc)) return -EEXIST;
-    }
     auto g = cfs->AsyncGetattr(std::string(to));
     g.Wait();
     if (g->GetReturnCode() == 0 && g->exists_ != 0) return -EEXIST;

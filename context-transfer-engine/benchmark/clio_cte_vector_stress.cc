@@ -588,7 +588,7 @@ class VectorStress {
       ck::Client ckpt(ck::kCheckpointPoolId, clio::cte::core::kCtePoolId);
       ck::CheckpointConfig params;
       params.next_pool_id_ = clio::cte::core::kCtePoolId;
-      auto cf = ckpt.AsyncCreateCheckpoint(clio::run::PoolQuery::Local(), ck::kCheckpointPoolName,
+      auto cf = ckpt.AsyncCreateCheckpoint(clio::run::PoolQuery::Dynamic(), ck::kCheckpointPoolName,
                                            ck::kCheckpointPoolId, params);
       cf.Wait();
       if (cf->GetReturnCode() != 0) {

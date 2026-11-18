@@ -49,8 +49,7 @@ GLOBAL_CROSS_CONST clio::run::u64 kFsPageSize = 1024 * 1024;
  * Lives in the shared header, not in the runtime's .cc, because since issue
  * #817 a CLIENT resolves page blobs itself on the fast path. Two copies of
  * this rule would let the reader and the writer disagree about which blob a
- * byte range lives in -- the same reasoning that keeps MakeShmBlobKey single
- * sourced in the CTE core.
+ * byte range lives in.
  */
 inline std::string PageName(clio::run::u64 off) {
   return std::to_string(off / kFsPageSize);

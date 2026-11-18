@@ -78,6 +78,11 @@ struct WtcConfig {
   clio::run::u32 max_sharer_entries_ = 65536;   ///< [max_sharer_entries]
   /** [md_only] cache tag and blob metadata only; blob bytes go down the
    *  chain (a data cache below already holds them). */
+  /** [invalidate_on_flush] a write sends no invalidation of its own: the
+   *  write-back cache below lands each flushed range through this pool on
+   *  the blob's home, which invalidates its sharers then (once per flushed
+   *  range). Set with a write-back cache whose flush_pool is this pool. */
+  bool invalidate_on_flush_ = false;
   bool md_only_ = false;
   /** [entry_pool_id] pool clients bind to so their tasks pass every module
    *  above this cache (e.g. the indexer); null = this pool. */
@@ -105,7 +110,8 @@ struct WtcConfig {
     ar(next_pool_id_, capacity_, log_depth_, flush_batch_bytes_, max_tags_,
        max_blobs_, max_fill_, evict_sample_, half_life_ms_, flush_period_us_,
        flush_retries_, max_sharer_entries_, flush_shards_, flush_depth_,
-       md_only_, entry_pool_id_, data_pool_, data_capacity_);
+       md_only_, entry_pool_id_, data_pool_, data_capacity_,
+       invalidate_on_flush_);
   }
 
   /** Parse "major.minor". */
@@ -164,6 +170,9 @@ struct WtcConfig {
         flush_retries_ = node["flush_retries"].as<clio::run::u32>();
       }
       if (node["md_only"]) md_only_ = node["md_only"].as<bool>();
+      if (node["invalidate_on_flush"]) {
+        invalidate_on_flush_ = node["invalidate_on_flush"].as<bool>();
+      }
       if (node["entry_pool_id"]) {
         entry_pool_id_ = ParsePoolId(node["entry_pool_id"].as<std::string>());
       }
