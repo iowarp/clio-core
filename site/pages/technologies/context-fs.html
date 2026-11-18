@@ -265,22 +265,15 @@ $ ls ~/clio-mnt/results
 <p>Context FS reads 3.9-4.9x faster than DAOS in every pattern. The data fits in its DRAM tier, so each rank's reads come from another node's memory, about 19 GiB/s per node; DAOS reads from its storage servers. On the shared file Context FS also reads about 300x faster than Flare (16 MiB transfers). Flare's 64 KiB shared-file read failed on one rank.</p>
 <p>On writes DAOS leads with one file per process (3.7x on 2 MiB transfers, 2.4x on 64 KiB), and Context FS leads on the shared file (1.1x on 16 MiB, 1.5x on 64 KiB). Flare writes one file per process at 262 GiB/s, but a shared file at 3.8 and 0.04 GiB/s.</p>
 <p>With a 1 TB footprint, Context FS wrote one file per process (2 MiB) at 145.5 GiB/s and read it at 2,456.7 GiB/s. The next pattern in that job reused the same DAOS space and ran the pool out of space: DAOS keeps every overwritten version until it reclaims it, and the Context FS DAOS tier overwrites its blocks in place. That interaction is an open issue, so the 1 TB set is incomplete.</p>
-<h3>IO500 at 256 and 512 nodes: incomplete</h3>
-<p>IO500 on 256 and 512 Aurora nodes (16 ranks per node), with work per rank capped so each run writes under 1 TB (about 850 GB for Context FS and DAOS, about 400 GB for Flare). No system completed every phase except Flare, whose run is not a valid IO500 result because its phases are shorter than 300 seconds. The completed phases (ior in GiB/s, mdtest in thousands of files per second; higher is better):</p>
+<h3>IOR easy and hard at 256 and 512 nodes</h3>
+<p>The ior-easy and ior-hard write phases of IO500 on 256 and 512 Aurora nodes (16 ranks per node), with work per rank capped so each run writes under 1 TB. ior-easy writes one file per rank in 2 MiB transfers; ior-hard writes 47,008-byte pieces interleaved into one shared file. GiB/s, higher is better; one run each.</p>
 <table>
   <tr><th>Phase</th><th>Context FS, 256</th><th>DAOS, 256</th><th>Context FS, 512</th><th>DAOS, 512</th><th>Flare, 512</th></tr>
   <tr><td>ior easy write</td><td>94.9</td><td><strong>344.9</strong></td><td>50.8</td><td><strong>313.5</strong></td><td>203.1</td></tr>
-  <tr><td>mdtest easy write</td><td><strong>326.7</strong></td><td>172.0</td><td><strong>407.6</strong></td><td>153.5</td><td>26.3</td></tr>
   <tr><td>ior hard write</td><td>did not finish</td><td><strong>15.7</strong></td><td>did not finish</td><td><strong>5.8</strong></td><td>0.07</td></tr>
-  <tr><td>mdtest hard write</td><td>—</td><td>failed</td><td>—</td><td>failed</td><td><strong>23.1</strong></td></tr>
 </table>
-<p>Context FS creates files 1.9x faster than DAOS at 256 nodes and 2.7x at 512, and 15x faster than Flare at 512. DAOS writes one file per process 3.6x faster at 256 nodes and 6.2x at 512.</p>
-<p>The two missing results are known problems:</p>
-<ul class="checks">
-  <li><strong>Context FS ior-hard.</strong> It deadlocked at 256 nodes: a write held a page lock while waiting for the flusher to release that page, and the flusher was waiting on an invalidation that needed the same lock. The fix (a pinned page refuses the write, which retries without the lock) is in PR #1376, and an 8-node run with it completes every IO500 phase. The 512-node run with the fix did not finish ior-hard within the job's hour; whether it was slow or blocked is not yet known.</li>
-  <li><strong>DAOS mdtest-hard</strong> ran the pool's storage-class-memory tier out of space at both scales.</li>
-</ul>
-<p>The complete Flare run at 512 nodes scored 17.4: 4.85 GiB/s bandwidth and 62.5 thousand operations per second metadata.</p>
+<p>DAOS writes one file per rank 3.6x faster than Context FS at 256 nodes and 6.2x at 512. Flare's run used a smaller footprint (about 400 GB against about 850 GB) because of its storage quota.</p>
+<p>Context FS's ior-hard deadlocked at 256 nodes: a write held a page lock while waiting for the flusher to release that page, and the flusher was waiting on an invalidation that needed the same lock. The fix (a pinned page refuses the write, which retries without the lock) is in PR #1376, and with it ior-hard completes on 8 nodes. The 512-node run with the fix did not finish ior-hard within the job's hour; whether it was slow or blocked is not yet known.</p>
 <h3>Checkpointing a simulation through the tiers</h3>
 <p>From the Eternia paper's evaluation: Gray-Scott on 2 Aurora nodes, 8 steps, a checkpoint every 2 steps. Each checkpoint is a copy-on-write snapshot that CLIO Core drains down the tier stack in the background, in a layout the HDF5 VOL can read. It is compared with a conventional synchronous checkpoint, in which the simulation waits until the snapshot reaches persistent storage; in the Lustre-heavy composition that is a simulation writing its checkpoint to the parallel file system. Total runtime in seconds, lower is better.</p>
 <div class="chart-grid">
