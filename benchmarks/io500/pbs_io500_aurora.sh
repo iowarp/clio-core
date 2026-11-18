@@ -31,6 +31,8 @@
 # (build/fs), IO500 (binary), DAOS_POOL (IOWarp), DAOS_CONT (io500_<nodes>n).
 # CLIO_FUSE_DIR_ATTR_CACHE_S (unset = off on multi-node): seconds the adapter
 # caches directory attributes; passed through to clio_cte_fuse unchanged.
+# DAOS_CONT_OPTS (unset): extra comma-separated `daos cont create` options,
+# e.g. --dir-oclass=SX to stripe directories across all targets.
 # DAOS_API (MODE=daos; dfuse): dfs runs IO500 on libdfs directly, no FUSE.
 # NO_FLARE (0): 1 drops the Flare tier; tiers are then DRAM + DAOS only.
 # DAOS_NATIVE (unset/0 = off; MODE=cliofs): 1 makes the DAOS tier a native
@@ -97,18 +99,36 @@ stop_nodes() {
   echo "=== teardown still running after ${DOWN_WAIT:-180} s; ending the job"
   kill "$NODES_PID" 2>/dev/null
 }
+[ "${CORE_DUMPS:-0}" = 1 ] || ulimit -c 0  # see cliofs_node.sh
 NN=$(sort -u "$PBS_NODEFILE" | wc -l)
+# MD_MAX_FILES: cap the files alive at any moment in BENCH=mdtest by
+# deriving MD_N (files per rank); each layout is deleted before the next is
+# created, so at most NN x PPN x MD_N files exist at once.
+if [ -n "${MD_MAX_FILES:-}" ]; then
+  MD_N=$(( MD_MAX_FILES / (NN * ${PPN:-16}) ))
+  [ "$MD_N" -lt 1 ] && MD_N=1
+  echo "=== mdtest cap ${MD_MAX_FILES} files alive: MD_N=$MD_N per rank ($(( MD_N * NN * ${PPN:-16} )) files)"
+fi
+# IOR_FOOTPRINT_GB: cap the IOR data footprint (all ranks together) at this
+# many GB by deriving EASY_MB, rounded down to a multiple of 16 MiB (the
+# shared16m segment). Rewrites (IOR_MINTIME) stay inside the footprint.
+if [ -n "${IOR_FOOTPRINT_GB:-}" ]; then
+  EASY_MB=$(( IOR_FOOTPRINT_GB * 1024 / (NN * ${PPN:-16}) / 16 * 16 ))
+  [ "$EASY_MB" -lt 16 ] && EASY_MB=16
+  echo "=== IOR footprint cap ${IOR_FOOTPRINT_GB} GB: EASY_MB=$EASY_MB per rank ($(( EASY_MB * NN * ${PPN:-16} / 1024 )) GB total)"
+fi
 # Log the DAOS pool's space at the start and end of every job, so a run's
 # footprint on a storage system we do not own is visible in its output.
 pool_space() {
   echo "=== DAOS pool $DAOS_POOL space ($1): $(daos pool query "${DAOS_POOL:-IOWarp}" 2>/dev/null | grep -iE 'Total size|Free' | tr -s ' ' | paste -sd ';')"
 }
-pool_space start
 NP=$(( NN * PPN ))
 # Per-node share of the dataset in MB: ior-easy + ior-hard + mdtest-hard
 # (3901-byte files). Blobs land on the node that wrote them (pool_query
 # local, neighborhood 1), so this is what each node's tiers must hold.
 DATA_MB=$(( PPN * (EASY_MB + HARD_SEG * 47008 / 1048576) + PPN * MD_N * 3901 / 1048576 + 1 ))
+# BENCH=ior writes only the EASY_MB footprint (one pattern at a time).
+[ "${BENCH:-io500}" = ior ] && DATA_MB=$(( PPN * EASY_MB + 1 ))
 RAM_PCT=${RAM_PCT:-25}
 DAOS_PCT=${DAOS_PCT:-50}
 # The Flare tier is the overflow: it only has to take the remaining
@@ -132,6 +152,7 @@ export PATH=/soft/daos/bin:$PATH DAOS_AGENT_DRPC_DIR=/run/daos_agent_oneScratch
 # Same fabric settings as `module load daos` (without them dfuse failed DER_HG).
 export FI_CXI_RX_MATCH_MODE=hybrid FI_MR_CACHE_MONITOR=kdreg2 \
   FI_MR_CACHE_MAX_COUNT=2000000 FI_CXI_DEFAULT_CQ_SIZE=131072 NA_OFI_CXI_PROTO_RNR=0
+pool_space start
 
 # One DAOS container per node count, so jobs at different scales (different
 # queues, possibly concurrent) never share one. DAOS_RESET=1 destroys it at
@@ -140,14 +161,62 @@ export FI_CXI_RX_MATCH_MODE=hybrid FI_MR_CACHE_MONITOR=kdreg2 \
 # (mdtest-hard-write hit ENOSPC at 64 nodes). DAOS_DESTROY lists other
 # containers to drop first (the old shared io500_cliofs).
 DAOS_CONT=${DAOS_CONT:-io500_${NN}n}
+_cont_opts=${DAOS_CONT_OPTS:-}  # set -u safe; see DAOS_CONT_OPTS
 if [ "$MODE" != flare ]; then
-  for c in ${DAOS_DESTROY:-}; do
+  _destroy=${DAOS_DESTROY:-}
+  for c in ${_destroy//,/ }; do  # comma- or space-separated
     daos cont destroy "$DAOS_POOL" "$c" --force 2>&1 | grep -v ' ERR ' | tail -1
   done
+  # DAOS_LIST_CONTS=1: print every container in the pool with its size, so a
+  # job shows who holds the pool's space (the login node cannot query DAOS).
+  if [ "${DAOS_LIST_CONTS:-1}" = 1 ]; then
+    echo "=== DAOS containers in $DAOS_POOL:"
+    daos cont list "$DAOS_POOL" 2>/dev/null | awk 'NR>2{print $NF}' | while read -r c; do
+      [ -z "$c" ] && continue
+      echo "===   $c $(daos cont query "$DAOS_POOL" "$c" 2>/dev/null | grep -iE 'Owner|Total|Size|Snapshot' | tr -s ' ' | paste -sd ';' | cut -c1-160)"
+    done
+  fi
   if [ "${DAOS_RESET:-1}" = 1 ]; then
     daos cont destroy "$DAOS_POOL" "$DAOS_CONT" --force 2>&1 | grep -v ' ERR ' | tail -1
   fi
   daos pool query "$DAOS_POOL" 2>&1 | grep -i -E 'total size|free' | head -4
+  # DAOS PREFLIGHT: the pool is shared and small, and a run that fills a
+  # target dies with ENOSPC partway through. Skip the run up front (exit 4,
+  # the sweep moves on to its next configuration) unless the pool has
+  # DAOS_HEADROOM (3) x this run's data free on NVMe, every NVMe target keeps
+  # its share of the run (x headroom) plus DAOS_MIN_TGT_MB (64), and every SCM target keeps
+  # DAOS_MIN_SCM_MB (64) free. DAOS_PREFLIGHT=0 skips the check.
+  # A container destroyed just above frees its space in the background, so
+  # poll for up to DAOS_PREFLIGHT_WAIT_S (300) before deciding to skip.
+  if [ "${DAOS_PREFLIGHT:-1}" = 1 ]; then
+   pf_deadline=$(( SECONDS + ${DAOS_PREFLIGHT_WAIT_S:-300} ))
+   while :; do
+    daos pool query "$DAOS_POOL" 2>/dev/null | python3 -c '
+import re, sys
+need_mb, head, min_tgt, min_scm = (float(a) for a in sys.argv[1:5])
+u = {"B": 1/2**20, "KB": 1/2**10, "MB": 1, "GB": 2**10, "TB": 2**20, "PB": 2**30}
+mb = lambda v, x: float(v) * u[x.upper()]
+tiers = re.findall(r"Free:\s*([\d.]+)\s*([KMGTP]?B),\s*min:\s*([\d.]+)\s*([KMGTP]?B).*?mean:\s*([\d.]+)\s*([KMGTP]?B)", sys.stdin.read(), re.I)
+if len(tiers) < 2:
+    print("=== DAOS PREFLIGHT: pool query unreadable; not running"); sys.exit(1)
+scm_min = mb(*tiers[0][2:4]); nvme_free = mb(*tiers[1][:2]); nvme_min = mb(*tiers[1][2:4])
+nvme_mean = mb(*tiers[1][4:6])
+# Each NVMe target holds about need/targets of this run; require head x that
+# plus min_tgt MB on the fullest one (min_tgt default 64), not a fixed 1 GB.
+targets = max(1.0, nvme_free / max(nvme_mean, 1e-9))
+min_tgt = min_tgt + head * need_mb / targets
+ok = nvme_free >= head * need_mb and nvme_min >= min_tgt and scm_min >= min_scm
+print("=== DAOS PREFLIGHT %s: run needs %.0f GB (x%.0f headroom); NVMe free %.0f GB, min/target %.0f MB; SCM min/target %.0f MB"
+      % ("ok" if ok else "SKIP", need_mb / 1024, head, nvme_free / 1024, nvme_min, scm_min))
+sys.exit(0 if ok else 1)
+' "$(( DATA_MB * NN ))" "${DAOS_HEADROOM:-3}" "${DAOS_MIN_TGT_MB:-64}" "${DAOS_MIN_SCM_MB:-64}" \
+      && break
+    if [ "$SECONDS" -ge "$pf_deadline" ]; then
+      echo "=== DAOS PREFLIGHT: skipping $MODE run rc=4"; exit 4
+    fi
+    sleep 20
+   done
+  fi
 fi
 
 if [ "$MODE" = cliofs ]; then
@@ -159,7 +228,7 @@ if [ "$MODE" = cliofs ]; then
   echo "=== cache module ${CACHE:-1}; data per node ${DATA_MB}MB; tiers per node: DRAM ${RAM_GB}MB (${RAM_PCT}%)  DAOS ${DAOS_GB}MB (${DAOS_PCT}%)  Flare ${FL_GB}MB (overflow)"
   daos pool query "$DAOS_POOL" 2>&1 | grep -i -E 'total size|free' | head -4
   daos cont query "$DAOS_POOL" "$DAOS_CONT" > /dev/null 2>&1 \
-    || daos cont create "$DAOS_POOL" "$DAOS_CONT" --type POSIX 2>&1 | grep -v ' ERR '
+    || daos cont create "$DAOS_POOL" "$DAOS_CONT" --type POSIX ${_cont_opts//,/ } 2>&1 | grep -v ' ERR '
   mkdir -p "$FLARE/tiers/$JOB"
   find "$FLARE/tiers" -mindepth 1 -maxdepth 1 -mmin +120 ! -name "$JOB" -exec rm -rf {} + 2>/dev/null
   LR=/tmp/$USER/cliofs
@@ -364,7 +433,7 @@ EOF
   DATADIR=$LR/mnt/io500_$JOB
 elif [ "$MODE" = daos ]; then
   daos cont query "$DAOS_POOL" "$DAOS_CONT" > /dev/null 2>&1 \
-    || daos cont create "$DAOS_POOL" "$DAOS_CONT" --type POSIX 2>&1 | grep -v ' ERR '
+    || daos cont create "$DAOS_POOL" "$DAOS_CONT" --type POSIX ${_cont_opts//,/ } 2>&1 | grep -v ' ERR '
   mkdir -p ready logs
   mpiexec -n "$NN" -ppn 1 --no-vni --cpu-bind none --envall \
     env OUT="$OUT" DAOS_POOL="$DAOS_POOL" DAOS_CONT="$DAOS_CONT" \
@@ -389,6 +458,20 @@ elif [ "$MODE" = daos ]; then
     DFS_API="DFS --dfs.pool=$DAOS_POOL --dfs.cont=$DAOS_CONT"
   fi
 else
+  # FLARE PREFLIGHT: the project's Lustre quota is shared. Skip (exit 4)
+  # unless FLARE_HEADROOM (1.5) x this run's data fits under the hard limit.
+  if [ "${FLARE_PREFLIGHT:-1}" = 1 ]; then
+    pid=$(lfs project -d "$FLARE" 2>/dev/null | awk '{print $1}')
+    read -r used_kb hard_kb < <(lfs quota -p "$pid" /lus/flare 2>/dev/null \
+      | awk '$1=="/lus/flare"{gsub(/\*/,""); print $2, $4}')
+    need_kb=$(( DATA_MB * NN * 1024 ))
+    avail_kb=$(( ${hard_kb:-0} - ${used_kb:-0} ))
+    echo "=== FLARE PREFLIGHT: run needs $(( need_kb / 1048576 )) GB x${FLARE_HEADROOM:-1.5}; project quota free $(( avail_kb / 1048576 )) GB (hard limit)"
+    if [ -z "$hard_kb" ] || [ "$hard_kb" = 0 ] \
+       || [ "$(( avail_kb * 10 ))" -lt "$(( need_kb * ${FLARE_HEADROOM_X10:-15} ))" ]; then
+      echo "=== FLARE PREFLIGHT: skipping flare run rc=4"; exit 4
+    fi
+  fi
   DATADIR=$FLARE/data/flare_${NN}n_$JOB
   mkdir -p "$DATADIR"
 fi
@@ -452,7 +535,8 @@ if [ "${BENCH:-io500}" = ior ]; then
   # STRACE=1: the first rank of each node runs under strace -T (ior_wrap.sh).
   # After every phase each node's runtime and adapter get SIGUSR1, which
   # prints the cumulative CLIO_EVLAT report, so phases can be told apart.
-  for v in ${IOR_VARIANTS:-fuse}; do
+  _variants=${IOR_VARIANTS:-fuse}
+  for v in ${_variants//,/ }; do  # comma- or space-separated
    if [ $v = preload ]; then
     mkdir -p "$DATADIR/ior-easy-pl" 2>/dev/null
     tgt="clio::/$(basename "$DATADIR")/ior-easy-pl/ior_file_easy"; sfx="-preload"
@@ -467,6 +551,21 @@ if [ "${BENCH:-io500}" = ior ]; then
     tgt="$DATADIR/ior-hard/file"; sfx="-hard"; pre=""
     shape="-t 47008 -b 47008 -s $HARD_SEG"
    fi
+   # Named access patterns, EASY_MB per rank (the data footprint):
+   #   fpp2m / fpp64k  file per process, 2 MiB / 64 KiB transfers
+   #   shared16m / shared1m / shared64k  one shared file, segmented: each
+   #     rank owns every Nth block of that size
+   case $v in
+    fpp2m)     shape="-t 2m -b ${EASY_MB}m -F" ;;
+    fpp64k)    shape="-t 64k -b ${EASY_MB}m -F" ;;
+    shared16m) shape="-t 16m -b 16m -s $(( EASY_MB / 16 ))" ;;
+    shared1m)  shape="-t 1m -b 1m -s $EASY_MB" ;;
+    shared64k) shape="-t 64k -b 64k -s $(( EASY_MB * 16 ))" ;;
+   esac
+   case $v in fpp*|shared*)
+    mkdir -p "$DATADIR/ior-$v" 2>/dev/null
+    tgt="$DATADIR/ior-$v/file"; sfx="-$v"; pre="" ;;
+   esac
    # IOR_FSYNC=0 drops IO500's fsync before close (-e): with a DRAM tier
    # that holds the whole dataset nothing then reaches the persistent tier
    # inside the timed phase, which isolates the path into DRAM.
@@ -477,8 +576,17 @@ if [ "${BENCH:-io500}" = ior ]; then
    # with a stonewall at the same time so a phase stops at the mark.
    mintime=""
    [ -n "${IOR_MINTIME:-}" ] && mintime="-D $IOR_MINTIME -O minTimeDuration=$IOR_MINTIME"
+   # IOR_WRITE_MINTIME: the write phase's minimum duration, default
+   # IOR_MINTIME. 0 writes the footprint once: for DAOS, which keeps every
+   # overwritten version until aggregation, so a timed rewrite fills the pool.
+   wmintime=$mintime
+   if [ -n "${IOR_WRITE_MINTIME:-}" ]; then
+    wmintime=""
+    [ "$IOR_WRITE_MINTIME" != 0 ] && wmintime="-D $IOR_WRITE_MINTIME -O minTimeDuration=$IOR_WRITE_MINTIME"
+   fi
    for ph in write read; do
     [ $ph = write ] && fl="-w" || fl="-r"
+    phmin=$mintime; [ $ph = write ] && phmin=$wmintime
     # PROFILE=1: sample thread CPU and stacks on this node during the phase.
     [ "${PROFILE:-0}" = 1 ] && bash "$HERE/sample_stacks.sh" "$OUT/prof$sfx-$ph" \
       "${PROFILE_DELAY:-1}" "${PROFILE_N:-8}" "${PROFILE_GAP:-0.4}" > /dev/null 2>&1 &
@@ -486,7 +594,7 @@ if [ "${BENCH:-io500}" = ior ]; then
     [ "${STRACE:-0}" = 1 ] && wrap="$HERE/ior_wrap.sh $OUT/ior$sfx-$ph $PPN"
     mpiexec -n $(( NN * PPN )) -ppn "$PPN" --cpu-bind depth -d 4 --envall \
       $wrap $pre "$IOR" -g -G 271828 -k $fs -o "$tgt" -C -Q 1 \
-      $shape $fl -a POSIX $mintime ${IOR_EXTRA:-} > "ior-easy$sfx-$ph.txt" 2>&1
+      $shape $fl -a POSIX $phmin ${IOR_EXTRA:-} > "ior-easy$sfx-$ph.txt" 2>&1
     rc=$?
     echo "IORCELL tag=${RUN_TAG:-none} variant=$v nodes=$NN phase=$ph rc=$rc $(grep -E '^(write|read) ' "ior-easy$sfx-$ph.txt" | awk '{print "MiB/s=" $2, "open_s=" $7, "io_s=" $8, "close_s=" $9}')"
     if [ "$MODE" = cliofs ]; then
@@ -495,6 +603,9 @@ if [ "${BENCH:-io500}" = ior ]; then
       sleep 3
     fi
    done
+   # A named pattern's files go once both phases ran, so patterns never
+   # stack up on a shared quota.
+   case $v in fpp*|shared*) rm -rf "$DATADIR/ior-$v" ;; esac
   done
 elif [ "${BENCH:-io500}" = mdtest ]; then
   # BENCH=mdtest: create then delete, for the per-rank-directory layout
@@ -505,10 +616,11 @@ elif [ "${BENCH:-io500}" = mdtest ]; then
     local tag=$1 fl=$2; shift 2
     mpiexec -n $(( NN * PPN )) -ppn "$PPN" --cpu-bind depth -d 4 --envall \
       "$MDT" -n "$MD_N" -F -N 1 -P "$fl" "$@" -a POSIX > "mdtest-$tag.txt" 2>&1
-    echo "MDCELL tag=${RUN_TAG:-none} nodes=$NN phase=$tag rc=$? $(grep -E 'File (creation|removal)' "mdtest-$tag.txt" | awk '{print $1 "_" $2 "_per_s=" $4}' | tr '\n' ' ')"
+    echo "MDCELL tag=${RUN_TAG:-none} nodes=$NN phase=$tag rc=$? $(grep -E 'File (creation|stat|read|removal)' "mdtest-$tag.txt" | awk '{print $1 "_" $2 "_per_s=" $4}' | tr '\n' ' ')"
   }
   mkdir -p "$DATADIR/md-easy" "$DATADIR/md-hard" 2>/dev/null
   run_md easy-create -C -u -L -d "$DATADIR/md-easy"
+  run_md easy-stat -T -u -L -d "$DATADIR/md-easy"
   SP=
   [ "${PROFILE:-0}" = 1 ] && { bash "$HERE/sample_stacks.sh" "$OUT/prof_easy_delete" \
     "${PROFILE_DELAY:-2}" "${PROFILE_N:-12}" > /dev/null 2>&1 & SP=$!; }
@@ -517,6 +629,8 @@ elif [ "${BENCH:-io500}" = mdtest ]; then
   # which run until the job tears down (this hung two jobs).
   [ -n "$SP" ] && wait "$SP"
   run_md hard-create -C -t -w 3901 -e 3901 -d "$DATADIR/md-hard"
+  run_md hard-stat -T -t -d "$DATADIR/md-hard"
+  run_md hard-read -E -t -e 3901 -d "$DATADIR/md-hard"
   SP=
   [ "${PROFILE:-0}" = 1 ] && { bash "$HERE/sample_stacks.sh" "$OUT/prof_hard_delete" \
     "${PROFILE_DELAY:-2}" "${PROFILE_N:-12}" > /dev/null 2>&1 & SP=$!; }

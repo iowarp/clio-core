@@ -3,6 +3,10 @@
 # dfuse, start clio_run with this node's config, mount clio_cte_fuse at
 # $LR/mnt, report $OUT/ready/<host>, wait for $OUT/stop, tear down.
 # EMBED=1 runs the runtime inside clio_cte_fuse instead of a separate clio_run.
+# Core dumps: a crashed runtime writes several GB per node into the run
+# directory on Flare; at hundreds of nodes that exceeds the project quota
+# and kills every run after it. CORE_DUMPS=1 keeps them for debugging.
+[ "${CORE_DUMPS:-0}" = 1 ] || ulimit -c 0
 set -u
 H=$(hostname)
 LOG=$OUT/logs/$H

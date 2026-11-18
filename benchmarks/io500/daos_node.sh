@@ -2,6 +2,10 @@
 # One per node (mpiexec -ppn 1) from pbs_io500_aurora.sh MODE=daos: mount
 # DAOS with dfuse at /tmp/$USER/daos_io500, report $OUT/ready/<host>, wait
 # for $OUT/stop, remove this job's data (first node only) and unmount.
+# Core dumps: a crashed runtime writes several GB per node into the run
+# directory on Flare; at hundreds of nodes that exceeds the project quota
+# and kills every run after it. CORE_DUMPS=1 keeps them for debugging.
+[ "${CORE_DUMPS:-0}" = 1 ] || ulimit -c 0
 set -u
 H=$(hostname)
 DM=/tmp/$USER/daos_io500
