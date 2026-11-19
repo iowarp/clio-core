@@ -448,6 +448,14 @@ class SystemInfo {
   /** Directory of the shared library containing the given symbol. */
   CTP_DLL static std::string GetModuleDirectoryFor(void *symbol);
 
+  /**
+   * Resolved path of the shared library (or executable) that contains the
+   * given symbol.
+   * @param symbol Address of a function or object
+   * @return The canonical file path, or "" if it cannot be determined
+   */
+  CTP_DLL static std::string GetModulePathFor(void *symbol);
+
   /// @brief Retrieves storage device hardware health statistics.
   CTP_DLL static std::string GetDeviceHealthStats(const std::string &path);
 
