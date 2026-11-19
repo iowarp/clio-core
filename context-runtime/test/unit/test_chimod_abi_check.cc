@@ -35,15 +35,19 @@
  * ModuleManager ABI-fingerprint check: a ChiMod whose get_chimod_abi()
  * differs from the runtime's (a stale .so left behind by an incremental
  * rebuild), or that predates the fingerprint, must be skipped rather than
- * instantiated. The three libraries are minimal stand-ins built by
+ * instantiated. The four libraries are minimal stand-ins built by
  * test_chimod_abi_fake.cc with different FAKE_ABI_MODE values; their paths
  * come in as compile definitions.
  */
 
 #include <cstdlib>
+#include <filesystem>
+#include <memory>
+#include <string>
 
 #include "clio_runtime/container.h"
 #include "clio_runtime/module_manager.h"
+#include "clio_ctp/introspect/system_info.h"
 #include "simple_test.h"
 
 TEST_CASE("ChiMod with the runtime's ABI fingerprint loads",
@@ -65,6 +69,27 @@ TEST_CASE("ChiMod without an ABI fingerprint is skipped",
   clio::run::ModuleManager mm;
   REQUIRE_FALSE(mm.LoadChiMod(ABI_FAKE_NONE_LIB));
   REQUIRE(mm.GetChiMod("abi_fake_none") == nullptr);
+}
+
+TEST_CASE("ChiMod with no get_chimod_abi reachable at all is skipped",
+          "[module_manager][abi]") {
+  clio::run::ModuleManager mm;
+  REQUIRE_FALSE(mm.LoadChiMod(ABI_FAKE_BARE_LIB));
+  REQUIRE(mm.GetChiMod("abi_fake_bare") == nullptr);
+}
+
+TEST_CASE("GetModulePathFor names the file that defines a symbol",
+          "[system_info][abi]") {
+  REQUIRE(ctp::SystemInfo::GetModulePathFor(nullptr).empty());
+  // A heap address belongs to no loaded module.
+  auto heap = std::make_unique<int>(0);
+  REQUIRE(ctp::SystemInfo::GetModulePathFor(heap.get()).empty());
+  // A function in libclio_ctp resolves to that library's file.
+  void *fn = reinterpret_cast<void *>(&ctp::SystemInfo::GetModulePathFor);
+  std::string path = ctp::SystemInfo::GetModulePathFor(fn);
+  REQUIRE_FALSE(path.empty());
+  REQUIRE(ctp::SystemInfo::GetModuleDirectoryFor(fn) ==
+          std::filesystem::path(path).parent_path().string());
 }
 
 TEST_CASE("CLIO_CHIMOD_ABI_CHECK=0 loads a mismatched ChiMod",

@@ -318,7 +318,7 @@ set_target_properties(${TASK_STAT_MODEL_TEST_TARGET} PROPERTIES
 set(CHIMOD_ABI_TEST_TARGET clio_run_chimod_abi_check_tests)
 set(_abi_fake_dir ${CMAKE_BINARY_DIR}/test_chimod_abi)
 set(_abi_fake_defs "")
-foreach(_mode_name IN ITEMS 0:match 1:stale 2:none)
+foreach(_mode_name IN ITEMS 0:match 1:stale 2:none 3:bare)
   string(REPLACE ":" ";" _pair ${_mode_name})
   list(GET _pair 0 _mode)
   list(GET _pair 1 _name)
@@ -327,10 +327,15 @@ foreach(_mode_name IN ITEMS 0:match 1:stale 2:none)
   target_compile_definitions(${_tgt} PRIVATE FAKE_ABI_MODE=${_mode})
   # Link admin like every real module runtime does: its get_chimod_abi() is
   # then reachable through dlsym on the "none" library's handle, which the
-  # check must not mistake for the library's own.
-  target_link_libraries(${_tgt} PRIVATE clio_run_cxx clio_admin_runtime)
-  if(NOT APPLE AND NOT WIN32)
-    target_link_options(${_tgt} PRIVATE -Wl,--no-as-needed)
+  # check must not mistake for the library's own. "bare" links no module, so
+  # no get_chimod_abi() is reachable from it at all.
+  if(_name STREQUAL "bare")
+    target_link_libraries(${_tgt} PRIVATE clio_run_cxx)
+  else()
+    target_link_libraries(${_tgt} PRIVATE clio_run_cxx clio_admin_runtime)
+    if(NOT APPLE AND NOT WIN32)
+      target_link_options(${_tgt} PRIVATE -Wl,--no-as-needed)
+    endif()
   endif()
   set_target_properties(${_tgt} PROPERTIES
     CXX_STANDARD 20

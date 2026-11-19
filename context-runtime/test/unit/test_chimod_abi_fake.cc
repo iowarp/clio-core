@@ -39,6 +39,8 @@
  *   0  get_chimod_abi() returns the runtime's fingerprint  ("abi_fake_match")
  *   1  get_chimod_abi() returns a different fingerprint    ("abi_fake_stale")
  *   2  no get_chimod_abi() at all, like a pre-check build  ("abi_fake_none")
+ *   3  same as 2, but links no module, so dlsym finds no    ("abi_fake_bare")
+ *      get_chimod_abi() in any dependency either
  */
 
 #include "clio_runtime/container.h"
@@ -66,8 +68,10 @@ const char *get_chimod_name() {
   return "abi_fake_match";
 #elif FAKE_ABI_MODE == 1
   return "abi_fake_stale";
-#else
+#elif FAKE_ABI_MODE == 2
   return "abi_fake_none";
+#else
+  return "abi_fake_bare";
 #endif
 }
 
