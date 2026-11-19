@@ -47,9 +47,9 @@
 
 #include "clio_ctp/util/msan.h"
 
-#ifdef CTP_ALLOC_TRACK_SIZE
 #include <chrono>
 #include <thread>
+#ifdef CTP_ALLOC_TRACK_SIZE
 #include "clio_ctp/memory/allocator/malloc_allocator.h"
 #endif
 
@@ -73,6 +73,38 @@ extern "C" size_t clio_runtime_worker_count() __attribute__((weak));
 
 namespace SimpleTest {
 
+/**
+ * Wait until a sampled quantity (e.g. heap bytes) is quiescent: unchanged
+ * for at least `quiet_ms` of wall time across consecutive samples. Server
+ * side frees can lag a client's Wait() by an unbounded amount on a slow
+ * runner, so two equal samples a few ms apart are not evidence of rest.
+ * @param sample   returns the current value
+ * @param quiet_ms how long the value must hold still (>= 500 ms)
+ * @param cap_ms   give up after this long and return the last sample
+ * @return the settled (or, at the cap, the last) value
+ */
+inline size_t WaitForQuiescentValue(const std::function<size_t()> &sample,
+                                    int quiet_ms = 500, int cap_ms = 30000) {
+  using Clock = std::chrono::steady_clock;
+  const auto start = Clock::now();
+  size_t prev = sample();
+  auto still_since = Clock::now();
+  while (Clock::now() - start < std::chrono::milliseconds(cap_ms)) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    const size_t cur = sample();
+    if (cur != prev) {
+      prev = cur;
+      still_since = Clock::now();
+    } else if (Clock::now() - still_since >=
+               std::chrono::milliseconds(quiet_ms)) {
+      return cur;
+    }
+  }
+  std::cout << "  [WaitForQuiescentValue] value still moving after " << cap_ms
+            << " ms; using the last sample" << std::endl;
+  return prev;
+}
+
 #ifdef CTP_ALLOC_TRACK_SIZE
 // Automatic per-test leak checking. Only compiled in leak-tracking builds
 // (-DCLIO_CORE_ENABLE_LEAK_CHECK=ON, which defines CTP_ALLOC_TRACK_SIZE), so
@@ -90,9 +122,9 @@ inline size_t RuntimeHeapBytes() {
   return CTP_MALLOC->GetCurrentlyAllocatedSize();
 }
 
-// Poll until the runtime private-heap usage stops changing (so async server-side
-// frees — which can lag the client's Wait() — have settled) or a short bound
-// elapses. Returns early once stable, so the common case costs ~20 ms.
+// StabilizeRuntimeHeap (below): poll until the runtime private-heap usage has
+// held still for 500 ms (async server-side frees can lag the client's Wait()
+// arbitrarily on a slow runner), capped at 30 s.
 // Number of workers the in-process runtime currently owns, or 0 if there is
 // no runtime. Used to tell a genuine leak apart from an elastic worker being
 // spawned mid-test -- see the leak check below.
@@ -112,15 +144,9 @@ inline size_t RuntimeWorkerCount() {
 #endif
 }
 
+/** @return runtime heap bytes once they have held still for 500 ms. */
 inline size_t StabilizeRuntimeHeap() {
-  size_t prev = RuntimeHeapBytes();
-  for (int i = 0; i < 50; ++i) {  // up to ~0.5 s
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    size_t cur = RuntimeHeapBytes();
-    if (cur == prev) return cur;
-    prev = cur;
-  }
-  return prev;
+  return WaitForQuiescentValue(RuntimeHeapBytes);
 }
 }  // namespace detail
 #endif  // CTP_ALLOC_TRACK_SIZE

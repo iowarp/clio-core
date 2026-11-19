@@ -223,7 +223,7 @@ if(CLIO_CORE_ENABLE_TESTS)
   set_tests_properties(cr_cli_client_crash_leak PROPERTIES
     ENVIRONMENT "${_cli_live_env}"
     RESOURCE_LOCK "clio_runtime"
-    TIMEOUT 180
+    TIMEOUT 300
     LABELS "msan_skip;leak;crash"
   )
 

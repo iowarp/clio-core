@@ -606,7 +606,9 @@ void CheckGarbageCountRejected() {
                 .count();
   REQUIRE(ar.Failed());
   REQUIRE(obj.empty());
-  REQUIRE(ms < 1000);
+  // The regression looped over 2^60 elements (hours); a correct reject is
+  // microseconds. 10 s separates the two on any runner, ASan included.
+  REQUIRE(ms < 10000);
 }
 
 }  // namespace

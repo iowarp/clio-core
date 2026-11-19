@@ -344,6 +344,23 @@ std::vector<clio::cte::core::TemporalSearchResult> SearchTimes(
   return search->results_;
 }
 
+/**
+ * Block until the wall clock (the one the CTE stamps last_modified_ with)
+ * has moved strictly past `stamp_ns`. A fixed few-ms sleep is not enough on
+ * a system clock with coarse resolution (~15.6 ms on Windows), where two
+ * writes a few ms apart get the SAME stamp; waiting for the clock itself
+ * makes the next write's stamp strictly larger on any runner.
+ * @param stamp_ns a last_modified_ value already handed out
+ */
+void WaitForWallClockPast(clio::run::u64 stamp_ns) {
+  const auto cap =
+      std::chrono::steady_clock::now() + std::chrono::seconds(60);
+  while (clio::cte::core::GetWallTimeNs() <= stamp_ns &&
+         std::chrono::steady_clock::now() < cap) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+}
+
 /** Pool and tag shared by the BlobTimes case and its phases. */
 constexpr clio::run::u32 kTimesPool = 703;
 constexpr const char *kTimesTag = "times_tag";
@@ -359,7 +376,9 @@ TEST_CASE("TimesPhaseWrite - one blob in the snapshot, one in the WAL",
   REQUIRE(PutFill(cte, tag->tag_id_, "in_snapshot", 0, 4096, 's') == 0);
   auto flush = cte->AsyncFlushMetadata(clio::run::PoolQuery::Local(), 0);
   flush.Wait();
-  std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  auto first = SearchTimes(cte, kTimesTag);
+  REQUIRE(first.size() == 1);
+  WaitForWallClockPast(first[0].last_modified_);
   REQUIRE(PutFill(cte, tag->tag_id_, "in_wal", 0, 4096, 'w') == 0);
   REQUIRE(SearchTimes(cte, kTimesTag).size() == 2);
 }

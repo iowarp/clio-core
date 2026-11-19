@@ -917,7 +917,7 @@ bool VizServer::StartOn(const std::string &bind_addr, u32 port,
   return true;
 }
 
-void VizServer::Stop() {
+bool VizServer::Stop() {
   // Detach the server under the lifecycle lock, then tear it down OUTSIDE the
   // lock: teardown may wait up to the stop budget for handlers, and a handler
   // may itself call GetPort()/IsRunning(). impl_ is null from here on, so a
@@ -926,7 +926,7 @@ void VizServer::Stop() {
   {
     std::lock_guard<std::mutex> life_lock(lifecycle_mutex_);
     if (!impl_) {
-      return;
+      return true;
     }
     impl = std::shared_ptr<Impl>(std::move(impl_));
   }
@@ -992,7 +992,9 @@ void VizServer::Stop() {
          "Viz: dashboard teardown did not finish within {} ms; abandoning it "
          "so the shutdown can proceed",
          stop_budget_ms);
+    return false;
   }
+  return true;
 }
 
 bool VizServer::IsRunning() const {
@@ -1025,7 +1027,7 @@ bool VizServer::StartOn(const std::string &bind_addr, u32 port,
   return false;
 }
 
-void VizServer::Stop() {}
+bool VizServer::Stop() { return true; }
 bool VizServer::IsRunning() const { return false; }
 u32 VizServer::GetPort() const { return 0; }
 std::string VizServer::GetBindAddr() const { return std::string(); }

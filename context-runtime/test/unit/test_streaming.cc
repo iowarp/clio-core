@@ -229,17 +229,12 @@ TEST_CASE("Runtime Heap Leak Check", "[streaming][leak]") {
   };
 
   // The server frees its per-request FutureShm *after* sending the response
-  // (SendOut), so the free can lag the client's Wait(). Poll until the
-  // runtime private-heap usage stops moving before snapshotting.
+  // (SendOut), so the free can lag the client's Wait() by any amount on a
+  // slow runner. Snapshot only once the runtime private-heap usage has held
+  // still for 500 ms (30 s cap).
   auto stabilized_heap = [&]() -> size_t {
-    size_t prev = ipc->GetRuntimeHeapAllocatedBytes();
-    for (int i = 0; i < 150; ++i) {  // up to ~3s
-      std::this_thread::sleep_for(20ms);
-      size_t cur = ipc->GetRuntimeHeapAllocatedBytes();
-      if (cur == prev) return cur;
-      prev = cur;
-    }
-    return prev;
+    return SimpleTest::WaitForQuiescentValue(
+        [&] { return static_cast<size_t>(ipc->GetRuntimeHeapAllocatedBytes()); });
   };
 
   // Warm up: the first RPCs lazily allocate caches/pools that legitimately
