@@ -791,7 +791,13 @@ struct ReadTask : public clio::run::Task {
   template <typename Archive>
   CTP_CROSS_FUN void SerializeOut(Archive &ar) {
     Task::SerializeOut(ar);
-    ar(length_, bytes_read_, io_error_);
+    // length_ is INOUT: a response may shorten it (a short read) but never
+    // grow it past the buffer the caller exposed, because the bulk below is
+    // copied into that buffer using it. When saving, `length` is just
+    // length_; when loading, a larger value from the wire is ignored.
+    size_t length = length_;
+    ar(length, bytes_read_, io_error_);
+    if (length < length_) length_ = length;
     // Use BULK_XFER to actually transfer the read data back
     ar.bulk(data_, length_, BULK_XFER);
   }

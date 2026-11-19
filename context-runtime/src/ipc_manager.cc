@@ -4511,6 +4511,15 @@ void IpcManager::RecvZmqClientThread() {
       auto info = recv_transport->Recv(*archive);
       int rc = info.rc;
       if (rc == EAGAIN) break;
+      if (rc == EPROTO) {
+        // The transport dropped a malformed response whole (a bulk frame
+        // that did not match its declared size). Its future stays pending
+        // rather than receiving corrupt data; keep draining the rest.
+        recv_transport->ClearRecvHandles(*archive);
+        HLOG(kError, "RecvZmqClientThread: dropped a malformed response");
+        got_message = true;
+        continue;
+      }
       if (rc != 0) {
         recv_transport->ClearRecvHandles(*archive);
         if (!zmq_recv_running_.load()) break;

@@ -246,6 +246,14 @@ bool IpcCpu2CpuZmq::RecvIn(IpcManager *ipc, u32 &tasks_received) {
       auto recv_info = transport->Recv(archive);
       int rc = recv_info.rc;
       if (rc == EAGAIN) break;
+      if (rc == EPROTO) {
+        // A malformed message (a bulk frame that did not match its declared
+        // size) was dropped whole by the transport. Keep draining: the
+        // ZMQ_FD is edge-triggered, so stopping here would strand the
+        // well-formed messages queued behind it.
+        HLOG(kError, "IpcCpu2CpuZmq::RecvIn: dropped a malformed message");
+        continue;
+      }
       if (rc != 0) {
         // -1 here is overwhelmingly "peer closed the socket" (RecvExact
         // returns -1 on EOF). The lightbeam SocketTransport already cleaned
