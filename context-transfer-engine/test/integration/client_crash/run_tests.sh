@@ -112,9 +112,11 @@ main() {
     say "$BLUE" "Bringing up daemon + crash driver..."
     docker compose up -d
 
-    # The daemon binds CLIO_BIND_ADDR (not loopback), so point the in-container
-    # status probe at that address.
-    if ! CW_STATUS_EXEC_OPTS="-e CLIO_SERVER_ADDR=172.31.2.10" cw_wait_runtimes "$DAEMON"; then
+    # The daemon binds only CLIO_BIND_ADDR (not loopback). An in-container
+    # `clio_run status` never completes its handshake there, even pointed at
+    # that address (CI: UNRESPONSIVE for 180 s while the daemon was serving),
+    # so wait for the runtime's own ready line instead.
+    if ! cw_wait_log "$DAEMON" "Compose: All [0-9]+ pools created successfully"; then
         cleanup; exit 1
     fi
     touch "$SYNC_DIR/daemon_ready"

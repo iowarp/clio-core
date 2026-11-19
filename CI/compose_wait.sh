@@ -247,6 +247,36 @@ cw_wait_runtimes() {
   return 0
 }
 
+# Wait until a container's log contains a line matching a pattern. For a
+# daemon the in-container `clio_run status` probe cannot reach (e.g. one
+# bound only to a non-loopback CLIO_BIND_ADDR, where the probe's handshake
+# never completes), use the runtime's own "ready" log line instead:
+# "Compose: All N pools created successfully" is printed only after the
+# compose pools exist, i.e. once the runtime is serving.
+# @param $1 container name
+# @param $2 extended regex to wait for in `docker logs`
+cw_wait_log() {
+  local c=$1 pat=$2 cap start
+  cap=$(cw_cap "$CW_READY_CAP")
+  start=$(date +%s)
+  cw_log "waiting for /$pat/ in $c's log (cap ${cap}s)"
+  while :; do
+    if docker logs "$c" 2>&1 | grep -Eq -- "$pat"; then
+      cw_log "$c: ready after $(( $(date +%s) - start ))s"
+      return 0
+    fi
+    if ! cw_is_running "$c"; then
+      cw_fail "$c is not running ($(cw_state "$c")) while waiting for /$pat/"
+      return 1
+    fi
+    if [ $(( $(date +%s) - start )) -ge "$cap" ]; then
+      cw_fail "/$pat/ not in $c's log after ${cap}s"
+      return 1
+    fi
+    sleep 2
+  done
+}
+
 # Run `docker exec` bounded by the suite deadline. On a timeout, dumps
 # diagnostics and returns 124; any other non-zero exit is returned as-is
 # (callers decide whether to dump -- see cw_exec_or_dump).
