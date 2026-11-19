@@ -176,7 +176,8 @@ static void CreateCache(const clio::run::PoolId &id, const std::string &name,
                         clio::run::u64 data_capacity = 0,
                         double flush_period_us = 0,
                         const clio::run::PoolId &next =
-                            clio::cte::core::kCtePoolId) {
+                            clio::cte::core::kCtePoolId,
+                        clio::run::u64 flush_batch_bytes = 0) {
   clio::cte::shm_wtc::Client admin;
   clio::cte::shm_wtc::WtcConfig params;
   params.md_only_ = md_only;
@@ -189,6 +190,7 @@ static void CreateCache(const clio::run::PoolId &id, const std::string &name,
   params.max_blobs_ = 4096;
   params.log_depth_ = 4096;
   if (flush_period_us > 0) params.flush_period_us_ = flush_period_us;
+  if (flush_batch_bytes > 0) params.flush_batch_bytes_ = flush_batch_bytes;
   auto create = admin.AsyncCreate(clio::run::PoolQuery::Local(), name, id,
                                   params);
   create.Wait();
@@ -615,11 +617,18 @@ TEST_CASE("ShmWtc - eviction keeps a small cache writable",
 TEST_CASE("ShmWtc - overwrites flush once and the last write wins",
           "[cte][shm_wtc][dedup]") {
   WtcFixture fx;
-  // A slow flusher (100 ms) of its own: the overwrites below pile up between
-  // flushes on any machine, instead of racing a 50 us one (a fast runner's
-  // flusher kept up with every put and so never had a range to retire).
+  // A range is retired without a resend only when it is still in the log
+  // after an EARLIER batch copied its blob: overwrites popped into the same
+  // batch coalesce into one record and count as nothing. So the pile-up
+  // must outgrow one batch. With the default 16 MiB batch (256 of these
+  // 64 KiB puts) a slow runner (icx on windows-2022) put fewer than that
+  // per 100 ms flusher period, every batch took the whole log, and nothing
+  // was ever skipped. A one-put batch makes any two queued overwrites of a
+  // blob a skip, however fast or slow the machine; the slow flusher (100 ms)
+  // still lets them queue instead of racing a 50 us one.
   const clio::run::PoolId kDedupPool(576, 0);
-  CreateCache(kDedupPool, "shm_wtc_dedup", 64ull << 20, false, 0, 100000.0);
+  CreateCache(kDedupPool, "shm_wtc_dedup", 64ull << 20, false, 0, 100000.0,
+              clio::cte::core::kCtePoolId, 64ull << 10);
   clio::cte::core::Client io(kDedupPool);
   Connect(io, kDedupPool);
   const wtc::Stats *st = io.CacheStats();
