@@ -1968,10 +1968,9 @@ void IpcManager::SetDead(u64 node_id) {
   // Remove cached client connections to the dead node (hostfile_mu_ is
   // released first, so this adds no hostfile -> client_pool lock order).
   {
-    std::lock_guard<std::mutex> lock(client_pool_mutex_);
     std::string key = ip + ":" + std::to_string(port);
-    client_pool_.erase(key);
-    client_pool_.erase(key + "#resp");
+    client_pool_.Erase(key);
+    client_pool_.Erase(key + "#resp");
   }
 
   HLOG(kWarning, "IpcManager: Node {} ({}) marked as DEAD", node_id, ip);
@@ -2942,8 +2941,10 @@ ctp::lbm::Transport *IpcManager::GetOrCreateClient(const std::string &addr,
                                                     const char *lane) {
   // Create key for the pool map. The lane suffix gives distinct traffic
   // classes (bulk task payloads vs small responses) their own connection
-  // and thus their own socket mutex + ZMQ pipe (issue #892).
-  std::string key = addr + ":" + std::to_string(port);
+  // and thus their own socket mutex + ZMQ pipe (issue #892). Backoff is per
+  // peer (addr:port), shared by every lane and send slot.
+  std::string peer = addr + ":" + std::to_string(port);
+  std::string key = peer;
   if (lane != nullptr && *lane != '\0') {
     key += "#";
     key += lane;
@@ -2952,48 +2953,59 @@ ctp::lbm::Transport *IpcManager::GetOrCreateClient(const std::string &addr,
     key += "#s" + std::to_string(tls_send_slot);
   }
 
-  // Lock the pool for thread-safe access
-  std::lock_guard<std::mutex> lock(client_pool_mutex_);
-
-  // Check if client already exists
-  auto it = client_pool_.find(key);
-  if (it != client_pool_.end()) {
-    HLOG(kDebug, "[ClientPool] Reusing existing connection to {}", key);
-    return it->second.get();
+  // A failed dial returns nullptr and the caller retries; the table bounds
+  // how often that retry really dials (exponential backoff per peer) and
+  // never holds a lock across the dial. TransportFactory::Get throws when the
+  // address is unroutable; the table turns that into a failure, so a
+  // malformed identity never terminates the runtime.
+  ctp::lbm::PeerDialReport rep;
+  ctp::lbm::Transport *t = client_pool_.GetOrDial(
+      key, peer,
+      [this, &addr, port](std::string *error) {
+        return DialPeerClient(addr, port, error);
+      },
+      &rep);
+  switch (rep.status_) {
+    case ctp::lbm::PeerDialStatus::kDialed:
+      if (rep.log_) {
+        HLOG(kInfo,
+             "[ClientPool] Connection established to {} after {} failed "
+             "dials",
+             key, rep.streak_);
+      } else {
+        HLOG(kInfo, "[ClientPool] Connection established to {}", key);
+      }
+      break;
+    case ctp::lbm::PeerDialStatus::kFailed:
+      if (rep.log_) {
+        HLOG(kError,
+             "[ClientPool] Failed to dial {}: {} (failure {} in a row, "
+             "{} unlogged since last report, next dial in {} ms)",
+             key, rep.error_, rep.streak_, rep.suppressed_,
+             rep.backoff_.count());
+      }
+      break;
+    default:
+      break;
   }
+  return t;
+}
 
-  // Create new persistent client connection. TransportFactory::Get throws
-  // (std::runtime_error) when the address is unroutable; a malformed client
-  // identity must never terminate the whole runtime, so swallow it and return
-  // nullptr — the caller falls back to echoing the response over the inbound
-  // ROUTER (see IpcCpu2CpuZmq::RecvIn).
-  HLOG(kInfo, "[ClientPool] Creating new persistent connection to {}", key);
-  ctp::lbm::TransportPtr transport;
-  try {
-    ctp::lbm::TransportType ttype = PeerTransportType();
-    {
-      const int slot = port - static_cast<int>(CLIO_CONFIG_MANAGER->GetPort()) -
-                       static_cast<int>(kNetTierPortOffset);
-      if (NetTierUsesZmq(slot)) ttype = ctp::lbm::TransportType::kZeroMq;
-    }
-    transport = ctp::lbm::TransportFactory::Get(
-        addr, ttype, ctp::lbm::TransportMode::kClient, "tcp", port);
-  } catch (const std::exception &e) {
-    HLOG(kError, "[ClientPool] Failed to dial {}: {}", key, e.what());
-    return nullptr;
+ctp::lbm::TransportPtr IpcManager::DialPeerClient(const std::string &addr,
+                                                  int port,
+                                                  std::string *error) {
+  HLOG(kDebug, "[ClientPool] Dialing {}:{}", addr, port);
+  ctp::lbm::TransportType ttype = PeerTransportType();
+  {
+    auto *config_manager = CLIO_CONFIG_MANAGER;
+    const int slot = port - static_cast<int>(config_manager->GetPort()) -
+                     static_cast<int>(kNetTierPortOffset);
+    if (NetTierUsesZmq(slot)) ttype = ctp::lbm::TransportType::kZeroMq;
   }
-
-  if (!transport) {
-    HLOG(kError, "[ClientPool] Failed to create client for {}", key);
-    return nullptr;
-  }
-
-  // Store in pool and return raw pointer
-  ctp::lbm::Transport *raw_ptr = transport.get();
-  client_pool_[key] = std::move(transport);
-
-  HLOG(kInfo, "[ClientPool] Connection established to {}", key);
-  return raw_ptr;
+  ctp::lbm::TransportPtr transport = ctp::lbm::TransportFactory::Get(
+      addr, ttype, ctp::lbm::TransportMode::kClient, "tcp", port);
+  if (!transport) *error = "transport factory returned no client";
+  return transport;
 }
 
 std::shared_ptr<ctp::lbm::Transport> IpcManager::GetOrCreateClientByIdentity(
@@ -3070,13 +3082,18 @@ void IpcManager::SetMaxClientDialBacks(size_t max_dial_backs) {
 }
 
 void IpcManager::ClearClientPool() {
-  std::lock_guard<std::mutex> lock(client_pool_mutex_);
+  size_t n_dial_backs = 0;
+  {
+    std::lock_guard<std::mutex> lock(client_pool_mutex_);
+    n_dial_backs = client_dial_backs_.size();
+    client_dial_backs_.clear();
+    client_dial_back_lru_.clear();
+  }
+  size_t n_peers = client_pool_.Size();
+  client_pool_.Clear();
   HLOG(kInfo,
-       "[ClientPool] Clearing {} persistent connections and {} dial-backs",
-       client_pool_.size(), client_dial_backs_.size());
-  client_dial_backs_.clear();
-  client_dial_back_lru_.clear();
-  client_pool_.clear();
+       "[ClientPool] Cleared {} persistent connections and {} dial-backs",
+       n_peers, n_dial_backs);
 }
 
 void IpcManager::EvictClientByIdentity(const std::string &key_id, int port) {

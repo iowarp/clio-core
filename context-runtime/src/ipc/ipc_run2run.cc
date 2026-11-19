@@ -188,6 +188,15 @@ clio::run::u64 IpcManagerRun2Run::SendInResolveTargetNode(
   return kInvalidNodeId;
 }
 
+/**
+ * Rate limiter for the per-task "no client for peer yet" warnings.
+ * @return The process-wide limiter (one report per peer per 5000 ms).
+ */
+static ctp::lbm::LogRateLimiter &NoClientLogLimiter() {
+  static ctp::lbm::LogRateLimiter limiter(std::chrono::milliseconds(5000));
+  return limiter;
+}
+
 void IpcManagerRun2Run::SendInTransmitReplica(
     clio::run::IpcManager *ipc_manager,
     clio::run::shared_ptr<clio::run::Task> task_copy,
@@ -210,8 +219,17 @@ void IpcManagerRun2Run::SendInTransmitReplica(
     // broadcast: to a node that already had the pool, so the intended node
     // never got it) and left the peer dead for the run. Retry the same node
     // until the task's network timeout; a failed SEND still marks it dead.
-    HLOG(kWarning, "[SendIn] Task {}: no client for {}:{} yet; retrying",
-         origin_task->task_id_, target_host->ip_address, port);
+    // Rate-limited per peer: during an outage every task to the peer lands
+    // here, and the dial table already reports the failures themselves.
+    uint64_t suppressed = 0;
+    if (NoClientLogLimiter().Allow(
+            target_host->ip_address + ":" + std::to_string(port),
+            &suppressed)) {
+      HLOG(kWarning,
+           "[SendIn] Task {}: no client for {}:{} yet; retrying ({} similar "
+           "unlogged)",
+           origin_task->task_id_, target_host->ip_address, port, suppressed);
+    }
     std::lock_guard<std::mutex> _rqlk(retry_queues_mutex_);
     send_in_retry_.push_back(
         {task_copy, target_node_id, std::chrono::steady_clock::now()});
@@ -505,8 +523,15 @@ int IpcManagerRun2Run::SendOutTransmit(
 
   if (lbm_transport == nullptr) {
     // Not a death; see SendInTransmitReplica. Retry the same node.
-    HLOG(kWarning, "[SendOut] Task {}: no client for {}:{} yet; retrying",
-         origin_task->task_id_, target_host->ip_address, port);
+    uint64_t suppressed = 0;
+    if (NoClientLogLimiter().Allow(
+            target_host->ip_address + ":" + std::to_string(port),
+            &suppressed)) {
+      HLOG(kWarning,
+           "[SendOut] Task {}: no client for {}:{} yet; retrying ({} similar "
+           "unlogged)",
+           origin_task->task_id_, target_host->ip_address, port, suppressed);
+    }
     std::lock_guard<std::mutex> _rqlk(retry_queues_mutex_);
     send_out_retry_.push_back(
         {origin_task, target_node_id, std::chrono::steady_clock::now()});

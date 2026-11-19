@@ -68,6 +68,7 @@
 #include "clio_runtime/ipc/ipc_run2run.h"
 #include "clio_ctp/data_structures/serialization/serialize_common.h"
 #include "clio_ctp/lightbeam/transport_factory_impl.h"
+#include "clio_ctp/lightbeam/peer_dial_table.h"
 #include "clio_ctp/memory/backend/posix_shm_mmap.h"
 #include "clio_ctp/lightbeam/shm_mpsc_transport.h"
 #include "clio_runtime/gpu/gpu_info.h"
@@ -1297,6 +1298,17 @@ class IpcManager {
                                          const char *lane = "");
 
   /**
+   * Dial a new runtime-peer client connection (no caching; used by
+   * GetOrCreateClient through the dial table, without any pool lock held).
+   * @param addr Peer host/IP.
+   * @param port Peer listener port.
+   * @param error Receives the failure reason.
+   * @return The connection, or null on failure.
+   */
+  ctp::lbm::TransportPtr DialPeerClient(const std::string &addr, int port,
+                                        std::string *error);
+
+  /**
    * Dedicated network send threads (experiment, CLIO_NET_SEND_THREADS=N).
    * Every cross-node request (SendIn) and reply (SendOut) used to be sent by
    * ONE worker (the admin Send periodic on net_send_worker_), so a node's
@@ -2098,10 +2110,14 @@ class IpcManager {
   int client_try_new_servers_ = 0;  // CLIO_CLIENT_TRY_NEW_SERVERS (default 0)
   std::atomic<bool> reconnecting_{false};  // Guards against recursive reconnect
 
-  // Persistent ZeroMQ transport connection pool
-  // Key format: "ip_address:port"
-  std::unordered_map<std::string, ctp::lbm::TransportPtr> client_pool_;
-  mutable std::mutex client_pool_mutex_;  // Mutex for thread-safe pool access
+  // Persistent runtime-peer connection pool. Key format:
+  // "ip_address:port[#lane][#sN]"; backoff is tracked per "ip_address:port".
+  // The table has its own lock and never holds it while dialing, so one
+  // slow/unreachable peer cannot stall connections to the others, and a
+  // failing peer is redialed with exponential backoff, not on every retry.
+  ctp::lbm::PeerDialTable<ctp::lbm::Transport, ctp::lbm::TransportDeleter>
+      client_pool_;
+  mutable std::mutex client_pool_mutex_;  // Guards the dial-back table below
 
   // Dial-back connections for returning responses to TCP clients (issue
   // #1065), keyed by "<client identity>:<response port>" and guarded by

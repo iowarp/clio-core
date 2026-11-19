@@ -310,9 +310,13 @@ class ThalliumEngine {
    * @param host Peer host name or IP.
    * @param port Peer listener port.
    * @param refresh true to ignore (and replace) a cached answer.
+   * @param why Receives the failure reason when "" is returned (may be
+   *        null), e.g. "connect: Connection refused" or "no reply within
+   *        5000 ms".
    * @return The peer's Mercury address, or "" if the peer did not answer.
    */
-  static std::string Resolve(const std::string &host, int port, bool refresh) {
+  static std::string Resolve(const std::string &host, int port, bool refresh,
+                             std::string *why = nullptr) {
     State &s = S();
     std::string key = host + ":" + std::to_string(port);
     if (!refresh) {
@@ -320,7 +324,9 @@ class ThalliumEngine {
       auto it = s.addr_cache_.find(key);
       if (it != s.addr_cache_.end()) return it->second;
     }
-    std::string addr = AskPeer(host, port);
+    std::string reason;
+    std::string addr = AskPeer(host, port, &reason);
+    if (why != nullptr) *why = reason;
     std::lock_guard<std::mutex> lock(s.cache_mtx_);
     if (addr.empty()) {
       s.addr_cache_.erase(key);
@@ -328,6 +334,17 @@ class ThalliumEngine {
       s.addr_cache_[key] = addr;
     }
     return addr;
+  }
+
+  /**
+   * Mutex that serializes RPC registration (engine.define) across threads.
+   * Peer connections are dialed concurrently, and Margo's registration
+   * table is not documented as safe for concurrent writers.
+   * @return The process-wide registration mutex.
+   */
+  static std::mutex &DefineMutex() {
+    static std::mutex m;
+    return m;
   }
 
   /**
@@ -470,8 +487,26 @@ class ThalliumEngine {
         }
         continue;
       }
-      sock::socket_t fd = sock::Accept(fds[idx]);
-      if (fd != sock::kInvalidSocket) AnswerPeer(fd, addr);
+      AnswerPending(fds[idx], addr);
+    }
+  }
+
+  /**
+   * Answer every connection already queued on a (non-blocking) listener, so
+   * a burst of peers dialing at once is served in one wakeup rather than one
+   * per poll round.
+   * @param listen_fd Listening socket that poll() reported readable.
+   * @param addr Address text to send to each peer.
+   */
+  static void AnswerPending(sock::socket_t listen_fd, const std::string &addr) {
+    static constexpr int kMaxPerWakeup = 1024;
+    for (int i = 0; i < kMaxPerWakeup; ++i) {
+      sock::socket_t fd = sock::Accept(listen_fd);
+      if (fd == sock::kInvalidSocket) return;
+      // Accepted sockets do not inherit O_NONBLOCK on Linux, but do on
+      // BSD/macOS; the reply is a few bytes, so a blocking send is safe.
+      sock::SetNonBlocking(fd, false);
+      AnswerPeer(fd, addr);
     }
   }
 
@@ -504,29 +539,57 @@ class ThalliumEngine {
    * Ask a peer listener for its Mercury address over TCP.
    * @param host Peer host name or IP.
    * @param port Peer listener port.
-   * @return The address, or "" on connect failure, timeout or a bad reply.
+   * @param why Receives the failure reason when "" is returned.
+   * @return The address, or "" on lookup/connect failure, timeout or a bad
+   *         reply.
    */
-  static std::string AskPeer(const std::string &host, int port) {
-    static constexpr uint32_t kMaxAddrLen = 4096;
+  static std::string AskPeer(const std::string &host, int port,
+                             std::string *why) {
     sock::InitSocketLib();
-    sock::socket_t fd = sock::Connect(host, port, "tcp");
-    if (fd == sock::kInvalidSocket) return "";
-    std::string addr;
-    uint32_t net_len = 0;
     int wait_ms = ThalliumConfig::Get().resolve_timeout_ms_;
-    if (sock::PollRead(fd, wait_ms) > 0 &&
-        sock::RecvExact(fd, reinterpret_cast<char *>(&net_len),
-                        sizeof(net_len)) == 0) {
-      uint32_t len = sock::NetToHost32(net_len);
-      if (len > 0 && len <= kMaxAddrLen) {
-        addr.resize(len);
-        if (sock::PollRead(fd, wait_ms) <= 0 ||
-            sock::RecvExact(fd, addr.data(), len) != 0) {
-          addr.clear();
-        }
-      }
+    sock::ConnectError cerr;
+    sock::socket_t fd = sock::ConnectTimed(host, port, wait_ms, &cerr);
+    if (fd == sock::kInvalidSocket) {
+      *why = cerr.ToString();
+      return "";
     }
+    std::string addr = ReadAnswer(fd, wait_ms, why);
     sock::Close(fd);
+    return addr;
+  }
+
+  /**
+   * Read the framed address reply from an address-exchange connection.
+   * @param fd Connected socket.
+   * @param wait_ms Longest wait for each part of the reply.
+   * @param why Receives the failure reason when "" is returned.
+   * @return The address, or "" on timeout, a closed connection or a bad
+   *         length.
+   */
+  static std::string ReadAnswer(sock::socket_t fd, int wait_ms,
+                                std::string *why) {
+    static constexpr uint32_t kMaxAddrLen = 4096;
+    uint32_t net_len = 0;
+    if (sock::PollRead(fd, wait_ms) <= 0) {
+      *why = "no reply within " + std::to_string(wait_ms) + " ms";
+      return "";
+    }
+    if (sock::RecvExact(fd, reinterpret_cast<char *>(&net_len),
+                        sizeof(net_len)) != 0) {
+      *why = "connection closed before the reply";
+      return "";
+    }
+    uint32_t len = sock::NetToHost32(net_len);
+    if (len == 0 || len > kMaxAddrLen) {
+      *why = "bad reply length " + std::to_string(len);
+      return "";
+    }
+    std::string addr(len, '\0');
+    if (sock::PollRead(fd, wait_ms) <= 0 ||
+        sock::RecvExact(fd, addr.data(), len) != 0) {
+      *why = "truncated reply";
+      return "";
+    }
     return addr;
   }
 };
