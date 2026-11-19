@@ -39,8 +39,22 @@ $SUDO apt-get install -y --no-install-recommends \
 
 echo "==> [2/4] Cloning xfstests (if missing) into ${XFSTESTS_DIR}"
 if [ ! -d "${XFSTESTS_DIR}/.git" ] && [ ! -f "${XFSTESTS_DIR}/configure.ac" ]; then
-  git clone --depth 1 \
-    https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git "${XFSTESTS_DIR}"
+  # git.kernel.org has been unreachable from CI runners for minutes at a time
+  # (a dev push failed on a 133 s connect timeout with every test green), so
+  # fall back to kernel.org's googlesource mirror, then a GitHub mirror.
+  cloned=0
+  for url in https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git \
+             https://kernel.googlesource.com/pub/scm/fs/xfs/xfstests-dev \
+             https://github.com/kdave/xfstests.git; do
+    rm -rf "${XFSTESTS_DIR}"
+    if timeout 300 git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=60 \
+         clone --depth 1 "${url}" "${XFSTESTS_DIR}"; then
+      cloned=1
+      break
+    fi
+    echo "WARNING: cloning xfstests from ${url} failed; trying the next mirror" >&2
+  done
+  [ "${cloned}" = 1 ] || { echo "ERROR: could not clone xfstests from any mirror" >&2; exit 1; }
 else
   echo "    already present, skipping clone"
 fi

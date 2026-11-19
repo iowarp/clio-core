@@ -452,6 +452,11 @@ jobs:
           echo Using Visual Studio at: %VSINSTALL%
           call "%VSINSTALL%\VC\Auxiliary\Build\vcvarsall.bat" x64 || exit /b 1
           call "%ProgramFiles(x86)%\Intel\oneAPI\setvars.bat" || exit /b 1
+          rem The newest Visual Studio on the image (VS 18, MSVC 14.52) ships an
+          rem STL whose yvals_core.h rejects any Clang older than 22 with
+          rem STL1000; icx 2025.3 is Clang 21. Microsoft's documented override
+          rem lets the pair build until Intel ships a Clang 22 based icx.
+          set "CXXFLAGS=/D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
           cmake -B build -G Ninja ^
             -DCMAKE_C_COMPILER=icx-cl ^
             -DCMAKE_CXX_COMPILER=icx-cl ^
