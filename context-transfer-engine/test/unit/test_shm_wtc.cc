@@ -169,6 +169,17 @@ compose:
   }
 };
 
+/**
+ * How long a put refused for room waits for earlier ranges to flush in every
+ * test cache (WtcConfig::nospace_wait_ms_; production default 250 ms). A
+ * test asserts what lands in the cache, so whether a refused put is cached
+ * or written around must not depend on how fast this machine flushes: a
+ * slow runner's flusher can take longer than 250 ms to land the ranges ahead
+ * of a put. A flush that never lands still fails (the put writes around
+ * after this wait; the ctest TIMEOUT bounds the whole run).
+ */
+static constexpr clio::run::u32 kTestNoSpaceWaitMs = 60000;
+
 /** Create a cache pool over the core (data_capacity > 0: extent mode, its
  *  bytes in granules leased from the core's RAM bdev on this node). */
 static void CreateCache(const clio::run::PoolId &id, const std::string &name,
@@ -176,7 +187,8 @@ static void CreateCache(const clio::run::PoolId &id, const std::string &name,
                         clio::run::u64 data_capacity = 0,
                         double flush_period_us = 0,
                         const clio::run::PoolId &next =
-                            clio::cte::core::kCtePoolId) {
+                            clio::cte::core::kCtePoolId,
+                        clio::run::u64 flush_batch_bytes = 0) {
   clio::cte::shm_wtc::Client admin;
   clio::cte::shm_wtc::WtcConfig params;
   params.md_only_ = md_only;
@@ -188,7 +200,9 @@ static void CreateCache(const clio::run::PoolId &id, const std::string &name,
   params.capacity_ = capacity;
   params.max_blobs_ = 4096;
   params.log_depth_ = 4096;
+  params.nospace_wait_ms_ = kTestNoSpaceWaitMs;
   if (flush_period_us > 0) params.flush_period_us_ = flush_period_us;
+  if (flush_batch_bytes > 0) params.flush_batch_bytes_ = flush_batch_bytes;
   auto create = admin.AsyncCreate(clio::run::PoolQuery::Local(), name, id,
                                   params);
   create.Wait();
@@ -262,16 +276,35 @@ static void Connect(clio::cte::core::Client &io,
   REQUIRE(io.HasCache());
 }
 
-/** Wait (bounded) until the cache has flushed every range pushed so far. */
+/** Longest WaitFlushed waits. Generous: tests call it after tens of MB of
+ *  puts, which a slow runner's flusher may take many seconds to land; a
+ *  flusher that never lands them still fails, only later. */
+static constexpr double kFlushDeadlineMs = 120000.0;
+
+/**
+ * Wait (bounded by kFlushDeadlineMs) until the cache has flushed every range
+ * pushed so far. Prints both counters when the deadline passes.
+ * @param io client connected to the cache
+ * @return true once flushed_ reaches pushed_; false on the deadline
+ */
 static bool WaitFlushed(clio::cte::core::Client &io) {
   wtc::View *view = TestView(io.CacheKeys());
   if (view == nullptr) return false;
-  for (int i = 0; i < 2000; ++i) {
-    const wtc::Root *root = view->GetRoot();
-    if (root->flushed_.load() >= root->pushed_.load()) return true;
+  const wtc::Root *root = view->GetRoot();
+  const auto t0 = std::chrono::steady_clock::now();
+  while (root->flushed_.load() < root->pushed_.load()) {
+    const double ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - t0)
+                          .count();
+    if (ms >= kFlushDeadlineMs) {
+      std::cout << "  WaitFlushed: gave up after " << ms << " ms: pushed "
+                << root->pushed_.load() << ", flushed "
+                << root->flushed_.load() << std::endl;
+      return false;
+    }
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
-  return false;
+  return true;
 }
 
 /** Read a blob range straight from the core (bypassing the cache). */
@@ -486,30 +519,40 @@ TEST_CASE("ShmWtc - writes and reads complete in shared memory",
   }
 
   SECTION("small writes coalesce into few batches") {
-    TagId tag = MakeTag(io, "wtc_coalesce");
+    // A cache of its own whose flusher never runs on its period during the
+    // writes (60 s): every write queues first, then one explicit flush pass
+    // (FlushLog, which drains the log) lands them. With the default 50 us
+    // period a slow runner flushes each write as it arrives (one batch per
+    // write), and the flusher's pins refuse appends busy, so neither the
+    // batch count nor the range count would depend on the code alone.
+    const clio::run::PoolId cpool(579, 0);
+    CreateCache(cpool, "shm_wtc_coalesce", 64ull << 20, false, 0,
+                /*flush_period_us=*/60e6);
+    clio::cte::core::Client cio(cpool);
+    Connect(cio, cpool);
+    const wtc::Stats *cst = cio.CacheStats();
+    TagId tag = MakeTag(cio, "wtc_coalesce");
     std::string want(128 * 512, '\0');
-    REQUIRE(WaitFlushed(io));
-    const clio::run::u64 batches0 = st->flush_batches_.load();
-    const clio::run::u64 ranges0 = st->flush_ranges_.load();
-    const clio::run::u64 busy0 = st->put_busy_.load();
+    const clio::run::u64 batches0 = cst->flush_batches_.load();
+    const clio::run::u64 ranges0 = cst->flush_ranges_.load();
+    const clio::run::u64 puts0 = cst->puts_.load();
     for (int i = 0; i < 128; ++i) {
       std::string piece(512, static_cast<char>('a' + (i % 26)));
       std::memcpy(&want[i * 512], piece.data(), piece.size());
-      REQUIRE(io.PutBlob(tag, "seq", i * 512, piece.size(), piece.data()) == 0);
+      REQUIRE(cio.PutBlob(tag, "seq", i * 512, piece.size(), piece.data()) == 0);
     }
-    REQUIRE(WaitFlushed(io));
-    // One flushed range per cached write. A write that grows the blob while
-    // the flusher has it pinned is refused busy and, past the client's short
-    // retry bound, goes down the task path instead of the cache, so it adds
-    // no range; that happens when a flush outlasts the bound (sanitizer
-    // builds). The count is exact unless writes were refused.
-    const clio::run::u64 ranges = st->flush_ranges_.load() - ranges0;
-    const clio::run::u64 busy = st->put_busy_.load() - busy0;
-    INFO("flushed ranges " + std::to_string(ranges) + ", busy refusals " +
-         std::to_string(busy));
-    REQUIRE((ranges == 128 || (ranges < 128 && busy > 0)));
-    // Many ranges per batch: far fewer batches than writes.
-    REQUIRE(st->flush_batches_.load() - batches0 < 64);
+    REQUIRE(cst->puts_.load() - puts0 == 128);  // all cached, none flushed
+    clio::cte::shm_wtc::Client flusher(cpool);
+    auto flush = flusher.AsyncFlushLog();
+    flush.Wait();
+    REQUIRE(flush->GetReturnCode() == 0);
+    REQUIRE(WaitFlushed(cio));
+    // One flushed range per cached write, carried by far fewer batches.
+    const clio::run::u64 ranges = cst->flush_ranges_.load() - ranges0;
+    const clio::run::u64 batches = cst->flush_batches_.load() - batches0;
+    INFO("flushed ranges " << ranges << ", batches " << batches);
+    REQUIRE(ranges == 128);
+    REQUIRE(batches < 64);
     REQUIRE(CoreRead(tag, "seq", 0, want.size()) == want);
   }
 
@@ -615,11 +658,18 @@ TEST_CASE("ShmWtc - eviction keeps a small cache writable",
 TEST_CASE("ShmWtc - overwrites flush once and the last write wins",
           "[cte][shm_wtc][dedup]") {
   WtcFixture fx;
-  // A slow flusher (100 ms) of its own: the overwrites below pile up between
-  // flushes on any machine, instead of racing a 50 us one (a fast runner's
-  // flusher kept up with every put and so never had a range to retire).
+  // A range is retired without a resend only when it is still in the log
+  // after an EARLIER batch copied its blob: overwrites popped into the same
+  // batch coalesce into one record and count as nothing. So the pile-up
+  // must outgrow one batch. With the default 16 MiB batch (256 of these
+  // 64 KiB puts) a slow runner (icx on windows-2022) put fewer than that
+  // per 100 ms flusher period, every batch took the whole log, and nothing
+  // was ever skipped. A one-put batch makes any two queued overwrites of a
+  // blob a skip, however fast or slow the machine; the slow flusher (100 ms)
+  // still lets them queue instead of racing a 50 us one.
   const clio::run::PoolId kDedupPool(576, 0);
-  CreateCache(kDedupPool, "shm_wtc_dedup", 64ull << 20, false, 0, 100000.0);
+  CreateCache(kDedupPool, "shm_wtc_dedup", 64ull << 20, false, 0, 100000.0,
+              clio::cte::core::kCtePoolId, 64ull << 10);
   clio::cte::core::Client io(kDedupPool);
   Connect(io, kDedupPool);
   const wtc::Stats *st = io.CacheStats();
@@ -783,6 +833,23 @@ TEST_CASE("ShmWtc - truncate through the cache drops cached bytes",
   REQUIRE(back == v.substr(0, 100));
 }
 
+/**
+ * The cache's put-refusal counters, for an INFO: when a put the test expects
+ * cached is written around, they say why it was refused.
+ * @param st the cache's stats
+ * @return "full_buf=.. full_slot=.. full_log=.. miss=.. busy=.. waits=..
+ *         evictions=.."
+ */
+static std::string RefusalCounters(const wtc::Stats *st) {
+  return "full_buf=" + std::to_string(st->put_full_buf_.load()) +
+         " full_slot=" + std::to_string(st->put_full_slot_.load()) +
+         " full_log=" + std::to_string(st->put_full_log_.load()) +
+         " miss=" + std::to_string(st->put_miss_.load()) +
+         " busy=" + std::to_string(st->put_busy_.load()) +
+         " waits=" + std::to_string(st->waits_.load()) +
+         " evictions=" + std::to_string(st->evictions_.load());
+}
+
 TEST_CASE("ShmWtc - large puts displace a cache full of small buffers",
           "[cte][shm_wtc][evict][fragment]") {
   WtcFixture fx;
@@ -803,8 +870,11 @@ TEST_CASE("ShmWtc - large puts displace a cache full of small buffers",
   REQUIRE(WaitFlushed(io));
 
   // Every large put must land in the cache (puts_ counts cached writes
-  // only; a write-around bypasses it), and quickly.
+  // only; a write-around bypasses it). The time is reported, not bounded:
+  // a regression that stops displacing small buffers writes around, which
+  // puts_ catches; one that hangs trips the ctest TIMEOUT.
   const clio::run::u64 puts0 = st->puts_.load();
+  const std::string before = RefusalCounters(st);
   std::vector<std::string> vals;
   auto t0 = std::chrono::steady_clock::now();
   for (int i = 0; i < 4; ++i) {
@@ -814,9 +884,9 @@ TEST_CASE("ShmWtc - large puts displace a cache full of small buffers",
   double ms = std::chrono::duration<double, std::milli>(
                   std::chrono::steady_clock::now() - t0)
                   .count();
-  INFO("large puts took " << ms << " ms");
+  INFO("large puts took " << ms << " ms; before: " << before
+       << "; after: " << RefusalCounters(st));
   REQUIRE(st->puts_.load() - puts0 == 4);
-  REQUIRE(ms < 2000.0);
   REQUIRE(WaitFlushed(io));
   for (int i = 0; i < 4; ++i) {
     std::string back(1 << 20, '\0');
@@ -842,7 +912,9 @@ TEST_CASE("ShmWtc - a put refused for room waits for the flush that makes it",
   const wtc::Stats *st = io.CacheStats();
   TagId tag = MakeTag(io, "wtc_flushwait");
 
-  // Idle long enough for the flusher's worker to back off its park.
+  // Idle long enough for the flusher's worker to back off its park: sets
+  // up the parked-worker case. The result does not depend on it: the
+  // cache waits up to kTestNoSpaceWaitMs for the flush either way.
   std::this_thread::sleep_for(std::chrono::milliseconds(300));
   constexpr int kPuts = 8;  // 8 MB of 1 MB puts
   const clio::run::u64 puts0 = st->puts_.load();
@@ -852,7 +924,8 @@ TEST_CASE("ShmWtc - a put refused for room waits for the flush that makes it",
     REQUIRE(io.PutBlob(tag, "W" + std::to_string(i), 0, vals.back().size(),
                        vals.back().data()) == 0);
   }
-  INFO("cached puts " << st->puts_.load() - puts0 << " of " << kPuts);
+  INFO("cached puts " << st->puts_.load() - puts0 << " of " << kPuts << "; "
+       << RefusalCounters(st));
   REQUIRE(st->puts_.load() - puts0 == static_cast<clio::run::u64>(kPuts));
   REQUIRE(WaitFlushed(io));
   for (int i = 0; i < kPuts; ++i) {
@@ -935,6 +1008,7 @@ TEST_CASE("ShmWtc - extent mode keeps bytes in leased RAM-bdev granules",
     }
     REQUIRE(WaitFlushed(io));
     const clio::run::u64 puts0 = st->puts_.load();
+    const std::string before = RefusalCounters(st);
     auto t0 = std::chrono::steady_clock::now();
     for (int i = 0; i < 4; ++i) {
       const std::string v = Payload(1 << 20, static_cast<char>('a' + i));
@@ -942,9 +1016,10 @@ TEST_CASE("ShmWtc - extent mode keeps bytes in leased RAM-bdev granules",
     }
     const double ms = std::chrono::duration<double, std::milli>(
                           std::chrono::steady_clock::now() - t0).count();
-    INFO("large puts took " << ms << " ms");
-    REQUIRE(st->puts_.load() - puts0 == 4);  // cached, not written around
-    REQUIRE(ms < 2000.0);
+    INFO("large puts took " << ms << " ms; before: " << before
+         << "; after: " << RefusalCounters(st));
+    // Cached, not written around (the time is reported, not bounded).
+    REQUIRE(st->puts_.load() - puts0 == 4);
     REQUIRE(WaitFlushed(io));
     for (int i = 0; i < 4; ++i) {
       const std::string v = Payload(1 << 20, static_cast<char>('a' + i));
@@ -1009,6 +1084,26 @@ static double MsSince(std::chrono::steady_clock::time_point t0) {
       .count();
 }
 
+/** How long the pin tests wait for a step that must not block before they
+ *  call it blocked. Generous (thread start-up on a loaded runner counts
+ *  against it): a step that really waits for the pin never finishes, so
+ *  any finite bound catches it; this one only has to never be hit by a
+ *  step that is merely slow. */
+static constexpr double kPinPromptMs = 30000.0;
+
+/**
+ * Poll `done` until it is true or kPinPromptMs passes.
+ * @param done flag the other thread sets when its step returns
+ * @return whether the step returned in time
+ */
+static bool WaitPrompt(const std::atomic<bool> &done) {
+  const auto t0 = std::chrono::steady_clock::now();
+  while (!done.load() && MsSince(t0) < kPinPromptMs) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  return done.load();
+}
+
 TEST_CASE("ShmWtc - a pinned entry refuses growth (kBusy) and never blocks "
           "the stripe lock",
           "[cte][shm_wtc][pin][deadlock]") {
@@ -1029,42 +1124,45 @@ TEST_CASE("ShmWtc - a pinned entry refuses growth (kBusy) and never blocks "
   REQUIRE(view.PinRange(slot, 0, &size, &gen) != nullptr);
 
   // A write past the buffer's capacity (1 MiB + 47008 B, ior-hard style)
-  // must grow, i.e. move, the pinned buffer.
+  // must grow, i.e. move, the pinned buffer. The writer retries WITHOUT
+  // holding anything, as the callers do, until the attempt after the unpin:
+  // it ends on an event, not on a clock.
   constexpr clio::run::u64 kGrowOff = 1ull << 20;
   const std::string grow = Payload(47008, 'g');
-  constexpr double kPromptMs = 1000.0;     // a refusal never waits
-  constexpr double kDeadlineMs = 10000.0;  // writer gives up after this
   std::atomic<int> first_status{-1};
-  std::atomic<double> first_ms{-1.0};
+  std::atomic<bool> first_done{false};
   std::atomic<int> final_status{-1};
   std::atomic<bool> writer_done{false};
+  std::atomic<bool> unpinned{false};
+  auto unpin = [&] {
+    view.UnpinRange(slot);
+    unpinned.store(true);
+  };
   std::thread writer([&] {
-    const auto t0 = std::chrono::steady_clock::now();
     wtc::Status s = view.TryPut(1, 1, blob.data(), blob.size(), kGrowOff,
                                 grow.size(), grow.data(), 0, false);
-    first_ms.store(MsSince(t0));
     first_status.store(static_cast<int>(s));
-    // Retry WITHOUT holding anything, as the callers do.
-    while (s == wtc::Status::kBusy && MsSince(t0) < kDeadlineMs) {
+    first_done.store(true);
+    while (s == wtc::Status::kBusy) {
+      const bool after_unpin = unpinned.load();
       std::this_thread::sleep_for(std::chrono::microseconds(50));
       s = view.TryPut(1, 1, blob.data(), blob.size(), kGrowOff, grow.size(),
                       grow.data(), 0, false);
+      if (after_unpin) break;  // one try after the unpin decides
     }
     final_status.store(static_cast<int>(s));
     writer_done.store(true);
   });
 
-  // The first refusal arrives promptly.
-  const auto wait0 = std::chrono::steady_clock::now();
-  while (first_status.load() < 0 && MsSince(wait0) < kPromptMs) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  // The first refusal arrives (a regressed writer blocked on the pin is
+  // unblocked and joined before the failure is reported).
+  const bool prompt = WaitPrompt(first_done);
+  if (!prompt) {
+    unpin();
+    writer.join();
   }
-  const bool prompt = first_status.load() >= 0;
-  if (!prompt) view.UnpinRange(slot);  // unblock a regressed writer
   REQUIRE(prompt);
-  INFO("first TryPut took " << first_ms.load() << " ms");
   REQUIRE(first_status.load() == static_cast<int>(wtc::Status::kBusy));
-  REQUIRE(first_ms.load() < kPromptMs);
   REQUIRE(st.put_busy_.load() >= 1);
 
   // The home's invalidation of this node, on the same stripe, completes
@@ -1075,20 +1173,20 @@ TEST_CASE("ShmWtc - a pinned entry refuses growth (kBusy) and never blocks "
     view.Invalidate(1, 1, blob.data(), blob.size());
     inv_done.store(true);
   });
-  const auto inv_t0 = std::chrono::steady_clock::now();
-  while (!inv_done.load() && MsSince(inv_t0) < kPromptMs) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  const bool inv_prompt = WaitPrompt(inv_done);
+  const bool still_refused = !writer_done.load();
+  if (!inv_prompt || !still_refused) {
+    unpin();
+    inval.join();
+    writer.join();
   }
-  const bool inv_prompt = inv_done.load();
-  if (!inv_prompt) view.UnpinRange(slot);
-  inval.join();
-  INFO("Invalidate took " << MsSince(inv_t0) << " ms");
   REQUIRE(inv_prompt);
+  REQUIRE(still_refused);  // still pinned: still refused
+  inval.join();
   REQUIRE(st.invalidations_.load() == inv0 + 1);
-  REQUIRE_FALSE(writer_done.load());  // still pinned: still refused
 
-  // The flush lands: unpin. The writer's retry now succeeds.
-  view.UnpinRange(slot);
+  // The flush lands: unpin. The writer's next retry succeeds.
+  unpin();
   writer.join();
   REQUIRE(final_status.load() == static_cast<int>(wtc::Status::kOk));
   std::string back(grow.size(), '\0');
@@ -1113,13 +1211,14 @@ TEST_CASE("ShmWtc - invalidate and drop of a pinned, flushed entry return "
     clio::run::u64 size = bytes.size();
     clio::run::u64 gen = 0;
     REQUIRE(view.PinRange(slot, 0, &size, &gen) != nullptr);
-    const auto t0 = std::chrono::steady_clock::now();
+    // Single-threaded: a call that waited for the pin would never return,
+    // so a regression hangs here and the ctest TIMEOUT reports it; no
+    // wall-clock bound is needed.
     if (blob == "inv") {
       view.Invalidate(1, 1, blob.data(), blob.size());
     } else {
       view.DropBlob(1, 1, blob.data(), blob.size());
     }
-    REQUIRE(MsSince(t0) < 1000.0);
     std::string back(bytes.size(), '\0');
     // Nothing stale is served, and no size is known.
     REQUIRE(view.TryGet(1, 1, blob.data(), blob.size(), 0, back.size(),

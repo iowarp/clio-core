@@ -95,6 +95,11 @@ struct WtcConfig {
    *  node>, so "512.0" is the first storage device of core 512 here. */
   clio::run::PoolId data_pool_;
   clio::run::u64 data_capacity_ = 0;            ///< [data_capacity] bytes leased
+  /** [nospace_wait_ms] most a put refused for room waits (ms) for the
+   *  ranges buffered before its first refusal to land (once flushed they
+   *  are clean and evictable, so room follows) before it stops waiting and,
+   *  after a few last retries, writes around the cache. */
+  clio::run::u32 nospace_wait_ms_ = 250;
 
   WtcConfig()
       : next_pool_id_(clio::run::PoolId::GetNull()),
@@ -111,7 +116,7 @@ struct WtcConfig {
        max_blobs_, max_fill_, evict_sample_, half_life_ms_, flush_period_us_,
        flush_retries_, max_sharer_entries_, flush_shards_, flush_depth_,
        md_only_, entry_pool_id_, data_pool_, data_capacity_,
-       invalidate_on_flush_);
+       invalidate_on_flush_, nospace_wait_ms_);
   }
 
   /** Parse "major.minor". */
@@ -175,6 +180,9 @@ struct WtcConfig {
       }
       if (node["entry_pool_id"]) {
         entry_pool_id_ = ParsePoolId(node["entry_pool_id"].as<std::string>());
+      }
+      if (node["nospace_wait_ms"]) {
+        nospace_wait_ms_ = node["nospace_wait_ms"].as<clio::run::u32>();
       }
       if (node["max_sharer_entries"]) {
         max_sharer_entries_ = node["max_sharer_entries"].as<clio::run::u32>();

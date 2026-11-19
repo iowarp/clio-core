@@ -797,6 +797,11 @@ compose:
     evict_sample: 16                    # clean entries sampled per eviction
     half_life_ms: 10000                 # frecency decay half-life
     max_sharer_entries: 65536           # blobs homed here that nodes cache
+    # A put refused for room waits up to this long (ms) for the ranges
+    # buffered before it to flush (flushed buffers are clean and evictable),
+    # then writes around the cache. Larger trades put latency on a slow
+    # flusher for fewer write-arounds.
+    nospace_wait_ms: 250
 
   - mod_name: clio_cte_indexer
     pool_name: clio_cte_indexer

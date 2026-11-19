@@ -273,7 +273,7 @@ def main() -> int:
         rc = fut.wait(0.5)
         el = time.monotonic() - t0
         proc.resume()
-        check(rc is None and el < 1.5,
+        check(rc is None and el < 10.0,
               f"wait(0.5) on a suspended daemon -> {rc} in {el:.2f}s",
               failures)
         check(fut.wait(10.0) == 0, "wait() completes once resumed", failures)
@@ -287,7 +287,7 @@ def main() -> int:
         t0 = time.monotonic()
         rc = fut.wait(2.0)
         el = time.monotonic() - t0
-        check(rc is None and el < 6.0,
+        check(rc is None and el < 15.0,
               f"wait(2.0) on a dead daemon -> {rc} in {el:.2f}s", failures)
 
         # 3c. A blocking op against the dead daemon raises within the

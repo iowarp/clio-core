@@ -293,9 +293,12 @@ TEST_CASE("Stream appends to a dropped stream are discarded", "[stream]") {
   st.Wait();
   char prefix[64];
   std::snprintf(prefix, sizeof(prefix), "sa.%x.%x.", tag.major_, tag.minor_);
-  // Discarded staged bytes are reaped in the background: wait for it.
+  // Discarded staged bytes are reaped in the background: wait for it, under
+  // a long deadline (a reap that never happens still fails).
   bool clean = false;
-  for (int attempt = 0; attempt < 100 && !clean; ++attempt) {
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(60);
+  while (!clean && std::chrono::steady_clock::now() < deadline) {
     auto blobs = cte->AsyncGetContainedBlobs(st->tag_id_, clio::run::PoolQuery::Broadcast());
     blobs.Wait();
     clean = true;

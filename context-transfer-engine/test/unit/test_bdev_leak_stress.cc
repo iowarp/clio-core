@@ -167,20 +167,26 @@ static clio::run::u64 TargetRemaining() {
   return info->remaining_space_;
 }
 
-// Poll the runtime-heap counter until it stops changing (so async server-side
-// frees that lag the client's Wait() have settled), or a short bound elapses.
+/** Longest a settle poll waits. Generous: a slow runner must never fail on
+ *  time alone; a real leak still fails, only after this. */
+static constexpr std::chrono::seconds kSettleDeadline(30);
+/** Consecutive equal reads (20 ms apart) that make a baseline "settled". */
+static constexpr int kSettleReads = 5;
+/** Heap growth the leak check allows: a couple of in-flight buffers. */
+static constexpr size_t kHeapTolerance = 2 * kBlobSize;
+
 /**
- * Read the bdev target's remaining bytes, waiting for it to stop moving first.
+ * Baseline bdev target remaining bytes, read once they stop moving.
  *
  * DelBlob's block free completes asynchronously, so sampling immediately after
- * the loop can catch the tail of the last cycle still in flight.
+ * the warm-up can catch the tail of its cycle still in flight.
  *
- * Mirrors StabilizeRuntimeHeap: poll until two consecutive reads agree, with a
- * bounded wait so a genuine leak still fails rather than hanging. This is only
- * meaningful because TargetRemaining() forces a StatTargets refresh per read —
- * polling the cached value alone would "stabilize" instantly on a stale number
- * that nothing was updating, since the periodic refresh (5 s) is far longer
- * than this loop's 1 s bound.
+ * Poll until kSettleReads consecutive reads agree, or kSettleDeadline passes.
+ * This is only meaningful because TargetRemaining() forces a StatTargets
+ * refresh per read — polling the cached value alone would "stabilize"
+ * instantly on a stale number that nothing was updating (the periodic
+ * refresh is 5 s). The post-loop reading instead waits for the baseline
+ * value itself (WaitTargetRemaining).
  *
  * NOTE: an earlier revision of this comment claimed the Windows force-net
  * failure was simply this settling race, with a "constant 65536-byte residue"
@@ -190,25 +196,71 @@ static clio::run::u64 TargetRemaining() {
  */
 static clio::run::u64 StabilizeTargetRemaining() {
   clio::run::u64 prev = TargetRemaining();
-  for (int i = 0; i < 50; ++i) {  // up to ~1 s
+  const auto deadline = std::chrono::steady_clock::now() + kSettleDeadline;
+  int same = 0;
+  while (same < kSettleReads && std::chrono::steady_clock::now() < deadline) {
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
     clio::run::u64 cur = TargetRemaining();
-    if (cur == prev) return cur;
+    same = cur == prev ? same + 1 : 0;
     prev = cur;
   }
   return prev;
 }
 
+/**
+ * Baseline runtime-heap counter: poll until kSettleReads consecutive reads
+ * agree (async server-side frees that lag the client's Wait() have
+ * settled), or kSettleDeadline passes.
+ * @return the last reading
+ */
 static size_t StabilizeRuntimeHeap() {
   auto *ipc = CLIO_IPC;
   size_t prev = ipc->GetRuntimeHeapAllocatedBytes();
-  for (int i = 0; i < 50; ++i) {  // up to ~1 s
+  const auto deadline = std::chrono::steady_clock::now() + kSettleDeadline;
+  int same = 0;
+  while (same < kSettleReads && std::chrono::steady_clock::now() < deadline) {
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
     size_t cur = ipc->GetRuntimeHeapAllocatedBytes();
-    if (cur == prev) return cur;
+    same = cur == prev ? same + 1 : 0;
     prev = cur;
   }
   return prev;
+}
+
+/**
+ * After the stress loop: poll the target's remaining bytes until they are
+ * back to `want` (every DelBlob's async block free has landed), or
+ * kSettleDeadline passes. Waiting for the expected value, rather than for
+ * two equal samples, cannot mistake a slow free for a settled one; a real
+ * leak still fails, only after the deadline.
+ * @param want the baseline remaining bytes
+ * @return the last reading
+ */
+static clio::run::u64 WaitTargetRemaining(clio::run::u64 want) {
+  clio::run::u64 cur = TargetRemaining();
+  const auto deadline = std::chrono::steady_clock::now() + kSettleDeadline;
+  while (cur != want && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    cur = TargetRemaining();
+  }
+  return cur;
+}
+
+/**
+ * After the stress loop: poll the runtime-heap counter until it is at most
+ * `limit`, or kSettleDeadline passes (see WaitTargetRemaining).
+ * @param limit the most heap the check allows
+ * @return the last reading
+ */
+static size_t WaitRuntimeHeapAtMost(size_t limit) {
+  auto *ipc = CLIO_IPC;
+  size_t cur = ipc->GetRuntimeHeapAllocatedBytes();
+  const auto deadline = std::chrono::steady_clock::now() + kSettleDeadline;
+  while (cur > limit && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    cur = ipc->GetRuntimeHeapAllocatedBytes();
+  }
+  return cur;
 }
 
 /**
@@ -294,8 +346,8 @@ TEST_CASE("BdevLeakStress - PutBlob/DelBlob loop leaves no leaks",
   // rather than sample once: the previous code took this reading before
   // StabilizeRuntimeHeap() ran, so nothing had actually settled despite the
   // comment saying so.
-  const clio::run::u64 remaining_after = StabilizeTargetRemaining();
-  const size_t heap_after = StabilizeRuntimeHeap();
+  const clio::run::u64 remaining_after = WaitTargetRemaining(remaining_before);
+  const size_t heap_after = WaitRuntimeHeapAtMost(heap_before + kHeapTolerance);
 
   const clio::run::u64 bdev_used =
       (remaining_before > remaining_after) ? (remaining_before - remaining_after)
@@ -326,7 +378,6 @@ TEST_CASE("BdevLeakStress - PutBlob/DelBlob loop leaves no leaks",
   //     Allow a couple of in-flight buffers of slack; a real per-op leak dwarfs
   //     this after tens of thousands of cycles. No-op in non-leak builds
   //     (counter is a constant 0).
-  const size_t kHeapTolerance = 2 * kBlobSize;
   REQUIRE(heap_growth <= kHeapTolerance);
 
   auto del_tag = cte->AsyncDelTag("leak_stress_tag");

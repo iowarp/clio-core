@@ -244,7 +244,15 @@ class PolicyCacheFixture {
       clio::cte::core_persist_write_back::WriteBackCacheConfig params;
       params.volatile_pool_ = kVolatilePool;
       params.persistent_pool_ = kPersistentPool;
-      params.flush_period_ms_ = 0;  // flushes only when the test asks
+      // Flushes only when the test asks: no period, and neither the fill
+      // trigger (volatile >= flush_fill_pct full) nor the continuous one
+      // (flush_dirty_mb of new dirty data). Left on, the fill trigger fires
+      // once an earlier test has filled the 8 MiB volatile core with clean
+      // copies, and its asynchronous flush races the "dirty, not flushed"
+      // checks: whether a write is on persistent yet depends on the clock.
+      params.flush_period_ms_ = 0;
+      params.flush_fill_pct_ = 0;
+      params.flush_dirty_mb_ = 0;
       params.fallback_to_persistent_ = strict == 0;
       auto f = c.AsyncCreateCache(
           clio::run::PoolQuery::Local(), strict ? "policy_strict" : "policy_back",

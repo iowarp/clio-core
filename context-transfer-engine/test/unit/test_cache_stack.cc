@@ -144,12 +144,18 @@ static std::string CompressiblePayload(clio::run::u64 size) {
   return v;
 }
 
+/** Longest a poll for an asynchronously replicated state waits. Generous:
+ *  a slow CI runner must never fail on time alone; a lost replica still
+ *  fails, only later. */
+static constexpr std::chrono::seconds kPollDeadline(60);
+
 /** Poll until a replica of tag/name reports `want` bytes via the raw core. */
 static bool WaitReplicaSize(clio::cte::core::Client *core,
                             const clio::cte::core::TagId &tag_id,
                             const std::string &name, clio::run::u64 want,
                             int replica) {
-  for (int attempt = 0; attempt < 300; ++attempt) {
+  const auto deadline = std::chrono::steady_clock::now() + kPollDeadline;
+  while (std::chrono::steady_clock::now() < deadline) {
     auto rsz = core->AsyncGetBlobSize(tag_id, name,
                                       clio::run::PoolQuery::Dynamic(),
                                       replica);
@@ -166,7 +172,8 @@ static bool WaitReplicaSize(clio::cte::core::Client *core,
 static clio::run::u64 WaitPrimaryNonzero(clio::cte::core::Client *core,
                                          const clio::cte::core::TagId &tag_id,
                                          const std::string &name) {
-  for (int attempt = 0; attempt < 300; ++attempt) {
+  const auto deadline = std::chrono::steady_clock::now() + kPollDeadline;
+  while (std::chrono::steady_clock::now() < deadline) {
     auto sz = core->AsyncGetBlobSize(tag_id, name);
     sz.Wait();
     if (sz->GetReturnCode() == 0 && sz->size_ > 0) {
