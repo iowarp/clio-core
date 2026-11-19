@@ -943,6 +943,19 @@ set_tests_properties(
         ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
 )
 
+# Runtime log level for the throughput-bound regressions below
+# (cte_concurrent_same_blob_* and cte_bdev_free_visibility). In a Debug build
+# with CLIO_CTP_LOG_LEVEL=0 -- what the macOS and Windows CI jobs run -- every
+# kDebug HLOG is written and fflush'ed to stderr, i.e. into ctest's pipe:
+# 150-250k lines / 34-51 MB per test. When ctest drains that pipe slowly
+# (the 113-420 s passing macOS runs imply ~0.1-0.3 MB/s) the workers block in
+# the write -- holding the per-blob write token every other writer is queued
+# on -- so the run takes bytes / drain rate and trips the 300/600 s TIMEOUT
+# (measured: same test, stderr read at 1 MB/s: 34 s; at "info": 1.7 s). The tests
+# assert on data, not logs, and warnings/errors (HANGWATCH, SLOW-PUT, the
+# mismatch diagnostics) still print at "info".
+set(CLIO_THROUGHPUT_TEST_LOG_LEVEL "CTP_LOG_LEVEL=info")
+
 add_test(NAME cte_concurrent_same_blob_all
     COMMAND test_concurrent_same_blob)
 
@@ -951,7 +964,7 @@ set_tests_properties(
     PROPERTIES
         TIMEOUT 300  # 5 minute timeout -> a hang trips this
         LABELS "regression;concurrent;cte"
-        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1;SAME_BLOB_THREADS=8;SAME_BLOB_ITERS=100"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1;SAME_BLOB_THREADS=8;SAME_BLOB_ITERS=100;${CLIO_THROUGHPUT_TEST_LOG_LEVEL}"
 )
 
 # issue #820: run the SAME rigorous same-blob correctness test again, this time
@@ -975,7 +988,7 @@ set_tests_properties(
     PROPERTIES
         TIMEOUT 300  # 5 minute timeout -> a hang trips this
         LABELS "regression;concurrent;cte"
-        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1;SAME_BLOB_THREADS=8;SAME_BLOB_ITERS=100;SAME_BLOB_FLUSH=1"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1;SAME_BLOB_THREADS=8;SAME_BLOB_ITERS=100;SAME_BLOB_FLUSH=1;${CLIO_THROUGHPUT_TEST_LOG_LEVEL}"
 )
 
 # issue #820: run the SAME rigorous same-blob correctness test again, this time
@@ -992,7 +1005,7 @@ set_tests_properties(
     PROPERTIES
         TIMEOUT 300
         LABELS "regression;concurrent;cte;batching"
-        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1;SAME_BLOB_THREADS=8;SAME_BLOB_ITERS=100;CLIO_CTE_BATCHING=1;CLIO_BATCH_LANE=1"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1;SAME_BLOB_THREADS=8;SAME_BLOB_ITERS=100;CLIO_CTE_BATCHING=1;CLIO_BATCH_LANE=1;${CLIO_THROUGHPUT_TEST_LOG_LEVEL}"
 )
 
 # issue #820: vectored PutBlob/GetBlob correctness (equivalence with N single
@@ -1029,7 +1042,7 @@ add_test(NAME cte_bdev_free_visibility
 set_tests_properties(cte_bdev_free_visibility PROPERTIES
     TIMEOUT 600
     LABELS "regression;bdev;cte;919"
-    ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1")
+    ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1;${CLIO_THROUGHPUT_TEST_LOG_LEVEL}")
 
 # Add reorganize blob tests
 # NOTE: These tests are chained (Put -> Move -> Integrity -> Promote -> Cleanup)
