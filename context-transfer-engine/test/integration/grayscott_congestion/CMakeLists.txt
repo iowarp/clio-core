@@ -36,6 +36,9 @@ add_test(
 set_tests_properties(cte_grayscott_congestion_docker_small PROPERTIES
     LABELS "integration;docker;distributed;grayscott"
     TIMEOUT 900
+    # Keep the script's own deadline (CI/compose_wait.sh) inside ctest's, so a
+    # hang prints node diagnostics before ctest kills the script.
+    ENVIRONMENT "CW_BUDGET_SEC=840"
 )
 
 message(STATUS "CTE grayscott_congestion repro harness configured (issue #774)")

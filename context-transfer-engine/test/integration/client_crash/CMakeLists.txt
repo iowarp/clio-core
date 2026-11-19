@@ -17,6 +17,9 @@ add_test(
 set_tests_properties(cte_client_crash_integration_docker PROPERTIES
     LABELS "integration;docker;distributed;crash;leak"
     TIMEOUT 600
+    # Keep the script's own deadline (CI/compose_wait.sh) inside ctest's, so a
+    # hang prints node diagnostics before ctest kills the script.
+    ENVIRONMENT "CW_BUDGET_SEC=540"
 )
 
 message(STATUS "CTE client-crash integration test configured (issue #722)")

@@ -98,8 +98,8 @@ services:
     entrypoint: [ "/bin/bash", "-c" ]
     command: >
       "
-        echo 'Node 3: Waiting 15s for initial cluster to start...' &&
-        sleep 15 &&
+        echo 'Node 3: waiting for nodes 1-2 to report RUNNING (run_tests.sh marker)...' &&
+        bash /workspace/CI/cluster_node.sh wait-file /workspace/build/cluster_sync/expand/initial_ready 240 &&
         echo 'Node 3: Starting runtime with --induct...' &&
         /workspace/build/bin/clio_run runtime start --fresh --induct
       "

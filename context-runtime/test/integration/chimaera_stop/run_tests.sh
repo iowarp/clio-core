@@ -97,8 +97,13 @@ log "starting 2-node cluster (image: $IOWARP_DOCKER_IMAGE)"
 docker compose down -v 2>/dev/null || true
 docker compose up -d
 
-log "waiting for node1 to run the stop gate (timeout 300s)"
-EXIT_CODE="$(timeout 300 docker wait chimaera-stop-node1 2>/dev/null || echo 1)"
+log "waiting for node1 to run the stop gate (deadline ${STOP_BUDGET_SEC:-480}s)"
+# Bounded wait; a timeout or non-zero exit dumps both nodes (CI/compose_wait.sh).
+# shellcheck source=../../../../CI/compose_wait.sh
+source "$REPO_ROOT/CI/compose_wait.sh"
+cw_init "${STOP_BUDGET_SEC:-480}" chimaera-stop-node1 chimaera-stop-node2
+cw_wait_containers chimaera-stop-node1 || true
+EXIT_CODE="${CW_RC[chimaera-stop-node1]:-124}"
 
 echo "==================== node1 (gate) log ===================="
 docker logs chimaera-stop-node1 2>&1 | tail -120

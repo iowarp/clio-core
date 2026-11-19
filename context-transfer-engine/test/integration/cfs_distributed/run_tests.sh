@@ -46,6 +46,10 @@ if [ -z "${IOWARP_DOCKER_IMAGE:-}" ]; then
 fi
 say "Using image: ${IOWARP_DOCKER_IMAGE}"
 
+# Bounded waits + diagnostics. Budget < the workflow step's 15 min.
+# shellcheck source=../../../../CI/compose_wait.sh
+source "$REPO_ROOT/CI/compose_wait.sh"
+
 cleanup() { docker compose down -v >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
@@ -53,17 +57,23 @@ say "=== Cleaning any previous run ==="
 docker compose down -v >/dev/null 2>&1 || true
 
 say "=== Starting 2-node CFS cluster (writer + reader) ==="
+cw_init "${CFS_DIST_BUDGET_SEC:-780}" cfs-dist-node1 cfs-dist-node2
+cw_reset_sync "$REPO_ROOT/build/cluster_sync/cfs_distributed"
 if ! docker compose up -d; then
     err "docker compose up failed"
     docker compose logs || true
     exit 1
 fi
 
-# Both node containers run to completion (writer waits for the reader's ack,
-# reader exits after it reads). Block on each and capture exit codes.
+cw_wait_ready_files 2 || { err "cluster never became ready"; exit 1; }
+
+# Both node containers run to completion (writer waits for reader_done.flag,
+# reader exits after it reads). Bounded by the suite deadline; a timeout or a
+# non-zero exit dumps both nodes.
 say "=== Waiting for reader (node 2) and writer (node 1) to finish ==="
-reader_rc=$(docker wait cfs-dist-node2 2>/dev/null || echo 1)
-writer_rc=$(docker wait cfs-dist-node1 2>/dev/null || echo 1)
+cw_wait_containers cfs-dist-node2 cfs-dist-node1 || true
+reader_rc="${CW_RC[cfs-dist-node2]:-timeout}"
+writer_rc="${CW_RC[cfs-dist-node1]:-timeout}"
 
 say "=== Reader (node 2) log ==="
 docker logs cfs-dist-node2 2>&1 | tail -40
