@@ -171,6 +171,7 @@ void StopGracefully(clio::run::test::RuntimeServer &server) {
  * @param what the step just finished
  */
 void Progress(const std::string &what) {
+  std::cout.flush();
   std::fprintf(stderr, "  [STEP] %s\n", what.c_str());
   std::fflush(stderr);
 }
@@ -551,10 +552,19 @@ TEST_CASE("ClientCrash - a dead client's SHM segments are reclaimed (#1192)",
   // Progress lines: this case has hung in CI (leak-check job) with no
   // output before the ctest TIMEOUT; each step reports so the next hang
   // shows where it stopped.
+  // Unbuffered stdout for this case: a FAIL message written to a buffered
+  // stdout is lost when ctest kills a process that then hangs in teardown.
+  std::cout << std::unitbuf;
   REQUIRE(server.Start(kPort, "127.0.0.1", /*ephemeral=*/true));
   Progress("reclaim: daemon started");
-  REQUIRE(server.WaitForReady(60000));
-  Progress("reclaim: daemon ready");
+  const bool ready = server.WaitForReady(60000);
+  Progress(std::string("reclaim: WaitForReady returned ") +
+           (ready ? "true" : "false") + ", daemon " +
+           (server.IsRunning() ? "running" : "not running"));
+  if (!ready) {
+    FAIL("daemon not ready within 60 s\n" +
+         clio::run::test::RuntimeServer::LogTail());
+  }
   REQUIRE(RunCliTimed({"compose", "start", compose_yaml.string()}, 60) == 0);
   Progress("reclaim: compose done");
   pid_t child = fork();
