@@ -10505,11 +10505,6 @@ clio::run::TaskResume Runtime::ModifyExistingData(
   // Iterate over every block in the blob (from the hinted start).
   for (size_t block_idx = start_block_idx; block_idx < blocks.size(); ++block_idx) {
     const BlobBlock &block = blocks[block_idx];
-    HLOG(
-        kDebug,
-        "ModifyExistingData: block[{}] - target_offset={}, size={}, pool_id={}",
-        block_idx, block.target_offset_, block.size_,
-        block.bdev_client_.pool_id_.ToU64());
 
     // Step 7: If remaining size is 0, quit the for loop
     if (remaining_size == 0) {
@@ -10523,6 +10518,15 @@ clio::run::TaskResume Runtime::ModifyExistingData(
 
     if (data_offset_in_blob < block_end_in_blob &&
         data_end_in_blob > block_offset_in_blob) {
+      // Logged only for blocks this write touches. Logging every block the
+      // scan passes made a Debug build emit O(blocks) lines per put -- on a
+      // blob grown by appends, quadratic output that throttled the whole
+      // write path on stderr (cte_concurrent_same_blob_*: ~75k lines/run).
+      HLOG(kDebug,
+           "ModifyExistingData: block[{}] - target_offset={}, size={}, "
+           "pool_id={}",
+           block_idx, block.target_offset_, block.size_,
+           block.bdev_client_.pool_id_.ToU64());
       // Step 4: Clamp the range
       timer.Resume();
       size_t write_start_in_blob =
@@ -10699,9 +10703,6 @@ clio::run::TaskResume Runtime::ReadData(const clio::run::priv::vector<BlobBlock>
   // Iterate over every block in the blob
   for (size_t block_idx = 0; block_idx < blocks.size(); ++block_idx) {
     const BlobBlock &block = blocks[block_idx];
-    HLOG(kDebug, "ReadData: block[{}] - target_offset={}, size={}, pool_id={}",
-         block_idx, block.target_offset_, block.size_,
-         block.bdev_client_.pool_id_.ToU64());
 
     // Step 7: If remaining size is 0, quit the for loop
     if (remaining_size == 0) {
@@ -10715,6 +10716,11 @@ clio::run::TaskResume Runtime::ReadData(const clio::run::priv::vector<BlobBlock>
 
     if (data_offset_in_blob < block_end_in_blob &&
         data_end_in_blob > block_offset_in_blob) {
+      // Only blocks the read touches are logged (see ModifyExistingData).
+      HLOG(kDebug,
+           "ReadData: block[{}] - target_offset={}, size={}, pool_id={}",
+           block_idx, block.target_offset_, block.size_,
+           block.bdev_client_.pool_id_.ToU64());
       // Step 4: Clamp the range [data_offset_in_blob, data_offset_in_blob +
       // data_size) to the range [block_offset_in_blob, block_offset_in_blob +
       // block.size)

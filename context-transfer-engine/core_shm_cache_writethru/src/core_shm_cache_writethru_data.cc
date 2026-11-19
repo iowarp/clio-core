@@ -69,12 +69,11 @@ static constexpr double kNoSpacePollUs = 50.0;
 /** Waits for segment room before a put writes around the cache (~1 ms),
  *  once no range buffered before the put's first refusal is still
  *  unflushed. A segment full of clean small buffers may never yield a large
- *  one. */
+ *  one. Before that, a refused put waits up to WtcConfig::nospace_wait_ms_
+ *  (default 250 ms) for those ranges to land: once flushed they are clean
+ *  and evictable, so room follows. Writing around instead would take the
+ *  same chain. */
 static constexpr int kNoSpaceRetries = 20;
-/** Most a refused put waits (ms) for the ranges buffered before its first
- *  refusal to land: once flushed they are clean and evictable, so room
- *  follows. Writing around instead would take the same chain. */
-static constexpr double kNoSpaceFlushWaitMs = 250.0;
 /** Retries of a put refused because its entry is pinned (kBusy) before it
  *  writes around the cache. The pin is an in-flight flush, released when
  *  the blob's home acks (a network round trip). */
@@ -91,7 +90,7 @@ bool Runtime::RoomMayFollowFlush(
   const double waited_ms = std::chrono::duration<double, std::milli>(
                                std::chrono::steady_clock::now() - t0)
                                .count();
-  return waited_ms < kNoSpaceFlushWaitMs;
+  return waited_ms < static_cast<double>(config_.nospace_wait_ms_);
 }
 
 clio::run::TaskResume Runtime::TryPutRetrying(const TagId &tag,
