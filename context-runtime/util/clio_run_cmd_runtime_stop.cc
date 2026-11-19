@@ -55,6 +55,17 @@
 #include "clio_run_commands.h"
 #include "clio_run_local_runtime.h"
 
+// Last: its macros (min/max, message names) must not reach the headers above.
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
 namespace {
 
 using clio::run::cli::DiscoverRuntimePid;
@@ -247,9 +258,14 @@ int EscalateLocalKill(clio::run::u32 /*port*/) {
  */
 bool WaitForRuntimeExit(int pid, clio::run::u64 timeout_ms) {
 #ifdef _WIN32
-  (void)pid;
-  (void)timeout_ms;
-  return false;
+  // A handle is signaled the moment the process exits (#1357); no polling.
+  HANDLE h = ::OpenProcess(SYNCHRONIZE, FALSE, static_cast<DWORD>(pid));
+  if (h == NULL) {
+    return true;  // already gone
+  }
+  const DWORD rc = ::WaitForSingleObject(h, static_cast<DWORD>(timeout_ms));
+  ::CloseHandle(h);
+  return rc == WAIT_OBJECT_0;
 #else
   const auto deadline = std::chrono::steady_clock::now() +
                         std::chrono::milliseconds(timeout_ms);
@@ -260,6 +276,64 @@ bool WaitForRuntimeExit(int pid, clio::run::u64 timeout_ms) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
   return !PidIsRunning(pid);
+#endif
+}
+
+/**
+ * Whether a known runtime pid has exited, without waiting.
+ * @param pid the runtime's pid (<= 0 if unknown)
+ * @return true only if the pid is known and its process is gone
+ */
+bool RuntimeExited(int pid) {
+  if (pid <= 0) {
+    return false;
+  }
+  return WaitForRuntimeExit(pid, 0);
+}
+
+#ifdef _WIN32
+/**
+ * Whether a Windows pid currently belongs to a clio_run binary, so a stale
+ * pid record that names a recycled pid is never waited on.
+ * @param pid candidate runtime pid
+ * @return true if the process's executable is a clio_run binary
+ */
+bool WinPidIsClioRun(int pid) {
+  HANDLE h = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
+                           static_cast<DWORD>(pid));
+  if (h == NULL) {
+    return false;
+  }
+  char buf[MAX_PATH];
+  DWORD len = MAX_PATH;
+  const bool ok = ::QueryFullProcessImageNameA(h, 0, buf, &len) != 0;
+  ::CloseHandle(h);
+  if (!ok) {
+    return false;
+  }
+  const std::string name =
+      std::filesystem::path(std::string(buf, len)).filename().string();
+  return clio::run::cli::IsClioRunExeName(name);
+}
+#endif
+
+/**
+ * The pid `clio_run stop` waits on.
+ *
+ * Elsewhere this is DiscoverRuntimePid. On Windows, which it does not cover,
+ * it is the pid record the runtime writes next to its segments, accepted only
+ * while that pid is a clio_run process. Without a pid the stop falls back to
+ * probing the runtime, which costs a 2 s acknowledgement wait plus a 1 s
+ * probe timeout after the daemon is already gone (#1357).
+ * @param port the runtime port
+ * @return the runtime's pid, or -1 if unknown
+ */
+int StopTargetPid(clio::run::u32 port) {
+#ifdef _WIN32
+  const int pid = clio::run::ReadRuntimePidRecord(port);
+  return (pid > 0 && WinPidIsClioRun(pid)) ? pid : -1;
+#else
+  return DiscoverRuntimePid(port);
 #endif
 }
 
@@ -305,7 +379,13 @@ int SendStopTask(const StopOptions& opts, int pid) {
   // forced runtime _exit()s ~500 ms after handling the task and may vanish
   // before the reply flushes. The authoritative check is the liveness poll
   // below.
-  if (stop_task.Wait(2.0f)) {
+  // Waited in slices so a runtime that exits before replying ends the wait
+  // at once instead of after the full 2 s (#1357).
+  bool acked = false;
+  for (int slice = 0; slice < 40 && !acked && !RuntimeExited(pid); ++slice) {
+    acked = stop_task.Wait(0.05f);
+  }
+  if (acked) {
     HLOG(kDebug, "Stop task acknowledged (return code: {})",
          stop_task->GetReturnCode());
   } else {
@@ -391,7 +471,7 @@ int RuntimeStop(int argc, char* argv[]) {
     } finalize_guard;
 
     const clio::run::u32 port = ResolveRuntimePort();
-    const int pid = DiscoverRuntimePid(port);
+    const int pid = StopTargetPid(port);
     if (SendStopTask(opts, pid) == 0) {
 #ifndef _WIN32
       // Idempotent residue sweep: a graceful exit unlinks everything itself,

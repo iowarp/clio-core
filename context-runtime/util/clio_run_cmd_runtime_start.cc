@@ -138,8 +138,8 @@ bool InductNode() {
 /**
  * Block until the runtime should exit: either a SIGTERM/SIGINT flipped
  * g_keep_running, or a StopRuntimeTask requested a graceful stop via
- * RuntimeManager::RequestStop. Returning lets main() exit normally so the
- * atexit teardown (ServerFinalize) runs on this main thread.
+ * RuntimeManager::RequestStop. The caller then finalizes the runtime
+ * (ServerFinalize) on this main thread while the workers are still alive.
  */
 void RunUntilStopped() {
   auto* runtime_manager = CLIO_RUNTIME_MANAGER;
@@ -468,7 +468,16 @@ int RuntimeStart(int argc, char* argv[]) {
   // DestroyAllContainers() does it after StopWorkers(). See the
   // "no ShutdownAdminChiMod()" note near the top of this file for why tearing
   // it down while the workers still run wedges the shutdown.
-  HLOG(kDebug, "Clio runtime stopped (finalization will happen automatically)");
+  //
+  // Finalize explicitly, here on the main thread, instead of leaving it to
+  // the atexit handler (#1365, #1357). On Windows that handler belongs to the
+  // runtime DLL and runs while the DLL unloads, after the OS has already
+  // terminated every other thread: the stop hooks then queue work that no
+  // worker will ever run and wait out the whole grace period. Calling it here
+  // runs the teardown with the workers alive on every platform; the atexit
+  // registration stays as the fallback and is a no-op once this has run.
+  clio::run::CLIO_RUNTIME_FINALIZE();
+  HLOG(kDebug, "Clio runtime stopped");
   return 0;
 }
 
