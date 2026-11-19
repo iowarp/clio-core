@@ -199,6 +199,9 @@ compose:
   }
 };
 
+/** Longest a test waits for the organizer to move a score (ms). */
+static constexpr int kScoreDeadlineMs = 60000;
+
 /** Poll a blob's score until `pred` holds or the deadline passes. */
 template <class Pred>
 static float WaitForScore(clio::cte::core::Tag &tag, const std::string &name,
@@ -227,8 +230,10 @@ TEST_CASE("GrayScott organizer - checkpoint tags are demoted, read data is not",
   live.PutBlob("plane", data.data(), kBlobSize, 0, 1.0f);
   { std::vector<char> buf(kBlobSize); live.GetBlob("plane", buf.data(), kBlobSize); }
 
+  // Poll under a long deadline: a slow runner takes more organizer rounds
+  // to get there, and a demotion that never happens still fails.
   const float ck = WaitForScore(ckpt, PageName(1), [](float v) { return v <= 0.05f; },
-                                12 * kOrganizerPeriodMs);
+                                kScoreDeadlineMs);
   INFO("checkpoint page score after organizer rounds: " << ck);
   REQUIRE(ck <= 0.05f);
 

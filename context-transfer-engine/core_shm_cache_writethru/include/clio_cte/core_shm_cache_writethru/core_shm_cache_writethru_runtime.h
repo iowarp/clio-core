@@ -147,7 +147,7 @@ class Runtime : public clio::cte::core::CoreInterposer {
    * Whether a put refused for room should keep waiting for the flusher:
    * ranges buffered before its first refusal are still unflushed (once
    * landed they are clean and evictable) and the wait is under
-   * kNoSpaceFlushWaitMs.
+   * WtcConfig::nospace_wait_ms_.
    * @param target pushed-range count at the put's first refusal
    * @param t0 time of the put's first refusal
    * @return true to keep waiting without spending a no-space retry
