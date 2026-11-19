@@ -496,6 +496,11 @@ class ThalliumTransport : public Transport {
     try {
       ctp::ipc::GlobalDeserialize<std::vector<char>> ar(entry.meta_);
       ar(meta);
+      if (ar.Failed()) {  // short or foreign metadata (#1353)
+        HLOG(kError, "ThalliumTransport::Recv: malformed metadata dropped");
+        info.rc = -1;
+        return info;
+      }
     } catch (const std::exception &e) {
       HLOG(kError, "ThalliumTransport::Recv: bad metadata: {}", e.what());
       info.rc = -1;
