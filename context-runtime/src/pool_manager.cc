@@ -1455,7 +1455,15 @@ void PoolManager::WriteAddressTableWAL(PoolId pool_id,
 
   // Create WAL directory
   std::string wal_dir = config_manager->GetConfDir() + "/wal";
-  std::filesystem::create_directories(wal_dir);
+  // With an error_code: an unusable conf_dir must fail this write, not throw
+  // a filesystem_error that terminates the process from a worker (#1356).
+  std::error_code wal_ec;
+  std::filesystem::create_directories(wal_dir, wal_ec);
+  if (wal_ec) {
+    HLOG(kError, "PoolManager: cannot create WAL directory {}: {}", wal_dir,
+         wal_ec.message());
+    return;
+  }
 
   // Determine this node's ID for the WAL filename
   auto *ipc_manager = CLIO_IPC;

@@ -319,7 +319,7 @@ std::string ConfigManager::GetServerConfigPath() const {
   // Check env var first: CLIO_SERVER_CONF preferred, CLIO_SERVER_CONF legacy.
   const char *env_path = clio::run::env::GetCompat("SERVER_CONF");
   if (env_path) {
-    return std::string(env_path);
+    return ctp::SystemInfo::NormalizePath(env_path);
   }
 
   // Unit tests are hermetic: never fall back to the developer's per-user
@@ -516,7 +516,8 @@ void ConfigManager::ParseYAML(YAML::Node &yaml_conf) {
     // Configuration directory for persistent runtime config; the default is
     // the per-user directory set in LoadDefault (see there).
     if (runtime["conf_dir"]) {
-      conf_dir_ = runtime["conf_dir"].as<std::string>();
+      conf_dir_ =
+          ctp::ConfigParse::ExpandPath(runtime["conf_dir"].as<std::string>());
     }
 
     // Task load prediction model learning rate

@@ -84,6 +84,28 @@ TEST_CASE("SystemInfoMemfdDir") {
   REQUIRE(!default_dir.empty());
 }
 
+TEST_CASE("SystemInfoNormalizePath") {
+  // Ordinary paths are untouched on every platform.
+  REQUIRE(SystemInfo::NormalizePath("/tmp/clio_x") == "/tmp/clio_x");
+  REQUIRE(SystemInfo::NormalizePath("C:\\Users\\u") == "C:\\Users\\u");
+  REQUIRE(SystemInfo::NormalizePath("").empty());
+#ifdef _WIN32
+  // Win32 verbatim paths lose their prefix (#1356).
+  REQUIRE(SystemInfo::NormalizePath("\\\\?\\C:\\Users\\u\\data") ==
+          "C:\\Users\\u\\data");
+  REQUIRE(SystemInfo::NormalizePath("//?/C:/Users/u") == "C:/Users/u");
+  REQUIRE(SystemInfo::NormalizePath("\\\\?\\UNC\\srv\\share\\d") ==
+          "\\\\srv\\share\\d");
+  // A verbatim CLIO_MEMFD_DIR yields usable segment paths.
+  SystemInfo::Setenv("CLIO_MEMFD_DIR", "\\\\?\\C:\\clio_test_dir", 1);
+  REQUIRE(SystemInfo::GetMemfdDir() == "C:\\clio_test_dir");
+  SystemInfo::Unsetenv("CLIO_MEMFD_DIR");
+#else
+  // On POSIX a "\\?\" prefix is just part of a file name.
+  REQUIRE(SystemInfo::NormalizePath("\\\\?\\C:\\x") == "\\\\?\\C:\\x");
+#endif
+}
+
 TEST_CASE("SystemInfoHostnameResolution") {
   // localhost must resolve to at least one address.
   std::vector<std::string> ips = SystemInfo::ResolveHostname("localhost");

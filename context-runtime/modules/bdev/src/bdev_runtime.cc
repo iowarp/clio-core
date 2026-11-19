@@ -88,6 +88,7 @@ std::string Runtime::MakePerfStatsPath(const std::string &pool_name) {
     }
     dir += "/bdev_perf";
   }
+  dir = ctp::SystemInfo::NormalizePath(dir);  // no "\\?\" prefix (#1356)
   // Sanitize the pool name (it may be a filesystem path or "ram::name")
   // into a flat file name.
   std::string name = pool_name;

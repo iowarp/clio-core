@@ -309,7 +309,9 @@ class ConfigParse {
       path.replace(pos, end - pos + 1, env_val);
       pos += env_val.size();
     }
-    return path;
+    // A Win32 verbatim path ("\\?\C:\...") breaks every file name the runtime
+    // builds from it by appending '/' (#1356).
+    return ctp::SystemInfo::NormalizePath(path);
   }
 
   /** Parse hostfile */
