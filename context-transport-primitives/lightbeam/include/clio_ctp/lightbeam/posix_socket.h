@@ -144,7 +144,9 @@ CTP_DLL socket_t Connect(const std::string& addr, int port,
 
 /** Create a socket, bind, and listen. protocol == "ipc" uses a Unix-domain
  *  socket at `addr` (unlinking any stale path first); otherwise TCP on `port`
- *  (with SO_REUSEADDR + a large recv buffer). Returns a listening fd, or
+ *  (with SO_REUSEADDR + a large recv buffer), bound to `addr`: an empty
+ *  address, "*" or "0.0.0.0" binds every interface, anything else must be an
+ *  IPv4 literal or a resolvable host name. Returns a listening fd, or
  *  kInvalidSocket on failure. */
 CTP_DLL socket_t Listen(const std::string& addr, int port,
                         const std::string& protocol);
