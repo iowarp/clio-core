@@ -244,7 +244,9 @@ class PolicyCacheFixture {
       clio::cte::core_persist_write_back::WriteBackCacheConfig params;
       params.volatile_pool_ = kVolatilePool;
       params.persistent_pool_ = kPersistentPool;
-      params.flush_period_ms_ = 0;  // flushes only when the test asks
+      params.flush_period_ms_ = 0;  // flushes only when the test asks:
+      params.flush_fill_pct_ = 0;   // no fill-level flush
+      params.flush_dirty_mb_ = 0;   // no dirty-volume flush
       params.fallback_to_persistent_ = strict == 0;
       auto f = c.AsyncCreateCache(
           clio::run::PoolQuery::Local(), strict ? "policy_strict" : "policy_back",
