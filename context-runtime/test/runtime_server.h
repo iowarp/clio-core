@@ -179,8 +179,13 @@ class RuntimeServer {
    *
    * Returns false if the timeout elapses or the daemon exits early, which is
    * what lets those callers retry instead of failing outright.
+   *
+   * The default cap is 120 s: a daemon that dies returns false at once, and a
+   * ready one returns as soon as it is ready, so the cap only decides how slow
+   * a still-starting daemon may be. 30 s was within reach of an ASan daemon
+   * loading every ChiMod on a loaded runner.
    */
-  bool WaitForReady(int timeout_ms = 30000) {
+  bool WaitForReady(int timeout_ms = 120000) {
     // Segment names are port-keyed (see ConfigManager::GetSharedMemorySegmentName)
     // so they match the daemon started on port_.
     const std::string seg =

@@ -109,8 +109,12 @@ int EnvInt(const char *name, int def) {
   int v = std::atoi(e);
   return v > 0 ? v : def;
 }
-// Wait longer than the daemon's undeliverable-response drop window
-// (kClientResponseRetryDropSec, ~5 s) so the drop has fired before we stop it.
+// Let the abandoned burst reach the daemon and run before stopping it. This is
+// a floor, not a budget: whatever is still in flight when the stop arrives is
+// drained by the graceful stop below, which must leak nothing either way. (The
+// #722 undeliverable-response drop window this used to outwait is not reached
+// on a single node -- the client's responses never fail to send -- so there is
+// no drop marker to poll for here; see NOTE ON SCOPE in the test.)
 constexpr int kDropWaitSec = 9;
 
 std::string ReadWholeFile(const std::string &path) {
@@ -131,6 +135,34 @@ size_t CountOccurrences(const std::string &hay, const std::string &needle) {
 }
 
 int g_nocrash_ok = 0;  // diagnostic: PutBlobs that returned rc==0 in nocrash mode
+
+/** How long a graceful stop (SIGTERM -> ServerFinalize -> exit) may take.
+ *  Only a hang reaches it; an ASan daemon finalizes in seconds. */
+constexpr int kGracefulStopMs = 60000;
+
+/**
+ * Stop the daemon with SIGTERM and wait for it to exit ON ITS OWN, so its
+ * ServerFinalize (and the leak report in it) runs to completion.
+ * RuntimeServer::Stop() SIGKILLs after a 5 s grace, which on a slow runner
+ * kills the daemon mid-finalize and leaves a log with no leak report -- a
+ * vacuous pass for a test that asserts the report's absence.
+ * @param server the running daemon
+ */
+void StopGracefully(clio::run::test::RuntimeServer &server) {
+  REQUIRE(server.Pid() > 0);
+  REQUIRE(kill(server.Pid(), SIGTERM) == 0);
+  int exit_code = -1;
+  const bool exited = server.WaitExit(kGracefulStopMs, &exit_code);
+  if (!exited) {
+    FAIL("daemon did not exit within " + std::to_string(kGracefulStopMs) +
+         " ms of SIGTERM\n" + clio::run::test::RuntimeServer::LogTail());
+  }
+  if (exit_code != 0) {
+    FAIL("daemon exited with code " + std::to_string(exit_code) +
+         " after SIGTERM (finalize did not complete)\n" +
+         clio::run::test::RuntimeServer::LogTail());
+  }
+}
 
 // Attach as a client, fire a burst of PutBlobs, then _exit WITHOUT waiting for
 // the responses. Never returns. Used two ways:
@@ -279,10 +311,9 @@ TEST_CASE("ClientCrash - PutBlob then terminate drops task with no leak [leak]",
   std::this_thread::sleep_for(std::chrono::seconds(kDropWaitSec));
 
   // Graceful stop -> ServerFinalize -> ReportRuntimeLeaks writes to the log.
-  server.Stop();
-  for (int i = 0; i < 50 && server.IsRunning(); ++i) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-  }
+  // Wait for the daemon's own exit (code 0) so the report is known to have
+  // been written before its absence is asserted below.
+  StopGracefully(server);
 
   const std::string log = ReadWholeFile(log_path);
   REQUIRE(!log.empty());

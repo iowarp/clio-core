@@ -40,6 +40,14 @@
 #include <thread>
 #include <vector>
 
+// These checks use assert(). CI also runs this test in Release builds,
+// where NDEBUG would compile every check to nothing and the test could
+// only fail by crashing. Re-including <cassert> without NDEBUG (after
+// every other header, so no library code changes) keeps assert() live.
+#undef NDEBUG
+#include <cassert>  // NOLINT(build/include_order)
+
+
 using namespace ctp::lbm;
 
 // Shared copy-space buffer and synchronization primitives

@@ -36,9 +36,11 @@
  */
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
@@ -46,6 +48,10 @@
 
 #ifndef _WIN32
 #include <sys/resource.h>  // RaiseFdLimit
+#if defined(__APPLE__)
+#include <sys/syslimits.h>  // OPEN_MAX (RaiseFdLimit)
+#include <sys/sysctl.h>     // kern.maxfilesperproc (RaiseFdLimit)
+#endif
 #if defined(__linux__)
 #include <sys/prctl.h>  // MaybeAllowPtrace
 #endif
@@ -286,22 +292,57 @@ void ReplayPoolLog(bool is_restart) {
        pools.size(), pool_manager->PoolLogPath());
 }
 
+#ifndef _WIN32
 /**
- * Raise this process's open-file soft limit to its hard limit. Every file
- * bdev opens its backing file once per worker, so an array of several disks
- * on 16 workers runs past the usual 1024 soft limit, and the next member's
+ * The highest open-file soft limit setrlimit will accept on this platform.
+ * macOS reports an unlimited hard limit (RLIM_INFINITY) but rejects a soft
+ * limit above kern.maxfilesperproc with EINVAL, so asking for the hard limit
+ * there fails and leaves the process at the default 256.
+ * @param hard the RLIMIT_NOFILE hard limit
+ * @return the target soft limit
+ */
+rlim_t FdLimitTarget(rlim_t hard) {
+#if defined(__APPLE__)
+  rlim_t cap = OPEN_MAX;
+  int per_proc = 0;
+  size_t len = sizeof(per_proc);
+  if (sysctlbyname("kern.maxfilesperproc", &per_proc, &len, nullptr, 0) ==
+          0 &&
+      per_proc > 0) {
+    cap = static_cast<rlim_t>(per_proc);
+  }
+  return hard < cap ? hard : cap;
+#else
+  return hard;
+#endif
+}
+#endif
+
+/**
+ * Raise this process's open-file soft limit to its hard limit (clamped to
+ * what the platform accepts, see FdLimitTarget). Every file bdev opens its
+ * backing file once per worker, so an array of several disks on 16 workers
+ * runs past the usual 1024 soft limit (256 on macOS), and the next member's
  * workers then fail to open it. Storage daemons raise the limit themselves.
  */
 void RaiseFdLimit() {
 #ifndef _WIN32
   struct rlimit rl;
-  if (getrlimit(RLIMIT_NOFILE, &rl) != 0 || rl.rlim_cur >= rl.rlim_max) {
+  if (getrlimit(RLIMIT_NOFILE, &rl) != 0) {
+    return;
+  }
+  const rlim_t target = FdLimitTarget(rl.rlim_max);
+  if (rl.rlim_cur >= target) {
     return;
   }
   const rlim_t old = rl.rlim_cur;
-  rl.rlim_cur = rl.rlim_max;
+  rl.rlim_cur = target;
   if (setrlimit(RLIMIT_NOFILE, &rl) == 0) {
     HLOG(kDebug, "Raised open-file limit from {} to {}", old, rl.rlim_cur);
+  } else {
+    HLOG(kWarning, "Could not raise the open-file limit from {} to {} ({}); "
+         "file bdevs may fail to open once it is reached", old, target,
+         std::strerror(errno));
   }
 #endif
 }

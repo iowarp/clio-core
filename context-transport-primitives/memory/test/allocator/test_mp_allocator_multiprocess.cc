@@ -41,9 +41,14 @@
  * rank 1+: Attaches to shared memory (consumer), reads only
  */
 
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <string>
+#include <thread>
 
 #include "clio_ctp/memory/allocator/mp_allocator.h"
 #include "clio_ctp/memory/backend/posix_shm_mmap.h"
@@ -55,6 +60,52 @@ using namespace ctp::testing;
 // Shared memory configuration
 constexpr size_t kShmSize = 512 * 1024 * 1024;  // 512 MB
 const std::string kShmUrl = "/mp_allocator_multiprocess_test";
+/** How long a consumer waits for rank 0's ready flag. A hang beyond this is
+ *  a real failure (rank 0 died or never initialized), not a slow runner. */
+constexpr int kReadyWaitMs = 30000;
+
+/**
+ * Path of the flag rank 0 publishes once its allocator is constructed.
+ * The driver script passes a per-run path in CTP_MP_ALLOC_READY_FILE.
+ * @return the flag path
+ */
+std::filesystem::path ReadyFlagPath() {
+  const char *e = std::getenv("CTP_MP_ALLOC_READY_FILE");
+  if (e != nullptr && *e != '\0') return std::filesystem::path(e);
+  return std::filesystem::temp_directory_path() /
+         "mp_allocator_multiprocess_test.ready";
+}
+
+/**
+ * Publish the ready flag atomically (write a temp file, then rename), so a
+ * consumer never sees a half-created flag.
+ * @return true if the flag now exists
+ */
+bool PublishReadyFlag() {
+  const std::filesystem::path flag = ReadyFlagPath();
+  const std::filesystem::path tmp = flag.string() + ".tmp";
+  { std::ofstream(tmp) << "ready\n"; }
+  std::error_code ec;
+  std::filesystem::rename(tmp, flag, ec);
+  return !ec;
+}
+
+/**
+ * Block until rank 0 has published the ready flag.
+ * @param timeout_ms give up after this long
+ * @return true once the flag exists, false on timeout
+ */
+bool WaitForReadyFlag(int timeout_ms) {
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(timeout_ms);
+  const std::filesystem::path flag = ReadyFlagPath();
+  while (std::chrono::steady_clock::now() < deadline) {
+    std::error_code ec;
+    if (std::filesystem::exists(flag, ec)) return true;
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  return false;
+}
 
 int main(int argc, char **argv) {
   if (argc != 4) {
@@ -75,6 +126,8 @@ int main(int argc, char **argv) {
 
   if (rank == 0) {
     // Rank 0 is the producer — initializes shared memory
+    std::error_code rm_ec;
+    std::filesystem::remove(ReadyFlagPath(), rm_ec);  // a previous run's flag
     std::cout << "Rank 0: Initializing shared memory" << std::endl;
     success = backend.shm_init(MemoryBackendId(0, 0), kShmSize, kShmUrl);
     if (!success) {
@@ -87,7 +140,15 @@ int main(int argc, char **argv) {
     std::memset(backend.data_, 11, backend.data_capacity_);
     backend.UnsetOwner();
   } else {
-    // Other ranks are consumers — attach to existing shared memory
+    // Other ranks are consumers. Rank 0 publishes a flag only after both the
+    // segment and the allocator in it are constructed; wait for that rather
+    // than guessing a delay.
+    if (!WaitForReadyFlag(kReadyWaitMs)) {
+      std::cerr << "Rank " << rank << ": rank 0 not ready after "
+                << kReadyWaitMs << " ms (flag " << ReadyFlagPath() << ")"
+                << std::endl;
+      return 1;
+    }
     std::cout << "Rank " << rank << ": Attaching to shared memory" << std::endl;
     success = backend.shm_attach(kShmUrl);
     if (!success) {
@@ -115,12 +176,14 @@ int main(int argc, char **argv) {
       return 1;
     }
     std::cout << "Rank 0: Allocator initialized successfully" << std::endl;
+    if (!PublishReadyFlag()) {
+      std::cerr << "Rank 0: Failed to publish ready flag " << ReadyFlagPath()
+                << std::endl;
+      return 1;
+    }
     std::cout << "  Allocator size: " << sizeof(ProducerConsumerAllocator) << std::endl;
   } else {
     std::cout << "Rank " << rank << ": Attaching to allocator" << std::endl;
-
-    // Give rank 0 time to fully initialize before we try to attach
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
     // Attach to existing allocator without reinitializing
     allocator = backend.AttachAlloc<ProducerConsumerAllocator>();
