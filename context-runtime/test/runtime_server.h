@@ -69,6 +69,7 @@
 
 #include "clio_ctp/introspect/system_info.h"
 #include "clio_ctp/util/config_parse.h"
+#include "clio_ctp/util/logging.h"
 #include "clio_ctp/util/msan.h"
 
 // Downstream POSIX tests that include this header (test_clio_run_cli,
@@ -217,8 +218,15 @@ class RuntimeServer {
     // created. Treating it as "ready" would hand callers a daemon that cannot
     // yet route a task, which is strictly worse than the sleep it replaced.
     // Waiting for the admin pool means the runtime can actually serve work.
+    // The marker is an INFO line. When the daemon cannot print INFO -- its
+    // compile-time CTP_LOG_LEVEL (the same build as this test) or the
+    // inherited CTP_LOG_LEVEL env is above info -- it can never appear, and
+    // polling for it used to burn the whole budget on every Start: in the
+    // leak-check preset (CLIO_CTP_LOG_LEVEL=3) a 3-daemon test outran its
+    // 300 s ctest TIMEOUT. Go straight to the settle instead.
     const std::string log_path = ServerLogPath();
     bool marker_seen = false;
+    if (!AdminPoolMarkerPossible()) i = attempts;
     for (; i < attempts && !marker_seen; ++i) {
       if (!IsRunning()) return false;
       if (ServerLogHasAdminPool(log_path)) {
@@ -236,6 +244,30 @@ class RuntimeServer {
     // Do not call a daemon that died inside the settle ready.
     std::this_thread::sleep_for(std::chrono::milliseconds(1000));
     return IsRunning();
+  }
+
+  /**
+   * Whether the daemon can print the INFO line WaitForReady waits for.
+   * HLOG compiles out levels below CTP_LOG_LEVEL (the daemon is built in the
+   * same tree as this test, so this translation unit sees the same value),
+   * and the daemon filters at run time by the CTP_LOG_LEVEL env var it
+   * inherits from this process.
+   * @return false when INFO is compiled out or filtered out at run time
+   */
+  static bool AdminPoolMarkerPossible() {
+    if (CTP_LOG_LEVEL > kInfo) return false;
+    const char *env = std::getenv("CTP_LOG_LEVEL");
+    if (env == nullptr || *env == '\0') return true;
+    const std::string v(env);
+    if (v == "debug" || v == "DEBUG" || v == "info" || v == "INFO") return true;
+    if (v == "success" || v == "SUCCESS" || v == "warning" || v == "WARNING" ||
+        v == "error" || v == "ERROR" || v == "fatal" || v == "FATAL") {
+      return false;
+    }
+    char *end = nullptr;
+    const long n = std::strtol(env, &end, 10);
+    if (end == env) return true;  // unparsable: the daemon keeps its default
+    return n <= kInfo;
   }
 
   /**
