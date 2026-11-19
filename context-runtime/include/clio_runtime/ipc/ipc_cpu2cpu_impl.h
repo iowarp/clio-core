@@ -10,6 +10,7 @@
 
 #include "clio_runtime/ipc/ipc_cpu2cpu.h"
 #include "clio_runtime/ipc/ipc_cpu2cpu_zmq.h"
+#include "clio_runtime/evlat.h"
 
 #include <unordered_map>
 
@@ -91,7 +92,8 @@ Future<TaskT> IpcCpu2Cpu::SendIn(IpcManager *ipc,
   // returned Future (or a copy) is alive — the client holds it until Recv.
   {
     std::lock_guard<std::mutex> lock(ipc->pending_futures_mutex_);
-    ipc->pending_zmq_futures_[net_key] = {task_ptr.get()};
+    ipc->pending_zmq_futures_[net_key] = {task_ptr.get(),
+                                          clio::run::evlat::Now()};
   }
 
   // issue #807: shard across the runtime's S inbound rings. Key by this client
@@ -145,13 +147,11 @@ bool IpcCpu2Cpu::RecvOut(IpcManager *ipc,
   // Both SendIn paths stamp net_key_ with the task's OWN heap address, which
   // cannot be null, and ResendTask re-stamps the same way -- so a zero
   // net_key_ is only ever TaskId's constructor default, i.e. a task that
-  // never went over IPC at all. The client-side read fast paths synthesize
-  // exactly that: a real GetBlobTask filled in from the shared metadata cache
-  // and SetComplete()'d locally, never Sent (CoreClient::TryShmGet and its
-  // deferred-put / vectored twins -- see the "synthesized-task contract"
-  // there). Returning true hands the caller the locally-produced result and
-  // lets WaitCpu2Cpu run Destroy(true) -> PostWait, which the fast paths rely
-  // on to finish the destination copy.
+  // never went over IPC at all. A future built around a task that was filled
+  // in and SetComplete()'d locally, never Sent, carries exactly that (the
+  // CLIO_RUN_INLINE path builds one). Returning true hands the caller the
+  // locally-produced result and lets WaitCpu2Cpu run Destroy(true) ->
+  // PostWait.
   //
   // Without this the #968 guard at the bottom treats every such future as a
   // protocol violation: the task IS complete (locally) and there IS no parked

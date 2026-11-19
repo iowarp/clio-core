@@ -215,7 +215,7 @@ class DefaultScheduler : public Scheduler {
    * @param now_us current time (NowUs)
    * @return the worker, or nullptr if the pool is empty
    */
-  Worker *PickPoolWorker(double now_us) const;
+  Worker *PickPoolWorker(double now_us, u32 min_id = 0) const;
 
   /** Whether  w is in pool_. */
   bool InPool(const Worker *w) const;

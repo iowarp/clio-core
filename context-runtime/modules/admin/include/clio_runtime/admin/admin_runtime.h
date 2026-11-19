@@ -141,6 +141,13 @@ public:
   static bool IsComposedPool(const clio::run::PoolId &pool_id);
 
   /**
+   * Whether the server's compose config defines a pool with this name.
+   * @param pool_name pool name to look for
+   * @return true when a compose entry has that pool_name
+   */
+  static bool IsComposedPoolName(const std::string &pool_name);
+
+  /**
    * Handle GetOrCreatePool task - Pool get-or-create operation (IS_ADMIN=false)
    * This is a coroutine that can co_await nested Create methods
    */
@@ -240,6 +247,17 @@ public:
 
   /** Monitor sub-handler: return host info (hostname, IP, node_id). */
   void MonitorGetHostInfo(clio::run::shared_ptr<MonitorTask> &task);
+
+  /**
+   * Monitor queries that drive this node's web dashboard, used by
+   * `clio-run viz <start|stop|status>`:
+   *   viz_status                          report only
+   *   viz_start[?bind=<addr>&port=<n>]    start unless already running
+   *   viz_stop                            stop if running
+   * Every form replies with a msgpack map {running, bind, port, error}
+   * describing the state AFTER the action.
+   */
+  void MonitorViz(clio::run::shared_ptr<MonitorTask> &task);
 
   /**
    * Register the web dashboard's endpoints and claim its home page
@@ -347,9 +365,13 @@ public:
   clio::run::TaskResume RegisterGpuContainer(clio::run::shared_ptr<RegisterGpuContainerTask> &task);
 
   /**
-   * Get live task statistics for this task instance.
+   * Get live task statistics for this task instance (every admin method).
    * For network periodics, compute_ = total queue depth across priorities;
    * io_size_ is a static stand-in (admin periodics don't have a payload).
+   * SubmitBatch scales with its serialized bytes and task count; every
+   * control verb returns an explicit constant (clio_runtime/task_cost.h).
+   * @param task the task to estimate
+   * @return the task's cost features
    */
   clio::run::TaskStat GetTaskStats(const clio::run::Task *task) const override;
 

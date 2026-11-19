@@ -73,77 +73,257 @@ $ ls ~/clio-mnt/results
 <p>About 91% of each operation's wall time is kernel transit; the daemon itself spends about 9.6 µs of CPU time per operation.</p>
 
 <h3>Against OrangeFS on Ares: IO500</h3>
-<p>IO500 on 4 nodes of the Ares cluster, 32 MPI ranks (8 per node). Each node: two Xeon Silver 4114 (40 cores), 46 GB of memory, a Toshiba RD400 NVMe drive, a Seagate ST1000LM049 1 TB HDD, and 40 GbE. Every node is both a server and a client of the filesystem under test.</p>
+<p>IO500 on 4 and 8 nodes of the Ares cluster, 8 MPI ranks per node. Each node: two Xeon Silver 4114 (40 cores), 46 GB of memory, a Toshiba RD400 NVMe drive and 40 GbE. Every node is both a server and a client of the filesystem under test, and both filesystems ran back to back on the same nodes in one allocation (ares-comp-21 to 23 and 25 for 4 nodes; ares-comp-11 to 16, 30 and 31 for 8; the two nodes whose NVMe drives write at a third of the others' speed were left out).</p>
 <ul class="checks">
-  <li><strong>Context FS</strong>: release build of <code>site-technologies</code> (c89f7f10f), 20% DRAM / 80% NVMe per node: a 3 GB DRAM tier, pre-faulted at start (<code>CLIO_PREFAULT=0</code>), over a 12 GB NVMe tier. No replication.</li>
-  <li><strong>OrangeFS 2.10</strong> (f4854f7): every node a metadata and data server, mounted through <code>pvfs2fuse</code>, with all storage on the NVMe drive or all on the HDD. <code>TroveMethod directio</code>, so OrangeFS reaches its device with O_DIRECT, as Context FS's file tier does.</li>
-  <li><strong>IO500</strong> (5c2237d) with a 60 s stonewall and data capped at about 27 GB, 2.3x the aggregate DRAM tier, so most data lands on NVMe. These are not valid IO500 list submissions, which need a 300 s stonewall. One run per system.</li>
+  <li><strong>Context FS</strong>: release build of <code>cte-shm-cache</code> (a6b70f12c), 20% DRAM / 80% NVMe per node: a 3 GB DRAM tier, pre-faulted at start, over a 12 GB NVMe tier, no replication. The shared-memory metadata cache and the write-back cache over the DRAM tier are on, as in the default configuration.</li>
+  <li><strong>OrangeFS 2.10</strong> (f4854f7): every node a metadata and data server, mounted through <code>pvfs2fuse</code>, all storage on the NVMe drive, <code>TroveMethod directio</code>, so OrangeFS reaches its device with O_DIRECT, as Context FS's file tier does.</li>
+  <li><strong>IO500</strong> (5c2237d) with a 60 s stonewall and data capped at about 27 GB, so most data lands on NVMe. These are not valid IO500 list submissions, which need a 300 s stonewall. One run per system and scale.</li>
 </ul>
 <div class="chart-grid">
   <figure><figcaption>IO500 score (higher is better)</figcaption>
 <ul class="bars" aria-label="IO500 score (higher is better)">
-  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:100%"></i></span><span class="val">0.686</span></li>
-  <li><span>OrangeFS, NVMe</span><span class="bar"><i style="width:62%"></i></span><span class="val">0.426</span></li>
-  <li><span>OrangeFS, HDD</span><span class="bar"><i style="width:18%"></i></span><span class="val">0.123</span></li>
+  <li class="ours"><span>Context FS, 4 nodes</span><span class="bar"><i style="width:57%"></i></span><span class="val">1.415</span></li>
+  <li><span>OrangeFS, 4 nodes</span><span class="bar"><i style="width:18%"></i></span><span class="val">0.431</span></li>
+  <li class="ours"><span>Context FS, 8 nodes</span><span class="bar"><i style="width:100%"></i></span><span class="val">2.465</span></li>
+  <li><span>OrangeFS, 8 nodes</span><span class="bar"><i style="width:31%"></i></span><span class="val">0.776</span></li>
 </ul>
   </figure>
   <figure><figcaption>ior-easy write, GiB/s</figcaption>
 <ul class="bars" aria-label="ior-easy write, GiB/s">
-  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:100%"></i></span><span class="val">0.77</span></li>
-  <li><span>OrangeFS, NVMe</span><span class="bar"><i style="width:49%"></i></span><span class="val">0.38</span></li>
-  <li><span>OrangeFS, HDD</span><span class="bar"><i style="width:10%"></i></span><span class="val">0.08</span></li>
+  <li class="ours"><span>Context FS, 4 nodes</span><span class="bar"><i style="width:54%"></i></span><span class="val">0.821</span></li>
+  <li><span>OrangeFS, 4 nodes</span><span class="bar"><i style="width:26%"></i></span><span class="val">0.402</span></li>
+  <li class="ours"><span>Context FS, 8 nodes</span><span class="bar"><i style="width:100%"></i></span><span class="val">1.521</span></li>
+  <li><span>OrangeFS, 8 nodes</span><span class="bar"><i style="width:43%"></i></span><span class="val">0.656</span></li>
 </ul>
   </figure>
   <figure><figcaption>ior-easy read, GiB/s</figcaption>
 <ul class="bars" aria-label="ior-easy read, GiB/s">
-  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:100%"></i></span><span class="val">0.73</span></li>
-  <li><span>OrangeFS, NVMe</span><span class="bar"><i style="width:69%"></i></span><span class="val">0.51</span></li>
-  <li><span>OrangeFS, HDD</span><span class="bar"><i style="width:5%"></i></span><span class="val">0.04</span></li>
+  <li class="ours"><span>Context FS, 4 nodes</span><span class="bar"><i style="width:44%"></i></span><span class="val">0.648</span></li>
+  <li><span>OrangeFS, 4 nodes</span><span class="bar"><i style="width:34%"></i></span><span class="val">0.492</span></li>
+  <li class="ours"><span>Context FS, 8 nodes</span><span class="bar"><i style="width:100%"></i></span><span class="val">1.460</span></li>
+  <li><span>OrangeFS, 8 nodes</span><span class="bar"><i style="width:63%"></i></span><span class="val">0.924</span></li>
 </ul>
   </figure>
   <figure><figcaption>ior-hard read, GiB/s</figcaption>
 <ul class="bars" aria-label="ior-hard read, GiB/s">
-  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:58%"></i></span><span class="val">0.12</span></li>
-  <li><span>OrangeFS, NVMe</span><span class="bar"><i style="width:100%"></i></span><span class="val">0.21</span></li>
-  <li><span>OrangeFS, HDD</span><span class="bar"><i style="width:4%"></i></span><span class="val">0.01</span></li>
+  <li class="ours"><span>Context FS, 4 nodes</span><span class="bar"><i style="width:34%"></i></span><span class="val">0.201</span></li>
+  <li><span>OrangeFS, 4 nodes</span><span class="bar"><i style="width:36%"></i></span><span class="val">0.213</span></li>
+  <li class="ours"><span>Context FS, 8 nodes</span><span class="bar"><i style="width:100%"></i></span><span class="val">0.590</span></li>
+  <li><span>OrangeFS, 8 nodes</span><span class="bar"><i style="width:68%"></i></span><span class="val">0.403</span></li>
 </ul>
   </figure>
-  <figure><figcaption>mdtest-easy stat, ops/s</figcaption>
-<ul class="bars" aria-label="mdtest-easy stat, ops/s">
-  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:100%"></i></span><span class="val">13,923</span></li>
-  <li><span>OrangeFS, NVMe</span><span class="bar"><i style="width:6%"></i></span><span class="val">803</span></li>
-  <li><span>OrangeFS, HDD</span><span class="bar"><i style="width:6%"></i></span><span class="val">805</span></li>
+  <figure><figcaption>mdtest-easy stat, kIOPS</figcaption>
+<ul class="bars" aria-label="mdtest-easy stat, kIOPS">
+  <li class="ours"><span>Context FS, 4 nodes</span><span class="bar"><i style="width:55%"></i></span><span class="val">13.9</span></li>
+  <li><span>OrangeFS, 4 nodes</span><span class="bar"><i style="width:3%"></i></span><span class="val">0.805</span></li>
+  <li class="ours"><span>Context FS, 8 nodes</span><span class="bar"><i style="width:100%"></i></span><span class="val">25.3</span></li>
+  <li><span>OrangeFS, 8 nodes</span><span class="bar"><i style="width:6%"></i></span><span class="val">1.558</span></li>
 </ul>
   </figure>
-  <figure><figcaption>mdtest-easy delete, ops/s</figcaption>
-<ul class="bars" aria-label="mdtest-easy delete, ops/s">
-  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:21%"></i></span><span class="val">143</span></li>
-  <li><span>OrangeFS, NVMe</span><span class="bar"><i style="width:99%"></i></span><span class="val">677</span></li>
-  <li><span>OrangeFS, HDD</span><span class="bar"><i style="width:100%"></i></span><span class="val">682</span></li>
+  <figure><figcaption>mdtest-hard delete, kIOPS</figcaption>
+<ul class="bars" aria-label="mdtest-hard delete, kIOPS">
+  <li class="ours"><span>Context FS, 4 nodes</span><span class="bar"><i style="width:45%"></i></span><span class="val">0.586</span></li>
+  <li><span>OrangeFS, 4 nodes</span><span class="bar"><i style="width:52%"></i></span><span class="val">0.684</span></li>
+  <li class="ours"><span>Context FS, 8 nodes</span><span class="bar"><i style="width:63%"></i></span><span class="val">0.818</span></li>
+  <li><span>OrangeFS, 8 nodes</span><span class="bar"><i style="width:100%"></i></span><span class="val">1.308</span></li>
 </ul>
   </figure>
 </div>
 <p>Every phase (bandwidth in GiB/s, metadata in thousands of operations per second; higher is better):</p>
 <table>
-  <tr><th>Phase</th><th>Context FS</th><th>OrangeFS, NVMe</th><th>OrangeFS, HDD</th></tr>
-  <tr><td>ior-easy write</td><td><strong>0.773</strong></td><td>0.377</td><td>0.076</td></tr>
-  <tr><td>ior-easy read</td><td><strong>0.728</strong></td><td>0.505</td><td>0.037</td></tr>
-  <tr><td>ior-hard write</td><td><strong>0.225</strong></td><td>0.142</td><td>0.018</td></tr>
-  <tr><td>ior-hard read</td><td>0.123</td><td><strong>0.213</strong></td><td>0.008</td></tr>
-  <tr><td>mdtest-easy write</td><td><strong>2.588</strong></td><td>0.699</td><td>0.685</td></tr>
-  <tr><td>mdtest-easy stat</td><td><strong>13.923</strong></td><td>0.803</td><td>0.805</td></tr>
-  <tr><td>mdtest-easy delete</td><td>0.143</td><td>0.677</td><td><strong>0.682</strong></td></tr>
-  <tr><td>mdtest-hard write</td><td><strong>0.741</strong></td><td>0.566</td><td>0.295</td></tr>
-  <tr><td>mdtest-hard stat</td><td><strong>5.678</strong></td><td>0.807</td><td>0.815</td></tr>
-  <tr><td>mdtest-hard read</td><td><strong>3.257</strong></td><td>0.824</td><td>0.493</td></tr>
-  <tr><td>mdtest-hard delete</td><td>0.035</td><td>0.685</td><td><strong>0.687</strong></td></tr>
-  <tr><td>find</td><td><strong>4.042</strong></td><td>0.364</td><td>0.495</td></tr>
-  <tr><td>Bandwidth score, GiB/s</td><td><strong>0.353</strong></td><td>0.276</td><td>0.026</td></tr>
-  <tr><td>Metadata score, kIOPS</td><td><strong>1.333</strong></td><td>0.659</td><td>0.592</td></tr>
-  <tr><td>IO500 score</td><td><strong>0.686</strong></td><td>0.426</td><td>0.123</td></tr>
+  <tr><th>Phase</th><th>Context FS, 4 nodes</th><th>OrangeFS, 4 nodes</th><th>Context FS, 8 nodes</th><th>OrangeFS, 8 nodes</th></tr>
+  <tr><td>ior easy write</td><td><strong>0.821</strong></td><td>0.402</td><td><strong>1.521</strong></td><td>0.656</td></tr>
+  <tr><td>ior easy read</td><td><strong>0.648</strong></td><td>0.492</td><td><strong>1.460</strong></td><td>0.924</td></tr>
+  <tr><td>ior hard write</td><td><strong>0.289</strong></td><td>0.152</td><td><strong>0.351</strong></td><td>0.267</td></tr>
+  <tr><td>ior hard read</td><td>0.201</td><td><strong>0.213</strong></td><td><strong>0.590</strong></td><td>0.403</td></tr>
+  <tr><td>mdtest easy write</td><td><strong>3.247</strong></td><td>0.700</td><td><strong>5.384</strong></td><td>1.369</td></tr>
+  <tr><td>mdtest easy stat</td><td><strong>13.945</strong></td><td>0.805</td><td><strong>25.293</strong></td><td>1.558</td></tr>
+  <tr><td>mdtest easy delete</td><td><strong>2.314</strong></td><td>0.695</td><td><strong>3.674</strong></td><td>1.328</td></tr>
+  <tr><td>mdtest hard write</td><td><strong>0.602</strong></td><td>0.569</td><td>0.968</td><td><strong>1.066</strong></td></tr>
+  <tr><td>mdtest hard stat</td><td><strong>5.945</strong></td><td>0.811</td><td><strong>10.551</strong></td><td>1.569</td></tr>
+  <tr><td>mdtest hard read</td><td><strong>6.034</strong></td><td>0.852</td><td><strong>10.222</strong></td><td>1.598</td></tr>
+  <tr><td>mdtest hard delete</td><td>0.586</td><td><strong>0.684</strong></td><td>0.818</td><td><strong>1.308</strong></td></tr>
+  <tr><td>find</td><td><strong>202.048</strong></td><td>0.335</td><td><strong>205.388</strong></td><td>0.407</td></tr>
+  <tr><td>Bandwidth score, GiB/s</td><td><strong>0.419</strong></td><td>0.283</td><td><strong>0.823</strong></td><td>0.505</td></tr>
+  <tr><td>Metadata score, kIOPS</td><td><strong>4.770</strong></td><td>0.658</td><td><strong>7.378</strong></td><td>1.190</td></tr>
+  <tr><td>IO500 score</td><td><strong>1.415</strong></td><td>0.431</td><td><strong>2.465</strong></td><td>0.776</td></tr>
 </table>
-<p>Context FS scores 1.6x OrangeFS on NVMe and 5.6x OrangeFS on HDD. It leads on writes, file-per-process reads and every create, stat, read and find phase, by 7-17x on stat and 8x on find. It loses two phases. OrangeFS on NVMe reads the single shared ior-hard file faster (0.21 vs 0.12 GiB/s). Deletes are Context FS's weak point: it removes files at 35-143 per second against about 680 for OrangeFS, so each delete phase took about 22 minutes. At OrangeFS's delete rate, Context FS's metadata score would be 2.35 kIOPS instead of 1.33.</p>
+<p>Context FS scores 3.3x OrangeFS on 4 nodes and 3.2x on 8. It leads on every ior write and file-per-process read and on every create, stat, read and find phase except one: by 7-17x on stat and over 500x on find, which Context FS answers from its directory tables. On 4 nodes OrangeFS reads the single shared ior-hard file slightly faster (0.213 vs 0.201 GiB/s); on 8 nodes Context FS leads it (0.590 vs 0.403). mdtest-hard write is 6% ahead on 4 nodes and 9% behind on 8. Deleting the small mdtest-hard files is the remaining weak point: 0.59-0.82 thousand per second against 0.68-1.31 for OrangeFS.</p>
 <p>Two things in this setup cost OrangeFS bandwidth. <code>directio</code> keeps the server page cache from standing in for the device, and <code>pvfs2fuse</code> uses the FUSE 2 API, which splits writes into pieces of at most 128 KiB, so a 2 MiB IOR transfer reaches the device as 16 synchronous writes. OrangeFS through its kernel module, or with its default buffered <code>alt-aio</code> method, would post higher bandwidth. <code>pvfs2fuse</code> also needed a four-line fix: when several nodes create the shared ior-hard file at once, the losers got <code>EEXIST</code> from an <code>open(O_CREAT)</code> without <code>O_EXCL</code>, which aborted IO500 on NVMe every time. The patched client opens the existing file instead, as POSIX requires.</p>
+<h3>Against DAOS on Aurora: IO500 at 32 nodes</h3>
+<p>IO500 on 32 compute nodes of Aurora, 16 MPI ranks per node (512 ranks), against DAOS mounted through <code>dfuse</code>. Both systems store their data in the same DAOS pool and ran on the same allocation type, in alternating jobs.</p>
+<ul class="checks">
+  <li><strong>Context FS</strong>: build of <code>cte-shm-cache</code> (62419d69d). Each node runs a runtime and a FUSE mount, with a 3.1 GB DRAM tier (pre-faulted at start) over a DAOS tier reached natively through libdfs, plus 512 MB of DRAM for metadata. The write-back cache over the DRAM tier and the shared-memory metadata cache are on; nodes talk to each other over Thallium on Slingshot (<code>ofi+cxi</code>).</li>
+  <li><strong>DAOS</strong>: a POSIX container in the same pool, mounted on every node with <code>dfuse</code>.</li>
+  <li><strong>IO500</strong> with work per rank capped: 768 MB for ior-easy, 400 segments for ior-hard, 125 files for each mdtest. The ior-easy data (384 GiB) is about four times the DRAM tier, so most of it is written to DAOS inside the timed phase. With these caps the scores are not valid IO500 list submissions. Three runs per system; every value is the mean, and the three IO500 scores of each system are within 2% of each other.</li>
+</ul>
+<div class="chart-grid">
+  <figure><figcaption>IO500 score (higher is better)</figcaption>
+<ul class="bars" aria-label="IO500 score (higher is better)">
+  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:100%"></i></span><span class="val">39.00</span></li>
+  <li><span>DAOS dfuse</span><span class="bar"><i style="width:55%"></i></span><span class="val">21.48</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>Bandwidth score, GiB/s</figcaption>
+<ul class="bars" aria-label="Bandwidth score, GiB/s">
+  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:57%"></i></span><span class="val">23.86</span></li>
+  <li><span>DAOS dfuse</span><span class="bar"><i style="width:100%"></i></span><span class="val">42.18</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>Metadata score, kIOPS</figcaption>
+<ul class="bars" aria-label="Metadata score, kIOPS">
+  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:100%"></i></span><span class="val">63.80</span></li>
+  <li><span>DAOS dfuse</span><span class="bar"><i style="width:17%"></i></span><span class="val">10.94</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>ior-easy write, GiB/s</figcaption>
+<ul class="bars" aria-label="ior-easy write, GiB/s">
+  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:23%"></i></span><span class="val">53.2</span></li>
+  <li><span>DAOS dfuse</span><span class="bar"><i style="width:100%"></i></span><span class="val">234.0</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>ior-easy read, GiB/s</figcaption>
+<ul class="bars" aria-label="ior-easy read, GiB/s">
+  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:100%"></i></span><span class="val">228.4</span></li>
+  <li><span>DAOS dfuse</span><span class="bar"><i style="width:99%"></i></span><span class="val">225.6</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>mdtest-easy stat, kIOPS</figcaption>
+<ul class="bars" aria-label="mdtest-easy stat, kIOPS">
+  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:100%"></i></span><span class="val">553.0</span></li>
+  <li><span>DAOS dfuse</span><span class="bar"><i style="width:8%"></i></span><span class="val">46.9</span></li>
+</ul>
+  </figure>
+</div>
+<p>Every phase (bandwidth in GiB/s, metadata in thousands of operations per second; higher is better; mean of three runs):</p>
+<table>
+  <tr><th>Phase</th><th>Context FS</th><th>DAOS dfuse</th><th>Context FS / DAOS</th></tr>
+  <tr><td>ior easy write</td><td>53.24</td><td><strong>234.03</strong></td><td>0.23x</td></tr>
+  <tr><td>ior easy read</td><td><strong>228.41</strong></td><td>225.60</td><td>1.01x</td></tr>
+  <tr><td>ior hard write</td><td><strong>1.94</strong></td><td>1.73</td><td>1.12x</td></tr>
+  <tr><td>ior hard read</td><td>13.75</td><td><strong>34.66</strong></td><td>0.40x</td></tr>
+  <tr><td>mdtest easy write</td><td>82.89</td><td><strong>134.16</strong></td><td>0.62x</td></tr>
+  <tr><td>mdtest easy stat</td><td><strong>553.00</strong></td><td>46.89</td><td>11.79x</td></tr>
+  <tr><td>mdtest easy delete</td><td><strong>25.85</strong></td><td>0.54</td><td>47.72x</td></tr>
+  <tr><td>mdtest hard write</td><td>9.85</td><td><strong>14.25</strong></td><td>0.69x</td></tr>
+  <tr><td>mdtest hard stat</td><td><strong>148.22</strong></td><td>46.77</td><td>3.17x</td></tr>
+  <tr><td>mdtest hard read</td><td><strong>88.92</strong></td><td>45.47</td><td>1.96x</td></tr>
+  <tr><td>mdtest hard delete</td><td><strong>7.10</strong></td><td>0.48</td><td>14.84x</td></tr>
+  <tr><td>find</td><td><strong>265.53</strong></td><td>4.15</td><td>63.96x</td></tr>
+  <tr><td>Bandwidth score, GiB/s</td><td>23.86</td><td><strong>42.18</strong></td><td>0.57x</td></tr>
+  <tr><td>Metadata score, kIOPS</td><td><strong>63.80</strong></td><td>10.94</td><td>5.83x</td></tr>
+  <tr><td>IO500 score</td><td><strong>39.00</strong></td><td>21.48</td><td>1.82x</td></tr>
+</table>
+<p>Context FS scores 1.82x DAOS dfuse overall (38.69-39.28 against 21.02-21.78 across the runs). The lead comes from metadata: stat, read, delete and find are 2-64x faster, and the metadata score is 5.8x. Two of those ratios are less settled than the rest, because Context FS varied between runs on mdtest-easy stat (383-780 thousand per second) and find (217-325); it led by a wide margin in every run.</p>
+<p>DAOS dfuse leads on bandwidth, 42.18 against 23.86 GiB/s. It writes the file-per-process ior-easy data 4.4x faster and reads the shared ior-hard file 2.5x faster; Context FS matches it on ior-easy read and is 12% ahead on ior-hard write. dfuse also creates files faster (mdtest easy and hard write, 0.62x and 0.69x). Context FS acknowledges a write once it is in the DRAM tier and makes it durable at <code>fsync</code>; each IOR write phase ends with an <code>fsync</code>, so the data is on DAOS when the phase's clock stops.</p>
+<h3>Against DAOS and Flare on Aurora: IOR bandwidth at 128 nodes</h3>
+<p>IOR on 128 compute nodes of Aurora, 16 ranks per node (2,048 ranks), in four access patterns. Every phase uses direct I/O (<code>--posix.odirect</code>), so the kernel page cache serves nothing and each system is measured on its own data path.</p>
+<ul class="checks">
+  <li><strong>Context FS</strong>: build of <code>clio-cache-cow-cost-models</code> (PR #1376, 33fedf5de). The shared-memory cache holds file data over write-through, with a DRAM tier twice the size of the data over a DAOS tier reached natively through libdfs. <code>CLIO_FUSE_ODIRECT=1</code> makes the FUSE mount honor <code>O_DIRECT</code>.</li>
+  <li><strong>DAOS</strong>: a POSIX container in the same pool, mounted with <code>dfuse</code>.</li>
+  <li><strong>Context FS and DAOS</strong> each write a 256 GiB footprint once (with <code>fsync</code>), then read it for 60 seconds; each rank reads another node's data. The write phases last 1-33 seconds, so they include fixed start-up and <code>fsync</code> costs.</li>
+  <li><strong>Flare</strong> (Lustre) ran in a separate job with a 96 GiB footprint, rewritten and then read for 60 seconds each, because of the project's storage quota. Its numbers are a rough comparison, not a matched one.</li>
+</ul>
+<div class="chart-grid">
+  <figure><figcaption>Read, file per process 2 MiB, GiB/s</figcaption>
+<ul class="bars" aria-label="Read, file per process 2 MiB, GiB/s">
+  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:100%"></i></span><span class="val">2,484.2</span></li>
+  <li><span>DAOS dfuse</span><span class="bar"><i style="width:25%"></i></span><span class="val">619.0</span></li>
+  <li><span>Flare (Lustre)</span><span class="bar"><i style="width:29%"></i></span><span class="val">731.1</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>Read, shared file 16 MiB, GiB/s</figcaption>
+<ul class="bars" aria-label="Read, shared file 16 MiB, GiB/s">
+  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:100%"></i></span><span class="val">2,043.6</span></li>
+  <li><span>DAOS dfuse</span><span class="bar"><i style="width:25%"></i></span><span class="val">520.0</span></li>
+  <li><span>Flare (Lustre)</span><span class="bar"><i style="width:1%"></i></span><span class="val">6.2</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>Write, file per process 2 MiB, GiB/s</figcaption>
+<ul class="bars" aria-label="Write, file per process 2 MiB, GiB/s">
+  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:24%"></i></span><span class="val">64.1</span></li>
+  <li><span>DAOS dfuse</span><span class="bar"><i style="width:91%"></i></span><span class="val">237.3</span></li>
+  <li><span>Flare (Lustre)</span><span class="bar"><i style="width:100%"></i></span><span class="val">262.1</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>Write, shared file 64 KiB, GiB/s</figcaption>
+<ul class="bars" aria-label="Write, shared file 64 KiB, GiB/s">
+  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:100%"></i></span><span class="val">12.1</span></li>
+  <li><span>DAOS dfuse</span><span class="bar"><i style="width:65%"></i></span><span class="val">7.9</span></li>
+  <li><span>Flare (Lustre)</span><span class="bar"><i style="width:1%"></i></span><span class="val">0.04</span></li>
+</ul>
+  </figure>
+</div>
+<p>Every pattern (GiB/s, higher is better; one run each):</p>
+<table>
+  <tr><th>Pattern</th><th>Context FS write</th><th>DAOS write</th><th>Flare write</th><th>Context FS read</th><th>DAOS read</th><th>Flare read</th></tr>
+  <tr><td>File per process, 2 MiB</td><td>64.1</td><td>237.3</td><td><strong>262.1</strong></td><td><strong>2,484.2</strong></td><td>619.0</td><td>731.1</td></tr>
+  <tr><td>File per process, 64 KiB</td><td>44.2</td><td><strong>106.0</strong></td><td>33.3</td><td><strong>1,673.8</strong></td><td>390.7</td><td>122.5</td></tr>
+  <tr><td>Shared file, 16 MiB</td><td><strong>96.0</strong></td><td>86.3</td><td>3.8</td><td><strong>2,043.6</strong></td><td>520.0</td><td>6.2</td></tr>
+  <tr><td>Shared file, 64 KiB</td><td><strong>12.1</strong></td><td>7.9</td><td>0.04</td><td><strong>1,844.2</strong></td><td>376.6</td><td>—</td></tr>
+</table>
+<p>Context FS reads 3.9-4.9x faster than DAOS in every pattern. The data fits in its DRAM tier, so each rank's reads come from another node's memory, about 19 GiB/s per node; DAOS reads from its storage servers. On the shared file Context FS also reads about 300x faster than Flare (16 MiB transfers). Flare's 64 KiB shared-file read failed on one rank.</p>
+<p>On writes DAOS leads with one file per process (3.7x on 2 MiB transfers, 2.4x on 64 KiB), and Context FS leads on the shared file (1.1x on 16 MiB, 1.5x on 64 KiB). Flare writes one file per process at 262 GiB/s, but a shared file at 3.8 and 0.04 GiB/s.</p>
+<p>With a 1 TB footprint, Context FS wrote one file per process (2 MiB) at 145.5 GiB/s and read it at 2,456.7 GiB/s. The next pattern in that job reused the same DAOS space and ran the pool out of space: DAOS keeps every overwritten version until it reclaims it, and the Context FS DAOS tier overwrites its blocks in place. That interaction is an open issue, so the 1 TB set is incomplete.</p>
+<h3>IOR easy and hard at 256 and 512 nodes</h3>
+<p>The ior-easy and ior-hard write phases of IO500 on 256 and 512 Aurora nodes (16 ranks per node), with work per rank capped so each run writes under 1 TB. ior-easy writes one file per rank in 2 MiB transfers; ior-hard writes 47,008-byte pieces interleaved into one shared file. GiB/s, higher is better; one run each.</p>
+<table>
+  <tr><th>Phase</th><th>Context FS, 256</th><th>DAOS, 256</th><th>Context FS, 512</th><th>DAOS, 512</th><th>Flare, 512</th></tr>
+  <tr><td>ior easy write</td><td>94.9</td><td><strong>344.9</strong></td><td>50.8</td><td><strong>313.5</strong></td><td>203.1</td></tr>
+  <tr><td>ior hard write</td><td>did not finish</td><td><strong>15.7</strong></td><td>did not finish</td><td><strong>5.8</strong></td><td>0.07</td></tr>
+</table>
+<p>DAOS writes one file per rank 3.6x faster than Context FS at 256 nodes and 6.2x at 512. Flare's run used a smaller footprint (about 400 GB against about 850 GB) because of its storage quota.</p>
+<p>Context FS's ior-hard deadlocked at 256 nodes: a write held a page lock while waiting for the flusher to release that page, and the flusher was waiting on an invalidation that needed the same lock. The fix (a pinned page refuses the write, which retries without the lock) is in PR #1376, and with it ior-hard completes on 8 nodes. The 512-node run with the fix did not finish ior-hard within the job's hour; whether it was slow or blocked is not yet known.</p>
+<h3>Scientific workflows on Aurora: WfCommons at 256 nodes</h3>
+<p>Three I/O-heavy workflows from <a href="https://wfcommons.org">WfCommons</a>, generated with WfBench from the recipes of real runs and executed by Parsl on 256 Aurora nodes (16 workers per node, 4,096 task slots). Every task does a token amount of CPU work, so the run time is the workflow's I/O and its dependencies. Each task checks the size of every file it reads and writes; all tasks completed on all three systems, with no short or stale files.</p>
+<table>
+  <tr><th>Workflow</th><th>Tasks</th><th>Files</th><th>Read by tasks</th><th>Written by tasks</th></tr>
+  <tr><td>Montage (astronomy mosaics)</td><td>15,986</td><td>31,930</td><td>1,544 GB</td><td>121 GB</td></tr>
+  <tr><td>Epigenomics (genome sequencing)</td><td>7,997</td><td>21,964</td><td>181 GB</td><td>41 GB</td></tr>
+  <tr><td>SRASearch (sequence search, file sizes scaled to one tenth)</td><td>3,997</td><td>6,064</td><td>194 GB</td><td>194 GB</td></tr>
+</table>
+<p>Context FS ran this module composition on every node, with the write-through cache:</p>
+<ul class="checks">
+  <li><strong>Filesystem</strong> (<code>clio_cte_filesystem</code>, pool 560): the FUSE mount's directories, inodes and file pages, writing through the shared-memory cache.</li>
+  <li><strong>Shared-memory cache</strong> (<code>core_shm_cache_writethru</code>, pool 568): a 32 GB segment holding file data, which every process on the node reads and writes directly; it flushes to the policy cache below, eight batches in flight.</li>
+  <li><strong>Write-through policy cache</strong> (<code>core_persist_write_thru</code>, pool 567): every write goes to both cores below before it completes.</li>
+  <li><strong>Volatile core</strong> (<code>clio_cte_core</code>, pool 540): DRAM, 512 MB reserved for filesystem metadata plus a data tier sized at eight times the node's share of the workflow.</li>
+  <li><strong>Persistent core</strong> (<code>clio_cte_core</code>, pool 512): a DAOS tier of the same size per node, reached natively through libdfs in the same pool DAOS dfuse used.</li>
+  <li><strong>Stream</strong> (<code>clio_cte_stream</code>, pool 565) for appends; nodes talk over Thallium on Slingshot (<code>ofi+cxi</code>).</li>
+</ul>
+<p>DAOS mounted a POSIX container of the same pool with <code>dfuse</code>, and Flare ran on Lustre directly. The build is the one merged in PR #1376 (2999d5b0e).</p>
+<div class="chart-grid">
+  <figure><figcaption>Montage, seconds (lower is better)</figcaption>
+<ul class="bars" aria-label="Montage, seconds (lower is better)">
+  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:52%"></i></span><span class="val">62.5</span></li>
+  <li><span>DAOS dfuse</span><span class="bar"><i style="width:60%"></i></span><span class="val">72.5</span></li>
+  <li><span>Flare (Lustre)</span><span class="bar"><i style="width:100%"></i></span><span class="val">119.9</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>Epigenomics, seconds (lower is better)</figcaption>
+<ul class="bars" aria-label="Epigenomics, seconds (lower is better)">
+  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:32%"></i></span><span class="val">29.6</span></li>
+  <li><span>DAOS dfuse</span><span class="bar"><i style="width:34%"></i></span><span class="val">31.1</span></li>
+  <li><span>Flare (Lustre)</span><span class="bar"><i style="width:100%"></i></span><span class="val">91.9</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>SRASearch, seconds (lower is better)</figcaption>
+<ul class="bars" aria-label="SRASearch, seconds (lower is better)">
+  <li class="ours"><span>Context FS</span><span class="bar"><i style="width:5%"></i></span><span class="val">10.2</span></li>
+  <li><span>DAOS dfuse</span><span class="bar"><i style="width:5%"></i></span><span class="val">9.7</span></li>
+  <li><span>Flare (Lustre)</span><span class="bar"><i style="width:100%"></i></span><span class="val">186.4</span></li>
+</ul>
+  </figure>
+</div>
+<p>Time from the first task submitted to the last task done, in seconds; lower is better; one run each:</p>
+<table>
+  <tr><th>Workflow</th><th>Context FS</th><th>DAOS dfuse</th><th>Flare</th><th>Slowest 1% of tasks (Context FS / DAOS / Flare)</th></tr>
+  <tr><td>Montage</td><td><strong>62.5</strong></td><td>72.5</td><td>119.9</td><td>1.18 / 1.17 / 12.07 s</td></tr>
+  <tr><td>Epigenomics</td><td><strong>29.6</strong></td><td>31.1</td><td>91.9</td><td>0.91 / 0.98 / 57.71 s</td></tr>
+  <tr><td>SRASearch</td><td>10.2</td><td><strong>9.7</strong></td><td>186.4</td><td>— / 1.25 / 67 s</td></tr>
+</table>
+<p>Context FS finishes Montage 14% faster than DAOS and Epigenomics 5% faster, and SRASearch 5% slower. Against Flare it is 1.9x, 3.1x and 18x faster: Flare's slowest tasks take 12-67 seconds where the other two take about one, and that tail sets its run times. Each task also carries about 0.45 seconds of Parsl overhead, the same on all three systems.</p>
+<p>Removing each workflow's files afterwards took Context FS 96 and 26 seconds for Montage and SRASearch, against 460 and 99 for DAOS and 102 and 18 for Flare. WfBench never calls <code>fsync</code>, so on every system a file is complete when its task's process closes it.</p>
 <h3>Checkpointing a simulation through the tiers</h3>
 <p>From the Eternia paper's evaluation: Gray-Scott on 2 Aurora nodes, 8 steps, a checkpoint every 2 steps. Each checkpoint is a copy-on-write snapshot that CLIO Core drains down the tier stack in the background, in a layout the HDF5 VOL can read. It is compared with a conventional synchronous checkpoint, in which the simulation waits until the snapshot reaches persistent storage; in the Lustre-heavy composition that is a simulation writing its checkpoint to the parallel file system. Total runtime in seconds, lower is better.</p>
 <div class="chart-grid">

@@ -60,9 +60,10 @@ def parallel(fn, items):
 class AgentConn:
   """A JSON-lines connection to agent.py running on one node."""
 
-  def __init__(self, host, agent_py, env_prefix=''):
+  def __init__(self, host, agent_py, env_prefix='',
+               python='/usr/bin/python3'):
     self.host = host
-    cmd = f'{env_prefix} exec /usr/bin/python3 -u {agent_py}'
+    cmd = f'{env_prefix} exec {python} -u {agent_py}'
     self.p = subprocess.Popen(SSH + [host, cmd], stdin=subprocess.PIPE,
                               stdout=subprocess.PIPE,
                               stderr=subprocess.DEVNULL)
@@ -137,8 +138,11 @@ class Cluster:
                extra_env=None, replicate_period_ms=0, fsync_mode=None,
                ram_mb=512, fast_mb=2048, organizer='frecency',
                organizer_period_ms=2000, neighborhood=1, ssd_mb=4096,
-               ssd_root=None, hdd_root=None):
+               ssd_root=None, hdd_root=None, cache='write_back'):
     self.hosts = list(hosts)
+    # Policy cache over the volatile and persistent cores: 'write_back'
+    # (default, as in clio_default.yaml) or 'write_thru'.
+    self.cache = cache
     self.bin_dir = bin_dir
     self.run_dir = run_dir            # shared (NFS): configs, logs, results
     self.profile = profile
@@ -176,6 +180,10 @@ class Cluster:
     self.ssd_root = ssd_root or f'/mnt/ssd/{user}/clio_fs_suite'
     self.hdd_root = hdd_root or f'/mnt/hdd/{user}/clio_fs_suite'
     self.agents = {}
+    # Interpreter the per-node agent runs under. agent.py needs Python 3.7+;
+    # where the system python3 is older (3.6 on Aurora's compute image) point
+    # CLIO_SUITE_PYTHON at a newer one that every node can reach.
+    self.python = os.environ.get('CLIO_SUITE_PYTHON', '/usr/bin/python3')
     self.agent_py = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                  'agent.py')
     os.makedirs(run_dir, exist_ok=True)
@@ -196,11 +204,18 @@ class Cluster:
         'PATH': f'{self.bin_dir}:/usr/bin:/bin:/usr/sbin:/sbin',
         # The login shell's LD_LIBRARY_PATH (e.g. another build's bin dir)
         # would override the binaries' RUNPATH and load mismatched libs.
-        'LD_LIBRARY_PATH': self.bin_dir,
+        # CLIO_SUITE_LD_LIBRARY_PATH appends directories the binaries need
+        # and carry no RUNPATH for (e.g. the compiler's runtime libraries on
+        # a system where they come from a module, not /usr/lib).
+        'LD_LIBRARY_PATH': ':'.join(filter(None, [
+            self.bin_dir, os.environ.get('CLIO_SUITE_LD_LIBRARY_PATH')])),
     }
     # Failure detection: the runtime defaults (30 s silence + 30 s retry per
     # send) ride out restarts but stall every op on a dead node for 30 s;
     # a filesystem deployment wants a prompt EIO. Overridable per run.
+    for k in ('CLIO_WTC_TRACE', 'CLIO_CTE_TRACE_PUT'):  # tracing (debug)
+      if os.environ.get(k):
+        e[k] = os.environ[k]
     e['CLIO_PROBE_SILENCE_S'] = str(getattr(self, 'probe_silence_s', 0) or
                                     os.environ.get(
                                         'CLIO_SUITE_PROBE_SILENCE_S', '10'))
@@ -215,6 +230,13 @@ class Cluster:
     for k, v in os.environ.items():
       if k.startswith('CLIO_SUITE_PASS_'):
         e[k[len('CLIO_SUITE_PASS_'):]] = v
+    # Write-back is eventually consistent: data a node wrote is visible on
+    # the others once flushed, and fsync is how a workload asks for that.
+    # The agents then behave like such a workload: every file they wrote is
+    # fsynced before it is closed. Write-through needs no fsync (its writes
+    # are visible at once), so those runs keep checking that.
+    if self.cache == 'write_back':
+      e['CLIO_SUITE_FSYNC_ON_CLOSE'] = '1'
     e.update(self.extra_env)
     return e
 
@@ -336,9 +358,10 @@ class Cluster:
     # SAFE_MEMBERS file bdevs (SAFE_PARITY of them parity) on each node.
     tiered = self.profile in ('tiered', 'safe', 'ares_tiers')
     ram_cap = f'{self.ram_mb}MB' if tiered else f'{self.ram_gb}GB'
-    storage = []
+    storage = []       # persistent core devices
+    ram_storage = []   # volatile core devices
     if tiered or self.ram_gb > 0:  # ram_gb 0: disk tier only (#1116)
-      storage.append(
+      ram_storage.append(
           f'      - path: "ram::clio_fs_ram"\n'
           f'        bdev_type: "ram"\n'
           f'        capacity_limit: "{ram_cap}"\n'
@@ -394,13 +417,16 @@ class Cluster:
       # the file sizes / pending appends of the streams it homes.
       fs_extra = f'    metadata_log_path: "{lr}/data/cfs_namespace_log"\n'
       stream_extra = f'    log_path: "{lr}/data/cte_stream_log"\n'
+    # Write-back only: the cache (not the core) flushes dirty RAM copies to
+    # disk every flush_period_ms; write-through ignores it.
+    flush_period_ms = 10000
     if self.profile == 'persistent_norepl':
       # Nothing but fsync may move bytes off the RAM tier: no replica on the
       # disk tier, and the periodic volatile->disk flush pushed out an hour.
-      perf += '      flush_data_period_ms: 3600000\n'
+      flush_period_ms = 3600000
     organizer = ''
     if tiered:
-      perf += '      flush_data_period_ms: 2000\n'
+      flush_period_ms = 2000
       organizer = (f'    organizer: "{self.organizer}"\n'
                    f'    organizer_period_ms: {self.organizer_period_ms}\n')
     if self.profile in ('persistent', 'tiered', 'safe', 'ares_tiers'):
@@ -422,6 +448,85 @@ class Cluster:
                '    remote_copies: 1\n'
                f'    handoff_log_path: "{lr}/data/cte_handoff_log"\n')
       fs_next = '561.0'
+    targets = (f'    targets:\n'
+               f'      neighborhood: {self.neighborhood}\n'
+               f'      default_target_timeout_ms: 30000\n'
+               f'      poll_period_ms: 5000\n'
+               f'      failover_to_successor: true\n')
+    # Each core states its role with `durability`. With a persistent
+    # tier: a persistent core (512.0) and a volatile RAM core (540.0) behind
+    # a policy cache (567.0; write-back by default, which owns flushing;
+    # --cache write_thru for the write-through module). RAM only: one volatile
+    # core under the node-local cache, as before.
+    if storage:
+      cores = ('  - mod_name: clio_cte_core\n'
+               '    pool_name: cte_main\n'
+               '    pool_query: local\n'
+               '    pool_id: "512.0"\n'
+               '    durability: persistent\n'
+               '    storage:\n'
+               f"{''.join(storage)}{perf}{organizer}"
+               '    dpe:\n'
+               '      dpe_type: "max_bw"\n'
+               f'{targets}')
+      if ram_storage:
+        cores += ('  - mod_name: clio_cte_core\n'
+                  '    pool_name: cte_volatile\n'
+                  '    pool_query: local\n'
+                  '    pool_id: "540.0"\n'
+                  '    durability: volatile\n'
+                  '    storage:\n'
+                  f"{''.join(ram_storage)}"
+                  '    dpe:\n'
+                  '      dpe_type: "max_bw"\n'
+                  '    targets:\n'
+                  '      neighborhood: 1\n')
+        cache_mod = f'clio_cte_core_persist_{self.cache}'
+        top = (f'  - mod_name: {cache_mod}\n'
+               f'    pool_name: {cache_mod}\n'
+               '    pool_query: local\n'
+               '    pool_id: "567.0"\n'
+               '    next_volatile: "540.0"\n'
+               f'    next_persistent: "{fs_next}"\n'
+               f'    flush_period_ms: {flush_period_ms}\n')
+        top_id = '567.0'
+      else:
+        top, top_id = '', fs_next
+    else:
+      cores = ('  - mod_name: clio_cte_core\n'
+               '    pool_name: cte_main\n'
+               '    pool_query: local\n'
+               '    pool_id: "512.0"\n'
+               '    durability: volatile\n'
+               '    storage:\n'
+               f"{''.join(ram_storage)}{organizer}"
+               '    dpe:\n'
+               '      dpe_type: "max_bw"\n'
+               f'{targets}')
+      top = ('  - mod_name: clio_cte_cache\n'
+             '    pool_name: clio_cte_cache\n'
+             '    pool_query: local\n'
+             '    pool_id: "563.0"\n'
+             f'    next_pool_id: "{fs_next}"\n'
+             '    min_score: 0.5\n')
+      top_id = '563.0'
+    # The shm cache (pool 568.0) sits on the chain top, below whatever
+    # composes above it (clio-fs, stream), as in clio_default.yaml: every
+    # clio-fs tag and blob operation passes through it. md_only: the cache
+    # below (563 or the write-back cache) already holds the bytes, so it
+    # caches tag and blob metadata only. CLIO_FS_SUITE_SHM_CACHE=0 leaves it
+    # out (the chain then ends at top_id as before).
+    if os.environ.get('CLIO_FS_SUITE_SHM_CACHE', '1') != '0':
+      shm_cache = ('  - mod_name: clio_cte_core_shm_cache_writethru\n'
+                   '    pool_name: clio_cte_core_shm_cache_writethru\n'
+                   '    pool_query: local\n'
+                   '    pool_id: "568.0"\n'
+                   f'    next_pool_id: "{top_id}"\n'
+                   '    md_only: true\n'
+                   '    capacity: "256M"\n')
+      top_id = '568.0'
+    else:
+      shm_cache = ''
     cfg = f"""# Generated by clio_fs_suite/cluster.py -- profile {self.profile}
 memory:
   main_segment_size: auto
@@ -436,35 +541,18 @@ runtime:
   queue_depth: 1024
   conf_dir: {lr}/conf
 compose:
-{self.safe_compose()}  - mod_name: clio_cte_core
-    pool_name: cte_main
-    pool_query: local
-    pool_id: "512.0"
-    storage:
-{''.join(storage)}{perf}{organizer}    dpe:
-      dpe_type: "max_bw"
-    targets:
-      neighborhood: {self.neighborhood}
-      default_target_timeout_ms: 30000
-      poll_period_ms: 5000
-      failover_to_successor: true
-{chain}  - mod_name: clio_cte_cache
-    pool_name: clio_cte_cache
-    pool_query: local
-    pool_id: "563.0"
-    next_pool_id: "{fs_next}"
-    min_score: 0.5
-  - mod_name: clio_cte_stream
+{self.safe_compose()}{cores}{chain}{top}{shm_cache}  - mod_name: clio_cte_stream
     pool_name: clio_cte_stream
     pool_query: local
     pool_id: "565.0"
-    next_pool_id: "563.0"
+    next_pool_id: "{top_id}"
     staging_pool_id: "{fs_next}"
 {stream_extra}  - mod_name: clio_cte_filesystem
     pool_name: clio_cte_filesystem
     pool_query: local
     pool_id: "560.0"
-    next_pool_id: "563.0"
+    next_pool_id: "{top_id}"
+    stream_pool_id: "565.0"
 {fs_extra}"""
     with open(self.conf, 'w') as f:
       f.write(cfg)
@@ -654,7 +742,7 @@ compose:
     if a is None or a.dead:
       if a is not None:
         a.close()
-      a = AgentConn(host, self.agent_py, self.env_prefix())
+      a = AgentConn(host, self.agent_py, self.env_prefix(), self.python)
       self.agents[host] = a
     return a
 
@@ -702,8 +790,10 @@ compose:
       rc, out = sh(h, f'df -Pm {paths} | tail -n +2', timeout=30)
       if rc != 0:
         return f'df failed: {out[-200:]}'
+      # A df data row: six fields with a numeric "available" column. The
+      # device name is not a path on tmpfs or a network filesystem.
       lines = [ln for ln in out.strip().splitlines()
-               if ln.split() and ln.split()[0].startswith('/')]
+               if len(ln.split()) >= 6 and ln.split()[3].isdigit()]
       if len(lines) != len(need):
         return f'unexpected df output: {out.strip()[-300:]}'
       have = {}

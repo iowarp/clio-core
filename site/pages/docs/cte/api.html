@@ -9,8 +9,8 @@ facts: Namespace | clio::cte::core ; Header | clio_cte/core/core_client.h ; Pyth
 <h2 id="init">Initialization</h2>
 <pre data-label="cpp">
 bool clio::run::CLIO_INIT(clio::run::RuntimeMode mode, bool default_with_runtime = false, bool is_restart = false);
-bool clio::cte::core::CLIO_CTE_CLIENT_INIT(const std::string &amp;config_path = "",
-                                          const PoolQuery &amp;pool_query = PoolQuery::Dynamic());
+bool clio::cte::core::CLIO_CTE_CLIENT_INIT(const std::string &config_path = "",
+                                          const PoolQuery &pool_query = PoolQuery::Dynamic());
 #define CLIO_CTE_CLIENT  /* clio::cte::core::Client * bound by CLIO_CTE_CLIENT_INIT */
 </pre>
 <ul>
@@ -24,27 +24,27 @@ bool clio::cte::core::CLIO_CTE_CLIENT_INIT(const std::string &amp;config_path = 
 <pre data-label="cpp">
 class Tag {
  public:
-  explicit Tag(const std::string &amp;tag_name);   // GetOrCreateTag
-  explicit Tag(const TagId &amp;tag_id);           // wrap an existing id, no RPC
+  explicit Tag(const std::string &tag_name);   // GetOrCreateTag
+  explicit Tag(const TagId &tag_id);           // wrap an existing id, no RPC
 
-  void PutBlob(const std::string &amp;blob_name, const char *data, size_t data_size,
-               size_t off = 0, float score = 1.0f, const Context &amp;context = Context());
-  void PutBlob(const std::string &amp;blob_name, const ctp::ipc::ShmPtr&lt;&gt; &amp;data, size_t data_size,
-               size_t off = 0, float score = -1.0f, const Context &amp;context = Context());
-  Future&lt;PutBlobTask&gt; AsyncPutBlob(const std::string &amp;blob_name, const char *data, size_t data_size,
-               size_t off = 0, float score = -1.0f, const Context &amp;context = Context());
-  Future&lt;PutBlobTask&gt; AsyncPutBlob(const std::string &amp;blob_name, const ctp::ipc::ShmPtr&lt;&gt; &amp;data,
-               size_t data_size, size_t off = 0, float score = -1.0f, const Context &amp;context = Context());
+  void PutBlob(const std::string &blob_name, const char *data, size_t data_size,
+               size_t off = 0, float score = 1.0f, const Context &context = Context());
+  void PutBlob(const std::string &blob_name, const ctp::ipc::ShmPtr<> &data, size_t data_size,
+               size_t off = 0, float score = -1.0f, const Context &context = Context());
+  Future<PutBlobTask> AsyncPutBlob(const std::string &blob_name, const char *data, size_t data_size,
+               size_t off = 0, float score = -1.0f, const Context &context = Context());
+  Future<PutBlobTask> AsyncPutBlob(const std::string &blob_name, const ctp::ipc::ShmPtr<> &data,
+               size_t data_size, size_t off = 0, float score = -1.0f, const Context &context = Context());
 
-  void GetBlob(const std::string &amp;blob_name, char *data, size_t data_size, size_t off = 0);
-  void GetBlob(const std::string &amp;blob_name, ctp::ipc::ShmPtr&lt;&gt; data, size_t data_size, size_t off = 0);
-  Future&lt;GetBlobTask&gt; AsyncGetBlob(const std::string &amp;blob_name, char *data, size_t data_size, size_t off = 0);
+  void GetBlob(const std::string &blob_name, char *data, size_t data_size, size_t off = 0);
+  void GetBlob(const std::string &blob_name, ctp::ipc::ShmPtr<> data, size_t data_size, size_t off = 0);
+  Future<GetBlobTask> AsyncGetBlob(const std::string &blob_name, char *data, size_t data_size, size_t off = 0);
 
-  float GetBlobScore(const std::string &amp;blob_name);
-  u64 GetBlobSize(const std::string &amp;blob_name);
-  std::vector&lt;std::string&gt; GetContainedBlobs();
-  void ReorganizeBlob(const std::string &amp;blob_name, float new_score);
-  const TagId &amp;GetTagId() const;
+  float GetBlobScore(const std::string &blob_name);
+  u64 GetBlobSize(const std::string &blob_name);
+  std::vector<std::string> GetContainedBlobs();
+  void ReorganizeBlob(const std::string &blob_name, float new_score);
+  const TagId &GetTagId() const;
 };
 </pre>
 <ul>
@@ -56,74 +56,74 @@ class Tag {
 <p>Every verb is asynchronous. Results live on the task after <code>Wait()</code>: <code>return_code_</code> or <code>GetReturnCode()</code> is 0 on success; <code>tag_id_</code> for GetOrCreateTag; <code>size_</code> for GetBlobSize; <code>results_</code> for TagQuery, SemanticSearch and TemporalSearch; parallel <code>tag_names_</code> and <code>blob_names_</code> for BlobQuery; <code>blob_names_</code> for GetContainedBlobs; <code>entries_</code> for PollTelemetryLog; <code>target_names_</code> for ListTargets.</p>
 <h3>Tags</h3>
 <pre data-label="cpp">
-Future&lt;GetOrCreateTagTask&lt;CreateParams&gt;&gt; AsyncGetOrCreateTag(const std::string &amp;tag_name,
-    const TagId &amp;tag_id = TagId::GetNull(), const PoolQuery &amp;pool_query = PoolQuery::Dynamic());
-Future&lt;GetOrCreateTagTask&lt;CreateParams&gt;&gt; AsyncGetOrCreateTag(const std::string &amp;tag_name,
-    const clio::run::PoolId &amp;fault_pool_id, const std::string &amp;fault_pool_name, const std::string &amp;fault_params,
-    const TagId &amp;tag_id = TagId::GetNull(), const PoolQuery &amp;pool_query = PoolQuery::Dynamic());
-Future&lt;DelTagTask&gt;    AsyncDelTag(const TagId &amp;tag_id, const PoolQuery &amp;pool_query = PoolQuery::Dynamic());
-Future&lt;DelTagTask&gt;    AsyncDelTag(const std::string &amp;tag_name, const PoolQuery &amp;pool_query = PoolQuery::Dynamic(),
+Future<GetOrCreateTagTask<CreateParams>> AsyncGetOrCreateTag(const std::string &tag_name,
+    const TagId &tag_id = TagId::GetNull(), const PoolQuery &pool_query = PoolQuery::Dynamic());
+Future<GetOrCreateTagTask<CreateParams>> AsyncGetOrCreateTag(const std::string &tag_name,
+    const clio::run::PoolId &fault_pool_id, const std::string &fault_pool_name, const std::string &fault_params,
+    const TagId &tag_id = TagId::GetNull(), const PoolQuery &pool_query = PoolQuery::Dynamic());
+Future<DelTagTask>    AsyncDelTag(const TagId &tag_id, const PoolQuery &pool_query = PoolQuery::Dynamic());
+Future<DelTagTask>    AsyncDelTag(const std::string &tag_name, const PoolQuery &pool_query = PoolQuery::Dynamic(),
     bool posix_unlink = false);
-Future&lt;RenameTagTask&gt; AsyncRenameTag(const std::string &amp;old_name, const std::string &amp;new_name,
-    const TagId &amp;tag_id = TagId::GetNull(), const PoolQuery &amp;pool_query = PoolQuery::Broadcast());
-Future&lt;SyncTagTask&gt;   AsyncSyncTag(const TagId &amp;tag_id, const PoolQuery &amp;pool_query = PoolQuery::Broadcast(),
+Future<RenameTagTask> AsyncRenameTag(const std::string &old_name, const std::string &new_name,
+    const TagId &tag_id = TagId::GetNull(), const PoolQuery &pool_query = PoolQuery::Broadcast());
+Future<SyncTagTask>   AsyncSyncTag(const TagId &tag_id, const PoolQuery &pool_query = PoolQuery::Broadcast(),
     int min_persistence = -1);
-Future&lt;GetContainedBlobsTask&gt; AsyncGetContainedBlobs(const TagId &amp;tag_id,
-    const PoolQuery &amp;pool_query = PoolQuery::Dynamic());
+Future<GetContainedBlobsTask> AsyncGetContainedBlobs(const TagId &tag_id,
+    const PoolQuery &pool_query = PoolQuery::Dynamic());
 </pre>
 <p>The second <code>AsyncGetOrCreateTag</code> registers another pool as the tag's fault handler: a get of a blob the tag does not hold is dispatched to that pool with <code>fault_params</code> in the context. The Context Assimilation Engine and the paged vectors' <code>Copy</code> use it.</p>
 <h3>Blobs</h3>
 <pre data-label="cpp">
-Future&lt;PutBlobTask&gt; AsyncPutBlob(const TagId &amp;tag_id, const std::string &amp;blob_name,
+Future<PutBlobTask> AsyncPutBlob(const TagId &tag_id, const std::string &blob_name,
     u64 offset, u64 size, const char *priv_data, float score = -1.0f,
-    const Context &amp;context = Context(), u32 flags = 0, const PoolQuery &amp;pool_query = PoolQuery::Dynamic());
-Future&lt;PutBlobTask&gt; AsyncPutBlob(const TagId &amp;tag_id, const std::string &amp;blob_name,
-    u64 offset, u64 size, ctp::ipc::ShmPtr&lt;&gt; blob_data, float score = -1.0f,
-    const Context &amp;context = Context(), u32 flags = 0, const PoolQuery &amp;pool_query = PoolQuery::Dynamic());
-int AsyncPutBlobDefer(const TagId &amp;tag_id, const std::string &amp;blob_name, u64 offset, u64 size,
-    const char *priv_data, float score = -1.0f, const Context &amp;context = Context(), u32 flags = 0,
-    const PoolQuery &amp;pool_query = PoolQuery::Dynamic(), u64 max_inflight_bytes = 0);
-static u64 AwaitPutsUntilSpace(u64 max_inflight_bytes, u64 max_inflight_count = std::numeric_limits&lt;u64&gt;::max());
+    const Context &context = Context(), u32 flags = 0, const PoolQuery &pool_query = PoolQuery::Dynamic());
+Future<PutBlobTask> AsyncPutBlob(const TagId &tag_id, const std::string &blob_name,
+    u64 offset, u64 size, ctp::ipc::ShmPtr<> blob_data, float score = -1.0f,
+    const Context &context = Context(), u32 flags = 0, const PoolQuery &pool_query = PoolQuery::Dynamic());
+int AsyncPutBlobDefer(const TagId &tag_id, const std::string &blob_name, u64 offset, u64 size,
+    const char *priv_data, float score = -1.0f, const Context &context = Context(), u32 flags = 0,
+    const PoolQuery &pool_query = PoolQuery::Dynamic(), u64 max_inflight_bytes = 0);
+static u64 AwaitPutsUntilSpace(u64 max_inflight_bytes, u64 max_inflight_count = std::numeric_limits<u64>::max());
 static u64 DeferErrorCount();
 
-Future&lt;GetBlobTask&gt; AsyncGetBlob(const TagId &amp;tag_id, const std::string &amp;blob_name,
+Future<GetBlobTask> AsyncGetBlob(const TagId &tag_id, const std::string &blob_name,
     u64 offset, u64 size, u32 flags, char *priv_data,
-    const PoolQuery &amp;pool_query = PoolQuery::Dynamic(), const Context &amp;context = Context());
-Future&lt;GetBlobTask&gt; AsyncGetBlob(const TagId &amp;tag_id, const std::string &amp;blob_name,
-    u64 offset, u64 size, u32 flags, ctp::ipc::ShmPtr&lt;&gt; blob_data,
-    const PoolQuery &amp;pool_query = PoolQuery::Dynamic(), const Context &amp;context = Context());
-Future&lt;GetBlobTask&gt; AsyncGetBlobDefer(const TagId &amp;tag_id, const std::string &amp;blob_name,
+    const PoolQuery &pool_query = PoolQuery::Dynamic(), const Context &context = Context());
+Future<GetBlobTask> AsyncGetBlob(const TagId &tag_id, const std::string &blob_name,
+    u64 offset, u64 size, u32 flags, ctp::ipc::ShmPtr<> blob_data,
+    const PoolQuery &pool_query = PoolQuery::Dynamic(), const Context &context = Context());
+Future<GetBlobTask> AsyncGetBlobDefer(const TagId &tag_id, const std::string &blob_name,
     u64 offset, u64 size, char *priv_data, u32 flags = 0,
-    const PoolQuery &amp;pool_query = PoolQuery::Dynamic(), const Context &amp;context = Context());
+    const PoolQuery &pool_query = PoolQuery::Dynamic(), const Context &context = Context());
 
-Future&lt;DelBlobTask&gt;        AsyncDelBlob(const TagId &amp;tag_id, const std::string &amp;blob_name,
-    const PoolQuery &amp;pool_query = PoolQuery::Dynamic(), u32 del_flags = 0);
-Future&lt;TruncateBlobTask&gt;   AsyncTruncateBlob(const TagId &amp;tag_id, const std::string &amp;blob_name, u64 new_size,
-    const PoolQuery &amp;pool_query = PoolQuery::Dynamic());
-Future&lt;GetBlobSizeTask&gt;    AsyncGetBlobSize(const TagId &amp;tag_id, const std::string &amp;blob_name,
-    const PoolQuery &amp;pool_query = PoolQuery::Dynamic(), int replica = 0);
-Future&lt;GetBlobScoreTask&gt;   AsyncGetBlobScore(const TagId &amp;tag_id, const std::string &amp;blob_name,
-    const PoolQuery &amp;pool_query = PoolQuery::Dynamic());
-Future&lt;ReorganizeBlobTask&gt; AsyncReorganizeBlob(const TagId &amp;tag_id, const std::string &amp;blob_name, float new_score,
-    const PoolQuery &amp;pool_query = PoolQuery::Dynamic(), int replica = 0);
-Future&lt;EvictTask&gt;          AsyncEvict(float min_tier_score, u64 bytes,
-    const PoolQuery &amp;pool_query = PoolQuery::Broadcast(), u32 droppable_only = 0);
+Future<DelBlobTask>        AsyncDelBlob(const TagId &tag_id, const std::string &blob_name,
+    const PoolQuery &pool_query = PoolQuery::Dynamic(), u32 del_flags = 0);
+Future<TruncateBlobTask>   AsyncTruncateBlob(const TagId &tag_id, const std::string &blob_name, u64 new_size,
+    const PoolQuery &pool_query = PoolQuery::Dynamic());
+Future<GetBlobSizeTask>    AsyncGetBlobSize(const TagId &tag_id, const std::string &blob_name,
+    const PoolQuery &pool_query = PoolQuery::Dynamic(), int replica = 0);
+Future<GetBlobScoreTask>   AsyncGetBlobScore(const TagId &tag_id, const std::string &blob_name,
+    const PoolQuery &pool_query = PoolQuery::Dynamic());
+Future<ReorganizeBlobTask> AsyncReorganizeBlob(const TagId &tag_id, const std::string &blob_name, float new_score,
+    const PoolQuery &pool_query = PoolQuery::Dynamic(), int replica = 0);
+Future<EvictTask>          AsyncEvict(float min_tier_score, u64 bytes,
+    const PoolQuery &pool_query = PoolQuery::Broadcast(), u32 droppable_only = 0);
 </pre>
 <p><code>Context</code> flags: <code>kNoFault</code> suppresses fault-handler dispatch for one operation; <code>kPutIfAbsent</code> fails with <code>kPutExistsRc</code> when the blob exists; <code>kPutIfVersion</code> applies the put only at the expected content version and fails with a version-mismatch code otherwise. A deferred put returns 0 when submitted. The private-buffer <code>AsyncGetBlob</code> has three paths: a copy out of the shared-memory cache with no task (the future is empty), a direct read when the caller is inside the runtime, and client staging.</p>
 <h3>Queries and telemetry</h3>
 <pre data-label="cpp">
-Future&lt;TagQueryTask&gt;       AsyncTagQuery(const std::string &amp;tag_regex, u32 max_tags = 0,
-    const PoolQuery &amp;pool_query = PoolQuery::Broadcast());
-Future&lt;BlobQueryTask&gt;      AsyncBlobQuery(const std::string &amp;tag_regex, const std::string &amp;blob_regex,
-    u32 max_blobs = 0, const PoolQuery &amp;pool_query = PoolQuery::Broadcast());
-Future&lt;SemanticSearchTask&gt; AsyncSemanticSearch(const std::string &amp;tag_regex, const std::string &amp;blob_regex,
-    const std::string &amp;query_text, u32 k = 10, const PoolQuery &amp;pool_query = PoolQuery::Broadcast());
-Future&lt;TemporalSearchTask&gt; AsyncTemporalSearch(const std::string &amp;tag_regex, const std::string &amp;blob_regex,
+Future<TagQueryTask>       AsyncTagQuery(const std::string &tag_regex, u32 max_tags = 0,
+    const PoolQuery &pool_query = PoolQuery::Broadcast());
+Future<BlobQueryTask>      AsyncBlobQuery(const std::string &tag_regex, const std::string &blob_regex,
+    u32 max_blobs = 0, const PoolQuery &pool_query = PoolQuery::Broadcast());
+Future<SemanticSearchTask> AsyncSemanticSearch(const std::string &tag_regex, const std::string &blob_regex,
+    const std::string &query_text, u32 k = 10, const PoolQuery &pool_query = PoolQuery::Broadcast());
+Future<TemporalSearchTask> AsyncTemporalSearch(const std::string &tag_regex, const std::string &blob_regex,
     Timestamp time_begin = 0, Timestamp time_end = 0, u32 max_entries = 0,
-    const PoolQuery &amp;pool_query = PoolQuery::Broadcast());
-Future&lt;PollTelemetryLogTask&gt; AsyncPollTelemetryLog(std::uint64_t minimum_logical_time,
-    const PoolQuery &amp;pool_query = PoolQuery::Dynamic());
-Future&lt;ListTargetsTask&gt;    AsyncListTargets(const PoolQuery &amp;pool_query = PoolQuery::Dynamic());
+    const PoolQuery &pool_query = PoolQuery::Broadcast());
+Future<PollTelemetryLogTask> AsyncPollTelemetryLog(std::uint64_t minimum_logical_time,
+    const PoolQuery &pool_query = PoolQuery::Dynamic());
+Future<ListTargetsTask>    AsyncListTargets(const PoolQuery &pool_query = PoolQuery::Dynamic());
 </pre>
 <p>Patterns are matched against the whole name with <code>std::regex_match</code>. <code>SemanticSearchResult</code> has <code>tag_id_</code>, <code>blob_name_</code> and <code>score_</code>; <code>TemporalSearchResult</code> has <code>tag_id_</code>, <code>blob_name_</code> and <code>last_modified_</code>. <code>Timestamp</code> is a <code>u64</code> of nanoseconds on <code>std::chrono::steady_clock</code> (see the note on the <a href="/docs/cte/usage.html">usage page</a>). SemanticSearch is answered by the indexer module, so the client must be bound to it.</p>
 <h3>Pool queries</h3>

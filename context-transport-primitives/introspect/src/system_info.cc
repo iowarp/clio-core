@@ -52,6 +52,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <string>
 
@@ -521,6 +522,22 @@ void *SystemInfo::GetTls(const ThreadLocalKey &key) {
 #endif
 }
 
+std::string SystemInfo::NormalizePath(const std::string &path) {
+#if CTP_ENABLE_WINDOWS_SYSINFO
+  // "\\?\" and its slash spelling "//?/" both mark a verbatim path.
+  auto starts_with = [&path](const char *prefix) {
+    return path.compare(0, std::strlen(prefix), prefix) == 0;
+  };
+  if (starts_with("\\\\?\\UNC\\") || starts_with("//?/UNC/")) {
+    return "\\\\" + path.substr(8);  // \\?\UNC\server\share -> \\server\share
+  }
+  if (starts_with("\\\\?\\") || starts_with("//?/")) {
+    return path.substr(4);  // \\?\C:\dir -> C:\dir
+  }
+#endif
+  return path;
+}
+
 std::string SystemInfo::GetMemfdDir() {
   // Default is /tmp/clio_$USER, but some sites have a tiny /
   // partition where /tmp fills up (ares compute nodes are a known
@@ -531,7 +548,7 @@ std::string SystemInfo::GetMemfdDir() {
   // bookkeeping at an NFS-backed location (e.g. $HOME).
   const char *override_dir = ctp::env::GetCompat("MEMFD_DIR");
   if (override_dir && *override_dir) {
-    return std::string(override_dir);
+    return NormalizePath(override_dir);
   }
 #if CTP_ENABLE_WINDOWS_SYSINFO
   // Windows has no /tmp and uses USERNAME (not USER). Anchor the per-user
@@ -1440,9 +1457,9 @@ std::string SystemInfo::GetHomeDir() {
   // Fall back to HOMEDRIVE+HOMEPATH or HOME if a user explicitly set them.
   char buf[MAX_PATH];
   DWORD len = ::GetEnvironmentVariableA("USERPROFILE", buf, sizeof(buf));
-  if (len > 0 && len < sizeof(buf)) return std::string(buf, len);
+  if (len > 0 && len < sizeof(buf)) return NormalizePath(std::string(buf, len));
   len = ::GetEnvironmentVariableA("HOME", buf, sizeof(buf));
-  if (len > 0 && len < sizeof(buf)) return std::string(buf, len);
+  if (len > 0 && len < sizeof(buf)) return NormalizePath(std::string(buf, len));
   return std::string();
 #endif
 }
@@ -1458,17 +1475,16 @@ std::string SystemInfo::GetHostname() {
   return std::string(buf);
 }
 
-std::string SystemInfo::GetModuleDirectoryFor(void *symbol) {
+std::string SystemInfo::GetModulePathFor(void *symbol) {
   if (!symbol) return "";
 #if CTP_ENABLE_PROCFS_SYSINFO
   Dl_info dl_info;
-  if (dladdr(symbol, &dl_info) == 0) return "";
+  if (dladdr(symbol, &dl_info) == 0 || dl_info.dli_fname == nullptr) {
+    return "";
+  }
   char resolved[PATH_MAX];
   if (realpath(dl_info.dli_fname, resolved) == nullptr) return "";
-  std::string resolved_str(resolved);
-  auto pos = resolved_str.rfind('/');
-  return (pos != std::string::npos) ? resolved_str.substr(0, pos)
-                                    : std::string();
+  return std::string(resolved);
 #elif CTP_ENABLE_WINDOWS_SYSINFO
   HMODULE hModule = nullptr;
   if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
@@ -1478,11 +1494,20 @@ std::string SystemInfo::GetModuleDirectoryFor(void *symbol) {
   }
   char path[MAX_PATH];
   if (GetModuleFileNameA(hModule, path, MAX_PATH) == 0) return "";
-  std::string path_str(path);
-  auto pos2 = path_str.rfind('\\');
-  if (pos2 == std::string::npos) pos2 = path_str.rfind('/');
-  return (pos2 != std::string::npos) ? path_str.substr(0, pos2) : std::string();
+  return std::string(path);
+#else
+  return "";
 #endif
+}
+
+std::string SystemInfo::GetModuleDirectoryFor(void *symbol) {
+  std::string path = GetModulePathFor(symbol);
+#if CTP_ENABLE_WINDOWS_SYSINFO
+  auto pos = path.find_last_of("/\\");
+#else
+  auto pos = path.rfind('/');
+#endif
+  return (pos != std::string::npos) ? path.substr(0, pos) : std::string();
 }
 
 std::vector<std::string> SystemInfo::GetLocalInterfaceIps() {

@@ -47,6 +47,10 @@ trap cleanup EXIT INT TERM
 LOG0="/tmp/mp_test_rank0_$$.log"
 LOG1="/tmp/mp_test_rank1_$$.log"
 LOG2="/tmp/mp_test_rank2_$$.log"
+# Rank 0 creates this once its allocator exists; ranks 1 and 2 wait for it
+# (up to 30 s) instead of the script guessing a startup delay.
+export CTP_MP_ALLOC_READY_FILE="${TMPDIR:-/tmp}/mp_test_ready_$$"
+rm -f "$CTP_MP_ALLOC_READY_FILE"
 
 # Start all three ranks in background
 echo -e "${YELLOW}[Step 1]${NC} Starting rank 0 (${DURATION}s, ${NTHREADS} threads) in background..."
@@ -54,8 +58,7 @@ echo -e "${YELLOW}[Step 1]${NC} Starting rank 0 (${DURATION}s, ${NTHREADS} threa
 RANK0_PID=$!
 echo "Rank 0 PID: $RANK0_PID"
 
-# Delay to ensure rank 0 initializes shared memory before other ranks attach
-sleep 2
+# No delay here: ranks 1 and 2 block on rank 0's ready flag before attaching.
 
 echo -e "${YELLOW}[Step 2]${NC} Starting rank 1 (${DURATION}s, ${NTHREADS} threads) in background..."
 "$TEST_BINARY" 1 $DURATION $NTHREADS > "$LOG1" 2>&1 &
@@ -124,7 +127,7 @@ if [ $RANK0_EXIT -eq 0 ] && [ $RANK1_EXIT -eq 0 ] && [ $RANK2_EXIT -eq 0 ]; then
     echo -e "==========================================${NC}"
 
     # Cleanup log files
-    rm -f "$LOG0" "$LOG1" "$LOG2"
+    rm -f "$LOG0" "$LOG1" "$LOG2" "$CTP_MP_ALLOC_READY_FILE"
 
     exit 0
 else

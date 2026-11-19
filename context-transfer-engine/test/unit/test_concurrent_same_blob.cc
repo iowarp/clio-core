@@ -89,17 +89,23 @@ int FromEnv(const char *name, int dflt) {
 }
 
 /**
- * SAME_BLOB_FLUSH=1: run against a self-contained two-tier config (RAM +
- * temporary file tier) with the periodic FlushData every 500 ms, so the
- * flush's move-to-persistent-tier races the writers. This is the
- * configuration under which the blob lost 0.4-240 MB before FlushData held
- * the write token across its place-and-swap and sized the move under it
- * (RELIABILITY.md defect 14). Written before CLIO_INIT so the runtime
- * composes from it instead of whatever ~/.clio/clio.yaml holds.
+ * SAME_BLOB_FLUSH=1: run against a self-contained split config -- a
+ * persistent core (file tier), a volatile core (RAM) and a write-back cache
+ * flushing dirty copies every 500 ms -- with the client bound to the cache,
+ * so the cache's flush of the shared blob races the writers. (The race this
+ * case was written for, RELIABILITY.md defect 14, was the core's own
+ * move-to-persistent flush; the core no longer flushes, and the write-back
+ * cache's flush is where that race lives now.) Written before CLIO_INIT so
+ * the runtime composes from it instead of whatever ~/.clio/clio.yaml holds.
  */
-static void MaybeWriteFlushConfig() {
+/** Whether this run is the SAME_BLOB_FLUSH variant. */
+static bool FlushMode() {
   const char *on = std::getenv("SAME_BLOB_FLUSH");
-  if (on == nullptr || *on == '\0' || *on == '0') return;
+  return on != nullptr && *on != '\0' && *on != '0';
+}
+
+static void MaybeWriteFlushConfig() {
+  if (!FlushMode()) return;
   const char *d = clio::run::env::GetCompat("TEST_DATA_DIR");
   std::string dir = (d && *d) ? d : ".";
   std::string path = dir + "/same_blob_flush.yaml";
@@ -109,21 +115,33 @@ static void MaybeWriteFlushConfig() {
       "runtime:\n  num_threads: 4\n  queue_depth: 1024\ncompose:\n"
       "  - mod_name: clio_cte_core\n    pool_name: clio_cte\n"
       "    pool_query: local\n    pool_id: 512.0\n"
+      "    durability: persistent\n"
+      "    targets:\n      neighborhood: 1\n"
+      "    storage:\n"
+      "      - path: \"" + tier + "\"\n        bdev_type: \"file\"\n"
+      "        capacity_limit: \"4GB\"\n        score: 0.2\n"
+      "        persistence_level: \"temporary\"\n"
+      "    dpe:\n      dpe_type: \"max_bw\"\n"
+      "  - mod_name: clio_cte_core\n    pool_name: clio_cte_volatile\n"
+      "    pool_query: local\n    pool_id: 540.0\n"
+      "    durability: volatile\n"
       "    targets:\n      neighborhood: 1\n"
       "    storage:\n"
       "      - path: \"ram::same_blob_flush_dram\"\n        bdev_type: \"ram\"\n"
       "        capacity_limit: \"4GB\"\n        score: 1.0\n"
-      "      - path: \"" + tier + "\"\n        bdev_type: \"file\"\n"
-      "        capacity_limit: \"4GB\"\n        score: 0.2\n"
-      "        persistence_level: \"temporary\"\n"
-      "    performance:\n      flush_data_period_ms: 500\n"
-      "      flush_data_min_persistence: 1\n"
-      "    dpe:\n      dpe_type: \"max_bw\"\n";
+      "    dpe:\n      dpe_type: \"max_bw\"\n"
+      "  - mod_name: clio_cte_core_persist_write_back\n"
+      "    pool_name: clio_cte_core_persist_write_back\n"
+      "    pool_query: local\n    pool_id: 567.0\n"
+      "    next_volatile: \"540.0\"\n    next_persistent: \"512.0\"\n"
+      "    flush_period_ms: 500\n";
   FILE *f = std::fopen(path.c_str(), "w");
   REQUIRE(f != nullptr);
   std::fputs(yaml.c_str(), f);
   std::fclose(f);
   ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", path.c_str(), 1);
+  // Every write and read goes through the cache, whose flush races them.
+  ctp::SystemInfo::Setenv("CLIO_CTE_POOL", "567.0", 1);
 }
 
 class Fixture {
@@ -138,6 +156,12 @@ class Fixture {
     REQUIRE(ok);
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
+    if (FlushMode()) {
+      // Tiers come from the composed cores; registering an extra RAM
+      // target would put a volatile device into the persistent core.
+      initialized_ = true;
+      return;
+    }
     auto *cte = CLIO_CTE_CLIENT;
     clio::run::PoolId bdev_pool_id(901, 0);
     clio::run::bdev::Client bdev_client(bdev_pool_id);
@@ -256,26 +280,17 @@ TEST_CASE("ConcurrentSameBlob - many threads write disjoint regions of ONE "
             }
             HLOG(kError,
                  "[same_blob] DIAG window [{}, +{}): RPC re-read rc={} bad={} "
-                 "(bad in both={}); fast-path bytes at first mismatch: {:02x} {:02x} {:02x} {:02x}",
+                 "(bad in both={}); first-read bytes at first mismatch: {:02x} {:02x} {:02x} {:02x}",
                  base, win, again->GetReturnCode(), rpc_bad, both_bad,
                  (unsigned)(unsigned char)rb.ptr_[b], (unsigned)(unsigned char)rb.ptr_[std::min(b + 1, win - 1)],
                  (unsigned)(unsigned char)rb.ptr_[std::min(b + 2, win - 1)], (unsigned)(unsigned char)rb.ptr_[std::min(b + 3, win - 1)]);
-            clio::cte::core::ShmBlobRecord rec;
-            if (CLIO_CTE_CLIENT->TryGetBlobRecordShm(tag_id, blob, &rec)) {
-              HLOG(kError,
-                   "[same_blob] DIAG shm record: total_size={} num_blocks={} flags={:#x} "
-                   "direct={} covered={} placement_gen={} content_seq={} rep_direct={} rep_blocks={}",
-                   rec.total_size_, rec.num_blocks_, rec.flags_, rec.IsDirectReadable(),
-                   rec.CoveredBytes(), rec.placement_gen_, rec.content_seq_, rec.rep_direct_,
-                   rec.rep_num_blocks_);
-              for (clio::run::u32 i = 0; i < rec.num_blocks_ && i < 16; ++i) {
-                HLOG(kError, "[same_blob]   block {}: pool={} target_off={} size={} bdev_type={} node={}",
-                     i, rec.blocks_[i].target_pool_, rec.blocks_[i].target_offset_,
-                     rec.blocks_[i].size_, rec.blocks_[i].bdev_type_, rec.blocks_[i].node_id_);
-              }
-            } else {
-              HLOG(kError, "[same_blob] DIAG: no shm record for the blob");
-            }
+            auto res = CLIO_CTE_CLIENT->AsyncGetResidency(tag_id, blob);
+            res.Wait();
+            HLOG(kError,
+                 "[same_blob] DIAG residency: rc={} exists={} present={} "
+                 "direct={}",
+                 res->GetReturnCode(), res->exists_, res->present_bytes_,
+                 res->direct_readable_);
             ipc->FreeBuffer(rb2);
           }
         }

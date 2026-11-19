@@ -340,6 +340,14 @@ class SocketTransport : public Transport {
     try {
       ctp::ipc::GlobalDeserialize<std::vector<char>> ar(meta_buf);
       ar(meta);
+      // A short or foreign frame does not throw; it fails the archive. Drop
+      // it like a dead link rather than handing on a half-decoded message
+      // (#1353).
+      if (ar.Failed()) {
+        HLOG(kError, "Socket RecvMetadata: malformed frame dropped (len={})",
+             meta_len);
+        return -1;
+      }
     } catch (const std::exception& e) {
       HLOG(kFatal, "Socket RecvMetadata: Deserialization failed - {} (len={})",
            e.what(), meta_len);

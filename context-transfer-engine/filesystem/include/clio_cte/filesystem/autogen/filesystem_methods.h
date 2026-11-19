@@ -45,8 +45,9 @@ GLOBAL_CROSS_CONST clio::run::u32 kMultiCreate = 36;      // batched file creati
 GLOBAL_CROSS_CONST clio::run::u32 kAdvanceSize = 37;      // tag-keyed logical-size advance
 GLOBAL_CROSS_CONST clio::run::u32 kShardOp = 38;          // internal: op on hash-owned ns state
 GLOBAL_CROSS_CONST clio::run::u32 kSyncMeta = 39;         // fsync the namespace log (broadcast)
+GLOBAL_CROSS_CONST clio::run::u32 kReaddirRange = 40;     // one chunk of a listing, by offset
 
-GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 40;
+GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 41;
 
 inline const std::vector<std::string>& GetMethodNames() {
   static const std::vector<std::string> names = [] {
@@ -78,6 +79,8 @@ inline const std::vector<std::string>& GetMethodNames() {
     v[36] = "MultiCreate";
     v[37] = "AdvanceSize";
     v[38] = "ShardOp";
+    v[39] = "SyncMeta";
+    v[40] = "ReaddirRange";
     return v;
   }();
   return names;

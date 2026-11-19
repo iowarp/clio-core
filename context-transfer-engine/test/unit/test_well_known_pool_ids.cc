@@ -67,9 +67,6 @@ namespace {
 /** Every well-known id this build knows about. */
 constexpr clio::run::PoolId kWellKnownIds[] = {
     clio::cte::core::kCtePoolId,
-#ifdef CLIO_HAVE_FILESYSTEM
-    clio::cte::filesystem::kCfsPoolId,
-#endif
 #ifdef CLIO_HAVE_REPLICATION
     clio::cte::replication::kReplicationPoolId,
 #endif
@@ -78,9 +75,6 @@ constexpr clio::run::PoolId kWellKnownIds[] = {
 #endif
 #ifdef CLIO_HAVE_INDEXER
     clio::cte::indexer::kIndexerPoolId,
-#endif
-#ifdef CLIO_HAVE_STREAM
-    clio::cte::stream::kStreamPoolId,
 #endif
 #ifdef CLIO_HAVE_CHECKPOINT
     clio::cte::checkpoint::kCheckpointPoolId,

@@ -854,6 +854,10 @@ class PocoVizHandlerFactory : public Poco::Net::HTTPRequestHandlerFactory {
 
 bool VizServer::StartOn(const std::string &bind_addr, u32 port,
                         u32 max_threads) {
+  // Serializes against Stop() and the getters: since `clio-run viz start|stop`
+  // the lifecycle is driven from an admin task too, concurrently with the
+  // daemon's own startup/shutdown and with handlers reading GetPort().
+  std::lock_guard<std::mutex> life_lock(lifecycle_mutex_);
   if (impl_) {
     HLOG(kWarning, "Viz: server already running on {}:{}", impl_->bind_addr,
          impl_->port);
@@ -913,12 +917,21 @@ bool VizServer::StartOn(const std::string &bind_addr, u32 port,
   return true;
 }
 
-void VizServer::Stop() {
-  if (!impl_) {
-    return;
+bool VizServer::Stop() {
+  // Detach the server under the lifecycle lock, then tear it down OUTSIDE the
+  // lock: teardown may wait up to the stop budget for handlers, and a handler
+  // may itself call GetPort()/IsRunning(). impl_ is null from here on, so a
+  // concurrent Stop() is a no-op and a concurrent Start() may bind afresh.
+  std::shared_ptr<Impl> impl;
+  {
+    std::lock_guard<std::mutex> life_lock(lifecycle_mutex_);
+    if (!impl_) {
+      return true;
+    }
+    impl = std::shared_ptr<Impl>(std::move(impl_));
   }
-  HLOG(kInfo, "Viz: stopping dashboard on {}:{}", impl_->bind_addr,
-       impl_->port);
+  HLOG(kInfo, "Viz: stopping dashboard on {}:{}", impl->bind_addr,
+       impl->port);
   // Close the LISTENING SOCKET FIRST, before asking Poco to stop. Poco is
   // thread-per-connection: TCPServer::start() spawns an acceptor parked in
   // ServerSocket::poll() on this socket, and the stop path joins it. Closing
@@ -929,7 +942,7 @@ void VizServer::Stop() {
   // down, aborting requests, and FALSE lets current requests finish. Waiting
   // is the risky one, so keep true.)
   try {
-    impl_->socket.close();
+    impl->socket.close();
   } catch (const Poco::Exception &e) {
     HLOG(kWarning, "Viz: error closing the dashboard socket: {}",
          e.displayText());
@@ -958,7 +971,6 @@ void VizServer::Stop() {
       stop_budget_ms = static_cast<int>(n);
     }
   }
-  std::shared_ptr<Impl> impl(std::move(impl_));  // impl_ is null from here on
   auto finished = std::make_shared<std::promise<void>>();
   std::future<void> done = finished->get_future();
   std::thread([impl, finished]() mutable {
@@ -980,14 +992,23 @@ void VizServer::Stop() {
          "Viz: dashboard teardown did not finish within {} ms; abandoning it "
          "so the shutdown can proceed",
          stop_budget_ms);
+    return false;
   }
+  return true;
 }
 
-bool VizServer::IsRunning() const { return impl_ != nullptr; }
+bool VizServer::IsRunning() const {
+  std::lock_guard<std::mutex> life_lock(lifecycle_mutex_);
+  return impl_ != nullptr;
+}
 
-u32 VizServer::GetPort() const { return impl_ ? impl_->port : 0; }
+u32 VizServer::GetPort() const {
+  std::lock_guard<std::mutex> life_lock(lifecycle_mutex_);
+  return impl_ ? impl_->port : 0;
+}
 
 std::string VizServer::GetBindAddr() const {
+  std::lock_guard<std::mutex> life_lock(lifecycle_mutex_);
   return impl_ ? impl_->bind_addr : std::string();
 }
 
@@ -1006,7 +1027,7 @@ bool VizServer::StartOn(const std::string &bind_addr, u32 port,
   return false;
 }
 
-void VizServer::Stop() {}
+bool VizServer::Stop() { return true; }
 bool VizServer::IsRunning() const { return false; }
 u32 VizServer::GetPort() const { return 0; }
 std::string VizServer::GetBindAddr() const { return std::string(); }

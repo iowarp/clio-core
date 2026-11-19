@@ -278,7 +278,11 @@ TEST_CASE("Cfs - filesystem chimod open/write/getattr/read/truncate",
   REQUIRE(gone->GetReturnCode() == 0);
   REQUIRE(!(gone->tag_id_ == orig_id));
 
-  // ---- Hierarchical tag names + O(1) directory move ----
+  // ---- Flat tag names: a path is one name; rename and delete touch only it --
+  // The core holds no hierarchy (flat tag names): "/a/b/c/d" is one opaque
+  // name, not a chain of parents, and clio-fs keeps directory structure
+  // itself. These checks pin that contract down: binding, renaming and
+  // deleting one name never reaches a tag whose name merely shares a prefix.
   using clio::cte::core::TagId;
   auto resolve = [&](const TagId &id) {
     auto g = core.AsyncGetTagName(id);
@@ -287,15 +291,20 @@ TEST_CASE("Cfs - filesystem chimod open/write/getattr/read/truncate",
     REQUIRE(g->found_ == 1);
     return g->tag_name_.str();
   };
+  auto exists = [&](const TagId &id) {
+    auto g = core.AsyncGetTagName(id);
+    g.Wait();
+    REQUIRE(g->GetReturnCode() == 0);
+    return g->found_ == 1;
+  };
 
-  // Creating "/a/b/c/d" builds the whole chain; the returned id is the leaf.
   auto deep = core.AsyncGetOrCreateTag(
       "/a/b/c/d", TagId::GetNull(), clio::run::PoolQuery::Local());
   deep.Wait();
   REQUIRE(deep->GetReturnCode() == 0);
   TagId d_id = deep->tag_id_;
 
-  // The intermediate "/a/b" already exists from the chain — same id, no dup.
+  // "/a/b" is its own name: creating it mints a separate tag.
   auto mid = core.AsyncGetOrCreateTag(
       "/a/b", TagId::GetNull(), clio::run::PoolQuery::Local());
   mid.Wait();
@@ -304,11 +313,10 @@ TEST_CASE("Cfs - filesystem chimod open/write/getattr/read/truncate",
   REQUIRE(!b_id.IsNull());
   REQUIRE(!(b_id == d_id));
 
-  // Names resolve to absolute paths.
   REQUIRE(resolve(d_id) == "/a/b/c/d");
   REQUIRE(resolve(b_id) == "/a/b");
 
-  // Write a blob under the deepest tag so we can prove data survives the move.
+  // Write a blob under the deep tag so we can prove data survives the rename.
   const char kDeepMsg[] = "deep-payload";
   constexpr clio::run::u64 kDeepN = sizeof(kDeepMsg);
   ctp::ipc::FullPtr<char> hpb = ipc->AllocateBuffer(kDeepN);
@@ -322,70 +330,56 @@ TEST_CASE("Cfs - filesystem chimod open/write/getattr/read/truncate",
   REQUIRE(hp->GetReturnCode() == 0);
   ipc->FreeBuffer(hpb);
 
-  // Move the mid-level directory "/a/b" -> "/x/y". This touches ONLY /a/b's
-  // own binding; "/a/b/c" and "/a/b/c/d" reference ids that do not change, so
-  // they must re-resolve under the new parent automatically (the O(1) win).
+  // Renaming "/a/b" -> "/x/y" moves that one binding. The tag keeps its id;
+  // "/a/b/c/d" is a different name and stays exactly where it was.
   auto mv = core.AsyncRenameTag("/a/b", "/x/y", b_id);
   mv.Wait();
   REQUIRE(mv->GetReturnCode() == 0);
-
+  REQUIRE(mv->tag_id_ == b_id);
   REQUIRE(resolve(b_id) == "/x/y");
-  REQUIRE(resolve(d_id) == "/x/y/c/d");  // deep child re-resolved, never moved
+  REQUIRE(resolve(d_id) == "/a/b/c/d");
 
-  // The blob under the (unmoved) deep id is still intact.
-  ctp::ipc::FullPtr<char> hgb = ipc->AllocateBuffer(kDeepN);
-  REQUIRE(!hgb.IsNull());
-  memset(hgb.ptr_, 0, kDeepN);
-  auto hg = core.AsyncGetBlob(d_id, "0", 0, kDeepN, 0u,
-                              hgb.shm_.template Cast<void>(),
-                              clio::run::PoolQuery::Local());
-  hg.Wait();
-  REQUIRE(hg->GetReturnCode() == 0);
-  REQUIRE(memcmp(hgb.ptr_, kDeepMsg, kDeepN) == 0);
-  ipc->FreeBuffer(hgb);
+  // The blob under the deep id is intact.
+  auto read_deep = [&]() {
+    ctp::ipc::FullPtr<char> buf = ipc->AllocateBuffer(kDeepN);
+    REQUIRE(!buf.IsNull());
+    memset(buf.ptr_, 0, kDeepN);
+    auto g = core.AsyncGetBlob(d_id, "0", 0, kDeepN, 0u,
+                               buf.shm_.template Cast<void>(),
+                               clio::run::PoolQuery::Local());
+    g.Wait();
+    const bool ok = g->GetReturnCode() == 0 &&
+                    memcmp(buf.ptr_, kDeepMsg, kDeepN) == 0;
+    ipc->FreeBuffer(buf);
+    return ok;
+  };
+  REQUIRE(read_deep());
 
-  // The old path "/a/b" is now free: re-creating it mints a NEW id (the old
-  // binding moved away), while "/a" itself still exists as a parent.
+  // The old name "/a/b" is free again: re-creating it mints a NEW id.
   auto recreate = core.AsyncGetOrCreateTag(
       "/a/b", TagId::GetNull(), clio::run::PoolQuery::Local());
   recreate.Wait();
   REQUIRE(recreate->GetReturnCode() == 0);
   REQUIRE(!(recreate->tag_id_ == b_id));
 
-  // ---- Recursive DelTag: deleting a directory deletes its whole subtree ----
-  // Current tree under the moved dir: "/x/y" (b_id) -> "/x/y/c" -> "/x/y/c/d"
-  // (d_id, holds a blob). Capture the intermediate id "/x/y/c" too.
-  auto cmid = core.AsyncGetOrCreateTag(
-      "/x/y/c", TagId::GetNull(), clio::run::PoolQuery::Local());
-  cmid.Wait();
-  REQUIRE(cmid->GetReturnCode() == 0);
-  TagId c_id = cmid->tag_id_;
+  // Deleting "/x/y" deletes that tag only -- no subtree to take with it.
+  auto del_xy = core.AsyncDelTag(std::string("/x/y"),
+                                 clio::run::PoolQuery::Local());
+  del_xy.Wait();
+  REQUIRE(del_xy->GetReturnCode() == 0);
+  REQUIRE(!exists(b_id));
+  REQUIRE(exists(d_id));
+  REQUIRE(read_deep());
 
-  auto rmrf = core.AsyncDelTag(std::string("/x/y"), clio::run::PoolQuery::Local());
-  rmrf.Wait();
-  REQUIRE(rmrf->GetReturnCode() == 0);
-
-  // Every tag in the subtree is gone (GetTagName reports not-found).
-  for (const TagId &gone_id : {b_id, c_id, d_id}) {
-    auto gn = core.AsyncGetTagName(gone_id);
-    gn.Wait();
-    REQUIRE(gn->GetReturnCode() == 0);
-    REQUIRE(gn->found_ == 0);
-  }
-
-  // The descendant's blob is gone too.
-  ctp::ipc::FullPtr<char> rdb = ipc->AllocateBuffer(kDeepN);
-  REQUIRE(!rdb.IsNull());
-  auto rdg = core.AsyncGetBlob(d_id, "0", 0, kDeepN, 0u,
-                               rdb.shm_.template Cast<void>(),
-                               clio::run::PoolQuery::Local());
-  rdg.Wait();
-  REQUIRE(rdg->GetReturnCode() != 0);
-  ipc->FreeBuffer(rdb);
-
-  // Re-creating the deepest path mints fresh ids (subtree fully removed).
+  // Deleting the deep name takes its tag and blob; re-creating mints a new id.
+  auto del_deep = core.AsyncDelTag(std::string("/a/b/c/d"),
+                                   clio::run::PoolQuery::Local());
+  del_deep.Wait();
+  REQUIRE(del_deep->GetReturnCode() == 0);
+  REQUIRE(!exists(d_id));
+  REQUIRE(!read_deep());
   auto reborn = core.AsyncGetOrCreateTag(
-      "/x/y/c/d", TagId::GetNull(), clio::run::PoolQuery::Local());
+      "/a/b/c/d", TagId::GetNull(), clio::run::PoolQuery::Local());
   reborn.Wait();
   REQUIRE(reborn->GetReturnCode() == 0);
   REQUIRE(!(reborn->tag_id_ == d_id));
@@ -546,7 +540,11 @@ TEST_CASE("Cfs - filesystem chimod open/write/getattr/read/truncate",
     REQUIRE(clio::cte::filesystem::FsIdHasHome(packed));
     const clio::run::u32 home = clio::cte::filesystem::FsIdHome(packed);
     const clio::cte::core::TagId tag = clio::cte::filesystem::FsUnpack(packed);
-    clio::cte::stream::Client stream;
+    // The stream pool this filesystem keeps sizes in (clients assume no
+    // pool id: ask the filesystem which one it uses).
+    clio::run::PoolId stream_pool;
+    REQUIRE(cfs.QueryPoolId("stream_pool", &stream_pool));
+    clio::cte::stream::Client stream(stream_pool);
 
     constexpr clio::run::u64 kChunk = 4096;
     constexpr int kNum = 16;  // concurrent stress (probe for corruption)

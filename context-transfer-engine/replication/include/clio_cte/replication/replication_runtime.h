@@ -48,41 +48,82 @@ class Runtime : public clio::cte::core::CoreInterposer {
   /**
    * Per-task cost estimate for the scheduler (see Container::GetTaskStats).
    *
-   * compute_ is the feature Container::InferCpuTime multiplies its learned
-   * per-method coefficient by; leaving it 0 — as every chimod but MOD_NAME and
-   * admin did — collapses that model to one constant per method with no
-   * dependence on request size. wall_time_ seeds InferWallClockTime at the
-   * ~500 MB/s house convention. Both coefficients are then learned from real
-   * completions, so these only need the right order of magnitude.
+   * Every method this pool serves gets an explicit estimate. The interposed
+   * PutBlob / MultiPutBlob add the copies a put writes before it returns
+   * (WriteCopiesStat); the module's own verbs are constants because their
+   * byte volume is only known once they run. Every other core verb falls
+   * back to CoreInterposer::GetTaskStats (the core's own estimate).
+   * @param task the task to estimate
+   * @return the task's cost features
    */
   clio::run::TaskStat GetTaskStats(const clio::run::Task *task) const override {
-    clio::run::TaskStat stat;
+    namespace cost = clio::run::cost;
+    namespace core = clio::cte::core;
     if (task == nullptr) {
-      return stat;
+      return clio::run::TaskStat();
     }
     switch (task->method_) {
       case Method::kReplicateBlob:
         // Re-reads the source blob and writes it to a peer: the local CPU cost
         // is one copy, but the wall time is a network round trip, so the two
         // estimates deliberately diverge here.
-        stat.compute_ = 30;
-        stat.wall_time_ = 2000.0f;
-        return stat;
+        return cost::Fixed(30, 2000.0f);
       case Method::kFlushTag:
-        stat.compute_ = 50;
-        stat.wall_time_ = 5000.0f;
-        return stat;
+        return cost::Fixed(50, 5000.0f);  // ReplicateBlob over a whole tag
       case Method::kReplicateSweep:
         // Periodic scan over pending replicas; cheap when there is nothing to
         // do, which is the common case.
-        stat.compute_ = 10;
-        stat.wall_time_ = 20.0f;
-        return stat;
+        return cost::Fixed(10, 20.0f);
+      case Method::kHandoffPull:
+        // Hands a returning owner every change made on its behalf.
+        return cost::Fixed(50, 1000.0f);
+      case Method::kHandoffSweep:
+        return cost::IdlePeriodic();  // periodic owner-liveness check
+      case core::Method::kPutBlob: {
+        const auto *t = static_cast<const core::PutBlobTask *>(task);
+        return WriteCopiesStat(CoreInterposer::GetTaskStats(task),
+                               core::CoreBlobBytes(t));
+      }
+      case core::Method::kMultiPutBlob:
+        return WriteCopiesStat(
+            CoreInterposer::GetTaskStats(task),
+            static_cast<const core::MultiPutBlobTask *>(task)->data_len_);
       default:
-        return clio::cte::core::CoreInterposer::GetTaskStats(task);
+        return CoreInterposer::GetTaskStats(task);
     }
   }
 
+ private:
+  /**
+   * Add to a put's primary-write estimate the copies it writes before
+   * returning: remote_copies_ peer copies always (bytes over the network +
+   * one round trip each), and num_replicas_ local persistent copies when
+   * write-through is synchronous (replicate_period_ms_ == 0; otherwise the
+   * periodic sweep writes them later). Each copy is also one more CPU copy.
+   * @param stat the primary write's estimate
+   * @param bytes payload bytes of the put
+   * @return the estimate including the synchronous copies
+   */
+  clio::run::TaskStat WriteCopiesStat(clio::run::TaskStat stat,
+                                      clio::run::u64 bytes) const {
+    namespace cost = clio::run::cost;
+    const float fbytes = static_cast<float>(bytes);
+    const int remote = config_.remote_copies_ > 0 ? config_.remote_copies_ : 0;
+    const int local = (config_.replicate_period_ms_ == 0 &&
+                       config_.num_replicas_ > 0)
+                          ? config_.num_replicas_
+                          : 0;
+    stat.wall_time_ += static_cast<float>(remote) *
+                       (fbytes / cost::kNetworkBytesPerWallUs +
+                        cost::kNetworkRttUs);
+    stat.wall_time_ +=
+        static_cast<float>(local) * (fbytes / cost::kStorageBytesPerWallUs);
+    stat.compute_ += static_cast<size_t>(remote + local) *
+                     static_cast<size_t>(fbytes / cost::kCopyBytesPerCpuUs);
+    return stat;
+  }
+
+ public:
 
   // ---- Method handlers ----
   clio::run::TaskResume Create(clio::run::shared_ptr<CreateTask> &task);
@@ -297,11 +338,15 @@ class Runtime : public clio::cte::core::CoreInterposer {
    * happens after a COMPLETE copy (a partial local copy is never served
    * because CachedGet requires coverage, but registering it would earn a
    * pointless invalidation).
+   * @param version out: the blob version every chunk was read at (0 if the
+   *        core reported none); registration passes it so the owner can
+   *        reject a copy a concurrent write already superseded
    */
   clio::run::TaskResume CacheLocalCopy(const TagId &tag_id,
                                        const std::string &blob_name,
                                        clio::run::u64 total,
-                                       bool &cached);
+                                       bool &cached,
+                                       clio::run::u64 *version);
 
   /** Lazily bind the core client (compose next_pool_id, default kCtePoolId) */
   clio::cte::core::Client *GetCoreClient();

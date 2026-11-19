@@ -125,25 +125,27 @@ enum class Placement { kMissing, kOnTier, kElsewhere };
  * @param name the blob's name
  * @param size the blob's expected size
  * @param type the tier's bdev type
- * @return kMissing if the record is absent or short, kOnTier if every block is
- *         on `type`, else kElsewhere
+ * @return kMissing if the blob is absent or short, kOnTier if it is on
+ *         `type` (RAM: every block; file: any block -- the tests have only
+ *         these two tiers), else kElsewhere
  */
 static Placement BlobPlacement(clio::cte::core::Client *cte_client,
                                const clio::cte::core::TagId &tag_id,
                                const std::string &name, clio::run::u64 size,
                                clio::run::bdev::BdevType type) {
-  clio::cte::core::ShmBlobRecord rec{};
-  if (!cte_client->TryGetBlobRecordShm(tag_id, name, &rec) ||
-      rec.total_size_ != size || rec.num_blocks_ == 0) {
+  // GetResidency: exists_/present_bytes_ say whether all `size` bytes are
+  // stored; direct_readable_ is 1 only when every block of the range is on a
+  // node-local RAM target. These tests have exactly a RAM and a file tier, so
+  // "not direct-readable" means at least one block is on the file tier.
+  auto res = cte_client->AsyncGetResidency(tag_id, name, 0, size);
+  res.Wait();
+  if (res->GetReturnCode() != 0 || res->exists_ == 0 ||
+      res->present_bytes_ != size) {
     return Placement::kMissing;
   }
-  for (clio::run::u32 b = 0;
-       b < rec.num_blocks_ && b < clio::cte::core::kMaxInlineBlocks; ++b) {
-    if (rec.blocks_[b].bdev_type_ != static_cast<clio::run::u32>(type)) {
-      return Placement::kElsewhere;
-    }
-  }
-  return Placement::kOnTier;
+  const bool on_ram = res->direct_readable_ != 0;
+  const bool want_ram = type == clio::run::bdev::BdevType::kRam;
+  return on_ram == want_ram ? Placement::kOnTier : Placement::kElsewhere;
 }
 
 /**

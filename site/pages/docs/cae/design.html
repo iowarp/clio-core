@@ -1,0 +1,140 @@
+<!--
+title: Design
+heading: Inside the <em>assimilation engine.</em>
+description: How the CAE is built: the clio_cae tool and OMNI loader, the core module, the assimilator factory and its per-source assimilators, ingest on fault with its off-worker I/O pool, pagify and page maps, and the summarizer interposer.
+eyebrow: Docs · Context Assimilation Engine
+lede: The CAE is a runtime module that copies, or lazily maps, outside data into CTE tags. Its work is done by assimilators, one class per kind of source, chosen by the source URL. This page names the pieces and follows a transfer through them.
+facts: Module | clio_cae_core (pool 400.0) ; Methods | ParseOmni, ImportData (HDF5), ExportData, ProcessHdf5Dataset, plus CTE forwarding ; Fault I/O threads | CLIO_CAE_REF_IO_THREADS (32)
+-->
+<h2 id="pieces">The pieces</h2>
+<figure class="diagram">
+  <svg viewBox="0 0 860 360" role="img" aria-label="CAE pieces: the clio_cae tool and CEE submit transfers to the CAE core, which picks an assimilator per source and writes through the CTE chain">
+    <defs><marker id="ca0" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+    <rect class="box alt" x="20" y="20" width="250" height="56" rx="8"/><text class="title" x="32" y="44">clio_cae + OMNI loader</text><text class="muted" x="32" y="62">YAML → AssimilationCtx list</text>
+    <rect class="box alt" x="300" y="20" width="250" height="56" rx="8"/><text class="title" x="312" y="44">CEE / Python / C++</text><text class="muted" x="312" y="62">context_bundle, CAE client</text>
+    <rect class="box hl" x="20" y="106" width="530" height="62" rx="8"/><text class="title" x="32" y="130">CAE core module</text><text class="muted" x="32" y="150">ParseOmni: run transfers in order · fault handler registry</text>
+    <path class="edge hl" d="M145,76 L145,104" marker-end="url(#ca0)"/><path class="edge hl" d="M425,76 L425,104" marker-end="url(#ca0)"/>
+    <rect class="box hl" x="20" y="198" width="530" height="62" rx="8"/><text class="title" x="32" y="222">Assimilator factory</text><text class="muted" x="32" y="242">file · string · hdf5 · http(s) · s3 · gs · globus</text>
+    <path class="edge hl" d="M285,168 L285,196" marker-end="url(#ca0)"/>
+    <rect class="box" x="580" y="106" width="260" height="62" rx="8"/><text class="title" x="592" y="130">Reference I/O pool</text><text class="muted" x="592" y="150">blocking source reads off workers</text>
+    <path class="edge" d="M550,137 L578,137" marker-end="url(#ca0)"/>
+    <rect class="box" x="580" y="198" width="260" height="62" rx="8"/><text class="title" x="592" y="222">Summarizer (optional)</text><text class="muted" x="592" y="242">labels blobs via a model</text>
+    <rect class="box hl" x="20" y="290" width="820" height="50" rx="8"/><text class="title" x="32" y="320">CTE chain (next_pool_id: the cache, 563.0, in the shipped config)</text>
+    <path class="edge hl" d="M285,260 L285,288" marker-end="url(#ca0)"/><path class="edge" d="M710,260 L710,288" marker-end="url(#ca0)"/>
+  </svg>
+  <figcaption>Transfers arrive as one task. The core picks an assimilator
+  per source and writes blobs through the chain, or registers the source
+  so blobs are ingested when first read.</figcaption>
+</figure>
+
+<h2 id="flow">A transfer, step by step</h2>
+<ol class="steps">
+  <li><strong>Load.</strong> The <code>clio_cae</code> tool's OMNI loader reads the YAML, expands each entry into an assimilation context (source, destination, format, range, dataset filters, credentials) and submits the list as one <code>ParseOmni</code> task. The CEE and the language clients build the same contexts directly.</li>
+  <li><strong>Choose.</strong> In the runtime, the core asks the assimilator factory for the class that handles each source's scheme.</li>
+  <li><strong>Assimilate.</strong> The assimilator's schedule coroutine reads the source and puts blobs into the destination tag through the CTE client: a <code>description</code> blob plus 1 MiB <code>chunk_N</code> blobs for files and objects, one tag per dataset for HDF5, one blob for a string. Puts go to the CAE's <code>next_pool_id</code>, so imports pass the cache, indexer and replication like any other write. The HTTP(S) and Globus assimilators are the exception: they download to a <code>file::</code> path (or, for Globus, another endpoint), not into a tag.</li>
+  <li><strong>Finish.</strong> Transfers run in order, each completing before the next starts, and the task returns one status.</li>
+</ol>
+
+<h2 id="assimilators">Assimilators</h2>
+<p>An assimilator is a C++ class implementing a small base interface. Besides scheduling a whole transfer, it can optionally produce the bytes of one destination blob on request (for ingest on fault) and describe the source's page layout (for pagify). The shipped ones cover local files, inline strings, HDF5, HTTP and HTTPS, S3 (with a pooled keep-alive connection set and forwarded credentials, since the daemon does not inherit the client's environment), Google Cloud Storage and Globus. Of these, only the local-file assimilator implements per-blob reads, so only <code>file::</code> sources can be ingested on fault. <a href="/docs/cae/extend.html">Extending the CAE</a> adds a new one.</p>
+
+<h2 id="landing">Where each source lands</h2>
+<figure class="diagram">
+  <svg viewBox="0 0 860 574" role="img" aria-label="The assimilator factory picks one class per source scheme; each row shows the class and the tags, blobs or files it produces">
+    <defs><marker id="cae1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+    <rect class="box alt" x="20" y="20" width="400" height="96" rx="8"/><text class="title" x="32" y="44">AssimilationCtx (one per transfer)</text>
+    <text class="muted" x="32" y="64">src, dst, format, range_off, range_size</text><text class="muted" x="32" y="80">on_fault, chunk_size, blob_prefix (default chunk_)</text><text class="muted" x="32" y="96">dataset filters, tokens, S3 region and profile</text>
+    <rect class="box hl" x="440" y="20" width="400" height="96" rx="8"/><text class="title" x="452" y="44">BaseAssimilator interface</text>
+    <text class="muted" x="452" y="64">Schedule: the whole transfer (a coroutine)</text><text class="muted" x="452" y="80">ReadBlob, BlobBytes: one blob, for on_fault</text><text class="muted" x="452" y="96">BuildPageMap: the page layout, for pagify</text>
+    <path class="edge" d="M420,68 L438,68" marker-end="url(#cae1)"/>
+    <text class="muted" x="20" y="146">SCHEME OF src</text><text class="muted" x="200" y="146">CLASS (AssimilatorFactory::Get)</text><text class="muted" x="440" y="146">WHAT IT WRITES</text>
+    <rect class="box" x="20" y="156" width="168" height="50" rx="8"/><text class="title" x="32" y="176">file::</text><text class="muted" x="32" y="194">file::/data/run.bin</text>
+    <rect class="box hl" x="200" y="156" width="228" height="50" rx="8"/><text class="title" x="212" y="176">BinaryFileAssimilator</text><text class="muted" x="212" y="194">the only one with ReadBlob</text>
+    <rect class="box hl" x="440" y="156" width="400" height="50" rx="8"/><text class="title" x="452" y="176">dst iowarp::run → tag run</text><text class="muted" x="452" y="194">description, chunk_0, chunk_1, … (1 MiB, or chunk_size)</text>
+    <rect class="box" x="20" y="214" width="168" height="50" rx="8"/><text class="title" x="32" y="234">string::</text><text class="muted" x="32" y="252">string::notes</text>
+    <rect class="box" x="200" y="214" width="228" height="50" rx="8"/><text class="title" x="212" y="234">StringDataAssimilator</text><text class="muted" x="212" y="252">payload rides in src_data</text>
+    <rect class="box hl" x="440" y="214" width="400" height="50" rx="8"/><text class="title" x="452" y="234">the tag named by dst</text><text class="muted" x="452" y="252">one blob, named notes, holding the bytes verbatim</text>
+    <rect class="box" x="20" y="272" width="168" height="50" rx="8"/><text class="title" x="32" y="292">hdf5::</text><text class="muted" x="32" y="310">hdf5::/d/sim.h5</text>
+    <rect class="box" x="200" y="272" width="228" height="50" rx="8"/><text class="title" x="212" y="292">Hdf5FileAssimilator</text><text class="muted" x="212" y="310">datasets round-robin over nodes</text>
+    <rect class="box hl" x="440" y="272" width="400" height="50" rx="8"/><text class="title" x="452" y="292">a tag per dataset: sim/fields/temp</text><text class="muted" x="452" y="310">description (tensor type, dims) + 1.5 MiB chunk_N</text>
+    <rect class="box" x="20" y="330" width="168" height="50" rx="8"/><text class="title" x="32" y="350">s3://</text><text class="muted" x="32" y="368">s3://bucket/key</text>
+    <rect class="box" x="200" y="330" width="228" height="50" rx="8"/><text class="title" x="212" y="350">S3FileAssimilator</text><text class="muted" x="212" y="368">keep-alive connection pool</text>
+    <rect class="box hl" x="440" y="330" width="400" height="50" rx="8"/><text class="title" x="452" y="350">an iowarp:: tag, or a cfs:: file</text><text class="muted" x="452" y="368">description + 1 MiB chunk_N; cfs: clio-fs pages 0, 1, …</text>
+    <rect class="box" x="20" y="388" width="168" height="50" rx="8"/><text class="title" x="32" y="408">gs:// · gcs://</text><text class="muted" x="32" y="426">gs://bucket/key</text>
+    <rect class="box" x="200" y="388" width="228" height="50" rx="8"/><text class="title" x="212" y="408">GcsFileAssimilator</text><text class="muted" x="212" y="426">up to 32 puts in flight</text>
+    <rect class="box hl" x="440" y="388" width="400" height="50" rx="8"/><text class="title" x="452" y="408">the tag named by dst</text><text class="muted" x="452" y="426">description + 1 MiB chunk_N</text>
+    <rect class="box" x="20" y="446" width="168" height="50" rx="8"/><text class="title" x="32" y="466">http:// · https://</text><text class="muted" x="32" y="484">https://host/f.nc</text>
+    <rect class="box" x="200" y="446" width="228" height="50" rx="8"/><text class="title" x="212" y="466">HttpFileAssimilator</text><text class="muted" x="212" y="484">parallel ranged GETs (curl)</text>
+    <rect class="box" x="440" y="446" width="400" height="50" rx="8"/><text class="title" x="452" y="466">a local file, not a tag</text><text class="muted" x="452" y="484">dst must be file::&lt;path&gt;</text>
+    <rect class="box" x="20" y="504" width="168" height="50" rx="8"/><text class="title" x="32" y="524">globus://</text><text class="muted" x="32" y="542">or app.globus.org URL</text>
+    <rect class="box" x="200" y="504" width="228" height="50" rx="8"/><text class="title" x="212" y="524">GlobusFileAssimilator</text><text class="muted" x="212" y="542">downloads with curl</text>
+    <rect class="box" x="440" y="504" width="400" height="50" rx="8"/><text class="title" x="452" y="524">a local file or another endpoint</text><text class="muted" x="452" y="542">dst file:: or globus://, not a tag</text>
+  </svg>
+  <figcaption>The factory picks the class by the scheme of the source URL; the
+  format field only refines it (HDF5's <code>hdf5_vol</code> stages the file in
+  the VOL connector's cache layout instead). Accented outputs are CTE tags,
+  written through the CAE's <code>next_pool_id</code>; the last two rows write
+  files outside the CTE. Only the file assimilator can serve a single blob, so
+  only it supports <code>on_fault</code>.</figcaption>
+</figure>
+
+<h2 id="fault">Ingest on fault</h2>
+<p>With <code>on_fault</code> set, a transfer copies nothing. The core records the context in a registry under a hashed id, and the destination carries that id as its fault parameters. When a read misses a blob, the CTE sends a get for that blob to the tag's fault pool, the CAE, carrying the id; the core looks up the context and asks the source's assimilator for exactly that blob, stores it, and lets the read continue. Source reads can take seconds on a parallel filesystem, so they run on a separate pool of threads (32 by default, <code>CLIO_CAE_REF_IO_THREADS</code>) while the fault task yields, keeping runtime workers free. Because the source is readable from every node, a fault tag's blobs are served and kept on whichever node reads them, rather than on a hashed owner. <code>CLIO_CAE_FAULT_STATS=1</code> logs per-stage counters every five seconds.</p>
+<p>Ingested blobs can always be fetched again, so they never take the last of a tier: a fault is served from the source without being stored when the node's free space would drop below a reserve (512 MiB, <code>CLIO_CAE_FAULT_RESERVE_MB</code>), and for the next 256 faults after a store fails. <code>CLIO_CAE_FAULT_STORE=0</code> turns storing off entirely, making the tag a pure read-through.</p>
+
+<h2 id="fault-path">The fault path</h2>
+<figure class="diagram">
+  <svg viewBox="0 0 860 660" role="img" aria-label="Ingest on fault: registration publishes the context and tags the destination; a read miss in the CTE becomes a get to the CAE, which reads the one blob from the source on its I/O pool, stores it and serves the read">
+    <defs><marker id="cae2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+    <rect class="box alt" x="20" y="20" width="820" height="76" rx="8"/><text class="title" x="32" y="44">Registration: ParseOmni with on_fault: true (nothing is copied)</text>
+    <text class="muted" x="32" y="64">id = "fault:" + a 64-bit FNV-1a hash of the context · the context is saved as blob &lt;id&gt; in tag __cae_on_fault</text>
+    <text class="muted" x="32" y="82">tag run gets fault pool = the CAE and fault params = &lt;id&gt; on every CTE container · the CAE maps id → assimilator</text>
+    <rect class="box" x="20" y="116" width="820" height="528" rx="10" stroke-dasharray="6 5"/><text class="muted" x="32" y="134">ANY NODE THAT READS THE TAG</text>
+    <rect class="box alt" x="36" y="146" width="400" height="56" rx="8"/><text class="title" x="48" y="168">Reader</text><text class="muted" x="48" y="188">GetBlob(tag run, chunk_7, 64 KiB at offset 0)</text>
+    <path class="edge hl" d="M236,202 L236,224" marker-end="url(#cae2)"/>
+    <rect class="box hl" x="36" y="226" width="400" height="92" rx="8"/><text class="title" x="48" y="248">CTE core container on this node</text>
+    <text class="muted" x="48" y="268">a fault tag's blobs are served where they are read</text><text class="muted" x="48" y="284">chunk_7 is missing and the get lacks kNoFault, so:</text><text class="muted" x="48" y="300">GetBlob → fault pool, fault_params = fault:&lt;16 hex&gt;</text>
+    <path class="edge hl" d="M236,318 L236,340" marker-end="url(#cae2)"/>
+    <rect class="box hl" x="36" y="342" width="400" height="150" rx="8"/><text class="title" x="48" y="364">CAE core: GetBlob with a fault: id</text>
+    <text class="muted" x="48" y="386">1. find the id in the map, else load it from the registry</text>
+    <text class="muted" x="48" y="402">2. stage a buffer of BlobBytes (1 MiB here)</text>
+    <text class="muted" x="48" y="418">3. ReadBlob on the I/O pool; the task yields meanwhile</text>
+    <text class="muted" x="48" y="434">4. zero-fill past the end of the source</text>
+    <text class="muted" x="48" y="450">5. PutBlob chunk_7 into tag run, with kNoFault</text>
+    <text class="muted" x="48" y="466">6. copy the asked range into the reader's buffer</text>
+    <path class="edge hl" d="M236,492 L236,538" marker-end="url(#cae2)"/>
+    <rect class="box" x="36" y="540" width="400" height="56" rx="8"/><text class="title" x="48" y="562">Tag run</text><text class="muted" x="48" y="582">chunk_7 is now held: the next read is a plain hit</text>
+    <rect class="box alt" x="470" y="226" width="354" height="72" rx="8"/><text class="title" x="482" y="248">Tag __cae_on_fault (registry)</text>
+    <text class="muted" x="482" y="268">one 16 KiB blob per id: the encoded context</text><text class="muted" x="482" y="284">read on nodes that did not register the source</text>
+    <path class="edge" d="M436,386 L452,386 L452,262 L468,262" marker-end="url(#cae2)"/>
+    <rect class="box" x="470" y="384" width="354" height="72" rx="8"/><text class="title" x="482" y="406">Reference I/O pool</text>
+    <text class="muted" x="482" y="426">32 threads (CLIO_CAE_REF_IO_THREADS)</text><text class="muted" x="482" y="442">task re-polls at 20 µs, 200 µs after 64 polls</text>
+    <path class="edge" d="M436,418 L468,418" marker-end="url(#cae2)"/>
+    <rect class="box" x="470" y="476" width="354" height="56" rx="8"/><text class="title" x="482" y="498">Source /data/run.bin</text><text class="muted" x="482" y="518">bytes [7 MiB, 8 MiB): one open stream per thread</text>
+    <path class="edge" d="M647,456 L647,474" marker-end="url(#cae2)"/>
+    <rect class="box" x="470" y="546" width="354" height="88" rx="8"/><text class="title" x="482" y="568">Store guard (step 5)</text>
+    <text class="muted" x="482" y="588">skip if node free space &lt; 512 MiB reserve</text><text class="muted" x="482" y="604">skip for 256 faults after a failed put</text><text class="muted" x="482" y="620">CLIO_CAE_FAULT_STORE=0: never store</text>
+  </svg>
+  <figcaption>A transfer from <code>file::/data/run.bin</code> to
+  <code>iowarp::run</code>, registered with <code>on_fault</code>. The first read
+  of <code>chunk_7</code> misses in the CTE, which hands the whole get to the CAE;
+  the CAE reads just that megabyte from the source off the runtime workers,
+  stores it as an eager import would have, and answers the read. Its own
+  registry read and put carry <code>kNoFault</code> so they cannot fault back
+  into it.</figcaption>
+</figure>
+
+<h2 id="pagify">Pagify and page maps</h2>
+<p>Paged consumers such as memory expansion and clio-ml address data only as page 0, 1, 2 and so on. A <strong>page map</strong> is an ordered list of extents saying which bytes of which blob occupy which range of page space. It travels with the data, as a blob named <code>pagemap</code> in the tag; the assimilator interface has a hook for producing one, though no shipped assimilator overrides it yet. <strong>Pagify</strong> uses it to build a page: a get through the CAE for a blob named <code>page:&lt;N&gt;</code> loads the tag's map once, fetches the slices straight into the caller's buffer, composes pages made of several blobs, and zero-fills uncovered ranges. The split keeps the arithmetic pure and testable and the I/O injectable.</p>
+
+<h2 id="summarizer">The summarizer</h2>
+<p>The optional summarizer module is a CTE interposer: it forwards every operation, and after a matching put sends the content to the configured language model endpoint (it speaks the Ollama protocol by default) and stores the label as a sibling blob. The model call runs inline on the put's task, so every matching put waits for the model. Enable it only for data you want described.</p>
+
+<h2 id="tradeoffs">Costs of this design</h2>
+<table class="tradeoffs">
+  <tr><th>Decision</th><th>Buys</th><th>Costs</th></tr>
+  <tr><td>One task per transfer list</td><td class="good">One round trip; ordered, simple status</td><td class="cost">Transfers in a list do not run in parallel</td></tr>
+  <tr><td>Writes through the chain</td><td class="good">Imported data is cached, indexed and replicated</td><td class="cost">Imports pay every composed module's cost</td></tr>
+  <tr><td>Ingest on fault</td><td class="good">Instant registration of huge sources</td><td class="cost">First reads pay source latency</td></tr>
+  <tr><td>Separate reference I/O pool</td><td class="good">Slow sources never stall workers</td><td class="cost">Extra threads per runtime</td></tr>
+</table>

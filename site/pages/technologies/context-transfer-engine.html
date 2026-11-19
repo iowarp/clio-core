@@ -82,6 +82,107 @@ print(tag.GetContainedBlobs())               # list keys in the tag
   <li>DynamoDB Local is the local emulator, not the AWS service. All records sit in one tag, so scale-out across tags is not exercised. These are single-node numbers on a development machine.</li>
 </ul>
 
+<h2>Against Redis and Redis Cluster on Ares</h2>
+<p><code>clio_cte_bench</code> and a Redis client built on the same measurement loop issue puts, then gets, over a 1 GiB working set (262,144 keys of 4 KiB, 16,384 of 64 KiB, 1,024 of 1 MiB), 15 s per point, at 1, 4 and 16 client threads with 1 or 16 requests in flight each. Ares nodes: two Xeon Silver 4114 (40 cores), 46 GB of memory, 40 GbE. Redis 7.4.0 runs without persistence. CLIO Core is a release build of <code>cte-shm-cache</code> (a6b70f12c) with 4 runtime workers and a 16 GB DRAM tier, measured without a cache and with the shared-memory write-through cache (4 GB) on top: puts and gets the cache absorbs complete in the client's own process, and the cache writes puts through to the core in the background.</p>
+<h3>One node, against Redis</h3>
+<div class="chart-grid">
+  <figure><figcaption>Put 4 KiB, ops/s</figcaption>
+<ul class="bars" aria-label="Put 4 KiB, ops/s">
+  <li class="ours"><span>CLIO Core + shm cache</span><span class="bar"><i style="width:100%"></i></span><span class="val">940,589</span></li>
+  <li><span>CLIO Core, no cache</span><span class="bar"><i style="width:8%"></i></span><span class="val">71,067</span></li>
+  <li><span>Redis</span><span class="bar"><i style="width:12%"></i></span><span class="val">113,853</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>Put 64 KiB, ops/s</figcaption>
+<ul class="bars" aria-label="Put 64 KiB, ops/s">
+  <li class="ours"><span>CLIO Core + shm cache</span><span class="bar"><i style="width:100%"></i></span><span class="val">243,501</span></li>
+  <li><span>CLIO Core, no cache</span><span class="bar"><i style="width:26%"></i></span><span class="val">62,382</span></li>
+  <li><span>Redis</span><span class="bar"><i style="width:8%"></i></span><span class="val">19,656</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>Put 1 MiB, ops/s</figcaption>
+<ul class="bars" aria-label="Put 1 MiB, ops/s">
+  <li class="ours"><span>CLIO Core + shm cache</span><span class="bar"><i style="width:100%"></i></span><span class="val">15,761</span></li>
+  <li><span>CLIO Core, no cache</span><span class="bar"><i style="width:79%"></i></span><span class="val">12,494</span></li>
+  <li><span>Redis</span><span class="bar"><i style="width:13%"></i></span><span class="val">1,986</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>Get 4 KiB, ops/s</figcaption>
+<ul class="bars" aria-label="Get 4 KiB, ops/s">
+  <li class="ours"><span>CLIO Core + shm cache</span><span class="bar"><i style="width:100%"></i></span><span class="val">1,757,810</span></li>
+  <li><span>CLIO Core, no cache</span><span class="bar"><i style="width:19%"></i></span><span class="val">336,184</span></li>
+  <li><span>Redis</span><span class="bar"><i style="width:12%"></i></span><span class="val">215,744</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>Get 64 KiB, ops/s</figcaption>
+<ul class="bars" aria-label="Get 64 KiB, ops/s">
+  <li class="ours"><span>CLIO Core + shm cache</span><span class="bar"><i style="width:100%"></i></span><span class="val">353,967</span></li>
+  <li><span>CLIO Core, no cache</span><span class="bar"><i style="width:37%"></i></span><span class="val">131,888</span></li>
+  <li><span>Redis</span><span class="bar"><i style="width:6%"></i></span><span class="val">20,832</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>Get 1 MiB, ops/s</figcaption>
+<ul class="bars" aria-label="Get 1 MiB, ops/s">
+  <li class="ours"><span>CLIO Core + shm cache</span><span class="bar"><i style="width:100%"></i></span><span class="val">17,886</span></li>
+  <li><span>CLIO Core, no cache</span><span class="bar"><i style="width:61%"></i></span><span class="val">10,843</span></li>
+  <li><span>Redis</span><span class="bar"><i style="width:5%"></i></span><span class="val">903</span></li>
+</ul>
+  </figure>
+</div>
+<p class="bars-caption">4 client threads, 16 requests in flight each; higher is better. Across all 36 points (6 operation and size pairs, 6 thread and depth settings) the cache beats Redis at every one: 12.0x on the geometric mean, 2.6x at the closest point. With the cache keeping its blob bytes in extents leased from the node's RAM device (an opt-in layout), it beats Redis at every point by 13.2x on the geometric mean.</p>
+<h3>Four nodes, against Redis Cluster</h3>
+<div class="chart-grid">
+  <figure><figcaption>Put 4 KiB, ops/s</figcaption>
+<ul class="bars" aria-label="Put 4 KiB, ops/s">
+  <li class="ours"><span>CLIO Core + shm cache</span><span class="bar"><i style="width:100%"></i></span><span class="val">5,249,790</span></li>
+  <li><span>CLIO Core, no cache</span><span class="bar"><i style="width:2%"></i></span><span class="val">104,124</span></li>
+  <li><span>Redis Cluster (best of 1 or 4 masters per node)</span><span class="bar"><i style="width:3%"></i></span><span class="val">183,447</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>Put 64 KiB, ops/s</figcaption>
+<ul class="bars" aria-label="Put 64 KiB, ops/s">
+  <li class="ours"><span>CLIO Core + shm cache</span><span class="bar"><i style="width:100%"></i></span><span class="val">987,720</span></li>
+  <li><span>CLIO Core, no cache</span><span class="bar"><i style="width:6%"></i></span><span class="val">54,979</span></li>
+  <li><span>Redis Cluster (best of 1 or 4 masters per node)</span><span class="bar"><i style="width:5%"></i></span><span class="val">45,610</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>Put 1 MiB, ops/s</figcaption>
+<ul class="bars" aria-label="Put 1 MiB, ops/s">
+  <li class="ours"><span>CLIO Core + shm cache</span><span class="bar"><i style="width:100%"></i></span><span class="val">82,363</span></li>
+  <li><span>CLIO Core, no cache</span><span class="bar"><i style="width:7%"></i></span><span class="val">5,370</span></li>
+  <li><span>Redis Cluster (best of 1 or 4 masters per node)</span><span class="bar"><i style="width:6%"></i></span><span class="val">4,535</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>Get 4 KiB, ops/s</figcaption>
+<ul class="bars" aria-label="Get 4 KiB, ops/s">
+  <li class="ours"><span>CLIO Core + shm cache</span><span class="bar"><i style="width:100%"></i></span><span class="val">5,166,590</span></li>
+  <li><span>CLIO Core, no cache</span><span class="bar"><i style="width:2%"></i></span><span class="val">89,432</span></li>
+  <li><span>Redis Cluster (best of 1 or 4 masters per node)</span><span class="bar"><i style="width:5%"></i></span><span class="val">267,966</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>Get 64 KiB, ops/s</figcaption>
+<ul class="bars" aria-label="Get 64 KiB, ops/s">
+  <li class="ours"><span>CLIO Core + shm cache</span><span class="bar"><i style="width:100%"></i></span><span class="val">1,357,757</span></li>
+  <li><span>CLIO Core, no cache</span><span class="bar"><i style="width:4%"></i></span><span class="val">56,008</span></li>
+  <li><span>Redis Cluster (best of 1 or 4 masters per node)</span><span class="bar"><i style="width:5%"></i></span><span class="val">62,995</span></li>
+</ul>
+  </figure>
+  <figure><figcaption>Get 1 MiB, ops/s</figcaption>
+<ul class="bars" aria-label="Get 1 MiB, ops/s">
+  <li class="ours"><span>CLIO Core + shm cache</span><span class="bar"><i style="width:100%"></i></span><span class="val">63,263</span></li>
+  <li><span>CLIO Core, no cache</span><span class="bar"><i style="width:13%"></i></span><span class="val">8,087</span></li>
+  <li><span>Redis Cluster (best of 1 or 4 masters per node)</span><span class="bar"><i style="width:8%"></i></span><span class="val">5,368</span></li>
+</ul>
+  </figure>
+</div>
+<p class="bars-caption">Aggregate over 4 nodes, one client process per node, 4 threads with 16 requests in flight each; higher is better. Keys are spread across nodes by hash for both systems. Across all 36 points the cache beats the better Redis Cluster layout at every one: 19.9x on the geometric mean, 8.2x at the closest point.</p>
+<p>How to read it:</p>
+<ul>
+  <li>Without the cache, CLIO Core pays a hop to its runtime process on every operation and trails Redis on small puts. The shared-memory cache removes that hop for the operations it absorbs, which is where most of the gain comes from.</li>
+  <li>A put the cache absorbs is acknowledged once it is in the node's shared memory; the cache writes it to the core in the background, and a sync (<code>SyncTag</code>) waits for it. Redis here keeps everything in memory with no persistence either.</li>
+  <li>In the cluster runs each node reads back the keys it wrote, so cached gets are served from that node's own memory, while Redis Cluster sends every get to the key's master. Workloads where nodes read each other's keys hit the cache less.</li>
+</ul>
+
 <h2>GPU checkpoints through the store</h2>
 <p>The <code>kvhdf5</code> adapter writes HDF5-style datasets from GPU kernels as CTE blobs. Its scaling campaign checkpoints a Gray-Scott simulation on an RTX 4090 with local NVMe, comparing asynchronous blob puts against HDF5:</p>
 <ul class="bars" aria-label="Checkpoint bandwidth into a RAM tier">

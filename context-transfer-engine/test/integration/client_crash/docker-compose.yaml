@@ -14,8 +14,14 @@
 #   Phase 2 (verify): reconnect and do successful PutBlobs — proving the daemon
 #                     survived the crash and is still responsive.
 #
-# run_tests.sh waits on the driver, then additionally asserts the daemon is
-# still running and its log shows no runaway re-queue.
+# run_tests.sh orchestrates the phases through marker files in CN_SYNC (on the
+# shared /workspace mount) instead of fixed sleeps:
+#   daemon_ready  host saw `clio_run status` RUNNING inside the daemon
+#   crash_done    driver finished phase 1 (the crash client exited)
+#   verify_go     host finished watching the daemon log for the #722
+#                 bounded-drop marker (polled, capped) -- start phase 2
+# Each driver wait is capped, and the host bounds everything with one deadline
+# that dumps both containers on a timeout.
 #
 # Client addressing note: an external client sets CLIO_SERVER_ADDR to the
 # daemon's IP (the DEALER connect target) and CLIO_BIND_ADDR to its OWN IP (its
@@ -77,6 +83,7 @@ services:
       - CLIO_PORT=8080
       - CLIO_SERVER_CONF=/workspace/context-transfer-engine/test/integration/client_crash/clio_config.yaml
       - CLIO_WAIT_SERVER=40
+      - CN_SYNC=/workspace/build/cluster_sync/client_crash
       - CTP_LOG_LEVEL=info
       - CLIO_REPO_PATH=/workspace/build/bin
       - PATH=/workspace/build/bin:/usr/local/bin:/usr/bin:/bin
@@ -87,15 +94,17 @@ services:
     command: >
       "
         BIN=/workspace/build/bin/clio_run_client_crash_putblob_test &&
-        echo 'cc-driver: waiting for daemon to be reachable' &&
-        sleep 6 &&
+        CN=/workspace/CI/cluster_node.sh &&
+        echo 'cc-driver: waiting for the daemon to report RUNNING' &&
+        bash $$CN wait-file \"$$CN_SYNC/daemon_ready\" 240 &&
         echo '===== PHASE 1: crash client (fire PutBlobs, then terminate) =====' &&
         CRASH_BURST=800 CRASH_BLOB_KB=64 CRASH_FLUSH_MS=100 timeout 90 $$BIN crash-client ;
-        echo \"crash phase exit=$$?\" &&
-        echo 'cc-driver: waiting past the undeliverable-response drop window' &&
-        sleep 12 &&
+        echo \"crash phase exit=$$?\" ;
+        bash $$CN mark \"$$CN_SYNC/crash_done\" &&
+        echo 'cc-driver: waiting for the host to finish the drop-marker watch' &&
+        bash $$CN wait-file \"$$CN_SYNC/verify_go\" $${CC_VERIFY_GO_CAP:-180} &&
         echo '===== PHASE 2: verify daemon is still responsive =====' &&
-        CRASH_NOCRASH=1 CRASH_BURST=20 CRASH_BLOB_KB=64 timeout 90 $$BIN crash-client ;
+        CRASH_NOCRASH=1 CRASH_BURST=20 CRASH_BLOB_KB=64 timeout $${CC_VERIFY_CAP:-240} $$BIN crash-client ;
         VERIFY_RC=$$? ;
         echo \"VERIFY_RC=$$VERIFY_RC\" ;
         exit $$VERIFY_RC

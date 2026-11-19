@@ -303,6 +303,20 @@ class SystemInfo {
 
   CTP_DLL static void Unsetenv(const char *name);
 
+  /**
+   * Convert a Win32 verbatim path to its ordinary form.
+   *
+   * A verbatim path ("\\?\C:\dir", "\\?\UNC\server\share") reaches the kernel
+   * unparsed, so a '/' that the runtime appends when it builds a file name
+   * becomes an invalid character and every open on it fails (#1356). Such a
+   * path is rewritten as "C:\dir" or "\\server\share". Other paths, and every
+   * path on non-Windows platforms, are returned unchanged.
+   *
+   * @param path path as given by a user, an environment variable or a config
+   * @return the path without a verbatim prefix
+   */
+  CTP_DLL static std::string NormalizePath(const std::string &path);
+
   /** Get the per-user clio tmp directory path (/tmp/clio_$USER) */
   CTP_DLL static std::string GetMemfdDir();
 
@@ -447,6 +461,14 @@ class SystemInfo {
 
   /** Directory of the shared library containing the given symbol. */
   CTP_DLL static std::string GetModuleDirectoryFor(void *symbol);
+
+  /**
+   * Resolved path of the shared library (or executable) that contains the
+   * given symbol.
+   * @param symbol Address of a function or object
+   * @return The canonical file path, or "" if it cannot be determined
+   */
+  CTP_DLL static std::string GetModulePathFor(void *symbol);
 
   /// @brief Retrieves storage device hardware health statistics.
   CTP_DLL static std::string GetDeviceHealthStats(const std::string &path);

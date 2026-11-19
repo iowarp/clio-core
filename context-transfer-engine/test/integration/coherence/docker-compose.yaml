@@ -23,6 +23,8 @@ x-coh-env: &coh-env
   CLIO_SERVER_CONF: /workspace/context-transfer-engine/test/integration/coherence/clio_config.yaml
   CONTAINER_HOSTFILE: /workspace/context-transfer-engine/test/integration/coherence/hostfile
   CTE_NUM_NODES: "4"
+  # Ready/done markers (CI/cluster_node.sh); run_tests.sh resets this dir.
+  CN_SYNC: /workspace/build/cluster_sync/coherence
   CLIO_WITH_RUNTIME: "0"
   # The test client binds the chain top (the runtime ignores this env; its
   # module-internal clients bind pools explicitly).
@@ -34,34 +36,34 @@ x-coh-env: &coh-env
   LD_LIBRARY_PATH: /workspace/build/bin:/usr/local/cuda/lib64:/usr/local/lib
 
 # Teardown note (cluster coherence regression, bisected to ddeb20d0):
-# each node kills ITS OWN runtime the instant its local client exits. Barrier()
+# each node kills ITS OWN runtime once its local client exits. Barrier()
 # guarantees every rank has PUBLISHED its blob, not that peers have finished
 # READING it -- so a rank that finishes first used to tear its node down while
 # slower peers were still fetching from it, and their Barrier() timed out.
+# That was papered over first by an accidental ~1s grace in ClientFinalize,
+# then by an explicit `sleep COH_TEARDOWN_LINGER` (10 s), which is still a
+# guess: too short on a slow runner, pure waste on a fast one.
 #
-# That never showed because ClientFinalize sat through up to a full second of
-# the heartbeat probe's nap, so the runtime outlived the client by roughly that
-# margin. ddeb20d0 made client exit prompt (correctly -- it was costing every
-# short-lived process ~1s) and the accidental grace disappeared, turning the
-# 4-node coherence step into a 20-minute timeout on every dev push since.
-#
-# Proven by experiment: f8f6fad9 fails, f8f6fad9 minus ddeb20d0 passes, and
-# f8f6fad9 WITH ddeb20d0 plus only that ~1s restored also passes -- so the
-# differentiator is the wall-clock grace, not the condition variable.
-#
-# Make the grace explicit and generous rather than incidental. Overridable via
-# COH_TEARDOWN_LINGER for anyone tightening the loop locally.
+# Now it is a barrier. Each node writes <node>.done to the shared sync dir
+# (/workspace bind mount) when its suite exits, and keeps its runtime up until
+# all four .done markers exist (CI/cluster_node.sh wait-done, capped at
+# COH_DONE_CAP s so a hung peer cannot pin this node forever -- the hung peer
+# itself is caught by run_tests.sh's deadline, which dumps every node).
+# Start is symmetric: no node runs the suite until all four runtimes answer
+# `clio_run status` (<node>.ready markers), replacing the old `sleep 5`.
 x-coh-cmd: &coh-cmd >
   "
     echo \"Node $$NODE_ID: starting runtime\" &&
     /workspace/build/bin/clio_run runtime start --fresh &
     RUNTIME_PID=$$! &&
-    sleep 5 &&
+    bash /workspace/CI/cluster_node.sh ready \"$$CN_SYNC\" node$$NODE_ID $$RUNTIME_PID &&
+    bash /workspace/CI/cluster_node.sh wait-ready \"$$CN_SYNC\" 4 &&
     echo \"Node $$NODE_ID: running coherence suite\" &&
     /workspace/build/bin/test_cache_coherence 2>&1;
     TEST_EXIT_CODE=$$?;
     echo \"Node $$NODE_ID: suite exit $$TEST_EXIT_CODE\";
-    sleep $${COH_TEARDOWN_LINGER:-10};
+    bash /workspace/CI/cluster_node.sh done \"$$CN_SYNC\" node$$NODE_ID $$TEST_EXIT_CODE;
+    bash /workspace/CI/cluster_node.sh wait-done \"$$CN_SYNC\" 4 $${COH_DONE_CAP:-600};
     kill $$RUNTIME_PID 2>/dev/null;
     exit $$TEST_EXIT_CODE
   "

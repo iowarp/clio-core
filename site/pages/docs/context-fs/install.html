@@ -40,8 +40,8 @@ $ cmake --build build-mac-fuse -j"$(sysctl -n hw.ncpu)"
   <section class="tab-panel" data-tab="Windows"><p class="tab-title">Windows</p>
 <p>Install <a href="https://winfsp.dev/rel/">WinFsp</a>. The pip console script adds <code>%ProgramFiles(x86)%\WinFsp\bin</code> to <code>PATH</code> itself and refuses to start if that folder is missing. To build from source you also need WinFsp's developer files (install the MSI with <code>ADDLOCAL=ALL</code>), then:</p>
 <pre data-label="powershell">
-PS&gt;cmake --preset windows-release -DCLIO_CTE_ENABLE_FUSE_ADAPTER=ON
-PS&gt;cmake --build build --config Release
+PS>cmake --preset windows-release -DCLIO_CTE_ENABLE_FUSE_ADAPTER=ON
+PS>cmake --build build --config Release
 </pre>
 <p>Dependencies come from vcpkg; set <code>VCPKG_ROOT</code> first. <a href="/tutorials/fuse-windows.html">FUSE on Windows</a> has the Defender note and the <code>-o uid=-1,gid=-1</code> option for git.</p></section>
 </div>
@@ -59,10 +59,10 @@ PS&gt;cmake --build build --config Release
 <h2>Check that it works</h2>
 <p>Start the runtime, mount, write a file through the mount, and unmount. On Linux:</p>
 <pre data-label="shell">
-$ clio_run start &amp;
+$ clio_run start &
 $ mkdir -p ~/clio-mnt
-$ CLIO_WITH_RUNTIME=0 clio_cte_fuse ~/clio-mnt -f &amp;
-$ echo hello &gt; ~/clio-mnt/hello.txt
+$ CLIO_WITH_RUNTIME=0 clio_cte_fuse ~/clio-mnt -f &
+$ echo hello > ~/clio-mnt/hello.txt
 $ cat ~/clio-mnt/hello.txt
 hello
 $ fusermount3 -u ~/clio-mnt

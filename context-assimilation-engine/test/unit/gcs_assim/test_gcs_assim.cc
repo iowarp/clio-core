@@ -189,7 +189,7 @@ int main(int /*argc*/, char* /*argv*/[]) {
       HLOG(kError, "Tag not found in CTE: {}", kTagName);
       exit_code = 1;
     } else {
-      auto size_task = cte_client->AsyncGetTagSize(tag_id);
+      auto size_task = cte_client->AsyncGetTagSize(tag_id, clio::run::PoolQuery::Broadcast(0.0f));
       size_task.Wait();
       size_t tag_size = size_task->tag_size_;
       // The assimilator stores the object bytes plus a "binary<size=N,

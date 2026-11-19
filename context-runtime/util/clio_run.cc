@@ -4,11 +4,17 @@
 
 #include "clio_run_commands.h"
 
+// Injected by CMake from project(iowarp-core VERSION ...) through the
+// clio_core_version interface target; the fallback only covers a hand build.
+#ifndef CLIO_CORE_VERSION_STRING
+#define CLIO_CORE_VERSION_STRING "unknown"
+#endif
+
 namespace {
 // Program name to display in usage messages: derived from argv[0]'s basename
-// so the symlink invocation `clio_run` prints "Usage: clio_run ..." while
-// the legacy `clio` invocation keeps the historical text. Set by main().
-const char* g_progname = "clio_run";
+// so the canonical `clio-run` and the legacy alias `clio_run` each print their
+// own name. Set by main().
+const char* g_progname = "clio-run";
 
 void PrintUsage() {
   std::cerr << "Usage: " << g_progname << " <command> [options]\n"
@@ -27,13 +33,17 @@ void PrintUsage() {
             << "  config          Export node configuration:\n"
             << "                  config export --path <file>\n"
             << "  refresh         Autogenerate ChiMod method files\n"
+            << "  viz             Control the web dashboard:\n"
+            << "                  viz <start|stop|status> (see viz --help)\n"
+            << "  version         Print the version (also --version, -V)\n"
             << "\n"
             << "Legacy nested forms (still supported):\n"
             << "  runtime <start|stop>\n"
             << "  repo refresh\n"
             << "\n"
             << "Run '" << g_progname
-            << " <command> --help' for more information on a command.\n";
+            << " <command> --help' for more information on a command.\n"
+            << "(clio_run is a legacy alias of clio-run.)\n";
 }
 /**
  * `restart` was removed: `start` always recovers persistent state now.
@@ -68,6 +78,11 @@ int main(int argc, char* argv[]) {
     return 0;
   }
 
+  if (cmd == "--version" || cmd == "-V" || cmd == "version") {
+    std::cout << g_progname << " " << CLIO_CORE_VERSION_STRING << "\n";
+    return 0;
+  }
+
   // Flat dispatch (canonical form):
   //   <progname> start | stop | refresh | migrate | monitor | compose
   // Strip "<progname> <cmd>" from argv. Each handler sees only its own args.
@@ -93,6 +108,8 @@ int main(int argc, char* argv[]) {
       return Compose(new_argc, new_argv);
     } else if (cmd == "config") {
       return Config(new_argc, new_argv);
+    } else if (cmd == "viz") {
+      return Viz(new_argc, new_argv);
     }
   }
 

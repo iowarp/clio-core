@@ -169,7 +169,11 @@ class Runtime : public clio::run::Container {
   static constexpr clio::run::u64 kCompactGrowthFactor = 4;
 
   /**
-   * Get live task statistics for this task instance.
+   * Get live task statistics for this task instance (every method).
+   * Read/Write scale with their length; every other method returns an
+   * explicit constant (see safe_bdev_runtime.cc).
+   * @param task the task to estimate
+   * @return the task's cost features
    */
   clio::run::TaskStat GetTaskStats(const clio::run::Task *task) const override;
 

@@ -13,7 +13,7 @@ $ clio_run start
 </pre>
 <p>Leave it running in its own terminal, or add <code>&amp;</code> to run it in the background. It is ready when the log shows the client transport. Its port is the base RPC port, 9413, plus 3:</p>
 <pre data-label="output">
-IpcManager: TCP ROUTER transport bound on &lt;address&gt;:9416
+IpcManager: TCP ROUTER transport bound on <address>:9416
 Viz: dashboard listening at http://127.0.0.1:8080
 </pre>
 <p>In another terminal, <code>clio_run status</code> prints <code>RUNNING</code>, <code>STOPPED (clean)</code>, or <code>STOPPED (stale artifacts)</code> when a crashed runtime left files behind.</p>
@@ -65,7 +65,7 @@ for name in client.TagQuery(".*notes/.*", 0):
     paths[(tid.major_, tid.minor_)] = name
 
 for hit in client.SemanticSearch(".*notes/.*", "[0-9]+", "sea ice extent", 5):
-    if hit.score &gt; 0:                      # 0 means no query word appears
+    if hit.score > 0:                      # 0 means no query word appears
         print(f"{hit.score:6.2f}  {paths.get((hit.tag_id.major_, hit.tag_id.minor_))}")
 </pre>
 <p>Results are ranked by BM25 relevance. Each hit is one 1 MiB page of a file, and <code>hit.blob_name</code> is the page number. The blob pattern <code>[0-9]+</code> limits the search to pages; each file also has a small attribute blob named <code>~i</code>. Every page that matches the patterns is ranked, so pages without any query word come back with a score of 0. <a href="/tutorials/python-semantic-query.html">Query files from Python</a> covers name and time queries, reading the bytes back, and the higher-level <code>clio_cee</code> API.</p>

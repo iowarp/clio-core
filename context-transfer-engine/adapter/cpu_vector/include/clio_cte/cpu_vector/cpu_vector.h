@@ -522,8 +522,10 @@ class Vector {
           clio::cte::checkpoint::kCheckpointPoolId, storage_pool_id_);
       clio::cte::checkpoint::CheckpointConfig params;
       params.next_pool_id_ = storage_pool_id_;
+      // Dynamic, not Local: a fault on a copy runs on the node that owns the
+      // blob, so the checkpoint pool must exist on every node.
       auto cf = ckpt.AsyncCreateCheckpoint(
-          clio::run::PoolQuery::Local(),
+          clio::run::PoolQuery::Dynamic(),
           clio::cte::checkpoint::kCheckpointPoolName,
           clio::cte::checkpoint::kCheckpointPoolId, params);
       cf.Wait();

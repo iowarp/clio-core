@@ -22,6 +22,8 @@
 #ifndef CLIO_CTE_FILESYSTEM_FILESYSTEM_TASKS_H_
 #define CLIO_CTE_FILESYSTEM_FILESYSTEM_TASKS_H_
 
+#include <cstdlib>
+#include <cstring>
 #include <string>
 #include <clio_ctp/util/msan.h>
 #include <vector>
@@ -29,6 +31,7 @@
 #include <clio_runtime/clio_runtime.h>
 #include <clio_runtime/task.h>
 #include <clio_runtime/admin/admin_tasks.h>
+#include <clio_ctp/util/config_parse.h>
 #include <clio_cte/core/core_tasks.h>
 #include <clio_cte/filesystem/autogen/filesystem_methods.h>
 
@@ -46,20 +49,51 @@ GLOBAL_CROSS_CONST clio::run::u64 kFsPageSize = 1024 * 1024;
  * Lives in the shared header, not in the runtime's .cc, because since issue
  * #817 a CLIENT resolves page blobs itself on the fast path. Two copies of
  * this rule would let the reader and the writer disagree about which blob a
- * byte range lives in -- the same reasoning that keeps MakeShmBlobKey single
- * sourced in the CTE core.
+ * byte range lives in.
  */
 inline std::string PageName(clio::run::u64 off) {
   return std::to_string(off / kFsPageSize);
 }
 
 /**
- * Well-known default pool id/name for the filesystem chimod, used by the
- * interceptor adapters (libfuse, POSIX, ...) to create-or-bind a single
- * shared filesystem pool over the default CTE core pool — exactly the way
- * clio::cte::core uses kCtePoolId/kCtePoolName.
+ * Text form of a page-score rule, as the Monitor query "data_score" returns
+ * it: "<bit pattern of data_score as a decimal u32> <head pages>". The bit
+ * pattern keeps the float exact and independent of the process locale.
+ * @param policy rule to encode
+ * @return the encoded rule (inverse of DecodePageScore)
  */
-static constexpr clio::run::PoolId kCfsPoolId(560, 0);
+inline std::string EncodePageScore(
+    const clio::cte::core::PageScorePolicy &policy) {
+  clio::run::u32 bits = 0;
+  std::memcpy(&bits, &policy.data_score_, sizeof(bits));
+  return std::to_string(bits) + " " + std::to_string(policy.head_pages_);
+}
+
+/**
+ * Parse EncodePageScore's text form.
+ * @param text encoded rule
+ * @param out receives the rule on success (untouched otherwise)
+ * @return true when both fields were present
+ */
+inline bool DecodePageScore(const std::string &text,
+                            clio::cte::core::PageScorePolicy *out) {
+  const size_t sp = text.find(' ');
+  if (sp == std::string::npos || sp == 0 || sp + 1 >= text.size()) {
+    return false;
+  }
+  const clio::run::u32 bits =
+      static_cast<clio::run::u32>(std::strtoul(text.c_str(), nullptr, 10));
+  std::memcpy(&out->data_score_, &bits, sizeof(bits));
+  out->head_pages_ = static_cast<clio::run::u32>(
+      std::strtoul(text.c_str() + sp + 1, nullptr, 10));
+  return true;
+}
+
+/**
+ * Default NAME of the filesystem pool. clio-fs assumes no pool id: clients
+ * find the composed filesystem pool by name (CLIO_CFS_POOL overrides it),
+ * and the filesystem learns every other pool it uses from its config.
+ */
 static constexpr const char *kCfsPoolName = "clio_cte_filesystem";
 
 /**
@@ -69,7 +103,7 @@ static constexpr const char *kCfsPoolName = "clio_cte_filesystem";
 struct FilesystemConfig {
   static constexpr const char* chimod_lib_name = "clio_cte_filesystem";
 
-  clio::run::PoolId next_pool_id_;  ///< CTE core pool id (e.g. 512.0)
+  clio::run::PoolId next_pool_id_;  ///< data chain pool (required)
   /**
    * Node-local file persisting this container's slice of the namespace
    * (its inode-table blocks and the inodes it is home for). Empty =
@@ -79,8 +113,9 @@ struct FilesystemConfig {
   std::string metadata_log_path_;
   /**
    * Stream pool that owns every file's logical size and merges deferred
-   * appends (clio::cte::stream). Created with defaults (over next_pool_id_,
-   * logging next to metadata_log_path_) if the deployment did not compose it.
+   * appends (clio::cte::stream). Unset: the filesystem creates its own,
+   * named "<filesystem pool name>_stream", at the id one minor above its own
+   * pool id, over next_pool_id_ and logging next to metadata_log_path_.
    */
   clio::run::PoolId stream_pool_id_;
   /**
@@ -90,31 +125,71 @@ struct FilesystemConfig {
    */
   clio::run::u32 dir_split_entries_;
   /**
+   * Bytes of delta frames a directory block's CTE blob may hold past its
+   * image frame before the next commit rewrites it whole (YAML
+   * `dir_log_compact_bytes`, a size, default 256KB; 0 rewrites the whole
+   * block on every commit, the earlier behaviour).
+   */
+  clio::run::u64 dir_log_compact_bytes_;
+  /**
    * Compare names case-insensitively, as NTFS does (YAML `case_insensitive`,
    * default false). Names keep the spelling they were created with. Fixed
    * when the volume is created: a volume opened with the other setting is
    * refused.
    */
   bool case_insensitive_;
+  /**
+   * Placement score file DATA pages are written with (YAML `data_score`,
+   * default -1 = off: every page is put with the core's default score, as
+   * metadata is). A value in (0, 1] steers bulk file data to the tier of
+   * that score, leaving the highest-scored tier to directory blocks and to
+   * the first `data_score_head_pages` pages of each file. Any other value
+   * is treated as off.
+   */
+  float data_score_;
+  /**
+   * Leading 1 MiB pages of every file that keep the default score when
+   * `data_score` is set (YAML `data_score_head_pages`, default 1; 0 = every
+   * page uses `data_score`). Ignored while `data_score` is off.
+   */
+  clio::run::u32 data_score_head_pages_;
 
   FilesystemConfig()
       : next_pool_id_(clio::run::PoolId::GetNull()),
-        stream_pool_id_(565, 0),
+        stream_pool_id_(clio::run::PoolId::GetNull()),
         dir_split_entries_(1024),
-        case_insensitive_(false) {}
+        dir_log_compact_bytes_(256ull << 10),
+        case_insensitive_(false),
+        data_score_(-1.0f),
+        data_score_head_pages_(1) {}
   FilesystemConfig(const clio::run::PoolId &pool_id, const FilesystemConfig &other)
       : next_pool_id_(other.next_pool_id_),
         metadata_log_path_(other.metadata_log_path_),
         stream_pool_id_(other.stream_pool_id_),
         dir_split_entries_(other.dir_split_entries_),
-        case_insensitive_(other.case_insensitive_) {
+        dir_log_compact_bytes_(other.dir_log_compact_bytes_),
+        case_insensitive_(other.case_insensitive_),
+        data_score_(other.data_score_),
+        data_score_head_pages_(other.data_score_head_pages_) {
     (void)pool_id;
   }
 
   template <class Archive>
   void serialize(Archive &ar) {
     ar(next_pool_id_, metadata_log_path_, stream_pool_id_, dir_split_entries_,
-       case_insensitive_);
+       case_insensitive_, dir_log_compact_bytes_, data_score_,
+       data_score_head_pages_);
+  }
+
+  /**
+   * The page-score rule these settings describe.
+   * @return policy whose ScoreOf(page index) is the score to put a page with
+   */
+  clio::cte::core::PageScorePolicy PageScore() const {
+    clio::cte::core::PageScorePolicy policy;
+    policy.data_score_ = data_score_;
+    policy.head_pages_ = data_score_head_pages_;
+    return policy;
   }
 
   void LoadConfig(const clio::run::PoolConfig &pool_config) {
@@ -142,8 +217,19 @@ struct FilesystemConfig {
       if (node["dir_split_entries"]) {
         dir_split_entries_ = node["dir_split_entries"].as<clio::run::u32>();
       }
+      if (node["dir_log_compact_bytes"]) {
+        dir_log_compact_bytes_ = ctp::ConfigParse::ParseSize(
+            node["dir_log_compact_bytes"].as<std::string>());
+      }
       if (node["case_insensitive"]) {
         case_insensitive_ = node["case_insensitive"].as<bool>();
+      }
+      if (node["data_score"]) {
+        data_score_ = node["data_score"].as<float>();
+      }
+      if (node["data_score_head_pages"]) {
+        data_score_head_pages_ =
+            node["data_score_head_pages"].as<clio::run::u32>();
       }
     } catch (...) {
       // best-effort
@@ -178,16 +264,35 @@ struct OpenTask : public clio::run::Task {
   // Packed TagId (major<<32|minor) of the file's tag, so adapters can drive
   // page-blob I/O (sieve writes, RYW reads) through the CTE client directly.
   OUT clio::run::u64 tag_packed_;
+  // The file's attributes as its inode's home held them when it opened the
+  // file (after an O_TRUNC truncation), i.e. what a Getattr at that instant
+  // reports: has_attr_ = 1 and the fields below are GetattrTask's of the
+  // same names (attr_mode_ is its mode_; the size is size_). Only for a
+  // regular file. A caller can answer the stat that follows a create from
+  // them instead of asking again.
+  OUT clio::run::u32 has_attr_;
+  OUT clio::run::u64 ino_;
+  OUT clio::run::u64 ctime_;
+  OUT clio::run::u64 mtime_;
+  OUT clio::run::u64 atime_;
+  OUT clio::run::u32 uid_;
+  OUT clio::run::u32 gid_;
+  OUT clio::run::u32 attr_mode_;
+  OUT clio::run::u32 nlink_;
 
   OpenTask()
       : clio::run::Task(), path_(CTP_MALLOC), flags_(0), mode_(0644),
-        handle_(0), size_(0), created_(0), tag_packed_(0) {}
+        handle_(0), size_(0), created_(0), tag_packed_(0), has_attr_(0),
+        ino_(0), ctime_(0), mtime_(0), atime_(0), uid_(0xFFFFFFFFu),
+        gid_(0xFFFFFFFFu), attr_mode_(0xFFFFFFFFu), nlink_(1) {}
   explicit OpenTask(const clio::run::TaskId &task_id, const clio::run::PoolId &pool_id,
                     const clio::run::PoolQuery &pool_query, const std::string &path,
                     clio::run::u32 flags, clio::run::u32 mode)
       : clio::run::Task(task_id, pool_id, pool_query, Method::kOpen),
         path_(CTP_MALLOC, path), flags_(flags), mode_(mode), handle_(0),
-        size_(0), created_(0), tag_packed_(0) {}
+        size_(0), created_(0), tag_packed_(0), has_attr_(0), ino_(0),
+        ctime_(0), mtime_(0), atime_(0), uid_(0xFFFFFFFFu),
+        gid_(0xFFFFFFFFu), attr_mode_(0xFFFFFFFFu), nlink_(1) {}
   void Copy(const ctp::ipc::FullPtr<OpenTask>& o) {
     // Base fields first (pool id, method, query, flags): a forwarded copy
     // without them reached SendIn with a null pool and crashed the node.
@@ -195,12 +300,17 @@ struct OpenTask : public clio::run::Task {
     path_ = o->path_; flags_ = o->flags_; mode_ = o->mode_;
     handle_ = o->handle_; size_ = o->size_; created_ = o->created_;
     tag_packed_ = o->tag_packed_;
+    has_attr_ = o->has_attr_; ino_ = o->ino_; ctime_ = o->ctime_;
+    mtime_ = o->mtime_; atime_ = o->atime_; uid_ = o->uid_; gid_ = o->gid_;
+    attr_mode_ = o->attr_mode_; nlink_ = o->nlink_;
   }
   template <typename Ar> void SerializeIn(Ar &ar) {
     Task::SerializeIn(ar); ar(path_, flags_, mode_);
   }
   template <typename Ar> void SerializeOut(Ar &ar) {
-    Task::SerializeOut(ar); ar(handle_, size_, created_, tag_packed_);
+    Task::SerializeOut(ar);
+    ar(handle_, size_, created_, tag_packed_, has_attr_, ino_, ctime_, mtime_,
+       atime_, uid_, gid_, attr_mode_, nlink_);
   }
 };
 
@@ -884,24 +994,82 @@ struct ReaddirTask : public clio::run::Task {
   IN clio::run::priv::string path_;
   OUT clio::run::priv::vector<clio::run::priv::string> entries_;
   OUT clio::run::priv::vector<clio::run::u64> inos_;  // packed TagId per entry (parallel)
+  /** kFsType* of each entry (parallel to entries_): the type stored in the
+   *  directory row, so a lister gets d_type without a stat per entry. */
+  OUT clio::run::priv::vector<clio::run::u32> types_;
   ReaddirTask()
       : clio::run::Task(), path_(CTP_MALLOC), entries_(CTP_MALLOC),
-        inos_(CTP_MALLOC) {}
+        inos_(CTP_MALLOC), types_(CTP_MALLOC) {}
   explicit ReaddirTask(const clio::run::TaskId &task_id, const clio::run::PoolId &pool_id,
                        const clio::run::PoolQuery &pool_query, const std::string &path)
       : clio::run::Task(task_id, pool_id, pool_query, Method::kReaddir),
-        path_(CTP_MALLOC, path), entries_(CTP_MALLOC), inos_(CTP_MALLOC) {}
+        path_(CTP_MALLOC, path), entries_(CTP_MALLOC), inos_(CTP_MALLOC),
+        types_(CTP_MALLOC) {}
   void Copy(const ctp::ipc::FullPtr<ReaddirTask>& o) {
     // Base fields first (pool id, method, query, flags): a forwarded copy
     // without them reached SendIn with a null pool and crashed the node.
     clio::run::Task::Copy(o.template Cast<clio::run::Task>());
     path_ = o->path_; entries_ = o->entries_; inos_ = o->inos_;
+    types_ = o->types_;
   }
   template <typename Ar> void SerializeIn(Ar &ar) {
     Task::SerializeIn(ar); ar(path_);
   }
   template <typename Ar> void SerializeOut(Ar &ar) {
-    Task::SerializeOut(ar); ar(entries_, inos_);
+    Task::SerializeOut(ar); ar(entries_, inos_, types_);
+  }
+};
+
+/**
+ * ReaddirRange: list one chunk of a directory in offset order.
+ *
+ * Every entry has a stable offset derived from its name (DirEntryOff, see
+ * fs_inode_table.h), the same in every process and across opens. The chunk
+ * holds the entries at or after `start_off_`, in ascending (offset, name)
+ * order, and `next_off_` is the exact offset of the first entry after it --
+ * pass it as the next `start_off_` -- or kDirOffEnd when the chunk reaches
+ * the end of the directory. A chunk holds at least `max_entries_` entries
+ * unless the directory ends first, and may hold somewhat more (it is never
+ * cut inside a table block; a directory small enough for one reply comes
+ * back whole). return_code_ is errno-style (0 / ENOENT / ENOTDIR / EIO /
+ * EAGAIN).
+ */
+struct ReaddirRangeTask : public clio::run::Task {
+  IN clio::run::priv::string path_;   ///< directory path
+  IN clio::run::u64 start_off_;       ///< first offset wanted (0: the start)
+  IN clio::run::u32 max_entries_;     ///< entries after which the chunk ends
+  OUT clio::run::priv::vector<clio::run::priv::string> entries_;  ///< full paths
+  OUT clio::run::priv::vector<clio::run::u64> inos_;   ///< inode per entry
+  OUT clio::run::priv::vector<clio::run::u32> types_;  ///< kFsType* per entry
+  OUT clio::run::priv::vector<clio::run::u64> offs_;   ///< offset per entry
+  OUT clio::run::u64 next_off_;       ///< where the next chunk starts
+  ReaddirRangeTask()
+      : clio::run::Task(), path_(CTP_MALLOC), start_off_(0),
+        max_entries_(8192), entries_(CTP_MALLOC), inos_(CTP_MALLOC),
+        types_(CTP_MALLOC), offs_(CTP_MALLOC), next_off_(0) {}
+  explicit ReaddirRangeTask(const clio::run::TaskId &task_id,
+                            const clio::run::PoolId &pool_id,
+                            const clio::run::PoolQuery &pool_query,
+                            const std::string &path, clio::run::u64 start_off,
+                            clio::run::u32 max_entries = 8192)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kReaddirRange),
+        path_(CTP_MALLOC, path), start_off_(start_off),
+        max_entries_(max_entries), entries_(CTP_MALLOC), inos_(CTP_MALLOC),
+        types_(CTP_MALLOC), offs_(CTP_MALLOC), next_off_(0) {}
+  void Copy(const ctp::ipc::FullPtr<ReaddirRangeTask>& o) {
+    // Base fields first (pool id, method, query, flags): a forwarded copy
+    // without them reached SendIn with a null pool and crashed the node.
+    clio::run::Task::Copy(o.template Cast<clio::run::Task>());
+    path_ = o->path_; start_off_ = o->start_off_;
+    max_entries_ = o->max_entries_; entries_ = o->entries_;
+    inos_ = o->inos_; types_ = o->types_; offs_ = o->offs_;
+    next_off_ = o->next_off_;
+  }
+  template <typename Ar> void SerializeIn(Ar &ar) {
+    Task::SerializeIn(ar); ar(path_, start_off_, max_entries_);
+  }
+  template <typename Ar> void SerializeOut(Ar &ar) {
+    Task::SerializeOut(ar); ar(entries_, inos_, types_, offs_, next_off_);
   }
 };
 

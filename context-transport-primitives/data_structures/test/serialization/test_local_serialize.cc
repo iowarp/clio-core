@@ -33,6 +33,9 @@
 
 #include "../../../../context-runtime/test/simple_test.h"
 #include "clio_ctp/data_structures/serialization/local_serialize.h"
+#include "clio_ctp/data_structures/serialization/global_serialize.h"
+#include <chrono>
+#include <cstring>
 #include <string>
 #include <vector>
 #include <list>
@@ -572,6 +575,87 @@ TEST_CASE("LocalSerialize: nested containers", "[local_serialize][nested]") {
       REQUIRE(restored[i][j] == original[i][j]);
     }
   }
+}
+
+// ============================================================================
+// Malformed input (#1353): an overrun must fail the archive once and stop,
+// never loop on a garbage element count.
+// ============================================================================
+
+namespace {
+
+/** A buffer holding one size_t element count and nothing else. */
+std::vector<char> GarbageCountBuffer(size_t count) {
+  std::vector<char> buf(sizeof(size_t));
+  std::memcpy(buf.data(), &count, sizeof(size_t));
+  return buf;
+}
+
+/** Load a container of type T from a garbage count with archive ArT. */
+template <template <typename> class ArT, typename T>
+void CheckGarbageCountRejected() {
+  // 2^60 elements: before #1353 this looped (or tried to allocate) for each
+  // one, logging a line per field.
+  std::vector<char> buf = GarbageCountBuffer(static_cast<size_t>(1) << 60);
+  T obj;
+  auto start = std::chrono::steady_clock::now();
+  ArT<std::vector<char>> ar(buf);
+  ar >> obj;
+  auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start)
+                .count();
+  REQUIRE(ar.Failed());
+  REQUIRE(obj.empty());
+  // The regression looped over 2^60 elements (hours); a correct reject is
+  // microseconds. 10 s separates the two on any runner, ASan included.
+  REQUIRE(ms < 10000);
+}
+
+}  // namespace
+
+TEST_CASE("Deserialize: truncated scalar fails the archive",
+          "[local_serialize][malformed]") {
+  std::vector<char> buf(2, 'x');  // shorter than an int
+  ctp::ipc::LocalDeserialize<> ar(buf);
+  int a = 7;
+  ar >> a;
+  REQUIRE(ar.Failed());
+  REQUIRE(a == 7);  // untouched
+  REQUIRE(ar.Remaining() == 0);
+  // Sticky: a read that would fit on its own is ignored too.
+  char c = 'q';
+  ar >> c;
+  REQUIRE(c == 'q');
+  REQUIRE(ar.Failed());
+}
+
+TEST_CASE("Deserialize: garbage element counts are rejected",
+          "[local_serialize][malformed]") {
+  using ctp::ipc::GlobalDeserialize;
+  using ctp::ipc::LocalDeserialize;
+  CheckGarbageCountRejected<LocalDeserialize, std::string>();
+  CheckGarbageCountRejected<LocalDeserialize, std::vector<int>>();
+  CheckGarbageCountRejected<LocalDeserialize, std::vector<std::string>>();
+  CheckGarbageCountRejected<LocalDeserialize, std::list<std::string>>();
+  CheckGarbageCountRejected<LocalDeserialize,
+                            std::unordered_map<int, std::string>>();
+  CheckGarbageCountRejected<GlobalDeserialize, std::string>();
+  CheckGarbageCountRejected<GlobalDeserialize, std::vector<int>>();
+  CheckGarbageCountRejected<GlobalDeserialize, std::vector<std::string>>();
+  CheckGarbageCountRejected<GlobalDeserialize, std::list<std::string>>();
+}
+
+TEST_CASE("Deserialize: well-formed data still round-trips",
+          "[local_serialize][malformed]") {
+  std::vector<std::string> original = {"a", "", "longer string"};
+  std::vector<char> buf;
+  ctp::ipc::GlobalSerialize<> out(buf);
+  out << original;
+  std::vector<std::string> restored;
+  ctp::ipc::GlobalDeserialize<> in(buf);
+  in >> restored;
+  REQUIRE_FALSE(in.Failed());
+  REQUIRE(restored == original);
 }
 
 SIMPLE_TEST_MAIN()

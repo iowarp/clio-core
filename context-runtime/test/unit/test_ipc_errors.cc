@@ -396,12 +396,9 @@ TEST_CASE("IpcErrors - Concurrent Init/Finalize", "[ipc][errors][multiproc]") {
 // ============================================================================
 
 /**
- * Build the shape the client-side read fast paths hand back: a REAL task,
- * filled in locally, SetComplete()'d, and NEVER Sent. That is the documented
- * "synthesized-task contract" of CoreClient::TryShmGet and its deferred-put /
- * vectored twins, which serve a read straight out of the shared metadata cache
- * and hand the caller an already-complete future so every call site gets the
- * optimization with no special-casing.
+ * Build a never-Sent future: a REAL task, filled in locally, SetComplete()'d,
+ * and NEVER Sent -- the shape of any future whose task was completed in the
+ * calling process (e.g. the CLIO_RUN_INLINE path) rather than over IPC.
  *
  * The defining property is that task_id_.net_key_ is still the TaskId
  * constructor's zero: both SendIn paths stamp it with the task's own heap
@@ -422,7 +419,7 @@ static clio::run::shared_ptr<clio::run::admin::FlushTask> MakeNeverSentTask(
 }
 
 /**
- * Regression for the #968 guard vs. the client-side read fast paths.
+ * Regression for the #968 guard vs. locally-completed (never-Sent) futures.
  *
  * Both RecvOut twins fail a complete task that has no parked response archive,
  * on the reasoning that the only client-path writer of IsComplete() is the
@@ -432,10 +429,8 @@ static clio::run::shared_ptr<clio::run::admin::FlushTask> MakeNeverSentTask(
  * cache-hit read came back rc = -1 with the bytes already correctly copied.
  *
  * Driving RecvOut directly (rather than through a real cache hit) is
- * deliberate: whether TryShmGet actually hits depends on the machine -- it
- * needs the SHM main segment to map and the metadata cache to attach, which a
- * CI runner or a login node with a small ulimit -v will not do, and there the
- * fast path silently never runs. This exercises the contract everywhere.
+ * deliberate: it exercises the contract on every machine, independent of
+ * which client paths happen to complete a task locally there.
  */
 TEST_CASE("IpcErrors - never-Sent future needs no response archive",
           "[ipc][errors][968]") {

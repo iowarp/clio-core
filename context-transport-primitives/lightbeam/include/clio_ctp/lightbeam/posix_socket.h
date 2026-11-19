@@ -142,9 +142,60 @@ CTP_DLL bool IsServerAlive(const std::string& addr, int port,
 CTP_DLL socket_t Connect(const std::string& addr, int port,
                          const std::string& protocol);
 
+/** Backlog every TCP / Unix-domain listener is created with. A peer listener
+ *  is dialed by up to (nodes - 1) x send-shards peers at once at startup; a
+ *  small backlog (it was 16) makes the kernel drop the excess handshakes, so
+ *  dialers stall in SYN retransmits or wait for a reply that never comes.
+ *  The kernel clamps it to net.core.somaxconn. */
+constexpr int kListenBacklog = 4096;
+
+/** Why a ConnectTimed() call failed. */
+struct ConnectError {
+  /** The step that failed. */
+  enum Stage {
+    kNone = 0,  /**< no failure */
+    kResolve,   /**< host name lookup (code_ is a getaddrinfo EAI_* code) */
+    kSocket,    /**< socket() (code_ is an errno) */
+    kConnect,   /**< connect() was refused/unreachable (code_ is an errno) */
+    kTimeout,   /**< connect() did not complete within the timeout */
+  };
+  Stage stage_ = kNone; /**< failing step */
+  int code_ = 0;        /**< errno / EAI_* code of that step */
+
+  /** @return Human-readable reason, e.g. "connect: Connection refused". */
+  CTP_DLL std::string ToString() const;
+};
+
+/**
+ * TCP connect with a bounded wait and a reported failure reason.
+ *
+ * Host names are resolved through a per-process cache (one getaddrinfo per
+ * host, not per dial); a connect that is refused, unreachable or times out
+ * drops the host's cache entry so the next dial looks it up again (the
+ * name may have moved). The returned socket is in blocking mode.
+ *
+ * @param addr IPv4 literal or host name.
+ * @param port TCP port.
+ * @param timeout_ms Longest wait for the handshake; <= 0 waits indefinitely.
+ * @param err Receives the failure reason (may be null).
+ * @return Connected fd, or kInvalidSocket on failure.
+ */
+CTP_DLL socket_t ConnectTimed(const std::string& addr, int port,
+                              int timeout_ms, ConnectError* err);
+
+/** @return Number of real host name lookups (getaddrinfo calls) made by the
+ *  connect path's resolve cache; for tests and diagnostics. */
+CTP_DLL uint64_t GetHostLookupCount();
+
+/** Drop a host's cached resolution so the next connect looks it up again.
+ *  @param host Host name as passed to Connect / ConnectTimed. */
+CTP_DLL void ForgetHost(const std::string& host);
+
 /** Create a socket, bind, and listen. protocol == "ipc" uses a Unix-domain
  *  socket at `addr` (unlinking any stale path first); otherwise TCP on `port`
- *  (with SO_REUSEADDR + a large recv buffer). Returns a listening fd, or
+ *  (with SO_REUSEADDR + a large recv buffer), bound to `addr`: an empty
+ *  address, "*" or "0.0.0.0" binds every interface, anything else must be an
+ *  IPv4 literal or a resolvable host name. Returns a listening fd, or
  *  kInvalidSocket on failure. */
 CTP_DLL socket_t Listen(const std::string& addr, int port,
                         const std::string& protocol);

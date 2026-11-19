@@ -37,11 +37,8 @@ compose:
     pool_name: cte_main
     pool_query: local
     pool_id: "512.0"
+    # A core is uniform in durability: persistent tiers only.
     storage:
-      - path: "ram::coherence_dram"
-        bdev_type: "ram"
-        capacity_limit: "512MB"
-        score: 1.0
       - path: "/tmp/coherence_disk.dat"
         bdev_type: "file"
         capacity_limit: "2GB"

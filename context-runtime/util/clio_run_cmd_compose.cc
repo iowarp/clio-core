@@ -15,7 +15,7 @@ namespace {
 namespace fs = std::filesystem;
 
 void PrintComposeUsage() {
-  HIPRINT("Usage: clio_run compose <start|stop|rm|list> [options]");
+  HIPRINT("Usage: clio-run compose <start|stop|rm|list> [options]");
   HIPRINT("  start <config.yaml>    Create the pools in the compose file.");
   HIPRINT("                         Pools with 'restart: true' are recorded in");
   HIPRINT("                         each node's pool log (<conf_dir>/wal) and");

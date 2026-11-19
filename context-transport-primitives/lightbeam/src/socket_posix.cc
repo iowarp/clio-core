@@ -35,8 +35,13 @@
 
 #include "clio_ctp/lightbeam/posix_socket.h"
 
+#include <netdb.h>
+
+#include <atomic>
 #include <cerrno>
 #include <cstring>
+#include <mutex>
+#include <unordered_map>
 
 // Linux suppresses SIGPIPE per-write via this send() flag; macOS/BSD lack it
 // and use the SO_NOSIGPIPE socket option (see SetNoSigPipe) instead, so define
@@ -220,9 +225,75 @@ int PollReadMulti(const socket_t* fds, int count, int timeout_ms) {
   return -1;
 }
 
+/** Per-process cache of host name -> IPv4 address for the connect path. */
+struct HostCache {
+  std::mutex mtx_;                                    /**< guards map_ */
+  std::unordered_map<std::string, struct in_addr> map_; /**< resolved hosts */
+  std::atomic<uint64_t> lookups_{0};                  /**< getaddrinfo calls */
+};
+
+/** @return The process-wide host cache (never destroyed: dials may run
+ *  from static destructors at exit). */
+static HostCache& GetHostCache() {
+  static HostCache* cache = new HostCache();
+  return *cache;
+}
+
+/**
+ * Resolve a dial target to an IPv4 address. Literals are parsed directly;
+ * names are looked up once and cached (a failed lookup is not cached).
+ * @param host IPv4 literal or host name.
+ * @param out Receives the address (network byte order).
+ * @return 0 on success, else a getaddrinfo EAI_* code.
+ */
+static int ResolveHostV4(const std::string& host, struct in_addr* out) {
+  if (::inet_pton(AF_INET, host.c_str(), out) > 0) return 0;
+  HostCache& cache = GetHostCache();
+  {
+    std::lock_guard<std::mutex> lock(cache.mtx_);
+    auto it = cache.map_.find(host);
+    if (it != cache.map_.end()) {
+      *out = it->second;
+      return 0;
+    }
+  }
+  struct addrinfo hints;
+  std::memset(&hints, 0, sizeof(hints));
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_STREAM;
+  struct addrinfo* res = nullptr;
+  cache.lookups_.fetch_add(1, std::memory_order_relaxed);
+  int rc = ::getaddrinfo(host.c_str(), nullptr, &hints, &res);
+  if (rc != 0 || res == nullptr) {
+    if (res != nullptr) ::freeaddrinfo(res);
+    return rc != 0 ? rc : EAI_NONAME;
+  }
+  *out = reinterpret_cast<struct sockaddr_in*>(res->ai_addr)->sin_addr;
+  ::freeaddrinfo(res);
+  std::lock_guard<std::mutex> lock(cache.mtx_);
+  cache.map_[host] = *out;
+  return 0;
+}
+
+uint64_t GetHostLookupCount() {
+  return GetHostCache().lookups_.load(std::memory_order_relaxed);
+}
+
+void ForgetHost(const std::string& host) {
+  HostCache& cache = GetHostCache();
+  std::lock_guard<std::mutex> lock(cache.mtx_);
+  cache.map_.erase(host);
+}
+
 bool IsServerAlive(const std::string& addr, int port,
                    const std::string& protocol) {
   if (protocol == "ipc") {
+    // sun_path holds a short fixed-size path; a longer one used to be
+    // silently truncated, binding or dialing the wrong name (#1356).
+    if (addr.size() >= sizeof(sockaddr_un::sun_path)) {
+      errno = ENAMETOOLONG;
+      return false;
+    }
     socket_t fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd == kInvalidSocket) return false;
     struct sockaddr_un sun;
@@ -254,6 +325,12 @@ bool IsServerAlive(const std::string& addr, int port,
 socket_t Connect(const std::string& addr, int port,
                  const std::string& protocol) {
   if (protocol == "ipc") {
+    // sun_path holds a short fixed-size path; a longer one used to be
+    // silently truncated, binding or dialing the wrong name (#1356).
+    if (addr.size() >= sizeof(sockaddr_un::sun_path)) {
+      errno = ENAMETOOLONG;
+      return kInvalidSocket;
+    }
     socket_t fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd == kInvalidSocket) return kInvalidSocket;
     struct sockaddr_un sun;
@@ -277,16 +354,149 @@ socket_t Connect(const std::string& addr, int port,
   std::memset(&sin, 0, sizeof(sin));
   sin.sin_family = AF_INET;
   sin.sin_port = htons(static_cast<uint16_t>(port));
-  if (::inet_pton(AF_INET, addr.c_str(), &sin.sin_addr) <= 0) {
+  // Not a dotted IPv4 literal: resolve it (cached). Hostfiles name hosts
+  // (e.g. ares-comp-31-40g), and ZeroMQ resolves names, so a peer path
+  // switched to this transport could otherwise never connect.
+  if (ResolveHostV4(addr, &sin.sin_addr) != 0) {
     Close(fd);
     return kInvalidSocket;
   }
   if (::connect(fd, reinterpret_cast<struct sockaddr*>(&sin),
                 sizeof(sin)) < 0) {
+    int saved = errno;
+    ForgetHost(addr);
     Close(fd);
+    errno = saved;
     return kInvalidSocket;
   }
   return fd;
+}
+
+std::string ConnectError::ToString() const {
+  switch (stage_) {
+    case kNone:
+      return "ok";
+    case kResolve:
+      return std::string("host lookup: ") + ::gai_strerror(code_);
+    case kSocket:
+      return std::string("socket: ") + std::strerror(code_);
+    case kConnect:
+      return std::string("connect: ") + std::strerror(code_);
+    case kTimeout:
+      return "connect: timed out";
+  }
+  return "unknown";
+}
+
+/**
+ * Wait for a non-blocking connect() to finish.
+ * @param fd Socket with a connect in progress.
+ * @param timeout_ms Longest wait; <= 0 waits indefinitely.
+ * @param err Receives the failure reason.
+ * @return true if the connection is established.
+ */
+static bool FinishConnect(socket_t fd, int timeout_ms, ConnectError* err) {
+  struct pollfd pfd;
+  pfd.fd = fd;
+  pfd.events = POLLOUT;
+  pfd.revents = 0;
+  int pr;
+  do {
+    pr = ::poll(&pfd, 1, timeout_ms > 0 ? timeout_ms : -1);
+  } while (pr < 0 && errno == EINTR);
+  if (pr == 0) {
+    err->stage_ = ConnectError::kTimeout;
+    err->code_ = ETIMEDOUT;
+    return false;
+  }
+  int so_err = 0;
+  socklen_t len = sizeof(so_err);
+  if (pr < 0) {
+    so_err = errno;
+  } else if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_err, &len) < 0) {
+    so_err = errno;
+  }
+  if (so_err != 0) {
+    err->stage_ = ConnectError::kConnect;
+    err->code_ = so_err;
+    return false;
+  }
+  return true;
+}
+
+socket_t ConnectTimed(const std::string& addr, int port, int timeout_ms,
+                      ConnectError* err) {
+  ConnectError local;
+  if (err == nullptr) err = &local;
+  *err = ConnectError();
+  struct sockaddr_in sin;
+  std::memset(&sin, 0, sizeof(sin));
+  sin.sin_family = AF_INET;
+  sin.sin_port = htons(static_cast<uint16_t>(port));
+  int gai = ResolveHostV4(addr, &sin.sin_addr);
+  if (gai != 0) {
+    err->stage_ = ConnectError::kResolve;
+    err->code_ = gai;
+    return kInvalidSocket;
+  }
+  socket_t fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (fd == kInvalidSocket) {
+    err->stage_ = ConnectError::kSocket;
+    err->code_ = errno;
+    return kInvalidSocket;
+  }
+  SetTcpNoDelay(fd);
+  SetNoSigPipe(fd);
+  SetNonBlocking(fd, true);
+  bool ok = true;
+  if (::connect(fd, reinterpret_cast<struct sockaddr*>(&sin), sizeof(sin)) <
+      0) {
+    if (errno == EINPROGRESS || errno == EINTR) {
+      ok = FinishConnect(fd, timeout_ms, err);
+    } else {
+      err->stage_ = ConnectError::kConnect;
+      err->code_ = errno;
+      ok = false;
+    }
+  }
+  if (!ok) {
+    ForgetHost(addr);
+    Close(fd);
+    return kInvalidSocket;
+  }
+  SetNonBlocking(fd, false);
+  return fd;
+}
+
+/**
+ * Resolve the IPv4 address a TCP listener binds.
+ *
+ * An empty address, "*" or "0.0.0.0" means every interface. Anything else is
+ * a dotted IPv4 literal or a host name, so a caller that asks for loopback
+ * gets loopback rather than a wildcard listener reachable from the network.
+ *
+ * @param addr address requested by the caller
+ * @param out receives the resolved address in network byte order
+ * @return true on success, false when `addr` cannot be resolved
+ */
+static bool ResolveListenAddr(const std::string& addr, struct in_addr* out) {
+  if (addr.empty() || addr == "*" || addr == "0.0.0.0") {
+    out->s_addr = htonl(INADDR_ANY);
+    return true;
+  }
+  if (::inet_pton(AF_INET, addr.c_str(), out) > 0) return true;
+  struct addrinfo hints;
+  std::memset(&hints, 0, sizeof(hints));
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_STREAM;
+  struct addrinfo* res = nullptr;
+  if (::getaddrinfo(addr.c_str(), nullptr, &hints, &res) != 0 ||
+      res == nullptr) {
+    return false;
+  }
+  *out = reinterpret_cast<struct sockaddr_in*>(res->ai_addr)->sin_addr;
+  ::freeaddrinfo(res);
+  return true;
 }
 
 socket_t Listen(const std::string& addr, int port,
@@ -294,6 +504,12 @@ socket_t Listen(const std::string& addr, int port,
   socket_t fd;
   if (protocol == "ipc") {
     UnlinkPath(addr.c_str());
+    // sun_path holds a short fixed-size path; a longer one used to be
+    // silently truncated, binding or dialing the wrong name (#1356).
+    if (addr.size() >= sizeof(sockaddr_un::sun_path)) {
+      errno = ENAMETOOLONG;
+      return kInvalidSocket;
+    }
     fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd == kInvalidSocket) return kInvalidSocket;
     struct sockaddr_un sun;
@@ -305,21 +521,21 @@ socket_t Listen(const std::string& addr, int port,
       return kInvalidSocket;
     }
   } else {
-    fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd == kInvalidSocket) return kInvalidSocket;
-    SetReuseAddr(fd);
-    SetRecvBuf(fd, 4 * 1024 * 1024);
     struct sockaddr_in sin;
     std::memset(&sin, 0, sizeof(sin));
     sin.sin_family = AF_INET;
     sin.sin_port = htons(static_cast<uint16_t>(port));
-    sin.sin_addr.s_addr = INADDR_ANY;
+    if (!ResolveListenAddr(addr, &sin.sin_addr)) return kInvalidSocket;
+    fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd == kInvalidSocket) return kInvalidSocket;
+    SetReuseAddr(fd);
+    SetRecvBuf(fd, 4 * 1024 * 1024);
     if (::bind(fd, reinterpret_cast<struct sockaddr*>(&sin), sizeof(sin)) < 0) {
       Close(fd);
       return kInvalidSocket;
     }
   }
-  if (::listen(fd, 16) < 0) {
+  if (::listen(fd, kListenBacklog) < 0) {
     Close(fd);
     return kInvalidSocket;
   }

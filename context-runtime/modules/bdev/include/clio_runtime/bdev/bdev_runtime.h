@@ -37,7 +37,11 @@ class Runtime : public clio::run::Container {
   ~Runtime() override;
 
   /**
-   * Get live task statistics for this task instance.
+   * Get live task statistics for this task instance (every bdev method).
+   * Read/Write scale with their length at this bdev type's device rate;
+   * every other method returns an explicit constant.
+   * @param task the task to estimate
+   * @return the task's cost features
    */
   clio::run::TaskStat GetTaskStats(const clio::run::Task *task) const override;
 

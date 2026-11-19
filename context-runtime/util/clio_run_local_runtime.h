@@ -184,6 +184,17 @@ inline bool PidIsRunning(int pid) {
 }
 
 /**
+ * @return true if @p name is the runtime binary's file name: the canonical
+ *         `clio-run` or anything starting with the legacy `clio_run` (the
+ *         historical prefix match, which also covers renamed test copies).
+ *         /proc/<pid>/exe resolves symlinks, so a daemon launched through the
+ *         `clio_run` alias reports `clio-run` here.
+ */
+inline bool IsClioRunExeName(const std::string& name) {
+  return name.rfind("clio-run", 0) == 0 || name.rfind("clio_run", 0) == 0;
+}
+
+/**
  * Check that a pid currently belongs to a clio_run process (guards kill
  * escalation against pid recycling). POSIX-only; false on Windows.
  * @param pid candidate runtime pid
@@ -200,8 +211,7 @@ inline bool PidIsClioRun(int pid) {
   if (proc_pidpath(pid, exe_path, sizeof(exe_path)) <= 0) {
     return false;
   }
-  return std::filesystem::path(exe_path).filename().string().rfind(
-             "clio_run", 0) == 0;
+  return IsClioRunExeName(std::filesystem::path(exe_path).filename().string());
 #else
   std::error_code ec;
   auto exe = std::filesystem::read_symlink(
@@ -209,7 +219,7 @@ inline bool PidIsClioRun(int pid) {
   if (ec) {
     return false;
   }
-  return exe.filename().string().rfind("clio_run", 0) == 0;
+  return IsClioRunExeName(exe.filename().string());
 #endif
 }
 

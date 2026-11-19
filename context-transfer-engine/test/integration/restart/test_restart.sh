@@ -14,6 +14,21 @@ clean_shm() {
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # Use BIN_DIR from environment, or fall back to /workspace/build/bin
 BIN_DIR="${BIN_DIR:-/workspace/build/bin}"
+
+# Clients (compose, the test binary) wait up to 120 s for the server instead of
+# failing on a slow start.
+export CLIO_WAIT_SERVER="${CLIO_WAIT_SERVER:-120}"
+
+# Block until the runtime just started answers `clio_run status` (RUNNING),
+# instead of guessing with `sleep 3`. Fails fast if it exits; cap 120 s.
+# @param $1 pid of the background `clio_run runtime start`
+wait_runtime_up() {
+    CLIO_RUN_BIN="$BIN_DIR/clio_run" bash \
+        "$SCRIPT_DIR/../../../../CI/cluster_node.sh" ready - local "$1" 120 || {
+        echo "ERROR: runtime (pid $1) did not reach RUNNING within 120s"
+        exit 1
+    }
+}
 COMPOSE_CONFIG="${SCRIPT_DIR}/test_restart_compose.yaml"
 CONF_DIR="/tmp/clio_run_restart_test"
 
@@ -70,7 +85,7 @@ echo "=== Phase 1: Start runtime and store blobs ==="
 export CLIO_SERVER_CONF="$COMPOSE_CONFIG"
 $BIN_DIR/clio_run runtime start --fresh &
 RUNTIME_PID=$!
-sleep 3
+wait_runtime_up "$RUNTIME_PID"
 
 echo "Runtime started (PID=$RUNTIME_PID), composing pools..."
 $BIN_DIR/clio_run compose "$COMPOSE_CONFIG"
@@ -95,7 +110,7 @@ echo "=== Phase 2: Restart runtime and verify blobs ==="
 # Start runtime again with same conf_dir so it can find restart configs
 $BIN_DIR/clio_run runtime start &
 RUNTIME_PID=$!
-sleep 3
+wait_runtime_up "$RUNTIME_PID"
 
 echo "Runtime restarted (PID=$RUNTIME_PID), calling RestartContainers + verify..."
 $BIN_DIR/test_restart --verify-blobs

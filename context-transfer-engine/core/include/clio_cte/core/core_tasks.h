@@ -167,6 +167,41 @@ inline Timestamp WallToSteadyNs(Timestamp wall) {
 }
 
 /**
+ * Keys a client needs to connect to the shared-memory cache module
+ * (core_shm_cache_writethru) that fronts a CTE stack. Returned by the CTE
+ * Create (CreateParams::cache_keys_): a client that holds them maps the
+ * cache's segment and completes puts, covered gets and known sizes there,
+ * with no task. All zero when no cache fronts the stack.
+ */
+struct ShmCacheKeys {
+  clio::run::u32 runtime_pid_ = 0;  /**< pid of the runtime owning the segment */
+  clio::run::u64 cache_pool_ = 0;   /**< PoolId::ToU64 of the cache pool; 0 = none */
+  clio::run::u64 root_off_ = 0;     /**< offset of the segment root */
+  clio::run::u64 entry_pool_ = 0;   /**< pool clients bind to; 0 = the cache pool */
+
+  /** @return true when the keys name a cache segment */
+  CTP_CROSS_FUN bool Valid() const {
+    return cache_pool_ != 0 && root_off_ != 0 && runtime_pid_ != 0;
+  }
+
+  /** @return the pool a connected client sends its tasks to */
+  CTP_CROSS_FUN clio::run::u64 FrontPool() const {
+    return entry_pool_ != 0 ? entry_pool_ : cache_pool_;
+  }
+
+#if CTP_IS_HOST
+  /**
+   * Serialize the keys.
+   * @param ar the archive
+   */
+  template <class Archive>
+  void serialize(Archive &ar) {
+    ar(runtime_pid_, cache_pool_, root_off_, entry_pool_);
+  }
+#endif
+};
+
+/**
  * CreateParams for CTE Core chimod
  * Contains configuration parameters for CTE container creation
  */
@@ -174,15 +209,11 @@ struct CreateParams {
   // CTE configuration object (not serialized, loaded from pool_config)
   Config config_;
 
-  // OUT: byte offset of the CTE shared-memory metadata cache root within the
-  // runtime's metadata allocator (issue #783). 0 means caching is disabled --
-  // no metadata segment, or the cache could not be built -- and the client
-  // must simply use the RPC path.
-  //
-  // This is an OFFSET into a segment both processes map, not a raw address.
-  // That is the whole reason the cache can be read by another process at
-  // all; a pointer here would resolve to garbage in the client.
-  clio::run::u64 shm_cache_root_off_ = 0;
+  // OUT: keys of the shared-memory cache module fronting this CTE pool on the
+  // answering node. Filled by Create and, for a pool that already exists, by
+  // Runtime::FillExistingCreate -- so every client receives them, not just
+  // the one that caused the pool to be created.
+  ShmCacheKeys cache_keys_;
 
   // Required: chimod library name for module manager
   static constexpr const char *chimod_lib_name = "clio_cte_core";
@@ -192,14 +223,12 @@ struct CreateParams {
 
   // Copy constructor (required for task creation)
   CreateParams(const CreateParams &other)
-      : config_(other.config_),
-        shm_cache_root_off_(other.shm_cache_root_off_) {}
+      : config_(other.config_), cache_keys_(other.cache_keys_) {}
 
   // Constructor with pool_id and CreateParams (required for admin
   // task creation)
   CreateParams(const clio::run::PoolId &pool_id, const CreateParams &other)
-      : config_(other.config_),
-        shm_cache_root_off_(other.shm_cache_root_off_) {
+      : config_(other.config_), cache_keys_(other.cache_keys_) {
     // pool_id is used by the admin task framework, but we don't need to store
     // it
     (void)pool_id;  // Suppress unused parameter warning
@@ -214,14 +243,13 @@ struct CreateParams {
     // pass directly via CreateParams (no compose YAML required) are on
     // the wire.
     //
-    // shm_cache_root_off_ flows back on the OUT path: the server writes
-    // it into chimod_params_ at the end of Create, and the client's
-    // GetParams() returns it.
+    // cache_keys_ flows back on the OUT path: the server writes it into
+    // chimod_params_ at the end of Create (and in FillExistingCreate).
     ar(config_.performance_.stat_targets_period_ms_,
        config_.organizer_.name_,
        config_.organizer_.organizer_tasks_,
        config_.organizer_.period_ms_,
-       shm_cache_root_off_);
+       cache_keys_);
   }
 
   /**
@@ -387,6 +415,10 @@ struct RegisterTargetTask : public clio::run::Task {
   IN clio::run::u32 attach_existing_;
   // File bdevs: lazy-growth (and reservation) step passed to the bdev create.
   IN clio::run::u64 growth_unit_;
+  // Durability label of this bdev (clio::run::bdev::PersistenceLevel as an
+  // int). -1 = take it from the core's storage config entry for this target,
+  // or volatile for a target the config does not list.
+  IN clio::run::i32 persistence_level_;
 
   // SHM constructor
   CTP_CROSS_FUN RegisterTargetTask()
@@ -396,7 +428,8 @@ struct RegisterTargetTask : public clio::run::Task {
         total_size_(0),
         bdev_id_(clio::run::PoolId::GetNull()),
         attach_existing_(0),
-        growth_unit_(clio::run::u64(1) << 30) {}
+        growth_unit_(clio::run::u64(1) << 30),
+        persistence_level_(-1) {}
 
   // Emplace constructor
   CTP_CROSS_FUN explicit RegisterTargetTask(
@@ -405,7 +438,8 @@ struct RegisterTargetTask : public clio::run::Task {
       clio::run::bdev::BdevType bdev_type, clio::run::u64 total_size,
       const clio::run::PoolQuery &target_query, const clio::run::PoolId &bdev_id,
       clio::run::u32 attach_existing = 0,
-      clio::run::u64 growth_unit = clio::run::u64(1) << 30)
+      clio::run::u64 growth_unit = clio::run::u64(1) << 30,
+      clio::run::i32 persistence_level = -1)
       : clio::run::Task(task_id, pool_id, pool_query, Method::kRegisterTarget),
         target_name_(CLIO_PRIV_ALLOC, target_name),
         bdev_type_(bdev_type),
@@ -413,7 +447,8 @@ struct RegisterTargetTask : public clio::run::Task {
         target_query_(target_query),
         bdev_id_(bdev_id),
         attach_existing_(attach_existing),
-        growth_unit_(growth_unit) {
+        growth_unit_(growth_unit),
+        persistence_level_(persistence_level) {
     task_id_ = task_id;
     pool_id_ = pool_id;
     method_ = Method::kRegisterTarget;
@@ -428,7 +463,7 @@ struct RegisterTargetTask : public clio::run::Task {
   CTP_CROSS_FUN void SerializeIn(Archive &ar) {
     Task::SerializeIn(ar);
     ar(target_name_, bdev_type_, total_size_, target_query_, bdev_id_,
-       attach_existing_, growth_unit_);
+       attach_existing_, growth_unit_, persistence_level_);
   }
 
   /**
@@ -454,6 +489,7 @@ struct RegisterTargetTask : public clio::run::Task {
     bdev_id_ = other->bdev_id_;
     attach_existing_ = other->attach_existing_;
     growth_unit_ = other->growth_unit_;
+    persistence_level_ = other->persistence_level_;
   }
 
   /**
@@ -781,6 +817,66 @@ struct hash<clio::cte::core::TagId> {
 namespace clio::cte::core {
 
 /**
+ * Pool name of the checkpoint chimod (the copy-on-write fault handler).
+ * The core keys copy-on-write links off a fault registration that names this
+ * pool; checkpoint_tasks.h takes its own kCheckpointPoolName from here so the
+ * two cannot drift apart.
+ */
+static constexpr const char *kCowFaultPoolName = "clio_cte_checkpoint";
+
+/**
+ * Materialise error: the copy's fault pool is not present on this node. The
+ * router would retry a task for an absent pool forever, so the write or
+ * delete is failed with this code instead of dispatching the fault.
+ */
+static constexpr clio::run::u32 kCowErrFaultPoolMissing = 2;
+
+/**
+ * Fault-parameter form of a source tag id: "#major.minor". A copy registered
+ * with this form names its source by id, so it still resolves after the
+ * source's NAME has been unbound (a tag delete that keeps blobs for an
+ * un-materialised copy).
+ * @param id the source tag
+ * @return the parameter string (well inside Context::kFaultParamsSize)
+ */
+inline std::string CowSourceParam(const TagId &id) {
+  return "#" + std::to_string(id.major_) + "." + std::to_string(id.minor_);
+}
+
+/**
+ * Parses a CowSourceParam string back into a tag id.
+ * @param param a fault parameter; a plain tag name is not in id form
+ * @param id    receives the id when the parameter is in id form
+ * @return true when param was in id form (and id was set)
+ */
+inline bool ParseCowSourceParam(const std::string &param, TagId *id) {
+  if (param.size() < 4 || param[0] != '#') return false;
+  const size_t dot = param.find('.', 1);
+  if (dot == std::string::npos || dot == 1 || dot + 1 >= param.size()) {
+    return false;
+  }
+  // Reads the decimal digits of [from, to) into *out; false on any non-digit
+  // or on a value that does not fit a u32.
+  auto digits = [&param](size_t from, size_t to, unsigned long long *out) {
+    unsigned long long v = 0;
+    for (size_t i = from; i < to; ++i) {
+      if (param[i] < '0' || param[i] > '9') return false;
+      v = v * 10 + static_cast<unsigned long long>(param[i] - '0');
+      if (v > 0xFFFFFFFFull) return false;
+    }
+    *out = v;
+    return true;
+  };
+  unsigned long long major = 0, minor = 0;
+  if (!digits(1, dot, &major) || !digits(dot + 1, param.size(), &minor)) {
+    return false;
+  }
+  id->major_ = static_cast<clio::run::u32>(major);
+  id->minor_ = static_cast<clio::run::u32>(minor);
+  return true;
+}
+
+/**
  * Tag information structure for blob grouping
  */
 struct TagInfo {
@@ -952,6 +1048,19 @@ static constexpr clio::run::u32 kReplicaAbsentRc = 12;
 /** PutBlob could not place the bytes: every eligible tier is full (10 +
  *  ExtendBlob's out-of-space code). A filesystem reports it as ENOSPC. */
 static constexpr clio::run::u32 kPutNoSpaceRc = 13;
+/** PutBlob reports a failed data write (ModifyExistingData) as this base +
+ *  the write's code (kPutWriteIoErr, kPutWriteNoSpaceErr). */
+static constexpr clio::run::u32 kPutWriteRcBase = 20;
+/** ModifyExistingData: a device write failed (an I/O error): PutBlob rc 21. */
+static constexpr clio::run::u32 kPutWriteIoErr = 1;
+/** PutBlob rc of a write a device refused for lack of space (ENOSPC, EDQUOT,
+ *  EFBIG from the bdev: a full disk, a DAOS pool out of space). Placement
+ *  succeeded -- the bdev's capacity accounting had room -- but the storage
+ *  underneath did not. A filesystem reports it as ENOSPC, like kPutNoSpaceRc. */
+static constexpr clio::run::u32 kPutDeviceNoSpaceRc = 28;  // ENOSPC
+/** ModifyExistingData: the device refused the write for lack of space. */
+static constexpr clio::run::u32 kPutWriteNoSpaceErr =
+    kPutDeviceNoSpaceRc - kPutWriteRcBase;
 /**
  * Whether a task's return code means the node it ran on was lost with the
  * task in flight (kRun2RunNetworkTimeoutRC): the
@@ -972,20 +1081,27 @@ static constexpr clio::run::u32 kReplicaPutRcBase = 30;
  * 10 + ExtendBlob's capacity codes (no target with space, no target able to
  * hold the request, tier exhausted), and 41-43 are the same codes from the
  * replication chimod's durable copy (kReplicaPutRcBase + 11-13) -- which is
- * what a full persistent tier returns when replication is on. A filesystem
+ * what a full persistent tier returns when replication is on. 28
+ * (kPutDeviceNoSpaceRc) is a device that refused the write itself, directly
+ * or through the replication chimod (kReplicaPutRcBase + 28). A filesystem
  * reports all of them as ENOSPC. (Replica-protocol UPDATE_ONLY writes reuse
  * 12 as kReplicaAbsentRc; this is for ordinary puts.)
  * @param rc PutBlob return code
  * @return true for an out-of-space failure
  */
 inline constexpr bool PutRcIsNoSpace(clio::run::u32 rc) {
-  // 28 (ENOSPC) is what the filesystem chimod's write task returns for a
-  // full store; the write-behind awaits those tasks too, and latched it as
+  // 28 (ENOSPC) is also what the filesystem chimod's write task returns for
+  // a full store; the write-behind awaits those tasks too, and latched it as
   // EIO -- a full store must stay ENOSPC (#1129).
-  return rc == 28 || (rc >= 11 && rc <= kPutNoSpaceRc) ||
+  return rc == kPutDeviceNoSpaceRc || (rc >= 11 && rc <= kPutNoSpaceRc) ||
          (rc >= kReplicaPutRcBase + 11 &&
-          rc <= kReplicaPutRcBase + kPutNoSpaceRc);
+          rc <= kReplicaPutRcBase + kPutNoSpaceRc) ||
+         rc == kReplicaPutRcBase + kPutDeviceNoSpaceRc;
 }
+/** PutBlob refused: kCtePutAppend was combined with a shape the append path
+ *  cannot honour (with kCtePutReplace, on a replica-targeted put, or vectored).
+ *  See kCtePutAppend. */
+static constexpr clio::run::u32 kCtePutAppendInvalidRc = 15;
 /** PutBlob with Context::kPutIfAbsent found the blob already there. */
 static constexpr clio::run::u32 kPutExistsRc = 60;
 /** PutBlob with Context::kPutIfVersion found a different version. */
@@ -2035,6 +2151,11 @@ struct Context {
    *  alive: its liveness view can lag the router's, and "not found" there
    *  reads as a hole -- zeros returned for data held by the dead owner. */
   static constexpr clio::run::u32 kStandInRead = 1u << 8;
+  /** kNoCow -- skip the copy-on-write hook for THIS write. Set by the
+   *  checkpoint handler on the puts that materialise a copy: they are the
+   *  copy's own bytes, not a mutation of a source, and running the hook on
+   *  them would recurse into the copy's own copies. */
+  static constexpr clio::run::u32 kNoCow = 1u << 9;
 
   /**
    * Fault-handler parameters (checkpointing / lazy copy). When the core
@@ -2275,10 +2396,39 @@ GLOBAL_CROSS_CONST clio::run::u32 kCtePrefetchHint = 0x80000000u;
 GLOBAL_CROSS_CONST clio::run::u32 kCtePutDroppable = 0x2u;
 
 /**
+ * kCtePutAppend: write the put's bytes at the blob's CURRENT end, like a
+ * journal append, without the caller knowing the size.
+ *
+ * The task's offset_ input is IGNORED. Under the blob's write token the put
+ * writes its size_ bytes at the blob's logical size as it stands then (0 for a
+ * blob the put creates). Concurrent appenders are ordered by write-token
+ * acquisition, first come first served, and nothing more. An append never
+ * shrinks the blob and never zero-fills: it is exactly a modify of
+ * [old_size, old_size + size).
+ *
+ * Output: the offset the bytes landed at is written back into the task's
+ * offset_ field, which is serialized OUT (PutBlobTask and PodPutBlobTask).
+ * Read it after Wait() as task->offset_. The landed offset is only valid when
+ * the return code is 0.
+ *
+ * Not supported, rejected with kCtePutAppendInvalidRc:
+ *  - combined with kCtePutReplace (an append cannot also replace);
+ *  - on a replica-targeted put (Context::replica_ != 0);
+ *  - on a vectored put (non-empty segments_).
+ */
+GLOBAL_CROSS_CONST clio::run::u32 kCtePutAppend = 0x4u;
+
+/**
  * PutBlob refused: the blob is an expendable cache copy (kCtePutDroppable) and
  * this put would take ownership of bytes the tier may discard.
  */
 GLOBAL_CROSS_CONST clio::run::u32 kCteDroppabilityConflictRc = 14;
+/** Create return code: `durability` is neither "volatile" nor
+ *  "persistent". */
+GLOBAL_CROSS_CONST clio::run::u32 kCteInvalidDurabilityRc = 15;
+/** RegisterTarget / SetDurability return code: a volatile bdev cannot back a
+ *  persistent core (the registration or the mode change is refused). */
+GLOBAL_CROSS_CONST clio::run::u32 kCteVolatileTargetRc = 16;
 
 /**
  * CTE Telemetry data structure for performance monitoring
@@ -2508,7 +2658,9 @@ struct PutBlobTask : public clio::run::Task {
     context_.op_flags_ &= ~Context::kBlobNameRawInt32;
     blob_name_ = dec.c_str();
   }
-  IN clio::run::u64 offset_;                 // Offset within blob
+  // Offset within blob. IN for ordinary puts. For kCtePutAppend it is ignored
+  // on input and OUT on completion: the offset the bytes landed at.
+  INOUT clio::run::u64 offset_;
   IN clio::run::u64 size_;                   // Size of blob data
   IN ctp::ipc::ShmPtr<> blob_data_;        // Blob data (shared memory pointer)
   /**
@@ -2688,7 +2840,9 @@ struct PutBlobTask : public clio::run::Task {
     // FreeBuffer(task->blob_data_) frees a foreign/already-freed buffer and
     // corrupts the allocator — observed as a hang in CAE assimilators under
     // CLIO_FORCE_NET (issue #500).
-    ar(blob_name_, context_);
+    // offset_ travels back as well: it is the landed offset of a kCtePutAppend
+    // put. It is a plain integer, so echoing its input value is harmless.
+    ar(offset_, blob_name_, context_);
     ar.PopPod();
   }
 
@@ -2725,8 +2879,10 @@ struct PutBlobTask : public clio::run::Task {
     // never modifies it, so the origin's copy is already correct. Do NOT assign
     // it: it is the CLIENT's shm string, and taking the replica's would free
     // the client's buffer through the runtime's allocator (the #500 class of
-    // corruption). context_ is the only field carrying real OUT state.
+    // corruption). context_ is the only field carrying real OUT state, plus
+    // the landed offset of a kCtePutAppend put (a plain integer, safe to copy).
     context_.AggregateOut(replica->context_);
+    offset_ = replica->offset_;
   }
 };
 
@@ -3245,10 +3401,47 @@ struct MultiPutDesc {
   clio::run::u64 offset_ = 0;
   clio::run::u64 size_ = 0;
   clio::run::u64 payload_off_ = 0;
+  /** Per-record put flags (kCtePutDroppable). Records needing replace or
+   *  append semantics are not batched. */
+  clio::run::u32 flags_ = 0;
+  /** Placement score of this record's nested put, with PutBlob's meaning:
+   *  -1 (default) = the blob's existing score, or 1.0 for a new blob. */
+  float score_ = -1.0f;
 
+  /** Serialize every field (the wire format of MultiPutBlobTask::descs_). */
   template <typename Ar>
   void serialize(Ar &ar) {
-    ar(tag_id_, blob_name_, offset_, size_, payload_off_);
+    ar(tag_id_, blob_name_, offset_, size_, payload_off_, flags_,
+       score_);
+  }
+};
+
+/**
+ * Placement-score rule for the page blobs of a paged file (the filesystem
+ * module's `data_score` / `data_score_head_pages` settings).
+ *
+ * File data is stored as fixed-size page blobs named by page index. With the
+ * rule off (the default) every page is put with score -1, exactly as before
+ * the rule existed. With it on, pages at or past `head_pages_` are put with
+ * `data_score_`, while the first `head_pages_` pages of every file keep -1 so
+ * small files and file heads stay on the fastest tier next to the metadata.
+ */
+struct PageScorePolicy {
+  /** Score for file data pages; anything outside (0, 1] turns the rule off. */
+  float data_score_ = -1.0f;
+  /** Leading pages of each file that keep the default score. */
+  clio::run::u32 head_pages_ = 1;
+
+  /** @return true when data_score_ is a usable score, i.e. in (0, 1]. */
+  bool Enabled() const { return data_score_ > 0.0f && data_score_ <= 1.0f; }
+
+  /**
+   * Score to pass to PutBlob for one page of a file.
+   * @param page_index index of the page blob (byte offset / page size)
+   * @return data_score_ for a data page under an enabled rule, else -1
+   */
+  float ScoreOf(clio::run::u64 page_index) const {
+    return (Enabled() && page_index >= head_pages_) ? data_score_ : -1.0f;
   }
 };
 
@@ -3349,6 +3542,222 @@ struct MultiPutBlobTask : public clio::run::Task {
   }
 };
 
+/** One blob a MultiDelBlob deletes. */
+struct MultiDelKey {
+  TagId tag_id_;
+  std::string blob_name_;
+
+  template <typename Ar>
+  void serialize(Ar &ar) {
+    ar(tag_id_, blob_name_);
+  }
+};
+
+/**
+ * Delete a set of blobs in ONE task. The core splits the set by owner: the
+ * blobs this container owns are deleted as one plan (each locked and
+ * invalidated, then all their blocks freed with one FreeBlocks per pool);
+ * every other owner's subset goes out as one MultiDelBlob, all concurrently.
+ * Routed by its first key (Dynamic), like MultiPutBlob.
+ */
+struct MultiDelBlobTask : public clio::run::Task {
+  IN TagId route_tag_id_;                  // routing key (first blob)
+  IN clio::run::priv::string route_blob_;  // routing key (first blob)
+  IN clio::run::priv::string keys_;        // serialized vector<MultiDelKey>
+  IN clio::run::u32 del_flags_;            // kDelCacheCopyOnly, or 0
+  OUT clio::run::u32 num_ok_;              // blobs deleted
+  OUT int first_rc_;                       // first nonzero rc (1 = not found)
+
+  MultiDelBlobTask()
+      : clio::run::Task(),
+        route_blob_(CLIO_PRIV_ALLOC),
+        keys_(CLIO_PRIV_ALLOC),
+        del_flags_(0),
+        num_ok_(0),
+        first_rc_(0) {}
+
+  CTP_CROSS_FUN explicit MultiDelBlobTask(
+      const clio::run::TaskId &task_id, const clio::run::PoolId &pool_id,
+      const clio::run::PoolQuery &pool_query, const TagId &route_tag_id,
+      const std::string &route_blob, const std::string &keys,
+      clio::run::u32 del_flags = 0)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kMultiDelBlob),
+        route_tag_id_(route_tag_id),
+        route_blob_(CLIO_PRIV_ALLOC, route_blob),
+        keys_(CLIO_PRIV_ALLOC, keys),
+        del_flags_(del_flags),
+        num_ok_(0),
+        first_rc_(0) {
+    task_id_ = task_id;
+    pool_id_ = pool_id;
+    method_ = Method::kMultiDelBlob;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(route_tag_id_, route_blob_, keys_, del_flags_);
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    ar(num_ok_, first_rc_);
+  }
+
+  void Copy(const ctp::ipc::FullPtr<MultiDelBlobTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    route_tag_id_ = other->route_tag_id_;
+    route_blob_ = other->route_blob_;
+    keys_ = other->keys_;
+    del_flags_ = other->del_flags_;
+    num_ok_ = other->num_ok_;
+    first_rc_ = other->first_rc_;
+  }
+
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    auto other = other_base.template Cast<MultiDelBlobTask>();
+    num_ok_ += other->num_ok_;
+    if (first_rc_ == 0) first_rc_ = other->first_rc_;
+  }
+};
+
+/**
+ * Delete a set of tags (by id) in ONE task. Like DelTag by id, each
+ * container that runs it removes ITS share of every listed tag (TagInfo,
+ * aliases, descendants and the blobs it holds, deleted as one plan per
+ * tag); broadcast it once to delete the set cluster-wide.
+ */
+struct MultiDelTagTask : public clio::run::Task {
+  IN clio::run::priv::string tags_;  // serialized vector<TagId>
+  OUT clio::run::u32 num_ok_;        // tags this container deleted
+  OUT int first_rc_;                 // first nonzero per-tag rc
+
+  MultiDelTagTask()
+      : clio::run::Task(), tags_(CLIO_PRIV_ALLOC), num_ok_(0), first_rc_(0) {}
+
+  CTP_CROSS_FUN explicit MultiDelTagTask(const clio::run::TaskId &task_id,
+                                         const clio::run::PoolId &pool_id,
+                                         const clio::run::PoolQuery &pool_query,
+                                         const std::string &tags)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kMultiDelTag),
+        tags_(CLIO_PRIV_ALLOC, tags),
+        num_ok_(0),
+        first_rc_(0) {
+    task_id_ = task_id;
+    pool_id_ = pool_id;
+    method_ = Method::kMultiDelTag;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(tags_);
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    ar(num_ok_, first_rc_);
+  }
+
+  void Copy(const ctp::ipc::FullPtr<MultiDelTagTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    tags_ = other->tags_;
+    num_ok_ = other->num_ok_;
+    first_rc_ = other->first_rc_;
+  }
+
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    auto other = other_base.template Cast<MultiDelTagTask>();
+    num_ok_ += other->num_ok_;
+    if (first_rc_ == 0) first_rc_ = other->first_rc_;
+  }
+};
+
+/**
+ * Broadcast: register a copy-on-write link on this container (kCowLink).
+ *
+ * Sent once per lazy copy by the copy's name owner, to every container of the
+ * core pool. On receipt each container records two things locally:
+ *   - the copy-on-write link: before a write lands on a blob of source_tag_
+ *     here, copy_tag_ must already hold that blob (materialised from the
+ *     source's pre-write bytes by fault_pool_id_ / fault_params_);
+ *   - the copy tag's fault handler, so a miss on the copy resolves on this
+ *     container too (the blob's owner is not necessarily the name owner).
+ * The receiver does only this local part and never re-broadcasts.
+ *
+ * source_tag_      the tag being copied (its blobs are the snapshot)
+ * copy_tag_        the lazy copy
+ * fault_pool_id_   pool that materialises the copy (the checkpoint chimod)
+ * fault_pool_name_ name of fault_pool_id_ (kCowFaultPoolName)
+ * fault_params_    source tag NAME, as the fault handler resolves it
+ */
+struct CowLinkTask : public clio::run::Task {
+  IN TagId source_tag_;
+  IN TagId copy_tag_;
+  IN clio::run::PoolId fault_pool_id_;
+  IN clio::run::priv::string fault_pool_name_;
+  IN clio::run::priv::string fault_params_;
+
+  // SHM constructor
+  CowLinkTask()
+      : clio::run::Task(),
+        source_tag_(TagId::GetNull()),
+        copy_tag_(TagId::GetNull()),
+        fault_pool_id_(clio::run::PoolId::GetNull()),
+        fault_pool_name_(CLIO_PRIV_ALLOC),
+        fault_params_(CLIO_PRIV_ALLOC) {}
+
+  // Emplace constructor
+  CTP_CROSS_FUN explicit CowLinkTask(const clio::run::TaskId &task_id,
+                                     const clio::run::PoolId &pool_id,
+                                     const clio::run::PoolQuery &pool_query,
+                                     const TagId &source_tag,
+                                     const TagId &copy_tag,
+                                     const clio::run::PoolId &fault_pool_id,
+                                     const std::string &fault_pool_name,
+                                     const std::string &fault_params)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kCowLink),
+        source_tag_(source_tag),
+        copy_tag_(copy_tag),
+        fault_pool_id_(fault_pool_id),
+        fault_pool_name_(CLIO_PRIV_ALLOC, fault_pool_name),
+        fault_params_(CLIO_PRIV_ALLOC, fault_params) {
+    task_id_ = task_id;
+    pool_id_ = pool_id;
+    method_ = Method::kCowLink;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(source_tag_, copy_tag_, fault_pool_id_, fault_pool_name_, fault_params_);
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+  }
+
+  void Copy(const ctp::ipc::FullPtr<CowLinkTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    source_tag_ = other->source_tag_;
+    copy_tag_ = other->copy_tag_;
+    fault_pool_id_ = other->fault_pool_id_;
+    fault_pool_name_ = other->fault_pool_name_;
+    fault_params_ = other->fault_params_;
+  }
+};
+
 
 // ===========================================================================
 // Fully-POD, GPU-compatible blob tasks (issue #556).
@@ -3394,7 +3803,7 @@ struct PodPutBlobTask : public clio::run::Task {
     context_.op_flags_ &= ~Context::kBlobNameRawInt32;
     blob_name_ = dec.c_str();
   }
-  IN clio::run::u64 offset_;
+  INOUT clio::run::u64 offset_;  // IN; OUT landed offset for kCtePutAppend
   IN clio::run::u64 size_;
   IN ctp::ipc::ShmPtr<> blob_data_;
   IN float score_;
@@ -3485,8 +3894,9 @@ struct PodPutBlobTask : public clio::run::Task {
   CTP_CROSS_FUN void SerializeOut(Archive &ar) {
     Task::SerializeOut(ar);
     // Only INOUT fields travel back (see PutBlobTask::SerializeOut for why
-    // blob_data_ must NOT be echoed).
-    ar(blob_name_, context_);
+    // blob_data_ must NOT be echoed). offset_ carries the landed offset of a
+    // kCtePutAppend put.
+    ar(offset_, blob_name_, context_);
   }
 
   void Copy(const ctp::ipc::FullPtr<PodPutBlobTask> &other) {
@@ -4622,40 +5032,81 @@ struct GetNumAliasesTask : public clio::run::Task {
   }
 };
 
-/** Operations carried by UpdateTagNamesTask (see EncodeTagNameOp). */
+/**
+ * Operations carried by UpdateTagNamesTask (see EncodeTagNameOp).
+ *
+ * Names are flat strings. A name's binding (name -> tag) lives on the
+ * container the name hashes to (NameHash, the same hash GetOrCreateTag routes
+ * by); a tag's name list (canonical name + aliases) lives on its home
+ * container (TagHomeHash). Callers send the first three ops; the core expands
+ * each into the per-container steps below and sends every step to the
+ * container that holds that state.
+ */
 enum class TagNameOp : clio::run::u32 {
   kAddName = 1,     ///< bind `name` to the tag (canonical if it has none, else an alias)
   kRemoveName = 2,  ///< unbind `name` from the tag
-  kRename = 3,      ///< rebind the tag's `name` to `name2` (O(1): children keep their ids)
-  kSetRoot = 4,     ///< bind "/" to the tag (the hierarchy's root)
-  kResetPublished = 5,  ///< drop every published "$tagid{..}" name (restart resync)
+  kRename = 3,      ///< rebind the tag's `name` to `name2` (replaces another tag's `name2`)
+  // ---- per-container steps (sent by the core to the container that holds the state) ----
+  kBind = 10,       ///< name owner: bind name -> tag (seq_ & kTnReplace: take it from another tag)
+  kUnbind = 11,     ///< name owner: drop the binding if it names the tag
+  kLookup = 12,     ///< name owner: report the bound tag
+  kHomeAdd = 20,    ///< tag home: add a name (seq_ & kTnMustExist: only to a known tag)
+  kHomeRemove = 21, ///< tag home: remove a name, promoting an alias if it was canonical
+  kHomeRename = 22, ///< tag home: replace name with name2 in place
+  kHomeUnlink = 23, ///< tag home: unlink a name; drops the tag when it was its last
+  kHomeDrop = 24,   ///< tag home: drop the whole name list (the tag is being deleted)
+  kHomeNames = 25,  ///< tag home: report the name list
+};
+
+/** kBind flag: take the name from another tag (rename semantics). */
+constexpr clio::run::u64 kTnReplace = 1;
+/** kHomeAdd flag: only when the home knows the tag. */
+constexpr clio::run::u64 kTnMustExist = 2;
+/** kHomeUnlink flag: POSIX unlink (keep the tag while another name is left). */
+constexpr clio::run::u64 kTnPosix = 4;
+
+/** Step results (TagNameOpRec::op_ of a result record). */
+enum TagNameResult : clio::run::u32 {
+  kTnOk = 0,        ///< applied; tag_ = the tag now bound / affected
+  kTnMissing = 1,   ///< name not bound / tag unknown at its home
+  kTnTaken = 2,     ///< kBind: name bound to another tag (tag_ = that tag)
+  kTnDeleted = 3,   ///< kHomeUnlink / kHomeDrop: the tag lost its last name
+                    ///< (name_ = every name it had, '\0'-separated)
+  kTnUnreached = 4, ///< a container holding this op's state did not answer
+                    ///< (down): nothing was undone; send the op again
 };
 
 /**
- * Stored hierarchical form of a child name: "$tagid{<major>.<minor>}/<leaf>"
- * relative to its parent tag, so moving a directory re-keys ONE name. The
- * core resolves it to an absolute path for its search index.
- * @param parent parent tag id
- * @param leaf single path component
- * @return stored name
+ * Hash that picks a tag's home container (DirectHash), from its id.
+ * Fixed and cheap: the server mints ids whose home is the minting container.
+ * @param id tag id
+ * @return routing hash
  */
-inline std::string MakeTagRefName(const TagId &parent, const std::string &leaf) {
-  return "$tagid{" + std::to_string(parent.major_) + "." +
-         std::to_string(parent.minor_) + "}/" + leaf;
+inline clio::run::u32 TagHomeHash(const TagId &id) {
+  return id.minor_ + (id.major_ * 2654435761u) % 65521u;
+}
+
+/**
+ * Hash that picks the container holding a name's binding (DirectHash).
+ * @param name tag name
+ * @return routing hash
+ */
+inline clio::run::u32 NameHash(const std::string &name) {
+  return static_cast<clio::run::u32>(std::hash<std::string>{}(name));
 }
 
 /**
  * Append one tag-name operation to an UpdateTagNames batch.
- * Record: [u32 op][u32 major][u32 minor][u64 seq][u32 len][name][u32 len][name2]
+ * Record: [u32 op][u32 major][u32 minor][u64 flags][u32 len][name][u32 len][name2]
  * @param out batch buffer
  * @param op operation
  * @param tag tag id
- * @param seq last-writer-wins stamp (wall-clock ns at the name's owner)
- * @param name stored name (see MakeTagRefName)
- * @param name2 new stored name (kRename only)
+ * @param flags kTn* flags (kTnMustExist on kAddName; step flags); 0 for none
+ * @param name tag name
+ * @param name2 new tag name (kRename / kHomeRename only)
  */
 inline void EncodeTagNameOp(std::string *out, TagNameOp op, const TagId &tag,
-                            clio::run::u64 seq, const std::string &name,
+                            clio::run::u64 flags, const std::string &name,
                             const std::string &name2 = std::string()) {
   auto put32 = [out](clio::run::u32 v) {
     out->append(reinterpret_cast<const char *>(&v), sizeof(v));
@@ -4663,7 +5114,7 @@ inline void EncodeTagNameOp(std::string *out, TagNameOp op, const TagId &tag,
   put32(static_cast<clio::run::u32>(op));
   put32(tag.major_);
   put32(tag.minor_);
-  out->append(reinterpret_cast<const char *>(&seq), sizeof(seq));
+  out->append(reinterpret_cast<const char *>(&flags), sizeof(flags));
   put32(static_cast<clio::run::u32>(name.size()));
   out->append(name);
   put32(static_cast<clio::run::u32>(name2.size()));
@@ -4674,7 +5125,7 @@ inline void EncodeTagNameOp(std::string *out, TagNameOp op, const TagId &tag,
 struct TagNameOpRec {
   TagNameOp op_ = TagNameOp::kAddName;
   TagId tag_;
-  clio::run::u64 seq_ = 0;
+  clio::run::u64 flags_ = 0;  ///< kTn* flags; a kBind result: the displaced tag
   std::string name_;
   std::string name2_;
 };
@@ -4706,7 +5157,7 @@ inline bool DecodeTagNameOps(const char *data, size_t len,
     TagNameOpRec r;
     clio::run::u32 op = 0;
     if (!get(&op, 4) || !get(&r.tag_.major_, 4) || !get(&r.tag_.minor_, 4) ||
-        !get(&r.seq_, 8) || !get_str(&r.name_) || !get_str(&r.name2_)) {
+        !get(&r.flags_, 8) || !get_str(&r.name_) || !get_str(&r.name2_)) {
       return false;
     }
     r.op_ = static_cast<TagNameOp>(op);
@@ -4716,20 +5167,25 @@ inline bool DecodeTagNameOps(const char *data, size_t len,
 }
 
 /**
- * UpdateTagNames task - apply a batch of tag-name operations to this
- * container's name table and search index. Sent as a Broadcast so EVERY
- * container holds every name: each can resolve "$tagid{parent}/leaf" names
- * to absolute paths and answer TagQuery/BlobQuery/SemanticSearch locally.
- * Idempotent and order-tolerant: per-name last-writer-wins by seq, and a
- * name whose parent has not arrived yet is parked until it does.
+ * UpdateTagNames task - the batched tag-name verb (MultiRenameTag,
+ * MultiGetOrCreateTagAlias and name removal in one). Each record names one
+ * tag and flat name(s); the core sends every step to the container that
+ * holds that state -- a name's binding to the container the name hashes to,
+ * a tag's name list to the tag's home -- and applies the steps for one
+ * container in record order. Send it Local: the receiving container routes.
  */
 struct UpdateTagNamesTask : public clio::run::Task {
-  IN clio::run::priv::string ops_;  // EncodeTagNameOp records
-  OUT clio::run::u32 applied_;      // records applied (not superseded)
+  IN clio::run::priv::string ops_;       // EncodeTagNameOp records
+  OUT clio::run::u32 applied_;           // records applied
+  OUT clio::run::priv::string results_;  // one EncodeTagNameOp record per op
+                                         // (op_ = TagNameResult)
 
   // SHM constructor
   UpdateTagNamesTask()
-      : clio::run::Task(), ops_(CLIO_PRIV_ALLOC), applied_(0) {}
+      : clio::run::Task(),
+        ops_(CLIO_PRIV_ALLOC),
+        applied_(0),
+        results_(CLIO_PRIV_ALLOC) {}
 
   // Emplace constructor
   CTP_CROSS_FUN explicit UpdateTagNamesTask(const clio::run::TaskId &task_id,
@@ -4738,7 +5194,8 @@ struct UpdateTagNamesTask : public clio::run::Task {
                                             const std::string &ops)
       : clio::run::Task(task_id, pool_id, pool_query, Method::kUpdateTagNames),
         ops_(CLIO_PRIV_ALLOC, ops),
-        applied_(0) {
+        applied_(0),
+        results_(CLIO_PRIV_ALLOC) {
     task_id_ = task_id;
     pool_id_ = pool_id;
     method_ = Method::kUpdateTagNames;
@@ -4755,20 +5212,25 @@ struct UpdateTagNamesTask : public clio::run::Task {
   template <typename Archive>
   CTP_CROSS_FUN void SerializeOut(Archive &ar) {
     Task::SerializeOut(ar);
-    ar(applied_);
+    ar(applied_, results_);
   }
 
   void Copy(const ctp::ipc::FullPtr<UpdateTagNamesTask> &other) {
     Task::Copy(other.template Cast<Task>());
     ops_ = other->ops_;
     applied_ = other->applied_;
+    results_ = other->results_;
   }
 
   // Broadcast aggregation: report the largest per-container count.
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
     auto other = other_base.template Cast<UpdateTagNamesTask>();
-    if (other->applied_ > applied_) applied_ = other->applied_;
+    // A remote reply reaches the sender through here too: carry the
+    // per-record results (a broadcast concatenates them).
+    applied_ += other->applied_;
+    results_ = clio::run::priv::string(
+        CLIO_PRIV_ALLOC, results_.str() + other->results_.str());
   }
 };
 
@@ -5572,6 +6034,67 @@ struct FlushMetadataTask : public clio::run::Task {
   }
 };
 
+/** Durability argument of SetDurabilityTask (matches CoreDurability). */
+GLOBAL_CROSS_CONST clio::run::u32 kCteDurabilityVolatile = 0;
+GLOBAL_CROSS_CONST clio::run::u32 kCteDurabilityPersistent = 1;
+
+/**
+ * SetDurabilityTask - switch a core between volatile and persistent at
+ * runtime. To persistent: refused with kCteVolatileTargetRc while any
+ * volatile bdev is registered; otherwise the WAL (if metadata_log_path is
+ * configured) is opened and a full snapshot written. To volatile: the WAL
+ * stops. The change lasts until the core restarts, which uses the config.
+ */
+struct SetDurabilityTask : public clio::run::Task {
+  IN clio::run::u32 durability_;   ///< kCteDurabilityVolatile / Persistent
+  OUT clio::run::u32 previous_;    ///< the class before this call
+
+  /** SHM default constructor */
+  SetDurabilityTask()
+      : clio::run::Task(), durability_(kCteDurabilityVolatile), previous_(0) {}
+
+  /** Emplace constructor */
+  CTP_CROSS_FUN explicit SetDurabilityTask(const clio::run::TaskId &task_node,
+                                           const clio::run::PoolId &pool_id,
+                                           const clio::run::PoolQuery &pool_query,
+                                           clio::run::u32 durability)
+      : clio::run::Task(task_node, pool_id, pool_query, Method::kSetDurability),
+        durability_(durability),
+        previous_(0) {
+    task_id_ = task_node;
+    pool_id_ = pool_id;
+    method_ = Method::kSetDurability;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(durability_);
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    ar(previous_);
+  }
+
+  void Copy(const ctp::ipc::FullPtr<SetDurabilityTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    durability_ = other->durability_;
+    previous_ = other->previous_;
+  }
+
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    // OUT fields only (issue #915). With a broadcast, previous_ is whichever
+    // container answered last; the return code carries any refusal.
+    Task::AggregateOut(other_base);
+    auto replica = other_base.template Cast<SetDurabilityTask>();
+    previous_ = replica->previous_;
+  }
+};
+
 /**
  * FlushDataTask - Periodic task to flush data from volatile to non-volatile
  * targets
@@ -5837,6 +6360,11 @@ static constexpr clio::run::u32 kSyncIoRc = 5;  // EIO
  *  barrier), so a blob with one at the persistence level needs no second
  *  durable copy of its primary (#1143). */
 GLOBAL_CROSS_CONST clio::run::u32 kSyncReplicasCurrent = 0x1;
+/** SyncTagTask::sync_flags_: the sync was broadcast, so every container of
+ *  the pool is running it. A cache that holds copies on several containers
+ *  then flushes only its own instead of asking every container again (one
+ *  fsync was otherwise a broadcast of broadcasts). */
+GLOBAL_CROSS_CONST clio::run::u32 kSyncFannedOut = 0x2;
 
 struct SyncTagTask : public clio::run::Task {
   IN TagId tag_id_;              ///< Tag whose blobs must become durable

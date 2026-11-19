@@ -134,10 +134,13 @@ def private_environment(
 
 def daemon_executable(bin_dir: Path) -> Path:
     """Require the exact executable alongside the selected installed artifact."""
-    executable = bin_dir / ("clio_run.exe" if os.name == "nt" else "clio_run")
-    if not executable.is_file():
-        raise RuntimeError(f"Missing installed daemon executable: {executable}")
-    return executable.resolve()
+    suffix = ".exe" if os.name == "nt" else ""
+    # clio-run is canonical; clio_run is the legacy alias (absent in wheels).
+    for name in ("clio-run", "clio_run"):
+        executable = bin_dir / f"{name}{suffix}"
+        if executable.is_file():
+            return executable.resolve()
+    raise RuntimeError(f"Missing installed daemon executable: {bin_dir / ('clio-run' + suffix)}")
 
 
 def owned_process(pid: int, created: float, executable: Path) -> Any:
@@ -503,6 +506,7 @@ def assert_registration_idempotent(
             pool_query=cte.PoolQuery.Local(),
             attach_existing=0,
             growth_unit=1 << 30,
+            persistence_level=1,
         )
         attempt: dict[str, Any] = {"register_rc": future.wait(max_sec=10.0)}
         receipt["attempts"].append(attempt)
@@ -539,6 +543,9 @@ def initial_phase(
         pool_query=cte.PoolQuery.Local(),
         attach_existing=0,
         growth_unit=1 << 30,
+        # The core is persistent and the running core does not re-read its
+        # config: label the new bdev, or it registers as volatile (refused).
+        persistence_level=1,
     )
     assert future.wait(max_sec=10.0) == 0
     capacity = client.AsyncGetCapacity().result(max_sec=10.0)

@@ -153,6 +153,42 @@ CTP_GPU_FUN CLIO_COROC_INLINE void SeedCoro(gv::DeviceVector<float> v, u64 per,
   if (publish != 0) CO_AWAIT(v.CoEndFlush());
 }
 
+/** --load-tag: bring one page in from the storage tiers and leave it resident
+ *  (unpinned). Out of line, like grayscott's ResolvePlane: a suspending loop
+ *  body written inline has crashed IGC's backend (AURORA.md (4)).
+ *  @param v    the vector
+ *  @param off  first element of the page
+ *  @param n    elements in the page */
+CTP_GPU_FUN __attribute__((noinline)) void LoadPage(gv::DeviceVector<float> v,
+                                                    u64 off, u64 n) {
+  gv::PageRef<float> h;
+  CO_AWAIT(v.CoFetch(0, off, n));
+  h = CO_AWAIT(v.CoHoldPage(off, n, /*write=*/false));
+  h = {};
+  v.UnpinRange(off, n);
+}
+
+/** --load-tag: the timed LOAD phase. Reads this block's slice back from the
+ *  storage tiers (it was staged there and the GPU cache dropped), as many
+ *  pages as fit in the block's share of the cache; the rest of the slice is
+ *  read on demand by the first Lloyd pass.
+ *  @param v          the vector
+ *  @param per        elements in this block's slice
+ *  @param page_elems elements per page
+ *  @param max_pages  pages this block may load (its share of the cache)
+ *  @param block      this block's index */
+CTP_GPU_FUN CLIO_COROC_INLINE void LoadCoro(gv::DeviceVector<float> v, u64 per,
+                                            u64 page_elems, u64 max_pages,
+                                            u32 block) {
+  const u64 base = static_cast<u64>(block) * per;
+  u64 np = 0;
+  for (u64 off = 0; off < per && np < max_pages; off += page_elems) {
+    const u64 n = (off + page_elems <= per) ? page_elems : (per - off);
+    CO_AWAIT(LoadPage(v, base + off, n));
+    ++np;
+  }
+}
+
 // ---- WORK-GROUP TILE (SYCL) ---------------------------------------------
 //
 // THE BASELINES TILE IN LOCAL MEMORY AND THIS DID NOT. Their AssignTiled
@@ -375,6 +411,15 @@ void LaunchSeed(dim3 grid, dim3 block, const GpuInfo &info, DevF32 v, u64 per,
   });
 }
 
+/** --load-tag: launch the load phase (LoadCoro) over every block. */
+void LaunchLoad(dim3 grid, dim3 block, const GpuInfo &info, DevF32 v, u64 per,
+                u64 page_elems, u64 max_pages, View vw, StackView sv) {
+  (void)info;
+  SubmitYieldable(grid, block, v, vw, sv, [=](clio::co::Ctx &_cy, DevF32 dev, u32 blk) {
+    LoadCoro(_cy, dev, per, page_elems, max_pages, blk);
+  });
+}
+
 void LaunchAssign(dim3 grid, dim3 block, const GpuInfo &info, DevF32 v, u64 per,
                   u64 page_elems, u32 dims, u32 k, const float *cent,
                   float *sums, unsigned *counts, View vw, StackView sv) {
@@ -455,6 +500,15 @@ __global__ GV_LAUNCH_BOUNDS void SeedKernel(GpuInfo info, DevF32 v, u64 per,
   CLIO_COROC_RUN(yv, ys, SeedCoro(_cy, v, per, page_elems, dims, k, base_idx, yv.Block(), publish));
 }
 
+__global__ GV_LAUNCH_BOUNDS void LoadKernel(GpuInfo info, DevF32 v, u64 per,
+                                            u64 page_elems, u64 max_pages,
+                                            View yv, StackView ys) {
+  CLIO_GPU_INIT(info, nullptr);
+  v.Init(yv.Block());
+  __syncthreads();
+  CLIO_COROC_RUN(yv, ys, LoadCoro(_cy, v, per, page_elems, max_pages, yv.Block()));
+}
+
 __global__ GV_LAUNCH_BOUNDS void AssignKernel(GpuInfo info, DevF32 v, u64 per, u64 page_elems,
                              u32 dims, u32 k, const float *cent, float *sums,
                              unsigned *counts, View yv, StackView ys) {
@@ -501,6 +555,12 @@ void LaunchSeed(dim3 grid, dim3 block, const GpuInfo &info, DevF32 v, u64 per,
                 StackView sv, u32 publish) {
   SeedKernel<<<grid, block, CLIO_YIELD_SMEM_BYTES>>>(
       info, v, per, page_elems, dims, k, base_idx, vw, sv, publish);
+}
+
+void LaunchLoad(dim3 grid, dim3 block, const GpuInfo &info, DevF32 v, u64 per,
+                u64 page_elems, u64 max_pages, View vw, StackView sv) {
+  LoadKernel<<<grid, block, CLIO_YIELD_SMEM_BYTES>>>(
+      info, v, per, page_elems, max_pages, vw, sv);
 }
 
 void LaunchAssign(dim3 grid, dim3 block, const GpuInfo &info, DevF32 v, u64 per,
@@ -614,6 +674,11 @@ int main(int argc, char **argv) {
   // --publish-seed writes the seeded points back to the CTE (the old
   // behaviour); by default a resident run keeps them only in its frames.
   bool publish_seed = false;
+  // --load-tag NAME: the input is LOADED, not generated. An untimed staging
+  // step writes the point set into the CTE tiers under tag NAME and drops
+  // the GPU cache; the timed run then reads it back through the vector
+  // (load phase, then the Lloyd passes fault the rest from storage).
+  std::string load_tag;
 
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -626,6 +691,7 @@ int main(int argc, char **argv) {
     else if (a == "--clusters") k = static_cast<u32>(next());
     else if (a == "--slots") slots = static_cast<u32>(next());
     else if (a == "--publish-seed") publish_seed = true;
+    else if (a == "--load-tag" && i + 1 < argc) load_tag = argv[++i];
     else if (a == "--iters") iters = static_cast<u32>(next());
     else if (a == "--page-kb") page_kb = next();
     else if (a == "--data-mb") data_mb = next();
@@ -644,6 +710,7 @@ int main(int argc, char **argv) {
       std::printf("usage: %s [--blocks N] [--threads N] [--dims N] "
                   "[--clusters N] [--slots N] [--iters N] [--page-kb N] "
                   "[--data-mb N] [--hbm-mb N] [--repeat N] [--hbm-only] "
+                  "[--load-tag NAME] [--ckpt-final] [--ckpt-sync] "
                   "[--nodes N --node I]\n",
                   argv[0]);
       return 0;
@@ -799,8 +866,12 @@ int main(int argc, char **argv) {
   // what covers several blocks colliding on one set.
   // Per-node tag namespace: the points are private to this node, and two
   // processes on one CTE would otherwise share the blob names.
+  const bool load = !load_tag.empty();
+  // A loaded input must be in the tiers before the cache is dropped.
+  if (load) publish_seed = true;
+  const std::string region_base = load ? load_tag : std::string("gv_kmeans");
   const std::string region =
-      (nodes > 1) ? ("gv_kmeans_n" + std::to_string(node)) : "gv_kmeans";
+      (nodes > 1) ? (region_base + "_n" + std::to_string(node)) : region_base;
   gv::Vector<float> vec(region.c_str(), {0}, page_bytes, blocks,
                         slots < 16u ? 16u : slots, n);
   vec.EnableStats();
@@ -808,11 +879,28 @@ int main(int argc, char **argv) {
   YieldRunner runner(blocks, threads);
 
   // ---- seed the point set -------------------------------------------------
+  // With --load-tag this is the untimed STAGING step: the seed is published
+  // to the tiers under the load tag and the GPU cache is then dropped, so
+  // the device holds none of the input when the clock starts.
+  const double t_stage0 = NowMs();
   runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw, gy::YieldStackView sv) {
     kb::LaunchSeed(g, b, gpu, dev, per, page_elems, dims, k, base_idx, vw,
                    sv, publish_seed ? 1u : 0u);
   });
   ctp::GpuApi::Synchronize();
+  const double stage_ms = NowMs() - t_stage0;
+  // Pages each block may load: three quarters of its share of the cache, so
+  // set conflicts do not evict what the load phase just brought in.
+  const u64 load_pages_per_block =
+      (static_cast<u64>(slots < 16u ? 16u : slots) * 3) / 4;
+  if (load) {
+    vec.ClearCache();
+    ctp::GpuApi::Synchronize();
+    std::fprintf(stderr, "KMEANS STAGE tag=%s stage_ms=%.1f pages=%llu "
+                 "(published to the tiers; GPU cache dropped)\n",
+                 region.c_str(), stage_ms,
+                 (unsigned long long)((per * blocks) / page_elems));
+  }
 
   // ---- device state -------------------------------------------------------
   float *d_cent = nullptr, *d_sums = nullptr;
@@ -929,9 +1017,26 @@ int main(int argc, char **argv) {
   };
 
   double best_ms = 1e30;
+  // E5 accounting: the repeat with the smallest load + compute.
+  double best_total = 1e30, best_load_ms = 0.0, best_compute_ms = 0.0;
   std::vector<float> h_final(static_cast<size_t>(k) * dims);
   for (int r = 0; r < repeat; ++r) {
     ctp::GpuApi::Memcpy(d_cent, h_cent.data(), h_cent.size() * sizeof(float));
+    double load_ms = 0.0;
+    if (load) {
+      // Every repeat starts cold: the input is only in the tiers. The pass
+      // is read-only, so dropping the frames discards nothing.
+      vec.ClearCache();
+      ctp::GpuApi::Synchronize();
+      const double tl0 = NowMs();
+      runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                     gy::YieldStackView sv) {
+        kb::LaunchLoad(g, b, gpu, dev, per, page_elems, load_pages_per_block,
+                       vw, sv);
+      });
+      ctp::GpuApi::Synchronize();
+      load_ms = NowMs() - tl0;
+    }
     vec.ResetStats();
     ctp::GpuApi::Synchronize();
     const auto km_c0 = vec.ReadStats(0);
@@ -998,6 +1103,11 @@ int main(int argc, char **argv) {
     ctp::GpuApi::Synchronize();
     const double ms = NowMs() - t0;
     if (ms < best_ms) best_ms = ms;
+    if (load_ms + ms < best_total) {
+      best_total = load_ms + ms;
+      best_load_ms = load_ms;
+      best_compute_ms = ms;
+    }
     {
       clio_gv_bench::CommAcc km_comm;
       km_comm.Add(km_c0, vec.ReadStats(0));
@@ -1095,10 +1205,28 @@ int main(int argc, char **argv) {
   // FINAL-STATE CHECKPOINT, after every gate that reads the live cache (the
   // multi-node path drops it first).
   std::unique_ptr<gv::Vector<float>> vec_ck;
+  double ckpt_ms = 0.0;
   if (ckpt && !baseline) {
+    const double tc0 = NowMs();
     vec_ck = clio_bench_ckpt::FinalCheckpoint(vec, region + "_ckpt", nodes,
                                               ckpt_sync);
+    ckpt_ms = NowMs() - tc0;
   }
+  // E5 line: load (from the tiers) + compute (the Lloyd passes, as ms= on
+  // the KMEANS line) + the final checkpoint. Staging is not part of total.
+  std::fprintf(stderr,
+               "KMEANS E5 load_ms=%.1f compute_ms=%.1f ckpt_ms=%.1f "
+               "total_ms=%.1f stage_ms=%.1f load=%d ckpt=%d ckpt_sync=%d "
+               "ckpt_flushed_pages=%llu ckpt_flushed_bytes=%llu "
+               "ckpt_materialized_bytes=%llu\n",
+               best_load_ms, best_compute_ms, ckpt_ms,
+               best_load_ms + best_compute_ms + ckpt_ms, stage_ms,
+               load ? 1 : 0, ckpt ? 1 : 0, ckpt_sync ? 1 : 0,
+               (unsigned long long)(vec_ck ? vec.LastFlushPages() : 0),
+               (unsigned long long)(vec_ck ? vec.LastFlushBytes() : 0),
+               (unsigned long long)(vec_ck && ckpt_sync
+                                        ? vec_ck->NumPages() * page_bytes
+                                        : 0));
   // EXIT BARRIER. Each rank embeds its node's runtime, so a rank that exits
   // takes that node's containers with it. A slower rank whose checkpoint tag
   // is owned by an exited node then waits forever in GetOrCreateTag (64

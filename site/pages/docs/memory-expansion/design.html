@@ -1,0 +1,184 @@
+<!--
+title: Memory expansion design
+heading: How memory expansion <em>is built</em>
+description: The pieces of the GPU and CPU vector adapters: host owner, device view, one shared set-associative page cache per GPU, pages as CTE blobs, the fetch and flush path through the runtime, and prefetch hints.
+eyebrow: Docs · Memory expansion
+lede: Memory expansion lets a kernel work on a vector larger than device memory. The vector is cut into pages, each page is a CTE blob, and each GPU keeps one cache of pages in device memory that every block of the kernel shares.
+facts: Source | context-transfer-engine/adapter/gpu_vector ; Backends | CUDA, SYCL, CPU ; Page | one CTE blob
+-->
+
+<figure class="diagram">
+<svg viewBox="0 0 860 300" role="img" aria-label="Memory expansion pieces">
+<defs><marker id="me0" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+<rect class="box alt" x="20" y="20" width="390" height="56" rx="8"/><text class="title" x="32" y="44">Host side (gpu_vector.h)</text><text class="muted" x="32" y="64">owns every allocation, hands out a device view</text>
+<rect class="box hl" x="450" y="20" width="390" height="56" rx="8"/><text class="title" x="462" y="44">Kernel blocks (device_vector.h)</text><text class="muted" x="462" y="64">one shared page cache, block-collective calls</text>
+<rect class="box" x="20" y="120" width="390" height="56" rx="8"/><text class="title" x="32" y="144">Prefetch hints (prefetch.h)</text><text class="muted" x="32" y="164">tier rescoring from yield state</text>
+<rect class="box" x="450" y="120" width="390" height="56" rx="8"/><text class="title" x="462" y="144">Pages (page.h)</text><text class="muted" x="462" y="164">page N is blob "N" in the vector's tag</text>
+<rect class="box alt" x="20" y="220" width="820" height="56" rx="8"/><text class="title" x="32" y="244">Context Transfer Engine</text><text class="muted" x="32" y="264">stores the blobs across tiers; a tag's fault handler, such as the CAE, fills pages that are missing</text>
+<path class="edge" d="M410 48 H450" marker-end="url(#me0)"/>
+<path class="edge" d="M645 76 V120" marker-end="url(#me0)"/>
+<path class="edge" d="M645 176 V220" marker-end="url(#me0)"/>
+<path class="edge" d="M215 176 V220" marker-end="url(#me0)"/>
+</svg>
+<figcaption>The host sets things up; kernels move pages; the CTE holds them.</figcaption>
+</figure>
+
+<h2 id="host-and-device">Host side and device side</h2>
+<p>The work is split in two. The host side creates the vector, makes every allocation, and gives the kernel a <em>device view</em>. A kernel cannot allocate anything, so all memory a kernel will ever touch is sized before launch. The device view is the only thing the kernel sees.</p>
+
+<h2 id="pages">Pages</h2>
+<p>The vector is cut into fixed-size pages. Page <code>N</code> is stored as a blob named <code>N</code>, in decimal, inside the vector's CTE tag. Pages therefore get every CTE property for free: placement across tiers, persistence, and the chain of modules. Any block of a kernel may touch any page; the vector does not divide pages among blocks.</p>
+
+<h2 id="layout">How a vector is laid out</h2>
+<figure class="diagram">
+<svg viewBox="0 0 860 712" role="img" aria-label="Layout of an eight-page vector: one CTE blob per page, and on the GPU a four-set page table whose slots point into a pool of eight page-sized regions owned per block">
+<defs><marker id="me1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+<rect class="box" x="20" y="20" width="820" height="96" rx="10"/>
+<text class="title" x="32" y="44">Vector&lt;float&gt; "grid": 8 pages of 1 MiB, 262,144 elements each</text>
+<rect class="box alt" x="32" y="58" width="92" height="44" rx="6"/><text class="title" x="44" y="85">page 0</text>
+<rect class="box alt" x="132" y="58" width="92" height="44" rx="6"/><text class="title" x="144" y="85">page 1</text>
+<rect class="box alt" x="232" y="58" width="92" height="44" rx="6"/><text class="title" x="244" y="85">page 2</text>
+<rect class="box alt" x="332" y="58" width="92" height="44" rx="6"/><text class="title" x="344" y="85">page 3</text>
+<rect class="box alt" x="432" y="58" width="92" height="44" rx="6"/><text class="title" x="444" y="85">page 4</text>
+<rect class="box alt" x="532" y="58" width="92" height="44" rx="6"/><text class="title" x="544" y="85">page 5</text>
+<rect class="box alt" x="632" y="58" width="92" height="44" rx="6"/><text class="title" x="644" y="85">page 6</text>
+<rect class="box alt" x="732" y="58" width="92" height="44" rx="6"/><text class="title" x="744" y="85">page 7</text>
+<path class="edge" d="M145,116 L145,138" marker-end="url(#me1)"/>
+<path class="edge hl" d="M565,116 L565,138" marker-end="url(#me1)"/>
+
+<rect class="box" x="20" y="140" width="250" height="420" rx="10" stroke-dasharray="6 5"/>
+<text class="title" x="32" y="164">CTE tag "grid"</text><text class="muted" x="32" y="182">one blob per page, every page</text>
+<rect class="box hl" x="36" y="196" width="101" height="34" rx="6"/><text class="title" x="48" y="218">blob "0"</text>
+<rect class="box hl" x="36" y="238" width="101" height="34" rx="6"/><text class="title" x="48" y="260">blob "1"</text>
+<rect class="box hl" x="36" y="280" width="101" height="34" rx="6"/><text class="title" x="48" y="302">blob "2"</text>
+<rect class="box hl" x="36" y="322" width="101" height="34" rx="6"/><text class="title" x="48" y="344">blob "3"</text>
+<rect class="box hl" x="153" y="196" width="101" height="34" rx="6"/><text class="title" x="165" y="218">blob "4"</text>
+<rect class="box hl" x="153" y="238" width="101" height="34" rx="6"/><text class="title" x="165" y="260">blob "5"</text>
+<rect class="box hl" x="153" y="280" width="101" height="34" rx="6"/><text class="title" x="165" y="302">blob "6"</text>
+<rect class="box hl" x="153" y="322" width="101" height="34" rx="6"/><text class="title" x="165" y="344">blob "7"</text>
+<text class="muted" x="36" y="384">The name is the page number in</text><text class="muted" x="36" y="400">decimal. A kernel sends it as 4 raw</text><text class="muted" x="36" y="416">bytes; the runtime renders digits.</text>
+<text class="muted" x="36" y="444">Pages are written at score 0.5;</text><text class="muted" x="36" y="460">the CTE picks the tier.</text>
+<text class="muted" x="36" y="488">A page never written reads as</text><text class="muted" x="36" y="504">zeros, unless the tag has a fault</text><text class="muted" x="36" y="520">handler to produce it.</text>
+
+<rect class="box" x="290" y="140" width="550" height="420" rx="10" stroke-dasharray="6 5"/>
+<text class="title" x="302" y="164">GPU memory (one copy per GPU)</text><text class="muted" x="302" y="182">sized by the host and registered before launch; kernels never allocate</text>
+<text class="title" x="306" y="210">Page table: 4 sets × 4 slots</text><text class="muted" x="306" y="226">home set = hash(page) mod 4; found or claimed under that set's lock</text>
+<text class="muted" x="306" y="263">set 0</text>
+<rect class="box hl" x="356" y="238" width="108" height="40" rx="6"/><text class="title" x="368" y="255">page 0</text><text class="muted" x="368" y="270">r0 · pins 2</text>
+<rect class="box" x="472" y="238" width="108" height="40" rx="6"/><text class="title" x="484" y="255">page 3</text><text class="muted" x="484" y="270">r1 · pins 0</text>
+<rect class="box" x="588" y="238" width="108" height="40" rx="6" stroke-dasharray="4 4"/><text class="muted" x="600" y="263">free</text>
+<rect class="box" x="704" y="238" width="108" height="40" rx="6" stroke-dasharray="4 4"/><text class="muted" x="716" y="263">free</text>
+<text class="muted" x="306" y="311">set 1</text>
+<rect class="box hl" x="356" y="286" width="108" height="40" rx="6"/><text class="title" x="368" y="303">page 1</text><text class="muted" x="368" y="318">r2 · pins 1</text>
+<rect class="box" x="472" y="286" width="108" height="40" rx="6"/><text class="title" x="484" y="303">page 4</text><text class="muted" x="484" y="318">r3 · pins 0</text>
+<rect class="box" x="588" y="286" width="108" height="40" rx="6" stroke-dasharray="4 4"/><text class="muted" x="600" y="311">free</text>
+<rect class="box" x="704" y="286" width="108" height="40" rx="6" stroke-dasharray="4 4"/><text class="muted" x="716" y="311">free</text>
+<text class="muted" x="306" y="359">set 2</text>
+<rect class="box hl" x="356" y="334" width="108" height="40" rx="6"/><text class="title" x="368" y="351">page 2</text><text class="muted" x="368" y="366">r4 · pins 1</text>
+<rect class="box" x="472" y="334" width="108" height="40" rx="6"/><text class="title" x="484" y="351">page 7</text><text class="muted" x="484" y="366">r5 · pins 0</text>
+<rect class="box" x="588" y="334" width="108" height="40" rx="6" stroke-dasharray="4 4"/><text class="muted" x="600" y="359">free</text>
+<rect class="box" x="704" y="334" width="108" height="40" rx="6" stroke-dasharray="4 4"/><text class="muted" x="716" y="359">free</text>
+<text class="muted" x="306" y="407">set 3</text>
+<rect class="box alt" x="356" y="382" width="108" height="40" rx="6"/><text class="title" x="368" y="399">page 5</text><text class="muted" x="368" y="414">r6 · fetching</text>
+<rect class="box" x="472" y="382" width="108" height="40" rx="6" stroke-dasharray="4 4"/><text class="muted" x="484" y="407">free</text>
+<rect class="box" x="588" y="382" width="108" height="40" rx="6" stroke-dasharray="4 4"/><text class="muted" x="600" y="407">free</text>
+<rect class="box" x="704" y="382" width="108" height="40" rx="6" stroke-dasharray="4 4"/><text class="muted" x="716" y="407">free</text>
+<text class="title" x="306" y="448">Region pool: 8 page-sized regions</text><text class="muted" x="306" y="464">each block's free list owns 2; an evicted page's region goes back to its owner</text>
+<rect class="box" x="306" y="474" width="58" height="30" rx="6"/><text class="muted" x="316" y="494">r0 · b0</text>
+<rect class="box" x="370" y="474" width="58" height="30" rx="6"/><text class="muted" x="380" y="494">r1 · b0</text>
+<rect class="box" x="434" y="474" width="58" height="30" rx="6"/><text class="muted" x="444" y="494">r2 · b1</text>
+<rect class="box" x="498" y="474" width="58" height="30" rx="6"/><text class="muted" x="508" y="494">r3 · b1</text>
+<rect class="box" x="562" y="474" width="58" height="30" rx="6"/><text class="muted" x="572" y="494">r4 · b2</text>
+<rect class="box" x="626" y="474" width="58" height="30" rx="6"/><text class="muted" x="636" y="494">r5 · b2</text>
+<rect class="box" x="690" y="474" width="58" height="30" rx="6"/><text class="muted" x="700" y="494">r6 · b3</text>
+<rect class="box" x="754" y="474" width="58" height="30" rx="6" stroke-dasharray="4 4"/><text class="muted" x="764" y="494">r7 · b3</text>
+<text class="muted" x="306" y="528">Per block: one PodMultiGetBlob and one PodMultiPutBlob of up to</text><text class="muted" x="306" y="544">64 pages each, built by the host; one fetch and one flush in flight.</text>
+
+<rect class="box" x="20" y="580" width="820" height="112" rx="10"/>
+<text class="title" x="32" y="604">One slot = a 64-byte Page record</text>
+<text class="muted" x="32" y="626">page_num: which page, or none (a free slot)</text>
+<text class="muted" x="32" y="644">data: its region; null while the slot is free</text>
+<text class="muted" x="32" y="662">pins: holders; a pinned frame is never a victim</text>
+<text class="muted" x="32" y="680">fetching, flushing: counts of transfers in flight</text>
+<text class="muted" x="440" y="626">valid_lo, valid_hi: the elements that landed</text>
+<text class="muted" x="440" y="644">generation: which version of the bytes it holds</text>
+<text class="muted" x="440" y="662">score, last_access: eviction rank, then age</text>
+<text class="muted" x="440" y="680">fetch_tag: completion word a waiting block parks on</text>
+</svg>
+<figcaption>A worked example with 4 blocks, 4 sets of 4 slots and room for 8
+pages. Every page lives in the CTE; the GPU holds only the pages kernels
+have fetched, each once for the whole grid, in the set its page number
+hashes to. A slot is only a tag: it borrows a region while it holds a page,
+so wider sets cost 64 bytes per slot rather than a page.</figcaption>
+</figure>
+
+<h2 id="cache">The page cache</h2>
+<p>Each GPU has one cache per vector, and every block of the kernel uses it, so a page that many blocks read is stored and transferred once. It is set-associative: a page's home set is a hash of its page number, and finding a page or claiming a slot for it happens under that set's lock. Every public call is <em>block-collective</em>: all threads of the block make it together.</p>
+<dl class="notes">
+<div><dt>Slots and regions</dt><dd>A slot is a 64-byte tag that points to a memory region only while it holds a page. Regions are handed out from per-block free lists, and a block whose list is empty takes one from another block's. Making the cache more associative therefore costs extra tags, not extra pages of memory.</dd></div>
+<div><dt>Pins</dt><dd>A fetch pins every page it names, and the pin lasts until the kernel calls <code>UnpinRange</code>. A hold only resolves a pointer into the pinned frame. A set full of pinned frames makes the next fetch yield and retry.</dd></div>
+<div><dt>Eviction</dt><dd>A freshly fetched page starts at eviction rank 1.0, and a kernel can rescore it; a higher rank means keep it longer. The victim is the unpinned frame with no transfer in flight and the lowest rank, oldest first among equals.</dd></div>
+<div><dt>Fetch</dt><dd>A kernel brings pages in with a begin/await pair, so it can start a fetch and keep computing while the pages arrive.</dd></div>
+<div><dt>Flush</dt><dd>There is no dirty bit. A kernel writes back the ranges it changed with a flush, and eviction never writes anything back, so a page must be flushed before it is unpinned.</dd></div>
+</dl>
+
+<h2 id="path">Fetch, hold and flush</h2>
+<figure class="diagram">
+<svg viewBox="0 0 860 680" role="img" aria-label="The fetch, hold and flush path: a block claims and pins a slot, sends a batched get through the gpu2cpu queue, the runtime worker reads the blob into the GPU frame and completes the task, and the block publishes, holds, flushes and unpins">
+<defs><marker id="me2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+<rect class="box" x="20" y="20" width="270" height="560" rx="10" stroke-dasharray="6 5"/><text class="muted" x="32" y="40">GPU · ONE KERNEL BLOCK</text>
+<rect class="box" x="305" y="20" width="270" height="560" rx="10" stroke-dasharray="6 5"/><text class="muted" x="317" y="40">HOST · RUNTIME GPU WORKER</text>
+<rect class="box" x="590" y="20" width="250" height="560" rx="10" stroke-dasharray="6 5"/><text class="muted" x="602" y="40">CTE · STORAGE TARGETS</text>
+
+<rect class="box hl" x="36" y="56" width="238" height="88" rx="8"/><text class="title" x="48" y="78">1 · BeginFetch(page 5)</text><text class="muted" x="48" y="98">Hit: just pin the slot. Miss:</text><text class="muted" x="48" y="114">claim a slot, take a region,</text><text class="muted" x="48" y="130">pin it, mark it fetching.</text>
+<rect class="box hl" x="36" y="164" width="238" height="88" rx="8"/><text class="title" x="48" y="186">2 · Send, then park</text><text class="muted" x="48" y="206">push the block's MultiGet onto</text><text class="muted" x="48" y="222">the gpu2cpu queue; the block</text><text class="muted" x="48" y="238">yields until is_complete flips.</text>
+<rect class="box hl" x="36" y="300" width="238" height="88" rx="8"/><text class="title" x="48" y="322">5 · AwaitFetch publishes</text><text class="muted" x="48" y="342">valid range, generation and</text><text class="muted" x="48" y="358">score 1.0, under the set lock;</text><text class="muted" x="48" y="374">fetching − 1.</text>
+<rect class="box hl" x="36" y="410" width="238" height="88" rx="8"/><text class="title" x="48" y="432">6 · Hold, compute, flush</text><text class="muted" x="48" y="452">a pointer into the frame; the</text><text class="muted" x="48" y="468">written ranges go out as one</text><text class="muted" x="48" y="484">PodMultiPutBlob.</text>
+<rect class="box hl" x="36" y="510" width="238" height="56" rx="8"/><text class="title" x="48" y="532">7 · UnpinRange</text><text class="muted" x="48" y="552">pins − 1; the frame can be evicted</text>
+
+<rect class="box alt" x="321" y="164" width="238" height="88" rx="8"/><text class="title" x="333" y="186">3 · Worker pops it</text><text class="muted" x="333" y="206">copies the task off the GPU and</text><text class="muted" x="333" y="222">runs PodMultiGetBlob: one</text><text class="muted" x="333" y="238">PodGetBlob per page.</text>
+<rect class="box alt" x="321" y="300" width="238" height="88" rx="8"/><text class="title" x="333" y="322">4 · SendOut</text><text class="muted" x="333" y="342">copies the task back to the GPU,</text><text class="muted" x="333" y="358">then sets is_complete; the</text><text class="muted" x="333" y="374">relaunch driver resumes the block.</text>
+<rect class="box alt" x="321" y="410" width="238" height="88" rx="8"/><text class="title" x="333" y="432">Flush, same path</text><text class="muted" x="333" y="452">one PodPutBlob per page; the</text><text class="muted" x="333" y="468">block clears flushing when it</text><text class="muted" x="333" y="484">retires the completed put.</text>
+
+<rect class="box" x="606" y="164" width="218" height="120" rx="8"/><text class="title" x="618" y="186">Blob "5" of tag grid</text><text class="muted" x="618" y="206">on the target its score chose.</text><text class="muted" x="618" y="222">Local owner: read straight</text><text class="muted" x="618" y="238">into the GPU frame.</text><text class="muted" x="618" y="254">Remote owner: GetBlob there</text><text class="muted" x="618" y="270">into a host buffer, then copy.</text>
+<rect class="box" x="606" y="410" width="218" height="88" rx="8"/><text class="title" x="618" y="432">Writes land as blobs</text><text class="muted" x="618" y="452">at score 0.5; the CTE places</text><text class="muted" x="618" y="468">them and moves them between</text><text class="muted" x="618" y="484">tiers.</text>
+
+<path class="edge" d="M155,144 L155,162" marker-end="url(#me2)"/>
+<path class="edge hl" d="M274,208 L319,208" marker-end="url(#me2)"/>
+<path class="edge hl" d="M559,208 L604,208" marker-end="url(#me2)"/>
+<path class="edge" d="M440,252 L440,298" marker-end="url(#me2)"/>
+<path class="edge hl" d="M321,344 L276,344" marker-end="url(#me2)"/>
+<path class="edge" d="M155,388 L155,408" marker-end="url(#me2)"/>
+<path class="edge hl" d="M274,454 L319,454" marker-end="url(#me2)"/>
+<path class="edge hl" d="M559,454 L604,454" marker-end="url(#me2)"/>
+<path class="edge" d="M155,498 L155,508" marker-end="url(#me2)"/>
+
+<rect class="box alt" x="20" y="600" width="820" height="64" rx="8"/>
+<text class="muted" x="32" y="624">Eviction, when a claim finds no free slot or region: drop the unpinned, idle frame with the lowest score,</text>
+<text class="muted" x="32" y="642">oldest first among equals. Nothing is written back, so a page must be flushed before it is unpinned.</text>
+</svg>
+<figcaption>The kernel only produces work: every task and frame was allocated
+by the host, and a block's one move across the bus is pushing a task onto
+the gpu2cpu queue. A CPU worker serves it against the CTE and writes the
+result and the completion flag back. A fetch that finds the page already
+resident takes a pin and skips steps 2 to 4.</figcaption>
+</figure>
+
+<h2 id="prefetch">Prefetch hints</h2>
+<p>The prefetcher does not copy pages into the GPU cache; only the kernel does that. Instead it uses the state of yielding blocks to predict which pages are next and sends tier hints through the CTE's bulk rescore call, so those blobs move to a faster tier before the kernel asks for them.</p>
+
+<h2 id="faults">Where missing data comes from</h2>
+<p>A fetch of a page that has no blob yet does not fail. If the vector's tag has a fault handler, the CTE asks it to produce the page: the CAE does this for data assimilated by reference, and the checkpoint module does it for a lazy <code>Copy</code> of another vector. That is how a file larger than memory can be opened as a vector without staging it first. With no handler, the CTE creates the blob and the page reads as zeros.</p>
+
+<h2 id="backends">Backends</h2>
+<p>The adapter has CUDA, SYCL and CPU backends; <code>adapter/cpu_vector</code> provides the same model on host threads. Communication timing can be compiled in with the opt-in <code>GV_COMM_TIMING</code> build flag.</p>
+
+<h2 id="tradeoffs">Tradeoffs</h2>
+<table class="tradeoffs">
+<thead><tr><th>Choice</th><th>Gain</th><th>Cost</th></tr></thead>
+<tbody>
+<tr><td>Host owns all allocation</td><td class="good">No allocator in kernels; memory use is known at launch</td><td class="cost">Cache size is fixed for the run</td></tr>
+<tr><td>One cache shared by every block</td><td class="good">A page many blocks read is stored and moved once</td><td class="cost">Set locks; a set full of pinned frames stalls fetches</td></tr>
+<tr><td>Pages as CTE blobs</td><td class="good">Tiering, persistence and faulting come from the CTE</td><td class="cost">Each miss is a runtime round trip</td></tr>
+</tbody>
+</table>

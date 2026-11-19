@@ -84,7 +84,8 @@ jarvis pkg conf runtime \
     num_threads=4 \
     client_data_segment_size=2G \
     log_level=info \
-    sleep=8
+    sleep=0 \
+    start_timeout=60
 
 # ---------------------------------------------------------------------------
 # Gate. clio_run runtime status: 0=RUNNING, 1=STOPPED(clean), 2=STOPPED(stale).
@@ -96,18 +97,30 @@ jarvis pkg conf runtime \
 set +e
 STATUS_CMD="LD_LIBRARY_PATH=/workspace/build/bin:/usr/local/lib ${CLIO_BIN} runtime status"
 
+# Seconds each host gets to report RUNNING after `jarvis ppl start`. The probe
+# used to run once, right after a fixed `sleep=8`, so a slow start failed the
+# precondition; now each host is retried until rc=0 or this cap.
+RUNNING_CAP=60
+
 assert_all() {
     # $1 = 'running' | 'stopped'
-    local want="$1" host out rc fail=0
+    local want="$1" host out rc fail=0 start
     while read -r host; do
         [ -z "$host" ] && continue
         # -n: keep ssh from swallowing the rest of the hostfile on stdin --
         # without it the loop silently probes only the first host.
-        out=$(ssh -n -o BatchMode=yes "$host" "$STATUS_CMD" 2>&1); rc=$?
-        echo "[status:$want] $host -> rc=$rc"
+        start=$(date +%s)
+        while :; do
+            out=$(ssh -n -o BatchMode=yes "$host" "$STATUS_CMD" 2>&1); rc=$?
+            [ "$want" != running ] && break
+            [ "$rc" = 0 ] && break
+            [ $(( $(date +%s) - start )) -ge "$RUNNING_CAP" ] && break
+            sleep 1
+        done
+        echo "[status:$want] $host -> rc=$rc after $(( $(date +%s) - start ))s"
         echo "$out" | sed 's/^/    /'
         if [ "$want" = running ]; then
-            [ "$rc" = 0 ] || { echo "  FAIL: $host expected RUNNING (rc=0), got rc=$rc"; fail=1; }
+            [ "$rc" = 0 ] || { echo "  FAIL: $host expected RUNNING (rc=0) within ${RUNNING_CAP}s, got rc=$rc"; fail=1; }
         else
             if echo "$out" | grep -q 'UNRESPONSIVE'; then
                 echo "  FAIL: $host runtime is UNRESPONSIVE (live but wedged)"; fail=1

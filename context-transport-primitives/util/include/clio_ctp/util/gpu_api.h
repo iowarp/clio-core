@@ -78,6 +78,7 @@
 #if !defined(_WIN32)
 extern "C" void clio_evlat_add(int which, unsigned long long cycles)
     __attribute__((weak));
+extern "C" double clio_evlat_cycles_per_us() __attribute__((weak));
 #endif
 
 extern "C" void ctp_copy_kernel_launch(char *dst, const char *src, size_t n,
@@ -98,6 +99,15 @@ inline void EvlatAdd(int which, unsigned long long cycles) {
   (void)which;
   (void)cycles;
 #endif
+}
+
+/** TSC cycles per microsecond the runtime's latency report divides by
+ *  (measured at startup), or 2995 when no runtime is linked / on Windows. */
+inline double EvlatCyclesPerUs() {
+#if !defined(_WIN32)
+  if (clio_evlat_cycles_per_us != nullptr) return clio_evlat_cycles_per_us();
+#endif
+  return 2995.0;
 }
 
 /** @return true when the latency-report hook is linked in. */
@@ -1289,9 +1299,13 @@ class GpuApi {
             ev.get_profiling_info<sycl::info::event_profiling::command_start>();
         const auto t_end =
             ev.get_profiling_info<sycl::info::event_profiling::command_end>();
-        // The report divides by 2995 cycles per us; these are ns.
-        if (t_start >= t_sub) EvlatAdd(17, (t_start - t_sub) * 2995ull / 1000ull);
-        if (t_end >= t_start) EvlatAdd(18, (t_end - t_start) * 2995ull / 1000ull);
+        // The report divides by the runtime's measured TSC rate; these are
+        // ns, so scale by that same rate (2995 if no runtime is linked).
+        const double cyc_per_ns = EvlatCyclesPerUs() / 1000.0;
+        if (t_start >= t_sub)
+          EvlatAdd(17, static_cast<unsigned long long>((t_start - t_sub) * cyc_per_ns));
+        if (t_end >= t_start)
+          EvlatAdd(18, static_cast<unsigned long long>((t_end - t_start) * cyc_per_ns));
       } catch (const sycl::exception &) {
       }
     }

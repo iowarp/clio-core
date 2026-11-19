@@ -26,9 +26,9 @@ class_id = cm.predict("mlr", r, X[0, :-1])
 
 <h2>C++</h2>
 <pre data-label="cpp">
-MultinomialLogisticResult FitMultinomialLogistic(Dataset &amp;ds,
-                                                  const MultinomialLogisticOptions &amp;opt);
-u32 MultinomialLogisticPredict(const MultinomialLogisticResult &amp;m, const float *x);
+MultinomialLogisticResult FitMultinomialLogistic(Dataset &ds,
+                                                  const MultinomialLogisticOptions &opt);
+u32 MultinomialLogisticPredict(const MultinomialLogisticResult &m, const float *x);
 </pre>
 <p>The paged call needs the runtime; the <code>Plain</code> call runs the same kernel over a plain copy of the data without one.</p>
 

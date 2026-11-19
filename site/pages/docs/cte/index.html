@@ -26,6 +26,16 @@ facts: Module | clio_cte_core ; Core pool | 512.0 ; C++ | clio_cte/core/core_cli
 <p>The core is the bottom of a chain of modules that all speak its task interface: cache (563.0), indexer (564.0), optional compressor (562.0), replication (561.0), core (512.0). A client bound to the top of the chain gets all of their behavior. A client bound to 512.0 bypasses them. The <a href="/design/chain.html">chain design page</a> explains the mechanism and the <a href="/modules/cte-core.html">CTE core module page</a> lists every configuration key.</p>
 
 <h2>How the other technologies use it</h2>
+
+<ol class="stack-position" aria-label="Where the CTE sits in the CLIO Core stack">
+  <li><b>Front ends</b><span>Context FS, memory expansion, machine learning, CAE, CEE</span></li>
+  <li><b>Interceptors</b><span>POSIX, STDIO, MPI-IO and HDF5 adapters; FUSE mount</span></li>
+  <li><b>ChiMod chain</b><span>Cache, replication, compressor, indexer, summarizer</span></li>
+  <li class="here"><b>CTE core</b><span>Tags, blobs, placement across tiers</span></li>
+  <li><b>Context Runtime</b><span>Modules, pools, tasks, scheduling, transports</span></li>
+  <li><b>Storage</b><span>Block devices: RAM, NVMe, SSD, HDD, S3/GCS</span></li>
+</ol>
+<p>Below it, the Context Runtime runs its tasks and block devices hold the bytes. Above it, the module chain transforms data on its way in and out, and every interceptor and front end ends up as CTE puts and gets. See <a href="/docs/cte/design.html">the CTE design</a>.</p>
 <ul>
   <li><a href="/docs/context-fs/index.html">Context FS</a> maps every file to a tag and every file page to a blob, and turns fsync into <code>SyncTag</code>.</li>
   <li>The <a href="/docs/cae/index.html">Context Assimilation Engine</a> imports outside data into tags and blobs, and can register itself as a tag's fault handler so a blob is ingested the first time it is read.</li>

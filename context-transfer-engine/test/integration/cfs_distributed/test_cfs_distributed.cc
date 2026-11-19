@@ -32,12 +32,19 @@
  *                     after the retry window == the cross-node namespace is
  *                     broken (#685).
  *
- * Cross-node ordering/liveness is handled WITHOUT any CFS or shared-fs
- * coordination (so it is independent of the very thing under test): the reader
- * simply delays a few seconds (CFS_READ_DELAY_SEC) so the writer has created the
- * file, then retries the open for a bounded window; the writer, after writing,
- * stays alive (CFS_KEEPALIVE_SEC) so its node's daemon — and thus the container
- * that owns the path — survives for the whole of the reader's read window.
+ * Cross-node ordering/liveness is handled WITHOUT any CFS coordination (so it
+ * is independent of the very thing under test). When CFS_SYNC_DIR names a
+ * directory both containers share (the /workspace bind mount), the roles
+ * hand off through plain flag files there:
+ *   - the writer writes written.flag ("ok" or "fail <rc>") when it is done,
+ *     then keeps its node alive until reader_done.flag appears (cap
+ *     CFS_KEEPALIVE_SEC, default 300 s);
+ *   - the reader polls written.flag (cap CFS_WRITTEN_WAIT_SEC, default 300 s),
+ *     then retries the open for a bounded window, and always writes
+ *     reader_done.flag on the way out.
+ * Without CFS_SYNC_DIR (manual runs) the old fixed timing applies: the reader
+ * delays CFS_READ_DELAY_SEC (12 s) and the writer stays up CFS_KEEPALIVE_SEC
+ * (75 s). Fixed timing was flaky on loaded CI runners in both directions.
  *
  * Exit code 0 == the role's checks passed. The reader's exit code is the
  * authoritative cross-node correctness signal (the run script keys on it).
@@ -73,8 +80,6 @@ constexpr clio::run::u64 kModLen = 128u * 1024u;                 // spans 1 MiB
 constexpr clio::run::u64 kFinalSize = 3u * kMiB + 512u * 1024u;  // 3.5 MiB
 constexpr const char *kSharedDir = "/dist685";
 constexpr const char *kSharedPath = "/dist685/shared.bin";
-// The CFS filesystem pool composed in clio_config.yaml (kCfsPoolId = 560.0).
-constexpr clio::run::u32 kCfsPoolMajor = 560;
 
 // Read an integer env var (seconds) with a default.
 int EnvSecs(const char *name, int def) {
@@ -108,15 +113,73 @@ void Log(const char *role, const std::string &msg) {
   std::fflush(stderr);
 }
 
+/**
+ * Path of a flag file in the shared sync directory.
+ * @param name flag file name (e.g. "written.flag")
+ * @return the full path, or "" when CFS_SYNC_DIR is unset (legacy timing)
+ */
+std::string SyncPath(const char *name) {
+  const char *dir = std::getenv("CFS_SYNC_DIR");
+  if (!dir || !*dir) return "";
+  return std::string(dir) + "/" + name;
+}
+
+/**
+ * Write a flag file atomically (temp file + rename) so a poller never sees a
+ * partially written body.
+ * @param path destination path
+ * @param body file contents
+ * @return true on success
+ */
+bool WriteFlag(const std::string &path, const std::string &body) {
+  const std::string tmp = path + ".tmp";
+  FILE *f = std::fopen(tmp.c_str(), "w");
+  if (!f) return false;
+  std::fputs(body.c_str(), f);
+  std::fclose(f);
+  return std::rename(tmp.c_str(), path.c_str()) == 0;
+}
+
+/**
+ * Poll for a flag file and return its contents.
+ * @param path flag file path
+ * @param cap_sec give up after this many seconds
+ * @param body receives the file contents when found
+ * @return true if the file appeared within cap_sec
+ */
+bool WaitFlag(const std::string &path, int cap_sec, std::string *body) {
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(cap_sec);
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (FILE *f = std::fopen(path.c_str(), "r")) {
+      char buf[128] = {0};
+      size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
+      std::fclose(f);
+      body->assign(buf, n);
+      return true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+  }
+  return false;
+}
+
 // ---- writer (node A): create + modify + grow, verify local read-back --------
-int RunWriter() {
+/**
+ * Create, modify and grow the shared file, then verify a local read-back.
+ * @return 0 on success, otherwise the writer's failure code
+ */
+int WriteSharedFile() {
   const char *role = "writer";
   if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, false)) {
     Log(role, "FAIL: CLIO_INIT(kClient) failed");
     return 2;
   }
-  clio::cte::filesystem::Client cfs;
-  cfs.Init(clio::run::PoolId(kCfsPoolMajor, 0));
+  // The filesystem pool composed in clio_config.yaml, found by name.
+  if (!clio::cte::filesystem::CLIO_CFS_CLIENT_INIT()) {
+    Log(role, "FAIL: no filesystem pool");
+    return 2;
+  }
+  clio::cte::filesystem::Client &cfs = *CLIO_CFS_CLIENT;
   auto *ipc = CLIO_IPC;
 
   // The namespace has real directories: creating a file under a parent that
@@ -187,40 +250,104 @@ int RunWriter() {
   ipc->FreeBuffer(rbuf);
   auto cl = cfs.AsyncClose(h);
   cl.Wait();
-  int keepalive = EnvSecs("CFS_KEEPALIVE_SEC", 75);
   Log(role, "created+modified+grew " + std::to_string(kFinalSize) +
-                " bytes at " + kSharedPath + "; staying alive " +
-                std::to_string(keepalive) + "s for the reader");
+                " bytes at " + kSharedPath);
+  return 0;
+}
 
-  // Keep this node's daemon (and thus the container that owns the path) alive
-  // for the whole of the reader's read window, so a cross-node read from the
-  // other node still resolves. Independent of the CFS being tested.
-  std::this_thread::sleep_for(std::chrono::seconds(keepalive));
-  Log(role, "keep-alive elapsed; exiting");
-  return 0;  // the writer's own operations succeeded
+/**
+ * Writer role: write the shared file, tell the reader (written.flag), then
+ * keep this node's daemon -- and the container that owns the path -- alive
+ * until the reader reports it is done, so its cross-node read resolves.
+ * @return 0 if the writer's own operations succeeded and the reader finished
+ */
+int RunWriter() {
+  const char *role = "writer";
+  const int rc = WriteSharedFile();
+  const std::string written = SyncPath("written.flag");
+  if (written.empty()) {
+    // Legacy fixed timing (no shared sync dir).
+    const int keepalive = EnvSecs("CFS_KEEPALIVE_SEC", 75);
+    if (rc == 0) {
+      Log(role, "staying alive " + std::to_string(keepalive) +
+                    "s for the reader (no CFS_SYNC_DIR)");
+      std::this_thread::sleep_for(std::chrono::seconds(keepalive));
+    }
+    return rc;
+  }
+  WriteFlag(written, rc == 0 ? "ok" : "fail " + std::to_string(rc));
+  if (rc != 0) return rc;
+
+  const int cap = EnvSecs("CFS_KEEPALIVE_SEC", 300);
+  Log(role, "waiting up to " + std::to_string(cap) +
+                "s for reader_done.flag");
+  std::string body;
+  if (!WaitFlag(SyncPath("reader_done.flag"), cap, &body)) {
+    Log(role, "FAIL: reader did not finish within " + std::to_string(cap) +
+                  "s (reader_done.flag never appeared)");
+    return 7;
+  }
+  Log(role, "reader done (" + body + "); exiting");
+  return 0;
 }
 
 // ---- reader (node B): must SEE the writer's modified file across the cluster -
-int RunReader() {
+/**
+ * Wait until the writer has finished writing the shared file.
+ * With CFS_SYNC_DIR this polls written.flag; otherwise it sleeps the legacy
+ * CFS_READ_DELAY_SEC.
+ * @param role log tag
+ * @return 0 when the reader may proceed, otherwise an exit code
+ */
+int WaitForWriter(const char *role) {
+  const std::string written = SyncPath("written.flag");
+  if (written.empty()) {
+    const int delay = EnvSecs("CFS_READ_DELAY_SEC", 12);
+    Log(role, "delaying " + std::to_string(delay) +
+                  "s for the writer (no CFS_SYNC_DIR), then reading");
+    std::this_thread::sleep_for(std::chrono::seconds(delay));
+    return 0;
+  }
+  const int cap = EnvSecs("CFS_WRITTEN_WAIT_SEC", 300);
+  std::string body;
+  if (!WaitFlag(written, cap, &body)) {
+    Log(role, "FAIL: writer did not finish within " + std::to_string(cap) +
+                  "s (written.flag never appeared)");
+    return 8;
+  }
+  if (body != "ok") {
+    Log(role, "FAIL: writer reported '" + body + "'; nothing to read");
+    return 9;
+  }
+  Log(role, "writer finished; reading");
+  return 0;
+}
+
+/**
+ * Reader role body: open the writer's file from this node and verify it.
+ * @return 0 if the cross-node read matched, otherwise a failure code
+ */
+int ReadSharedFile() {
   const char *role = "reader";
-  // Give the writer time to create+modify the file before we start looking (the
-  // retry loop below tolerates the rest of the skew).
-  int delay = EnvSecs("CFS_READ_DELAY_SEC", 12);
-  Log(role, "delaying " + std::to_string(delay) + "s for the writer, then reading");
-  std::this_thread::sleep_for(std::chrono::seconds(delay));
+  if (int rc = WaitForWriter(role); rc != 0) return rc;
   if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, false)) {
     Log(role, "FAIL: CLIO_INIT(kClient) failed");
     return 3;
   }
-  clio::cte::filesystem::Client cfs;
-  cfs.Init(clio::run::PoolId(kCfsPoolMajor, 0));
+  // The filesystem pool composed in clio_config.yaml, found by name.
+  if (!clio::cte::filesystem::CLIO_CFS_CLIENT_INIT()) {
+    Log(role, "FAIL: no filesystem pool");
+    return 2;
+  }
+  clio::cte::filesystem::Client &cfs = *CLIO_CFS_CLIENT;
   auto *ipc = CLIO_IPC;
 
   // Retry the cross-node open: the shared namespace should resolve the tag the
   // writer created (on whichever container owns it) from THIS node too, and
   // report the grown size once the writer's modify+grow has landed.
   int rc = 1;
-  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(40);
+  auto deadline = std::chrono::steady_clock::now() +
+                  std::chrono::seconds(EnvSecs("CFS_READ_WINDOW_SEC", 40));
   clio::run::u64 last_rc = 999, last_bytes = 0;
   while (std::chrono::steady_clock::now() < deadline) {
     auto open = cfs.AsyncOpen(kSharedPath, O_RDONLY, 0644);
@@ -267,6 +394,20 @@ int RunReader() {
               "(ENOENT/short read) — CFS namespace is node-local (#685). "
               "last read rc=" + std::to_string(last_rc) +
               " bytes=" + std::to_string(last_bytes));
+  }
+  return rc;
+}
+
+/**
+ * Reader role: run the check, then always signal reader_done.flag so the
+ * writer can release its node instead of waiting out its cap.
+ * @return the reader's exit code
+ */
+int RunReader() {
+  const int rc = ReadSharedFile();
+  const std::string done = SyncPath("reader_done.flag");
+  if (!done.empty()) {
+    WriteFlag(done, std::to_string(rc));
   }
   return rc;
 }

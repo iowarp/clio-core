@@ -54,8 +54,9 @@ class BdevTransport {
   /**
    * Initialize the transport
    * @param params Creation parameters
-   * @param pool_name Pool name; doubles as the file path (kFile) or S3 bucket
-   *   name (kS3). Carried on the create task, not in CreateParams.
+   * @param pool_name Pool name; doubles as the file path (kFile), the S3
+   *   bucket name (kS3) or the daos:// URI (kDaos). Carried on the create
+   *   task, not in CreateParams.
    * @param runtime Pointer to the parent bdev runtime
    * @return true if successful
    */

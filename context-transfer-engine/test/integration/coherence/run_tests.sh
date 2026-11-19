@@ -17,6 +17,11 @@ fi
 
 cd "$SCRIPT_DIR"
 
+# Bounded waits + diagnostics. Budget < the workflow step's 20 min.
+# shellcheck source=../../../../CI/compose_wait.sh
+source "$REPO_ROOT/CI/compose_wait.sh"
+COH_NODES=(coh-node1 coh-node2 coh-node3 coh-node4)
+
 RED='\033[0;31m'; GREEN='\033[0;32m'; BLUE='\033[0;34m'; NC='\033[0m'
 say()  { echo -e "${BLUE}$*${NC}"; }
 ok()   { echo -e "${GREEN}✓ $*${NC}"; }
@@ -50,29 +55,27 @@ say "=== Cleaning any previous run ==="
 docker compose down -v >/dev/null 2>&1 || true
 
 say "=== Starting 4-node coherence cluster ==="
+cw_init "${COH_BUDGET_SEC:-1020}" "${COH_NODES[@]}"
+cw_reset_sync "$REPO_ROOT/build/cluster_sync/coherence"
 if ! docker compose up -d; then
     err "docker compose up failed"
     docker compose logs || true
     exit 1
 fi
 
+say "=== Waiting for all four runtimes ==="
+cw_wait_ready_files 4 || { err "cluster never became ready"; exit 1; }
+
 say "=== Waiting for all four nodes to finish ==="
+# One shared deadline; on a timeout or any non-zero exit every node is dumped.
 overall=0
+cw_wait_containers "${COH_NODES[@]}" || overall=1
 for n in 1 2 3 4; do
-    rc=$(docker wait "coh-node$n" 2>/dev/null || echo 1)
-    if [ "$rc" = "0" ]; then
-        ok "node $n exit 0"
-    else
-        err "node $n exit $rc"
-        overall=1
-    fi
+    rc="${CW_RC[coh-node$n]:-?}"
+    if [ "$rc" = "0" ]; then ok "node $n exit 0"; else err "node $n exit $rc"; fi
 done
 
 if [ "$overall" != "0" ]; then
-    for n in 1 2 3 4; do
-        say "=== node $n log (tail) ==="
-        docker logs "coh-node$n" 2>&1 | tail -60
-    done
     if [ -n "${COH_LOG_DIR:-}" ]; then
         # Full per-node logs for post-mortem (the tails above routinely miss
         # the interesting window; the EXIT trap destroys the containers).

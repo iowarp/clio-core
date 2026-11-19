@@ -40,6 +40,7 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -109,8 +110,12 @@ int EnvInt(const char *name, int def) {
   int v = std::atoi(e);
   return v > 0 ? v : def;
 }
-// Wait longer than the daemon's undeliverable-response drop window
-// (kClientResponseRetryDropSec, ~5 s) so the drop has fired before we stop it.
+// Let the abandoned burst reach the daemon and run before stopping it. This is
+// a floor, not a budget: whatever is still in flight when the stop arrives is
+// drained by the graceful stop below, which must leak nothing either way. (The
+// #722 undeliverable-response drop window this used to outwait is not reached
+// on a single node -- the client's responses never fail to send -- so there is
+// no drop marker to poll for here; see NOTE ON SCOPE in the test.)
 constexpr int kDropWaitSec = 9;
 
 std::string ReadWholeFile(const std::string &path) {
@@ -132,6 +137,76 @@ size_t CountOccurrences(const std::string &hay, const std::string &needle) {
 
 int g_nocrash_ok = 0;  // diagnostic: PutBlobs that returned rc==0 in nocrash mode
 
+/** How long a graceful stop (SIGTERM -> ServerFinalize -> exit) may take.
+ *  Only a hang reaches it; an ASan daemon finalizes in seconds. */
+constexpr int kGracefulStopMs = 60000;
+
+/**
+ * Stop the daemon with SIGTERM and wait for it to exit ON ITS OWN, so its
+ * ServerFinalize (and the leak report in it) runs to completion.
+ * RuntimeServer::Stop() SIGKILLs after a 5 s grace, which on a slow runner
+ * kills the daemon mid-finalize and leaves a log with no leak report -- a
+ * vacuous pass for a test that asserts the report's absence.
+ * @param server the running daemon
+ */
+void StopGracefully(clio::run::test::RuntimeServer &server) {
+  REQUIRE(server.Pid() > 0);
+  REQUIRE(kill(server.Pid(), SIGTERM) == 0);
+  int exit_code = -1;
+  const bool exited = server.WaitExit(kGracefulStopMs, &exit_code);
+  if (!exited) {
+    FAIL("daemon did not exit within " + std::to_string(kGracefulStopMs) +
+         " ms of SIGTERM\n" + clio::run::test::RuntimeServer::LogTail());
+  }
+  if (exit_code != 0) {
+    FAIL("daemon exited with code " + std::to_string(exit_code) +
+         " after SIGTERM (finalize did not complete)\n" +
+         clio::run::test::RuntimeServer::LogTail());
+  }
+}
+
+/**
+ * Print one progress line at once (unbuffered stderr), so a step that hangs
+ * until the ctest TIMEOUT still shows the last step that completed.
+ * @param what the step just finished
+ */
+void Progress(const std::string &what) {
+  std::cout.flush();
+  std::fprintf(stderr, "  [STEP] %s\n", what.c_str());
+  std::fflush(stderr);
+}
+
+/** How long a forked crash client may live. It attaches, does one round trip
+ *  and fires a burst; a healthy one exits in seconds. */
+constexpr unsigned kChildLifeSec = 60;
+/** How long the parent waits for a forked crash client (> kChildLifeSec). */
+constexpr int kChildWaitMs = 90000;
+
+/**
+ * Wait for a forked crash client with a deadline. A child stuck in its
+ * connect round trip used to leave an unbounded waitpid() hanging until the
+ * ctest TIMEOUT, with no output; this fails fast with the daemon's log tail.
+ * @param child pid returned by fork()
+ * @param status receives the waitpid() status
+ */
+void WaitChild(pid_t child, int *status) {
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(kChildWaitMs);
+  while (true) {
+    const pid_t r = waitpid(child, status, WNOHANG);
+    if (r == child) return;
+    REQUIRE(r == 0);
+    if (std::chrono::steady_clock::now() >= deadline) {
+      kill(child, SIGKILL);
+      waitpid(child, status, 0);
+      FAIL("crash client " + std::to_string(child) + " still running after " +
+           std::to_string(kChildWaitMs) + " ms\n" +
+           clio::run::test::RuntimeServer::LogTail());
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+}
+
 // Attach as a client, fire a burst of PutBlobs, then _exit WITHOUT waiting for
 // the responses. Never returns. Used two ways:
 //   - forked from the single-node TEST_CASE (quiet=true), where the client is
@@ -144,6 +219,9 @@ int g_nocrash_ok = 0;  // diagnostic: PutBlobs that returned rc==0 in nocrash mo
   // In the forked single-node case, silence the child so its worker/log chatter
   // does not pollute the parent's test output (the daemon log is asserted on).
   if (quiet) {
+    // Forked from a test case: never outlive it. SIGALRM's default action
+    // terminates the child if its connect round trip (mk.Wait) never ends.
+    alarm(kChildLifeSec);
     int devnull = open("/dev/null", O_WRONLY);
     if (devnull >= 0) {
       dup2(devnull, STDOUT_FILENO);
@@ -269,7 +347,7 @@ TEST_CASE("ClientCrash - PutBlob then terminate drops task with no leak [leak]",
     CrashClientMain(/*quiet=*/true);  // never returns
   }
   int status = 0;
-  REQUIRE(waitpid(child, &status, 0) == child);
+  WaitChild(child, &status);
   INFO("crash-client exited: exited=" << WIFEXITED(status)
        << " code=" << (WIFEXITED(status) ? WEXITSTATUS(status) : -1)
        << " signaled=" << WIFSIGNALED(status));
@@ -279,10 +357,9 @@ TEST_CASE("ClientCrash - PutBlob then terminate drops task with no leak [leak]",
   std::this_thread::sleep_for(std::chrono::seconds(kDropWaitSec));
 
   // Graceful stop -> ServerFinalize -> ReportRuntimeLeaks writes to the log.
-  server.Stop();
-  for (int i = 0; i < 50 && server.IsRunning(); ++i) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-  }
+  // Wait for the daemon's own exit (code 0) so the report is known to have
+  // been written before its absence is asserted below.
+  StopGracefully(server);
 
   const std::string log = ReadWholeFile(log_path);
   REQUIRE(!log.empty());
@@ -425,7 +502,7 @@ TEST_CASE("ClientCrash - dead SHM client's segments are reaped while running",
 
   kill(child, SIGKILL);
   int status = 0;
-  REQUIRE(waitpid(child, &status, 0) == child);
+  WaitChild(child, &status);
 
   // Grace 2 s plus the 1 s reap period: well inside 30 s.
   bool reaped = false;
@@ -472,9 +549,24 @@ TEST_CASE("ClientCrash - a dead client's SHM segments are reclaimed (#1192)",
          "      dpe_type: random\n";
   }
   clio::run::test::RuntimeServer server;
+  // Progress lines: this case has hung in CI (leak-check job) with no
+  // output before the ctest TIMEOUT; each step reports so the next hang
+  // shows where it stopped.
+  // Unbuffered stdout for this case: a FAIL message written to a buffered
+  // stdout is lost when ctest kills a process that then hangs in teardown.
+  std::cout << std::unitbuf;
   REQUIRE(server.Start(kPort, "127.0.0.1", /*ephemeral=*/true));
-  REQUIRE(server.WaitForReady());
+  Progress("reclaim: daemon started");
+  const bool ready = server.WaitForReady(60000);
+  Progress(std::string("reclaim: WaitForReady returned ") +
+           (ready ? "true" : "false") + ", daemon " +
+           (server.IsRunning() ? "running" : "not running"));
+  if (!ready) {
+    FAIL("daemon not ready within 60 s\n" +
+         clio::run::test::RuntimeServer::LogTail());
+  }
   REQUIRE(RunCliTimed({"compose", "start", compose_yaml.string()}, 60) == 0);
+  Progress("reclaim: compose done");
   pid_t child = fork();
   REQUIRE(child >= 0);
   if (child == 0) {
@@ -497,16 +589,19 @@ TEST_CASE("ClientCrash - a dead client's SHM segments are reclaimed (#1192)",
     }
     return n;
   };
+  Progress("reclaim: forked crash client " + std::to_string(child));
   size_t left = segments_left();
   INFO("segments of the dead client right after its death: " << left);
   for (int i = 0; i < 400 && left > 0; ++i) {  // grace 2 s + reaper 1 s period
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     left = segments_left();
   }
+  Progress("reclaim: segments left " + std::to_string(left));
   REQUIRE(left == 0);
   REQUIRE(server.IsRunning());  // and the daemon survived the reap
   int status = 0;
-  REQUIRE(waitpid(child, &status, 0) == child);
+  WaitChild(child, &status);
+  Progress("reclaim: crash client reaped");
   server.Stop();
   for (int i = 0; i < 50 && server.IsRunning(); ++i) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));

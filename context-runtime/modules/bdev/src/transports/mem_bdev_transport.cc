@@ -17,7 +17,15 @@ extern "C" void ctp_copy_kernel_launch(char *dst, const char *src, size_t n,
 #include <chrono>
 #include <thread>
 #include <cstdlib>
+#include <cerrno>
+#include <cstdio>
 #include <cstring>
+#include <string>
+#if defined(__linux__)
+#include <dirent.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 
 namespace clio::run::bdev {
 
@@ -72,6 +80,7 @@ bool MemBdevTransport::Init(const CreateParams& params,
   // 16GB at compose. The populated watermark starts past the pre-faulted
   // prefix, so incremental population resumes seamlessly beyond it.
   if (shm_backed_ && shm_base_ != nullptr) {
+    InterleavePages();
     const char *prefault = std::getenv("CLIO_PREFAULT");
     if (prefault != nullptr && *prefault != '\0') {
       clio::run::u64 want;
@@ -190,6 +199,45 @@ void MemBdevTransport::InitDeviceBacking() {
   HLOG(kWarning,
        "HBM bdev requested in a build with no GPU support -- this tier is "
        "host memory, not device memory");
+#endif
+}
+
+void MemBdevTransport::InterleavePages() {
+#if defined(__linux__) && defined(SYS_mbind)
+  // Spread the device's pages over every NUMA node (CLIO_NUMA_INTERLEAVE=0
+  // opts out). Pages land on the node of whichever thread faults them first;
+  // a pre-fault from one runtime thread puts the whole device on one socket,
+  // halving the memory bandwidth every client that maps it can reach (shm
+  // cache extents measured 12K -> 24K 1 MiB puts/s at 16 threads).
+  const char *on = std::getenv("CLIO_NUMA_INTERLEAVE");
+  if (on != nullptr && std::string(on) == "0") {
+    return;
+  }
+  unsigned long mask = 0;  // NOLINT(runtime/int): the syscall's type
+  DIR *d = opendir("/sys/devices/system/node");
+  if (d == nullptr) {
+    return;
+  }
+  while (dirent *ent = readdir(d)) {
+    int n = -1;
+    if (std::sscanf(ent->d_name, "node%d", &n) == 1 && n >= 0 && n < 64) {
+      mask |= 1ul << n;
+    }
+  }
+  closedir(d);
+  if (__builtin_popcountl(mask) < 2) {
+    return;  // one node: nothing to spread
+  }
+  constexpr int kMpolInterleave = 3;  // MPOL_INTERLEAVE (linux/mempolicy.h)
+  // mbind wants a page-aligned start; the device begins just past the
+  // header, so cover the whole pages around it.
+  const uintptr_t page = static_cast<uintptr_t>(sysconf(_SC_PAGESIZE));
+  const uintptr_t lo = reinterpret_cast<uintptr_t>(shm_base_) & ~(page - 1);
+  const uintptr_t hi = reinterpret_cast<uintptr_t>(shm_base_) + shm_usable_;
+  const long rc = syscall(SYS_mbind, lo, hi - lo,  // NOLINT(runtime/int)
+                          kMpolInterleave, &mask, 64ul, 0u);
+  HLOG(kInfo, "RAM bdev '{}': NUMA interleave over mask {:#x}: {}", shm_name_,
+       mask, rc == 0 ? "ok" : std::strerror(errno));
 #endif
 }
 

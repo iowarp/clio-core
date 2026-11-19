@@ -96,8 +96,12 @@ static int PutBlobs() {
            i, psz->size_);
       return 1;
     }
+    // Polled under a long deadline: a slow runner's sweep may take longer;
+    // a replica that never appears still fails.
     bool replicated = false;
-    for (int attempt = 0; attempt < 500 && !replicated; ++attempt) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    while (!replicated && std::chrono::steady_clock::now() < deadline) {
       auto rsz = cte.AsyncGetBlobSize(tag_id, BlobName(i),
                                       clio::run::PoolQuery::Dynamic(), 1);
       rsz.Wait();

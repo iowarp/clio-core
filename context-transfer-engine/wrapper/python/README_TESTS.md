@@ -255,4 +255,4 @@ To integrate these tests in CI/CD:
 
 - [CTE Core API Documentation](../../docs/cte/cte.md)
 - [Python Bindings Implementation](core_bindings.cc)
-- [Module Development Guide](../../../docs/docs/sdk/context-runtime/2.module_dev_guide.md)
+- [Module Development Guide](https://core.iowarp.ai/develop/)

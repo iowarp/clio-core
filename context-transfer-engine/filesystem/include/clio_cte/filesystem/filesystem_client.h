@@ -9,6 +9,7 @@
 #include <atomic>
 #include "clio_cte/filesystem/api.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -25,6 +26,7 @@
 #include <vector>
 #include <mutex>
 #include <clio_cte/filesystem/filesystem_tasks.h>
+#include <clio_cte/stream/stream_client.h>
 #include <clio_cte/filesystem/fs_shard.h>
 #include <clio_cte/filesystem/shm_fs_cache.h>
 
@@ -92,14 +94,16 @@ class Client : public clio::cte::core::Client {
 #if CTP_IS_HOST
   // Copyable by hand, because the descriptor table below carries a std::mutex
   // and the compiler-generated copies would be deleted. The base client is
-  // copyable by contract (its deferred-write registry is process-wide for
-  // exactly that reason), and callers do copy it, so losing that here would be
-  // a silent API break.
+  // copyable by contract, and callers do copy it, so losing that here would
+  // be a silent API break.
   //
   // The lock is on the SOURCE: we are reading its table. Our own mutex is
   // freshly constructed -- a lock is not state worth copying, and copying one
   // would be undefined anyway.
-  Client(const Client &other) : clio::cte::core::Client(other) {
+  Client(const Client &other)
+      : clio::cte::core::Client(other),
+        data_cte_(other.data_cte_),
+        stream_(other.stream_) {
     std::lock_guard<std::mutex> g(other.fd_mu_);
     shm_fs_root_ = other.shm_fs_root_;
     fds_ = other.fds_;
@@ -111,6 +115,8 @@ class Client : public clio::cte::core::Client {
       return *this;
     }
     clio::cte::core::Client::operator=(other);
+    data_cte_ = other.data_cte_;
+    stream_ = other.stream_;
     // Both tables are touched, so both locks are taken -- ordered by address
     // so two threads assigning A=B and B=A cannot deadlock.
     std::mutex *first = &fd_mu_;
@@ -228,16 +234,17 @@ class Client : public clio::cte::core::Client {
 
 #if CTP_IS_HOST
   /**
-   * Ask the local filesystem container which pool it stores its page blobs
-   * through (the top of its interposition chain, e.g. replication).
+   * Ask the local filesystem container for one of the pools it uses
+   * (Monitor query; the filesystem's config is the only source of pool ids).
+   * @param key "next_pool" (the data chain its pages go through) or
+   *        "stream_pool" (where file sizes live)
    * @param out receives the pool id on success
-   * @return true when the home answered with a valid pool id
+   * @return true when the container answered with a valid pool id
    */
-  bool GetDataPoolId(clio::run::PoolId *out) {
+  bool QueryPoolId(const std::string &key, clio::run::PoolId *out) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<MonitorTask>(clio::run::CreateTaskId(), pool_id_,
-                                          clio::run::PoolQuery::Local(),
-                                          std::string("next_pool"));
+                                          clio::run::PoolQuery::Local(), key);
     auto fut = ipc->Send(task);
     fut.Wait();
     if (fut->GetReturnCode() != 0 || fut->results_.empty()) {
@@ -253,6 +260,66 @@ class Client : public clio::cte::core::Client {
         static_cast<clio::run::u32>(
             std::strtoul(v.c_str() + dot + 1, nullptr, 10)));
     return !out->IsNull();
+  }
+
+  /**
+   * The pool this filesystem stores page blobs through (the top of its
+   * interposition chain).
+   * @param out receives the pool id on success
+   * @return true when the filesystem answered
+   */
+  bool GetDataPoolId(clio::run::PoolId *out) {
+    return QueryPoolId("next_pool", out);
+  }
+
+  /**
+   * Bind the data-path and stream clients to the pools this filesystem
+   * pool is configured with. Every CTE call a clio-fs client makes (page
+   * I/O, fsync, capacity) must take the same chain the filesystem does, or
+   * it bypasses the caches and replication above the cores.
+   * @return true when both pools were learned
+   */
+  bool BindPools() {
+    clio::run::PoolId data_pool;
+    clio::run::PoolId stream_pool;
+    if (!QueryPoolId("next_pool", &data_pool) ||
+        !QueryPoolId("stream_pool", &stream_pool)) {
+      return false;
+    }
+    data_cte_.Init(data_pool);
+    // Connect the data client to the shm cache module when the data pool
+    // fronts it (the keys come from the CTE Create; a lookup, no create).
+    // Otherwise it stays on the task path.
+    data_cte_.ConnectCache();
+    stream_.Init(stream_pool);
+    return true;
+  }
+
+  /** CTE client bound to this filesystem's data chain (see BindPools). */
+  clio::cte::core::Client *Cte() { return &data_cte_; }
+
+  /** Stream client bound to this filesystem's stream pool. */
+  clio::cte::stream::Client *Stream() { return &stream_; }
+
+  /**
+   * Ask the local filesystem container for its file-data score rule (YAML
+   * `data_score` / `data_score_head_pages`). A client that puts page blobs
+   * itself applies it the way the container's own Write does:
+   * `policy.ScoreOf(offset / kFsPageSize)` is the score of that page's put.
+   * @param out receives the rule on success (untouched otherwise)
+   * @return true when the home answered with a well-formed rule
+   */
+  bool GetPageScorePolicy(clio::cte::core::PageScorePolicy *out) {
+    auto *ipc = CLIO_CPU_IPC;
+    auto task = ipc->NewTask<MonitorTask>(clio::run::CreateTaskId(), pool_id_,
+                                          clio::run::PoolQuery::Local(),
+                                          std::string("data_score"));
+    auto fut = ipc->Send(task);
+    fut.Wait();
+    if (fut->GetReturnCode() != 0 || fut->results_.empty()) {
+      return false;
+    }
+    return DecodePageScore(fut->results_.begin()->second, out);
   }
 
   /** Create/initialize the filesystem container over a CTE core pool. */  /** Create/initialize the filesystem container over a CTE core pool. */
@@ -580,6 +647,25 @@ class Client : public clio::cte::core::Client {
     return ipc->Send(task);
   }
 
+  /**
+   * List one chunk of a directory in offset order (Method::kReaddirRange).
+   * @param path directory path
+   * @param start_off first offset wanted: 0 for the start, else a previous
+   *        chunk's next_off_ or any offset to seek to
+   * @param max_entries entries after which the chunk ends (it may run a
+   *        little over: chunks are never cut inside a table block)
+   * @return future of the chunk; next_off_ is kDirOffEnd at the end
+   */
+  clio::run::Future<ReaddirRangeTask> AsyncReaddirRange(
+      const std::string &path, clio::run::u64 start_off,
+      clio::run::u32 max_entries = 8192) {
+    auto *ipc = CLIO_CPU_IPC;
+    auto task = ipc->NewTask<ReaddirRangeTask>(
+        clio::run::CreateTaskId(), pool_id_, FsPathQuery(), path, start_off,
+        max_entries);
+    return ipc->Send(task);
+  }
+
   clio::run::Future<StatSizeTask> AsyncStatSize(const std::string &path) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<StatSizeTask>(clio::run::CreateTaskId(), pool_id_,
@@ -605,223 +691,70 @@ class Client : public clio::cte::core::Client {
   // the POSIX adapter, which meant the next adapter either duplicated them or
   // silently did without.
   //
-  // The write-behind window is the CTE core's deferred-write registry, not a
-  // private one — it already owns the in-flight FIFO, the per-key pending
-  // table, the byte budget, the recycled staging pool (issue #892) and the
-  // per-key error latch. Two consequences worth knowing:
-  //
-  //  - The byte budget is now GLOBAL rather than per-file. It bounds what it
-  //    is actually protecting (shared-memory staging capacity), which a
-  //    per-file bound never did: 100 files under a 64 MiB per-file window
-  //    could pin 6.4 GiB.
-  //  - Read-your-own-writes no longer WAITS. The registry keeps each in-flight
-  //    write's staging bytes addressable, so a read overlapping one is served
-  //    from them (DeferTryServe) and only a partially-covered read has to
-  //    drain. The old adapter drained on any overlap.
+  // Writes are synchronous: write(2) returns once the filesystem chimod has
+  // the bytes, and a failure is reported by that write(2) itself.
   // =========================================================================
 
-  /** Whether write(2) may return before the runtime has the bytes (issue
-   *  #817). ON by default; CLIO_CFS_ASYNC_WRITES=0 restores blocking writes.
-   *
-   *  Measured on 128 x 64 KiB overwrite + fsync, five runs each, medians:
-   *  queued 5.77 ms vs blocking 6.86 ms — "no worse, probably a little
-   *  better", not a headline.
-   *
-   *  A NOTE ON HOW EASY THIS IS TO MEASURE WRONG: the first pass over a fresh
-   *  file allocates every block and a second pass does not, so timing one mode
-   *  on a new file and the other on the warmed one compares allocation against
-   *  overwrite. Doing exactly that produced a confident, entirely spurious
-   *  "async is 2.3x SLOWER". Warm first; time only overwrites. */
-  static bool AsyncWritesEnabled() {
-    static const bool v = [] {
-      if (const char *e = std::getenv("CLIO_CFS_ASYNC_WRITES")) {
-        return !(std::string(e) == "0" || std::string(e) == "false");
-      }
-      return true;
-    }();
-    return v;
-  }
-
-  /** Deferred writes allowed in flight before a write blocks on the oldest.
-   *
-   *  This is the bound that actually binds for small I/O -- see
-   *  AwaitPutsUntilSpace for why a byte-only window lets 4 KiB writes queue
-   *  16k deep and lose 1.59x throughput to page-token contention. 256 was the
-   *  best of {256, 512, 1024, 2048, 4096, 16384} measured at 4 KiB, and is
-   *  well above what large I/O ever reaches (a 1 MiB writer hits the 64 MiB
-   *  byte bound at 64 in flight), so it costs large writes nothing.
-   *  CLIO_CFS_WRITE_WINDOW_COUNT overrides. */
-  static clio::run::u64 WriteWindowCount() {
-    static const clio::run::u64 v = [] {
-      if (const char *e = std::getenv("CLIO_CFS_WRITE_WINDOW_COUNT")) {
-        char *end = nullptr;
-        unsigned long long n = std::strtoull(e, &end, 10);
-        if (end != e && n > 0) return static_cast<clio::run::u64>(n);
-      }
-      return static_cast<clio::run::u64>(256);
-    }();
-    return v;
-  }
-
-  /** Staging bytes allowed in flight before a write blocks on the oldest.
-   *  Back-pressure, never a failure. CLIO_CFS_WRITE_WINDOW_BYTES overrides. */
-  static clio::run::u64 WriteWindowBytes() {
-    static const clio::run::u64 v = [] {
-      if (const char *e = std::getenv("CLIO_CFS_WRITE_WINDOW_BYTES")) {
-        char *end = nullptr;
-        unsigned long long n = std::strtoull(e, &end, 10);
-        if (end != e && n > 0) return static_cast<clio::run::u64>(n);
-      }
-      return static_cast<clio::run::u64>(64ULL * 1024 * 1024);
-    }();
-    return v;
-  }
-
-  /** Registry key for a file. Writes and reads of one path must agree on it,
-   *  and it is what makes read-your-own-writes a property of the FILE rather
-   *  than of a handle — two descriptors on one file see each other's writes. */
-  static clio::run::u64 FileKey(const std::string &path) {
-    return DeferKeyHashName(path);
-  }
-
   /**
-   * write(2) at an explicit offset. Copies `buf` into pooled shared memory
-   * (mandatory: the caller may reuse its buffer the instant write(2) returns),
-   * submits, and — unless `sync` — registers the write as deferred and
-   * returns without waiting.
+   * write(2) at an explicit offset. Copies `buf` into a runtime buffer (the
+   * caller may reuse its buffer the instant write(2) returns), sends the
+   * Write task and waits for it.
    *
-   * ALWAYS SUCCEEDS when deferred: a queued write that fails latches its
-   * errno against the path for Flush/close to report, exactly as the kernel
-   * page cache reports writeback failures to fsync rather than to an
-   * unrelated later write(2).
-   *
-   * @param sync O_SYNC/O_DSYNC — wait for completion. The caller asked for
-   *        durability over latency and honouring that is the point of the flag.
-   * @return bytes accepted, or -1 with errno set.
+   * @param handle chimod handle of the open file
+   * @param path bare path of the file (unused; kept for the descriptor API)
+   * @param off file offset
+   * @param buf source bytes
+   * @param count bytes to write
+   * @param sync O_SYNC/O_DSYNC (writes already complete before returning)
+   * @return bytes written, or -1 with errno set (ENOSPC for a full store,
+   *         ENOMEM when no buffer could be allocated, else EIO).
    */
   FsSsize Write(clio::run::u64 handle, const std::string &path,
                 clio::run::u64 off, const void *buf, size_t count,
                 bool sync = false) {
+    (void)path;
+    (void)sync;
     if (count == 0) {
       return 0;
     }
-    const bool blocking = sync || !AsyncWritesEnabled();
-    // Recycle completed writes' staging so this burst feeds its own pool
-    // instead of allocating fault-cold buffers (issue #892 measured cold
-    // allocation as THE submit bottleneck). Opportunistic: it gives up rather
-    // than queue when another submitter is already reaping, which is what
-    // keeps this off the critical path as thread count rises.
-    const bool prof = ProfileEnabled();
-    auto tick = [] { return std::chrono::steady_clock::now(); };
-    auto t0 = prof ? tick() : std::chrono::steady_clock::time_point{};
-    DeferReapCompletedIfUncontended();
-    ctp::ipc::FullPtr<char> staging = PoolTryAlloc(count);
+    auto *ipc = CLIO_IPC;
+    ctp::ipc::FullPtr<char> staging = ipc->AllocateBuffer(count);
     if (staging.IsNull()) {
-      // Pool miss. NOW it is worth reaping completed writes -- that refills
-      // the pool with pre-faulted buffers, and a fresh allocation is the
-      // expensive thing we are trying to avoid (issue #892 measured cold
-      // allocation as THE submit bottleneck). Doing this on every write
-      // instead, hit or miss, is what made the global registry mutex the
-      // busiest lock in the client.
-      DeferReapCompleted();
-      staging = PoolAllocStaging(count);
+      errno = ENOMEM;
+      return -1;
     }
-    if (staging.IsNull()) {
-      // Draining hands those buffers straight back, so a write that would
-      // have failed with ENOMEM waits instead — the same trade the window
-      // bound already makes, triggered by the allocator rather than a count.
-      AwaitPutsUntilSpace(0);
-      staging = PoolAllocStaging(count);
-      if (staging.IsNull()) {
-        errno = ENOMEM;
-        return -1;
-      }
-    }
-    auto t1 = prof ? tick() : std::chrono::steady_clock::time_point{};
     std::memcpy(staging.ptr_, buf, count);
-    auto t2 = prof ? tick() : std::chrono::steady_clock::time_point{};
     auto fut = AsyncWrite(handle, off, count,
                           ctp::ipc::ShmPtr<>(staging.shm_));
-    auto t3 = prof ? tick() : std::chrono::steady_clock::time_point{};
-    if (blocking) {
-      fut.Wait();
-      FsSsize ret;
-      if (fut->GetReturnCode() == 0) {
-        ret = static_cast<FsSsize>(fut->bytes_written_);
-      } else {
-        // The chimod reports a full store as ENOSPC; all else is EIO.
-        errno = fut->GetReturnCode() == ENOSPC ? ENOSPC : EIO;
-        ret = -1;
-      }
-      PoolFreeStaging(staging, count);
-      return ret;
+    fut.Wait();
+    FsSsize ret;
+    if (fut->GetReturnCode() == 0) {
+      ret = static_cast<FsSsize>(fut->bytes_written_);
+    } else {
+      // The chimod reports a full store as ENOSPC; all else is EIO.
+      errno = fut->GetReturnCode() == ENOSPC ? ENOSPC : EIO;
+      ret = -1;
     }
-    // Deferred. The staging pointer is handed to the registry as the write's
-    // readable extent, which is what lets a subsequent read of these bytes be
-    // served without waiting for the task.
-    //
-    // Note what is NOT ordered: two writes to overlapping bytes with no
-    // intervening flush race the runtime's write token, and a client-side
-    // wait cannot fix it (measured: 512 rewrites of one range lose the last
-    // write ~30% of runs even WITH a same-range wait). An application needing
-    // strict last-writer-wins across overlapping unsynced writes must flush
-    // between them or open O_SYNC. Disjoint writes — every sequential or
-    // random writer — are unaffected.
-    DeferRegisterWrite(fut, FileKey(path), off, count, staging.ptr_, staging,
-                       count);
-    auto t4 = prof ? tick() : std::chrono::steady_clock::time_point{};
-    // Enforce the window AFTER accounting, so this write is included in the
-    // bound rather than being the one that overshoots it. This can block —
-    // that is the back-pressure — but it cannot fail.
-    AwaitPutsUntilSpace(WriteWindowBytes(), WriteWindowCount());
-    if (prof) {
-      auto t5 = tick();
-      using ns = std::chrono::nanoseconds;
-      SubmitProfile &p = Profile();
-      p.n.fetch_add(1, std::memory_order_relaxed);
-      p.stage_ns.fetch_add(std::chrono::duration_cast<ns>(t1 - t0).count(),
-                           std::memory_order_relaxed);
-      p.copy_ns.fetch_add(std::chrono::duration_cast<ns>(t2 - t1).count(),
-                          std::memory_order_relaxed);
-      p.send_ns.fetch_add(std::chrono::duration_cast<ns>(t3 - t2).count(),
-                          std::memory_order_relaxed);
-      p.reg_ns.fetch_add(std::chrono::duration_cast<ns>(t4 - t3).count(),
-                         std::memory_order_relaxed);
-      p.window_ns.fetch_add(std::chrono::duration_cast<ns>(t5 - t4).count(),
-                            std::memory_order_relaxed);
-    }
-    return static_cast<FsSsize>(count);
+    ipc->FreeBuffer(staging);
+    return ret;
   }
 
   /**
-   * read(2) at an explicit offset, with read-your-own-writes.
+   * read(2) at an explicit offset. Committed bytes come from shared memory
+   * when the mirrors can serve them (no IPC); anything else is one task to
+   * the chimod.
    *
-   * Three tiers, cheapest first: bytes still in flight are copied out of the
-   * pending write's staging (no wait, no IPC); committed bytes come from the
-   * shared-memory mirror (no IPC); anything else is one RPC to the chimod.
-   *
+   * @param handle chimod handle of the open file
+   * @param path bare path of the file
+   * @param off file offset
+   * @param buf destination
+   * @param count bytes to read
    * @return bytes read (possibly 0 at EOF), or -1 with errno set.
    */
   FsSsize Read(clio::run::u64 handle, const std::string &path,
                clio::run::u64 off, void *buf, size_t count) {
     if (count == 0) {
       return 0;
-    }
-    const clio::run::u64 key = FileKey(path);
-    int served = DeferTryServe(key, off, static_cast<char *>(buf), count);
-    if (served > 0) {
-      // Fully covered by in-flight writes: those bytes ARE the current value,
-      // and the file is necessarily at least this long.
-      return static_cast<FsSsize>(count);
-    }
-    if (served == -1) {
-      // PARTIAL coverage: the bytes outside the in-flight writes are stale in
-      // the file until those writes land, so this is the one case that has to
-      // wait. -2 means writes are in flight for this file but none touches
-      // these bytes -- the overwhelmingly common case for a mixed workload --
-      // and waiting there would let any concurrent writer stall every reader
-      // of the same file.
-      DeferAwaitKey(key);
     }
     FsSsize fast = TryReadShm(path, off, buf, count);
     if (fast >= 0) {
@@ -851,71 +784,30 @@ class Client : public clio::cte::core::Client {
   }
 
   /**
-   * fsync(2): wait for every deferred write to `path` and report — once —
-   * any failure they latched. Before deferred writes this was a no-op,
-   * because every write blocked.
-   */
-  int Flush(const std::string &path) {
-    const clio::run::u64 key = FileKey(path);
-    DeferAwaitKey(key);
-    int err = DeferTakeKeyError(key);
-    if (err != 0) {
-      errno = err;
-      return -1;
-    }
-    return 0;
-  }
-
-  /** Wait for every deferred write this client has outstanding, on any path.
-   *  For teardown and for benchmarks that must time a complete flush. */
-  static void FlushAll() { AwaitPutsUntilSpace(0); }
-
-  /**
    * stat(2)-shaped query: existence and logical size.
    *
-   * Drains `path` first — a queued write has not updated the file's logical
-   * size yet, and stat(2) must report the size a completed write(2)
-   * established. The drain does NOT consume a latched error: stat is not one
-   * of the two calls (fsync, close) that owns that report.
-   *
+   * @param path bare path
+   * @param exists receives whether the file is there
+   * @param size receives the logical size
    * @return false when the query itself failed (ask again); *exists says
    *         whether the file is there.
    */
   bool GetAttr(const std::string &path, bool *exists, clio::run::u64 *size) {
-    const clio::run::u64 key = FileKey(path);
-    // Serve from the shared-memory mirror when nothing is in flight for this
-    // file. stat(2) is the most frequent metadata call a filesystem sees, and
-    // the record the runtime already publishes carries both answers -- paying
-    // a round trip for them made stat cost ~325 us against ~4 us for a
-    // fast-pathed 4 KiB read, i.e. metadata became the bottleneck of a
-    // workload whose DATA path had stopped doing IPC at all.
-    //
-    // The pending-write check is what keeps this honest: a queued write has
-    // not advanced the published size yet, so with anything in flight we take
-    // the slow path (drain, then ask the runtime) exactly as before. Same
-    // staleness argument as TryReadShm otherwise -- the runtime publishes the
-    // new size at the end of the Write handler, so it lands before the
-    // write(2) that grew the file returns to its caller.
+    // Serve from the filesystem's shared-memory mirror when it has the path:
+    // stat(2) is the most frequent metadata call a filesystem sees, and the
+    // record the runtime publishes carries both answers. Writes are
+    // synchronous, so the published size already includes every write(2)
+    // that has returned.
     if (HasShmCache() || AttachShmCache()) {
       ShmFileRecord rec;
       if (TryGetFileRecordShm(path, &rec)) {
-        const clio::run::u64 published = rec.Exists() ? rec.size_ : 0;
-        // The published size is already correct unless something in flight
-        // reaches PAST the current end -- an overwrite cannot change a file's
-        // size, and overwrites are what a steady-state workload mostly does.
-        // Draining on any pending write instead (the obvious version of this
-        // check) left stat at ~264 us because it waited on writes that could
-        // not possibly have affected the answer.
-        if (DeferMaxPendingEnd(key) <= published) {
-          *exists = rec.Exists();
-          *size = published;
-          ShmStatHits().fetch_add(1, std::memory_order_relaxed);
-          return true;
-        }
+        *exists = rec.Exists();
+        *size = rec.Exists() ? rec.size_ : 0;
+        ShmStatHits().fetch_add(1, std::memory_order_relaxed);
+        return true;
       }
     }
     ShmStatMisses().fetch_add(1, std::memory_order_relaxed);
-    DeferAwaitKey(key);
     auto t = AsyncGetattr(path);
     t.Wait();
     if (t->GetReturnCode() != 0) {
@@ -926,7 +818,12 @@ class Client : public clio::cte::core::Client {
     return true;
   }
 
-  /** Logical size of `path` (0 when absent). See GetAttr for the drain. */
+  /**
+   * Logical size of `path` (0 when absent).
+   * @param path bare path
+   * @param size receives the size
+   * @return false when the query itself failed
+   */
   bool GetSize(const std::string &path, clio::run::u64 *size) {
     bool exists = false;
     if (!GetAttr(path, &exists, size)) {
@@ -938,22 +835,6 @@ class Client : public clio::cte::core::Client {
     return true;
   }
 
-  /**
-   * Zero-IPC read of COMMITTED bytes straight out of shared memory (issue
-   * #817). Resolves the path to its tag + logical size in this pool's SHM
-   * mirror, then copies each page blob out of the RAM bdev segment via the
-   * core's payload fast path.
-   *
-   * Distinct from the deferred-registry fast path in Read(), which serves
-   * bytes that have NOT been committed yet: the two cover disjoint cases and
-   * a read may need either.
-   *
-   * @return bytes read (possibly 0 at EOF), or -1 meaning "not
-   *         fast-pathable" — NOT an error. -1 covers every refusal: cache
-   *         absent, path not mirrored, pending appends, a hole, a page on a
-   *         file/remote/GPU tier, or placement moving mid-copy. The caller
-   *         must then use the RPC path, which is always correct.
-   */
   // =========================================================================
   // POSIX descriptor layer.
   //
@@ -965,8 +846,7 @@ class Client : public clio::cte::core::Client {
   // API into these calls and hold nothing.
   //
   // The table is process-wide and static rather than a member because
-  // clio::cte::core::Client is copyable by contract (see the deferred-write
-  // registry, which is static for the same reason); a mutex member would
+  // clio::cte::core::Client is copyable by contract; a mutex member would
   // silently break that.
   // =========================================================================
 
@@ -1055,8 +935,8 @@ class Client : public clio::cte::core::Client {
   FsOff TellFd(int fd);
   FsOff SizeFd(int fd);
   int CloseFd(int fd);
-  /** fsync(2): drain this file's deferred writes (reporting a latched failure
-   *  exactly once), then make the file durable (SyncPathDurable). */
+  /** fsync(2): make the file durable (SyncDurable). Writes are synchronous,
+   *  so there is nothing to drain first. */
   int SyncFd(int fd);
 
   // ---- fsync(2) durability (shared by the interceptors and FUSE) ----
@@ -1099,8 +979,7 @@ class Client : public clio::cte::core::Client {
   /**
    * fsync(2)'s durability step: the file's blobs (pages and inode record),
    * its size, then the directory blocks naming it, so the bytes, the size
-   * and the name all survive power loss. Deferred writes must already be
-   * drained (Flush).
+   * and the name all survive power loss.
    * @param tag the file's tag (null: only the directory)
    * @param dir the directory whose entries must be durable
    * @return 0, -ENOSPC or -EIO
@@ -1160,8 +1039,6 @@ class Client : public clio::cte::core::Client {
     if (!LookupFd(fd, &of)) {
       return -1;
     }
-    // GetSize drains this file's deferred writes: stat(2) must report the
-    // size a completed write(2) established (issue #817).
     clio::run::u64 size = 0;
     if (!GetSize(of.path, &size)) {
       errno = EBADF;
@@ -1174,6 +1051,13 @@ class Client : public clio::cte::core::Client {
   /** stat(2): fill *buf for a clio:: path; ENOENT if it does not exist. */
   template <typename StatT>
   int StatPath(const std::string &raw_path, StatT *buf) {
+    // A stat can be the first clio:: call a process makes (IOR stats its
+    // target before opening it), so it must bring the client up itself.
+    if (!EnsureInit()) {
+      std::memset(buf, 0, sizeof(StatT));
+      errno = EIO;
+      return -1;
+    }
     std::string path = StripClioPrefix(raw_path);
     clio::run::u64 size = 0;
     bool exists = false;
@@ -1198,241 +1082,84 @@ class Client : public clio::cte::core::Client {
   }
 
   /**
-   * What a caller wants done about a byte range the tier does not hold.
-   *
-   * The two consumers need OPPOSITE answers from the same lookup, and getting
-   * it backwards is silent data corruption rather than an error:
-   *
-   *   kZeroFillHoles -- POSIX filesystem semantics. This client IS the
-   *     filesystem, so a range inside the file with nothing behind it was
-   *     never written and reads as zeros. Correct for CfsIo.
-   *
-   *   kRefuseHoles -- cache-over-authoritative semantics. The tier is a cache
-   *     in front of a file that holds the real bytes, so "not here" means "ask
-   *     the authoritative copy", NEVER "the answer is zeros". Correct for the
-   *     HDF5 VFD, which write-throughs to a native file.
-   */
-  enum class ShmHolePolicy { kZeroFillHoles, kRefuseHoles };
-
-  /**
    * Read committed bytes from shared memory, refusing rather than inventing
-   * anything the tier does not hold. See ShmHolePolicy::kRefuseHoles.
-   *
+   * anything the shm cache does not hold (the HDF5 VFD's cache-over-file
+   * semantics). Same as TryReadShm: a page the cache does not hold is never
+   * zero-filled, because from this side "not cached" and "a hole" look alike.
+   * @param path bare path
+   * @param off file offset
+   * @param buf destination
+   * @param count bytes to read
    * @return bytes read, or -1 meaning "not fast-pathable, use the
-   *         authoritative source" -- which for this policy also covers "some
-   *         of that range is not cached".
+   *         authoritative source"
    */
   FsSsize TryReadShmResident(const std::string &path, clio::run::u64 off,
                              void *buf, size_t count) {
-    return TryReadShmImpl(path, off, buf, count, ShmHolePolicy::kRefuseHoles);
+    return TryReadShm(path, off, buf, count);
   }
 
-  // FsSsize, not ssize_t: MSVC has no ssize_t, and this layer's whole
-  // vocabulary was ported to FsSsize/FsOff so it builds on Windows.
+  /**
+   * Zero-IPC read of committed bytes: resolves the path to its tag and
+   * logical size in this filesystem pool's shared-memory mirror, then copies
+   * each page out of the data client's shm cache segment
+   * (core::Client::TryGetCached).
+   *
+   * FsSsize, not ssize_t: MSVC has no ssize_t, and this layer's whole
+   * vocabulary was ported to FsSsize/FsOff so it builds on Windows.
+   *
+   * @param path bare path
+   * @param off file offset
+   * @param buf destination
+   * @param count bytes to read
+   * @return bytes read (possibly 0 at EOF), or -1 meaning "not
+   *         fast-pathable" -- NOT an error: mirror absent, path not mirrored,
+   *         pending appends, no shm cache connected, or a page the cache does
+   *         not hold. The caller then uses the task path, which is always
+   *         correct.
+   */
   FsSsize TryReadShm(const std::string &path, clio::run::u64 off, void *buf,
                      size_t count) {
-    return TryReadShmImpl(path, off, buf, count, ShmHolePolicy::kZeroFillHoles);
-  }
-
-  /** CLIO_TRACE_SHM_READ=1: log every page the shared-memory read path
-   *  hands back as zeros, and why (residency "absent" vs. an SHM hit). */
-  static bool TraceShmRead() {
-    static const bool on = [] {
-      const char *e = std::getenv("CLIO_TRACE_SHM_READ");
-      return e != nullptr && e[0] == '1';
-    }();
-    return on;
-  }
-
-  FsSsize TryReadShmImpl(const std::string &path, clio::run::u64 off, void *buf,
-                         size_t count, ShmHolePolicy policy) {
-    // Read-your-own-writes, here rather than only in Read().
-    //
-    // CFS writes defer by default, and in-flight bytes are visible ONLY
-    // through this registry -- the page blob still holds the previously
-    // committed content until they land. Read() consults it before calling
-    // this function, so for that caller the check below costs an atomic load
-    // and returns 0. But TryReadShmResident is a PUBLIC entry point the VFD
-    // calls directly, and it never runs Read(): an in-place rewrite followed
-    // by a read in the same session would otherwise find the stale committed
-    // page, succeed, and hand back pre-write bytes. kShmFilePendingAppend does
-    // not cover it either, because an in-place rewrite is not an append.
-    //
-    // Depending on the caller for a correctness precondition is what made that
-    // reachable, so the function now establishes it itself.
-    const clio::run::u64 defer_key = FileKey(path);
-    const int served =
-        DeferTryServe(defer_key, off, static_cast<char *>(buf), count);
-    if (served > 0) {
-      // Fully covered by in-flight writes: those bytes ARE the current value.
-      return static_cast<FsSsize>(count);
-    }
-    if (served == -1) {
-      // Partial coverage: the bytes outside the in-flight writes are stale
-      // until those writes land, so this is the one case that has to wait.
-      DeferAwaitKey(defer_key);
-    }
-
     if (!ShmReadFastPathEnabled()) {
       return -1;
     }
-    // Attach lazily, and RETRY when not yet attached, rather than latching
-    // the result of one attempt at init. A client can legitimately come up
-    // before its pool has been composed (or before the chimod has registered
-    // its cache root), and a one-shot attach would leave that process on the
-    // RPC path forever -- silently, since a disabled cache and a working one
-    // look identical from the outside. Retrying costs a scan of a <=32-entry
-    // directory, against an RPC that costs ~100 us.
+    // Attach lazily, and RETRY when not yet attached: a client can come up
+    // before its pool has been composed, and a one-shot attach would leave
+    // that process on the task path forever.
     if (!HasShmCache() && !AttachShmCache()) {
       ShmReadMisses().fetch_add(1, std::memory_order_relaxed);
       return -1;
     }
-    auto *cte = CLIO_CTE_CLIENT;
-    if (cte == nullptr || (!cte->HasShmCache() && !cte->AttachShmCache())) {
-      // Page payloads come from the core cache; both are required.
-      ShmReadMisses().fetch_add(1, std::memory_order_relaxed);
-      return -1;
-    }
-
+    auto *cte = Cte();
     ShmFileRecord rec;
-    if (!TryGetFileRecordShm(path, &rec) || !rec.IsFastPathable()) {
+    if (cte->pool_id_.IsNull() || !cte->HasCache() ||
+        !TryGetFileRecordShm(path, &rec) || !rec.IsFastPathable()) {
       ShmReadMisses().fetch_add(1, std::memory_order_relaxed);
       return -1;
     }
-
-    // Clamp to the LOGICAL size. This is the number the chimod owns and the
-    // one POSIX read() semantics are defined against; the tag's physical byte
-    // total would be wrong after a sparse write or an ftruncate-grow.
-    //
-    // Reading a stale (too small) size here cannot produce a short read for a
-    // properly ordered caller: the runtime publishes the new size at the end
-    // of the Write handler, so it lands before the write() that grew the file
-    // returns to its caller.
+    // Clamp to the LOGICAL size: the number the chimod owns and the one POSIX
+    // read() semantics are defined against. The runtime publishes a new size
+    // at the end of the Write handler, before the write() that grew the file
+    // returns, so a properly ordered reader never sees it too small.
     if (off >= rec.size_) {
       return 0;  // at or past EOF
     }
-    clio::run::u64 want = count;
-    if (off + want > rec.size_) {
-      want = rec.size_ - off;
-    }
-
+    const clio::run::u64 want = std::min<clio::run::u64>(count, rec.size_ - off);
     char *dst = static_cast<char *>(buf);
     clio::run::u64 done = 0;
-    clio::run::u64 cur = off;
-    // Bound on residency probes per request. Each probe is metadata-only and
-    // replaces a whole-request data RPC, so a few are a clear win -- but they
-    // are still round trips, and a heavily perforated range would spend more
-    // on asking than the single RPC it is trying to avoid. Past the bound,
-    // take the RPC, which answers everything in one go.
-    unsigned residency_probes = 0;
     while (done < want) {
-      clio::run::u64 page_off = cur % kFsPageSize;
-      clio::run::u64 to_read = kFsPageSize - page_off;
-      if (to_read > want - done) {
-        to_read = want - done;
-      }
-      if (!cte->TryReadBlobShm(rec.tag_id_, PageName(cur), dst + done,
-                               static_cast<size_t>(to_read),
-                               static_cast<size_t>(page_off))) {
-        // A miss here used to abandon the WHOLE request, because "hole" and
-        // "cached elsewhere" were indistinguishable from this side and only
-        // one of them can be answered with zeros. GetResidency draws that
-        // distinction at the tier, which is the only place that knows it.
-        //
-        // Zeroing is correct for an absent page, and specifically here:
-        //   * the range is already clamped to the LOGICAL size above, so this
-        //     page lies inside the file, and a page inside the file with no
-        //     blob behind it was never written -- POSIX says zeros. This is
-        //     the same rule the runtime's own read path applies when it
-        //     pre-zeros before GetBlob.
-        //   * uncommitted writes cannot be hiding here. Read() serves or
-        //     awaits the deferred registry BEFORE calling this path, and
-        //     IsFastPathable() refuses a record carrying kShmFilePendingAppend.
-        //
-        // Anything other than a definite absence -- present but unreachable,
-        // or a failed probe -- still falls back, because those are exactly the
-        // cases where zeros would be wrong.
-        // kRefuseHoles: the authoritative copy has these bytes, so there is
-        // nothing to decide -- do not probe, do not invent, just refuse.
-        if (policy == ShmHolePolicy::kRefuseHoles) {
-          ShmReadMisses().fetch_add(1, std::memory_order_relaxed);
-          return -1;
-        }
-        if (residency_probes < kMaxResidencyProbes) {
-          ++residency_probes;
-          auto res = cte->AsyncGetResidency(rec.tag_id_, PageName(cur),
-                                            static_cast<clio::run::u64>(page_off),
-                                            static_cast<clio::run::u64>(to_read));
-          res.Wait();
-          if (res->GetReturnCode() == 0 && res->exists_ == 0) {
-            if (TraceShmRead()) {
-              std::fprintf(stderr,
-                           "[SHM-READ] zero-fill (residency: absent) %s tag "
-                           "%u.%u page %s off %llu len %llu file_size %llu\n",
-                           path.c_str(), rec.tag_id_.major_, rec.tag_id_.minor_,
-                           PageName(cur).c_str(),
-                           static_cast<unsigned long long>(page_off),
-                           static_cast<unsigned long long>(to_read),
-                           static_cast<unsigned long long>(rec.size_));
-            }
-            std::memset(dst + done, 0, static_cast<size_t>(to_read));
-            ShmReadHoles().fetch_add(1, std::memory_order_relaxed);
-            done += to_read;
-            cur += to_read;
-            continue;
-          }
-        }
+      const clio::run::u64 cur = off + done;
+      const clio::run::u64 page_off = cur % kFsPageSize;
+      const clio::run::u64 to_read =
+          std::min<clio::run::u64>(kFsPageSize - page_off, want - done);
+      if (!cte->TryGetCached(rec.tag_id_, PageName(cur), page_off, to_read,
+                             dst + done)) {
         ShmReadMisses().fetch_add(1, std::memory_order_relaxed);
         return -1;
       }
-      if (TraceShmRead()) {
-        // A shared-memory HIT that returns an all-zero page: either a real
-        // zero page or a stale record pointing at reused memory.
-        const char *p = dst + done;
-        bool all_zero = to_read > 0;
-        for (clio::run::u64 i = 0; i < to_read && all_zero; i += 512) {
-          all_zero = p[i] == 0;
-        }
-        if (all_zero) {
-          std::fprintf(stderr,
-                       "[SHM-READ] zero page from SHM hit %s tag %u.%u page %s "
-                       "off %llu len %llu file_size %llu\n",
-                       path.c_str(), rec.tag_id_.major_, rec.tag_id_.minor_,
-                       PageName(cur).c_str(),
-                       static_cast<unsigned long long>(page_off),
-                       static_cast<unsigned long long>(to_read),
-                       static_cast<unsigned long long>(rec.size_));
-        }
-      }
       done += to_read;
-      cur += to_read;
     }
-    // Say so, once, the first time a read is actually served from shared
-    // memory. "The fast path is on" is otherwise unobservable from outside --
-    // a disabled cache and a working one differ only in latency -- and the
-    // failure this whole path was chasing was precisely a fast path that was
-    // silently off everywhere. Operators need something to grep for; the
-    // counters below are for anyone who needs the RATE rather than the fact.
-    static std::once_flag announced;
-    std::call_once(announced, [] {
-      HLOG(kInfo,
-           "clio-fs: serving reads from shared memory (zero-IPC fast path "
-           "active)");
-    });
     ShmReadHits().fetch_add(1, std::memory_order_relaxed);
     return static_cast<FsSsize>(done);
-  }
-
-  /** Max GetResidency probes in one ShmRead (see the call site). */
-  static constexpr unsigned kMaxResidencyProbes = 8;
-
-  /** Pages served as holes: absent at the tier, so zeros are the answer and no
-   *  data round trip was needed. Counted apart from hits because they are a
-   *  different thing -- bytes produced locally, not bytes read from the tier --
-   *  and folding them into hits would overstate what the cache served. */
-  static std::atomic<clio::run::u64> &ShmReadHoles() {
-    static std::atomic<clio::run::u64> n{0};
-    return n;
   }
 
   // Zero-IPC read accounting. A silently-disabled fast path and a working one
@@ -1455,31 +1182,6 @@ class Client : public clio::cte::core::Client {
     return v;
   }
 
-  // ---- submit-path profile (CLIO_CFS_PROFILE_SUBMIT=1) --------------------
-  // A deferred write does not wait for completion, so single-thread write
-  // throughput IS one over the submit cost -- measured at ~12.6 us for 4 KiB,
-  // which is far more than the ~0.3 us the payload copy can explain. These
-  // counters attribute it. Off by default: five clock reads is ~125 ns, small
-  // against 12.6 us but not free.
-  struct SubmitProfile {
-    std::atomic<clio::run::u64> n{0};
-    std::atomic<clio::run::u64> stage_ns{0};   // acquire staging buffer
-    std::atomic<clio::run::u64> copy_ns{0};    // memcpy payload
-    std::atomic<clio::run::u64> send_ns{0};    // build + send the task
-    std::atomic<clio::run::u64> reg_ns{0};     // register in the registry
-    std::atomic<clio::run::u64> window_ns{0};  // enforce the in-flight window
-  };
-  static SubmitProfile &Profile() {
-    static SubmitProfile p;
-    return p;
-  }
-  static bool ProfileEnabled() {
-    static const bool v = [] {
-      const char *e = std::getenv("CLIO_CFS_PROFILE_SUBMIT");
-      return e != nullptr && std::string(e) != "0";
-    }();
-    return v;
-  }
 #endif  // CTP_IS_HOST
 
 #if CTP_IS_HOST
@@ -1488,6 +1190,10 @@ class Client : public clio::cte::core::Client {
   // when caching is unavailable. Not owned: the runtime owns the segment and
   // may drop the cache at any time, which is why every read is validated.
   ShmFsCacheRoot *shm_fs_root_ = nullptr;
+
+  // Bound by BindPools from the filesystem pool's own config.
+  clio::cte::core::Client data_cte_;
+  clio::cte::stream::Client stream_;
 
   // ---- POSIX descriptor table ----
   // Guarded by fd_mu_. Held only around map lookups and insertions -- never
@@ -1506,7 +1212,12 @@ class Client : public clio::cte::core::Client {
 // filesystem_client.cc), exactly like core's g_cte_client.
 CLIO_CTE_FS_DEFINE_GLOBAL_PTR_VAR_H(clio::cte::filesystem::Client, g_fs_client);
 
-/** Initialize the filesystem client singleton (creates/binds the pool). */
+/**
+ * Initialize the filesystem client singleton: find the composed filesystem
+ * pool by name (CLIO_CFS_POOL, default kCfsPoolName; a "major.minor" value
+ * names the id directly) and bind the pools it is configured with. Creates
+ * nothing and assumes no pool id.
+ */
 bool CLIO_CFS_CLIENT_INIT(const std::string &config_path = "",
                           const clio::run::PoolQuery &pool_query =
                               clio::run::PoolQuery::Dynamic());

@@ -104,8 +104,26 @@ static bool EnforcePermissions() {
   return e == nullptr || std::strcmp(e, "0") != 0;
 }
 
+/** FUSE worker threads when CLIO_FUSE_MAX_THREADS is unset. */
+static constexpr unsigned kDefaultFuseMaxThreads = 64;
+
 /**
- * argv for fuse_main, plus "-o default_permissions" when enforced.
+ * Most FUSE requests the mount serves at once (CLIO_FUSE_MAX_THREADS).
+ * libfuse >= 3.12 caps fuse_main's worker pool at 10 threads unless told
+ * otherwise, so a node with more writing ranks than that queues their
+ * writes in the kernel however fast the store behind them is.
+ * @return the thread count; 0 leaves the libfuse default
+ */
+static unsigned FuseMaxThreads() {
+  const char *e = std::getenv("CLIO_FUSE_MAX_THREADS");
+  if (e == nullptr || *e == '\0') return kDefaultFuseMaxThreads;
+  const long v = std::strtol(e, nullptr, 10);
+  return v > 0 ? static_cast<unsigned>(v) : 0;
+}
+
+/**
+ * argv for fuse_main, plus "-o default_permissions" when enforced and
+ * "-o max_threads=N" when the loaded libfuse knows that option (3.12+).
  * @param argc argument count
  * @param argv arguments
  * @return null-terminated argument vector (size() - 1 arguments)
@@ -113,10 +131,18 @@ static bool EnforcePermissions() {
 static std::vector<char *> MountArgv(int argc, char *argv[]) {
   static char opt_flag[] = "-o";
   static char opt_perm[] = "default_permissions";
+  static char opt_threads[64];
   std::vector<char *> v(argv, argv + argc);
   if (EnforcePermissions()) {
     v.push_back(opt_flag);
     v.push_back(opt_perm);
+  }
+  const unsigned threads = FuseMaxThreads();
+  if (threads != 0 && fuse_version() >= 312) {
+    std::snprintf(opt_threads, sizeof(opt_threads), "max_threads=%u",
+                  threads);
+    v.push_back(opt_flag);
+    v.push_back(opt_threads);
   }
   v.push_back(nullptr);
   return v;
@@ -216,7 +242,8 @@ int main(int argc, char *argv[]) {
   // the FUSE protocol. The callbacks and the entire CTE data path below them
   // are identical to the Linux build.
   cte_fuse_mark_session_live();
-  return fuse_main(argc, argv, &cte_fuse_ops, nullptr);
+  const int rc = fuse_main(argc, argv, &cte_fuse_ops, nullptr);
+  return cte_fuse_init_failed() ? 1 : rc;
 #else
   // Apptainer's --fusemount opens /dev/fuse on the host, performs the
   // kernel mount, and passes the fd to the FUSE binary as the last
@@ -244,8 +271,9 @@ int main(int argc, char *argv[]) {
   if (prefd == -1) {
     cte_fuse_mark_session_live();
     std::vector<char *> mount_argv = MountArgv(argc, argv);
-    return fuse_main(static_cast<int>(mount_argv.size()) - 1,
-                     mount_argv.data(), &cte_fuse_ops, nullptr);
+    const int rc = fuse_main(static_cast<int>(mount_argv.size()) - 1,
+                             mount_argv.data(), &cte_fuse_ops, nullptr);
+    return cte_fuse_init_failed() ? 1 : rc;
   }
 
 #if FUSE_VERSION < FUSE_MAKE_VERSION(3, 14)

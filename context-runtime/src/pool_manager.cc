@@ -496,6 +496,18 @@ DynamicContainer PoolManager::GetRealOrStaticContainer(PoolId pool_id) const {
                                          : info.static_container_;
 }
 
+DynamicContainer PoolManager::GetLocalContainer(PoolId pool_id) const {
+  if (!is_initialized_) {
+    return DynamicContainer();
+  }
+  PoolMetaReadLock lock(pool_metadata_mutex_);
+  auto it = pool_metadata_.find(pool_id);
+  if (it == pool_metadata_.end()) {
+    return DynamicContainer();
+  }
+  return it->second.local_container_;
+}
+
 void PoolManager::PlugContainer(PoolId pool_id, ContainerId container_id) {
   DynamicContainer dc = GetContainerRaw(pool_id, container_id);
   ContainerHold container = dc.get();
@@ -834,6 +846,30 @@ class CreateInProgressGuard {
 };
 }  // namespace
 
+/**
+ * Let an existing pool's local container fill the OUT fields of a
+ * get-or-create that found it (Container::FillExistingCreate). Skipped when
+ * this node hosts no container of the pool, or when the task names a
+ * different ChiMod than the pool runs: the OUT params are typed by the
+ * requesting ChiMod, so another module's params would not deserialize.
+ * @param pm this node's pool manager
+ * @param task the create task
+ * @param pool_id the existing pool
+ * @param chimod_name the ChiMod the task asked for
+ */
+static void FillExistingCreateOut(PoolManager *pm, Task *task, PoolId pool_id,
+                                  const std::string &chimod_name) {
+  const PoolInfo *info = pm->GetPoolInfo(pool_id);
+  if (info == nullptr || info->chimod_name_ != chimod_name) {
+    return;
+  }
+  DynamicContainer container = pm->GetLocalContainer(pool_id);
+  if (!container) {
+    return;
+  }
+  container.get()->FillExistingCreate(task);
+}
+
 TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
   CLIO_TASK_BODY_BEGIN
   if (!is_initialized_) {
@@ -902,6 +938,7 @@ TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
   if (!existing_pool_id.IsNull()) {
     // Pool with this name already exists, update task with existing pool ID
     create_task->new_pool_id_ = existing_pool_id;
+    FillExistingCreateOut(this, task.get(), existing_pool_id, chimod_name);
     was_created = false;
     HLOG(kInfo,
          "PoolManager: Pool with name '{}' for ChiMod '{}' already exists "
@@ -926,6 +963,7 @@ TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
   // generation, but safety check)
   if (HasPool(target_pool_id)) {
     // Pool already exists by ID, task already has correct new_pool_id_
+    FillExistingCreateOut(this, task.get(), target_pool_id, chimod_name);
     was_created = false;
     HLOG(kInfo,
          "PoolManager: Pool {} already exists by ID, returning existing pool",
@@ -1417,7 +1455,15 @@ void PoolManager::WriteAddressTableWAL(PoolId pool_id,
 
   // Create WAL directory
   std::string wal_dir = config_manager->GetConfDir() + "/wal";
-  std::filesystem::create_directories(wal_dir);
+  // With an error_code: an unusable conf_dir must fail this write, not throw
+  // a filesystem_error that terminates the process from a worker (#1356).
+  std::error_code wal_ec;
+  std::filesystem::create_directories(wal_dir, wal_ec);
+  if (wal_ec) {
+    HLOG(kError, "PoolManager: cannot create WAL directory {}: {}", wal_dir,
+         wal_ec.message());
+    return;
+  }
 
   // Determine this node's ID for the WAL filename
   auto *ipc_manager = CLIO_IPC;

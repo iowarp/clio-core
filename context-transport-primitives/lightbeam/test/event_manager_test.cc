@@ -42,6 +42,16 @@
 #include <iostream>
 #include <thread>
 #include <atomic>
+
+#include "lbm_test_deadline.h"
+
+// These checks use assert(). CI also runs this test in Release builds,
+// where NDEBUG would compile every check to nothing and the test could
+// only fail by crashing. Re-including <cassert> without NDEBUG (after
+// every other header, so no library code changes) keeps assert() live.
+#undef NDEBUG
+#include <cassert>  // NOLINT(build/include_order)
+
 #ifndef _WIN32
 #include <signal.h>
 #include <unistd.h>
@@ -287,13 +297,17 @@ void TestSocketTransportWithEM() {
   int rc = client->Send(send_meta);
   assert(rc == 0);
 
-  // Wait for event on server
-  int nfds = em.Wait(500000);  // 500ms
+  // Wait for the event on the server. Wait() returns 0 on its own timeout,
+  // which on a loaded runner is not evidence the data will never come.
+  lbm_test::Deadline deadline;
+  int nfds = 0;
+  while (nfds < 1 && !deadline.Expired()) {
+    nfds = em.Wait(500000);  // 500ms
+  }
   assert(nfds >= 1);
 
   // Server should now be able to recv
   TestMeta recv_meta;
-  int attempts = 0;
   while (true) {
     auto info = server->Recv(recv_meta);
     rc = info.rc;
@@ -304,8 +318,9 @@ void TestSocketTransportWithEM() {
     }
     // Re-wait on the event manager
     nfds = em.Wait(100000);
-    if (++attempts > 50) {
-      std::cerr << "Recv timed out\n";
+    if (deadline.Expired()) {
+      std::cerr << "Recv timed out after " << lbm_test::kRecvDeadlineMs
+                << " ms\n";
       assert(false);
     }
   }
@@ -358,7 +373,7 @@ void TestZmqTransportWithEM() {
   // immediately available after epoll fires — retry with short waits)
   TestMeta recv_meta;
   ClientInfo info;
-  for (int attempt = 0; attempt < 20; ++attempt) {
+  for (lbm_test::Deadline deadline; !deadline.Expired();) {
     int nfds = em.Wait(500000);
     (void)nfds;
     info = server->Recv(recv_meta);

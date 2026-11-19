@@ -83,6 +83,30 @@ class Runtime : public clio::cte::core::CoreInterposer {
   Runtime() = default;
   ~Runtime() override = default;
 
+  /**
+   * Per-task cost estimate for the scheduler (see Container::GetTaskStats).
+   *
+   * Every verb takes the core's estimate (CoreInterposer::GetTaskStats); a
+   * PutBlob additionally pays the rule match (~5 us of regex per configured
+   * rule) when rules exist. The model inference a MATCHING put triggers is
+   * not added: whether a put matches is only known after its tag name is
+   * resolved, so that cost is left to the learned PutBlob coefficient.
+   * @param task the task to estimate
+   * @return the task's cost features
+   */
+  clio::run::TaskStat GetTaskStats(
+      const clio::run::Task *task) const override {
+    constexpr size_t kRuleMatchUs = 5;
+    clio::run::TaskStat stat = CoreInterposer::GetTaskStats(task);
+    if (task != nullptr &&
+        task->method_ == clio::cte::core::Method::kPutBlob) {
+      const size_t rules = config_.label_matches_.size();
+      stat.compute_ += kRuleMatchUs * rules;
+      stat.wall_time_ += static_cast<float>(kRuleMatchUs * rules);
+    }
+    return stat;
+  }
+
   // ---- Method handlers ----
   clio::run::TaskResume Create(clio::run::shared_ptr<CreateTask> &task);
   clio::run::TaskResume Destroy(clio::run::shared_ptr<DestroyTask> &task);

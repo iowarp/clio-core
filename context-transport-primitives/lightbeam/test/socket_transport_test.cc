@@ -41,6 +41,16 @@
 #include <thread>
 #include <vector>
 
+#include "lbm_test_deadline.h"
+
+// These checks use assert(). CI also runs this test in Release builds,
+// where NDEBUG would compile every check to nothing and the test could
+// only fail by crashing. Re-including <cassert> without NDEBUG (after
+// every other header, so no library code changes) keeps assert() live.
+#undef NDEBUG
+#include <cassert>  // NOLINT(build/include_order)
+
+
 using namespace ctp::lbm;
 
 // Custom metadata class that inherits from LbmMeta
@@ -92,7 +102,7 @@ void TestBasicTcpTransfer() {
 
   // Recv with retry loop (does everything - metadata + bulks)
   TestMeta recv_meta;
-  int attempts = 0;
+  lbm_test::Deadline deadline;
   while (true) {
     auto info = server->Recv(recv_meta);
     rc = info.rc;
@@ -102,7 +112,7 @@ void TestBasicTcpTransfer() {
       return;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    if (++attempts > 5000) {
+    if (deadline.Expired()) {
       std::cerr << "Recv timed out\n";
       return;
     }
@@ -153,7 +163,7 @@ void TestMultipleBulks() {
   assert(rc == 0);
 
   LbmMeta<> recv_meta;
-  int attempts = 0;
+  lbm_test::Deadline deadline;
   while (true) {
     auto info = server->Recv(recv_meta);
     rc = info.rc;
@@ -163,7 +173,7 @@ void TestMultipleBulks() {
       return;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    if (++attempts > 5000) {
+    if (deadline.Expired()) {
       std::cerr << "Recv timed out\n";
       return;
     }
@@ -206,7 +216,7 @@ void TestUnixDomainSocket() {
   std::cout << "Client sent IPC data\n";
 
   TestMeta recv_meta;
-  int attempts = 0;
+  lbm_test::Deadline deadline;
   while (true) {
     auto info = server->Recv(recv_meta);
     rc = info.rc;
@@ -216,7 +226,7 @@ void TestUnixDomainSocket() {
       return;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    if (++attempts > 5000) {
+    if (deadline.Expired()) {
       std::cerr << "Recv timed out\n";
       return;
     }
@@ -251,7 +261,7 @@ void TestMetadataOnly() {
   assert(rc == 0);
 
   TestMeta recv_meta;
-  int attempts = 0;
+  lbm_test::Deadline deadline;
   while (true) {
     auto info = server->Recv(recv_meta);
     rc = info.rc;
@@ -261,7 +271,7 @@ void TestMetadataOnly() {
       return;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    if (++attempts > 5000) {
+    if (deadline.Expired()) {
       std::cerr << "Recv timed out\n";
       return;
     }

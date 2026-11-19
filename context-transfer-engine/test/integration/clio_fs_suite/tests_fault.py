@@ -11,7 +11,9 @@ What a persistent, reliable deployment must guarantee (and what is checked):
 Each test leaves the cluster redeployed from scratch (redeploy_after).
 """
 
+import os
 import random
+import re
 import time
 
 from cluster import parallel, sh
@@ -531,25 +533,33 @@ def t_node_loss_partial(ctx):
 @test('tag_names_after_restart', 'fault', min_nodes=2, redeploy_after=True,
       timeout=1800)
 def t_tag_names_restart(ctx):
-  """A restarted node rebuilds its tag-name mirror: it republishes its own
-  directory shard and pulls every peer's, so path search on it (and on the
-  peers) again matches the namespace, including names created while it was
-  down."""
+  """The CTE tag names of clio-fs links ("<leaf>/<inode>") survive a node
+  restart: the restarted node recovers the names it holds from its own
+  metadata log, and names changed while it was down reach it once it is
+  back, so tag search on every node again matches the namespace."""
   n = len(ctx.hosts)
   r = ctx.dir
-  want = {'/'}
+  px = f'rtn{os.getpid() % 100000}_'
+  rx = '^' + re.escape(px) + '[^/]*/[0-9]+$'
+  links = {}
+
+  def want():
+    return {os.path.basename(k) + '/' + str(v) for k, v in links.items()}
+
   for i in range(n):
-    ctx.ok(i, 'mkdir', path=f'{r}/n{i}')
-    res = ctx.ok(i, 'create_many', dirpath=f'{r}/n{i}', prefix='f',
-                 count=100)
+    d = f'/{px}n{i}'
+    ctx.ok(i, 'mkdir', path=r + d)
+    links[d] = ctx.ok(i, 'stat', path=r + d)['ino']
+    res = ctx.ok(i, 'create_many', dirpath=r + d, prefix=px + 'f', count=100)
     ctx.check(not res['fails'], f'create_many node{i}: {res["fails"][:3]}')
-    want.add(f'/n{i}')
-    want.update(f'/n{i}/f{k}' for k in range(100))
-  ctx.ok(0, 'rename', src=f'{r}/n0', dst=f'{r}/n0moved')
-  want = {w.replace('/n0', '/n0moved', 1) if w.startswith('/n0') else w
-          for w in want}
+    for k in range(100):
+      rel = f'{d}/{px}f{k}'
+      links[rel] = ctx.ok(i, 'stat', path=r + rel)['ino']
+  ctx.ok(0, 'rename', src=f'{r}/{px}n0', dst=f'{r}/{px}n0moved')
+  for k in [k for k in links if k == f'/{px}n0' or k.startswith(f'/{px}n0/')]:
+    links[k.replace(f'/{px}n0', f'/{px}n0moved', 1)] = links.pop(k)
   for i in range(n):
-    _tags_match(ctx, i, r, want, 'before restart')
+    _tags_match(ctx, i, rx, want(), 'before restart')
   victim = n - 1
   vh = ctx.hosts[victim]
   ctx.cl.kill_fuse(vh)
@@ -559,17 +569,17 @@ def t_tag_names_restart(ctx):
   # by the victim are unreachable, so create in fresh ones and keep those
   # that succeed.
   for k in range(8):
-    p = f'{r}/during{k}'
-    res = ctx.a(0).call('mkdir', timeout=OP_DEADLINE, path=p)
+    p = f'/{px}during{k}'
+    res = ctx.a(0).call('mkdir', timeout=OP_DEADLINE, path=r + p)
     if res.get('ok'):
-      want.add(f'/during{k}')
+      links[p] = ctx.ok(0, 'stat', path=r + p)['ino']
   ctx.cl.start_runtime(vh)
   ctx.check(ctx.cl.runtime_up(vh), f'{vh} runtime did not restart')
   time.sleep(3)
   ctx.check(ctx.cl.mount(vh), f'{vh} remount failed')
   ctx.cl.agents.pop(vh, None)
   for i in range(n):
-    _tags_match(ctx, i, r, want, f'after {vh} restarted')
+    _tags_match(ctx, i, rx, want(), f'after {vh} restarted', timeout=120)
 
 
 def inode_home(ctx, i, path):

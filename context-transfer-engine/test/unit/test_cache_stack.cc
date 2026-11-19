@@ -13,9 +13,9 @@
  * compressor(562) -> replication(561) -> core(512) — driven by ONE plain
  * clio::cte::core::Client at the top. Verifies the properties only this
  * stack has:
- *   - a compressed blob KEEPS the zero-IPC SHM fast path: the cache layer's
- *     raw REPLICA_CACHE copy serves it while the primary (stored
- *     compressed, landed with the ack — async write-through) refuses;
+ *   - a compressed blob is served ORIGINAL bytes by the task path while the
+ *     primary is stored compressed (landed with the ack — async
+ *     write-through);
  *   - the replication layer's persistent replica holds the STORED form,
  *     marked transformed (the #886 per-replica transform stamping);
  *
@@ -23,8 +23,8 @@
  * owner deliberately keeps no cache-slot copy — its primary is already the
  * node-local copy, and an owner-side copy would sit outside the
  * register/invalidate protocol. So the properties above hold in their
- * owner-node form: there is no raw replica, and the zero-IPC fast path must
- * REFUSE a transformed primary rather than hand back codec bytes.
+ * owner-node form: there is no raw replica, and reads of the transformed
+ * primary go through the compressor.
  *
  * A third section used to evict the cache replica and watch the fast path
  * drop to refusal and then revive. That is unreachable here: with no cache
@@ -121,11 +121,7 @@ compose:
       poll_period_ms: 5000
 
     storage:
-      - path: "ram::cache_stack_dram"
-        bdev_type: "ram"
-        capacity_limit: "128MB"
-        score: 1.0
-
+      # A core is uniform in durability: the persistent tier only.
       - path: ")" << file_storage_path_ << R"("
         bdev_type: "file"
         capacity_limit: "64MB"
@@ -148,12 +144,18 @@ static std::string CompressiblePayload(clio::run::u64 size) {
   return v;
 }
 
+/** Longest a poll for an asynchronously replicated state waits. Generous:
+ *  a slow CI runner must never fail on time alone; a lost replica still
+ *  fails, only later. */
+static constexpr std::chrono::seconds kPollDeadline(60);
+
 /** Poll until a replica of tag/name reports `want` bytes via the raw core. */
 static bool WaitReplicaSize(clio::cte::core::Client *core,
                             const clio::cte::core::TagId &tag_id,
                             const std::string &name, clio::run::u64 want,
                             int replica) {
-  for (int attempt = 0; attempt < 300; ++attempt) {
+  const auto deadline = std::chrono::steady_clock::now() + kPollDeadline;
+  while (std::chrono::steady_clock::now() < deadline) {
     auto rsz = core->AsyncGetBlobSize(tag_id, name,
                                       clio::run::PoolQuery::Dynamic(),
                                       replica);
@@ -170,7 +172,8 @@ static bool WaitReplicaSize(clio::cte::core::Client *core,
 static clio::run::u64 WaitPrimaryNonzero(clio::cte::core::Client *core,
                                          const clio::cte::core::TagId &tag_id,
                                          const std::string &name) {
-  for (int attempt = 0; attempt < 300; ++attempt) {
+  const auto deadline = std::chrono::steady_clock::now() + kPollDeadline;
+  while (std::chrono::steady_clock::now() < deadline) {
     auto sz = core->AsyncGetBlobSize(tag_id, name);
     sz.Wait();
     if (sz->GetReturnCode() == 0 && sz->size_ > 0) {
@@ -194,6 +197,9 @@ TEST_CASE("CacheStack - cache over compressor over replication over core",
         clio::cte::replication::kReplicationPoolId, clio::cte::core::kCtePoolId);
     clio::cte::replication::ReplicationConfig params;
     params.next_pool_id_ = clio::cte::core::kCtePoolId;
+    // One local durable replica (index 1): the default replication_factor
+    // keeps only the primary, and this test inspects the replica.
+    params.num_replicas_ = 1;
     auto create = repl.AsyncCreateReplication(
         clio::run::PoolQuery::Local(),
         clio::cte::replication::kReplicationPoolName,
@@ -224,10 +230,9 @@ TEST_CASE("CacheStack - cache over compressor over replication over core",
     REQUIRE(create->GetReturnCode() == 0);
   }
 
-  // ONE plain core client at the top of the stack, mirror attached so the
-  // zero-IPC fast path is live (the CLIO_CTE_POOL deployment configuration).
+  // ONE plain core client at the top of the stack (the CLIO_CTE_POOL
+  // deployment configuration); every request takes the task path.
   clio::cte::core::Client stack_io(clio::cte::cache::kCachePoolId);
-  REQUIRE(stack_io.AttachShmCacheOf(clio::cte::core::kCtePoolId));
 
   clio::cte::core::Tag tag("cache_stack_tag");
   const clio::cte::core::TagId tag_id = tag.GetTagId();
@@ -235,9 +240,8 @@ TEST_CASE("CacheStack - cache over compressor over replication over core",
 
   // ======================================================================
   // 1. A COMPRESSED put through the stack (async write-through): the
-  //    compressed primary AND the raw cache replica both land before the
-  //    ack, and the SHM fast path serves ORIGINAL bytes via the raw copy
-  //    while the transformed primary refuses.
+  //    compressed primary lands before the ack, and reads return ORIGINAL
+  //    bytes.
   // ======================================================================
   {
     clio::cte::core::Context ctx;
@@ -258,21 +262,12 @@ TEST_CASE("CacheStack - cache over compressor over replication over core",
       REQUIRE((rsz->GetReturnCode() != 0 || rsz->size_ == 0));
     }
 
-    // THE HEADLINE, in its owner-node form: the primary is COMPRESSED and
-    // there is no raw copy to serve from, so the zero-IPC fast path must
-    // REFUSE. Handing back the codec bytes as if they were the payload is
-    // the failure this guards -- a caller cannot tell them apart.
-    const char *view = nullptr;
-    clio::run::u64 view_size = 0, gen = 0;
-    REQUIRE_FALSE(stack_io.TryGetBlobViewShm(tag_id, "comp_blob", &view,
-                                             &view_size, &gen));
   }
 
   // ======================================================================
   // 2. The primary is COMPRESSED on the core (it landed with the ack); the
   //    persistent replica holds the STORED form and is marked TRANSFORMED
-  //    (the replication sweep stamps the get's OUT flags). The fast path
-  //    keeps serving raw bytes.
+  //    (the replication sweep stamps the get's OUT flags).
   // ======================================================================
   clio::run::u64 stored_size = 0;
   {
@@ -306,8 +301,7 @@ TEST_CASE("CacheStack - cache over compressor over replication over core",
       REQUIRE(g0->context_.transform_flags_ != 0);
     }
 
-    // Still no cache-slot copy on the owner node (issue #894), so nothing
-    // raw exists to serve and the fast path keeps refusing.
+    // Still no cache-slot copy on the owner node (issue #894).
     {
       auto rsz = core->AsyncGetBlobSize(tag_id, "comp_blob",
                                         clio::run::PoolQuery::Dynamic(),
@@ -316,10 +310,6 @@ TEST_CASE("CacheStack - cache over compressor over replication over core",
       REQUIRE((rsz->GetReturnCode() != 0 || rsz->size_ == 0));
     }
 
-    const char *view = nullptr;
-    clio::run::u64 view_size = 0, gen = 0;
-    REQUIRE_FALSE(stack_io.TryGetBlobViewShm(tag_id, "comp_blob", &view,
-                                             &view_size, &gen));
 
     // Task path through the stack: whole and partial reads decompress.
     // This is what actually carries the payload on the owner node, so it

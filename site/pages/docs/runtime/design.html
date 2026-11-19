@@ -1,0 +1,196 @@
+<!--
+title: Design
+heading: Inside the <em>Context Runtime.</em>
+description: How the Context Runtime is built: its managers, task futures, transports and queues, the work orchestrator and scheduler, coroutines, pool routing, collective batching, the restart log and the dashboard.
+eyebrow: Docs · Context Runtime
+lede: The runtime is a small set of cooperating managers inside one process per node. This page names each one, says what it owns, and follows a task through them. It describes structure, not APIs; for the calls themselves see the API reference, and for the reasoning behind the mechanisms see the Design section.
+facts: Process | one per node ; Core pieces | config, IPC, module, pool, work orchestrator, viz ; Threads | runtime.num_threads workers + monitor + dashboard pool
+-->
+<h2 id="overview">The pieces at a glance</h2>
+<figure class="diagram">
+  <svg viewBox="0 0 860 470" role="img" aria-label="Internal structure of one Context Runtime process">
+    <defs><marker id="rd0" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+    <text class="muted" x="20" y="22">ONE RUNTIME PROCESS (clio_run start)</text>
+    <rect class="box" x="10" y="32" width="840" height="428" rx="10" stroke-dasharray="6 5"/>
+    <rect class="box alt" x="30" y="50" width="180" height="56" rx="8"/><text class="title" x="42" y="74">Config manager</text><text class="muted" x="42" y="92">clio.yaml, hostfile</text>
+    <rect class="box alt" x="230" y="50" width="180" height="56" rx="8"/><text class="title" x="242" y="74">Module manager</text><text class="muted" x="242" y="92">finds, dlopens ChiMods</text>
+    <rect class="box alt" x="430" y="50" width="200" height="56" rx="8"/><text class="title" x="442" y="74">Pool manager</text><text class="muted" x="442" y="92">pools, containers, routing</text>
+    <rect class="box alt" x="650" y="50" width="180" height="56" rx="8"/><text class="title" x="662" y="74">Viz server</text><text class="muted" x="662" y="92">dashboard, REST routes</text>
+
+    <rect class="box hl" x="30" y="130" width="380" height="120" rx="8"/><text class="title" x="42" y="154">IPC manager</text>
+    <text class="muted" x="42" y="176">shared-memory queues (same machine)</text>
+    <text class="muted" x="42" y="196">ZeroMQ TCP / Unix socket (clients)</text>
+    <text class="muted" x="42" y="216">run-to-run TCP (other nodes)</text>
+    <text class="muted" x="42" y="236">GPU-to-CPU device rings</text>
+    <rect class="box hl" x="430" y="130" width="400" height="120" rx="8"/><text class="title" x="442" y="154">Work orchestrator + scheduler</text>
+    <text class="muted" x="442" y="176">maps each task to a worker lane</text>
+    <text class="muted" x="442" y="196">monitor thread: rescue, steal, grow, retire</text>
+    <text class="muted" x="442" y="216">learned per-method cost models</text>
+    <text class="muted" x="442" y="236">pluggable: runtime.local_sched</text>
+    <path class="edge hl" d="M410,190 L428,190" marker-end="url(#rd0)"/>
+
+    <text class="muted" x="30" y="282">WORKERS (runtime.num_threads)</text>
+    <rect class="box" x="30" y="292" width="150" height="70" rx="8"/><text class="title" x="42" y="316">Worker 0</text><text class="muted" x="42" y="336">scheduler worker</text><text class="muted" x="42" y="352">lane + coroutines</text>
+    <rect class="box" x="195" y="292" width="150" height="70" rx="8"/><text class="title" x="207" y="316">Workers 1..k</text><text class="muted" x="207" y="336">general pool</text><text class="muted" x="207" y="352">elastic</text>
+    <rect class="box" x="360" y="292" width="150" height="70" rx="8"/><text class="title" x="372" y="316">GPU worker</text><text class="muted" x="372" y="336">polls device rings</text>
+    <rect class="box" x="525" y="292" width="150" height="70" rx="8"/><text class="title" x="537" y="316">Net send</text><text class="muted" x="537" y="336">DEALER sockets</text>
+    <rect class="box" x="690" y="292" width="140" height="70" rx="8"/><text class="title" x="702" y="316">Net recv</text><text class="muted" x="702" y="336">ROUTER sockets</text>
+    <path class="edge" d="M630,250 L630,290" marker-end="url(#rd0)"/>
+
+    <rect class="box alt" x="30" y="384" width="800" height="56" rx="8"/><text class="title" x="42" y="408">Containers (one per pool on this node)</text><text class="muted" x="42" y="426">module code: coroutine handlers per method, cost model, Expand / Migrate / Recover, dashboard routes</text>
+  </svg>
+  <figcaption>The managers are process-wide singletons. Workers execute
+  container handlers; the IPC manager moves tasks in and out of the
+  process; the scheduler decides which worker runs each task.</figcaption>
+</figure>
+
+<h2 id="managers">The managers</h2>
+<dl class="notes">
+  <div><dt>Config manager</dt><dd>Reads <code>~/.clio/clio.yaml</code> (or the file named by the environment), the hostfile and the <code>compose</code> list, and applies environment overrides. Everything else asks it for settings such as the thread count, the scheduler name and the ports.</dd></div>
+  <div><dt>Module manager</dt><dd>At startup, scans the runtime's own library directory, <code>CLIO_REPO_PATH</code>, <code>LD_LIBRARY_PATH</code> and default paths for shared libraries whose names contain <code>_runtime</code>, opens each one, and records its factory functions. It can then construct a container of any loaded module by name. On load it also builds a throwaway prototype container so the module can register its dashboard pages before any pool exists.</dd></div>
+  <div><dt>Pool manager</dt><dd>Owns the table of pools and their local containers. It creates and destroys pools on request from the admin module, resolves a task's pool id and <code>PoolQuery</code> to a container (here or on another node), saves and restores each container's learned cost model, and hands containers to workers through a lightweight handle cached at routing time.</dd></div>
+  <div><dt>IPC manager</dt><dd>Owns every way a task can enter or leave the process, described below, plus node identity, peer liveness and the heartbeat clients use to notice a restarted runtime.</dd></div>
+  <div><dt>Work orchestrator</dt><dd>Spawns and owns the worker threads and their lanes, holds the active scheduler, and runs the monitor thread that calls the scheduler's load-balancing hook every 100 ms.</dd></div>
+  <div><dt>Viz server</dt><dd>A small HTTP server with its own thread pool. It serves the dashboard, a registry of REST routes that modules add, and static assets a module ships in a <code>viz/</code> directory.</dd></div>
+</dl>
+
+<h2 id="tasks">Tasks and futures</h2>
+<p>A task is a C++ struct with input and output fields plus a header: its pool, method, <code>PoolQuery</code>, flags and return code. Submitting a task returns a <strong>future</strong>. The future's completion flag lives in memory both sides can see, so a caller in another process or on a GPU can wait for it without a message. Only inputs travel toward the container and only outputs travel back: tasks are serialized at every process boundary and are never shared objects.</p>
+<p>Inside the runtime a handler that submits a subtask passes it by pointer, with no serialization, and <code>co_await</code>s its future. When the subtask completes, the parent coroutine is put back on its worker's queue.</p>
+
+<h2 id="transports">Transports and queues</h2>
+<p>The IPC manager picks a transport for each direction a task can travel. Every transport has the same four steps: send the input, receive the input, send the output, receive the output.</p>
+<table>
+  <tr><th>Path</th><th>Mechanism</th><th>Used by</th></tr>
+  <tr><td>Runtime to itself</td><td>Pointer handed to a worker lane; no copy</td><td>Subtasks from handlers, periodic tasks</td></tr>
+  <tr><td>Client to runtime, same machine</td><td>Shared-memory ring buffers and a shared data segment per client</td><td>Default for local clients</td></tr>
+  <tr><td>Client to runtime, socket</td><td>ZeroMQ over a Unix socket or TCP, read by a dedicated receive thread. A worker queues the reply; the network receive worker writes it</td><td>Containers, remote clients, or when shared memory is unavailable. Probed fastest-first unless <code>CLIO_IPC_MODE</code> forces one</td></tr>
+  <tr><td>Runtime to runtime</td><td>ZeroMQ TCP: DEALER sockets per peer for sends, one ROUTER for receives; messages carry an incarnation number</td><td>Any task whose <code>PoolQuery</code> resolves to another node</td></tr>
+  <tr><td>GPU to runtime</td><td>A device-memory ring per GPU. The kernel fills a pre-allocated task, the GPU worker copies it in, runs it, and writes the output back</td><td>Memory expansion and GPU kernels</td></tr>
+</table>
+<p>Worker lanes are multi-producer, single-consumer ring buffers: any thread may push, and only the owning worker pops. A worker that would push onto its own full lane is redirected to another worker, so a full queue becomes back-pressure instead of a deadlock.</p>
+
+<h2 id="inside">Inside the process: lanes, workers and queues</h2>
+<figure class="diagram">
+  <svg viewBox="0 0 860 790" role="img" aria-label="One runtime process with the default four threads: ingress paths, one lane per worker, the roles of workers 0 to 3, the network queue, the monitor thread, the queues every worker loops over, and what a task and a container hold">
+    <defs><marker id="runtime1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+    <text class="muted" x="20" y="22">ONE RUNTIME PROCESS · runtime.num_threads: 4 (the default)</text>
+    <rect class="box" x="10" y="30" width="840" height="750" rx="10" stroke-dasharray="6 5"/>
+
+    <rect class="box alt" x="26" y="46" width="196" height="70" rx="8"/><text class="title" x="38" y="68">SHM clients</text><text class="muted" x="38" y="88">one shard ring per worker;</text><text class="muted" x="38" y="104">worker w runs shard w inline</text>
+    <rect class="box alt" x="234" y="46" width="196" height="70" rx="8"/><text class="title" x="246" y="68">Socket clients</text><text class="muted" x="246" y="88">TCP or Unix socket, read</text><text class="muted" x="246" y="104">by the chi-client-recv thread</text>
+    <rect class="box alt" x="442" y="46" width="196" height="70" rx="8"/><text class="title" x="454" y="68">Other runtimes</text><text class="muted" x="454" y="88">TCP, read by the</text><text class="muted" x="454" y="104">chi-peer-recv thread</text>
+    <rect class="box alt" x="650" y="46" width="184" height="70" rx="8"/><text class="title" x="662" y="68">GPU kernels</text><text class="muted" x="662" y="88">one ring per GPU, polled</text><text class="muted" x="662" y="104">by the GPU worker</text>
+
+    <rect class="box" x="234" y="136" width="600" height="50" rx="8"/><text class="title" x="246" y="156">Worker lanes: one TaskLane per worker</text><text class="muted" x="246" y="174">ring of Future&lt;Task&gt;; any thread pushes, only its worker pops; runtime.queue_depth 1024</text>
+    <path class="edge" d="M332,116 L332,134" marker-end="url(#runtime1)"/><path class="edge" d="M540,116 L540,134" marker-end="url(#runtime1)"/>
+    <path class="edge" d="M124,116 L124,198" marker-end="url(#runtime1)"/>
+    <path class="edge" d="M234,176 L170,176 L170,198" marker-end="url(#runtime1)"/><path class="edge" d="M300,186 L300,198" marker-end="url(#runtime1)"/><path class="edge" d="M500,186 L500,198" marker-end="url(#runtime1)"/><path class="edge" d="M742,186 L742,198" marker-end="url(#runtime1)"/>
+
+    <rect class="box hl" x="26" y="200" width="196" height="86" rx="8"/><text class="title" x="38" y="222">Worker 0 · scheduler</text><text class="muted" x="38" y="242">runs handlers (pool member)</text><text class="muted" x="38" y="258">flushes collective batches</text><text class="muted" x="38" y="274">GPU worker below 5 threads</text>
+    <rect class="box hl" x="234" y="200" width="196" height="86" rx="8"/><text class="title" x="246" y="222">Worker 1 · general</text><text class="muted" x="246" y="242">runs handlers (pool member)</text><text class="muted" x="246" y="258">pool grows by a worker when</text><text class="muted" x="246" y="274">none has 100 µs of room</text>
+    <rect class="box hl" x="442" y="200" width="196" height="86" rx="8"/><text class="title" x="454" y="222">Worker 2 · net send</text><text class="muted" x="454" y="242">Send periodic, every 25 µs:</text><text class="muted" x="454" y="258">SendIn, SendOut to peers,</text><text class="muted" x="454" y="274">latency lanes before I/O</text>
+    <rect class="box hl" x="650" y="200" width="184" height="86" rx="8"/><text class="title" x="662" y="222">Worker 3 · net recv</text><text class="muted" x="662" y="242">ClientSend periodic:</text><text class="muted" x="662" y="258">replies to socket clients</text>
+
+    <rect class="box alt" x="26" y="306" width="196" height="86" rx="8"/><text class="title" x="38" y="328">Monitor thread</text><text class="muted" x="38" y="348">every 100 ms; a worker in</text><text class="muted" x="38" y="364">one task over 1 s gets a</text><text class="muted" x="38" y="380">replacement; its lane moves</text>
+    <rect class="box" x="234" y="306" width="600" height="86" rx="8"/><text class="title" x="246" y="328">Net queue · 6 lanes</text><text class="muted" x="246" y="348">SendIn, SendOut × latency (&lt; 4 KiB) or I/O (≥ 4 KiB); ClientSend TCP, ClientSend IPC</text><text class="muted" x="246" y="364">filled by RouteGlobal and by EndTask of a task from another node</text><text class="muted" x="246" y="380">never blocks a producer: a full lane spills to an overflow list</text>
+    <path class="edge" d="M332,286 L332,304" marker-end="url(#runtime1)"/>
+    <path class="edge hl" d="M540,306 L540,288" marker-end="url(#runtime1)"/><path class="edge hl" d="M742,306 L742,288" marker-end="url(#runtime1)"/>
+
+    <rect class="box" x="26" y="412" width="808" height="212" rx="10" stroke-dasharray="6 5"/>
+    <text class="title" x="38" y="434">Inside every worker</text><text class="muted" x="190" y="434">one pass of its loop, left to right; it sleeps when a pass finds nothing</text>
+    <rect class="box" x="38" y="448" width="148" height="102" rx="6"/><text class="title" x="50" y="470">SHM shard</text><text class="muted" x="50" y="490">client requests,</text><text class="muted" x="50" y="506">routed and run</text><text class="muted" x="50" y="522">inline, up to 256</text><text class="muted" x="50" y="538">per pass</text>
+    <rect class="box hl" x="198" y="448" width="148" height="102" rx="6"/><text class="title" x="210" y="470">Event queue</text><text class="muted" x="210" y="490">finished subtasks;</text><text class="muted" x="210" y="506">each resumes the</text><text class="muted" x="210" y="522">parent coroutine</text><text class="muted" x="210" y="538">that awaits it</text>
+    <rect class="box" x="358" y="448" width="148" height="102" rx="6"/><text class="title" x="370" y="470">Lane</text><text class="muted" x="370" y="490">new tasks; each is</text><text class="muted" x="370" y="506">routed, then run</text><text class="muted" x="370" y="522">here or pushed to</text><text class="muted" x="370" y="538">another lane</text>
+    <rect class="box" x="518" y="448" width="148" height="102" rx="6"/><text class="title" x="530" y="470">GPU rings</text><text class="muted" x="530" y="490">tasks submitted</text><text class="muted" x="530" y="506">by kernels; only</text><text class="muted" x="530" y="522">the GPU worker</text><text class="muted" x="530" y="538">has any</text>
+    <rect class="box" x="678" y="448" width="144" height="102" rx="6"/><text class="title" x="690" y="470">Parked queues</text><text class="muted" x="690" y="490">periodic, by period:</text><text class="muted" x="690" y="506">≤ 50 µs, ≤ 200 µs,</text><text class="muted" x="690" y="522">≤ 50 ms, longer;</text><text class="muted" x="690" y="538">retry: 1 pass in 32</text>
+    <path class="edge" d="M186,499 L196,499" marker-end="url(#runtime1)"/><path class="edge" d="M346,499 L356,499" marker-end="url(#runtime1)"/><path class="edge" d="M506,499 L516,499" marker-end="url(#runtime1)"/><path class="edge" d="M666,499 L676,499" marker-end="url(#runtime1)"/>
+    <text class="muted" x="38" y="574">A handler that co_awaits a subtask records the future it waits on and returns to the loop. It sits in no queue.</text>
+    <text class="muted" x="38" y="592">The subtask's EndTask puts that future on this worker's event queue and wakes it; the next pass resumes the parent.</text>
+    <text class="muted" x="38" y="610">co_await yield(t), with t &gt; 0, parks the task in the periodic queue for t, so other tasks run in the meantime.</text>
+
+    <rect class="box alt" x="26" y="644" width="400" height="120" rx="8"/><text class="title" x="38" y="666">A task in memory</text>
+    <text class="muted" x="38" y="686">header: pool_id_, task_id_, pool_query_, method_,</text><text class="muted" x="38" y="702">task_flags_; then the method's IN and OUT fields</text><text class="muted" x="38" y="718">fut_.is_complete_: the flag its waiter polls</text><text class="muted" x="38" y="734">run_ctx_ (runtime side only): coroutine, container,</text><text class="muted" x="38" y="750">lane, event queue, awaited future, predicted cost</text>
+    <rect class="box alt" x="434" y="644" width="400" height="120" rx="8"/><text class="title" x="446" y="666">A container (one per pool per node)</text>
+    <text class="muted" x="446" y="686">the module's state; Run(method, task) starts</text><text class="muted" x="446" y="702">that method's handler coroutine</text><text class="muted" x="446" y="718">a learned cost model per method, saved between runs</text><text class="muted" x="446" y="734">plus one static container per pool with no state,</text><text class="muted" x="446" y="750">used for ScheduleTask and (de)serializing tasks</text>
+  </svg>
+  <figcaption>With the default four threads, workers 0 and 1 run handlers and
+  workers 2 and 3 serve the network; messages from other nodes and socket
+  clients are read by two dedicated threads. Every worker owns one lane and
+  loops over it together with its own shard, event queue and parked queues. A
+  coroutine waiting on a subtask holds no thread and occupies no queue: the
+  subtask's completion event brings it back.</figcaption>
+</figure>
+
+<h2 id="workers">Workers, coroutines and the scheduler</h2>
+<p>Each worker loops over its shared-memory shard, its event queue (completions of subtasks its handlers await), its lane, its GPU rings, and its periodic and retry queues. Running a task means resuming its handler coroutine until it finishes or suspends. Handlers are C++20 stackless coroutines; with <code>CLIO_CORE_ENABLE_BOOST_COROUTINES</code> they are Boost.Context fibers behind the same macros, which allows suspending from nested ordinary functions at the price of a stack per task.</p>
+<p>Roles are fixed by position. Worker 0 is the scheduler worker. With three or more threads the last two are the network send worker, which drains the outbound network queue, and the network receive worker, which writes replies to socket clients. Messages from other runtimes and from socket clients are read by two dedicated threads that are not workers, so send-side back-pressure never stops incoming replies and probes from draining. A GPU worker is carved out before the network pair when there are five or more threads, and otherwise shares the scheduler worker. The rest are general workers.</p>
+<p>The <strong>scheduler</strong> is an object behind a small interface, chosen by <code>runtime.local_sched</code>. The default one predicts how long each task will hold a worker, using a per-method linear model that each container learns from measured run times and that the pool manager saves to disk between runs. It keeps each worker below about 100 µs of booked work: a task stays on the submitting worker when it fits, otherwise it goes to the least-loaded worker, and when nothing fits the pool grows by one thread. Every 100 ms the monitor thread treats a worker stuck in one task for over a second as stalled, starts a replacement and moves its backlog, lets idle workers steal, and retires idle extra threads. The <code>local</code> scheduler maps tasks by a hash of the submitting process and thread and never rebalances. <a href="/docs/runtime/extend.html#scheduler">Write a scheduler</a> describes the interface.</p>
+
+<h2 id="routing">Pools, containers and routing</h2>
+<p>A pool has one container per node, and the container id is the node id. When a task is routed, its <code>PoolQuery</code> selects containers: the local one, one by id or hash, a range, all of them, a physical node, or a collective. Tasks for this node go to a worker lane; tasks for another node go to the network send worker. A module that holds data receives <code>Expand</code> when a node joins, so it can re-partition, and <code>Recover</code> when a container is rebuilt on another node.</p>
+<p><strong>Collectives.</strong> A <code>ManyToOne</code> or <code>AllToOne</code> query sends each submitter's task to a leader, where the batch manager parks it, grouped by pool, method, target and batch key. When the batch window closes, it builds one aggregate task by folding each member's inputs in through the container's <code>AggregateIn</code>, runs it once, and copies the output back into every member. A thousand ranks asking for the same thing cost one execution.</p>
+
+<h2 id="trip">A task's trip to another node and back</h2>
+<figure class="diagram">
+  <svg viewBox="0 0 860 806" role="img" aria-label="A CTE PutBlob sent with PoolQuery Dynamic: resolved on node 0 to container 1, sent by the net send worker, received and run on node 1, and its outputs returned and folded into the origin task on node 0; below, how each PoolQuery mode resolves">
+    <defs><marker id="runtime2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+    <rect class="box" x="20" y="20" width="400" height="584" rx="10" stroke-dasharray="6 5"/><text class="muted" x="32" y="40">NODE 0 · the PutBlob arrives here</text>
+    <rect class="box" x="440" y="20" width="400" height="584" rx="10" stroke-dasharray="6 5"/><text class="muted" x="452" y="40">NODE 1</text>
+
+    <rect class="box alt" x="36" y="52" width="368" height="86" rx="8"/><text class="title" x="48" y="74">PoolInfo for pool 512.0 (CTE core)</text><text class="muted" x="48" y="94">containers_ on this node: 0</text><text class="muted" x="48" y="110">address_map_: container 0 → node 0, 1 → node 1</text><text class="muted" x="48" y="126">static container: ScheduleTask, (de)serialize</text>
+    <rect class="box alt" x="456" y="52" width="368" height="86" rx="8"/><text class="title" x="468" y="74">PoolInfo for pool 512.0 (CTE core)</text><text class="muted" x="468" y="94">containers_ on this node: 1</text><text class="muted" x="468" y="110">address_map_: the same table on every node</text><text class="muted" x="468" y="126">static container: ScheduleTask, (de)serialize</text>
+
+    <rect class="box hl" x="36" y="158" width="368" height="86" rx="8"/><text class="title" x="48" y="180">1 · RouteTask on the worker that took it</text><text class="muted" x="48" y="200">Dynamic → the static container's ScheduleTask</text><text class="muted" x="48" y="216">returns DirectHash(BlobHash(tag, blob name))</text><text class="muted" x="48" y="232">container hash % 2 = 1 is remote → DirectId(1)</text>
+    <path class="edge" d="M220,244 L220,258" marker-end="url(#runtime2)"/>
+    <rect class="box hl" x="36" y="260" width="368" height="70" rx="8"/><text class="title" x="48" y="282">2 · RouteGlobal</text><text class="muted" x="48" y="302">onto the net queue's SendIn lane (I/O if ≥ 4 KiB)</text><text class="muted" x="48" y="318">the task is marked routed; the worker moves on</text>
+    <path class="edge" d="M220,330 L220,344" marker-end="url(#runtime2)"/>
+    <rect class="box hl" x="36" y="346" width="368" height="70" rx="8"/><text class="title" x="48" y="368">3 · SendIn on the net send worker</text><text class="muted" x="48" y="388">send_map_[origin] = task; one copy per target</text><text class="muted" x="48" y="404">node; inputs serialized and sent to node 1</text>
+    <rect class="box" x="36" y="432" width="368" height="70" rx="8"/><text class="title" x="48" y="454">Meanwhile, the submitter waits</text><text class="muted" x="48" y="474">a client polls its future; a handler's coroutine</text><text class="muted" x="48" y="490">is suspended and holds no worker</text>
+    <rect class="box hl" x="36" y="518" width="368" height="70" rx="8"/><text class="title" x="48" y="540">7 · RecvOut on the chi-peer-recv thread</text><text class="muted" x="48" y="560">outputs loaded into the copy, folded into the origin</text><text class="muted" x="48" y="576">origin completes: reply to client, or wake the parent</text>
+
+    <text class="muted" x="456" y="240">A task that arrives from another node is already</text><text class="muted" x="456" y="256">marked routed, so RouteTask runs it on this node</text><text class="muted" x="456" y="272">without resolving its query again. Every resolved</text><text class="muted" x="456" y="288">query carries ret_node, the node to answer.</text>
+    <rect class="box hl" x="456" y="346" width="368" height="70" rx="8"/><text class="title" x="468" y="368">4 · RecvIn on the chi-peer-recv thread</text><text class="muted" x="468" y="388">inputs loaded; flagged TASK_REMOTE and routed;</text><text class="muted" x="468" y="404">kept in recv_map_; pushed to a worker's lane</text>
+    <path class="edge" d="M640,416 L640,430" marker-end="url(#runtime2)"/>
+    <rect class="box hl" x="456" y="432" width="368" height="70" rx="8"/><text class="title" x="468" y="454">5 · A worker runs PutBlob on container 1</text><text class="muted" x="468" y="474">EndTask sees TASK_REMOTE and puts the task on</text><text class="muted" x="468" y="490">the net queue's SendOut lane (latency if &lt; 4 KiB)</text>
+    <path class="edge" d="M640,502 L640,516" marker-end="url(#runtime2)"/>
+    <rect class="box hl" x="456" y="518" width="368" height="70" rx="8"/><text class="title" x="468" y="540">6 · SendOut on the net send worker</text><text class="muted" x="468" y="560">outputs serialized and sent to ret_node 0;</text><text class="muted" x="468" y="576">the recv_map_ entry is dropped</text>
+    <path class="edge hl" d="M404,381 L454,381" marker-end="url(#runtime2)"/>
+    <path class="edge hl" d="M456,553 L406,553" marker-end="url(#runtime2)"/>
+
+    <text class="muted" x="20" y="632">HOW EACH POOLQUERY RESOLVES (ResolvePoolQuery, on the node that routes the task)</text>
+    <rect class="box" x="20" y="642" width="820" height="150" rx="8"/>
+    <text class="title" x="36" y="666">Local</text><text class="muted" x="216" y="666">this node's container; the scheduler picks a worker lane, often the caller's own</text>
+    <text class="title" x="36" y="688">DirectHash(h)</text><text class="muted" x="216" y="688">container h % num_containers: Local if it lives here, otherwise DirectId of that container</text>
+    <text class="title" x="36" y="710">DirectId(c)</text><text class="muted" x="216" y="710">Local if container c is here, otherwise Physical(the node address_map_ gives for c)</text>
+    <text class="title" x="36" y="732">Range, Broadcast</text><text class="muted" x="216" y="732">one query per container; Broadcast is Range(0, num_containers)</text>
+    <text class="title" x="36" y="754">Dynamic</text><text class="muted" x="216" y="754">the pool's ScheduleTask picks a mode (admin create: Local if the pool exists, else Broadcast)</text>
+    <text class="title" x="36" y="776">ManyToOne, AllToOne</text><text class="muted" x="216" y="776">sent to the neighborhood leader, where the batch manager merges matching tasks</text>
+  </svg>
+  <figcaption>A client's PutBlob is sent with PoolQuery::Dynamic(). On node 0
+  the CTE's ScheduleTask turns it into a hash of the blob's tag and name,
+  which names container 1 on node 1, so the task goes to the network queue
+  instead of a worker lane. Node 1 runs it like any local task and sends only
+  the outputs back, where they are folded into the waiting origin task.</figcaption>
+</figure>
+
+<h2 id="durability">What persists</h2>
+<ul>
+  <li><strong>The restart log</strong> is an append-only log of the compose files that should be re-composed at the next <code>clio_run start</code>. Pools created with <code>restart: true</code> are recorded the same way. <code>--fresh</code> discards it.</li>
+  <li><strong>Cost models</strong> are saved per module, pool, node and container, flushed about once a second while they change and on shutdown, and restored when the container is recreated, so a restarted runtime schedules well from the first task.</li>
+  <li><strong>Module state</strong> is the module's own business: the CTE keeps its metadata log, a block device its allocation log. A container's recovery callback is where it reloads them.</li>
+</ul>
+
+<h2 id="dashboard">The dashboard</h2>
+<p>The viz server answers built-in routes such as <code>/api/health</code>, <code>/api/topology</code>, <code>/api/pools</code>, <code>/api/config</code>, <code>/api/chimods</code> and <code>/api/routes</code> (the list of every registered route). Module routes and asset directories are added at load time. Handlers run on the server's own threads, not on workers, so a slow page never delays a task; they may submit a task and wait for it.</p>
+
+<h2 id="tradeoffs">Costs of this design</h2>
+<table class="tradeoffs">
+  <tr><th>Decision</th><th>Buys</th><th>Costs</th></tr>
+  <tr><td>Everything is a module</td><td class="good">One mechanism for built-in and custom code</td><td class="cost">A new library needs a runtime restart to be found; online code swap is not yet enabled</td></tr>
+  <tr><td>Serialized tasks at process boundaries</td><td class="good">Crash isolation between clients and runtime</td><td class="cost">Inputs and outputs are copied once per crossing</td></tr>
+  <tr><td>Cooperative coroutines</td><td class="good">Thousands of waiting tasks on a few threads</td><td class="cost">A handler that blocks without yielding holds its worker until the monitor rescues the queue behind it</td></tr>
+  <tr><td>Learned hold-time scheduling</td><td class="good">Few threads, low latency, no manual classes</td><td class="cost">Predictions are only as good as a module's reported task size</td></tr>
+  <tr><td>Fixed network workers</td><td class="good">Receives never wait behind sends</td><td class="cost">Two workers and two receive threads per node reserved for networking</td></tr>
+</table>
+<p>The <a href="/design/runtime.html">Runtime and block devices</a> design page discusses failure detection, membership and the block-device allocator in more depth.</p>

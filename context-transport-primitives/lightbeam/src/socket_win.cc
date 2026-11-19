@@ -274,6 +274,12 @@ int PollReadMulti(const socket_t* fds, int count, int timeout_ms) {
 bool IsServerAlive(const std::string& addr, int port,
                    const std::string& protocol) {
   if (protocol == "ipc") {
+    // sun_path holds a short fixed-size path; a longer one used to be
+    // silently truncated, binding or dialing the wrong name (#1356).
+    if (addr.size() >= sizeof(sockaddr_un::sun_path)) {
+      ::WSASetLastError(WSAENAMETOOLONG);
+      return false;
+    }
     socket_t fd = static_cast<socket_t>(::socket(AF_UNIX, SOCK_STREAM, 0));
     if (fd == kInvalidSocket) return false;
     struct sockaddr_un sun;
@@ -305,6 +311,12 @@ bool IsServerAlive(const std::string& addr, int port,
 socket_t Connect(const std::string& addr, int port,
                  const std::string& protocol) {
   if (protocol == "ipc") {
+    // sun_path holds a short fixed-size path; a longer one used to be
+    // silently truncated, binding or dialing the wrong name (#1356).
+    if (addr.size() >= sizeof(sockaddr_un::sun_path)) {
+      ::WSASetLastError(WSAENAMETOOLONG);
+      return kInvalidSocket;
+    }
     socket_t fd = static_cast<socket_t>(::socket(AF_UNIX, SOCK_STREAM, 0));
     if (fd == kInvalidSocket) return kInvalidSocket;
     struct sockaddr_un sun;
@@ -338,11 +350,86 @@ socket_t Connect(const std::string& addr, int port,
   return fd;
 }
 
+std::string ConnectError::ToString() const {
+  switch (stage_) {
+    case kNone:
+      return "ok";
+    case kResolve:
+      return "host lookup failed: " + std::to_string(code_);
+    case kSocket:
+      return "socket failed: WSA error " + std::to_string(code_);
+    case kConnect:
+      return "connect failed: WSA error " + std::to_string(code_);
+    case kTimeout:
+      return "connect: timed out";
+  }
+  return "unknown";
+}
+
+socket_t ConnectTimed(const std::string& addr, int port, int timeout_ms,
+                      ConnectError* err) {
+  // Windows dials IPv4 literals only and connects in blocking mode; the
+  // timeout is not applied here (the Thallium address exchange, the only
+  // caller that needs it, is POSIX-only).
+  (void)timeout_ms;
+  ConnectError local;
+  if (err == nullptr) err = &local;
+  *err = ConnectError();
+  socket_t fd = Connect(addr, port, "tcp");
+  if (fd == kInvalidSocket) {
+    err->stage_ = ConnectError::kConnect;
+    err->code_ = ::WSAGetLastError();
+  }
+  return fd;
+}
+
+uint64_t GetHostLookupCount() { return 0; }
+
+void ForgetHost(const std::string& host) { (void)host; }
+
+/**
+ * Resolve the IPv4 address a TCP listener binds.
+ *
+ * An empty address, "*" or "0.0.0.0" means every interface. Anything else is
+ * a dotted IPv4 literal or a host name, so a caller that asks for loopback
+ * gets loopback rather than a wildcard listener that trips the Windows
+ * Defender Firewall prompt and is reachable from the network.
+ *
+ * @param addr address requested by the caller
+ * @param out receives the resolved address in network byte order
+ * @return true on success, false when `addr` cannot be resolved
+ */
+static bool ResolveListenAddr(const std::string& addr, struct in_addr* out) {
+  if (addr.empty() || addr == "*" || addr == "0.0.0.0") {
+    out->s_addr = htonl(INADDR_ANY);
+    return true;
+  }
+  if (::inet_pton(AF_INET, addr.c_str(), out) > 0) return true;
+  struct addrinfo hints;
+  std::memset(&hints, 0, sizeof(hints));
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_STREAM;
+  struct addrinfo* res = nullptr;
+  if (::getaddrinfo(addr.c_str(), nullptr, &hints, &res) != 0 ||
+      res == nullptr) {
+    return false;
+  }
+  *out = reinterpret_cast<struct sockaddr_in*>(res->ai_addr)->sin_addr;
+  ::freeaddrinfo(res);
+  return true;
+}
+
 socket_t Listen(const std::string& addr, int port,
                 const std::string& protocol) {
   socket_t fd;
   if (protocol == "ipc") {
     UnlinkPath(addr.c_str());
+    // sun_path holds a short fixed-size path; a longer one used to be
+    // silently truncated, binding or dialing the wrong name (#1356).
+    if (addr.size() >= sizeof(sockaddr_un::sun_path)) {
+      ::WSASetLastError(WSAENAMETOOLONG);
+      return kInvalidSocket;
+    }
     fd = static_cast<socket_t>(::socket(AF_UNIX, SOCK_STREAM, 0));
     if (fd == kInvalidSocket) return kInvalidSocket;
     struct sockaddr_un sun;
@@ -355,22 +442,22 @@ socket_t Listen(const std::string& addr, int port,
       return kInvalidSocket;
     }
   } else {
-    fd = static_cast<socket_t>(::socket(AF_INET, SOCK_STREAM, 0));
-    if (fd == kInvalidSocket) return kInvalidSocket;
-    SetReuseAddr(fd);
-    SetRecvBuf(fd, 4 * 1024 * 1024);
     struct sockaddr_in sin;
     std::memset(&sin, 0, sizeof(sin));
     sin.sin_family = AF_INET;
     sin.sin_port = htons(static_cast<uint16_t>(port));
-    sin.sin_addr.s_addr = INADDR_ANY;
+    if (!ResolveListenAddr(addr, &sin.sin_addr)) return kInvalidSocket;
+    fd = static_cast<socket_t>(::socket(AF_INET, SOCK_STREAM, 0));
+    if (fd == kInvalidSocket) return kInvalidSocket;
+    SetReuseAddr(fd);
+    SetRecvBuf(fd, 4 * 1024 * 1024);
     if (::bind(static_cast<SOCKET>(fd),
                reinterpret_cast<struct sockaddr*>(&sin), sizeof(sin)) < 0) {
       Close(fd);
       return kInvalidSocket;
     }
   }
-  if (::listen(static_cast<SOCKET>(fd), 16) < 0) {
+  if (::listen(static_cast<SOCKET>(fd), SOMAXCONN) < 0) {
     Close(fd);
     return kInvalidSocket;
   }

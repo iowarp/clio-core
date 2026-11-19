@@ -120,7 +120,15 @@ GLOBAL_CROSS_CONST clio::run::u32 kListLocalBlobs = 57;
 // memory on the container that owns it and logged per key in the WAL.
 GLOBAL_CROSS_CONST clio::run::u32 kTagXattr = 58;
 
-GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 59;
+// Switch the core between volatile and persistent at runtime.
+GLOBAL_CROSS_CONST clio::run::u32 kSetDurability = 59;
+/** Delete a set of blobs in one task (split by owner, one plan per owner). */
+GLOBAL_CROSS_CONST clio::run::u32 kMultiDelBlob = 60;
+/** Delete a set of tags (by id) in one task (each container its share). */
+GLOBAL_CROSS_CONST clio::run::u32 kMultiDelTag = 61;
+
+GLOBAL_CROSS_CONST clio::run::u32 kCowLink = 62;
+GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 63;
 
 inline const std::vector<std::string>& GetMethodNames() {
   static const std::vector<std::string> names = [] {
@@ -159,6 +167,7 @@ inline const std::vector<std::string>& GetMethodNames() {
     v[56] = "SyncTag";
     v[57] = "ListLocalBlobs";
     v[58] = "TagXattr";
+    v[59] = "SetDurability";
     v[41] = "GetCapacity";
     v[42] = "GetNumAliases";
     v[43] = "PodPutBlob";
@@ -167,6 +176,9 @@ inline const std::vector<std::string>& GetMethodNames() {
     v[46] = "DynamicReorganize";
     v[47] = "Evict";
     v[48] = "MultiPutBlob";
+    v[60] = "MultiDelBlob";
+    v[61] = "MultiDelTag";
+    v[62] = "CowLink";
     v[49] = "RegisterReplicaContainer";
     v[50] = "GetResidency";
     v[51] = "PodMultiPutBlob";

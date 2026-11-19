@@ -924,7 +924,7 @@ clio::run::TaskResume Runtime::ExportData(clio::run::shared_ptr<ExportDataTask> 
   }
 
   // Step 2: list all blobs in the tag
-  auto blobs_future = cte_client_->AsyncGetContainedBlobs(tag_id);
+  auto blobs_future = cte_client_->AsyncGetContainedBlobs(tag_id, clio::run::PoolQuery::Broadcast());
   CLIO_CO_AWAIT(blobs_future);
   const auto &blob_names = blobs_future->blob_names_;
 

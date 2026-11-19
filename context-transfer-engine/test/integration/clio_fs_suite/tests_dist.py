@@ -7,6 +7,7 @@ TTL (CLIO_FUSE_ATTR_CACHE_S, default 1 s).  Staleness beyond
 VIS_TIMEOUT is a failure; staleness inside it is reported as a metric.
 """
 
+import os
 import random
 import re
 import shlex
@@ -27,31 +28,33 @@ def _vis(ctx, i, fn, what):
   ctx.metrics[key] = round(max(ctx.metrics.get(key, 0), dt), 2)
 
 
-def tag_index_paths(ctx, i, root):
-  """Absolute CTE tag names at or under mount-relative dir root, as seen by
-  node i's tag search index (cte_search --tag-query).  Returns (set, err)."""
-  rel = root[len(ctx.cl.mnt):] or '/'
-  rx = '^' + re.escape(rel) + '(/.*)?$'
+def tag_index_names(ctx, i, rx):
+  """CTE tag names matching rx, as node i's cte_search --tag-query sees them
+  (the cluster-wide search).  Returns (set, err)."""
   cmd = (f'{ctx.cl.env_prefix()} {ctx.cl.bin_dir}/cte_search '
          f'{shlex.quote(rx)} --tag-query')
   rc, out = sh(ctx.hosts[i], cmd, timeout=60)
   if rc != 0:
     return None, out[-500:]
-  names = {l.strip() for l in out.splitlines() if l.startswith('/')}
-  return {n[len(rel):] or '/' for n in names}, None
+  pat = re.compile(rx)  # the output also carries the client's log lines
+  return {l.strip() for l in out.splitlines() if pat.match(l.strip())}, None
 
 
-def _tags_match(ctx, i, root, want, what):
-  """Wait until node i's tag index under root equals want (relative names)."""
+def _tags_match(ctx, i, rx, want, what, timeout=5):
+  """Require node i's tag search for rx to equal want.  A namespace
+  operation changes its CTE tag names before it returns, so there is no
+  grace period beyond a few seconds of slack (unless a node was down)."""
   last = {}
 
   def f():
-    got, err = tag_index_paths(ctx, i, root)
+    got, err = tag_index_names(ctx, i, rx)
     last['got'], last['err'] = got, err
     return got == want, None
-  done, _, dt = ctx.eventually(f, timeout=60, period=1.0)
+  done, _, dt = ctx.eventually(f, timeout=timeout, period=0.5)
   got = last['got'] or set()
-  ctx.check(done, f'node{i} tag index {what}: missing '
+  ctx.check(done, f'node{i} tag names {what}: '
+                  f'{len(want - got)}/{len(want)} missing, '
+                  f'{len(got - want)} extra; missing '
                   f'{sorted(want - got)[:8]} extra {sorted(got - want)[:8]}'
                   f'{" err " + last["err"] if last["err"] else ""}')
   key = 'max_tag_lag_s'
@@ -434,55 +437,69 @@ def t_xlinks(ctx):
 
 @test('xnode_tag_names', 'dist', min_nodes=2, timeout=1800)
 def t_tag_names(ctx):
-  """The CTE tag namespace mirrors clio-fs paths on every node: create,
-  rename (a directory with a subtree), cross-directory move, rename over an
-  existing file, unlink, rmdir and hard link, issued back to back with no
-  pauses, are all reflected by path in every node's tag search index."""
+  """Every link of a clio-fs inode is a flat CTE tag name "<leaf>/<inode>".
+  Create, rename (a directory with a subtree), cross-directory move, rename
+  over an existing file, unlink, rmdir and hard link, issued back to back
+  from different nodes, are all reflected in every node's tag search by the
+  time each operation returns."""
   n = len(ctx.hosts)
   r = ctx.dir
-  want = {'/'}
+  px = f'xtn{os.getpid() % 100000}_'   # this run's leaves
+  rx = '^' + re.escape(px) + '[^/]*/[0-9]+$'
+  links = {}  # path relative to r -> inode
+
+  def ino(i, rel):
+    return ctx.ok(i, 'stat', path=r + rel)['ino']
 
   def mk(i, rel):
     ctx.ok(i, 'mkdir', path=r + rel)
-    want.add(rel)
+    links[rel] = ino(i, rel)
 
   def wr(i, rel):
     ctx.ok(i, 'write_file', path=r + rel, size=64, seed=len(rel))
-    want.add(rel)
+    links[rel] = ino(i, rel)
 
   def mv(i, a, b):
     ctx.ok(i, 'rename', src=r + a, dst=r + b)
-    for w in [w for w in want if w == a or w.startswith(a + '/')]:
-      want.discard(w)
-      want.add(b + w[len(a):])
-  # Deep tree from node 0, then renames from other nodes, no pauses.
-  mk(0, '/d1'); mk(0, '/d1/sub'); mk(0, '/d1/sub/deep')
-  wr(0, '/d1/f1'); wr(0, '/d1/sub/f2'); wr(0, '/d1/sub/deep/f3')
-  mv(1 % n, '/d1', '/d2')
-  mk(1 % n, '/x')
-  mv(0, '/d2/sub', '/x/moved')
-  wr(0, '/x/victim'); wr(1 % n, '/x/src')
-  mv(0, '/x/src', '/x/victim')          # rename over an existing file
-  wr(1 % n, '/x/gone'); ctx.ok(0, 'unlink', path=r + '/x/gone')
-  mk(0, '/x/rmd'); ctx.ok(1 % n, 'rmdir', path=r + '/x/rmd')
-  ctx.ok(0, 'link', src=r + '/d2/f1', dst=r + '/x/f1link')
-  want.add('/x/f1link')
-  want -= {'/x/gone', '/x/rmd'}
+    for w in [w for w in links if w == a or w.startswith(a + '/')]:
+      links[b + w[len(a):]] = links.pop(w)
+
+  def want():
+    return {os.path.basename(k) + '/' + str(v) for k, v in links.items()}
+
+  d1, d2, sub, deep = px + 'd1', px + 'd2', px + 'sub', px + 'deep'
+  x, f1 = px + 'x', px + 'f1'
+  mk(0, f'/{d1}'); mk(0, f'/{d1}/{sub}'); mk(0, f'/{d1}/{sub}/{deep}')
+  wr(0, f'/{d1}/{f1}'); wr(0, f'/{d1}/{sub}/{px}f2')
+  wr(0, f'/{d1}/{sub}/{deep}/{px}f3')
+  mv(1 % n, f'/{d1}', f'/{d2}')
+  mk(1 % n, f'/{x}')
+  mv(0, f'/{d2}/{sub}', f'/{x}/{px}moved')
+  wr(0, f'/{x}/{px}victim'); wr(1 % n, f'/{x}/{px}src')
+  mv(0, f'/{x}/{px}src', f'/{x}/{px}victim')   # rename over an existing file
+  wr(1 % n, f'/{x}/{px}gone'); ctx.ok(0, 'unlink', path=f'{r}/{x}/{px}gone')
+  links.pop(f'/{x}/{px}gone')
+  mk(0, f'/{x}/{px}rmd'); ctx.ok(1 % n, 'rmdir', path=f'{r}/{x}/{px}rmd')
+  links.pop(f'/{x}/{px}rmd')
+  ctx.ok(0, 'link', src=f'{r}/{d2}/{f1}', dst=f'{r}/{x}/{px}f1link')
+  links[f'/{x}/{px}f1link'] = links[f'/{d2}/{f1}']
   # A directory per node with many entries, owners spread by hashing.
   for i in range(n):
-    mk(i, f'/many{i}')
-    res = ctx.ok(i, 'create_many', dirpath=f'{r}/many{i}', prefix='e',
+    mk(i, f'/{px}many{i}')
+    res = ctx.ok(i, 'create_many', dirpath=f'{r}/{px}many{i}', prefix=px + 'e',
                  count=200)
     ctx.check(not res['fails'], f'create_many node{i}: {res["fails"][:3]}')
-    want.update(f'/many{i}/e{k}' for k in range(200))
-  mv(0, '/many0', '/x/many0moved')
+    for k in range(200):
+      rel = f'/{px}many{i}/{px}e{k}'
+      links[rel] = ino(i, rel)
+  mv(0, f'/{px}many0', f'/{x}/{px}many0moved')
   for i in range(n):
-    _tags_match(ctx, i, r, want, 'after namespace churn')
+    _tags_match(ctx, i, rx, want(), 'after namespace churn')
   # Unlinking the original name leaves the hard link's name.
-  ctx.ok(0, 'unlink', path=r + '/d2/f1')
-  want.discard('/d2/f1')
+  ctx.ok(0, 'unlink', path=f'{r}/{d2}/{f1}')
+  links.pop(f'/{d2}/{f1}')
   for i in range(n):
-    _tags_match(ctx, i, r, want, 'after unlinking a hard-linked name')
+    _tags_match(ctx, i, rx, want(), 'after unlinking a hard-linked name')
 
 
 @test('xnode_truncate_cache_coherence', 'dist', min_nodes=2)

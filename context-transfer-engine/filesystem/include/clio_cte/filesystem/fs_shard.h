@@ -224,6 +224,18 @@ inline clio::run::u64 FsPack(const clio::cte::core::TagId &t) {
          static_cast<clio::run::u64>(t.minor_);
 }
 
+/**
+ * The CTE tag name of an inode's link `leaf`: "<leaf>/<inode>". Flat (the
+ * core has no hierarchy) and unique per inode, so names of different inodes
+ * never collide and need no ordering between them; paths are clio-fs's own.
+ * @param leaf the link's name in its directory
+ * @param id the inode
+ * @return tag name
+ */
+inline std::string FsTagName(const std::string &leaf, clio::run::u64 id) {
+  return leaf + "/" + std::to_string(id);
+}
+
 /** Unpack (major << 32) | minor into a TagId. */
 inline clio::cte::core::TagId FsUnpack(clio::run::u64 p) {
   return clio::cte::core::TagId(static_cast<clio::run::u32>(p >> 32),
