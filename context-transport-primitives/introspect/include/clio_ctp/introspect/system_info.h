@@ -303,6 +303,20 @@ class SystemInfo {
 
   CTP_DLL static void Unsetenv(const char *name);
 
+  /**
+   * Convert a Win32 verbatim path to its ordinary form.
+   *
+   * A verbatim path ("\\?\C:\dir", "\\?\UNC\server\share") reaches the kernel
+   * unparsed, so a '/' that the runtime appends when it builds a file name
+   * becomes an invalid character and every open on it fails (#1356). Such a
+   * path is rewritten as "C:\dir" or "\\server\share". Other paths, and every
+   * path on non-Windows platforms, are returned unchanged.
+   *
+   * @param path path as given by a user, an environment variable or a config
+   * @return the path without a verbatim prefix
+   */
+  CTP_DLL static std::string NormalizePath(const std::string &path);
+
   /** Get the per-user clio tmp directory path (/tmp/clio_$USER) */
   CTP_DLL static std::string GetMemfdDir();
 

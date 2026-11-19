@@ -148,6 +148,41 @@ CTP_INLINE_CROSS_FUN void resize_for_overwrite(ContainerT &c, size_t n) {
   }
 }
 
+// Detect archives that report how many bytes remain and can be marked failed
+template <typename Ar, typename = void>
+struct has_remaining : std::false_type {};
+template <typename Ar>
+struct has_remaining<
+    Ar, std::void_t<decltype(std::declval<const Ar &>().Remaining()),
+                    decltype(std::declval<Ar &>().MarkFailed())>>
+    : std::true_type {};
+
+/**
+ * Check a decoded element count against the bytes left in a loading archive.
+ *
+ * Every element of a serialized container takes at least `min_elem_bytes`,
+ * so a count that cannot fit in the unread bytes came from a truncated,
+ * foreign or corrupt message. Such a count is rejected before it can size an
+ * allocation or drive a loop, and the archive is marked failed (#1353).
+ * Archives without Remaining() are trusted as before.
+ *
+ * @param ar loading archive
+ * @param count element count read from the stream
+ * @param min_elem_bytes fewest bytes one element can occupy (at least 1)
+ * @return true if the count is plausible, false if it was rejected
+ */
+template <typename Ar>
+CTP_INLINE_CROSS_FUN bool check_count(Ar &ar, size_t count,
+                                      size_t min_elem_bytes) {
+  if constexpr (has_remaining<Ar>::value) {
+    if (count > ar.Remaining() / min_elem_bytes) {
+      ar.MarkFailed();
+      return false;
+    }
+  }
+  return true;
+}
+
 template <typename Ar, typename T>
 CTP_INLINE_CROSS_FUN void write_binary(Ar &ar, const T *data, size_t size) {
   ar.write_binary((const char *)data, size);
@@ -169,6 +204,7 @@ template <typename Ar, typename StringT>
 CTP_INLINE_CROSS_FUN void load_string(Ar &ar, StringT &text) {
   size_t size = 0;
   ar >> size;
+  if (!check_count(ar, size, 1)) return;
   resize_for_overwrite(text, size);
   read_binary(ar, text.data(), size);
 }
@@ -191,9 +227,11 @@ CTP_INLINE_CROSS_FUN void load_vec(Ar &ar, ContainerT &obj) {
   size_t size = 0;
   ar >> size;
   if constexpr (std::is_arithmetic_v<T>) {
+    if (!check_count(ar, size, sizeof(T))) return;
     resize_for_overwrite(obj, size);
     read_binary(ar, (char *)obj.data(), size * sizeof(T));
   } else {
+    if (!check_count(ar, size, 1)) return;
     obj.resize(size);
     for (size_t i = 0; i < size; ++i) {
       ar >> (obj[i]);
@@ -214,6 +252,7 @@ template <typename Ar, typename ContainerT, typename T>
 CTP_INLINE_CROSS_FUN void load_list(Ar &ar, ContainerT &obj) {
   size_t size = 0;
   ar >> size;
+  if (!check_count(ar, size, 1)) return;
   for (size_t i = 0; i < size; ++i) {
     obj.emplace_back();
     auto &last = obj.back();
@@ -235,6 +274,7 @@ template <typename Ar, typename ContainerT, typename KeyT, typename T>
 CTP_INLINE_CROSS_FUN void load_map(Ar &ar, ContainerT &obj) {
   size_t size = 0;
   ar >> size;
+  if (!check_count(ar, size, 1)) return;
   for (size_t i = 0; i < size; ++i) {
     KeyT key{};
     T val{};

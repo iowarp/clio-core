@@ -508,7 +508,12 @@ class ConfigManager : public ctp::BaseConfig {
   // CLIO_MAIN_SEGMENT_SIZE; LoadDefault() also installs 0, this initializer
   // just matches it.
   size_t main_segment_size_ = 0;
-  size_t client_data_segment_size_ = ctp::Unit<size_t>::Megabytes(256);
+  /** Default size of each client's first data segment (clio_<pid>_0). */
+  static constexpr size_t kDefaultClientDataSegmentSize =
+      static_cast<size_t>(512) * 1024 * 1024;
+  // issue #1359: settable via yaml `runtime: client_data_segment_size` or
+  // CLIO_CLIENT_DATA_SEGMENT_SIZE (both used to be silently ignored).
+  size_t client_data_segment_size_ = kDefaultClientDataSegmentSize;
   // issue #783: metadata segment. Deliberately huge and never pre-faulted --
   // shm_open + ftruncate + mmap is lazily populated, so the reservation
   // (default: the machine's RAM capacity, so metadata scales with the host)

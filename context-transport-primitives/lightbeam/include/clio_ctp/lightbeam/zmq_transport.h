@@ -759,6 +759,16 @@ class ZeroMqTransport : public Transport {
                                   static_cast<char*>(zmq_msg_data(&msg)) + msg_size);
       ctp::ipc::GlobalDeserialize<std::vector<char>> ar(meta_buf);
       ar(meta);
+      // A short or foreign message does not throw; it fails the archive.
+      // Skip the rest of the multipart message and drop it (#1353).
+      if (ar.Failed()) {
+        HLOG(kError,
+             "ZeroMQ RecvMetadata: malformed message dropped (msg_size={})",
+             msg_size);
+        zmq_msg_close(&msg);
+        DrainToMessageBoundary();
+        return -1;
+      }
     } catch (const std::exception& e) {
       HLOG(kFatal,
            "ZeroMQ RecvMetadata: Deserialization failed - {} (msg_size={})",

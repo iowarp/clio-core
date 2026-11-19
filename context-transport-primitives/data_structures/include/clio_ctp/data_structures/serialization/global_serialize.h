@@ -189,9 +189,42 @@ class GlobalDeserialize {
 
   const DataT &data_;
   size_t cur_off_ = 0;
+  /** Set by the first read past the end of the data; sticky. */
+  bool failed_ = false;
 
  public:
   GlobalDeserialize(const DataT &data) : data_(data) { cur_off_ = 0; }
+
+  /**
+   * Whether any read ran past the end of the data.
+   *
+   * A failed archive is a truncated, foreign or corrupt message: every later
+   * read is ignored, and the receiver must drop the message instead of
+   * using the half-filled object.
+   *
+   * @return true once a read has overrun the data
+   */
+  CTP_INLINE bool Failed() const { return failed_; }
+
+  /** Mark the archive failed, e.g. when a decoded count cannot fit. */
+  CTP_INLINE void MarkFailed() {
+    if (!failed_) {
+      HLOG(kError,
+           "GlobalDeserialize: malformed data (offset {} of {} bytes); the "
+           "rest of this message is ignored",
+           cur_off_, data_.size());
+    }
+    failed_ = true;
+  }
+
+  /**
+   * Bytes not yet consumed.
+   *
+   * @return number of unread bytes, 0 once the archive has failed
+   */
+  CTP_INLINE size_t Remaining() const {
+    return failed_ ? 0 : data_.size() - cur_off_;
+  }
 
   /** right shift operator */
   template <typename T>
@@ -253,10 +286,12 @@ class GlobalDeserialize {
   /** Load function (binary data) */
   CTP_INLINE
   GlobalDeserialize &read_binary(char *data, size_t size) {
-    if (cur_off_ + size > data_.size()) {
-      HLOG(kError,
-           "GlobalDeserialize::read_binary: Attempted to read beyond end of "
-           "data");
+    // Compare against the bytes left rather than cur_off_ + size, which a
+    // garbage size can wrap. One overrun fails the archive for good: it logs
+    // once, and every later read returns at once, so a garbage element count
+    // can no longer loop logging one line per field (#1353).
+    if (failed_ || size > data_.size() - cur_off_) {
+      MarkFailed();
       return *this;
     }
     if (size > 0) {

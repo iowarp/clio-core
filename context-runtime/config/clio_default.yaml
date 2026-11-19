@@ -126,6 +126,20 @@ runtime:
                                        # as the memfd links). Learned task-stat models are
                                        # saved under <conf_dir>/models; a directory shared
                                        # between users cannot be written by the second one.
+  # Shared-memory segment sizes. Each takes a byte count or a size string
+  # ("256m", "1g"). Segments are sparse: untouched pages cost no RAM, but a
+  # scanner that reads every mapped page (e.g. Windows Defender) makes them
+  # resident, so desktop embeddings may want them smaller.
+  # main_segment_size: 0               # default: 0 = auto (RAM, capped at 1 GiB off
+                                       # Linux). Env CLIO_MAIN_SEGMENT_SIZE overrides.
+  # metadata_segment_size: 0           # default: 0 = auto (RAM, capped at 1 GiB off
+                                       # Linux).
+  # client_data_segment_size: 512m     # default: 512m -- each client's first data
+                                       # segment (clio_<pid>_0, plus 32 MB of
+                                       # allocator metadata). More segments are
+                                       # added when it fills; 0 restores the
+                                       # default. Env CLIO_CLIENT_DATA_SEGMENT_SIZE
+                                       # overrides.
   # ipc_namespace: ""                  # Extra suffix for shared-memory segment
                                        # names, which already carry the user
                                        # and port. Set it to run two runtimes

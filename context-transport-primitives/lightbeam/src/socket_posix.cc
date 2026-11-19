@@ -225,6 +225,12 @@ int PollReadMulti(const socket_t* fds, int count, int timeout_ms) {
 bool IsServerAlive(const std::string& addr, int port,
                    const std::string& protocol) {
   if (protocol == "ipc") {
+    // sun_path holds a short fixed-size path; a longer one used to be
+    // silently truncated, binding or dialing the wrong name (#1356).
+    if (addr.size() >= sizeof(sockaddr_un::sun_path)) {
+      errno = ENAMETOOLONG;
+      return false;
+    }
     socket_t fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd == kInvalidSocket) return false;
     struct sockaddr_un sun;
@@ -256,6 +262,12 @@ bool IsServerAlive(const std::string& addr, int port,
 socket_t Connect(const std::string& addr, int port,
                  const std::string& protocol) {
   if (protocol == "ipc") {
+    // sun_path holds a short fixed-size path; a longer one used to be
+    // silently truncated, binding or dialing the wrong name (#1356).
+    if (addr.size() >= sizeof(sockaddr_un::sun_path)) {
+      errno = ENAMETOOLONG;
+      return kInvalidSocket;
+    }
     socket_t fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd == kInvalidSocket) return kInvalidSocket;
     struct sockaddr_un sun;
@@ -305,11 +317,48 @@ socket_t Connect(const std::string& addr, int port,
   return fd;
 }
 
+/**
+ * Resolve the IPv4 address a TCP listener binds.
+ *
+ * An empty address, "*" or "0.0.0.0" means every interface. Anything else is
+ * a dotted IPv4 literal or a host name, so a caller that asks for loopback
+ * gets loopback rather than a wildcard listener reachable from the network.
+ *
+ * @param addr address requested by the caller
+ * @param out receives the resolved address in network byte order
+ * @return true on success, false when `addr` cannot be resolved
+ */
+static bool ResolveListenAddr(const std::string& addr, struct in_addr* out) {
+  if (addr.empty() || addr == "*" || addr == "0.0.0.0") {
+    out->s_addr = htonl(INADDR_ANY);
+    return true;
+  }
+  if (::inet_pton(AF_INET, addr.c_str(), out) > 0) return true;
+  struct addrinfo hints;
+  std::memset(&hints, 0, sizeof(hints));
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_STREAM;
+  struct addrinfo* res = nullptr;
+  if (::getaddrinfo(addr.c_str(), nullptr, &hints, &res) != 0 ||
+      res == nullptr) {
+    return false;
+  }
+  *out = reinterpret_cast<struct sockaddr_in*>(res->ai_addr)->sin_addr;
+  ::freeaddrinfo(res);
+  return true;
+}
+
 socket_t Listen(const std::string& addr, int port,
                 const std::string& protocol) {
   socket_t fd;
   if (protocol == "ipc") {
     UnlinkPath(addr.c_str());
+    // sun_path holds a short fixed-size path; a longer one used to be
+    // silently truncated, binding or dialing the wrong name (#1356).
+    if (addr.size() >= sizeof(sockaddr_un::sun_path)) {
+      errno = ENAMETOOLONG;
+      return kInvalidSocket;
+    }
     fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd == kInvalidSocket) return kInvalidSocket;
     struct sockaddr_un sun;
@@ -321,15 +370,15 @@ socket_t Listen(const std::string& addr, int port,
       return kInvalidSocket;
     }
   } else {
-    fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd == kInvalidSocket) return kInvalidSocket;
-    SetReuseAddr(fd);
-    SetRecvBuf(fd, 4 * 1024 * 1024);
     struct sockaddr_in sin;
     std::memset(&sin, 0, sizeof(sin));
     sin.sin_family = AF_INET;
     sin.sin_port = htons(static_cast<uint16_t>(port));
-    sin.sin_addr.s_addr = INADDR_ANY;
+    if (!ResolveListenAddr(addr, &sin.sin_addr)) return kInvalidSocket;
+    fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd == kInvalidSocket) return kInvalidSocket;
+    SetReuseAddr(fd);
+    SetRecvBuf(fd, 4 * 1024 * 1024);
     if (::bind(fd, reinterpret_cast<struct sockaddr*>(&sin), sizeof(sin)) < 0) {
       Close(fd);
       return kInvalidSocket;

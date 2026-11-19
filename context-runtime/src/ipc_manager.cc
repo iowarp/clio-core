@@ -2037,7 +2037,11 @@ void IpcManager::ControlChannelLoop() {
   int zero = 0, hwm = 64;
   zmq_setsockopt(router, ZMQ_LINGER, &zero, sizeof(zero));
   zmq_setsockopt(router, ZMQ_SNDHWM, &hwm, sizeof(hwm));
-  const std::string bind = "tcp://*:" + std::to_string(base + 2);
+  // Through DefaultServerBindAddr like every other bind site: a wildcard bind
+  // here ignored CLIO_BIND_ADDR / CLIO_TEST_MODE and tripped the Windows
+  // Defender Firewall prompt for every binary that starts a runtime.
+  const std::string bind =
+      "tcp://" + DefaultServerBindAddr() + ":" + std::to_string(base + 2);
   if (zmq_bind(router, bind.c_str()) != 0) {
     HLOG(kWarning, "control channel: cannot bind {} ({}); liveness falls "
          "back to the main sockets", bind, zmq_strerror(zmq_errno()));
