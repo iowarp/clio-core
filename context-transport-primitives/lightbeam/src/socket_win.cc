@@ -350,6 +350,43 @@ socket_t Connect(const std::string& addr, int port,
   return fd;
 }
 
+std::string ConnectError::ToString() const {
+  switch (stage_) {
+    case kNone:
+      return "ok";
+    case kResolve:
+      return "host lookup failed: " + std::to_string(code_);
+    case kSocket:
+      return "socket failed: WSA error " + std::to_string(code_);
+    case kConnect:
+      return "connect failed: WSA error " + std::to_string(code_);
+    case kTimeout:
+      return "connect: timed out";
+  }
+  return "unknown";
+}
+
+socket_t ConnectTimed(const std::string& addr, int port, int timeout_ms,
+                      ConnectError* err) {
+  // Windows dials IPv4 literals only and connects in blocking mode; the
+  // timeout is not applied here (the Thallium address exchange, the only
+  // caller that needs it, is POSIX-only).
+  (void)timeout_ms;
+  ConnectError local;
+  if (err == nullptr) err = &local;
+  *err = ConnectError();
+  socket_t fd = Connect(addr, port, "tcp");
+  if (fd == kInvalidSocket) {
+    err->stage_ = ConnectError::kConnect;
+    err->code_ = ::WSAGetLastError();
+  }
+  return fd;
+}
+
+uint64_t GetHostLookupCount() { return 0; }
+
+void ForgetHost(const std::string& host) { (void)host; }
+
 /**
  * Resolve the IPv4 address a TCP listener binds.
  *
@@ -420,7 +457,7 @@ socket_t Listen(const std::string& addr, int port,
       return kInvalidSocket;
     }
   }
-  if (::listen(static_cast<SOCKET>(fd), 16) < 0) {
+  if (::listen(static_cast<SOCKET>(fd), SOMAXCONN) < 0) {
     Close(fd);
     return kInvalidSocket;
   }

@@ -142,6 +142,20 @@ if(CLIO_CORE_ENABLE_THALLIUM)
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 endif()
 
+# Peer dial robustness: backoff/single-flight dial table, connect-path host
+# cache and failure reasons; with Thallium also the address exchange under a
+# 1024-dialer burst and next to an unresponsive peer.
+# POSIX only (the test uses BSD socket calls directly).
+if(NOT WIN32)
+    add_executable(peer_dial_test peer_dial_test.cc)
+    target_link_libraries(peer_dial_test clio_ctp_host ctp::lightbeam)
+    add_test(NAME ctp_peer_dial COMMAND peer_dial_test)
+    set_tests_properties(ctp_peer_dial PROPERTIES
+        LABELS "msan_skip"
+        TIMEOUT 600
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}")
+endif()
+
 # Socket transport full test (always enabled)
 add_executable(socket_transport_full_test socket_transport_full_test.cc)
 target_link_libraries(socket_transport_full_test clio_ctp_host ctp::lightbeam ctp::serialize)

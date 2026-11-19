@@ -536,8 +536,11 @@ class ThalliumTransport : public Transport {
                             tl::bulk &remote) {
       req.respond(HandleSend(*q, mid, req, wire, remote));
     };
-    rpc_ = eng.define(ThalliumLbmRpcName(), handler,
-                      static_cast<uint16_t>(port_));
+    {
+      std::lock_guard<std::mutex> lock(ThalliumEngine::DefineMutex());
+      rpc_ = eng.define(ThalliumLbmRpcName(), handler,
+                        static_cast<uint16_t>(port_));
+    }
     if (port_ != 0) {
       try {
         ThalliumEngine::Publish(port_);
@@ -552,7 +555,11 @@ class ThalliumTransport : public Transport {
 
   /** Connect: bind the RPC and resolve the peer's Mercury address. */
   void InitClient() {
-    rpc_ = ThalliumEngine::Get().define(ThalliumLbmRpcName());
+    {
+      tl::engine &eng = ThalliumEngine::Get();
+      std::lock_guard<std::mutex> lock(ThalliumEngine::DefineMutex());
+      rpc_ = eng.define(ThalliumLbmRpcName());
+    }
     (void)GetHandle();
     HLOG(kDebug, "ThalliumTransport(client) {}:{} -> {}", addr_, port_,
          peer_addr_);
@@ -728,10 +735,12 @@ class ThalliumTransport : public Transport {
     if (ph_) return ph_;
     std::string target = addr_;
     if (!direct_) {
-      target = ThalliumEngine::Resolve(addr_, port_, stale_);
+      std::string why;
+      target = ThalliumEngine::Resolve(addr_, port_, stale_, &why);
       if (target.empty()) {
         throw std::runtime_error("ThalliumTransport: no address from " +
-                                 addr_ + ":" + std::to_string(port_));
+                                 addr_ + ":" + std::to_string(port_) +
+                                 ": " + why);
       }
     }
     try {
