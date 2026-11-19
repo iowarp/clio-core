@@ -40,6 +40,7 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -164,11 +165,21 @@ void StopGracefully(clio::run::test::RuntimeServer &server) {
   }
 }
 
+/**
+ * Print one progress line at once (unbuffered stderr), so a step that hangs
+ * until the ctest TIMEOUT still shows the last step that completed.
+ * @param what the step just finished
+ */
+void Progress(const std::string &what) {
+  std::fprintf(stderr, "  [STEP] %s\n", what.c_str());
+  std::fflush(stderr);
+}
+
 /** How long a forked crash client may live. It attaches, does one round trip
  *  and fires a burst; a healthy one exits in seconds. */
-constexpr unsigned kChildLifeSec = 120;
+constexpr unsigned kChildLifeSec = 60;
 /** How long the parent waits for a forked crash client (> kChildLifeSec). */
-constexpr int kChildWaitMs = 150000;
+constexpr int kChildWaitMs = 90000;
 
 /**
  * Wait for a forked crash client with a deadline. A child stuck in its
@@ -537,9 +548,15 @@ TEST_CASE("ClientCrash - a dead client's SHM segments are reclaimed (#1192)",
          "      dpe_type: random\n";
   }
   clio::run::test::RuntimeServer server;
+  // Progress lines: this case has hung in CI (leak-check job) with no
+  // output before the ctest TIMEOUT; each step reports so the next hang
+  // shows where it stopped.
   REQUIRE(server.Start(kPort, "127.0.0.1", /*ephemeral=*/true));
-  REQUIRE(server.WaitForReady());
+  Progress("reclaim: daemon started");
+  REQUIRE(server.WaitForReady(60000));
+  Progress("reclaim: daemon ready");
   REQUIRE(RunCliTimed({"compose", "start", compose_yaml.string()}, 60) == 0);
+  Progress("reclaim: compose done");
   pid_t child = fork();
   REQUIRE(child >= 0);
   if (child == 0) {
@@ -562,16 +579,19 @@ TEST_CASE("ClientCrash - a dead client's SHM segments are reclaimed (#1192)",
     }
     return n;
   };
+  Progress("reclaim: forked crash client " + std::to_string(child));
   size_t left = segments_left();
   INFO("segments of the dead client right after its death: " << left);
   for (int i = 0; i < 400 && left > 0; ++i) {  // grace 2 s + reaper 1 s period
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     left = segments_left();
   }
+  Progress("reclaim: segments left " + std::to_string(left));
   REQUIRE(left == 0);
   REQUIRE(server.IsRunning());  // and the daemon survived the reap
   int status = 0;
   WaitChild(child, &status);
+  Progress("reclaim: crash client reaped");
   server.Stop();
   for (int i = 0; i < 50 && server.IsRunning(); ++i) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
