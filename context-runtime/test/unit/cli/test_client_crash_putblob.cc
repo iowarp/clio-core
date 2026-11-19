@@ -164,6 +164,37 @@ void StopGracefully(clio::run::test::RuntimeServer &server) {
   }
 }
 
+/** How long a forked crash client may live. It attaches, does one round trip
+ *  and fires a burst; a healthy one exits in seconds. */
+constexpr unsigned kChildLifeSec = 120;
+/** How long the parent waits for a forked crash client (> kChildLifeSec). */
+constexpr int kChildWaitMs = 150000;
+
+/**
+ * Wait for a forked crash client with a deadline. A child stuck in its
+ * connect round trip used to leave an unbounded waitpid() hanging until the
+ * ctest TIMEOUT, with no output; this fails fast with the daemon's log tail.
+ * @param child pid returned by fork()
+ * @param status receives the waitpid() status
+ */
+void WaitChild(pid_t child, int *status) {
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(kChildWaitMs);
+  while (true) {
+    const pid_t r = waitpid(child, status, WNOHANG);
+    if (r == child) return;
+    REQUIRE(r == 0);
+    if (std::chrono::steady_clock::now() >= deadline) {
+      kill(child, SIGKILL);
+      waitpid(child, status, 0);
+      FAIL("crash client " + std::to_string(child) + " still running after " +
+           std::to_string(kChildWaitMs) + " ms\n" +
+           clio::run::test::RuntimeServer::LogTail());
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+}
+
 // Attach as a client, fire a burst of PutBlobs, then _exit WITHOUT waiting for
 // the responses. Never returns. Used two ways:
 //   - forked from the single-node TEST_CASE (quiet=true), where the client is
@@ -176,6 +207,9 @@ void StopGracefully(clio::run::test::RuntimeServer &server) {
   // In the forked single-node case, silence the child so its worker/log chatter
   // does not pollute the parent's test output (the daemon log is asserted on).
   if (quiet) {
+    // Forked from a test case: never outlive it. SIGALRM's default action
+    // terminates the child if its connect round trip (mk.Wait) never ends.
+    alarm(kChildLifeSec);
     int devnull = open("/dev/null", O_WRONLY);
     if (devnull >= 0) {
       dup2(devnull, STDOUT_FILENO);
@@ -301,7 +335,7 @@ TEST_CASE("ClientCrash - PutBlob then terminate drops task with no leak [leak]",
     CrashClientMain(/*quiet=*/true);  // never returns
   }
   int status = 0;
-  REQUIRE(waitpid(child, &status, 0) == child);
+  WaitChild(child, &status);
   INFO("crash-client exited: exited=" << WIFEXITED(status)
        << " code=" << (WIFEXITED(status) ? WEXITSTATUS(status) : -1)
        << " signaled=" << WIFSIGNALED(status));
@@ -456,7 +490,7 @@ TEST_CASE("ClientCrash - dead SHM client's segments are reaped while running",
 
   kill(child, SIGKILL);
   int status = 0;
-  REQUIRE(waitpid(child, &status, 0) == child);
+  WaitChild(child, &status);
 
   // Grace 2 s plus the 1 s reap period: well inside 30 s.
   bool reaped = false;
@@ -537,7 +571,7 @@ TEST_CASE("ClientCrash - a dead client's SHM segments are reclaimed (#1192)",
   REQUIRE(left == 0);
   REQUIRE(server.IsRunning());  // and the daemon survived the reap
   int status = 0;
-  REQUIRE(waitpid(child, &status, 0) == child);
+  WaitChild(child, &status);
   server.Stop();
   for (int i = 0; i < 50 && server.IsRunning(); ++i) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
