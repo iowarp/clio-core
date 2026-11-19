@@ -13,6 +13,7 @@ MOUNT_POINT="/tmp/cte_fuse_test_mount"
 FUSE_BIN="${FUSE_BIN:-/workspace/build/bin/clio_cte_fuse}"
 RUNTIME_BIN="${RUNTIME_BIN:-/workspace/build/bin/clio_run}"
 CONFIG_FILE="${SCRIPT_DIR}/clio_config.yaml"
+CLUSTER_NODE="${SCRIPT_DIR}/../../../../CI/cluster_node.sh"
 FUSE_PID=""
 RUNTIME_PID=""
 EXIT_CODE=0
@@ -82,13 +83,15 @@ info "Starting Clio runtime..."
 export CLIO_SERVER_CONF="$CONFIG_FILE"
 CLIO_WITH_RUNTIME=1 "$RUNTIME_BIN" runtime start --fresh &
 RUNTIME_PID=$!
-sleep 3
 
-if ! kill -0 "$RUNTIME_PID" 2>/dev/null; then
-    fail "Clio runtime failed to start"
+# Ready = `clio_run status` answers RUNNING (a heartbeat round-trip), not "the
+# pid is still alive after 3 s". Fails fast if the runtime exits; cap 120 s.
+if ! CLIO_RUN_BIN="$RUNTIME_BIN" bash "$CLUSTER_NODE" ready \
+        /tmp/cte_fuse_sync fuse "$RUNTIME_PID" 120; then
+    fail "Clio runtime did not become ready"
     exit 1
 fi
-pass "Clio runtime started (PID $RUNTIME_PID)"
+pass "Clio runtime RUNNING (PID $RUNTIME_PID)"
 
 # Create mount point and start FUSE daemon. It must attach to the runtime above
 # as a pure client (CLIO_WITH_RUNTIME=0); otherwise CLIO_INIT(kClient, true)
@@ -97,15 +100,21 @@ mkdir -p "$MOUNT_POINT"
 info "Mounting FUSE filesystem at $MOUNT_POINT..."
 CLIO_WITH_RUNTIME=0 "$FUSE_BIN" "$MOUNT_POINT" -f &
 FUSE_PID=$!
-sleep 2
 
-if ! kill -0 "$FUSE_PID" 2>/dev/null; then
-    fail "clio_cte_fuse failed to start"
-    exit 1
-fi
+# Poll for the mount (as CI/fuse_mount_smoke.sh does) instead of a fixed
+# `sleep 2`: fail fast if the daemon exits, give up after 60 s.
+MOUNT_CAP=60
+for _ in $(seq 1 "$MOUNT_CAP"); do
+    mountpoint -q "$MOUNT_POINT" 2>/dev/null && break
+    if ! kill -0 "$FUSE_PID" 2>/dev/null; then
+        fail "clio_cte_fuse exited before the mount appeared"
+        exit 1
+    fi
+    sleep 1
+done
 
 if ! mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
-    fail "FUSE filesystem not mounted at $MOUNT_POINT"
+    fail "FUSE filesystem not mounted at $MOUNT_POINT within ${MOUNT_CAP}s"
     exit 1
 fi
 pass "FUSE filesystem mounted (PID $FUSE_PID)"

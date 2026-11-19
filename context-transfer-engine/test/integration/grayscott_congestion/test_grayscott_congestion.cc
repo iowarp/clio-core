@@ -109,9 +109,14 @@ int main() {
   // first future would otherwise never reach the in-loop stall checks (this is
   // exactly the parked-forever state the Delta ranks were found in). If the
   // whole run overshoots its budget, report the stall and _exit(42).
+  // GS_WATCHDOG_SEC (set by run_tests.sh from its phase deadline) overrides
+  // the computed budget so the STALL report always prints before the outer
+  // harness timeout kills the container.
   static std::atomic<bool> g_done{false};
+  const long watchdog_env = EnvLong("GS_WATCHDOG_SEC", 0);
   const double budget =
-      out_timeout * outputs + 120.0;  // all outputs + startup slack
+      watchdog_env > 0 ? static_cast<double>(watchdog_env)
+                       : out_timeout * outputs + 120.0;  // outputs + slack
   std::thread([node, budget] {
     auto t0 = std::chrono::steady_clock::now();
     while (!g_done.load()) {

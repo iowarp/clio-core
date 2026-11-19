@@ -21,6 +21,14 @@ fi
 
 cd "$SCRIPT_DIR"
 
+# Bounded waits + diagnostics (CI/compose_wait.sh). The budget stays below the
+# workflow step's timeout-minutes (25) so a hang is reported here, with every
+# node's logs and backtraces, instead of as a silent step kill.
+# shellcheck source=../../../../CI/compose_wait.sh
+source "$REPO_ROOT/CI/compose_wait.sh"
+CTE_NODES=(cte-distributed-node1 cte-distributed-node2 cte-distributed-node3 cte-distributed-node4)
+SYNC_DIR="$REPO_ROOT/build/cluster_sync/cte_distributed"
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -140,29 +148,18 @@ start_environment() {
         fi
     fi
 
+    cw_reset_sync "$SYNC_DIR"
     docker compose up -d
 
-    # Wait for containers to be ready with retry logic
-    print_msg "$BLUE" "Waiting for containers to start..."
-    local max_attempts=30
-    local attempt=0
-    while [ $attempt -lt $max_attempts ]; do
-        # Count all containers (running or exited)
-        local total=$(docker compose ps -a -q 2>/dev/null | wc -l)
-        if [ "$total" -ge 4 ]; then
-            print_success "All 4 containers started successfully"
-            return 0
-        fi
-        sleep 1
-        attempt=$((attempt + 1))
-    done
-
-    print_error "Not all containers started within ${max_attempts}s (expected 4, got $total)"
-    docker compose logs
-    exit 1
+    # Every node writes <node>.ready once its runtime answers `clio_run
+    # status`; node1 waits for all four before starting the test. Fail here
+    # (with logs) if any node dies or never comes up.
+    if ! cw_wait_ready_files 4; then
+        docker compose down -v 2>/dev/null || true
+        exit 1
+    fi
+    print_success "All 4 runtimes are RUNNING"
 }
-
-
 
 # Function to show usage
 usage() {
@@ -310,16 +307,20 @@ main() {
         exit 0
     fi
 
+    # One deadline for the whole run: readiness + test + node exit.
+    cw_init "${CTE_DIST_BUDGET_SEC:-1320}" "${CTE_NODES[@]}"
+
     # Start test environment
     start_environment
 
     print_success "Test environment started. Containers are running."
     print_msg "$BLUE" "Tests are executing. Waiting for completion..."
 
-    # Wait for test container (node1) to complete and capture exit code
-    # Use docker wait which blocks until container exits and returns exit code
+    # Wait for the test container (node1), bounded by the suite deadline. On a
+    # timeout or failure cw_wait_containers dumps every node's logs, process
+    # table and thread backtraces before returning.
     local exit_code=0
-    exit_code=$(docker wait cte-distributed-node1 2>/dev/null || echo "1")
+    cw_wait_containers cte-distributed-node1 || exit_code=$?
 
     # Show test logs after completion
     print_header "Test Output"

@@ -340,14 +340,56 @@ class CTECoreFunctionalTestFixture {
   }
 
   /**
-   * Helper method to wait for task completion with timeout
+   * Scale a per-call timeout for the current environment.
+   *
+   * Loaded CI runners (four runtimes in four containers on one VM) run far
+   * slower than a workstation, so every bound is multiplied by
+   * CTE_TEST_WAIT_SCALE (default 3, must be >= 1).
+   *
+   * @param timeout_ms nominal timeout in milliseconds
+   * @return the scaled timeout in seconds, as Future::Wait expects
+   */
+  static float ScaledWaitSec(int timeout_ms) {
+    double scale = 3.0;
+    if (const char *env = std::getenv("CTE_TEST_WAIT_SCALE")) {
+      const double parsed = std::atof(env);
+      if (parsed >= 1.0) {
+        scale = parsed;
+      }
+    }
+    return static_cast<float>(timeout_ms * scale / 1000.0);
+  }
+
+  /**
+   * Wait for a task to complete, bounded by a timeout.
+   *
+   * A task that never completes used to block here forever (the timeout was
+   * ignored), which turned a lost response into a silent CI step timeout. The
+   * wait is now bounded: on expiry this returns false so the caller's REQUIRE
+   * fails the test with a message naming the bound.
+   *
+   * @param task future of the submitted task
+   * @param timeout_ms nominal bound in milliseconds (scaled by ScaledWaitSec)
+   * @return true if the task completed within the bound, false otherwise
    */
   template <typename TaskType>
   bool WaitForTaskCompletion(clio::run::Future<TaskType> &task,
                              int timeout_ms = 5000) {
-    (void)timeout_ms;  // Parameter kept for API consistency
-    task.Wait();
-    INFO("Task completed successfully");
+    const float max_sec = ScaledWaitSec(timeout_ms);
+    const auto start = std::chrono::steady_clock::now();
+    const bool done = task.Wait(max_sec);
+    const double elapsed_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - start)
+            .count();
+    if (!done) {
+      std::fprintf(stderr,
+                   "WaitForTaskCompletion: task did NOT complete within "
+                   "%.0f ms (waited %.0f ms)\n",
+                   max_sec * 1000.0, elapsed_ms);
+      return false;
+    }
+    INFO("Task completed in " << elapsed_ms << " ms");
     return true;
   }
 

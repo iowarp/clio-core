@@ -17,6 +17,9 @@ fi
 
 cd "$SCRIPT_DIR"
 
+# shellcheck source=../../../../CI/compose_wait.sh
+source "$REPO_ROOT/CI/compose_wait.sh"
+
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -134,26 +137,16 @@ main() {
         done
     fi
 
+    # One bounded wait against a deadline below the workflow step's
+    # timeout-minutes (20). A hang dumps the container's logs, process table
+    # and thread state instead of dying silently with the step.
+    cw_init "${CTE_FUSE_BUDGET_SEC:-1020}" cte-fuse-test
     docker compose up -d
-
-    # Wait for container to start
-    local max_attempts=15
-    local attempt=0
-    while [ $attempt -lt $max_attempts ]; do
-        local total=$(docker compose ps -a -q 2>/dev/null | wc -l)
-        if [ "$total" -ge 1 ]; then
-            print_msg "$GREEN" "✓ Container started"
-            break
-        fi
-        sleep 1
-        attempt=$((attempt + 1))
-    done
 
     print_msg "$BLUE" "Tests executing. Waiting for completion..."
 
-    # Wait for test container to complete
     local exit_code=0
-    exit_code=$(docker wait cte-fuse-test 2>/dev/null || echo "1")
+    cw_wait_containers cte-fuse-test || exit_code=$?
 
     # Show test output
     print_header "Test Output"

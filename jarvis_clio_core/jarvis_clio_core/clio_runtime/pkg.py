@@ -72,6 +72,13 @@ class ClioRuntime(Service):
                 'default': 9413
             },
             {
+                'name': 'start_timeout',
+                'msg': 'Seconds start() waits for the runtime port to open '
+                       'on EVERY host before failing',
+                'type': int,
+                'default': 60
+            },
+            {
                 'name': 'forward_env',
                 'msg': 'Env var names to copy from the submitting shell into '
                        'the runtime daemon environment',
@@ -462,19 +469,10 @@ class ClioRuntime(Service):
         self.sleep()
 
         port = self.config['port']
-        host = self.hostfile.hosts[0] if self.hostfile.hosts else '127.0.0.1'
-        self.log(f'Waiting for runtime on {host}:{port}', color=Color.YELLOW)
-        for i in range(30):
-            try:
-                ret = subprocess.run(
-                    ['bash', '-c', f'echo > /dev/tcp/{host}/{port}'],
-                    capture_output=True, timeout=2)
-                if ret.returncode == 0:
-                    break
-            except subprocess.TimeoutExpired:
-                pass
-            time.sleep(1)
-        else:
+        hosts = list(self.hostfile.hosts) if self.hostfile.hosts else ['127.0.0.1']
+        start_timeout = int(self.config.get('start_timeout', 60))
+        missing = self._wait_runtime_ports(hosts, port, start_timeout)
+        if missing:
             # Hard failure, not a warning. Continuing here used to log
             # "IOWarp runtime started" for a runtime that does not exist; the
             # sweep then ran on to the next package, which died ~150 log lines
@@ -494,15 +492,50 @@ class ClioRuntime(Service):
             # $SLURM_JOB_NODELIST. Fix by removing the stale run directories.
             nodelist = os.environ.get('SLURM_JOB_NODELIST', '')
             hint = ''
-            if nodelist and host not in nodelist:
-                hint = (f" -- host is NOT in SLURM_JOB_NODELIST ({nodelist}): "
+            stale = [h for h in missing if nodelist and h not in nodelist]
+            if stale:
+                hint = (f" -- {stale} NOT in SLURM_JOB_NODELIST ({nodelist}): "
                         f"the hostfile is stale, left over from an earlier "
                         f"allocation. Remove the pipeline's per-run shared "
                         f"directories and resubmit.")
             raise ValueError(
-                f'Runtime did not respond on {host}:{port} after 30s{hint}')
+                f'Runtime did not respond on port {port} of {missing} '
+                f'after {start_timeout}s{hint}')
 
         self.log("IOWarp runtime started")
+
+    def _wait_runtime_ports(self, hosts, port, timeout_s=60):
+        """
+        Poll every host's runtime port until all accept a TCP connection.
+
+        Only the first host used to be probed, so a runtime that failed to
+        start on any other node was reported as started.
+
+        :param hosts: host names / addresses from the hostfile
+        :param port: runtime RPC port
+        :param timeout_s: overall cap in seconds, shared by all hosts
+        :return: list of hosts that never answered (empty on success)
+        """
+        pending = list(hosts)
+        deadline = time.time() + timeout_s
+        self.log(f'Waiting for runtime on port {port} of {len(pending)} '
+                 f'host(s)', color=Color.YELLOW)
+        while pending and time.time() < deadline:
+            still = []
+            for host in pending:
+                try:
+                    ret = subprocess.run(
+                        ['bash', '-c', f'echo > /dev/tcp/{host}/{port}'],
+                        capture_output=True, timeout=2)
+                    if ret.returncode == 0:
+                        continue
+                except subprocess.TimeoutExpired:
+                    pass
+                still.append(host)
+            pending = still
+            if pending:
+                time.sleep(1)
+        return pending
 
     def stop(self):
         # Symmetric with start(): when this package didn't spawn the

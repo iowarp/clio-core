@@ -67,7 +67,13 @@ if ! docker compose up -d; then
 fi
 
 say "=== Waiting for node 1 (mpirun launcher) to finish ==="
-node1_rc=$(docker wait wr-node1 2>/dev/null || echo 1)
+# Bounded by one deadline below the workflow step's 20 min; a timeout or a
+# non-zero exit dumps both nodes (CI/compose_wait.sh).
+# shellcheck source=../../../../CI/compose_wait.sh
+source "$REPO_ROOT/CI/compose_wait.sh"
+cw_init "${WR_BUDGET_SEC:-1020}" wr-node1 wr-node2
+cw_wait_containers wr-node1 || true
+node1_rc="${CW_RC[wr-node1]:-timeout}"
 
 # The ranks' own lines first: a debug build's runtime logging is voluminous
 # enough to push them out of any reasonable tail.
