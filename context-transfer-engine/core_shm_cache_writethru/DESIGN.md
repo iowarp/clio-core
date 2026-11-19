@@ -410,6 +410,8 @@ phase 2 lands, not off.
   evict_sample: 16             # clean entries sampled per eviction
   half_life_ms: 10000          # frecency decay
   max_sharer_entries: 65536    # blobs homed here that other nodes cache
+  nospace_wait_ms: 250         # a put refused for room waits this long for
+                               # earlier ranges to flush, then writes around
   inval_timeout_ms: 30000      # stop waiting on a silent sharer
 ```
 

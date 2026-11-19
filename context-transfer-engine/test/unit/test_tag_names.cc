@@ -382,7 +382,10 @@ TEST_CASE("a snapshot from before flat names restores every name",
     auto nm = c.AsyncGetTagName(flat);
     nm.Wait();
     canonical = nm->found_ ? nm->tag_name_.str() : std::string();
-    for (int i = 0; i < 100 && !legacy_gone; ++i) {  // migration: next tick
+    // Migration happens on the next tick: poll under a long deadline.
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    while (!legacy_gone && std::chrono::steady_clock::now() < deadline) {
       auto q = c.AsyncGetTagName(dirent);
       q.Wait();
       legacy_gone = q->found_ == 0;

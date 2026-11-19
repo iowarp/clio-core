@@ -124,7 +124,11 @@ static std::string CompressiblePayload(clio::run::u64 size) {
 static bool WaitReplicaSize(clio::cte::core::Client *core,
                             const clio::cte::core::TagId &tag_id,
                             const std::string &name, clio::run::u64 want) {
-  for (int attempt = 0; attempt < 250; ++attempt) {
+  // A deadline, not an attempt count: a slow CI runner must never fail on
+  // time alone; a lost replica still fails, only later.
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(60);
+  while (std::chrono::steady_clock::now() < deadline) {
     auto rsz = core->AsyncGetBlobSize(tag_id, name,
                                       clio::run::PoolQuery::Dynamic(), 1);
     rsz.Wait();

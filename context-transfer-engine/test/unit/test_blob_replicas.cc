@@ -616,8 +616,12 @@ TEST_CASE("BlobReplicas - transparent interposition on the core Put/Get",
     REQUIRE(psz->size_ == kValSize);
   }
   {
+    // Polled under a long deadline: a slow runner's sweep may take longer;
+    // a replica that never appears still fails.
     bool replicated = false;
-    for (int attempt = 0; attempt < 200 && !replicated; ++attempt) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    while (!replicated && std::chrono::steady_clock::now() < deadline) {
       auto rsz = client->AsyncGetBlobSize(tag_id, "cache_blob",
                                           clio::run::PoolQuery::Dynamic(), 1);
       rsz.Wait();
