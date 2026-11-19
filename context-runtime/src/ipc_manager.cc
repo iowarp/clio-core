@@ -117,13 +117,27 @@ static std::condition_variable g_heartbeat_cv;
 
 namespace clio::run {
 
-// Bind address for the local server sockets (client ROUTER, response listener,
-// single-node host). CLIO_BIND_ADDR wins; otherwise loopback under
-// CLIO_TEST_MODE so a unit-test binary binding a fresh port never trips the
-// Windows Defender Firewall "Allow access?" prompt — every unit test is
-// single-node loopback. Falls back to 0.0.0.0 for real multi-interface
-// deployments. Keep all bind sites going through this so none silently default
-// to 0.0.0.0 and accumulate per-binary firewall rules.
+/** Whether an address names this machine's loopback interface. */
+static bool IsLoopbackAddr(const std::string &addr) {
+  return addr == "localhost" || addr == "::1" || addr.rfind("127.", 0) == 0;
+}
+
+// Bind address for the server sockets that are not tied to a hostfile entry:
+// the client ROUTER, each client's response listener, the control channel, and
+// node 0 of a single-node runtime. Keep all bind sites going through this.
+//
+// The runtime does not authenticate peers or clients, so the default is
+// loopback and listening on the network is opt-in:
+//   1. CLIO_BIND_ADDR, when set, always wins. Set it (for example to 0.0.0.0)
+//      to serve clients on other hosts from a single-node runtime.
+//   2. CLIO_TEST_MODE: loopback, as before.
+//   3. A configured hostfile (multi-node): 0.0.0.0, unchanged, because peers
+//      and failover clients connect to every node. Multi-node deployments
+//      stay reachable until peers authenticate.
+//   4. A client of a runtime on another host (CLIO_SERVER_ADDR is not
+//      loopback): 0.0.0.0, so the runtime can dial back to this client's
+//      response listener.
+//   5. Otherwise: loopback. (This used to be 0.0.0.0.)
 static std::string DefaultServerBindAddr() {
   if (const char *env = clio::run::env::GetCompat("BIND_ADDR")) {
     if (*env) return std::string(env);
@@ -131,7 +145,14 @@ static std::string DefaultServerBindAddr() {
   if (const char *tm = clio::run::env::GetCompat("TEST_MODE")) {
     if (*tm && std::string(tm) != "0") return std::string("127.0.0.1");
   }
-  return std::string("0.0.0.0");
+  if (ConfigManager *config = CLIO_CONFIG_MANAGER) {
+    if (!config->GetHostfilePath().empty()) return std::string("0.0.0.0");
+    const std::string server = config->GetServerAddr();
+    if (!server.empty() && !IsLoopbackAddr(server)) {
+      return std::string("0.0.0.0");
+    }
+  }
+  return std::string("127.0.0.1");
 }
 
 // True for bind addresses that can only ever serve this machine. A loopback
@@ -1824,20 +1845,11 @@ bool IpcManager::LoadHostfile() {
   }
 
   if (hostfile_path.empty()) {
-    // No hostfile configured: bind on all local interfaces (0.0.0.0) by
-    // default. GetServerAddr() defaults to 127.0.0.1 — fine for the
-    // client DEALER target on a single host, but useless as a hostfile
-    // entry because IdentifyThisHost matches entries against
-    // gethostname() and on real multi-rail hosts (e.g. Aurora's
-    // `x4315c7s0b0n0`) the hostname is never literally `127.0.0.1`.
-    // Pushing "0.0.0.0" here, combined with the wildcard match in
-    // IdentifyThisHost, lets the runtime come up anywhere without
-    // forcing every user to write a one-line hostfile.
-    //
-    // CLIO_BIND_ADDR env override: when set, replaces the wildcard with
-    // the requested address. Used by tests on Windows to pin to
-    // 127.0.0.1 so the Defender Firewall doesn't pop "Allow access?"
-    // for every new test binary that binds a fresh port.
+    // No hostfile configured: a single-node runtime. Node 0 binds
+    // DefaultServerBindAddr(), which is loopback unless CLIO_BIND_ADDR asks
+    // for more (for example 0.0.0.0, to serve clients on other hosts).
+    // IdentifyThisHost treats both loopback and the 0.0.0.0 wildcard as this
+    // node, so neither needs a one-line hostfile.
     std::string bind_addr = DefaultServerBindAddr();
     HLOG(kDebug, "No hostfile configured, binding {} as node 0", bind_addr);
     Host host(bind_addr, 0);

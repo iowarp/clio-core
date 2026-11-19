@@ -630,6 +630,11 @@ TEST_CASE("CliRuntime - client commands against a live runtime",
   REQUIRE(RunCliTimed({"viz", "stop"}, 60) == 0);   // idempotent
   REQUIRE(RunCliTimed({"viz", "status"}, 60) == 1);  // not running
 #if CLIO_RUN_HAS_POCO
+  // A query may not move the dashboard off loopback unless the runtime's
+  // configuration names that address (here it names the default, loopback).
+  REQUIRE(RunCliTimed({"viz", "start", "--port", "0", "--bind", "0.0.0.0"},
+                      60) == 1);
+  REQUIRE(RunCliTimed({"viz", "status"}, 60) == 1);
   // Ephemeral port: CI runs many daemons at once.
   REQUIRE(RunCliTimed({"viz", "start", "--port", "0", "--bind", "127.0.0.1"},
                       60) == 0);
