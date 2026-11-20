@@ -162,14 +162,21 @@ jobs:
           -DCMAKE_CUDA_ARCHITECTURES=89-real \
           -DCLIO_RUN_ENABLE_COROC=ON \
           -DLLVM_DIR=/usr/lib/llvm-22/lib/cmake/llvm \
-          -DClang_DIR=/usr/lib/llvm-22/lib/cmake/clang
+          -DClang_DIR=/usr/lib/llvm-22/lib/cmake/clang \
+          -DCLIO_CORO_REGCAP=OFF
+        # CLIO_CORO_REGCAP=OFF: installing llvm-22-dev (for clio-coroc) also
+        # puts llvm-config on PATH, which switches on the register-cap pass
+        # plugin -- and loading it crashes clang 22's frontend on the
+        # lammps_md probe build. Before llvm-22-dev was installed here the
+        # plugin was never built, so OFF keeps this job's configuration as it
+        # was. The crash itself is a separate bug.
         # gpu_vector_all, not a hand-written --target list: that list only
         # named what someone remembered to add, so four paged benchmark
         # drivers stopped compiling and nothing noticed. gpu_vector_all is
         # every target under adapter/gpu_vector, including ones added later,
         # minus an explicit, printed GV_ALL_KNOWN_BROKEN list.
         cmake --build build-gpu-compile -j "$(nproc)" \
-          --target gpu_vector_all test_yieldable test_yield_stack
+          --target gpu_vector_all test_yieldable test_yield_stack -- -k
 
     # NOTE: GPU tests are disabled until self-hosted GPU runners are available.
     # To re-enable, change runs-on to [self-hosted, gpu], add nvidia-smi
