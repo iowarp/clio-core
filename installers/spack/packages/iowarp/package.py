@@ -284,6 +284,15 @@ class Iowarp(CMakePackage, CudaPackage, ROCmPackage):
         args.append(self.define_from_variant('CLIO_CORE_ENABLE_ZMQ', 'zmq'))
         args.append(self.define_from_variant('CLIO_CORE_ENABLE_THALLIUM', 'mochi'))
         args.append(self.define_from_variant('CLIO_CORE_ENABLE_MPI', 'mpiio'))
+        if '+mpiio' in self.spec:
+            # The MPI-IO adapter reads implementation-specific MPI_Status
+            # fields and probes mpicc to tell OpenMPI from MPICH; that probe
+            # does not recognize every MPI Spack can choose (Intel MPI, for
+            # one, is MPICH-ABI). Say which family was built against.
+            if self.spec['mpi'].name == 'openmpi':
+                args.append(self.define('CLIO_CTE_OPENMPI', True))
+            else:
+                args.append(self.define('CLIO_CTE_MPICH', True))
         args.append(self.define_from_variant('CLIO_CORE_ENABLE_HDF5', 'hdf5'))
         args.append(self.define_from_variant('CLIO_CORE_ENABLE_ENCRYPT', 'encrypt'))
         args.append(self.define_from_variant('CLIO_CORE_ENABLE_PYTHON', 'python'))

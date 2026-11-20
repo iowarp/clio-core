@@ -50,6 +50,12 @@ include(CMakeFindDependencyMacro)
 # 3. The headers that external users include don't expose Boost/cereal types in public APIs
 find_package(Boost QUIET COMPONENTS fiber context filesystem)
 find_package(cereal QUIET CONFIG)
+# Some cereal installs (Spack's package, for one) export the target as plain
+# `cereal` rather than `cereal::cereal`, which ctp::serialize links.
+if(TARGET cereal AND NOT TARGET cereal::cereal)
+    add_library(cereal::cereal INTERFACE IMPORTED)
+    set_target_properties(cereal::cereal PROPERTIES INTERFACE_LINK_LIBRARIES cereal)
+endif()
 # msgpack-c provides the `msgpack-c-static` (or `msgpack-c`) imported target
 # referenced from ClioCtp's INTERFACE_LINK_LIBRARIES. Downstream projects
 # must have this target visible at find_package(iowarp-core) time, otherwise
