@@ -92,14 +92,32 @@ bool IsUnder(const fs::path &p, const fs::path &root) {
   return true;
 }
 
+/**
+ * Whether resolved path `p` lies under system location `loc`, as written or
+ * as it resolves. Requests are compared after Resolve(), so a location that
+ * is itself a symlink must be resolved the same way: on macOS /etc is a link
+ * to /private/etc, and comparing only the literal "/etc" let writes there
+ * through. An empty resolution is never treated as a root (IsUnder would
+ * match everything).
+ * @param p   the resolved request path
+ * @param loc a system location from kSystemDeny / kSystemWriteDeny
+ * @return true if p is loc or lies under it
+ */
+bool UnderSystemPath(const fs::path &p, std::string_view loc) {
+  const fs::path literal(loc);
+  if (IsUnder(p, literal)) return true;
+  const fs::path resolved = Resolve(std::string(loc));
+  return !resolved.empty() && resolved != literal && IsUnder(p, resolved);
+}
+
 /** Why the default policy refuses `p`, or empty if it allows it. */
 std::string DenyReason(const fs::path &p, bool write) {
   for (std::string_view s : kSystemDeny) {
-    if (IsUnder(p, fs::path(s))) return std::string("system location ") += s;
+    if (UnderSystemPath(p, s)) return std::string("system location ") += s;
   }
   if (write) {
     for (std::string_view s : kSystemWriteDeny) {
-      if (IsUnder(p, fs::path(s))) {
+      if (UnderSystemPath(p, s)) {
         return std::string("system directory ") += s;
       }
     }
