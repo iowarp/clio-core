@@ -132,6 +132,11 @@ jobs:
             | sudo tee /etc/apt/keyrings/rocm.gpg >/dev/null
           echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/6.4 noble main" \
             | sudo tee /etc/apt/sources.list.d/rocm.list
+          # Ubuntu's universe ships older hipcc / rocm-cmake that apt would
+          # otherwise prefer, leaving rocm-hip-runtime-dev unsatisfiable. Pin
+          # AMD's repository above it, as AMD's install guide does.
+          printf 'Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600\n' \
+            | sudo tee /etc/apt/preferences.d/rocm-pin-600
           sudo apt-get update
           sudo apt-get install -y rocm-hip-runtime-dev hipcc rocm-cmake
           /opt/rocm/bin/hipconfig --version
