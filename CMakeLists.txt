@@ -53,6 +53,7 @@ option(CLIO_CORE_ENABLE_COVERAGE "Enable code coverage instrumentation for all c
 option(CLIO_CORE_ENABLE_LEAK_CHECK "Enable allocator allocation-size tracking (CTP_ALLOC_TRACK_SIZE) so tests can assert no runtime memory is leaked. Adds a small per-allocation atomic; keep OFF in production." OFF)
 option(CLIO_CORE_ENABLE_DOXYGEN "Check how well the code is documented" OFF)
 option(CLIO_CORE_ENABLE_RPATH "Enable RPATH configuration with relative ($ORIGIN) paths" ON)
+option(CLIO_CORE_SEED_USER_CONFIG "On install, copy clio_default.yaml to ~/.clio/clio.yaml if absent (package builds turn this off)" ON)
 option(CLIO_CORE_ENABLE_CPACK "Enable CPack for package generation" OFF)
 option(CLIO_CORE_ENABLE_DEB_PACKAGE "Build Debian .deb package via CPack" OFF)
 option(CLIO_CORE_ENABLE_RPM_PACKAGE "Build RPM .rpm package via CPack" OFF)

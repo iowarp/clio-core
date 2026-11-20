@@ -228,8 +228,6 @@ install(DIRECTORY config/
 # read time as a fallback for users with pre-existing configs, but we
 # no longer seed it on install — that path is documented as legacy
 # in docs/deprecation-notes.md and will eventually be removed.
-option(CLIO_CORE_SEED_USER_CONFIG
-       "On install, copy clio_default.yaml to ~/.clio/clio.yaml if absent" ON)
 if(CLIO_CORE_SEED_USER_CONFIG)
 install(CODE "
   # Determine real user's home directory (handles sudo install)
