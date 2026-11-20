@@ -11,16 +11,17 @@
 name: CI cloud bdev
 
 on:
-  pull_request:
-    paths:
-      - "context-runtime/modules/bdev/**"
-      - "context-transport-primitives/**"
-      - ".github/workflows/ci-cloud-bdev.yml"
   push:
-    branches: [main, dev]
+    branches: [main]
     paths:
       - "context-runtime/modules/bdev/**"
       - ".github/workflows/ci-cloud-bdev.yml"
+  # Push to dev does NOT trigger this directly: dev-full-ci.yml dispatches
+  # the full matrix once dev has been quiet for 30 minutes, so a burst of
+  # merges gets one full run instead of one per merge.
+  # Single-node (local emulators): runs on every PR, no path filter.
+  pull_request:
+    branches: [main, dev]
   schedule:
     - cron: "0 7 * * 1"   # weekly, to catch emulator or API drift
   workflow_dispatch:
@@ -31,6 +32,8 @@ concurrency:
 
 jobs:
   cloud-bdev:
+    # Skipped on dev -> main PRs: dev-to-main-gate.yml checks dev's full CI on the same commit instead.
+    if: ${{ !(github.event_name == 'pull_request' && github.head_ref == 'dev' && github.base_ref == 'main') }}
     name: cloud-bdev (VersityGW + fake-gcs-server)
     runs-on: ubuntu-24.04
     timeout-minutes: 60

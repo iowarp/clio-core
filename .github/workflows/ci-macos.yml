@@ -9,16 +9,12 @@ name: CI macOS
 
 on:
   push:
-    branches: [main, dev]
+    branches: [main]
+  # Push to dev does NOT trigger this directly: dev-full-ci.yml dispatches
+  # the full matrix once dev has been quiet for 30 minutes, so a burst of
+  # merges gets one full run instead of one per merge.
   pull_request:
     branches: [main, dev]
-  # Merge queue (issue #1013): the full matrix -- macFUSE, WinFsp, the boost
-  # backend, the wide macOS sweep -- is gated on `event_name != pull_request`,
-  # so it never ran on a PR and only spoke up AFTER the merge, on dev, where a
-  # single bad commit turns every later push red. A merge_group run is that
-  # same full matrix executed on the PROSPECTIVE merge commit, before it lands.
-  # Cost is unchanged for PRs; dev stops being where breakage is discovered.
-  merge_group:
   workflow_dispatch:
 
 concurrency:
@@ -42,6 +38,8 @@ jobs:
   # macos-15 (arm64) is the PR runner: current-generation Apple silicon, the
   # default arch for contributors, and where cr_cli_cfs_rename surfaced.
   matrix-tier:
+    # Skipped on dev -> main PRs: dev-to-main-gate.yml checks dev's full CI on the same commit instead.
+    if: ${{ !(github.event_name == 'pull_request' && github.head_ref == 'dev' && github.base_ref == 'main') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -58,6 +56,8 @@ jobs:
 
   # ---- Standard build + ctest (arm64 + Intel, macOS 15 -> 26, xcode-27) ------
   build-test:
+    # Skipped on dev -> main PRs: dev-to-main-gate.yml checks dev's full CI on the same commit instead.
+    if: ${{ !(github.event_name == 'pull_request' && github.head_ref == 'dev' && github.base_ref == 'main') }}
     name: build-test (${{ matrix.os }})
     needs: matrix-tier
     runs-on: ${{ matrix.os }}
@@ -122,6 +122,7 @@ jobs:
           cmake --build build -- -j"$(sysctl -n hw.ncpu)"
 
       - name: Run ctest
+        if: github.event_name != 'pull_request'
         run: |
           if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
             source "$HOME/miniconda3/etc/profile.d/conda.sh"
@@ -143,7 +144,7 @@ jobs:
             -E "cr_bdev_|cr_mpi_|cr_per_process_shm_stress|cte_tag_large|cte_tiered_storage_all|cte_tiered_dram_default_all|cte_reorganize_all"
 
       - name: Submit results to CDash
-        if: always()
+        if: always() && github.event_name != 'pull_request'
         continue-on-error: true
         run: |
           if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
@@ -158,7 +159,7 @@ jobs:
           ctest -T Submit || true
 
       - name: Summarize failed tests
-        if: always()
+        if: always() && github.event_name != 'pull_request'
         run: |
           LOG="build/Testing/Temporary/LastTest.log"
           echo "## macOS test summary (${{ matrix.os }})" >> "$GITHUB_STEP_SUMMARY"
@@ -172,14 +173,14 @@ jobs:
             echo "(LastTest.log not found)" >> "$GITHUB_STEP_SUMMARY"
           fi
       - name: Report retried-but-passed tests
-        if: always()
+        if: always() && github.event_name != 'pull_request'
         shell: bash
         # A green check must not mean "some test failed and we retried until it
         # did not" (#921). Reports only -- never fails the job.
         run: bash CI/report_flaky_tests.sh build/Testing/Temporary/LastTest.log "macos ${{ matrix.os }}"
 
       - name: Upload test logs
-        if: always()
+        if: always() && github.event_name != 'pull_request'
         # Never let the artifact service sink an otherwise-green job (#921).
         # These logs are diagnostics; the verdict already came from "Run tests".
         # Seen on PR #920: build-test (windows-11-arm) passed every one of its
