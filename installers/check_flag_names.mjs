@@ -7,19 +7,37 @@
 //
 // Usage: node installers/check_flag_names.mjs
 // Exit 0 if every -D<FLAG>= in the checked installer files names a flag
-// declared by an option()/set(... CACHE ...) in the root CMakeLists.txt (or
+// declared by an option()/set(... CACHE ...) in any CMakeLists.txt of the
+// repo -- components declare their own options, e.g.
+// context-runtime/CMakeLists.txt's CLIO_CORE_SEED_USER_CONFIG -- (or
 // a well-known external prefix: CMAKE_, HSHM_, BUILD_SHARED_LIBS). Exit 1
 // and print each offending flag otherwise.
 
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(here, "..");
 
-const cmakeListsPath = join(repoRoot, "CMakeLists.txt");
-const cmakeLists = readFileSync(cmakeListsPath, "utf8");
+// Every CMakeLists.txt in the source tree. Build trees, VCS metadata and
+// fetched dependencies are skipped: their options are not ours.
+const skipDirs = new Set([".git", "node_modules", "_deps", "third_party",
+                          "external"]);
+function findCMakeLists(dir, out) {
+  for (const e of readdirSync(dir, { withFileTypes: true })) {
+    if (e.isDirectory()) {
+      if (skipDirs.has(e.name) || e.name.startsWith("build")) continue;
+      findCMakeLists(join(dir, e.name), out);
+    } else if (e.name === "CMakeLists.txt") {
+      out.push(join(dir, e.name));
+    }
+  }
+  return out;
+}
+const cmakeLists = findCMakeLists(repoRoot, [])
+  .map((f) => readFileSync(f, "utf8"))
+  .join("\n");
 
 const declared = new Set();
 // option(NAME "desc" DEFAULT)
