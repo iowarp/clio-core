@@ -1,10 +1,10 @@
 <!--
 title: Usage
 heading: Using the <em>Context Assimilation Engine.</em>
-description: How to import data with the Context Assimilation Engine: writing OMNI transfer files, running clio_cae, the supported sources and formats, preprocessing with run steps, cloud credentials, importing from code, and labeling data in the I/O path with the summarizer.
+description: How to import data with the Context Assimilation Engine: writing OMNI transfer files, running clio-cae, the supported sources and formats, preprocessing with run steps, cloud credentials, importing from code, and labeling data in the I/O path with the summarizer.
 eyebrow: Docs · Context Assimilation Engine
 lede: Most imports are an OMNI file and one command. This page walks through the file, the tool, each source scheme, and the two ways to describe data as it is written. Every key and default is listed on the API reference page.
-facts: Submit | clio_cae transfers.yaml ; From code | clio_cee.context_bundle or AsyncParseOmni ; Needs | A running runtime
+facts: Submit | clio-cae transfers.yaml ; From code | clio_cee.context_bundle or AsyncParseOmni ; Needs | A running runtime
 -->
 <h2>Import a file</h2>
 <p>An OMNI file is a YAML document with a <code>transfers</code> list. Each transfer names a source, a destination tag and a format. Write one, start the runtime, and submit it:</p>
@@ -17,8 +17,8 @@ transfers:
     format: binary
 </pre>
 <pre data-label="shell">
-$ clio_run start &
-$ clio_cae transfers.yaml
+$ clio-run start &
+$ clio-cae transfers.yaml
 </pre>
 <p>The file becomes the tag <code>run42_field</code> holding blobs <code>chunk_0</code>, <code>chunk_1</code>, and so on, 1 MiB each. Top-level keys other than <code>transfers</code>, such as <code>name</code>, are ignored. A per-transfer key the loader does not know is logged as a warning and ignored.</p>
 <p>The tool initializes a client of the running runtime, loads the file, executes any <code>run</code> steps locally, then submits the whole list as one <code>ParseOmni</code> task and waits. Transfers run in order inside the runtime, each finishing before the next starts. The tool exits 1 when:</p>
@@ -33,7 +33,7 @@ $ clio_cae transfers.yaml
 <h2>Sources and formats</h2>
 <p>The scheme of <code>src</code>, everything before <code>://</code> or <code>::</code>, selects the assimilator. The <code>format</code> key is required on every transfer; the values the code acts on are <code>binary</code>, <code>hdf5</code>, <code>hdf5_vol</code> and <code>globus</code>.</p>
 <ul class="checks">
-  <li><code>file::/path</code>. Reads a local file in chunks and stores blobs <code>chunk_0</code>, <code>chunk_1</code>, and so on. <code>range_off</code> and <code>range_size</code> select a byte range. The path must be visible to the runtime process, not only to the machine running <code>clio_cae</code>.</li>
+  <li><code>file::/path</code>. Reads a local file in chunks and stores blobs <code>chunk_0</code>, <code>chunk_1</code>, and so on. <code>range_off</code> and <code>range_size</code> select a byte range. The path must be visible to the runtime process, not only to the machine running <code>clio-cae</code>.</li>
   <li><code>string::name</code>. Stores the bytes of <code>src_data</code> verbatim as one blob named <code>name</code>. OMNI files have no key for <code>src_data</code>, so this scheme is for programs that build contexts in code, such as <code>clio_cee</code>.</li>
   <li><code>hdf5::/path.h5</code>. Discovers every dataset in the file. With <code>format: hdf5</code>, each dataset becomes its own tag named <code>&lt;dst tag&gt;/&lt;dataset path&gt;</code>, and large datasets are split into several blobs. <code>dataset_filter</code> selects datasets with include and exclude glob patterns. With <code>format: hdf5_vol</code> the file is staged in the layout the CTE's HDF5 VOL connector expects, so an application opening the file through the connector is served from the CTE from its first read. Needs <code>CLIO_CORE_ENABLE_HDF5=ON</code>.</li>
   <li><code>http://</code> and <code>https://</code>. Downloads through a <code>curl</code> child process, with <code>src_token</code> as the bearer token when set. POSIX builds only. A URL under <code>https://app.globus.org</code> is handed to the Globus assimilator instead.</li>
@@ -64,7 +64,7 @@ transfers:
 <p>Glob patterns support <code>*</code>, <code>?</code> and <code>[]</code>, and <code>*</code> crosses <code>/</code>. If the include patterns match no dataset the transfer fails with result code -9 and the tool prints the likely cause.</p>
 
 <h2>Preprocess a source with a run step</h2>
-<p>A transfer may carry <code>run</code> and <code>run_out</code>. The script runs in the <code>clio_cae</code> process, as the user running the tool, before anything is submitted. It never runs inside the runtime. It is called with two arguments: the source, which is the local path for <code>file::</code> and <code>hdf5::</code> sources and the URL unchanged for other schemes, and the output path. If it exits 0 and <code>run_out</code> exists as a regular file, the transfer ingests <code>run_out</code> instead of the original source: as <code>hdf5::</code> when the format starts with <code>hdf5</code>, as <code>file::</code> otherwise. Later <code>depends_on</code> entries that named the old source are rewritten. Any failure stops the whole ingest.</p>
+<p>A transfer may carry <code>run</code> and <code>run_out</code>. The script runs in the <code>clio-cae</code> process, as the user running the tool, before anything is submitted. It never runs inside the runtime. It is called with two arguments: the source, which is the local path for <code>file::</code> and <code>hdf5::</code> sources and the URL unchanged for other schemes, and the output path. If it exits 0 and <code>run_out</code> exists as a regular file, the transfer ingests <code>run_out</code> instead of the original source: as <code>hdf5::</code> when the format starts with <code>hdf5</code>, as <code>file::</code> otherwise. Later <code>depends_on</code> entries that named the old source are rewritten. Any failure stops the whole ingest.</p>
 <pre data-label="yaml">
 transfers:
   - src: file::/data/A46_xx.csv
@@ -76,7 +76,7 @@ transfers:
 <p>Both paths are environment-expanded, and relative paths resolve against the OMNI file's directory. <code>run_out</code> without <code>run</code>, or the reverse, is an error.</p>
 
 <h2>Import from the cloud</h2>
-<p>Credentials are read by the process that performs the read. For <code>s3://</code> and <code>gs://</code> that is the runtime, so set the AWS or Google environment where <code>clio_run</code> starts. The exceptions are the two S3 hints the client can forward: a program that builds contexts in code can set <code>s3_region</code> and <code>s3_profile</code> on the context, and they become <code>AWS_DEFAULT_REGION</code> and <code>AWS_PROFILE</code> for the S3 helper. OMNI files have no key for them.</p>
+<p>Credentials are read by the process that performs the read. For <code>s3://</code> and <code>gs://</code> that is the runtime, so set the AWS or Google environment where <code>clio-run</code> starts. The exceptions are the two S3 hints the client can forward: a program that builds contexts in code can set <code>s3_region</code> and <code>s3_profile</code> on the context, and they become <code>AWS_DEFAULT_REGION</code> and <code>AWS_PROFILE</code> for the S3 helper. OMNI files have no key for them.</p>
 <pre data-label="yaml">
 transfers:
   - src: s3://my-bucket/reference/baseline.bin

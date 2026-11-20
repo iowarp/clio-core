@@ -19,7 +19,7 @@ small".
 | file | read it when |
 |---|---|
 | [architecture.md](architecture.md) | you need the big picture: processes, managers, how a task travels client -> worker -> handler -> back (SHM/TCP/IPC, futures, remote tasks), shared memory, IPC paths, cleanup, config and env vars |
-| [module-anatomy.md](module-anatomy.md) | writing or reading a module: `clio_mod.yaml`, autogen (`clio_run refresh`), task structs (IN/OUT, Serialize, bulk, Copy/AggregateOut), client class, runtime class (Container API), `GetTaskStats`, CMake targets/aliases/linking |
+| [module-anatomy.md](module-anatomy.md) | writing or reading a module: `clio_mod.yaml`, autogen (`clio-run refresh`), task structs (IN/OUT, Serialize, bulk, Copy/AggregateOut), client class, runtime class (Container API), `GetTaskStats`, CMake targets/aliases/linking |
 | [create-and-ids.md](create-and-ids.md) | anything about Create / GetOrCreatePool, `kAdminPoolId`, pool ids, container ids (== node ids), module discovery and `chimod_lib_name`, compose, `PoolQuery` modes, how Dynamic is resolved (`ScheduleTask`), method dispatch, Destroy/Monitor |
 | [scheduling-and-performance.md](scheduling-and-performance.md) | performance: worker layout, hold-time placement, the learned cost model, network lanes, worker loop and yield queues, inline ops, collectives, measured costs, fast-handler rules, measurement tools |
 | [cte-data-path.md](cte-data-path.md) | CTE blobs/tags/targets, the two client paths, interposers, the shm cache (segment, flusher, invalidation, zero copy), write-back vs write-through, fsync |
@@ -41,7 +41,7 @@ small".
   **static container** used only for routing.
 - A **method** is a numbered entry point (`clio_mod.yaml`, 0-9 lifecycle:
   `kCreate 0`, `kDestroy 1`, `kRestart 2`, `kMonitor 9`; custom >= 10;
-  interposer verbs >= 100). `clio_run refresh` generates `Method::k*`, the
+  interposer verbs >= 100). `clio-run refresh` generates `Method::k*`, the
   `Run(method, task)` dispatch switch and all (de)serialization switches.
 - The client does `NewTask<FooTask>(CreateTaskId(), pool_id_, query, ...)` and
   `Send`. The runtime routes the task by its **PoolQuery** (Dynamic is
@@ -112,7 +112,7 @@ small".
 ### Module checklist
 
 1. Methods live in `clio_mod.yaml` (modules listed in `clio_repo.yaml`).
-   After adding a method run `clio_run refresh <repo dir>`; never hand-edit
+   After adding a method run `clio-run refresh <repo dir>`; never hand-edit
    `autogen/`; never re-implement `SaveIn/LoadIn/SaveOut/LoadOut`,
    `NewCopy`, `Aggregate`, `Run`, `Init` or the Save/Load family in runtime
    sources. **Check manifest drift first** (the CTE core and shm cache yamls
@@ -197,9 +197,7 @@ runtime, CTE, CAE, bdev or any module -- is documented in the same change:
 1. `context-runtime/config/clio_default.yaml`: the key with its default (as a
    comment if it is not set there) and a comment describing it and its
    options.
-2. `docs/deployment/configuration.md` in the iowarp/docs repository
-   (https://github.com/iowarp/docs; a checkout lives at `docs/` in this repo,
-   i.e. `docs/docs/deployment/configuration.md`).
+2. The module's page under `site/pages/modules/` (its compose-key table).
 
 ### Building and testing
 
@@ -238,8 +236,7 @@ runtime, CTE, CAE, bdev or any module -- is documented in the same change:
 
 ## Further reading (optional, outside this skill)
 
-The iowarp/docs checkout has a longer module development guide
-(`docs/docs/sdk/context-runtime/2.module_dev_guide.md`, published at
-https://core.iowarp.ai/develop/) and a module test guide
-(`3.module_test_guide.md`). This skill takes precedence where they differ:
-it was verified against the code.
+The site has a longer module development guide
+(`site/pages/docs/runtime/usage.html` and `extend.html`, published at
+https://core.iowarp.ai/develop/). This skill takes precedence where they
+differ: it was verified against the code.

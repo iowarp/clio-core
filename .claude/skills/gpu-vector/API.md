@@ -1,9 +1,8 @@
 # API.md -- the current gpu_vector contract
 
 Source of truth: `context-transfer-engine/adapter/gpu_vector/include/clio_cte/gpu_vector/{device_vector.h,gpu_vector.h,page.h,prefetch.h}`
-and `context-runtime/include/clio_runtime/gpu/{yieldable.h,yield_stack.h,yield_coro.h,yield_backend.h}`.
-The API was rewritten on 2026-08-22 (commit 27dd3cc3) and again reshaped by
-later commits. When a comment disagrees with this file, check the code.
+and `context-runtime/include/clio_runtime/gpu/{yieldable.h,yield_stack.h,yield_coro.h}`.
+When a comment in the tree disagrees with this file, check the code.
 
 Namespaces used below: `gv = clio::cte::gpu_vector`, `gy = clio::run::gpu`
 (yield machinery), `u32/u64 = clio::run::u32/u64`.
@@ -292,7 +291,7 @@ Latched into a pinned-host channel (first writer wins); `FatalReport()` returns 
 | code | name | cause |
 |---|---|---|
 | 1 | InitBlock | `Init(block >= nblocks)` |
-| 2 | NotResident | hold of a page never fetched: forgot to fetch, fetch > 64 pages, or unpinned before holding |
+| 2 | NotResident | hold of a page never fetched: forgot to fetch, fetch > 64 pages, or unpinned before holding. A page fetched and then evicted by a peer before the hold is re-fetched (up to 64 times, since abf541997); trapping anyway means the set cannot keep it -- see code 5 |
 | 3 | NotCovered | read hold outside the frame's valid bytes |
 | 4 | Unbound | verb before `Init` |
 | 5 | SetFull | a set full of pinned frames through every retry: cache/sets too small, or pins leaked |
@@ -302,7 +301,3 @@ Latched into a pinned-host channel (first writer wins); `FatalReport()` returns 
 | 101/102/103 | yield depth / frame / coroutine frame | raise `bytes_per_lane` for 103 |
 
 Hitting the round cap is not a trap: a stderr line plus `HitRoundCap()`.
-
-## Stale -- do not use or trust
-
-Removed: `FetchPagesBatched*`, `BeginFetchRunLocked`, `FlushBlockBatched`, `FlushAsync`/`AwaitFlush`, `WaitFetch`, `WaitFlush`, `TryHoldRawConst`, `TestAccess`, `RescorePages*`, `FaultPage`, `EvictPages`, identity placement way, resident fast path, dirty bits ("a dirty page is unevictable"), "the hold/guard is the pin", private per-block page tables and cache grouping, "Rescore 0 drops a page". Many headers, tests, `eternia.md`, `design.md`, and `shared.md` still describe these.

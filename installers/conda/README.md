@@ -210,7 +210,7 @@ conda install cuda-toolkit -c nvidia
 
 - Main README: `../../README.md`
 - Build wheel guide: `../../BUILD_WHEEL.md`
-- Contributing guide: `../../docs/contributing.md`
+- Contributing guide: `../../.claude-plugin/plugins/iowarp-contributing/skills/contributing/SKILL.md`
 - CMake presets: `../../CMakePresets.json`
 </content>
 </invoke>

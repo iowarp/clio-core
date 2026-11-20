@@ -237,7 +237,7 @@ log covers them), but never a logged block whose bytes were lost.</p>
 
 <h2 id="registry">Durable pool registry</h2>
 <p>Each node keeps a small pool log of the durable pools it hosts and
-their parameters, fsynced on every change. <code>clio_run start</code>
+their parameters, fsynced on every change. <code>clio-run start</code>
 replays it in creation order, so a node comes back with the same storage
 tiers and module stack it had. <code>--fresh</code> discards it along with
 all other persisted state.</p>

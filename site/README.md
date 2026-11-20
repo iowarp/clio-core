@@ -13,8 +13,7 @@ It follows the editorial style of the sibling Clio sites
 ([clio-coder](https://github.com/iowarp/clio-coder) and
 [clio-agent](https://github.com/iowarp/clio-agent)): black and warm ivory,
 cyan accent, copper secondary, Newsreader headings, IBM Plex text and code,
-dark by default with a light theme. It is separate from, and narrower than,
-the Docusaurus documentation in the [`docs/`](../docs) submodule.
+dark by default with a light theme. It is the documentation for CLIO Core.
 
 ## Build and preview
 

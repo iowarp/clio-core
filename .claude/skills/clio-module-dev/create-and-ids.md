@@ -250,13 +250,13 @@ compose:
 ```
 
 - Each node walks its own compose list serially at start and fails startup on
-  a non-zero rc (`src/manager.cc:402-445`). On a plain `clio_run start`
+  a non-zero rc (`src/manager.cc:402-445`). On a plain `clio-run start`
   (recovery) compose pools are forced to `restart` and the address-table WAL
   and pool log are replayed (`src/manager.cc:417-455`); `start --fresh`
   discards the state.
 - `admin::Client::AsyncCompose` sends `ComposeTask<PoolConfig>` to the admin
   pool with the entry's `pool_query` (`modules/admin/include/clio_runtime/admin/admin_client.h:200-212`).
-- CLI: `clio_run compose start|stop|rm|list` (`util/clio_run_cmd_compose.cc`).
+- CLI: `clio-run compose start|stop|rm|list` (`util/clio_run_cmd_compose.cc`).
 - Your `CreateParams` needs `LoadConfig(const PoolConfig&)` (or equivalent)
   to read its keys from the YAML node. **Every key it reads needs a default**
   and must be documented in `config/clio_default.yaml` (see SKILL.md, config
@@ -338,7 +338,7 @@ Consequences for module authors:
 
 ## 7. Method ids and dispatch
 
-`clio_mod.yaml` assigns numbers; `clio_run refresh` turns them into
+`clio_mod.yaml` assigns numbers; `clio-run refresh` turns them into
 `Method::kFoo` constants and a generated `Runtime::Run` switch that casts the
 task to `FooTask` and `CLIO_CO_AWAIT`s your `Foo(task)` handler
 (`modules/MOD_NAME/src/autogen/MOD_NAME_lib_exec.cc:33-110`). The method id

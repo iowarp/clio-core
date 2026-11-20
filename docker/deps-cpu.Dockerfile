@@ -406,7 +406,7 @@ ENV PATH="/home/iowarp/.cargo/bin:${PATH}"
 RUN curl -fsSL https://bun.sh/install | bash
 ENV PATH="/home/iowarp/.bun/bin:${PATH}"
 
-# Install Node.js 22 LTS (required by Docusaurus docs site, needs >= 20)
+# Install Node.js 22 LTS
 USER root
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl gnupg && \
     mkdir -p /etc/apt/keyrings && \
@@ -420,12 +420,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     node --version && \
     chown -R iowarp:iowarp /home/iowarp/.npm || true
 USER iowarp
-
-# Install docs site (Docusaurus) dependencies
-# Try SSH clone first, fall back to HTTPS if SSH is unavailable
-RUN cd /home/iowarp \
-    && (git clone -b iowarp-dev git@github.com:iowarp/docs.git 2>/dev/null || \
-        git clone -b iowarp-dev https://github.com/iowarp/docs.git)
 
 # Create Python virtual environment and install build tools
 RUN python3 -m venv /home/iowarp/venv && \

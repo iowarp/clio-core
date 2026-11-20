@@ -10,7 +10,7 @@ facts: Process | one per node ; Core pieces | config, IPC, module, pool, work or
 <figure class="diagram">
   <svg viewBox="0 0 860 470" role="img" aria-label="Internal structure of one Context Runtime process">
     <defs><marker id="rd0" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10 z"/></marker></defs>
-    <text class="muted" x="20" y="22">ONE RUNTIME PROCESS (clio_run start)</text>
+    <text class="muted" x="20" y="22">ONE RUNTIME PROCESS (clio-run start)</text>
     <rect class="box" x="10" y="32" width="840" height="428" rx="10" stroke-dasharray="6 5"/>
     <rect class="box alt" x="30" y="50" width="180" height="56" rx="8"/><text class="title" x="42" y="74">Config manager</text><text class="muted" x="42" y="92">clio.yaml, hostfile</text>
     <rect class="box alt" x="230" y="50" width="180" height="56" rx="8"/><text class="title" x="242" y="74">Module manager</text><text class="muted" x="242" y="92">finds, dlopens ChiMods</text>
@@ -176,7 +176,7 @@ facts: Process | one per node ; Core pieces | config, IPC, module, pool, work or
 
 <h2 id="durability">What persists</h2>
 <ul>
-  <li><strong>The restart log</strong> is an append-only log of the compose files that should be re-composed at the next <code>clio_run start</code>. Pools created with <code>restart: true</code> are recorded the same way. <code>--fresh</code> discards it.</li>
+  <li><strong>The restart log</strong> is an append-only log of the compose files that should be re-composed at the next <code>clio-run start</code>. Pools created with <code>restart: true</code> are recorded the same way. <code>--fresh</code> discards it.</li>
   <li><strong>Cost models</strong> are saved per module, pool, node and container, flushed about once a second while they change and on shutdown, and restored when the container is recreated, so a restarted runtime schedules well from the first task.</li>
   <li><strong>Module state</strong> is the module's own business: the CTE keeps its metadata log, a block device its allocation log. A container's recovery callback is where it reloads them.</li>
 </ul>

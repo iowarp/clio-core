@@ -16,7 +16,7 @@ Paths are relative to `context-runtime/` unless they name another component
 
 ## 2. Processes
 
-- **Runtime (server) process**: `clio_run start` (kServer mode). Owns the
+- **Runtime (server) process**: `clio-run start` (kServer mode). Owns the
   shared-memory segments, the workers, every pool's containers, and the
   network endpoints. One runtime per node; nodes are listed in the hostfile.
 - **Client processes**: applications and adapters linking module client
@@ -42,8 +42,6 @@ Paths are relative to `context-runtime/` unless they name another component
   `ServerFinalize` then `ClientFinalize` (`:163-183`). Call
   `CLIO_RUNTIME_FINALIZE()` before exit in tests (ZMQ context teardown hangs
   otherwise).
-- There is no `CLIO_RUNTIME_INIT` macro any more (only a stale mention in a
-  comment, `clio_runtime.h:81`).
 
 ## 3. Managers (singletons)
 

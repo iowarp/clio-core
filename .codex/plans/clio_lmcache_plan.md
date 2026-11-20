@@ -8,7 +8,6 @@ When starting a new session, ask Codex:
 
 ```text
 Please read /workspace/.codex/plans/clio_lmcache_plan.md before working.
-Follow it in addition to /workspace/AGENTS.md.
 ```
 
 ## Current Goal

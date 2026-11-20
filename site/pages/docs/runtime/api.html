@@ -1,14 +1,14 @@
 <!--
 title: API reference
 heading: Context Runtime <em>reference.</em>
-description: The clio_run command and its subcommands, client initialisation, PoolQuery routing modes, the task and coroutine macros, the container callbacks, the CMake functions for ChiMods, the configuration file sections and the runtime environment variables.
+description: The clio-run command and its subcommands, client initialisation, PoolQuery routing modes, the task and coroutine macros, the container callbacks, the CMake functions for ChiMods, the configuration file sections and the runtime environment variables.
 eyebrow: Docs · Context Runtime
 lede: Everything an operator types and everything a module author calls, with the defaults as they are in the source. The filesystem daemon that attaches to this runtime, clio_cte_fuse, is documented with Context FS.
-facts: Command | clio_run ; Headers | clio_runtime/clio_runtime.h, pool_query.h, container.h, task.h ; Config | ~/.clio/clio.yaml
+facts: Command | clio-run ; Headers | clio_runtime/clio_runtime.h, pool_query.h, container.h, task.h ; Config | ~/.clio/clio.yaml
 -->
-<h2>clio_run</h2>
+<h2>clio-run</h2>
 <pre data-label="usage">
-clio_run <command> [options]
+clio-run <command> [options]
 </pre>
 <ul>
   <li><code>start</code>: start the runtime in the foreground, recover every piece of persistent state it finds, and compose the pools in the configuration.</li>
@@ -20,10 +20,10 @@ clio_run <command> [options]
   <li><code>migrate</code>: move a container to a different node.</li>
   <li><code>refresh</code>: regenerate ChiMod method files for module development.</li>
 </ul>
-<p>The nested forms <code>clio_run runtime start|stop|status</code> and <code>clio_run repo refresh</code> still work. <code>clio_run restart</code> was removed: <code>start</code> always recovers state, and <code>start --fresh</code> discards it.</p>
+<p>The nested forms <code>clio-run runtime start|stop|status</code> and <code>clio-run repo refresh</code> still work. <code>clio-run restart</code> was removed: <code>start</code> always recovers state, and <code>start --fresh</code> discards it. <code>clio_run</code> is installed as an alias of <code>clio-run</code> for older scripts.</p>
 <h3>start</h3>
 <pre data-label="usage">
-clio_run start [--fresh] [--induct] [--ephemeral] [--disk <path>]
+clio-run start [--fresh] [--induct] [--ephemeral] [--disk <path>]
                [--viz | --no-viz] [--viz-port <port>] [--viz-bind <addr>]
 </pre>
 <ul>
@@ -36,7 +36,7 @@ clio_run start [--fresh] [--induct] [--ephemeral] [--disk <path>]
 </ul>
 <h3>stop</h3>
 <pre data-label="usage">
-clio_run stop [--force] [--grace-period <ms>]
+clio-run stop [--force] [--grace-period <ms>]
 </pre>
 <ul>
   <li><code>--grace-period &lt;ms&gt;</code>: drain budget for in-flight work (default 5000; 0 means the default). A graceful stop also moves RAM-tier data to disk within this budget.</li>
@@ -53,13 +53,13 @@ clio_run stop [--force] [--grace-period <ms>]
 <p>The probe waits up to 2 s unless <code>CLIO_WAIT_SERVER</code> is set.</p>
 <h3 id="compose">compose</h3>
 <pre data-label="usage">
-clio_run compose start <config.yaml>
-clio_run compose stop  <config.yaml>
-clio_run compose rm    <config.yaml>
-clio_run compose list  [--restartable]
+clio-run compose start <config.yaml>
+clio-run compose stop  <config.yaml>
+clio-run compose rm    <config.yaml>
+clio-run compose list  [--restartable]
 </pre>
 <ul>
-  <li><code>start</code>: create the pools in the file's <code>compose:</code> list, in order, through the admin pool. Pools with <code>restart: true</code> are recorded in each node's pool log and recreated by the next <code>clio_run start</code>.</li>
+  <li><code>start</code>: create the pools in the file's <code>compose:</code> list, in order, through the admin pool. Pools with <code>restart: true</code> are recorded in each node's pool log and recreated by the next <code>clio-run start</code>.</li>
   <li><code>stop</code>: destroy the listed pools but keep them in the pool log, so they are still restartable.</li>
   <li><code>rm</code>: destroy the listed pools and drop them from the pool log. The compose file itself is kept.</li>
   <li><code>list</code>: list the active containers in the local runtime. <code>--restartable</code> lists the pool-log entries instead, read from <code>&lt;conf_dir&gt;/wal</code> without contacting the runtime.</li>
@@ -99,7 +99,7 @@ void CLIO_RUNTIME_FINALIZE();
 <ul>
   <li><code>mode</code>: <code>kClient</code> for a program; <code>kServer</code> (alias <code>kRuntime</code>) for a process that is the runtime, which fails if one is already running on the port.</li>
   <li><code>default_with_runtime</code>: used when <code>CLIO_WITH_RUNTIME</code> is unset. In client mode "with runtime" means try to be the runtime and attach if the port is already bound, so several processes launched together elect one host. <code>false</code> only attaches.</li>
-  <li><code>is_restart</code>: <code>true</code> recovers the node's persistent state (a plain <code>clio_run start</code>); <code>false</code> discards it.</li>
+  <li><code>is_restart</code>: <code>true</code> recovers the node's persistent state (a plain <code>clio-run start</code>); <code>false</code> discards it.</li>
   <li>Returns <code>false</code> when no runtime could be started or reached within <code>CLIO_WAIT_SERVER</code>.</li>
 </ul>
 <p>Call <code>CLIO_RUNTIME_FINALIZE()</code> before the process exits; it closes the sockets and joins the background threads the client started.</p>
@@ -145,7 +145,7 @@ void CLIO_RUNTIME_FINALIZE();
   <li><code>void Migrate(u32 dest_node_id)</code>: move state to another node. Default no-op.</li>
   <li><code>u64 GetWorkRemaining() const</code>: pending work, used when draining.</li>
 </ul>
-<p>The admin module also provides <code>AsyncHeartbeat</code>, <code>AsyncCompose(PoolConfig)</code>, <code>AsyncDestroyPool(PoolQuery, PoolId, flags)</code> and <code>AsyncListContainers(PoolQuery)</code> on <code>clio::run::admin::Client</code>, which the <code>clio_run</code> subcommands use.</p>
+<p>The admin module also provides <code>AsyncHeartbeat</code>, <code>AsyncCompose(PoolConfig)</code>, <code>AsyncDestroyPool(PoolQuery, PoolId, flags)</code> and <code>AsyncListContainers(PoolQuery)</code> on <code>clio::run::admin::Client</code>, which the <code>clio-run</code> subcommands use.</p>
 
 <h2>CMake functions</h2>
 <p>Provided by <code>ClioCoreCommon.cmake</code>, loaded by <code>find_package(clio-core CONFIG)</code>. Both read <code>clio_mod.yaml</code> in the current source directory and search upward for <code>clio_repo.yaml</code>.</p>
