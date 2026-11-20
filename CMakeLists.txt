@@ -435,6 +435,13 @@ if(CLIO_CORE_ENABLE_MPI)
     set(MPI_LIBS MPI::MPI_CXX)
     message(STATUS "found mpi.h at ${MPI_CXX_INCLUDE_DIRS}")
 endif()
+# The deprecated MPI C++ bindings are never used, but mpi.h pulls them in
+# (Intel MPI's mpicxx.h, OpenMPI's and MPICH's equivalents) and some of them
+# fail to compile under newer compilers, e.g. clang in CUDA mode. Skip them
+# everywhere, since clio_ctp.h includes mpi.h for every target when MPI is on.
+if(CLIO_CORE_ENABLE_MPI)
+    add_compile_definitions(OMPI_SKIP_MPICXX MPICH_SKIP_MPICXX)
+endif()
 
 # ROCm (conditional). Only require the HIP CMake package when HIP-AMD is
 # in use; the HIP-NVCC path goes through CMake's CUDA language and the
