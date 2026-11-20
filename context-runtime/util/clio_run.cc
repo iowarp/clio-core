@@ -1,7 +1,9 @@
 #include <cstring>
 #include <iostream>
 #include <string>
+#include <vector>
 
+#include "clio_ctp/introspect/system_info.h"
 #include "clio_run_commands.h"
 
 // Injected by CMake from project(iowarp-core VERSION ...) through the
@@ -17,7 +19,13 @@ namespace {
 const char* g_progname = "clio-run";
 
 void PrintUsage() {
-  std::cerr << "Usage: " << g_progname << " <command> [options]\n"
+  std::cerr << "Usage: " << g_progname << " [--local] <command> [options]\n"
+            << "\n"
+            << "Global options:\n"
+            << "  --local         Single-host mode: bind and connect on\n"
+            << "                  127.0.0.1 only (sets CLIO_BIND_ADDR and\n"
+            << "                  CLIO_SERVER_ADDR). Never listens on 0.0.0.0,\n"
+            << "                  so no firewall prompt. Accepted anywhere.\n"
             << "\n"
             << "Commands:\n"
             << "  start           Start the Clio runtime server; it recovers\n"
@@ -59,6 +67,40 @@ int RestartRemoved() {
             << " start --fresh` (discard this node's state).\n";
   return 1;
 }
+
+/**
+ * Remove every `--local` from the argument list and, if any was present,
+ * pin the runtime and its clients to loopback.
+ *
+ * Sets CLIO_BIND_ADDR (what every server socket binds) and CLIO_SERVER_ADDR
+ * (what clients connect to) to 127.0.0.1 in this process's environment, so a
+ * runtime started from here -- in process or as a spawned daemon, which
+ * inherits the environment -- never listens on 0.0.0.0. A single-host
+ * runtime then needs no hostfile and trips no firewall prompt. Loopback
+ * binding also makes the runtime ignore any configured hostfile (see
+ * IpcManager's single-node path).
+ *
+ * @param argc in/out: argument count; reduced by the number of flags removed
+ * @param argv in/out: argument vector, compacted in place (argv[0] kept)
+ * @return true if `--local` was given
+ */
+bool ConsumeLocalFlag(int &argc, char *argv[]) {
+  int out = 0;
+  bool local = false;
+  for (int i = 0; i < argc; ++i) {
+    if (i > 0 && argv[i] != nullptr && std::strcmp(argv[i], "--local") == 0) {
+      local = true;
+      continue;
+    }
+    argv[out++] = argv[i];
+  }
+  argc = out;
+  if (local) {
+    ctp::SystemInfo::Setenv("CLIO_BIND_ADDR", std::string("127.0.0.1"), 1);
+    ctp::SystemInfo::Setenv("CLIO_SERVER_ADDR", std::string("127.0.0.1"), 1);
+  }
+  return local;
+}
 }  // namespace
 
 int main(int argc, char* argv[]) {
@@ -68,6 +110,10 @@ int main(int argc, char* argv[]) {
     const char* base = std::strrchr(argv[0], '/');
     g_progname = base ? base + 1 : argv[0];
   }
+
+  // Global, position-independent: strip it before dispatch so no subcommand
+  // parser sees it.
+  ConsumeLocalFlag(argc, argv);
 
   if (argc < 2) {
     PrintUsage();

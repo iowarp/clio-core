@@ -2544,11 +2544,9 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
       // wrote, never lowering one. Per extent, because two writers sharing a
       // blob otherwise release each other's waits -- see BlobBlock.
       if (task->context_.op_flags_ & Context::kGenerational) {
-        if (task->context_.generation_ > blob_info_ptr->generation_) {
-          blob_info_ptr->generation_ = task->context_.generation_;
-        }
-        blob_info_ptr->StampRangeGeneration(offset, size,
-                                            task->context_.generation_);
+        blob_info_ptr->PublishGeneration(
+            offset, size, task->context_.generation_,
+            (task->context_.transform_flags_ & kBlobTransformed) != 0);
       }
 
       task->return_code_ = 0;
@@ -2935,11 +2933,9 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     blob_info_ptr->score_ = blob_score;
     // GENERATIONAL PUT: see the note on the replica path above.
     if (task->context_.op_flags_ & Context::kGenerational) {
-      if (task->context_.generation_ > blob_info_ptr->generation_) {
-        blob_info_ptr->generation_ = task->context_.generation_;
-      }
-      blob_info_ptr->StampRangeGeneration(offset, size,
-                                          task->context_.generation_);
+      blob_info_ptr->PublishGeneration(
+          offset, size, task->context_.generation_,
+          (context.transform_flags_ & kBlobTransformed) != 0);
       // EMPTY IS OFF. docker-compose declares `CLIO_GEN_LOG=${CLIO_GEN_LOG:-}`
     // unconditionally, so the variable is always PRESENT in the container and
     // `getenv != nullptr` would leave this on for every run.

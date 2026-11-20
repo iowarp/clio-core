@@ -43,6 +43,15 @@ set(CLIO_CORO_TARGET_BLOCKS 4 CACHE STRING
 mark_as_advanced(CLIO_CORO_REGS_PER_SM CLIO_CORO_REF_THREADS
                  CLIO_CORO_TARGET_BLOCKS)
 
+# The whole mechanism switches itself on wherever llvm-config is found. This
+# option turns it off explicitly, for builds that have LLVM development files
+# for another reason (e.g. clio-coroc) but must not load the pass plugin into
+# the CUDA compiler: with apt's clang 22 the probe build crashes the clang
+# frontend (gpu-tests.yml, clio_lammps_md_paged_bench_regprobe).
+option(CLIO_CORO_REGCAP
+       "Measure coroutine kernels and cap their registers with the NVPTXCoroCap plugin (needs llvm-config)"
+       ON)
+
 # --------------------------------------------------------------------------
 # The pass plugin, built once for the whole project.
 # --------------------------------------------------------------------------
@@ -53,6 +62,12 @@ function(_clio_coro_regcap_plugin out_var)
     return()
   endif()
 
+  if(NOT CLIO_CORO_REGCAP)
+    message(STATUS "coro_regcap: disabled (CLIO_CORO_REGCAP=OFF) -- coroutine "
+                   "kernels keep their natural register allocation")
+    set(${out_var} "" PARENT_SCOPE)
+    return()
+  endif()
   find_program(CLIO_LLVM_CONFIG NAMES llvm-config-22 llvm-config)
   if(NOT CLIO_LLVM_CONFIG)
     message(STATUS "coro_regcap: llvm-config not found -- coroutine kernels "

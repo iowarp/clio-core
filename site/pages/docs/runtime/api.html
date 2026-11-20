@@ -8,8 +8,9 @@ facts: Command | clio-run ; Headers | clio_runtime/clio_runtime.h, pool_query.h,
 -->
 <h2>clio-run</h2>
 <pre data-label="usage">
-clio-run <command> [options]
+clio-run [--local] <command> [options]
 </pre>
+<p><code>--local</code>, accepted anywhere on the command line, runs single-host on loopback: it sets <code>CLIO_BIND_ADDR</code> and <code>CLIO_SERVER_ADDR</code> to <code>127.0.0.1</code> for that invocation and any runtime it starts, so nothing listens on <code>0.0.0.0</code>, no firewall prompt appears, and a configured hostfile is ignored. Programs that host the runtime in their own process (benchmarks, tests) do not go through <code>clio-run</code>; set the two variables for them.</p>
 <ul>
   <li><code>start</code>: start the runtime in the foreground, recover every piece of persistent state it finds, and compose the pools in the configuration.</li>
   <li><code>stop</code>: stop the local runtime.</li>
@@ -208,7 +209,7 @@ add_clio_module_runtime(<same arguments>)
   <li><code>CLIO_STORAGE_ROOT</code> (<code>~/.clio</code>): directory for on-disk state; expanded as <code>${CLIO_STORAGE_ROOT}</code> in the file.</li>
   <li><code>CLIO_PORT</code> (9413): overrides <code>networking.port</code>.</li>
   <li><code>CLIO_SERVER_ADDR</code>: address clients use to reach the runtime.</li>
-  <li><code>CLIO_BIND_ADDR</code>: address the runtime binds its TCP sockets to. On Windows set both this and <code>CLIO_SERVER_ADDR</code> to <code>127.0.0.1</code>.</li>
+  <li><code>CLIO_BIND_ADDR</code>: address the runtime binds its TCP sockets to. On Windows set both this and <code>CLIO_SERVER_ADDR</code> to <code>127.0.0.1</code>, or pass <code>clio-run --local</code>.</li>
   <li><code>CLIO_IPC_MODE</code>: <code>SHM</code>, <code>IPC</code> or <code>TCP</code>. Unset, the client picks shared memory for a runtime on the same machine, otherwise a Unix socket, otherwise TCP.</li>
   <li><code>CLIO_WITH_RUNTIME</code>: <code>0</code> attaches to a running runtime only; <code>1</code> makes sure one is available. Unset, the program's <code>default_with_runtime</code> applies.</li>
   <li><code>CLIO_WAIT_SERVER</code>: seconds a client waits for the runtime. <code>status</code> uses 2, <code>stop</code> 5, the FUSE mount 600.</li>
