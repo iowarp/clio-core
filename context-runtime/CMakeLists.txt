@@ -144,7 +144,12 @@ set(MAIN_PACKAGE_NAME "${CLIO_RUN_PACKAGE_NAME}")
 # Include cereal in export if it was built as a submodule
 set(_CEREAL_TARGET "")
 if(TARGET cereal)
-    set(_CEREAL_TARGET cereal)
+    # Not when cereal comes from an install: its target is IMPORTED, which
+    # install(EXPORT) cannot carry (Spack's cereal exports a plain `cereal`).
+    get_target_property(_cereal_imported cereal IMPORTED)
+    if(NOT _cereal_imported)
+        set(_CEREAL_TARGET cereal)
+    endif()
 endif()
 
 # Collect GPU target if it exists.

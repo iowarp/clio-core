@@ -115,11 +115,10 @@ jobs:
           fi
           echo "SPEC=$(echo $SPEC)" >> "$GITHUB_ENV"
 
+      # Outside the workspace: Spack installs under its own tree, and CMake
+      # refuses to export include paths that sit inside the source directory.
       - name: Checkout spack
-        uses: actions/checkout@v4
-        with:
-          repository: spack/spack
-          path: ./spack
+        run: git clone --depth 1 https://github.com/spack/spack.git "$HOME/spack"
 
       - name: Install system build tools
         run: |
@@ -172,7 +171,7 @@ jobs:
         run: |
           # Convert SSH submodule URLs to HTTPS so spack can clone without keys.
           git config --global url."https://github.com/".insteadOf "git@github.com:"
-          . ./spack/share/spack/setup-env.sh
+          . "$HOME/spack/share/spack/setup-env.sh"
           spack repo add installers/spack
           # Public binary cache: anything whose hash matches is not rebuilt.
           spack mirror add --type binary spack-develop https://binaries.spack.io/develop
@@ -183,12 +182,19 @@ jobs:
             autoconf automake libtool m4 pkgconf gmake bison flex
           case "${{ matrix.toolchain }}" in
             cuda)
-              spack external find --not-buildable --path /usr/local/cuda-12.9 cuda
-              # Register apt.llvm.org's clang by its own prefix: `external find`
-              # reports it under /usr, whose bin/ has only clang++-22.
-              llvm_ver=$(/usr/lib/llvm-22/bin/clang++ --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+              # Pin the apt toolkits as externals, by their own prefixes:
+              # `external find` reports apt.llvm.org's clang under /usr (whose
+              # plain clang++ is the runner's older system clang) and missed
+              # the CUDA 12.9 install, so Spack built CUDA 13 instead.
+              cuda_ver=$(/usr/local/cuda-12.9/bin/nvcc --version | grep -oE 'V[0-9]+[.][0-9]+[.][0-9]+' | tr -d V)
+              llvm_ver=$(/usr/lib/llvm-22/bin/clang++ --version | grep -oE '[0-9]+[.][0-9]+[.][0-9]+' | head -1)
               cat >> "$(spack location -r)/etc/spack/packages.yaml" <<EOF2
           packages:
+            cuda:
+              buildable: false
+              externals:
+              - spec: cuda@${cuda_ver}
+                prefix: /usr/local/cuda-12.9
             llvm:
               buildable: false
               externals:
@@ -210,7 +216,7 @@ jobs:
 
       - name: Concretize
         run: |
-          . ./spack/share/spack/setup-env.sh
+          . "$HOME/spack/share/spack/setup-env.sh"
           spack env create --without-view -d ci-env
           spack -e ci-env develop --path "$GITHUB_WORKSPACE" iowarp@=dev
           spack -e ci-env add "iowarp@=dev ${SPEC}"
@@ -218,7 +224,7 @@ jobs:
 
       - name: Install
         run: |
-          . ./spack/share/spack/setup-env.sh
+          . "$HOME/spack/share/spack/setup-env.sh"
           spack -e ci-env install --fail-fast -j "$(nproc)" || {
             echo "=== spack build logs ==="
             find /tmp -path '*spack-stage*' -name 'spack-build-out.txt' \
@@ -230,7 +236,7 @@ jobs:
       # check each feature's files are really there (#1194).
       - name: Verify the features were installed
         run: |
-          . ./spack/share/spack/setup-env.sh
+          . "$HOME/spack/share/spack/setup-env.sh"
           prefix=$(spack -e ci-env location -i iowarp)
           echo "prefix: $prefix"
           missing=0

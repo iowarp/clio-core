@@ -382,6 +382,13 @@ class Iowarp(CMakePackage, CudaPackage, ROCmPackage):
         @return the path of the clang++ to use
         """
         bindir = self.spec['llvm'].prefix.bin
+        # A distribution prefix (/usr) can hold several clangs, with the plain
+        # name pointing at the system default; take the one matching llvm's
+        # version first.
+        major = str(self.spec['llvm'].version.up_to(1))
+        matching = join_path(bindir, 'clang++-' + major)
+        if os.path.exists(matching):
+            return matching
         plain = join_path(bindir, 'clang++')
         if os.path.exists(plain):
             return plain
