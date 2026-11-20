@@ -1,0 +1,93 @@
+<!--
+title: POSIX interceptor
+heading: Intercept <em>POSIX I/O.</em>
+description: How to use the CLIO Core POSIX interceptor: build it with CLIO_CORE_ENABLE_ELF, preload libclio_cte_posix.so, open files under a clio:: path, and what it intercepts, what it does not, and how writes, fsync and errors behave.
+eyebrow: Docs · I/O adapters
+lede: The POSIX interceptor sends <code>open</code>, <code>read</code>, <code>write</code>, <code>stat</code> and related calls on <code>clio::</code> paths to the CLIO filesystem module instead of the kernel. The program needs no changes and no recompile: preload the library and point the program at a <code>clio::</code> path.
+facts: Library | libclio_cte_posix.so ; Build | CLIO_CTE_ENABLE_POSIX_ADAPTER=ON CLIO_CORE_ENABLE_ELF=ON ; Load | LD_PRELOAD ; Platform | Linux ; Install | Source builds: Spack (+posix) or CMake
+-->
+<h2>How it works</h2>
+<p>The library defines <code>open</code>, <code>write</code> and the other functions below itself. Loaded with <code>LD_PRELOAD</code>, its definitions win over the C library's. Each call checks the path (or the descriptor): if the path has a component starting with <code>clio::</code>, the call goes to the <code>clio_cte_filesystem</code> module in the runtime; anything else goes to the real C library untouched. The marker is removed, so <code>clio::/data/out.bin</code> is the file <code>/data/out.bin</code> in the clio-fs namespace, the same namespace a <a href="/docs/context-fs/index.html">Context FS</a> mount shows. Nothing is written to <code>/data/out.bin</code> on the host's own filesystem.</p>
+<p>The interceptor attaches to the runtime on the first <code>clio::</code> open, not at load time, so a preloaded program that never opens a <code>clio::</code> path never connects.</p>
+
+<h2>1. Build it</h2>
+<p>The POSIX adapter option is on by default, but it is only built when ELF support is on. Configure a source build with:</p>
+<pre data-label="shell">
+$ cmake -S . -B build -DCLIO_CORE_ENABLE_ELF=ON -DCLIO_CTE_ENABLE_POSIX_ADAPTER=ON
+$ cmake --build build -j"$(nproc)"
+$ ls build/bin/libclio_cte_posix.so
+</pre>
+<p>ELF support needs libelf through pkg-config. See <a href="/docs/io-adapters/install.html">Install</a> for the details and for the other adapters. The interceptor is not in the pip wheel, conda or Docker; Spack builds it with <code>+posix</code> (on by default).</p>
+
+<h2>2. Start a runtime</h2>
+<p>The interceptor needs a running runtime with a filesystem pool. The default configuration composes one (<code>clio_cte_filesystem</code> at <code>560.0</code>), so the plain command is enough:</p>
+<pre data-label="shell">
+$ build/bin/clio-run start &
+</pre>
+<p>If you use your own configuration, it must contain a <code>clio_cte_filesystem</code> entry; the interceptor looks the pool up by that name and creates none. Set <code>CLIO_CFS_POOL</code> to use a pool with another name, or to name it by id (<code>CLIO_CFS_POOL=560.0</code>).</p>
+<p>When no runtime or no filesystem pool can be reached, opening a <code>clio::</code> path fails with <code>EIO</code>. The attach first waits for a server for <code>CLIO_WAIT_SERVER</code> seconds (30 by default).</p>
+
+<h2>3. Run a program under the interceptor</h2>
+<p>Any program that does POSIX I/O works. This one writes a file, syncs it, and reads it back; the path comes from the command line, which is the usual way to steer an unmodified program to a <code>clio::</code> path.</p>
+<pre data-label="c · hello_posix.c">
+#include <fcntl.h>
+#include <stdio.h>
+#include <unistd.h>
+
+int main(int argc, char **argv) {
+  const char *path = argc > 1 ? argv[1] : "clio::/demo/hello.txt";
+  const char msg[] = "hello from the POSIX interceptor\n";
+
+  int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+  if (fd < 0) { perror("open"); return 1; }
+  if (write(fd, msg, sizeof(msg) - 1) < 0) { perror("write"); return 1; }
+  if (fsync(fd) != 0) { perror("fsync"); return 1; }
+  close(fd);
+
+  char buf[64] = {0};
+  fd = open(path, O_RDONLY);
+  if (fd < 0) { perror("open"); return 1; }
+  ssize_t n = read(fd, buf, sizeof(buf) - 1);
+  close(fd);
+  printf("read %zd bytes: %s", n, buf);
+  return 0;
+}
+</pre>
+<pre data-label="shell">
+$ cc -o hello_posix hello_posix.c          # no CLIO headers or libraries needed
+$ LD_PRELOAD=$PWD/build/bin/libclio_cte_posix.so ./hello_posix clio::/demo/hello.txt
+read 33 bytes: hello from the POSIX interceptor
+</pre>
+<p>Run it without <code>LD_PRELOAD</code> and the same path is just a relative path whose first directory, <code>clio::</code>, does not exist, so <code>open</code> fails. That is a quick way to confirm the interceptor was loaded. After an install, the library is <code>&lt;prefix&gt;/lib/libclio_cte_posix.so</code>.</p>
+
+<h2>What is intercepted</h2>
+<dl class="notes">
+<div><dt>Open and create</dt><dd><code>open</code>, <code>open64</code>, <code>__open_2</code>, <code>creat</code>, <code>creat64</code>. <code>O_CREAT</code>, <code>O_TRUNC</code> and <code>O_APPEND</code> are honored. Parent directories that do not exist yet in clio-fs are created on the fly.</dd></div>
+<div><dt>Data</dt><dd><code>read</code>, <code>write</code>, <code>pread</code>, <code>pwrite</code>, <code>pread64</code>, <code>pwrite64</code>, <code>lseek</code>, <code>lseek64</code>.</dd></div>
+<div><dt>Metadata</dt><dd><code>stat</code>, <code>fstat</code>, their <code>64</code> variants and the glibc <code>__xstat</code>, <code>__lxstat</code>, <code>__fxstat</code> and <code>__fxstatat</code> entry points; <code>ftruncate</code>, <code>ftruncate64</code>.</dd></div>
+<div><dt>Lifetime</dt><dd><code>fsync</code>, <code>close</code>, <code>unlink</code>, <code>remove</code>. <code>flock</code> on a CLIO descriptor succeeds without locking anything.</dd></div>
+</dl>
+<p>Descriptors returned for <code>clio::</code> files start at 8192, so they never collide with the kernel's. <code>stat</code> results are synthesized by the filesystem module and report 1 MiB blocks, the module's page size.</p>
+
+<h2>Behavior</h2>
+<ul>
+  <li><strong>Writes are synchronous.</strong> <code>write</code> returns once the filesystem module has the bytes, and a failure is reported by that <code>write</code> itself: <code>ENOSPC</code> when the store is full, <code>EIO</code> otherwise.</li>
+  <li><strong><code>fsync</code> is a durability barrier.</strong> It puts the file's bytes on a persistent device, the same guarantee as <code>fsync</code> through the Context FS mount. Without it, data stays on whichever tier took it (RAM, typically) until the runtime's periodic flush.</li>
+  <li><strong>Reads can skip the runtime.</strong> When the configuration composes the shared-memory cache module (<code>clio_cte_core_shm_cache_writethru</code>, part of the default configuration), committed pages are read straight from shared memory. Otherwise each read is a task to the filesystem module. <code>CLIO_CFS_SHM_READ=0</code> turns the shared-memory path off, for diagnosis.</li>
+  <li><strong>Durability is the compose's.</strong> There is no backing file on a parallel filesystem; the tiers the runtime composes decide where the data lives and how long it survives.</li>
+</ul>
+
+<h2>Limits</h2>
+<ul>
+  <li>Not intercepted: <code>mmap</code>, vectored I/O (<code>readv</code>, <code>writev</code>), <code>openat</code>, <code>rename</code>, <code>dup</code>, <code>fcntl</code>, <code>mkdir</code> and directory iteration (<code>opendir</code>, <code>readdir</code>), <code>fallocate</code>. A program that relies on these for a <code>clio::</code> file will see the kernel's answer for a descriptor or path it does not know. Use the <a href="/docs/context-fs/index.html">Context FS mount</a> when you need full POSIX semantics.</li>
+  <li>The checked variants glibc substitutes under <code>_FORTIFY_SOURCE</code> with optimization (<code>__read_chk</code>, <code>__pread_chk</code>) are not defined by the interceptor, so those reads are not intercepted; <code>__open_2</code> is. Build the program without <code>_FORTIFY_SOURCE</code> (add <code>-U_FORTIFY_SOURCE</code> where the toolchain enables it by default).</li>
+  <li>Linux only, and only for dynamically linked programs: <code>LD_PRELOAD</code> has no effect on a static binary.</li>
+  <li>The program must open the file under a <code>clio::</code> path. Paths without the marker are never redirected.</li>
+</ul>
+
+<h2>Where to go next</h2>
+<ul>
+  <li><a href="/docs/io-adapters/stdio.html">STDIO interceptor</a> for <code>fopen</code>/<code>fwrite</code> code, and <a href="/docs/io-adapters/mpiio.html">MPI-IO</a> for <code>MPI_File_*</code>. Preload several at once with <code>LD_PRELOAD="libA.so libB.so"</code>.</li>
+  <li><a href="/docs/io-adapters/configuration.html">Configuration reference</a>: <code>CLIO_CFS_POOL</code>, <code>CLIO_CFS_SHM_READ</code> and the runtime attach variables.</li>
+  <li><a href="/design/adapters.html#interceptors">Interceptor design</a>.</li>
+</ul>

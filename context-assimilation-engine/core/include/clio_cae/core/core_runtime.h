@@ -86,8 +86,13 @@ class Runtime : public clio::run::Container {
 #ifdef CLIO_ENABLE_S3_REST
     // sockets==1 & requests>>1 is reuse. No-ops when no S3 I/O happened.
     s3_conn_pool_.LogTally();
+#ifdef CAE_ENABLE_S3
     // Where each object's latency actually went. Same placement, same reason.
+    // Defined with the S3 assimilator, which only CAE_ENABLE_S3 builds:
+    // CLIO_ENABLE_S3_REST alone also comes from the S3 storage tier
+    // (CLIO_ENABLE_AMAZON_DRIVE), which does not.
     S3AssimLogPhaseTally();
+#endif
 #endif
   }
 

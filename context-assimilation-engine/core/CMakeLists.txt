@@ -159,6 +159,11 @@ add_clio_module_runtime(
   LINK_LIBRARIES
     ${RUNTIME_LINK_LIBRARIES}
 )
+# Poco's TLS stack (Globus, the S3 read path) is static Poco + OpenSSL in the
+# pip wheel; keep its symbols private (see cmake/ClioCheckPocoAbi.cmake).
+if(Poco_FOUND)
+  clio_hide_static_tls(clio_cae_core_runtime)
+endif()
 
 # Add HDF5 include directories to runtime if enabled
 if(HDF5_ENABLED)

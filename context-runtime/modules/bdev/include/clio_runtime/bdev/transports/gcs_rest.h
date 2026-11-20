@@ -31,6 +31,8 @@
 #include <Poco/Net/HTTPRequest.h>
 #include <Poco/Net/HTTPResponse.h>
 #include <Poco/Net/HTTPMessage.h>
+
+#include "clio_runtime/bdev/transports/tls_ca.h"
 #include <Poco/Net/SSLManager.h>
 #include <Poco/Net/Context.h>
 #include <Poco/Net/RejectCertificateHandler.h>
@@ -90,10 +92,10 @@ inline void EnsureSslInitialized() {
     Poco::Net::initializeSSL();
     Poco::SharedPtr<Poco::Net::InvalidCertificateHandler> cert_handler(
         new Poco::Net::RejectCertificateHandler(false));
-    // privateKey="", cert="", caLocation="" + loadDefaultCAs=true => use the
-    // system CA bundle; VERIFY_RELAXED + RejectCertificateHandler => verify peer.
+    // caLocation = the system CA bundle (tls_ca.h) + loadDefaultCAs=true;
+    // VERIFY_RELAXED + RejectCertificateHandler => verify peer.
     Poco::Net::Context::Ptr context(new Poco::Net::Context(
-        Poco::Net::Context::CLIENT_USE, "", "", "",
+        Poco::Net::Context::CLIENT_USE, "", "", DefaultCaBundle(),
         Poco::Net::Context::VERIFY_RELAXED, 9, true,
         "ALL:!ADH:!LOW:!EXP:!MD5:@STRENGTH"));
     Poco::Net::SSLManager::instance().initializeClient(0, cert_handler, context);

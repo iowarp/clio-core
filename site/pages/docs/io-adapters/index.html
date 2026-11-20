@@ -1,0 +1,66 @@
+<!--
+title: Overview
+heading: I/O <em>adapters.</em>
+description: The CLIO Core I/O adapters: POSIX, STDIO and MPI-IO interceptors, the HDF5 VOL connector and VFD, and the ADIOS2 plugin engine. What each one does, where its data lives, the library it builds, and the source build they all require.
+eyebrow: Docs · I/O adapters
+lede: The I/O adapters let an application that uses POSIX, STDIO, MPI-IO, HDF5 or ADIOS2 store its data in the <a href="/docs/cte/index.html">Context Transfer Engine</a> without changing its I/O code. They come from <strong>source builds</strong>, with Spack or CMake; the pip wheel and conda do not include them, and the Docker image has only the HDF5 VOL connector and the ADIOS2 engine.
+facts: Adapters | POSIX, STDIO, MPI-IO, HDF5 VOL, HDF5 VFD, ADIOS2 ; Source | context-transfer-engine/adapter/ ; Install | Spack or a CMake source build ; Needs | A running clio-run runtime
+-->
+<h2>The adapters</h2>
+<table>
+  <tr><th>Adapter</th><th>Mechanism</th><th>Where the data lives</th><th>Library</th><th>CMake option</th></tr>
+  <tr><td><a href="/docs/io-adapters/posix.html">POSIX</a></td><td><code>LD_PRELOAD</code> interception of <code>open</code>, <code>read</code>, <code>write</code>, <code>stat</code> and friends</td><td>Only in the CTE (clio-fs)</td><td><code>libclio_cte_posix.so</code></td><td><code>CLIO_CTE_ENABLE_POSIX_ADAPTER</code> + <code>CLIO_CORE_ENABLE_ELF</code></td></tr>
+  <tr><td><a href="/docs/io-adapters/stdio.html">STDIO</a></td><td><code>LD_PRELOAD</code> interception of <code>fopen</code>, <code>fread</code>, <code>fwrite</code> and friends</td><td>Only in the CTE (clio-fs)</td><td><code>libclio_cte_stdio.so</code></td><td><code>CLIO_CTE_ENABLE_STDIO_ADAPTER</code> + <code>CLIO_CORE_ENABLE_ELF</code></td></tr>
+  <tr><td><a href="/docs/io-adapters/mpiio.html">MPI-IO</a></td><td><code>LD_PRELOAD</code> interception of <code>MPI_File_*</code></td><td>Only in the CTE (clio-fs)</td><td><code>libclio_cte_mpiio.so</code></td><td><code>CLIO_CTE_ENABLE_MPIIO_ADAPTER</code> + <code>CLIO_CORE_ENABLE_ELF</code></td></tr>
+  <tr><td><a href="/docs/io-adapters/hdf5-vol.html">HDF5 VOL</a></td><td>HDF5 VOL connector <code>clio</code>, above the HDF5 library</td><td>Native file first; dataset images cached in the CTE</td><td><code>libclio_hdf5_vol.so</code></td><td><code>CLIO_CTE_ENABLE_HDF5_VOL</code></td></tr>
+  <tr><td><a href="/docs/io-adapters/hdf5-vfd.html">HDF5 VFD</a></td><td>HDF5 virtual file driver <code>clio_vfd</code>, below the HDF5 library</td><td>Native file first; byte ranges optionally cached in the CTE</td><td><code>libclio_vfd.so</code></td><td><code>CLIO_CTE_ENABLE_VFD</code></td></tr>
+  <tr><td><a href="/docs/io-adapters/adios2.html">ADIOS2</a></td><td>ADIOS2 plugin engine</td><td>Only in the CTE: one blob per variable, step and rank</td><td><code>libiowarp_engine.so</code></td><td><code>CLIO_CTE_ENABLE_ADIOS2_ADAPTER</code></td></tr>
+</table>
+<p>The <a href="/docs/io-adapters/install.html">install page</a> has the exact configure lines, dependencies and output paths.</p>
+
+<div class="callout warn">
+  <span class="callout-title">Source builds</span>
+  <p><code>pip install iowarp-core</code>, the conda packages and the .deb/.rpm/AppImage/Windows packages contain none of these libraries, and the Docker image has only the HDF5 VOL connector and the ADIOS2 engine. Build CLIO Core from source with Spack (each adapter is a variant) or with CMake and the options above; see <a href="/docs/io-adapters/install.html">Install</a>.</p>
+</div>
+
+<h2>Two designs</h2>
+<p>The adapters fall into two groups that treat the CTE very differently.</p>
+<ul>
+  <li><strong>The CTE is the only home of the data.</strong> The POSIX, STDIO and MPI-IO interceptors hand a file to the filesystem module (<code>clio_cte_filesystem</code>), the same module behind <a href="/docs/context-fs/index.html">Context FS</a>. Nothing is written to the path on the host's own filesystem. The ADIOS2 engine writes blobs straight into a CTE tag. How durable the data is depends on the tiers the runtime composes.</li>
+  <li><strong>The CTE is a cache.</strong> The HDF5 VOL connector and VFD write every byte to an ordinary HDF5 file first, synchronously. <code>h5dump</code>, <code>h5py</code> and every other tool read that file with or without CLIO. The cache can be lost or dropped at any time without losing data.</li>
+</ul>
+
+<h2>The clio:: path marker</h2>
+<p>The three interceptors take over a file only when its path contains a component that starts with <code>clio::</code>. The marker is removed, and the rest is the file's path in the clio-fs namespace:</p>
+<table>
+  <tr><th>The application opens</th><th>Intercepted?</th><th>clio-fs path</th></tr>
+  <tr><td><code>clio::/data/run1/out.bin</code></td><td>Yes</td><td><code>/data/run1/out.bin</code></td></tr>
+  <tr><td><code>/scratch/clio::run1/out.bin</code></td><td>Yes</td><td><code>/scratch/run1/out.bin</code></td></tr>
+  <tr><td><code>/scratch/run1/out.bin</code></td><td>No: passed to the real library</td><td>none</td></tr>
+</table>
+<p>So the interceptors need a path you can choose: a command-line argument, an input deck, an environment variable. The HDF5 VFD is the opposite: it takes plain paths and refuses <code>clio::</code> names. The VOL connector and ADIOS2 engine do not look at the marker.</p>
+
+<h2>What every adapter needs at run time</h2>
+<ol class="steps">
+  <li><h3>A runtime</h3><p>Start one with <code>clio-run start</code>. The adapters attach to it as clients; the runtime reads <code>CLIO_SERVER_CONF</code> (default <code>~/.clio/clio.yaml</code>), and so does every client.</p></li>
+  <li><h3>The right pools</h3><p>The interceptors need a <code>clio_cte_filesystem</code> pool, which the default configuration composes at <code>560.0</code>. The HDF5 connectors and the ADIOS2 engine need a <code>clio_cte_core</code> pool; the HDF5 quickstart config names it <code>clio_cte_core</code>, the name clients look it up by. See the <a href="/docs/io-adapters/configuration.html">configuration reference</a>.</p></li>
+  <li><h3>The adapter loaded</h3><p><code>LD_PRELOAD</code> for an interceptor, <code>HDF5_PLUGIN_PATH</code> plus a selector for HDF5, <code>ADIOS2_PLUGIN_PATH</code> plus the plugin engine for ADIOS2. Each adapter page shows the exact lines.</p></li>
+</ol>
+
+<h2>Other adapters in the tree</h2>
+<p>The adapter directory holds a few more components. They are documented elsewhere or are not general-purpose I/O adapters:</p>
+<ul>
+  <li><strong>FUSE</strong> (<code>adapter/libfuse</code>, option <code>CLIO_CTE_ENABLE_FUSE_ADAPTER</code>): the <code>clio_cte_fuse</code> daemon that mounts the clio-fs namespace as a directory. See <a href="/docs/context-fs/index.html">Context FS</a>.</li>
+  <li><strong>Paged vectors</strong> (<code>adapter/cpu_vector</code>, <code>adapter/gpu_vector</code>): arrays larger than host or GPU memory whose pages are CTE blobs. See <a href="/docs/memory-expansion/index.html">Memory expansion</a>.</li>
+  <li><strong>cuFile (GDS) interceptor</strong> (<code>adapter/nvidia_gds</code>, option <code>CLIO_CTE_ENABLE_NVIDIA_GDS_ADAPTER</code>, needs <code>CLIO_CORE_ENABLE_CUDA=ON</code> and ELF): <code>libclio_cte_nvidia_gds.so</code> replaces <code>cuFileRead</code> and <code>cuFileWrite</code> with a copy through a host buffer and <code>pread</code>/<code>pwrite</code>, so that with the POSIX interceptor also preloaded a <code>clio::</code> path reaches the CTE. It is a compatibility shim, not GPU-direct I/O. Batch I/O goes to the real cuFile library unchanged.</li>
+  <li><strong>kvhdf5</strong> (<code>adapter/kvhdf5</code>, built when <code>CLIO_CORE_ENABLE_CUDA=ON</code>): a header-only, HDF5-like dataset API for CUDA kernels over the CTE. It is a GPU programming interface, not an adapter for existing HDF5 code.</li>
+  <li><strong>mapper</strong>: an internal header used by the adapters, with no user-facing interface.</li>
+</ul>
+
+<h2>Where to go next</h2>
+<ul>
+  <li><a href="/docs/io-adapters/install.html">Install</a>: build options, dependencies and library paths.</li>
+  <li>One walkthrough per adapter: <a href="/docs/io-adapters/posix.html">POSIX</a>, <a href="/docs/io-adapters/stdio.html">STDIO</a>, <a href="/docs/io-adapters/mpiio.html">MPI-IO</a>, <a href="/docs/io-adapters/hdf5-vol.html">HDF5 VOL</a>, <a href="/docs/io-adapters/hdf5-vfd.html">HDF5 VFD</a>, <a href="/docs/io-adapters/adios2.html">ADIOS2</a>.</li>
+  <li><a href="/docs/io-adapters/configuration.html">Configuration reference</a>: every environment variable and C entry point the adapters read.</li>
+  <li><a href="/design/adapters.html">Adapter design</a>: interception, the descriptor layer and the HDF5 caches in depth.</li>
+</ul>

@@ -1,0 +1,85 @@
+<!--
+title: STDIO interceptor
+heading: Intercept <em>STDIO streams.</em>
+description: How to use the CLIO Core STDIO interceptor: build it, preload libclio_cte_stdio.so, open streams on clio:: paths with fopen, which stream functions are intercepted, and the ones that must not be used on an intercepted stream.
+eyebrow: Docs · I/O adapters
+lede: The STDIO interceptor routes <code>fopen</code>, <code>fread</code>, <code>fwrite</code>, <code>fseek</code> and the other unformatted stream calls on <code>clio::</code> paths to the CLIO filesystem module. Like the POSIX interceptor, it is preloaded into an unmodified program; unlike it, it covers only part of the stream API, so check the list below against what your program calls.
+facts: Library | libclio_cte_stdio.so ; Build | CLIO_CTE_ENABLE_STDIO_ADAPTER=ON CLIO_CORE_ENABLE_ELF=ON ; Load | LD_PRELOAD ; Platform | Linux ; Install | Source builds: Spack (+stdio) or CMake
+-->
+<h2>How it works</h2>
+<p>When <code>fopen</code> is given a path with a <code>clio::</code> component, the interceptor opens the file in the <code>clio_cte_filesystem</code> module and returns a <code>FILE *</code> that is really an opaque token for that descriptor. The program only ever hands the token back to the stream functions, which the interceptor also defines, so it never notices. Every other <code>fopen</code>, and every call on an ordinary stream such as <code>stdout</code>, goes to the real C library. Files land in the same clio-fs namespace as the <a href="/docs/io-adapters/posix.html">POSIX interceptor</a> and <a href="/docs/context-fs/index.html">Context FS</a> use, with the marker removed: <code>clio::/demo/log.txt</code> is <code>/demo/log.txt</code>.</p>
+
+<h2>1. Build it</h2>
+<pre data-label="shell">
+$ cmake -S . -B build -DCLIO_CORE_ENABLE_ELF=ON -DCLIO_CTE_ENABLE_STDIO_ADAPTER=ON
+$ cmake --build build -j"$(nproc)"
+$ ls build/bin/libclio_cte_stdio.so
+</pre>
+<p>The option is off by default and needs ELF support (libelf). It is only available from a source build, with Spack (<code>+stdio</code>) or CMake; see <a href="/docs/io-adapters/install.html">Install</a>.</p>
+
+<h2>2. Start a runtime</h2>
+<pre data-label="shell">
+$ build/bin/clio-run start &
+</pre>
+<p>As for the POSIX interceptor, the runtime's configuration must compose a <code>clio_cte_filesystem</code> pool; the default configuration does. <code>CLIO_CFS_POOL</code> selects a pool by another name or by id.</p>
+
+<h2>3. Run a program under the interceptor</h2>
+<pre data-label="c · hello_stdio.c">
+#include <stdio.h>
+#include <string.h>
+
+int main(int argc, char **argv) {
+  const char *path = argc > 1 ? argv[1] : "clio::/demo/log.txt";
+
+  FILE *f = fopen(path, "w");
+  if (!f) { perror("fopen"); return 1; }
+  const char line[] = "step 1 done\n";
+  fwrite(line, 1, strlen(line), f);
+  fputs("step 2 done\n", f);
+  fclose(f);
+
+  char buf[64];
+  f = fopen(path, "r");
+  if (!f) { perror("fopen"); return 1; }
+  while (fgets(buf, sizeof(buf), f) != NULL) {   /* test the return value, not feof() */
+    printf("read: %s", buf);
+  }
+  fclose(f);
+  return 0;
+}
+</pre>
+<pre data-label="shell">
+$ cc -o hello_stdio hello_stdio.c
+$ LD_PRELOAD=$PWD/build/bin/libclio_cte_stdio.so ./hello_stdio clio::/demo/log.txt
+read: step 1 done
+read: step 2 done
+</pre>
+<p>A program that mixes <code>FILE *</code> streams and raw descriptors on the same <code>clio::</code> file needs both interceptors: <code>LD_PRELOAD="$PWD/build/bin/libclio_cte_stdio.so $PWD/build/bin/libclio_cte_posix.so"</code>.</p>
+
+<h2>What is intercepted</h2>
+<dl class="notes">
+<div><dt>Open and close</dt><dd><code>fopen</code>, <code>fopen64</code>, <code>fdopen</code> (on a descriptor the POSIX interceptor returned), <code>freopen</code>, <code>freopen64</code>, <code>fclose</code>. Modes <code>r</code>, <code>w</code>, <code>a</code> and their <code>+</code> forms map to the usual <code>open</code> flags.</dd></div>
+<div><dt>Write</dt><dd><code>fwrite</code>, <code>fputc</code>, <code>putc</code>, <code>putw</code>, <code>fputs</code>.</dd></div>
+<div><dt>Read</dt><dd><code>fread</code>, <code>fgetc</code>, <code>getc</code>, <code>getw</code>, <code>fgets</code>.</dd></div>
+<div><dt>Position</dt><dd><code>fseek</code>, <code>fseeko</code>, <code>fseeko64</code>, <code>ftell</code>, <code>rewind</code>, <code>fgetpos</code>, <code>fgetpos64</code>, <code>fsetpos</code>, <code>fsetpos64</code>.</dd></div>
+<div><dt>Other</dt><dd><code>fflush</code>, which on an intercepted stream is a durability barrier like <code>fsync</code> (the file's bytes are put on a persistent device). <code>fileno</code> returns the CLIO descriptor (8192 or above), which only the POSIX interceptor understands.</dd></div>
+</dl>
+
+<h2>Limits</h2>
+<div class="callout warn">
+  <span class="callout-title">Calls that must not touch an intercepted stream</span>
+  <p>An intercepted <code>FILE *</code> is not a real C library stream. Functions the interceptor does not define receive the token and misbehave. That includes formatted I/O (<code>fprintf</code>, <code>vfprintf</code>, <code>fscanf</code>), <code>feof</code>, <code>ferror</code>, <code>clearerr</code>, <code>ungetc</code> and <code>setvbuf</code>. Use <code>fputs</code>/<code>fwrite</code> (format into a buffer with <code>snprintf</code> first) and check return values instead of <code>feof</code>.</p>
+</div>
+<ul>
+  <li><strong>Fortified builds.</strong> The interceptor does not define the checked variants (<code>__fgets_chk</code>, <code>__fread_chk</code>) that glibc substitutes for <code>fgets</code> and <code>fread</code> when a program is compiled with <code>_FORTIFY_SOURCE</code> and optimization, so those calls are not intercepted. Build the program without <code>_FORTIFY_SOURCE</code> (add <code>-U_FORTIFY_SOURCE</code> where the toolchain enables it by default).</li>
+  <li><strong>No user-space buffering.</strong> Each call is a request to the filesystem module, so writing one character at a time with <code>fputc</code> costs one request per character. Write whole buffers.</li>
+  <li><strong>Writes are synchronous</strong> and report their own errors, as in the <a href="/docs/io-adapters/posix.html#behavior">POSIX interceptor</a>.</li>
+  <li><strong><code>freopen</code></strong> only applies to a stream that is already intercepted, and only onto another <code>clio::</code> path. Reopening <code>stdout</code> onto a <code>clio::</code> path goes to the real <code>freopen</code>.</li>
+  <li>Linux only, dynamically linked programs only, and only <code>clio::</code> paths are redirected.</li>
+</ul>
+
+<h2>Where to go next</h2>
+<ul>
+  <li><a href="/docs/io-adapters/posix.html">POSIX interceptor</a>: descriptors, <code>stat</code> and <code>fsync</code>.</li>
+  <li><a href="/docs/io-adapters/configuration.html">Configuration reference</a>.</li>
+</ul>

@@ -36,6 +36,16 @@ transfers:
 <h2>Pages for paged consumers</h2>
 <p>Memory expansion and clio-ml address data as page 0, page 1, and so on. The engine can serve numbered pages assembled from named blobs, and with an empty blob prefix an imported file's blobs are the pager's pages. That is how <a href="/docs/ml/usage.html">clio-ml trains on an assimilated CSV or Parquet table</a> without first loading it into memory.</p>
 
+<h2 id="source-build">Build from source</h2>
+<p>A source build has many settings and configurations to optimize the installation for your specific system. We keep an <a href="https://github.com/iowarp/clio-core/blob/main/INSTALL.md"><code>INSTALL.md</code></a> in the root of the repository, written to help AI agents install CLIO Core. Build from source to enable the assimilation formats and sources that are off by default, such as HDF5, Amazon S3, Google Cloud Storage and Globus. To have a coding agent do it, give it a prompt like this:</p>
+<pre data-label="prompt for a coding agent">
+Clone https://github.com/iowarp/clio-core and follow INSTALL.md to build CLIO Core
+from source on this machine with HDF5 support in the Context Assimilation Engine
+(-DCLIO_CORE_ENABLE_HDF5=ON). Install HDF5 and the other system packages it lists
+for my OS, then run the cae tests with ctest to verify the install.
+</pre>
+<p>The agent should name the options it chose for your system; the <a href="/docs/cae/install.html">install page</a> lists the options that matter here.</p>
+
 <h2>Where to go next</h2>
 <ul>
   <li><a href="/docs/cae/usage.html">Context Assimilation Engine docs</a>: assimilators, OMNI files, ingest on fault and pagify.</li>

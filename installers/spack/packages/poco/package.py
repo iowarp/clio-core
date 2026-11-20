@@ -44,6 +44,8 @@ class Poco(CMakePackage):
 
     license("BSL-1.0")
 
+    # 1.14.1 is what the pip wheels build (installers/pip).
+    version("1.14.1", tag="poco-1.14.1-release", preferred=True)
     version("1.13.3", tag="poco-1.13.3-release")
     version("1.12.5", tag="poco-1.12.5-release")
 
@@ -52,7 +54,10 @@ class Poco(CMakePackage):
             description="C++ standard")
 
     depends_on("cmake@3.15:", type="build")
-    depends_on("openssl")
+    # OpenSSL 4 made several accessors return const pointers, which Poco
+    # through 1.14 casts away (Crypto/src/PKCS12Container.cpp: "casts away
+    # qualifiers") and so fails to compile.
+    depends_on("openssl@:3")
 
     def cmake_args(self):
         return [

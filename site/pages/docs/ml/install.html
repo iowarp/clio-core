@@ -8,10 +8,11 @@ facts: Core option | CLIO_CORE_ENABLE_CLIO_ML ; Python | CLIO_ML_PYTHON ; Backen
 -->
 <h2>What you get from each method</h2>
 <ul>
-  <li><strong>pip install iowarp-core</strong> installs CLIO Core only. It does not contain clio-ml. See <a href="/docs/installation.html">the general install page</a> for that wheel.</li>
+  <li><strong>pip install iowarp-core</strong> installs CLIO Core only. It does not contain clio-ml. See the <a href="/index.html#install">install matrix</a> for what that wheel includes.</li>
   <li><strong>pip install clio-ml</strong> is the package the clio-ml repository's release workflow builds. It is the CPU backend over <code>cpu_vector</code>, built with the Context Assimilation Engine off, so <code>clio_ml.assimilate</code> is unavailable in it. It depends on <code>numpy</code> and needs Python 3.10 or newer.</li>
   <li><strong>Source build</strong> gives every backend and the assimilate path. This is the method the rest of this page describes.</li>
-  <li><strong>conda, Docker, Spack:</strong> the CLIO Core recipes and images under <code>installers/</code> and <code>docker/</code> do not build clio-ml.</li>
+  <li><strong>Spack:</strong> <code>spack install iowarp +clio_ml</code> fetches clio-ml and builds it with the backend the spec chooses: add <code>+cuda cuda_arch=&lt;sm&gt; +gpu_vector</code> for CUDA, <code>+sycl %oneapi</code> for SYCL, and <code>+python</code> for the Python package.</li>
+  <li><strong>conda, Docker:</strong> do not build clio-ml.</li>
 </ul>
 
 <h2>Prerequisites</h2>

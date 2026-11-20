@@ -21,7 +21,7 @@ facts: Time | 20 minutes ; You need | A source build with cloud options, and buc
     <tr><td>Status</td><td class="good">Supported, with unit tests</td><td class="cost">Config parsing tested; no end-to-end test yet</td></tr>
   </tbody>
 </table></div>
-<p>The pip wheel includes neither. Build from source with the options you need, or use Spack (<code>spack install iowarp +s3 +gcs</code>).</p>
+<p>The pip wheel includes the bucket tiers from the next release; it does not include the importers. For the importers, build from source with the options you need, or use Spack (<code>spack install iowarp +s3_cae +gcs</code> for import, <code>+s3_bdev +gcs_bdev</code> for the tiers).</p>
 <pre data-label="shell">
 $ cmake --preset release-fuse \
     -DCAE_ENABLE_S3=ON -DCAE_ENABLE_GCS=ON \
@@ -90,13 +90,14 @@ transfers:
 <p>A build with <code>CLIO_ENABLE_AMAZON_DRIVE</code> or <code>CLIO_ENABLE_GOOGLE_CLOUD</code> can use a bucket as a storage tier. Give the tier <code>bdev_type: "s3"</code> or <code>"gcs"</code> and a path of the form <code>s3://bucket/prefix</code> or <code>gcs://bucket/prefix</code>. The prefix is required: CLIO Core appends <code>_node&lt;N&gt;</code> to the path for each node, and without a prefix that would change the bucket name.</p>
 
 <h3>1. Credentials for a bucket tier</h3>
+<p>Give credentials either in the tier's entry, as an <code>s3:</code> or <code>gcs:</code> block (step 2), or as environment variables of the process that starts the runtime. A key in the block wins over its variable. The <a href="/modules/bdev.html#s3">bdev reference</a> lists every key.</p>
 <div class="tabs" data-label="Provider">
   <section class="tab-panel" data-tab="Amazon S3"><p class="tab-title">Amazon S3</p>
 <pre data-label="shell">
 $ export AWS_DEFAULT_REGION=us-east-1
 $ export AWS_ACCESS_KEY_ID=...  AWS_SECRET_ACCESS_KEY=...
 </pre>
-  <p>Credentials come from the AWS SDK's usual sources: environment variables, <code>~/.aws/credentials</code>, or an instance role.</p></section>
+  <p>Only these variables and the <code>s3:</code> block are read: <code>~/.aws/credentials</code> and instance roles are not.</p></section>
   <section class="tab-panel" data-tab="Google Cloud Storage"><p class="tab-title">Google Cloud Storage</p>
 <pre data-label="shell">
 $ export GCS_ACCESS_TOKEN=$(gcloud auth print-access-token)
@@ -123,6 +124,13 @@ $ export GCS_PROJECT_ID=my-project        # used only when creating the bucket
         capacity_limit: "1TB"
         score: 0.05
         persistence_level: "long_term"
+        s3:                                  # optional; else the environment
+          region: us-east-2
+          access_key_id: AKIA...
+          secret_access_key: ...
+        # gcs:
+        #   access_token: ya29....
 </pre>
+<p>Keys in the file end up in the runtime's pool log under <code>conf_dir</code> too, so keep the file and that directory private, or use the environment variables instead.</p>
 <p>Give the bucket the lowest score, so only data the organizer demotes reaches it (see <a href="/tutorials/operators.html#tiering-where-data-moves-later">tiering</a>). The CTE roster in the <a href="/tutorials/dashboard.html">dashboard</a> lists it as a tier.</p>
 <p>If the runtime logs <code>CLIO_ENABLE_AMAZON_DRIVE is not defined. Cannot use S3 bdev.</code>, the build lacks the S3 option. Reconfigure with <code>-DCLIO_ENABLE_AMAZON_DRIVE=ON</code>.</p>

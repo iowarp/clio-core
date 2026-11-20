@@ -18,7 +18,7 @@ Each page source starts with a metadata comment::
 
 followed by body HTML. ``<pre data-label="bash">`` blocks hold raw text: the
 builder escapes and lightly highlights them and adds a copy control. Links
-written as ``href="/docs/installation.html"`` are rewritten relative to the
+written as ``href="/docs/concepts.html"`` are rewritten relative to the
 page. ``<h2>``/``<h3>`` headings feed the "On this page" rail.
 
 Usage:
@@ -68,7 +68,9 @@ def _title_of(f: Path) -> str:
 # Every technology has its own docs section, docs/<tech>/, with its own
 # sidebar. These pages come first, in this order, when they exist.
 DOC_CORE_PAGES = [("index.html", "Overview"), ("install.html", "Install"),
-                  ("quickstart.html", "Quickstart"), ("usage.html", "Usage"),
+                  ("quickstart.html", "Quickstart"),
+                  ("gpu-vector.html", "gpu_vector"), ("cpu-vector.html", "cpu_vector"),
+                  ("usage.html", "Usage"),
                   ("performance.html", "Performance and tuning"),
                   ("api.html", "API reference")]
 
@@ -98,8 +100,28 @@ TECHNOLOGIES = [
     ("technologies/context-transfer-engine.html", "docs/cte/index.html", "Context Transfer Engine"),
     ("technologies/context-runtime.html", "docs/runtime/index.html", "Context Runtime"),
     ("technologies/memory-expansion.html", "docs/memory-expansion/index.html", "Memory expansion"),
+    ("technologies/io-adapters.html", "docs/io-adapters/index.html", "I/O adapters"),
     ("technologies/machine-learning.html", "docs/ml/index.html", "Machine learning"),
 ]
+
+# Docs sections that have no technology page, placed after the docs section
+# named in the first field. (after docs page, docs page, label)
+DOC_ONLY_SECTIONS = [
+    ("docs/runtime/index.html", "docs/dashboard/index.html", "Dashboard"),
+]
+
+
+def _doc_sections() -> list:
+    """Every docs section as (docs page, label), technologies in their order
+    with the docs-only sections spliced in after their anchor."""
+    out = []
+    for _, dp, lb in TECHNOLOGIES:
+        out.append((dp, lb))
+        out += [(d, l) for after, d, l in DOC_ONLY_SECTIONS if after == dp]
+    return out
+
+
+DOC_SECTIONS = _doc_sections()
 
 NAV = {
     "technologies": [
@@ -109,10 +131,9 @@ NAV = {
     "docs": [
         ("Start here", [
             ("docs/index.html", "Introduction"),
-            ("docs/installation.html", "Install CLIO Core"),
             ("docs/concepts.html", "Core concepts"),
         ]),
-        ("Technologies", [(dp, lb) for _, dp, lb in TECHNOLOGIES]),
+        ("Technologies", DOC_SECTIONS),
     ],
     "tutorials": [
         ("Overview", [
@@ -189,7 +210,8 @@ PRIMARY = [
 REDIRECTS = {
     "docs.html": "docs/index.html",
     "tutorials.html": "tutorials/index.html",
-    "install/index.html": "docs/installation.html",
+    "install/index.html": "index.html#install",
+    "docs/installation.html": "index.html#install",
     "tutorials/fuse-adapters.html": "tutorials/fuse-linux.html",
     "technologies/kv-store.html": "technologies/context-transfer-engine.html",
     "docs/context-fs.html": "docs/context-fs/usage.html",
@@ -405,7 +427,7 @@ def add_heading_ids(body: str) -> tuple[str, list[tuple[int, str, str]]]:
     return body, toc
 
 
-for _tp, _dp, _lb in TECHNOLOGIES:
+for _dp, _lb in DOC_SECTIONS:
     _dir = _dp.split("/")[1]
     NAV[f"docs/{_dir}"] = _tech_docs_nav(_dir, _lb)
 
@@ -416,7 +438,7 @@ DROPDOWNS = {"technologies", "docs"}
 # Docs links one page per technology.
 DROPDOWN_ITEMS = {
     "technologies": [(tp, lb) for tp, _, lb in TECHNOLOGIES],
-    "docs": [(dp, lb) for _, dp, lb in TECHNOLOGIES],
+    "docs": DOC_SECTIONS,
 }
 
 
@@ -474,10 +496,11 @@ def footer_html() -> str:
       <li><a href="/technologies/context-fs.html">Context FS</a></li>
       <li><a href="/technologies/context-transfer-engine.html">Context Transfer Engine</a></li>
       <li><a href="/technologies/memory-expansion.html">Memory expansion</a></li>
+      <li><a href="/technologies/io-adapters.html">I/O adapters</a></li>
       <li><a href="/technologies/machine-learning.html">Machine learning</a></li>
     </ul></div>
     <div><h2>Docs</h2><ul>
-      <li><a href="/docs/installation.html">Installation</a></li>
+      <li><a href="/index.html#install">Installation</a></li>
       <li><a href="/docs/basic-usage.html">Basic usage</a></li>
       <li><a href="/docs/concepts.html">Core concepts</a></li>
       <li><a href="/docs/python-api.html">Python API</a></li>
@@ -596,7 +619,7 @@ def side_nav_html(section: str, page: str) -> str:
             for href, label in items)
         groups.append(f"<h2>{title}</h2><ul>{lis}</ul>")
     label = section.capitalize() if "/" not in section else \
-        next((lb for _, dp, lb in TECHNOLOGIES if dp.startswith(section + "/")), section)
+        next((lb for dp, lb in DOC_SECTIONS if dp.startswith(section + "/")), section)
     return (f'<nav class="side-nav" aria-label="{label}"><details open><summary>{label} menu</summary>'
             f'<div>{"".join(groups)}</div></details></nav>')
 
@@ -695,9 +718,11 @@ def write_redirect(out_root: Path, old: str, new: str) -> None:
     """Write a small HTML redirect so an old URL keeps working.
 
     The redirect's canonical is the absolute canonical URL of the new page.
+    ``new`` may end in ``#anchor`` to land on a section; the canonical drops it.
     """
-    target = (rel_prefix(old) + canonical_path(new)[1:]) or "./"
-    canonical = canonical_url(new)
+    page, sep, frag = new.partition("#")
+    target = ((rel_prefix(old) + canonical_path(page)[1:]) or "./") + sep + frag
+    canonical = canonical_url(page)
     out = out_root / old
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(

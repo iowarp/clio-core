@@ -7,7 +7,7 @@ lede: The CAE core module ships in every CLIO Core package. The file, string and
 facts: CMake | CLIO_CORE_ENABLE_CAE=ON by default ; HDF5 | CLIO_CORE_ENABLE_HDF5=ON ; Cloud | CAE_ENABLE_S3, CAE_ENABLE_GCS, CAE_ENABLE_GLOBUS ; Summarizer | libcurl + nlohmann_json
 -->
 <h2>What each package includes</h2>
-<p>The general <a href="/docs/installation.html">installation page</a> covers every method. This page says what each one gives you for the CAE.</p>
+<p>The <a href="/index.html#install">install matrix</a> on the home page covers every method. This page says what each one gives you for the CAE.</p>
 <ul class="checks">
   <li><strong>pip wheel</strong> (<code>pip install iowarp-core</code>). Built with <code>CLIO_CORE_ENABLE_CAE=ON</code> and <code>CLIO_CORE_ENABLE_HDF5=OFF</code>; the S3, GCS and Globus options are left at their OFF defaults. The wheel contains the CAE core client and runtime libraries, so <code>clio-run</code> composes the CAE pool from the default configuration and the Python <code>clio_cee</code> module can submit transfers. The wheel does not install a <code>clio-cae</code> command: its console scripts are <code>clio-run</code>, <code>clio_cte_fuse</code>, <code>clio_cte_bench</code> and <code>clio_run_thrpt_bench</code>. Use <a href="/docs/cee/usage.html">clio_cee</a> to import from a pip install.</li>
   <li><strong>conda</strong> (<code>iowarp-core</code> on the <code>iowarp</code> channel). Includes the CAE and installs <code>clio-cae</code> under <code>$CONDA_PREFIX/bin</code>. The recipe's cloud SDK lines are commented out; to add S3 or GCS, build the recipe yourself with the matching CMake flag.</li>

@@ -1,0 +1,124 @@
+<!--
+title: HDF5 VOL connector
+heading: Cache HDF5 datasets with the <em>VOL connector.</em>
+description: How to use the CLIO Core HDF5 VOL connector: build libclio_hdf5_vol.so, start a runtime with a clio_cte_core pool, select it with HDF5_PLUGIN_PATH and HDF5_VOL_CONNECTOR=clio or H5Pset_vol, what it caches, how admission and coherence stamps work, and how to confirm it is actually caching.
+eyebrow: Docs · I/O adapters
+lede: The VOL connector <code>clio</code> sits above the HDF5 library and caches whole dataset images in the Context Transfer Engine, so a dataset read again in a later session can come from a fast tier instead of slow storage. The native HDF5 file is always written first and stays authoritative. Select it with two environment variables; the application does not change.
+facts: Connector | clio (value 600) ; Library | libclio_hdf5_vol.so ; Build | CLIO_CTE_ENABLE_HDF5_VOL=ON, HDF5 1.14+ ; Select | HDF5_VOL_CONNECTOR=clio ; Install | Spack (+vol), CMake, or the Docker image
+-->
+<h2>What it does</h2>
+<p>A VOL (virtual object layer) connector sees each request as the application made it: this dataset, this selection, this datatype. The <code>clio</code> connector passes every operation to HDF5's native connector, so the file on disk is an ordinary HDF5 file that <code>h5dump</code> and <code>h5py</code> read with or without CLIO. In addition it mirrors dataset transfers into the CTE:</p>
+<ul class="checks">
+  <li><strong>Cached:</strong> datasets of atomic types (integer, float, enum, bitfield, fixed-length string), when the memory datatype is the native form of the stored type. The image is split into 64 KiB blobs by default.</li>
+  <li><strong>Passed through:</strong> compound, array, variable-length and reference types, transfers whose memory type converts, and everything that is not dataset I/O (groups, attributes, links).</li>
+  <li><strong>Served from the cache:</strong> whole-dataset reads, and hyperslab or point reads of a dataset whose image is already cached. A partial read never triggers staging, and a miss reads the native file.</li>
+  <li><strong>Invalidated:</strong> a partial write, <code>H5Dset_extent</code> or a failed cache operation drops the dataset's image, so reads never see stale data.</li>
+</ul>
+
+<h2>1. Build it</h2>
+<pre data-label="shell">
+$ cmake -S . -B build -DCLIO_CTE_ENABLE_HDF5_VOL=ON \
+    -DHDF5_ROOT=/path/to/the/hdf5/your/application/uses
+$ cmake --build build -j"$(nproc)"
+$ ls build/bin/libclio_hdf5_vol.so
+$ ldd build/bin/libclio_hdf5_vol.so | grep hdf5      # must be the application's libhdf5
+</pre>
+<p>HDF5 1.14 or newer is required. If CMake finds no suitable HDF5 it only warns and skips the connector, so check that the library exists. The connector comes with Spack (<code>+vol</code>, on by default), a CMake source build and the Docker image; see <a href="/docs/io-adapters/install.html">Install</a>.</p>
+
+<h2>2. Start a runtime with a CTE pool</h2>
+<pre data-label="shell">
+$ export CLIO_SERVER_CONF=$PWD/context-transfer-engine/adapter/config/clio_hdf5_quickstart.yaml
+$ build/bin/clio-run start &
+</pre>
+<p><code>clio_hdf5_quickstart.yaml</code> is a small configuration (a 256 MB RAM tier, no persistence) that starts anywhere. For real workloads, start from <code>context-runtime/config/clio_default.yaml</code>, add your tiers, and <strong>rename its CTE pool to <code>clio_cte_core</code></strong>: clients look the pool up by that exact name, and the default file's <code>cte_main</code> misses. Export the same <code>CLIO_SERVER_CONF</code> in the application's environment.</p>
+
+<h2>3. Select the connector</h2>
+<pre data-label="shell">
+$ export HDF5_PLUGIN_PATH=$PWD/build/bin
+$ export HDF5_VOL_CONNECTOR=clio
+$ ./my_hdf5_app            # or python, h5dump, any HDF5 program
+</pre>
+<p>Options can follow the name, in the semicolon-separated grammar other HDF5 connectors use. The recognised keys are <code>cache</code> (boolean) and <code>chunk_size</code> (bytes); an unknown key or a malformed value fails the open instead of being ignored.</p>
+<pre data-label="shell">
+$ export HDF5_VOL_CONNECTOR="clio cache=1;chunk_size=1048576"
+</pre>
+<p><code>under_vol</code> and <code>under_info</code> are accepted but have no effect yet: the connector always sits directly on the native connector and cannot be stacked over another pass-through connector.</p>
+
+<h3>Or select it in code</h3>
+<p>Include <code>clio_vol.h</code> (in <code>context-transfer-engine/adapter/hdf5_vol/</code>), link <code>libclio_hdf5_vol.so</code>, and put the connector on a file-access property list:</p>
+<pre data-label="c">
+#include <hdf5.h>
+#include "clio_vol.h"
+
+hid_t vol = H5VL_clio_register();
+clio_vol_info_t info = {0};          /* zeroed fields mean "use the default" */
+info.under_vol_id = H5VL_NATIVE;
+info.chunk_size = 1 << 20;           /* optional: 1 MiB cache chunks */
+hid_t fapl = H5Pcreate(H5P_FILE_ACCESS);
+H5Pset_vol(fapl, vol, &info);
+hid_t file = H5Fcreate("/scratch/run1/out.h5", H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
+</pre>
+<p>Always zero the struct. <code>cache_enabled</code> left at <code>CLIO_VOL_CACHE_UNSET</code> lets the environment decide; switching the tier off from code takes an explicit <code>CLIO_VOL_CACHE_OFF</code>.</p>
+
+<h2>4. An end-to-end example with h5py</h2>
+<p>Write a file in one session, then read it in later sessions. The file name is an ordinary path; the connector does not use the <code>clio::</code> marker.</p>
+<pre data-label="python · write.py">
+import h5py, numpy as np
+with h5py.File("/scratch/run1/field.h5", "w") as f:
+    f["temperature"] = np.random.rand(1024, 1024)
+</pre>
+<pre data-label="python · read.py">
+import h5py
+with h5py.File("/scratch/run1/field.h5", "r") as f:
+    t = f["temperature"][...]          # whole-dataset read
+print(t.mean())
+</pre>
+<pre data-label="shell">
+$ export CLIO_REQUIRE_RUNTIME=1 CLIO_VOL_TRACE=$PWD/trace
+$ export CLIO_VOL_ADMIT_COST=0     # demo only: stage even if the local disk is faster
+$ mkdir -p trace
+$ python write.py
+$ python read.py        # first read after the write: native, stages the image
+$ python read.py        # served from the CTE tier
+$ grep -o '"read_bytes_from_cache": [0-9]*' trace/field.h5.*.access.json
+</pre>
+<p>The access summary of the last run should show bytes read from the cache. <code>CLIO_VOL_ADMIT_COST=0</code> is there because on a local disk the file is already in the page cache, and the connector's cost gate (see <a href="#tuning">Tuning</a>) would correctly decide that caching cannot win. Leave it unset in production.</p>
+<p>The first read after a write is always native, by design: at close the connector withholds the coherence stamp while the file's modification time is younger than one timestamp granule (10 ms by default), and a writing session always closes inside that window. The read-back stores a stamp, and the session after it can hit.</p>
+
+<h2>Confirm it is working</h2>
+<p>Correct data proves nothing: with no runtime, no CTE pool or the cache off, the connector quietly falls back to the native file and still returns correct data. Three tools tell the cases apart:</p>
+<ul>
+  <li><code>CLIO_REQUIRE_RUNTIME=1</code> makes the open fail when the runtime or CTE pool cannot be reached, instead of falling back. Set it in tests, benchmarks and CI.</li>
+  <li><code>CLIO_VOL_TRACE=&lt;dir&gt;</code> writes <code>&lt;file&gt;.&lt;pid&gt;.access.jsonl</code> (one record per <code>H5Dread</code>/<code>H5Dwrite</code>) and, at file close, a <code>&lt;file&gt;.&lt;pid&gt;.access.json</code> summary. <code>read_bytes_from_cache</code> against <code>read_bytes_from_native</code> is the hit rate; the <code>coherence</code> block (<code>matched</code>, <code>mismatched</code>, <code>absent</code>, <code>ambiguous</code>) explains the misses.</li>
+  <li><code>scripts/clio-hdf5-doctor --smoke</code> checks the environment, prints the fix for each problem, and round-trips a file through the connector.</li>
+</ul>
+<p>When the runtime cannot be reached the connector prints <code>[clio-vol] CLIO runtime unavailable; running as a pure pass-through to the native VOL (cache disabled)</code> to stderr.</p>
+
+<h2>Tuning</h2>
+<dl class="notes">
+<div><dt><code>CLIO_VOL_ADMIT</code></dt><dd>When data enters the tier: <code>read-miss</code> (default), <code>write</code>, or <code>second-access</code> (stage a dataset only after it has missed twice). The default becomes <code>write</code> when <code>CLIO_STAMP_SETTLE_MAX_NS</code> is set.</dd></div>
+<div><dt>Cost gate</dt><dd>On by default: a transfer is staged only if the native read measured slower than the tier is predicted to be, so caching is skipped on a fast local disk. The model starts from <code>CLIO_VOL_TIER_FIXED_US</code> (60 µs per request) and <code>CLIO_VOL_TIER_MBPS</code> (1200) and re-estimates both from its own cache hits. <code>CLIO_VOL_ADMIT_COST=0</code> stages unconditionally.</dd></div>
+<div><dt><code>CLIO_VOL_CHUNK_SIZE</code></dt><dd>Blob size for dataset images, default 65536. A partial read fetches every chunk it touches, so this is the cost floor of a small read. It overrides <code>chunk_size</code> from the connector string or the info struct.</dd></div>
+<div><dt><code>CLIO_VOL_MAX_SERVE_BYTES</code></dt><dd>Datasets larger than this (default 1 GiB) are not served from the cache for partial reads, because serving one assembles the whole image in memory.</dd></div>
+<div><dt><code>CLIO_VOL_MIN_STAGE_BYTES</code></dt><dd>Do not stage images smaller than this. Default 0.</dd></div>
+<div><dt><code>CLIO_VOL_TIER_RETRY_MS</code></dt><dd>Cache blobs are written as droppable, so the CTE may reclaim them. When a put still fails because the tier is full, staging pauses for this long (default 5000 ms) and then probes again. The native write is never slowed.</dd></div>
+<div><dt><code>CLIO_STAMP_GRANULARITY_NS</code></dt><dd>Timestamp granularity the coherence stamp assumes: 10 ms by default, 1 s on Windows. Raise it on filesystems with coarse timestamps (some NFS mounts, FAT). <code>CLIO_VOL_STAMP_GRANULARITY_NS</code> is accepted as the older name.</dd></div>
+<div><dt><code>CLIO_STAMP_SETTLE_MAX_NS</code></dt><dd>Opt in to waiting, at close, until the file's timestamp has settled so the stamp is not withheld. Only safe for single-writer pipelines. Off (0) by default.</dd></div>
+</dl>
+
+<h2>Guarantees and limits</h2>
+<ul>
+  <li><strong>Flush and close are barriers.</strong> <code>H5Fflush</code>, <code>H5Dflush</code> and <code>H5Fclose</code> wait for all in-flight cache writes before returning.</li>
+  <li><strong>Between sessions, changes are caught.</strong> The coherence stamp (device, inode, size, modification time and chunk size) is checked at open; anything but an exact match drops the file's cache. Modifying the file from another process <em>while</em> it is open is undefined, as with native HDF5.</li>
+  <li><strong>Collective reads</strong> are served from the tier like independent ones; their native fallbacks run as independent I/O.</li>
+  <li><strong>Partial reads assemble the whole image</strong>, so their cost grows with the dataset, not the selection.</li>
+  <li><strong>h5py</strong> drives dataset I/O through the connector, but some of its other code paths assume the native connector.</li>
+  <li><strong>When not to use it:</strong> a file on a local disk that fits in the page cache. A tier hit then replaces a page-cache hit with a runtime round trip. Measure against <code>CLIO_VOL_CACHE=0</code>, which keeps the connector loaded with the tier off and needs no runtime.</li>
+</ul>
+
+<h2>Where to go next</h2>
+<ul>
+  <li><a href="/docs/io-adapters/hdf5-vfd.html">HDF5 VFD</a>, for workloads the VOL connector passes through.</li>
+  <li><a href="/docs/io-adapters/configuration.html">Configuration reference</a>: every variable with its default.</li>
+  <li><a href="/design/adapters.html#hdf5">HDF5 connector design</a>. The repository's <code>context-transfer-engine/adapter/HDF5_QUICKSTART.md</code> covers the same setup with a troubleshooting table.</li>
+</ul>

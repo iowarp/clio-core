@@ -7,7 +7,7 @@ lede: The filesystem module ships in every CLIO Core install. The mount daemon, 
 facts: pip | Linux and Windows wheels include clio_cte_fuse ; macOS | build from source ; CMake option | CLIO_CTE_ENABLE_FUSE_ADAPTER
 -->
 <h2>What each install method gives you</h2>
-<p>The general install page, <a href="/docs/installation.html">Installation</a>, covers every method. For Context FS the question is whether <code>clio_cte_fuse</code> is in the package.</p>
+<p>The <a href="/index.html#install">install matrix</a> on the home page covers every method. For Context FS the question is whether <code>clio_cte_fuse</code> is in the package.</p>
 <ul class="checks">
   <li><strong>pip</strong> (<code>pip install iowarp-core</code>): the Linux and Windows wheels build the FUSE adapter; the macOS wheel does not. The <code>clio_cte_fuse</code> console script exists on every platform, but on macOS the binary behind it is absent.</li>
   <li><strong>conda</strong> (<code>iowarp</code> channel): built from the <code>release</code> preset, which does not enable the adapter. Build the recipe yourself with a FUSE preset to get it.</li>

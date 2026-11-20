@@ -1,0 +1,76 @@
+<!--
+title: REST API
+heading: The dashboard <em>REST API.</em>
+description: Every REST route the CLIO Core dashboard serves, from the admin, block device, safe block device and CTE core modules, with curl examples for reading cluster state and creating pools and storage tiers.
+eyebrow: Docs · Dashboard
+lede: Every dashboard page reads a small REST API that returns JSON, so anything you see in the browser you can also get from a script. The Config page lists the routes a running daemon actually registered.
+facts: Base URL | http://127.0.0.1:8080 ; Format | JSON responses; POST fields as query or form parameters ; List routes | GET /api/routes
+-->
+<h2 id="examples">Examples</h2>
+<pre data-label="shell">
+$ curl -s http://127.0.0.1:8080/api/health
+{"ok":true,"node_id":0,"hostname":"127.0.0.1","ip_address":"127.0.0.1","is_leader":true}
+
+$ curl -s http://127.0.0.1:8080/api/pools | python -m json.tool
+$ curl -s http://127.0.0.1:8080/api/topology        # node ids for /api/nodes/{node}/...
+$ curl -s http://127.0.0.1:8080/api/nodes/0/workers
+</pre>
+<p>POST routes take their fields as query or form parameters. The module's own settings go in <code>config</code> as a YAML mapping. Validate first, which creates nothing and returns every field error at once, then send the same request without <code>action</code> to create:</p>
+<pre data-label="shell">
+$ curl -s -X POST http://127.0.0.1:8080/api/pools/compose \
+    -d mod_name=clio_bdev -d pool_name=ram::scratch -d pool_id=700.0 \
+    -d pool_query=local \
+    --data-urlencode $'config=bdev_type: ram\ncapacity: 256MB' \
+    -d action=validate
+</pre>
+
+<h2 id="admin">Runtime routes (clio_admin)</h2>
+<div class="table-wrap"><table>
+  <thead><tr><th>Method</th><th>Path</th><th>Returns or does</th></tr></thead>
+  <tbody>
+    <tr><td>GET</td><td><code>/api/health</code></td><td>Dashboard liveness plus this node's identity</td></tr>
+    <tr><td>GET</td><td><code>/api/topology</code></td><td>Cluster membership and SWIM state as this node sees it</td></tr>
+    <tr><td>GET</td><td><code>/api/pools</code></td><td>Pools composed on this node</td></tr>
+    <tr><td>GET</td><td><code>/api/config</code></td><td>The settings this daemon actually came up with</td></tr>
+    <tr><td>GET</td><td><code>/api/routes</code></td><td>Every route and asset mount registered by any module</td></tr>
+    <tr><td>GET</td><td><code>/api/chimods</code></td><td>Loaded modules and their dashboard capabilities</td></tr>
+    <tr><td>GET</td><td><code>/api/nodes/{node}/workers</code></td><td>Per-worker queue depth, load and task counts</td></tr>
+    <tr><td>GET</td><td><code>/api/nodes/{node}/containers</code></td><td>Per-pool containers and their learned task-cost models</td></tr>
+    <tr><td>GET</td><td><code>/api/nodes/{node}/bdevs</code></td><td>Every block device on the node, with capacity and throughput</td></tr>
+    <tr><td>GET</td><td><code>/api/nodes/{node}/system_stats</code></td><td>Sampled CPU, RAM and GPU utilization newer than <code>?min_event_id</code></td></tr>
+    <tr><td>GET</td><td><code>/api/pools/{pool}/monitor</code></td><td>Forwards <code>?query</code> to the pool's own <code>Monitor()</code> (<code>?routing=local|broadcast|…</code>)</td></tr>
+    <tr><td>POST</td><td><code>/api/pools/{pool}/destroy</code></td><td>Destroys a pool and its containers on this node</td></tr>
+    <tr><td>POST</td><td><code>/api/pools/compose</code></td><td>Creates a pool of any module. Fields: <code>mod_name</code>, <code>pool_name</code>, <code>pool_id</code>, <code>pool_query</code>, <code>config</code>; <code>action=validate</code> checks without creating</td></tr>
+  </tbody>
+</table></div>
+<p><code>{node}</code> is a node id from <code>/api/topology</code>. <code>{pool}</code> is a pool id such as <code>512.0</code>.</p>
+
+<h2 id="modules">Module routes</h2>
+<p>Modules with their own page register routes under <code>/api/mod/&lt;module&gt;/</code>.</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Module</th><th>Method</th><th>Path</th><th>Returns or does</th></tr></thead>
+  <tbody>
+    <tr><td rowspan="3"><code>clio_bdev</code></td><td>GET</td><td><code>/api/mod/clio_bdev/pools</code></td><td>Block-device pools on this node</td></tr>
+    <tr><td>GET</td><td><code>/api/mod/clio_bdev/create</code></td><td>The form spec for a new block device</td></tr>
+    <tr><td>POST</td><td><code>/api/mod/clio_bdev/create</code></td><td>Validates (<code>action=validate</code>) or creates a block device</td></tr>
+    <tr><td rowspan="6"><code>clio_cte_core</code></td><td>GET</td><td><code>/api/mod/clio_cte_core/pools</code></td><td>CTE core pools on this node</td></tr>
+    <tr><td>GET</td><td><code>/api/mod/clio_cte_core/{pool}/targets</code></td><td>The pool's storage targets, with score and capacity</td></tr>
+    <tr><td>POST</td><td><code>/api/mod/clio_cte_core/{pool}/register_target</code></td><td>Registers a block device as a storage target. Fields: <code>name</code>, then <code>bdev_type</code> and <code>capacity</code>, or <code>attach_pool_id</code></td></tr>
+    <tr><td>POST</td><td><code>/api/mod/clio_cte_core/{pool}/unregister_target</code></td><td>Removes a storage target from placement. Field: <code>name</code></td></tr>
+    <tr><td>GET</td><td><code>/api/mod/clio_cte_core/create</code></td><td>The form spec for a new CTE core pool</td></tr>
+    <tr><td>POST</td><td><code>/api/mod/clio_cte_core/create</code></td><td>Validates (<code>action=validate</code>) or creates a CTE core pool</td></tr>
+    <tr><td rowspan="6"><code>clio_safe_bdev</code></td><td>GET</td><td><code>/api/mod/clio_safe_bdev/pools</code></td><td>Safe block-device arrays on this node</td></tr>
+    <tr><td>POST</td><td><code>/api/mod/clio_safe_bdev/{pool}/add_member</code></td><td>Adds a member to the array</td></tr>
+    <tr><td>POST</td><td><code>/api/mod/clio_safe_bdev/{pool}/replace_member</code></td><td>Replaces a member</td></tr>
+    <tr><td>POST</td><td><code>/api/mod/clio_safe_bdev/{pool}/remove_member</code></td><td>Removes a member</td></tr>
+    <tr><td>GET</td><td><code>/api/mod/clio_safe_bdev/create</code></td><td>The form spec for a new array</td></tr>
+    <tr><td>POST</td><td><code>/api/mod/clio_safe_bdev/create</code></td><td>Validates (<code>action=validate</code>) or creates an array</td></tr>
+  </tbody>
+</table></div>
+<p>Routes are registered by modules that are loaded, so a runtime without <code>clio_safe_bdev</code> has none of its routes. <code>GET /api/routes</code> is the authoritative list for a given daemon.</p>
+
+<h2>Where to go next</h2>
+<ul>
+  <li><a href="/docs/dashboard/index.html">Overview</a>: the pages these routes feed.</li>
+  <li><a href="/docs/dashboard/usage.html">Usage</a>: ports, remote access and creating pools from the browser.</li>
+</ul>

@@ -122,3 +122,26 @@ function(clio_link_poco_private target)
       "LINKER:--exclude-libs,libPocoNet.a:libPocoFoundation.a:libPocoNetd.a:libPocoFoundationd.a")
   endif()
 endfunction()
+
+# clio_hide_static_tls(<target>)
+#
+# For a library that links Poco's TLS stack (Poco::NetSSL, Poco::Crypto) and,
+# through it, OpenSSL: when those are static archives on Linux (the pip wheel
+# links a static OpenSSL 3 because the build image's libssl.so.1.1 is gone
+# from current distributions), keep every embedded symbol local to <target>.
+# Exported OpenSSL symbols could bind to, or be bound by, another OpenSSL in
+# the same process -- Python's _ssl loads the system one. Same reasoning as
+# clio_link_poco_private() above. No-op for shared Poco or other platforms.
+#
+# Arguments:
+#   target - a library that links Poco::NetSSL / Poco::Crypto.
+function(clio_hide_static_tls target)
+  if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR NOT TARGET Poco::Foundation)
+    return()
+  endif()
+  get_target_property(_poco_type Poco::Foundation TYPE)
+  if(_poco_type STREQUAL "STATIC_LIBRARY")
+    target_link_options(${target} PRIVATE
+      "LINKER:--exclude-libs,libssl.a:libcrypto.a:libPocoNetSSL.a:libPocoCrypto.a:libPocoUtil.a:libPocoXML.a:libPocoJSON.a:libPocoNet.a:libPocoFoundation.a")
+  endif()
+endfunction()

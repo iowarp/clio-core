@@ -1,0 +1,83 @@
+<!--
+title: Usage
+heading: Using <em>the dashboard.</em>
+description: How to change the dashboard's port and bind address, reach it on a remote node or in Docker, create pools and register storage tiers from the browser, watch a workload, and turn the dashboard off.
+eyebrow: Docs · Dashboard
+lede: The dashboard needs no setup, but where it listens is configurable, and most of what you can do in the YAML compose section you can also do from the browser while the runtime runs.
+facts: Flags | --viz-port, --viz-bind, --no-viz ; Environment | CLIO_VIZ_PORT, CLIO_VIZ_BIND, CLIO_VIZ_ENABLE ; YAML | viz: section
+-->
+<h2 id="where">Choose where it listens</h2>
+<p>By default the dashboard listens on <code>127.0.0.1:8080</code>. Each setting can come from a flag, an environment variable or the <code>viz</code> section of the runtime configuration:</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Setting</th><th>Flag</th><th>Environment</th><th>YAML (<code>viz:</code>)</th><th>Default</th></tr></thead>
+  <tbody>
+    <tr><td>Serve the dashboard</td><td><code>--viz</code> / <code>--no-viz</code></td><td><code>CLIO_VIZ_ENABLE</code></td><td><code>enabled</code></td><td>on</td></tr>
+    <tr><td>Port</td><td><code>--viz-port &lt;port&gt;</code></td><td><code>CLIO_VIZ_PORT</code></td><td><code>port</code></td><td>8080; 0 picks a free port</td></tr>
+    <tr><td>Bind address</td><td><code>--viz-bind &lt;addr&gt;</code></td><td><code>CLIO_VIZ_BIND</code></td><td><code>bind</code></td><td><code>127.0.0.1</code></td></tr>
+    <tr><td>HTTP threads</td><td></td><td><code>CLIO_VIZ_MAX_THREADS</code></td><td><code>max_threads</code></td><td>16</td></tr>
+  </tbody>
+</table></div>
+<div class="tabs" data-label="Where the runtime runs">
+  <section class="tab-panel" data-tab="Another port"><p class="tab-title">Another port</p>
+<pre data-label="shell">
+$ clio-run start --viz-port 9000 &
+</pre></section>
+  <section class="tab-panel" data-tab="Remote host"><p class="tab-title">Remote host</p>
+<pre data-label="shell">
+# On your laptop, then open http://127.0.0.1:8080 locally
+$ ssh -L 8080:127.0.0.1:8080 user@node1
+</pre></section>
+  <section class="tab-panel" data-tab="Docker"><p class="tab-title">Docker</p>
+<pre data-label="yaml">
+services:
+  iowarp:
+    image: iowarp/deploy-cpu:latest
+    environment:
+      - CLIO_VIZ_BIND=0.0.0.0
+    ports:
+      - "9413:9413"
+      - "8080:8080"
+    command: ["clio-run", "start"]
+</pre></section>
+  <section class="tab-panel" data-tab="YAML"><p class="tab-title">In clio.yaml</p>
+<pre data-label="yaml">
+viz:
+  enabled: true
+  port: 8080
+  bind: "127.0.0.1"
+  max_threads: 16
+</pre></section>
+</div>
+<p>Inside a container, binding <code>0.0.0.0</code> is what lets the published port reach the dashboard; keep the published port on a trusted network. The pip wheel includes the dashboard. A source build includes it only when CMake finds the Poco HTTP library at configure time; without it the runtime logs <code>this build has no HTTP transport</code> and serves no dashboard.</p>
+
+<h2 id="create-pool">Create a pool from the browser</h2>
+<ol class="steps">
+  <li><p>On <strong>Pools</strong>, click <strong>Add Pool</strong> and choose <code>clio_bdev</code>.</p></li>
+  <li><p>Fill in the form: <strong>pool_name</strong> <code>ram::scratch</code>, keep the suggested <strong>pool_id</strong>, <strong>bdev_type</strong> <code>ram</code>, <strong>capacity</strong> <code>256MB</code>.</p></li>
+  <li><p>Click <strong>Validate</strong>. Each field is checked, nothing is created, and errors come back per field.</p></li>
+  <li><p>Click <strong>Create</strong>. A new card appears under <code>clio_bdev</code>. Click it to watch the device.</p></li>
+</ol>
+<p>Block devices, safe block devices and the CTE core have typed forms. Other modules get a compose editor: identity fields plus a YAML box that takes anything you could put in the <code>compose</code> section of <code>clio.yaml</code>. S3 and GCS block devices are left out of the form because they need credentials; compose those from a file (see <a href="/tutorials/cloud-storage.html">cloud storage</a>).</p>
+
+<h2 id="tiers">Add or remove a storage tier</h2>
+<p>Open the <code>clio_cte_core</code> pool from <strong>Pools</strong>. Under <strong>Register bdev</strong>, give the target a name, pick a type and capacity, and click <strong>Register</strong>; to reuse an existing block device pool, put its id in <em>attach pool</em> instead. The new row appears in the targets table and data placement starts using it at once. The button at the end of a row unregisters that tier.</p>
+
+<h2 id="watch">Watch a workload</h2>
+<p>Keep the dashboard open while something writes to the runtime, for example a copy into a <a href="/docs/context-fs/index.html">Context FS</a> mount:</p>
+<pre data-label="shell">
+$ cp -r ~/datasets/era5-sample ~/clio-mnt/
+</pre>
+<ol class="steps">
+  <li><p><strong>Cluster → This node</strong>: the <em>processed</em> count climbs and the worker meters move.</p></li>
+  <li><p><strong>Pools → clio_cte_core</strong>: the RAM tier's free space drops, then slower tiers' <em>bytes written</em> grows as data moves down.</p></li>
+  <li><p><strong>Pools → clio_bdev</strong>: the block device's capacity meter fills.</p></li>
+</ol>
+
+<h2 id="destroy">Destroy a pool</h2>
+<p>The <strong>×</strong> in a pool card's corner destroys that pool and its containers on this node, after you confirm. The admin pool has no <strong>×</strong>: it is the runtime itself.</p>
+
+<h2>Where to go next</h2>
+<ul>
+  <li><a href="/docs/dashboard/api.html">REST API</a>: the routes behind every page, for scripts.</li>
+  <li><a href="/docs/dashboard/index.html">Overview</a>: what each page shows, with screenshots.</li>
+</ul>

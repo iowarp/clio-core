@@ -1,0 +1,74 @@
+<!--
+title: I/O adapters
+heading: I/O adapters: <em>the I/O libraries you already use.</em>
+description: CLIO Core's I/O adapters connect unmodified applications to the Context Transfer Engine through POSIX, STDIO and MPI-IO interception, the HDF5 VOL connector and virtual file driver, and an ADIOS2 plugin engine. They come from source builds, with Spack or CMake.
+eyebrow: Technologies · Adapters
+lede: Applications that already speak POSIX, STDIO, MPI-IO, HDF5 or ADIOS2 can reach the Context Transfer Engine without being rewritten. An adapter plugs into the library the application already calls, through <code>LD_PRELOAD</code>, an HDF5 plugin or an ADIOS2 engine. The adapters come from a source build of CLIO Core, with Spack or CMake.
+facts: Interceptors | POSIX, STDIO, MPI-IO (Linux, LD_PRELOAD) ; HDF5 | VOL connector clio, VFD clio_vfd ; ADIOS2 | Plugin engine iowarp_engine ; Install | Spack or a CMake source build
+-->
+<h2>Key takeaways</h2>
+<ul class="checks">
+  <li>No source changes for HDF5: set <code>HDF5_VOL_CONNECTOR=clio</code> or <code>HDF5_DRIVER=clio_vfd</code> and the application's reads and writes go through CLIO.</li>
+  <li>POSIX, STDIO and MPI-IO calls are intercepted only for paths that contain a <code>clio::</code> component. Every other file passes straight through to the real library.</li>
+  <li>The HDF5 connectors keep the native file authoritative and use the CTE as a cache that can be thrown away. The interceptors and the ADIOS2 engine store the data only in the CTE.</li>
+  <li>None of the adapters ship in the pip wheel or conda. Spack builds them as variants (<code>+posix +stdio +mpiio +vol +vfd +adios2</code>); a CMake source build turns each on with its own option.</li>
+</ul>
+
+<h2>What it is</h2>
+<p>Most scientific codes do their I/O through a library: the C library's <code>open</code> and <code>fopen</code>, MPI-IO, HDF5, ADIOS2. Rewriting them against a new storage API is rarely an option. The adapters meet those codes where they are. Each one implements the interface of an existing I/O library and turns the calls into operations on the <a href="/technologies/context-transfer-engine.html">Context Transfer Engine</a> (CTE), so the data lands on the tiers the runtime composes: RAM, NVMe, disk or cloud buckets.</p>
+
+<ol class="stack-position" aria-label="Where the adapters sit in the CLIO Core stack">
+  <li><b>Front ends</b><span>Context FS, memory expansion, machine learning, CAE, CEE</span></li>
+  <li class="here"><b>Interceptors</b><span>POSIX, STDIO and MPI-IO interceptors, HDF5 VOL and VFD, ADIOS2 engine</span></li>
+  <li><b>ChiMod chain</b><span>Cache, replication, compressor, indexer, summarizer</span></li>
+  <li><b>CTE core</b><span>Tags, blobs, placement across tiers</span></li>
+  <li><b>Context Runtime</b><span>Modules, pools, tasks, scheduling, transports</span></li>
+  <li><b>Storage</b><span>Block devices: RAM, NVMe, SSD, HDD, S3/GCS</span></li>
+</ol>
+
+<h2>Three kinds of adapter</h2>
+<table>
+  <tr><th>Kind</th><th>Adapters</th><th>How it attaches</th><th>Where the data lives</th></tr>
+  <tr><td>Interceptors</td><td>POSIX, STDIO, MPI-IO</td><td><code>LD_PRELOAD</code> of a shared library that defines the same symbols. Only <code>clio::</code> paths are taken over.</td><td>Only in the CTE, as files of the clio-fs namespace that <a href="/technologies/context-fs.html">Context FS</a> also serves. There is no backing file.</td></tr>
+  <tr><td>HDF5 connectors</td><td>VOL connector <code>clio</code>, VFD <code>clio_vfd</code></td><td>HDF5's own plugin mechanism: <code>HDF5_PLUGIN_PATH</code> plus <code>HDF5_VOL_CONNECTOR</code> or <code>HDF5_DRIVER</code>.</td><td>In the native HDF5 file, written synchronously. The CTE holds a cache that can be dropped at any time.</td></tr>
+  <tr><td>ADIOS2 engine</td><td><code>iowarp_engine</code></td><td>ADIOS2's plugin engine: engine type <code>Plugin</code> with <code>PluginLibrary=iowarp_engine</code>.</td><td>Only in the CTE: one blob per variable, step and rank.</td></tr>
+</table>
+
+<h2>Which one to use</h2>
+<ul>
+  <li><strong>Your code uses HDF5 and re-reads datasets in later sessions from slow storage</strong> (a parallel filesystem, network storage, a cold disk): use the <a href="/docs/io-adapters/hdf5-vol.html">VOL connector</a>. It caches whole dataset images of atomic types and serves later reads from the tier.</li>
+  <li><strong>Your HDF5 workload is something the VOL passes through</strong> (compound or variable-length types, metadata-heavy I/O): the <a href="/docs/io-adapters/hdf5-vfd.html">VFD</a> works at the byte level below HDF5. Its read tier is experimental and off by default; without it the VFD is a write-through replacement for HDF5's default <code>sec2</code> driver.</li>
+  <li><strong>Your code uses ADIOS2</strong>: switch the IO's engine to the <a href="/docs/io-adapters/adios2.html">plugin engine</a> in code or in the ADIOS2 XML file.</li>
+  <li><strong>Your code writes plain files</strong> with <code>open</code>/<code>write</code>, <code>fopen</code>/<code>fwrite</code> or <code>MPI_File_*</code>, and you can choose the path it writes to: preload the <a href="/docs/io-adapters/posix.html">POSIX</a>, <a href="/docs/io-adapters/stdio.html">STDIO</a> or <a href="/docs/io-adapters/mpiio.html">MPI-IO</a> interceptor and give it a <code>clio::</code> path.</li>
+  <li><strong>Your code needs a whole directory tree, or cannot be preloaded</strong> (a static binary, macOS, Windows): mount <a href="/technologies/context-fs.html">Context FS</a> through FUSE instead. It serves the same namespace as the interceptors.</li>
+  <li><strong>Neither HDF5 connector</strong> helps when the file sits on a local disk and fits in the page cache: a tier hit then replaces a page-cache hit with a round trip to the runtime.</li>
+</ul>
+
+<h2>Built to fail safe</h2>
+<ul class="checks">
+  <li><strong>Opt-in by path.</strong> An interceptor never captures a system library, a configuration file or any path without the <code>clio::</code> marker.</li>
+  <li><strong>The native HDF5 file stays the authority.</strong> Every write goes to the file first. With no runtime, no CTE pool or the cache switched off, both HDF5 connectors fall back to the native file and stay correct.</li>
+  <li><strong>Coherence stamps.</strong> At close the VOL connector (and the VFD, when its read tier is on) records the file's device, inode, size and modification time. A file changed between sessions by any other tool no longer matches, and its cache is dropped.</li>
+  <li><strong>Silent fallback can be turned into an error.</strong> <code>CLIO_REQUIRE_RUNTIME=1</code> makes an HDF5 open fail when the CLIO tier cannot be reached, so a test or benchmark cannot pass by quietly never using CLIO.</li>
+</ul>
+
+<h2>Performance</h2>
+<p>No adapter benchmark with stated hardware has been published in the repository yet, so this page gives no figures. The HDF5 connectors' compatibility is checked by a differential suite against native HDF5 (<code>benchmarks/hdf5-ingest/hdf5_compat_suite.py</code>, CTest <code>cte_hdf5_vol_compat_suite</code> and <code>cte_hdf5_vfd_compat_suite</code>). To measure the VOL connector on your own system, compare against <code>CLIO_VOL_CACHE=0</code>, which runs the same connector with the tier switched off, rather than against running without the connector.</p>
+
+<h2 id="source-build">Build from source</h2>
+<p>A source build has many settings and configurations to optimize the installation for your specific system. We keep an <a href="https://github.com/iowarp/clio-core/blob/main/INSTALL.md"><code>INSTALL.md</code></a> in the root of the repository, written to help AI agents install CLIO Core. The I/O adapters are I/O library extensions, so they come from a source build with that adapter turned on: Spack, where each adapter is a variant, or CMake. To have a coding agent do it, give it a prompt like this:</p>
+<pre data-label="prompt for a coding agent">
+Clone https://github.com/iowarp/clio-core and follow INSTALL.md to build CLIO Core
+from source on this machine with the HDF5 VOL connector and the ADIOS2 engine
+(-DCLIO_CTE_ENABLE_HDF5_VOL=ON -DCLIO_CTE_ENABLE_ADIOS2_ADAPTER=ON). Install HDF5
+1.14+, ADIOS2 and the other system packages it lists for my OS, then run the
+adapter tests with ctest to verify the install.
+</pre>
+<p>The agent should name the options it chose for your system; the <a href="/docs/io-adapters/install.html">install page</a> lists the options that matter here.</p>
+
+<h2>Where to go next</h2>
+<ul>
+  <li><a href="/docs/io-adapters/index.html">I/O adapters documentation</a>: one page per adapter with build flags, setup and examples.</li>
+  <li><a href="/docs/io-adapters/install.html">Install</a>: the CMake option for each adapter and the libraries it produces.</li>
+  <li><a href="/design/adapters.html">Design of the adapters</a>: how interception, the descriptor layer and the HDF5 caches work.</li>
+</ul>

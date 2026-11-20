@@ -30,6 +30,20 @@ facts: Interface | Paged vector (gpu_vector, cpu_vector) ; GPUs | Intel Max 1550
   <li><strong>Shipped with its expertise.</strong> An agent skill encodes how to use the interface well, and derives application-specific placement policies from an application's own kernels.</li>
 </ul>
 
+<h2>What the code looks like</h2>
+<p>Inside a CUDA kernel, each block fetches a page, works on it through an ordinary pointer, writes it back and releases it. Each <code>co_await</code> lets the block pause while the runtime moves the page, so other blocks keep the GPU busy. The kernel is compiled with clang, which supports C++20 coroutines in device code.</p>
+<pre data-label="cpp · inside a kernel">
+co_await v.Fetch(0, off, count);                       // bring the page into GPU memory
+{
+  auto h = co_await v.HoldPage(off, count, /*write=*/true);
+  for (u64 i = off + threadIdx.x; i < off + h.run(); i += blockDim.x)
+    h[i] = 2.0f * h[i];                                // ordinary array access
+}
+co_await v.Flush(0, off, count);                       // write it back to the tiers
+v.UnpinRange(off, count);                              // let the cache reuse the slot
+</pre>
+<p><a href="/docs/memory-expansion/gpu-vector.html">gpu_vector</a> has the full example, CPU side and GPU side. <a href="/docs/memory-expansion/cpu-vector.html">cpu_vector</a> does the same from ordinary host threads with no GPU.</p>
+
 <h2>Against MPI, oneCCL and Intel SHMEM</h2>
 <p>Four workloads with very different access patterns (k-means, a Gray-Scott stencil, the particle-mesh Ewald spread and gather of a molecular-dynamics step, and model-parallel neural-network training) were written once on Eternia's paged vector and again as standalone MPI, oneCCL and Intel SHMEM codes. They weak-scale from 4 to 64 Aurora nodes, one GPU tile per node, with each node's share fitting in GPU memory. Every run ends in a correctness gate: identical checksums, bit-equal mesh totals, identical weight digests.</p>
 <figure class="figure"><img src="/assets/figures/eternia-weak-scaling.png" alt="Weak scaling on Aurora from 4 to 64 nodes for kmeans, Gray-Scott, gmx and lbann. Each bar is time per iteration for Eternia, MPI, oneCCL and Intel SHMEM, split into communication and compute." loading="lazy"><figcaption>Weak scaling on Aurora, one GPU tile per node. Each bar is time per iteration, split into communication on the slowest rank (hatched) and compute. Flat is ideal, except for lbann, whose model grows with the node count. Intel SHMEM failed validation for lbann at 4 and 8 nodes and has no result at 64.</figcaption></figure>
@@ -93,8 +107,20 @@ facts: Interface | Paged vector (gpu_vector, cpu_vector) ; GPUs | Intel Max 1550
 <h2>Where these numbers come from</h2>
 <p>All results on this page are from the Eternia paper's evaluation (<code>external/eternia</code>), run on Argonne's Aurora (two Xeon CPU Max 9470, 1 TB DDR5 and six Intel Data Center GPU Max 1550 per node, Slingshot 11) and NCSA's Delta. Every timed region runs for at least two minutes, and every run is checked against its reference.</p>
 
+<h2 id="source-build">Build from source</h2>
+<p>A source build has many settings and configurations to optimize the installation for your specific system. We keep an <a href="https://github.com/iowarp/clio-core/blob/main/INSTALL.md"><code>INSTALL.md</code></a> in the root of the repository, written to help AI agents install CLIO Core. <code>gpu_vector</code> is a GPU extension, so it is only available from a source build with CUDA and clang (or SYCL) enabled: Spack (<code>+cuda +gpu_vector</code> or <code>+sycl %oneapi</code>) or CMake. To have a coding agent do it, give it a prompt like this:</p>
+<pre data-label="prompt for a coding agent">
+Clone https://github.com/iowarp/clio-core and follow INSTALL.md to build CLIO Core
+from source on this machine with gpu_vector enabled: CUDA with clang as the CUDA
+compiler (-DCLIO_CORE_ENABLE_CUDA=ON -DCLIO_GPU_CLANG=ON) and tests on
+(-DCLIO_CORE_ENABLE_TESTS=ON). Install the CUDA toolkit, a recent clang++ and the
+other system packages it lists, then run ctest -L gpu_vector to verify the install.
+</pre>
+<p>The agent should name the options it chose for your system; the <a href="/docs/memory-expansion/install.html">install page</a> lists the options that matter here.</p>
+
 <h2>Where to go next</h2>
 <ul>
+  <li><a href="/docs/memory-expansion/gpu-vector.html">gpu_vector</a> and <a href="/docs/memory-expansion/cpu-vector.html">cpu_vector</a>: step-by-step examples</li>
   <li><a href="/technologies/machine-learning.html">Machine learning on paged vectors</a></li>
   <li><a href="/design/placement.html">Placement and tiering</a></li>
 </ul>

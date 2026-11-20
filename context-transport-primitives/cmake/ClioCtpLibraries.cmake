@@ -174,8 +174,13 @@ endif()
 
 set(_CEREAL_TARGET "")
 if(TARGET cereal AND NOT TARGET cereal::cereal)
-    # Only include if built as submodule (not a system/imported target)
-    set(_CEREAL_TARGET cereal)
+    # Only include if built as submodule, not a system/imported target: an
+    # installed cereal (Spack's, for one) may export a plain imported `cereal`
+    # target, and install(TARGETS) rejects imported targets.
+    get_target_property(_cereal_imported cereal IMPORTED)
+    if(NOT _cereal_imported)
+        set(_CEREAL_TARGET cereal)
+    endif()
 endif()
 
 # Install compiled libraries (interface libraries are installed in parent CMakeLists.txt)

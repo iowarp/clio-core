@@ -121,7 +121,7 @@ jobs:
         # does not bundle libfuse3.so.3 — end users get it from their
         # distro's fuse3 packages.
         CIBW_BEFORE_ALL: >
-          yum install -y curl patchelf fuse3-devel openssl-devel &&
+          yum clean all && bash {project}/CI/retry.sh yum install -y --refresh curl patchelf fuse3-devel openssl-devel &&
           bash {project}/installers/pip/build_deps_manylinux.sh
         CIBW_ENVIRONMENT: ${{ matrix.cibw_environment }}
         CIBW_REPAIR_WHEEL_COMMAND_LINUX: >
@@ -199,7 +199,7 @@ jobs:
         CIBW_BUILD: ${{ matrix.py }}-manylinux_x86_64
         CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
         CIBW_BEFORE_ALL: >
-          yum install -y curl patchelf fuse3-devel openssl-devel &&
+          yum clean all && bash {project}/CI/retry.sh yum install -y --refresh curl patchelf fuse3-devel openssl-devel &&
           bash {project}/installers/pip/install_gpu_toolchain.sh ${{ matrix.variant }} &&
           bash {project}/installers/pip/build_deps_manylinux.sh
         # The icx/icpx and nvcc paths need oneAPI's environment and CUDA on
@@ -305,8 +305,15 @@ jobs:
     # test job, far from the cause (#1004).
     - name: Install WinFsp (FUSE adapter SDK)
       run: |
-        pwsh CI/Retry.ps1 -Attempts 3 -DelaySeconds 30 choco install winfsp -y --no-progress
-        if (-not (Test-Path "${env:ProgramFiles(x86)}\WinFsp\inc\fuse3\fuse.h")) {
+        # choco can exit 0 having installed nothing when its feed answers 503
+        # ("installed 0/0 packages"), which Retry.ps1 cannot see; retry until
+        # the SDK header is actually there.
+        $hdr = "${env:ProgramFiles(x86)}\WinFsp\inc\fuse3\fuse.h"
+        for ($i = 1; $i -le 4 -and -not (Test-Path $hdr); $i++) {
+          pwsh CI/Retry.ps1 -Attempts 3 -DelaySeconds 30 choco install winfsp -y --no-progress
+          if (-not (Test-Path $hdr)) { Start-Sleep -Seconds (30 * $i) }
+        }
+        if (-not (Test-Path $hdr)) {
           throw "WinFsp SDK missing after the install succeeded -- failing HERE instead of shipping a wheel without the FUSE adapter (#1004)"
         }
 
@@ -688,6 +695,9 @@ jobs:
             echo "=== Web dashboard compiled in and its pages shipped ==="
             python /ci/check_wheel_dashboard.py
 
+            echo "=== S3 and GCS storage tiers compiled in ==="
+            python /ci/check_wheel_cloud_tiers.py
+
             echo "=== Symbol resolution check ==="
             LIB_DIR=$(python -c "import iowarp_core; print(iowarp_core.get_lib_dir())")
             export LD_LIBRARY_PATH="$LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -843,6 +853,9 @@ jobs:
 
         echo "=== Web dashboard compiled in and its pages shipped ==="
         python installers/pip/check_wheel_dashboard.py
+
+        echo "=== S3 and GCS storage tiers compiled in ==="
+        python installers/pip/check_wheel_cloud_tiers.py
 
         echo "=== Symbol resolution check (otool -L) ==="
         LIB_DIR=$(python -c "import iowarp_core; print(iowarp_core.get_lib_dir())")
@@ -1003,6 +1016,10 @@ jobs:
         Write-Host "=== Web dashboard compiled in and its pages shipped ==="
         python installers/pip/check_wheel_dashboard.py
         if ($LASTEXITCODE -ne 0) { throw "wheel has no web dashboard" }
+
+        Write-Host "=== S3 and GCS storage tiers compiled in ==="
+        python installers/pip/check_wheel_cloud_tiers.py
+        if ($LASTEXITCODE -ne 0) { throw "wheel has no S3/GCS storage tiers" }
 
         $moduleDir = python -c "import iowarp_core; print(iowarp_core.get_ext_dir())"
         if ($LASTEXITCODE -ne 0) { throw "get_ext_dir failed" }
