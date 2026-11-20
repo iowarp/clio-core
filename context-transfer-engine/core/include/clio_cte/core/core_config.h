@@ -133,6 +133,11 @@ struct StorageDeviceConfig {
   // filesystem (tmpfs) every file tier costs this much memory up front.
   // YAML key: growth_unit (size string). Default matches the bdev's 1 GiB.
   clio::run::u64 growth_unit_;
+  // The bdev type's own settings: the YAML text of the block named after the
+  // type in this storage entry (`s3:` for bdev_type s3, `gcs:` for gcs),
+  // handed to the bdev as CreateParams::ext_yaml_. Holds credentials; never
+  // logged. Empty when the entry has no such block.
+  std::string bdev_ext_yaml_;
 
   StorageDeviceConfig()
       : capacity_limit_(0),

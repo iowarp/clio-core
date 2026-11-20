@@ -4,6 +4,7 @@
  */
 
 #include <clio_runtime/bdev/transports/gcs_bdev_transport.h>
+#include <yaml-cpp/yaml.h>
 #include <clio_runtime/clio_runtime.h>
 #include <clio_runtime/worker.h>
 #include <clio_runtime/work_orchestrator.h>
@@ -43,6 +44,39 @@ void ParsePoolName(const std::string &pool_name, std::string &bucket,
 }  // namespace
 #endif
 
+#ifdef CLIO_ENABLE_GOOGLE_CLOUD
+namespace {
+/**
+ * Apply the pool's `gcs:` block over the settings ConfigFromEnv read, so a key
+ * in the compose entry wins over its environment variable.
+ *
+ * Keys: endpoint (GCS_ENDPOINT), access_token (GCS_ACCESS_TOKEN),
+ * project_id (GCS_PROJECT_ID).
+ *
+ * @param ext_yaml YAML text of the `gcs:` block; empty means none
+ * @param config   settings to update in place
+ * @return false if the block is not valid YAML (logged, without its values)
+ */
+bool ApplyGcsExt(const std::string& ext_yaml, gcs::GcsConfig& config) {
+  if (ext_yaml.empty()) return true;
+  YAML::Node ext;
+  try {
+    ext = YAML::Load(ext_yaml);
+  } catch (const YAML::Exception&) {
+    HLOG(kError, "GCS bdev: the gcs: block of the pool config is not valid YAML");
+    return false;
+  }
+  auto take = [&ext](const char* key, std::string& field) {
+    if (ext[key]) field = ext[key].as<std::string>();
+  };
+  take("endpoint", config.endpoint);
+  take("access_token", config.token);
+  take("project_id", config.project_id);
+  return true;
+}
+}  // namespace
+#endif
+
 bool GcsBdevTransport::Init(const CreateParams& params,
                             const std::string& pool_name, Runtime* runtime) {
 #ifdef CLIO_ENABLE_GOOGLE_CLOUD
@@ -55,10 +89,12 @@ bool GcsBdevTransport::Init(const CreateParams& params,
   }
 
   gcs::GcsConfig config = gcs::GcsRestClient::ConfigFromEnv(bucket, prefix);
+  if (!ApplyGcsExt(params.ext_yaml_, config)) return false;
   if (config.token.empty()) {
     HLOG(kError,
-         "GCS bdev: GCS_ACCESS_TOKEN is not set. Export it from "
-         "`gcloud auth print-access-token` before creating a gcs pool.");
+         "GCS bdev: no access token. Give access_token in the pool's gcs: "
+         "block, or export GCS_ACCESS_TOKEN (from `gcloud auth "
+         "print-access-token`) before creating a gcs pool.");
     return false;
   }
   client_ = std::make_unique<gcs::GcsRestClient>(config);

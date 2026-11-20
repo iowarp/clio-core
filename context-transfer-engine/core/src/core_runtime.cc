@@ -1504,7 +1504,9 @@ clio::run::TaskResume Runtime::RegisterTarget(clio::run::shared_ptr<RegisterTarg
           // at runtime, or no persistence_level key) passes -1 and keeps the
           // WAL -- GetPersistenceLevelForTarget's kVolatile fallback is not a
           // promise that its blocks are disposable.
-          ConfiguredPersistenceLevel(target_name));
+          ConfiguredPersistenceLevel(target_name),
+          // The tier's s3: / gcs: block (endpoint, region, credentials).
+          ConfiguredBdevExt(target_name));
       CLIO_CO_AWAIT(create_task);
       if (create_task->return_code_ == 0 && target_node != this_node) {
         // The pool exists only on target_node, so this node has no metadata
@@ -7249,6 +7251,20 @@ int Runtime::ConfiguredPersistenceLevel(const std::string &target_name) {
     }
   }
   return -1;  // not a configured device (registered at runtime)
+}
+
+std::string Runtime::ConfiguredBdevExt(const std::string &target_name) {
+  for (size_t i = 0; i < storage_devices_.size(); ++i) {
+    const auto &device = storage_devices_[i];
+    const std::string expected_target_name = "storage_device_" + std::to_string(i);
+    if (target_name == expected_target_name || target_name == device.path_ ||
+        (target_name.rfind(device.path_, 0) == 0 &&
+         (target_name.size() == device.path_.size() ||
+          target_name[device.path_.size()] == '_'))) {
+      return device.bdev_ext_yaml_;
+    }
+  }
+  return std::string();
 }
 
 clio::run::bdev::PersistenceLevel Runtime::GetPersistenceLevelForTarget(

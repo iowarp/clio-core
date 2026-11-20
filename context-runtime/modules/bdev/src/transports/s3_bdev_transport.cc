@@ -4,6 +4,7 @@
  */
 
 #include <clio_runtime/bdev/transports/s3_bdev_transport.h>
+#include <yaml-cpp/yaml.h>
 #include <clio_runtime/clio_runtime.h>
 #include <clio_runtime/worker.h>
 #include <clio_runtime/work_orchestrator.h>
@@ -68,6 +69,49 @@ void ReportConnectionChurn(const char *op, size_t worker_id,
 }  // namespace
 #endif
 
+#ifdef CLIO_ENABLE_AMAZON_DRIVE
+namespace {
+/**
+ * Apply the pool's `s3:` block over the settings ConfigFromEnv read, so a key
+ * in the compose entry wins over its environment variable.
+ *
+ * Keys: endpoint (S3_ENDPOINT), region (AWS_DEFAULT_REGION), access_key_id
+ * (AWS_ACCESS_KEY_ID), secret_access_key (AWS_SECRET_ACCESS_KEY),
+ * session_token (AWS_SESSION_TOKEN), allow_bucket_create
+ * (S3_ALLOW_BUCKET_CREATE).
+ *
+ * @param ext_yaml YAML text of the `s3:` block; empty means none
+ * @param config   settings to update in place
+ * @return false if the block is not valid YAML (logged, without its values)
+ */
+bool ApplyS3Ext(const std::string& ext_yaml, s3::S3Config& config) {
+  if (ext_yaml.empty()) return true;
+  YAML::Node ext;
+  try {
+    ext = YAML::Load(ext_yaml);
+  } catch (const YAML::Exception&) {
+    HLOG(kError, "S3 bdev: the s3: block of the pool config is not valid YAML");
+    return false;
+  }
+  auto take = [&ext](const char* key, std::string& field) {
+    if (ext[key]) field = ext[key].as<std::string>();
+  };
+  take("endpoint", config.endpoint);
+  take("region", config.region);
+  take("access_key_id", config.access_key);
+  take("secret_access_key", config.secret_key);
+  take("session_token", config.session_token);
+  if (ext["allow_bucket_create"]) {
+    config.allow_bucket_create = ext["allow_bucket_create"].as<bool>();
+  }
+  while (!config.endpoint.empty() && config.endpoint.back() == '/') {
+    config.endpoint.pop_back();
+  }
+  return true;
+}
+}  // namespace
+#endif
+
 bool S3BdevTransport::Init(const CreateParams& params,
                            const std::string& pool_name, Runtime* runtime) {
 #ifdef CLIO_ENABLE_AMAZON_DRIVE
@@ -80,11 +124,12 @@ bool S3BdevTransport::Init(const CreateParams& params,
   }
 
   s3::S3Config config = s3::S3RestClient::ConfigFromEnv(bucket, prefix);
+  if (!ApplyS3Ext(params.ext_yaml_, config)) return false;
   if (config.access_key.empty() || config.secret_key.empty()) {
     HLOG(kError,
-         "S3 bdev: AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY are not set. "
-         "The signer reads credentials from the environment only -- export "
-         "them in the process that starts the runtime.");
+         "S3 bdev: no credentials. Give access_key_id and secret_access_key "
+         "in the pool's s3: block, or export AWS_ACCESS_KEY_ID and "
+         "AWS_SECRET_ACCESS_KEY in the process that starts the runtime.");
     return false;
   }
   client_ = std::make_unique<s3::S3RestClient>(config);

@@ -1158,6 +1158,15 @@ private:
    *  (PersistenceLevel), or -1 when the target has no configured level. */
   int ConfiguredPersistenceLevel(const std::string &target_name);
 
+  /**
+   * The bdev-type settings block (StorageDeviceConfig::bdev_ext_yaml_) of the
+   * configured storage device a target name belongs to, matched the same way
+   * as ConfiguredPersistenceLevel.
+   * @param target_name the target being registered
+   * @return the block's YAML text, or empty for an unconfigured target
+   */
+  std::string ConfiguredBdevExt(const std::string &target_name);
+
   clio::run::bdev::PersistenceLevel GetPersistenceLevelForTarget(
       const std::string &target_name);
 

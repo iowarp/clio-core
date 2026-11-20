@@ -258,6 +258,31 @@ compose:
   #   # fails with an I/O error, as a dead disk would; delete the file and it
   #   # works again. Checked at most every 100 ms; off unless the file exists.
 
+  # === Block Device (Amazon S3 / Google Cloud Storage bucket) ===
+  # Needs a build with -DCLIO_ENABLE_AMAZON_DRIVE=ON / -DCLIO_ENABLE_GOOGLE_CLOUD=ON
+  # (on in the pip wheel; Spack: iowarp +s3_bdev / +gcs_bdev). Each block is
+  # one object [prefix/]block_<offset>. Settings go in a block named after the
+  # bdev type; every key falls back to the environment variable after it.
+  # The same s3: / gcs: block works on a clio_cte_core storage tier entry.
+  # Keys in this file are also kept in the pool log under conf_dir.
+  # - mod_name: clio_bdev
+  #   pool_name: "s3://my-bucket/clio"   # or gcs://my-bucket/clio
+  #   pool_query: local
+  #   pool_id: "320.0"
+  #   bdev_type: s3                      # or gcs
+  #   capacity: "1TB"
+  #   s3:
+  #     access_key_id: "..."             # AWS_ACCESS_KEY_ID (required)
+  #     secret_access_key: "..."         # AWS_SECRET_ACCESS_KEY (required)
+  #     session_token: "..."             # AWS_SESSION_TOKEN (optional)
+  #     region: us-east-1                # AWS_DEFAULT_REGION (default us-east-1)
+  #     endpoint: "http://127.0.0.1:9000" # S3_ENDPOINT; set => path-style (MinIO, R2)
+  #     allow_bucket_create: false       # S3_ALLOW_BUCKET_CREATE=1
+  #   gcs:
+  #     access_token: "..."              # GCS_ACCESS_TOKEN (required; ~1 hour)
+  #     endpoint: "https://storage.googleapis.com"  # GCS_ENDPOINT
+  #     project_id: my-project           # GCS_PROJECT_ID (only to create the bucket)
+
   # === Block Device (native DAOS) ===
   # Needs a build with -DCLIO_ENABLE_DAOS=ON (Spack: iowarp +daos); without
   # it the pool is refused with an error naming the option.
