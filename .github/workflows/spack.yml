@@ -49,7 +49,7 @@ jobs:
           - name: cloud-and-network
             toolchain: none
             spec: >-
-              +s3_bdev +gcs_bdev +s3_cae +gcs +globus +libfabric +mochi
+              +s3_bdev +gcs_bdev +s3_cae +gcs +globus +mochi
               ~test ~benchmark
             expect: >-
               bin/clio_run

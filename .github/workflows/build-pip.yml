@@ -305,8 +305,15 @@ jobs:
     # test job, far from the cause (#1004).
     - name: Install WinFsp (FUSE adapter SDK)
       run: |
-        pwsh CI/Retry.ps1 -Attempts 3 -DelaySeconds 30 choco install winfsp -y --no-progress
-        if (-not (Test-Path "${env:ProgramFiles(x86)}\WinFsp\inc\fuse3\fuse.h")) {
+        # choco can exit 0 having installed nothing when its feed answers 503
+        # ("installed 0/0 packages"), which Retry.ps1 cannot see; retry until
+        # the SDK header is actually there.
+        $hdr = "${env:ProgramFiles(x86)}\WinFsp\inc\fuse3\fuse.h"
+        for ($i = 1; $i -le 4 -and -not (Test-Path $hdr); $i++) {
+          pwsh CI/Retry.ps1 -Attempts 3 -DelaySeconds 30 choco install winfsp -y --no-progress
+          if (-not (Test-Path $hdr)) { Start-Sleep -Seconds (30 * $i) }
+        }
+        if (-not (Test-Path $hdr)) {
           throw "WinFsp SDK missing after the install succeeded -- failing HERE instead of shipping a wheel without the FUSE adapter (#1004)"
         }
 

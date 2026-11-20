@@ -67,7 +67,7 @@ spack install iowarp +sycl +clio_ml %oneapi      # Intel GPUs
 | Compression | `+compress` |
 | S3 / GCS / DAOS storage tiers | `+s3_bdev` / `+gcs_bdev` / `+daos` |
 | S3 / GCS / Globus import (CAE) | `+s3_cae` / `+gcs` / `+globus` |
-| Transports | `+libfabric`, `+mochi`, `+zmq` (default on) |
+| Transports | `+mochi`, `+zmq` (default on) |
 | io_uring, OpenMP | `+io_uring` (default on), `+openmp` |
 
 `spack info iowarp` lists every variant. `.github/workflows/spack.yml`

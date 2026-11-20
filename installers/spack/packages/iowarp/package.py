@@ -88,8 +88,6 @@ class Iowarp(CMakePackage, CudaPackage, ROCmPackage):
                         'tier (Poco). Distinct from +gcs, the CAE gs:// importer.')
     variant('globus', default=False,
             description='Enable Globus transfer support in the CAE (Poco)')
-    variant('libfabric', default=False,
-            description='Enable the libfabric network transport')
     variant('io_uring', default=True,
             description='Enable the io_uring async I/O backend (Linux)')
     variant('openmp', default=False, description='Enable OpenMP')
@@ -139,7 +137,6 @@ class Iowarp(CMakePackage, CudaPackage, ROCmPackage):
     depends_on('adios2@:2.11', when='+adios2')
     depends_on('libfuse@3:', when='+fuse')
     depends_on('liburing', when='+io_uring')
-    depends_on('libfabric', when='+libfabric')
     # The dashboard, the GCS tier and the Globus importer all speak HTTP(S)
     # through Poco (find_package(Poco COMPONENTS Net NetSSL Crypto JSON)).
     depends_on('poco', when='+viz')
@@ -304,7 +301,6 @@ class Iowarp(CMakePackage, CudaPackage, ROCmPackage):
         args.append(self.define_from_variant('CLIO_CORE_ENABLE_ENCRYPT', 'encrypt'))
         args.append(self.define_from_variant('CLIO_CORE_ENABLE_PYTHON', 'python'))
         args.append(self.define_from_variant('CLIO_CORE_ENABLE_IO_URING', 'io_uring'))
-        args.append(self.define_from_variant('CLIO_CORE_ENABLE_LIBFABRIC', 'libfabric'))
         args.append(self.define_from_variant('CLIO_CORE_ENABLE_OPENMP', 'openmp'))
         args.extend(self._gpu_args())
         args.append(self.define_from_variant('CLIO_CORE_ENABLE_CLIO_ML', 'clio_ml'))
@@ -436,6 +432,22 @@ class Iowarp(CMakePackage, CudaPackage, ROCmPackage):
         versioned.sort(key=lambda p: int(p.rsplit("-", 1)[1])
                        if p.rsplit("-", 1)[1].isdigit() else -1)
         return versioned[-1] if versioned else plain
+
+    def setup_build_environment(self, env):
+        """Let the linker find libcuda on machines without a GPU driver.
+
+        The GPU libraries link -lcuda (the driver). A build host without a
+        driver (a login node, CI) has only the toolkit's stub, which carries
+        the same soname, so the real driver is used at run time.
+
+        @param env the build environment to modify
+        """
+        if '+cuda' in self.spec:
+            for sub in ('lib64', 'lib'):
+                stubs = join_path(self.spec['cuda'].prefix, sub, 'stubs')
+                if os.path.isdir(stubs):
+                    env.append_flags('LDFLAGS', '-L' + stubs)
+                    break
 
     def setup_run_environment(self, env):
         # Set up library and module paths
