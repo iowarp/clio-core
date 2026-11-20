@@ -233,6 +233,10 @@ class Iowarp(CMakePackage, CudaPackage, ROCmPackage):
     # CMAKE_CUDA_COMPILER (CLIO_GPU_CLANG). The tree is tested with clang 22;
     # older than 19 lacks the device-coroutine support it needs.
     depends_on('llvm@19: +clang', type='build', when='+gpu_vector')
+    # CudaPackage refuses newer clangs as nvcc's host compiler (e.g. clang 20+
+    # with CUDA <= 12.9). With +gpu_vector clang compiles the CUDA sources
+    # itself and nvcc is not involved, so that check does not apply.
+    depends_on('cuda+allow-unsupported-compilers', when='+gpu_vector')
     conflicts('+gpu_vector', when='~cuda',
               msg='+gpu_vector builds the CUDA vector; add +cuda (a SYCL '
                   'build gets gpu_vector from +sycl alone)')

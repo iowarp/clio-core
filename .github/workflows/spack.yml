@@ -193,7 +193,7 @@ jobs:
             cuda:
               buildable: false
               externals:
-              - spec: cuda@${cuda_ver}
+              - spec: cuda@${cuda_ver}+allow-unsupported-compilers
                 prefix: /usr/local/cuda-12.9
             llvm:
               buildable: false
