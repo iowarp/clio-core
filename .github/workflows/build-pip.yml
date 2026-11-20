@@ -688,6 +688,9 @@ jobs:
             echo "=== Web dashboard compiled in and its pages shipped ==="
             python /ci/check_wheel_dashboard.py
 
+            echo "=== S3 and GCS storage tiers compiled in ==="
+            python /ci/check_wheel_cloud_tiers.py
+
             echo "=== Symbol resolution check ==="
             LIB_DIR=$(python -c "import iowarp_core; print(iowarp_core.get_lib_dir())")
             export LD_LIBRARY_PATH="$LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -843,6 +846,9 @@ jobs:
 
         echo "=== Web dashboard compiled in and its pages shipped ==="
         python installers/pip/check_wheel_dashboard.py
+
+        echo "=== S3 and GCS storage tiers compiled in ==="
+        python installers/pip/check_wheel_cloud_tiers.py
 
         echo "=== Symbol resolution check (otool -L) ==="
         LIB_DIR=$(python -c "import iowarp_core; print(iowarp_core.get_lib_dir())")
@@ -1003,6 +1009,10 @@ jobs:
         Write-Host "=== Web dashboard compiled in and its pages shipped ==="
         python installers/pip/check_wheel_dashboard.py
         if ($LASTEXITCODE -ne 0) { throw "wheel has no web dashboard" }
+
+        Write-Host "=== S3 and GCS storage tiers compiled in ==="
+        python installers/pip/check_wheel_cloud_tiers.py
+        if ($LASTEXITCODE -ne 0) { throw "wheel has no S3/GCS storage tiers" }
 
         $moduleDir = python -c "import iowarp_core; print(iowarp_core.get_ext_dir())"
         if ($LASTEXITCODE -ne 0) { throw "get_ext_dir failed" }

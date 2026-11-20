@@ -102,6 +102,12 @@ if(CLIO_ENABLE_DAOS)
   target_compile_definitions(clio_bdev_runtime PRIVATE CLIO_ENABLE_DAOS=1)
 endif()
 
+# The cloud tiers link Poco's TLS stack; in the pip wheel that is static
+# Poco + OpenSSL, whose symbols must stay private (see ClioCheckPocoAbi.cmake).
+if(CLIO_ENABLE_AMAZON_DRIVE OR CLIO_ENABLE_GOOGLE_CLOUD)
+  clio_hide_static_tls(clio_bdev_runtime)
+endif()
+
 # Web dashboard page for this module (issue #990): mounted at /viz/clio_bdev by
 # the runtime as soon as a bdev pool comes up.
 clio_add_viz_assets(MOD_NAME clio_bdev)
