@@ -1023,11 +1023,19 @@ void SystemInfo::TouchPages(void *addr, size_t size) {
   // writing and never changes it; if a concurrent write won, that write
   // already faulted the page. (Not fetch_add(0): clang folds an idempotent
   // RMW whose result is unused into a bare fence, touching nothing.)
+  // Host only: ctp::ipc::atomic_ref exists only on the host pass, and the
+  // GPU builds also compile this file for the device, which never runs it.
+#if CTP_IS_HOST
   for (uintptr_t a = begin; a < end; a += page) {
     ctp::ipc::atomic_ref<char> ref(*reinterpret_cast<char *>(a));
     char seen = ref.load(std::memory_order_relaxed);
     ref.compare_exchange_strong(seen, seen, std::memory_order_relaxed);
   }
+#else
+  (void)begin;
+  (void)end;
+  (void)page;
+#endif
 }
 
 void *SystemInfo::AlignedAlloc(size_t alignment, size_t size) {
