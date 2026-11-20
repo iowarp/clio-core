@@ -135,7 +135,7 @@ void EnsureInit() {
       << dram_mib << "MB\"\n        score: 0.5\n"
       << "    dpe:\n      dpe_type: \"max_bw\"\n";
   }
-  setenv("CLIO_SERVER_CONF", cfg.c_str(), 1);
+  ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", cfg, 1);
   REQUIRE(clio::run::CLIO_INIT(clio::run::RuntimeMode::kServer));
   std::this_thread::sleep_for(1s);
   g_initialized = true;

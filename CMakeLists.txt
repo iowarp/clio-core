@@ -1420,7 +1420,11 @@ endif()
 # Use CLIO_CORE_MSVC_LIKE (not just MSVC) so clang-cl / icx.exe on Windows take
 # the MSVC-style flag path; GNU flags break icx's /Fo handling (see issue #555).
 if(NOT CLIO_CORE_MSVC_LIKE)
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC")
+    # -fPIC has no meaning on Windows (PE/COFF) and GNU-style clang++ targeting
+    # x86_64-pc-windows-msvc rejects it outright.
+    if(NOT WIN32)
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC")
+    endif()
     if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "NVHPC")
         # Add compiler flags following Google C++ style guide
         set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -pedantic")

@@ -1,0 +1,92 @@
+name: GPU portability (SYCL compile + cpu_vector matrix, no GPU)
+
+# Gates for GPU code that need no GPU runner. Both jobs run
+# CI/ci-gpu-portability.sh inside iowarp/deps-cpu; run the same script in the
+# devcontainer to reproduce a failure locally.
+#
+#   sycl-compile       oneAPI DPC++ (Aurora's 2025.3), SYCL_TARGET=spir64, build
+#                      gpu_vector_all: every gpu_vector target the SYCL
+#                      configure creates. The CUDA side of the same target is
+#                      built by gpu-tests.yml.
+#   cpu-vector-matrix  cpu_vector through the CTE storage path gpu_vector uses
+#                      (compressor module, CPU codecs, RAM and file tiers,
+#                      generations), out of core and resident, byte-exact.
+#                      ci-linux builds with the compressor OFF, so without
+#                      this job the compressed cells would never run.
+
+on:
+  # Push to main/dev runs unconditionally, for the same reason as
+  # gpu-tests.yml: a merge must exercise everything.
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+    paths:
+      - 'context-runtime/**'
+      - 'context-transfer-engine/**'
+      - 'context-transport-primitives/**'
+      - 'CMakeLists.txt'
+      - 'CMakePresets.json'
+      - 'CI/ci-gpu-portability.sh'
+      - '.github/workflows/gpu-portability.yml'
+  merge_group:
+  workflow_dispatch:
+
+concurrency:
+  group: gpu-portability-${{ github.ref }}
+  # Cancel superseded runs on PR branches only; a merge's run must finish
+  # (see gpu-tests.yml).
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  sycl-compile:
+    name: SYCL spir64 compile (gpu_vector_all)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      # oneAPI (~4 GB) plus deps-cpu plus the build exceed a runner's free
+      # disk; drop the preinstalled toolchains this job never uses.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Build gpu_vector_all for SYCL (inside deps-cpu)
+        run: |
+          docker run --rm -v "${{ github.workspace }}":/workspace -w /workspace -u 0 \
+            iowarp/deps-cpu:latest bash -c '
+              set -e
+              git config --global --add safe.directory /workspace
+              export LD_LIBRARY_PATH=/usr/local/lib:/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}
+              export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/lib/x86_64-linux-gnu/pkgconfig:${PKG_CONFIG_PATH:-}
+              BUILD_ROOT=/workspace/build-gpu-portability bash CI/ci-gpu-portability.sh sycl-compile
+            '
+
+  cpu-vector-matrix:
+    name: cpu_vector matrix (codecs x tiers, no GPU)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Build and run the cpu_vector matrix (inside deps-cpu)
+        run: |
+          # --shm-size: docker's default /dev/shm (64 MB) is far too small for
+          # the runtime's shared-memory segments.
+          docker run --rm --shm-size=2g -v "${{ github.workspace }}":/workspace -w /workspace -u 0 \
+            iowarp/deps-cpu:latest bash -c '
+              set -e
+              git config --global --add safe.directory /workspace
+              export LD_LIBRARY_PATH=/usr/local/lib:/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}
+              export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/lib/x86_64-linux-gnu/pkgconfig:${PKG_CONFIG_PATH:-}
+              BUILD_ROOT=/workspace/build-gpu-portability bash CI/ci-gpu-portability.sh cpu-vector-matrix
+            '
