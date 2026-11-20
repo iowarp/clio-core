@@ -6,12 +6,16 @@
 from spack.package import *
 
 
-class Iowarp(CMakePackage):
+class Iowarp(CMakePackage, CudaPackage, ROCmPackage):
     """IOWarp Core: Unified repository containing runtime (Clio),
     context-transport-primitives, context-transfer-engine,
     context-assimilation-engine, and context-exploration-engine."""
 
     homepage = "https://github.com/iowarp/clio-core"
+    # This package is a source build of the whole tree: every optional feature
+    # the CMake build has (GPU memory expansion, the I/O adapters, clio-ml, the
+    # dashboard, cloud tiers) is a variant here. .github/workflows/spack.yml
+    # installs the feature variants on every change to this file.
     git = "https://github.com/iowarp/clio-core.git"
 
     # Branch versions
@@ -34,7 +38,11 @@ class Iowarp(CMakePackage):
     variant('posix', default=True, description='Enable POSIX adapter')
     variant('mpiio', default=True, description='Enable MPI I/O adapter')
     variant('stdio', default=True, description='Enable STDIO adapter')
-    variant('hdf5', default=True, description='Enable HDF5')
+    variant('hdf5', default=True, description='Enable HDF5 import in the CAE')
+    variant('vol', default=True,
+            description='Build the HDF5 VOL connector (needs HDF5 1.14+)')
+    variant('vfd', default=True,
+            description='Build the HDF5 virtual file driver (needs HDF5 1.14+)')
     variant('ares', default=False, description='Enable full libfabric install')
     variant('mochi', default=False, description='Build with mochi-thallium support')
     variant('encrypt', default=False, description='Include encryption libraries')
@@ -42,8 +50,22 @@ class Iowarp(CMakePackage):
     variant('python', default=False, description='Install python bindings')
     variant('elf', default=True, description='Build elf toolkit')
     variant('zmq', default=True, description='Build ZeroMQ support')
-    variant('cuda', default=False, description='Enable CUDA support')
-    variant('rocm', default=False, description='Enable ROCm support')
+    # +cuda / cuda_arch come from CudaPackage, +rocm / amdgpu_target from
+    # ROCmPackage.
+    variant('gpu_vector', default=False,
+            description='Build gpu_vector (memory expansion in CUDA kernels): '
+                        'uses clang as the CUDA compiler, since nvcc cannot '
+                        'compile device coroutines. Needs +cuda.')
+    variant('sycl', default=False,
+            description='Enable Intel GPU support through SYCL (builds '
+                        'gpu_vector for SYCL). Needs the oneAPI compiler.')
+    variant('gds', default=False,
+            description='Build the NVIDIA GPUDirect Storage (cuFile) adapter')
+    variant('clio_ml', default=False,
+            description='Build clio-ml (Spark-MLlib-style algorithms over the '
+                        'paged vectors); its backend follows +cuda / +sycl')
+    variant('viz', default=True,
+            description='Build the runtime web dashboard (needs Poco)')
     variant('adios2', default=False, description='Build with ADIOS2 support')
     variant('fuse', default=False, description='Enable FUSE3 adapter (CTE)')
     variant('s3_cae', default=False,
@@ -58,6 +80,16 @@ class Iowarp(CMakePackage):
             description='Enable the native DAOS (kDaos) bdev storage tier: '
                         'a DFS file driven through libdfs/libdaos instead '
                         'of a dfuse mount.')
+    variant('gcs_bdev', default=False,
+            description='Enable the Google Cloud Storage (kGcs) bdev storage '
+                        'tier (Poco). Distinct from +gcs, the CAE gs:// importer.')
+    variant('globus', default=False,
+            description='Enable Globus transfer support in the CAE (Poco)')
+    variant('libfabric', default=False,
+            description='Enable the libfabric network transport')
+    variant('io_uring', default=True,
+            description='Enable the io_uring async I/O backend (Linux)')
+    variant('openmp', default=False, description='Enable OpenMP')
     variant('boost_coro', default=False,
             description='Use Boost.Context stackful coroutine backend (issue #620)')
 
@@ -95,8 +127,18 @@ class Iowarp(CMakePackage):
     depends_on('libelf', when='+elf')
     depends_on('mpi', when='+mpiio')
     depends_on('hdf5', when='+hdf5')
+    # The VOL connector and the VFD use the HDF5 1.14 plugin APIs.
+    depends_on('hdf5@1.14:', when='+vol')
+    depends_on('hdf5@1.14:', when='+vfd')
     depends_on('adios2', when='+adios2')
     depends_on('libfuse@3:', when='+fuse')
+    depends_on('liburing', when='+io_uring')
+    depends_on('libfabric', when='+libfabric')
+    # The dashboard, the GCS tier and the Globus importer all speak HTTP(S)
+    # through Poco (find_package(Poco COMPONENTS Net NetSSL Crypto JSON)).
+    depends_on('poco', when='+viz')
+    depends_on('poco', when='+gcs_bdev')
+    depends_on('poco', when='+globus')
     depends_on('boost+context', when='+boost_coro')
 
     # CAE cloud import backends (opt-in). The S3 assimilator now needs BOTH:
@@ -180,9 +222,35 @@ class Iowarp(CMakePackage):
     # Encryption libraries (conditional on +encrypt)
     depends_on('openssl', when='+encrypt')
 
-    # GPU support (conditional)
-    depends_on('cuda', when='+cuda')
-    depends_on('rocm-core', when='+rocm')
+    # GPU support. CudaPackage adds depends_on('cuda') under +cuda;
+    # ROCmPackage adds hip and friends under +rocm.
+    #
+    # gpu_vector's device verbs are C++20 coroutines, which only clang can
+    # compile for CUDA, so +gpu_vector brings a clang that the build uses as
+    # CMAKE_CUDA_COMPILER (CLIO_GPU_CLANG). The tree is tested with clang 22;
+    # older than 19 lacks the device-coroutine support it needs.
+    depends_on('llvm@19: +clang', type='build', when='+gpu_vector')
+    conflicts('+gpu_vector', when='~cuda',
+              msg='+gpu_vector builds the CUDA vector; add +cuda (a SYCL '
+                  'build gets gpu_vector from +sycl alone)')
+    conflicts('+gds', when='~cuda', msg='the GDS adapter needs +cuda')
+    conflicts('+gds', when='~elf', msg='the GDS adapter needs +elf')
+    conflicts('+sycl', when='+cuda',
+              msg='pick one GPU language: +cuda or +sycl')
+    # SYCL needs the oneAPI DPC++ compiler (icpx -fsycl) as the C++ compiler.
+    requires('%oneapi', when='+sycl',
+             msg='+sycl builds with the oneAPI compiler: add %oneapi')
+
+    # clio-ml lives in its own repository and is built as external/clio-ml.
+    resource(name='clio-ml', git='https://github.com/iowarp/clio-ml.git',
+             branch='main', destination='external', placement='clio-ml',
+             when='+clio_ml')
+    conflicts('+clio_ml', when='~cte', msg='clio-ml is built on the CTE vectors')
+    conflicts('+vol', when='~cte', msg='the VOL connector lives under CTE')
+    conflicts('+vfd', when='~cte', msg='the VFD lives under CTE')
+    conflicts('+gcs_bdev', when='~runtime',
+              msg='the GCS bdev tier lives in the runtime; enable +runtime')
+    conflicts('+globus', when='~cae', msg='Globus import lives under CAE')
 
     def cmake_args(self):
         args = []
@@ -216,8 +284,13 @@ class Iowarp(CMakePackage):
         args.append(self.define_from_variant('CLIO_CORE_ENABLE_HDF5', 'hdf5'))
         args.append(self.define_from_variant('CLIO_CORE_ENABLE_ENCRYPT', 'encrypt'))
         args.append(self.define_from_variant('CLIO_CORE_ENABLE_PYTHON', 'python'))
-        args.append(self.define_from_variant('CLIO_CORE_ENABLE_CUDA', 'cuda'))
-        args.append(self.define_from_variant('CLIO_CORE_ENABLE_ROCM', 'rocm'))
+        args.append(self.define_from_variant('CLIO_CORE_ENABLE_IO_URING', 'io_uring'))
+        args.append(self.define_from_variant('CLIO_CORE_ENABLE_LIBFABRIC', 'libfabric'))
+        args.append(self.define_from_variant('CLIO_CORE_ENABLE_OPENMP', 'openmp'))
+        args.extend(self._gpu_args())
+        args.append(self.define_from_variant('CLIO_CORE_ENABLE_CLIO_ML', 'clio_ml'))
+        if '+clio_ml' in self.spec:
+            args.append(self.define_from_variant('CLIO_ML_PYTHON', 'python'))
         if '+adios2' in self.spec:
             args.append(self.define('CLIO_CTE_ENABLE_ADIOS2_ADAPTER', 'ON'))
             args.append(self.define('CLIO_CORE_ENABLE_GRAY_SCOTT', 'ON'))
@@ -234,14 +307,14 @@ class Iowarp(CMakePackage):
                 ('posix', 'CLIO_CTE_ENABLE_POSIX_ADAPTER'),
                 ('stdio', 'CLIO_CTE_ENABLE_STDIO_ADAPTER'),
                 ('mpiio', 'CLIO_CTE_ENABLE_MPIIO_ADAPTER'),
-                ('hdf5', 'CLIO_CTE_ENABLE_VFD'),
+                ('vfd', 'CLIO_CTE_ENABLE_VFD'),
+                ('gds', 'CLIO_CTE_ENABLE_NVIDIA_GDS_ADAPTER'),
                 ('compress', 'CLIO_CTE_ENABLE_COMPRESS'),
                 ('fuse', 'CLIO_CTE_ENABLE_FUSE_ADAPTER')):
             on = cte and ('+' + variant) in self.spec
             args.append(self.define(option, on))
-        # The VOL connector needs the HDF5 1.14 VOL API.
-        vol = cte and self.spec.satisfies('+hdf5 ^hdf5@1.14:')
-        args.append(self.define('CLIO_CTE_ENABLE_HDF5_VOL', vol))
+        args.append(self.define('CLIO_CTE_ENABLE_HDF5_VOL',
+                                cte and '+vol' in self.spec))
 
         # Context-assimilation-engine (CAE) object-store importers.
         if '+cae' in self.spec:
@@ -249,6 +322,7 @@ class Iowarp(CMakePackage):
                 args.append(self.define('CAE_ENABLE_S3', 'ON'))
             if '+gcs' in self.spec:
                 args.append(self.define('CAE_ENABLE_GCS', 'ON'))
+            args.append(self.define_from_variant('CAE_ENABLE_GLOBUS', 'globus'))
 
         # The S3 bdev tier lives in the runtime's bdev module, not under CAE,
         # so it is gated outside the '+cae' block above.
@@ -259,7 +333,40 @@ class Iowarp(CMakePackage):
         # define_from_variant passes OFF too, so a ~daos build never picks up
         # a stale ON from a reused build directory.
         args.append(self.define_from_variant('CLIO_ENABLE_DAOS', 'daos'))
+        args.append(self.define_from_variant('CLIO_ENABLE_GOOGLE_CLOUD', 'gcs_bdev'))
 
+        return args
+
+    def _gpu_args(self):
+        """CMake defines for the GPU backends (+cuda, +rocm, +sycl)."""
+        spec = self.spec
+        args = [
+            self.define_from_variant('CLIO_CORE_ENABLE_CUDA', 'cuda'),
+            self.define_from_variant('CLIO_CORE_ENABLE_ROCM', 'rocm'),
+            self.define_from_variant('CLIO_CORE_ENABLE_SYCL', 'sycl'),
+            self.define_from_variant('CLIO_GPU_CLANG', 'gpu_vector'),
+        ]
+        if '+cuda' in spec:
+            archs = spec.variants['cuda_arch'].value
+            if archs and archs[0] != 'none':
+                args.append(self.define('CMAKE_CUDA_ARCHITECTURES',
+                                        ';'.join(archs)))
+            cuda_prefix = spec['cuda'].prefix
+            args.append(self.define('CUDAToolkit_ROOT', cuda_prefix))
+            if '+gpu_vector' in spec:
+                # clang compiles the CUDA sources; point it at Spack's CUDA.
+                clangxx = join_path(spec['llvm'].prefix.bin, 'clang++')
+                args.append(self.define('CMAKE_CUDA_COMPILER', clangxx))
+                args.append(self.define(
+                    'CMAKE_CUDA_FLAGS',
+                    '--cuda-path={0} -Wno-unknown-cuda-version'.format(
+                        cuda_prefix)))
+        if '+rocm' in spec:
+            args.append(self.define('ROCM_PATH', spec['hip'].prefix))
+            targets = spec.variants['amdgpu_target'].value
+            if targets and targets[0] != 'none':
+                args.append(self.define('CMAKE_HIP_ARCHITECTURES',
+                                        ';'.join(targets)))
         return args
 
     def setup_run_environment(self, env):
