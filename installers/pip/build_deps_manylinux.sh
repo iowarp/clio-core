@@ -173,7 +173,7 @@ yum install -y perl-core >/dev/null
 download_tar https://github.com/openssl/openssl/releases/download/openssl-3.0.15/openssl-3.0.15.tar.gz openssl.tar.gz
 tar xzf openssl.tar.gz && rm openssl.tar.gz
 (cd openssl-3.0.15 && \
-  ./Configure no-shared no-tests no-docs no-module -fPIC \
+  ./Configure no-shared no-tests no-module -fPIC \
       --prefix=$PREFIX --libdir=lib --openssldir=/etc/pki/tls && \
   make -j$NPROC build_libs && make install_dev)
 rm -rf /tmp/openssl-3.0.15
