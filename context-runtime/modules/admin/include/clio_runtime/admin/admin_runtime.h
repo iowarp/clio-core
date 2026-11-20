@@ -255,7 +255,8 @@ public:
    *   viz_start[?bind=<addr>&port=<n>]    start unless already running
    *   viz_stop                            stop if running
    * Every form replies with a msgpack map {running, bind, port, error}
-   * describing the state AFTER the action.
+   * describing the state AFTER the action. `bind` must be a loopback address
+   * or the dashboard address the runtime's configuration names.
    */
   void MonitorViz(clio::run::shared_ptr<MonitorTask> &task);
 

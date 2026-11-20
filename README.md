@@ -139,6 +139,16 @@ export CLIO_SERVER_CONF=/path/to/my_config.yaml
 clio_run start
 ```
 
+A single-node runtime listens on loopback only. The runtime does not
+authenticate clients or peers, so listening on the network is opt-in.
+
+- **Clients on other hosts.** Start the runtime with `CLIO_BIND_ADDR=0.0.0.0`,
+  or with one of this machine's addresses. Clients connect with
+  `CLIO_SERVER_ADDR=<runtime address>`. Do this only on a network you trust.
+- **Multi-node runtimes.** A runtime with a hostfile listens on every interface,
+  because its peers must reach it. Run multi-node deployments on a trusted
+  network.
+
 ### FUSE filesystem
 
 `clio_cte_fuse` exposes the Context Transfer Engine as a POSIX filesystem, so

@@ -63,7 +63,8 @@ void PrintVizCmdUsage() {
   HIPRINT("  start   Start the dashboard unless it is already running, then");
   HIPRINT("          print its address.");
   HIPRINT("            --port <n>     TCP port (0 = any free port)");
-  HIPRINT("            --bind <addr>  bind address (e.g. 0.0.0.0)");
+  HIPRINT("            --bind <addr>  bind address: loopback, or the address");
+  HIPRINT("                           the runtime's configuration names");
   HIPRINT("          Without options the runtime's configured endpoint is used");
   HIPRINT("          (viz: port/bind, CLIO_VIZ_PORT/CLIO_VIZ_BIND; default");
   HIPRINT("          127.0.0.1:8080).");
