@@ -49,8 +49,19 @@ function(clio_add_cli_alias target alias)
       VERBATIM)
   endif()
 
-  # Install tree. The target's file name is resolved at generate time;
+  # Install tree. The installed file name is computed here, at configure
+  # time, rather than with $<TARGET_FILE_NAME:...>: generator expressions in
+  # install(CODE) are only expanded under policy CMP0087, and a caller whose
+  # directory declares cmake_minimum_required(VERSION < 3.14) (as
+  # context-runtime/util does) gets it OLD -- the literal "$<...>" string then
+  # never matched a file and the alias was silently not installed.
   # DESTDIR is honoured so staged installs (cpack, rpmbuild, conda) work.
+  get_target_property(_out_name ${target} OUTPUT_NAME)
+  if(NOT _out_name)
+    set(_out_name ${target})
+  endif()
+  set(_src_name "${_out_name}${CMAKE_EXECUTABLE_SUFFIX}")
+
   set(_components ${ARG_COMPONENTS})
   if(NOT _components)
     set(_components Unspecified)
@@ -58,17 +69,19 @@ function(clio_add_cli_alias target alias)
   foreach(_comp IN LISTS _components)
     install(CODE "
       set(_bindir \"\$ENV{DESTDIR}\${CMAKE_INSTALL_PREFIX}/bin\")
-      set(_src \"$<TARGET_FILE_NAME:${target}>\")
+      set(_src \"${_src_name}\")
       set(_dst \"\${_bindir}/${alias}${CMAKE_EXECUTABLE_SUFFIX}\")
-      if(EXISTS \"\${_bindir}/\${_src}\")
-        file(REMOVE \"\${_dst}\")
-        if(WIN32)
-          file(COPY_FILE \"\${_bindir}/\${_src}\" \"\${_dst}\")
-        else()
-          file(CREATE_LINK \"\${_src}\" \"\${_dst}\" SYMBOLIC)
-        endif()
-        message(STATUS \"Installing: \${_dst} -> \${_src}\")
+      if(NOT EXISTS \"\${_bindir}/\${_src}\")
+        message(FATAL_ERROR
+          \"CLI alias ${alias}: \${_bindir}/\${_src} was not installed\")
       endif()
+      file(REMOVE \"\${_dst}\")
+      if(WIN32)
+        file(COPY_FILE \"\${_bindir}/\${_src}\" \"\${_dst}\")
+      else()
+        file(CREATE_LINK \"\${_src}\" \"\${_dst}\" SYMBOLIC)
+      endif()
+      message(STATUS \"Installing: \${_dst} -> \${_src}\")
     " COMPONENT ${_comp})
   endforeach()
 endfunction()
