@@ -398,7 +398,17 @@ class PoolManager {
    *        next start re-creates it (`compose stop`)
    * @return TaskResume coroutine handle
    */
-  TaskResume DestroyPool(PoolId pool_id, bool keep_in_pool_log = false);
+  TaskResume DestroyPool(PoolId pool_id, bool keep_in_pool_log = false,
+                         PoolId successor = PoolId::GetNull());
+
+  /**
+   * Successor an unplugged pool redirects to. Follows redirect chains (bounded
+   * to kMaxRedirectHops) so a pool unplugged twice still resolves to its live
+   * successor. Hot-path cheap: one relaxed atomic load when no redirect exists.
+   * @param pool_id Pool identifier, possibly unplugged
+   * @return the final successor pool, or a null PoolId when no redirect applies
+   */
+  PoolId RedirectOf(PoolId pool_id) const;
 
   /**
    * Destroy a local pool and its containers on this node (simple version)
@@ -591,6 +601,43 @@ class PoolManager {
   /** Pools destroyed on this node and not re-created (see WasDestroyed). */
   std::unordered_set<PoolId> destroyed_pools_;
   mutable std::mutex destroyed_pools_mu_;
+
+  /**
+   * Redirects left by unplugged pools: old pool id -> successor pool id.
+   * Consulted only when the old pool has no metadata entry (see RedirectOf).
+   */
+  std::unordered_map<PoolId, PoolId> redirects_;
+  mutable std::shared_mutex redirects_mu_;  ///< readers: every routed task
+  /** Fast-path flag: false while redirects_ is empty, so lookups stay cheap. */
+  std::atomic<bool> has_redirects_{false};
+
+  /**
+   * Resolve a container lookup for `pool_id`: `pick` runs on the pool's
+   * metadata when the pool exists; otherwise on its redirect successor's
+   * metadata (if the pool was unplugged with a successor). Takes the metadata
+   * read lock once on the fast path. Defined in pool_manager.cc.
+   * @param pool_id Pool identifier, possibly unplugged
+   * @param pick Callable taking const PoolInfo& and returning DynamicContainer
+   * @return the picked container handle, or an invalid handle
+   */
+  template <typename Pick>
+  DynamicContainer PickFromServingPool(PoolId pool_id, Pick pick) const;
+
+  /**
+   * Record that `from` now redirects to `to`. No-op when from == to.
+   * @param from Unplugged pool id
+   * @param to Successor pool id
+   */
+  void InstallRedirect(PoolId from, PoolId to);
+
+  /**
+   * Drop any redirect whose key is `pool_id` (called when it is re-created).
+   * @param pool_id Pool identifier being re-created
+   */
+  void ClearRedirect(PoolId pool_id);
+
+  /** Maximum redirect hops followed by RedirectOf before giving up. */
+  static constexpr size_t kMaxRedirectHops = 8;
 
   // Pool ID counter for generating unique IDs (used as minor number)
   std::atomic<u32> next_pool_minor_{5}; // Start at 5 for safety, 1 reserved for admin

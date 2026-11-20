@@ -1507,6 +1507,69 @@ set_tests_properties(
         LABELS "unit;cache;cte"
         ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
 )
+
+# Unplugging (stopping) a write-back cache flushes its dirty data, counts it
+# and leaves a redirect. Own in-process runtime, one cache pool per case.
+add_executable(test_cache_unplug test_cache_unplug.cc)
+target_include_directories(test_cache_unplug PRIVATE
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+)
+target_link_libraries(test_cache_unplug
+    clio_cte_core_runtime
+    clio_cte_core_client
+    clio_cte_core_persist_write_back_runtime
+    clio_cte_core_persist_write_back_client
+    clio::run::admin_runtime
+    clio::run::admin_client
+    clio::run::bdev_runtime
+    clio::run::bdev_client
+)
+add_test(NAME cte_cache_unplug COMMAND test_cache_unplug)
+set_tests_properties(
+    cte_cache_unplug
+    PROPERTIES
+        TIMEOUT 300
+        RESOURCE_LOCK "clio_runtime"
+        LABELS "unit;cache;cte;persistence"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
+)
+
+# `clio_run pool stop|start|rm <cache>` end to end: a real daemon, then a restart on the same
+# storage. UNIX-only (RuntimeServer / re-launching this binary).
+if(UNIX)
+add_executable(test_cli_cache_unplug test_cli_cache_unplug.cc)
+target_include_directories(test_cli_cache_unplug PRIVATE
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+)
+target_compile_definitions(test_cli_cache_unplug PRIVATE
+    CLIO_RUN_EXE="$<TARGET_FILE:clio_run>")
+target_link_libraries(test_cli_cache_unplug
+    clio_cte_core_client
+    # Config helpers of the client live in the runtime library; keep it after
+    # the client on the link line.
+    clio_cte_core_runtime
+    clio::run::admin_client
+    clio::run::bdev_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+add_dependencies(test_cli_cache_unplug
+    clio_run
+    clio_cte_core_runtime
+    clio_cte_core_persist_write_back_runtime
+    clio_bdev_runtime
+    clio_admin_runtime)
+add_test(NAME cte_cli_cache_unplug
+    COMMAND test_cli_cache_unplug
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+set(_cli_cache_unplug_env
+    "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1")
+set_tests_properties(cte_cli_cache_unplug PROPERTIES
+    RESOURCE_LOCK "clio_runtime"
+    TIMEOUT 300
+    ENVIRONMENT "${_cli_cache_unplug_env}"
+    LABELS "unit;cache;cte;persistence;msan_skip")
+endif()  # UNIX
 endif()  # policy caches
 
 # Add score-driven eviction tests (Method::kEvict)

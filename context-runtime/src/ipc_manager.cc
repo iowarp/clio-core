@@ -5221,6 +5221,30 @@ void Task::EnsureRunCtx() {
   }
 }
 
+/**
+ * Point a task addressed to an unplugged pool at that pool's successor.
+ * Used by RouteTask and Task::BeginRunContext, so a task still addressed to
+ * an unplugged pool (sent by a pool stacked above it that was never
+ * reconfigured) runs on the successor. Periodic tasks are NOT rewritten here:
+ * RouteTask retires them instead (see RouteTask).
+ * @param task Task whose pool_id_ may be rewritten in place
+ * @param pool_manager PoolManager holding the redirects; null is a no-op
+ * @return true if pool_id_ was rewritten
+ */
+static bool FollowUnplugRedirect(Task *task, PoolManager *pool_manager) {
+  if (pool_manager == nullptr) {
+    return false;
+  }
+  PoolId successor = pool_manager->RedirectOf(task->pool_id_);
+  if (successor.IsNull()) {
+    return false;
+  }
+  HLOG(kDebug, "Task: pool {} is unplugged; rerouting method {} to pool {}",
+       task->pool_id_, task->method_, successor);
+  task->pool_id_ = successor;
+  return true;
+}
+
 void Task::BeginRunContext() {
   // Reuse an existing RunContext (e.g. one created at RecvIn to hold the
   // response-routing state) rather than clobbering it — re-allocating here
@@ -5231,6 +5255,11 @@ void Task::BeginRunContext() {
   UnsetComplete();
   UnsetNewData();
 #if CTP_IS_HOST
+  // Network-received tasks arrive already routed and skip RouteTask's redirect
+  // step, so apply it here too (periodic tasks are retired by RouteTask).
+  if (!IsPeriodic()) {
+    FollowUnplugRedirect(this, CLIO_POOL_MANAGER);
+  }
   // Resolve the execution container: the real (local) container if one exists
   // (the common case), otherwise the static container.
   ExecContainer() = CLIO_POOL_MANAGER->GetRealOrStaticContainer(pool_id_);
@@ -5246,6 +5275,23 @@ RouteResult IpcManager::RouteTask(Future<Task> &future, bool force_enqueue) {
     HLOG(kWarning, "Worker {}: RouteTask - task_ptr is null",
          worker ? worker->GetId() : 0);
     return RouteResult::Dne;
+  }
+
+  // Pool unplugged with a successor (see PoolManager::RedirectOf). A periodic
+  // task of it (e.g. the cache's FlushData) must die, never run against the
+  // successor; any other task is rewritten to the successor and routed on.
+  // This runs before the collective and routed branches below.
+  PoolManager *redirect_pm = CLIO_POOL_MANAGER;
+  if (redirect_pm != nullptr &&
+      !redirect_pm->RedirectOf(task_ptr->pool_id_).IsNull()) {
+    if (task_ptr->IsPeriodic()) {
+      HLOG(kDebug, "RouteTask: retiring periodic task of unplugged pool {} "
+           "(method {})", task_ptr->pool_id_, task_ptr->method_);
+      task_ptr->SetReturnCode(1);
+      future.SetComplete();
+      return RouteResult::Dne;
+    }
+    FollowUnplugRedirect(task_ptr.get(), redirect_pm);
   }
 
   // Collective (ManyToOne / AllToOne) routing is handled before the normal

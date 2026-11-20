@@ -8,6 +8,8 @@
 
 int RuntimeStart(int argc, char** argv);
 int RuntimeStop(int argc, char** argv);
+/** `pool start|stop|rm <pool> [--force]`: manage one pool (not the runtime). */
+int Pool(int argc, char** argv);
 int RuntimeStatus(int argc, char** argv);
 int Monitor(int argc, char** argv);
 int Compose(int argc, char** argv);

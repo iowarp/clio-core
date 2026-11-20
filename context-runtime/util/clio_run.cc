@@ -30,6 +30,9 @@ void PrintUsage() {
             << "  monitor         Monitor worker statistics\n"
             << "  compose         Manage pools from a compose config:\n"
             << "                  compose <start|stop|rm|list> (see compose --help)\n"
+            << "  pool            Manage one pool of the running runtime:\n"
+            << "                  pool <start|stop|rm> <pool> [--force]\n"
+            << "                  (see pool --help)\n"
             << "  config          Export node configuration:\n"
             << "                  config export --path <file>\n"
             << "  refresh         Autogenerate ChiMod method files\n"
@@ -84,7 +87,7 @@ int main(int argc, char* argv[]) {
   }
 
   // Flat dispatch (canonical form):
-  //   <progname> start | stop | refresh | migrate | monitor | compose
+  //   <progname> start | stop | refresh | migrate | monitor | compose | pool
   // Strip "<progname> <cmd>" from argv. Each handler sees only its own args.
   {
     int new_argc = argc - 2;
@@ -96,6 +99,8 @@ int main(int argc, char* argv[]) {
       return RestartRemoved();
     } else if (cmd == "stop") {
       return RuntimeStop(new_argc, new_argv);
+    } else if (cmd == "pool") {
+      return Pool(new_argc, new_argv);
     } else if (cmd == "status") {
       return RuntimeStatus(new_argc, new_argv);
     } else if (cmd == "refresh") {
