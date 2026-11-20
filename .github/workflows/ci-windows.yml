@@ -8,16 +8,12 @@ name: CI Windows
 
 on:
   push:
-    branches: [main, dev]
+    branches: [main]
+  # Push to dev does NOT trigger this directly: dev-full-ci.yml dispatches
+  # the full matrix once dev has been quiet for 30 minutes, so a burst of
+  # merges gets one full run instead of one per merge.
   pull_request:
     branches: [main, dev]
-  # Merge queue (issue #1013): the full matrix -- macFUSE, WinFsp, the boost
-  # backend, the wide macOS sweep -- is gated on `event_name != pull_request`,
-  # so it never ran on a PR and only spoke up AFTER the merge, on dev, where a
-  # single bad commit turns every later push red. A merge_group run is that
-  # same full matrix executed on the PROSPECTIVE merge commit, before it lands.
-  # Cost is unchanged for PRs; dev stops being where breakage is discovered.
-  merge_group:
   workflow_dispatch:
 
 concurrency:
@@ -41,6 +37,8 @@ jobs:
   # windows-2025 x64 is the PR runner for both toolchains: the current image,
   # and the one both cte_bdev_fragmentation (icx) and cr_detached_spawn hit.
   matrix-tier:
+    # Skipped on dev -> main PRs: dev-to-main-gate.yml checks dev's full CI on the same commit instead.
+    if: ${{ !(github.event_name == 'pull_request' && github.head_ref == 'dev' && github.base_ref == 'main') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -60,6 +58,8 @@ jobs:
 
   # ---- MSVC build + ctest (Visual Studio generator) -------------------------
   build-test:
+    # Skipped on dev -> main PRs: dev-to-main-gate.yml checks dev's full CI on the same commit instead.
+    if: ${{ !(github.event_name == 'pull_request' && github.head_ref == 'dev' && github.base_ref == 'main') }}
     name: build-test (${{ matrix.os }})
     needs: matrix-tier
     runs-on: ${{ matrix.os }}
@@ -250,6 +250,7 @@ jobs:
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
       - name: Run tests
+        if: github.event_name != 'pull_request'
         # VCPKG_APPLOCAL_DEPS=OFF above (see #848: the z-applocal DLL copy
         # intermittently dies with ERROR_SHARING_VIOLATION) means dependency
         # DLLs were never copied next to the exes -- resolve them from the
@@ -258,11 +259,11 @@ jobs:
           $env:PATH = "${{ github.workspace }}\build\vcpkg_installed\${{ matrix.triplet }}\debug\bin;${{ github.workspace }}\build\vcpkg_installed\${{ matrix.triplet }}\bin;$env:PATH"
           ctest --test-dir build -T Test --build-config Debug --output-on-failure --timeout 120 --repeat until-pass:3 -LE "ollama|flaky"
       - name: Submit results to CDash
-        if: always()
+        if: always() && github.event_name != 'pull_request'
         continue-on-error: true
         run: ctest --test-dir build -T Submit --build-config Debug
       - name: Summarize failed tests
-        if: always()
+        if: always() && github.event_name != 'pull_request'
         shell: bash
         run: |
           LOG="build/Testing/Temporary/LastTest.log"
@@ -277,13 +278,13 @@ jobs:
             echo "(LastTest.log not found)" >> "$GITHUB_STEP_SUMMARY"
           fi
       - name: Report retried-but-passed tests
-        if: always()
+        if: always() && github.event_name != 'pull_request'
         shell: bash
         # A green check must not mean "some test failed and we retried until it
         # did not" (#921). Reports only -- never fails the job.
         run: bash CI/report_flaky_tests.sh build/Testing/Temporary/LastTest.log "windows ${{ matrix.os }}"
       - name: Upload test logs
-        if: always()
+        if: always() && github.event_name != 'pull_request'
         # Never let the artifact service sink an otherwise-green job (#921).
         # These logs are diagnostics; the verdict already came from "Run tests".
         # Seen on PR #920: build-test (windows-11-arm) passed every one of its
@@ -300,6 +301,7 @@ jobs:
   # ---- Intel oneAPI (icx-cl) compiler variant (#555) ------------------------
   icx:
     name: icx (${{ matrix.os }})
+    if: github.event_name != 'pull_request'
     needs: matrix-tier
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120

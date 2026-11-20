@@ -1,35 +1,14 @@
 name: GPU Tests (CUDA)
 
 on:
-  # Push to main/dev runs UNCONDITIONALLY -- no path filter. A merge is the
-  # gate that decides what lands, so it must exercise everything; a path
-  # filter here meant a merge touching only, say, CI or docs skipped the CUDA
-  # compile entirely, and the next unrelated merge inherited the breakage.
-  # PRs keep the path filter (below): breadth on every PR commit costs queue
-  # time for little signal, and the merge sweep still gates the branch.
   push:
-    branches: [main, dev]
-  # Also run on PRs touching the same paths. Previously this workflow fired
-  # ONLY on push to main/dev, so a change that broke the CUDA device compile
-  # was invisible in PR review and only surfaced after merge, on dev — which
-  # is exactly how the shm_metadata_cache.h device-pass break (#812, from
-  # #788) landed. Running the same compile-only build on PRs catches these
-  # before merge. Same path filter, so PRs that don't touch buildable source
-  # still skip it.
-  pull_request:
-    branches: [main, dev]
-    paths:
-      - 'context-runtime/**'
-      - 'context-transfer-engine/**'
-      - 'context-transport-primitives/**'
-      - 'CMakeLists.txt'
-      - 'CMakePresets.json'
-      - 'installers/conda/**'
-      - '.github/workflows/gpu-tests.yml'
-      - 'context-transfer-engine/adapter/gpu_vector/test/distributed*/**'
-  # Merge queue (issue #1013): same full-matrix-before-merge rationale as the
-  # other gates -- see ci-adapters.yml.
-  merge_group:
+    branches: [main]
+  # Push to dev does NOT trigger this directly: dev-full-ci.yml dispatches
+  # the full matrix once dev has been quiet for 30 minutes, so a burst of
+  # merges gets one full run instead of one per merge.
+  # Not run on pull requests: PRs only check that the tree builds on
+  # Linux/macOS/Windows and passes Linux unit tests. This runs in the full
+  # dev sweep (dev-full-ci.yml) and on push to main.
   workflow_dispatch:
 
 # One in-flight run per ref; a new push to a PR branch cancels the previous

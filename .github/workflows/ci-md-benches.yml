@@ -23,15 +23,13 @@ name: MD baselines compile gate (MPI + NVSHMEM)
 
 on:
   push:
-    branches: [main, dev]
-  pull_request:
-    branches: [main, dev]
-    paths:
-      - 'context-transfer-engine/adapter/gpu_vector/benchmark/lammps_md/clio_lammps_md_mpi_bench.cc'
-      - 'context-transfer-engine/adapter/gpu_vector/benchmark/lammps_md/clio_lammps_md_nvshmem_bench.cc'
-      - 'context-transfer-engine/adapter/gpu_vector/benchmark/lammps_md/CMakeLists.txt'
-      - 'context-transfer-engine/adapter/gpu_vector/test/distributed_md/**'
-      - '.github/workflows/ci-md-benches.yml'
+    branches: [main]
+  # Push to dev does NOT trigger this directly: dev-full-ci.yml dispatches
+  # the full matrix once dev has been quiet for 30 minutes, so a burst of
+  # merges gets one full run instead of one per merge.
+  # Not run on pull requests: PRs only check that the tree builds on
+  # Linux/macOS/Windows and passes Linux unit tests. This runs in the full
+  # dev sweep (dev-full-ci.yml) and on push to main.
   workflow_dispatch:
 
 concurrency:

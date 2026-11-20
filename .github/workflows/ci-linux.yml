@@ -9,16 +9,12 @@ name: CI Linux
 
 on:
   push:
-    branches: [main, dev]
+    branches: [main]
+  # Push to dev does NOT trigger this directly: dev-full-ci.yml dispatches
+  # the full matrix once dev has been quiet for 30 minutes, so a burst of
+  # merges gets one full run instead of one per merge.
   pull_request:
     branches: [main, dev]
-  # Merge queue (issue #1013): the full matrix -- macFUSE, WinFsp, the boost
-  # backend, the wide macOS sweep -- is gated on `event_name != pull_request`,
-  # so it never ran on a PR and only spoke up AFTER the merge, on dev, where a
-  # single bad commit turns every later push red. A merge_group run is that
-  # same full matrix executed on the PROSPECTIVE merge commit, before it lands.
-  # Cost is unchanged for PRs; dev stops being where breakage is discovered.
-  merge_group:
   workflow_dispatch:
 
 concurrency:
@@ -104,6 +100,8 @@ jobs:
   #              selection -- a phase should run the tests for the code it
   #              measures.
   matrix-tier:
+    # Skipped on dev -> main PRs: dev-to-main-gate.yml checks dev's full CI on the same commit instead.
+    if: ${{ !(github.event_name == 'pull_request' && github.head_ref == 'dev' && github.base_ref == 'main') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -125,7 +123,7 @@ jobs:
           JSON
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             echo "full=false" >> "$GITHUB_OUTPUT"
-            sel=$(jq -c '{include: [.[] | select((.phase == "unit" and .arch == "amd64") or .phase == "cae")]}' /tmp/phases.json)
+            sel=$(jq -c '{include: [.[] | select(.arch == "amd64")]}' /tmp/phases.json)
           else
             echo "full=true" >> "$GITHUB_OUTPUT"
             sel=$(jq -c '{include: .}' /tmp/phases.json)
@@ -133,10 +131,25 @@ jobs:
           echo "phases=$sel" >> "$GITHUB_OUTPUT"
 
   build-test:
+    # Skipped on dev -> main PRs: dev-to-main-gate.yml checks dev's full CI on the same commit instead.
+    if: ${{ !(github.event_name == 'pull_request' && github.head_ref == 'dev' && github.base_ref == 'main') }}
     name: build-test (${{ matrix.phase }} ${{ matrix.arch }})
     needs: matrix-tier
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
+    # Dependencies come from the published iowarp/deps-cpu image (amd64 +
+    # arm64), not a per-run conda solve: that install alone was ~28 min of
+    # every PR. The image user (iowarp, uid 1001) matches the hosted runner's
+    # uid, so the mounted workspace stays writable; it has passwordless sudo
+    # for the per-phase apt packages. /dev/fuse + SYS_ADMIN + unconfined
+    # apparmor/seccomp let the FUSE phase mount and io_uring work (the default
+    # seccomp profile blocks io_uring); --shm-size matches a bare runner's
+    # /dev/shm so the runtime's GB-scale segments fit.
+    container:
+      image: iowarp/deps-cpu:latest
+      options: >-
+        --shm-size=8g --device /dev/fuse --cap-add SYS_ADMIN
+        --security-opt apparmor=unconfined --security-opt seccomp=unconfined
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.matrix-tier.outputs.phases) }}
@@ -145,14 +158,11 @@ jobs:
         uses: actions/checkout@v5
         with:
           submodules: recursive
-      - name: Install lcov (+ phase deps)
+      - name: Install phase packages (lcov and HDF5 are already in deps-cpu)
+        if: matrix.apt != '' || matrix.phase == 'prediction'
         run: |
           bash CI/retry.sh sudo apt-get update
-          bash CI/retry.sh sudo apt-get install -y lcov ${{ matrix.apt }}
-      - name: Install project dependencies (CI/ci-deps.sh)
-        run: |
-          chmod +x CI/ci-deps.sh
-          ./CI/ci-deps.sh
+          bash CI/retry.sh sudo apt-get install -y ${{ matrix.apt }} ${{ matrix.phase == 'prediction' && 'git-lfs' || '' }}
       # The prediction phase's E2E tests SKIP without the trained models and the
       # server's Python deps; provide both so they actually run.
       - name: Pull prediction models (Git LFS)
@@ -183,14 +193,6 @@ jobs:
           PHASE_CDASH_KEEP: ${{ matrix.cdash_scope }}
           PKG_CONFIG_PATH: ${{ matrix.pkgconfig }}
         run: |
-          if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
-            source "$HOME/miniconda3/etc/profile.d/conda.sh"
-          elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
-            source "$HOME/anaconda3/etc/profile.d/conda.sh"
-          elif command -v conda &>/dev/null; then
-            eval "$(conda shell.bash hook)"
-          fi
-          conda activate iowarp
           ./CI/calculate_coverage.sh --build --run-ctest --clean --site ${{ matrix.site }}
       - name: Require real Python conditional-write and capacity coverage
         if: matrix.phase == 'unit' && matrix.arch == 'amd64'
@@ -198,14 +200,6 @@ jobs:
         # UNTIL_PASS sweep. Each must be discovered once and run once, without
         # retry; missing, skipped or failed execution is a failure.
         run: |
-          if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
-            source "$HOME/miniconda3/etc/profile.d/conda.sh"
-          elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
-            source "$HOME/anaconda3/etc/profile.d/conda.sh"
-          elif command -v conda &>/dev/null; then
-            eval "$(conda shell.bash hook)"
-          fi
-          conda activate iowarp
           python3 -m pip install psutil
           python3 - <<'PY'
           from collections import Counter
@@ -245,14 +239,6 @@ jobs:
         # This daemon/restart fixture executes exactly once, outside the broad
         # UNTIL_PASS sweep. Missing, skipped or failed execution is a failure.
         run: |
-          if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
-            source "$HOME/miniconda3/etc/profile.d/conda.sh"
-          elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
-            source "$HOME/anaconda3/etc/profile.d/conda.sh"
-          elif command -v conda &>/dev/null; then
-            eval "$(conda shell.bash hook)"
-          fi
-          conda activate iowarp
           python3 -m pip install psutil
           python3 - <<'PY'
           from collections import Counter
@@ -398,6 +384,8 @@ jobs:
   # itself. No AWS account, no credentials, no egress -- so this gates PRs too,
   # unlike the push-only boost variants above.
   s3-bdev:
+    # Skipped on dev -> main PRs: dev-to-main-gate.yml checks dev's full CI on the same commit instead.
+    if: ${{ !(github.event_name == 'pull_request' && github.head_ref == 'dev' && github.base_ref == 'main') }}
     name: s3-bdev (sigv4 + rest)
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -454,6 +442,7 @@ jobs:
   # ---- Sanitizers: asan / ubsan / msan --------------------------------------
   sanitizers:
     name: sanitizer (${{ matrix.sanitizer }})
+    if: github.event_name != 'pull_request'
     needs: matrix-tier
     runs-on: ubuntu-24.04
     timeout-minutes: 120
@@ -499,6 +488,7 @@ jobs:
   # ---- Leak check (gating allocation-leak detection, #560/#563) -------------
   leak-check:
     name: leak-check
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:

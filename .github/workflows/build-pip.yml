@@ -5,21 +5,9 @@ on:
   push:
     branches: main
     tags: ['v*']
-  # Validate packaging changes BEFORE they reach main (#953). Without this the
-  # workflow only ran post-merge, so a packaging break was discovered on main
-  # -- which is exactly how the wheels shipped for days with the FUSE adapter
-  # silently disabled, and how a Linux+FUSE combination that had never once
-  # been compiled in CI got enabled. Paths-filtered so ordinary source PRs do
-  # not pay for a full multi-arch wheel matrix; anything that can change what
-  # lands in a wheel is listed here.
-  pull_request:
-    paths:
-      - 'pyproject.toml'
-      - 'installers/pip/**'
-      - '.github/workflows/build-pip.yml'
-      - 'CMakeLists.txt'
-      - 'context-transfer-engine/adapter/libfuse/**'
-      - 'context-transfer-engine/wrapper/python/**'
+  # Not run on pull requests: PRs only check that the tree builds on
+  # Linux/macOS/Windows and passes Linux unit tests. This runs in the full
+  # dev sweep (dev-full-ci.yml) and on push to main.
 
 permissions:
   contents: write
