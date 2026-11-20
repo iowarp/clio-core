@@ -58,7 +58,7 @@ jobs:
             toolchain: cuda
             spec: >-
               +cuda cuda_arch=89 +gpu_vector +gds +elf +clio_ml
-              ~test ~benchmark ^cuda@12.9
+              ~test ~benchmark ^cuda@12.6
             expect: >-
               include/clio_cte/gpu_vector/gpu_vector.h
               include/clio_cte/gpu_vector/device_vector.h
@@ -126,15 +126,18 @@ jobs:
           sudo apt-get install -y build-essential gfortran python3-dev \
             pkg-config autoconf automake libtool
 
-      - name: Install CUDA 12.9 and clang 22
+      - name: Install CUDA 12.6 and clang 22
         if: matrix.toolchain == 'cuda'
         run: |
           wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
           sudo dpkg -i cuda-keyring_1.1-1_all.deb
           sudo apt-get update
-          sudo apt-get install -y cuda-nvcc-12-9 cuda-cudart-dev-12-9 \
-            cuda-driver-dev-12-9 cuda-nvrtc-dev-12-9 cuda-cccl-12-9 \
-            libcufile-dev-12-9
+          # The full 12.6 toolkit, as gpu-tests.yml installs for its clang 22
+          # build: clang needs more of the toolkit (libdevice, CUPTI headers,
+          # ...) than the nvcc-only package set, and CMake could not identify
+          # clang as a CUDA compiler against that.
+          sudo apt-get install -y cuda-toolkit-12-6 cuda-driver-dev-12-6 \
+            libcufile-dev-12-6
           # The CUDA compiler for gpu_vector (CLIO_GPU_CLANG): device
           # coroutines need a recent clang; the tree is tested with 22.
           wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 22
@@ -185,8 +188,8 @@ jobs:
               # Pin the apt toolkits as externals, by their own prefixes:
               # `external find` reports apt.llvm.org's clang under /usr (whose
               # plain clang++ is the runner's older system clang) and missed
-              # the CUDA 12.9 install, so Spack built CUDA 13 instead.
-              cuda_ver=$(/usr/local/cuda-12.9/bin/nvcc --version | grep -oE 'V[0-9]+[.][0-9]+[.][0-9]+' | tr -d V)
+              # the CUDA 12.6 install, so Spack built CUDA 13 instead.
+              cuda_ver=$(/usr/local/cuda-12.6/bin/nvcc --version | grep -oE 'V[0-9]+[.][0-9]+[.][0-9]+' | tr -d V)
               llvm_ver=$(/usr/lib/llvm-22/bin/clang++ --version | grep -oE '[0-9]+[.][0-9]+[.][0-9]+' | head -1)
               cat >> "$(spack location -r)/etc/spack/packages.yaml" <<EOF2
           packages:
@@ -194,7 +197,7 @@ jobs:
               buildable: false
               externals:
               - spec: cuda@${cuda_ver}+allow-unsupported-compilers
-                prefix: /usr/local/cuda-12.9
+                prefix: /usr/local/cuda-12.6
             llvm:
               buildable: false
               externals:

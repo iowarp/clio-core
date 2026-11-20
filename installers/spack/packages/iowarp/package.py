@@ -133,7 +133,10 @@ class Iowarp(CMakePackage, CudaPackage, ROCmPackage):
     # The VOL connector and the VFD use the HDF5 1.14 plugin APIs.
     depends_on('hdf5@1.14:', when='+vol')
     depends_on('hdf5@1.14:', when='+vfd')
-    depends_on('adios2', when='+adios2')
+    # ADIOS2 2.12 replaced the plugin-engine interface (adios2/plugin/,
+    # built on the C++ bindings rather than core::Engine); the engine is
+    # written against the 2.11 one.
+    depends_on('adios2@:2.11', when='+adios2')
     depends_on('libfuse@3:', when='+fuse')
     depends_on('liburing', when='+io_uring')
     depends_on('libfabric', when='+libfabric')
@@ -377,6 +380,10 @@ class Iowarp(CMakePackage, CudaPackage, ROCmPackage):
                     'CMAKE_CUDA_FLAGS',
                     '--cuda-path={0} -Wno-unknown-cuda-version'.format(
                         cuda_prefix)))
+        if '+sycl' in spec:
+            inc = self._sycl_include_dir()
+            if inc:
+                args.append(self.define('CLIO_SYCL_INCLUDE_DIR', inc))
         if '+rocm' in spec:
             args.append(self.define('ROCM_PATH', spec['hip'].prefix))
             targets = spec.variants['amdgpu_target'].value
@@ -384,6 +391,26 @@ class Iowarp(CMakePackage, CudaPackage, ROCmPackage):
                 args.append(self.define('CMAKE_HIP_ARCHITECTURES',
                                         ';'.join(targets)))
         return args
+
+    def _sycl_include_dir(self):
+        """Directory holding sycl/sycl.hpp for the oneAPI compiler in use.
+
+        CMake looks for it next to CMAKE_CXX_COMPILER, which under Spack is
+        Spack's compiler wrapper, so name the real compiler's include dir.
+
+        @return the include directory, or None if it cannot be found
+        """
+        try:
+            cxx = self['cxx'].cxx
+        except Exception:
+            cxx = getattr(self.compiler, 'cxx', None)
+        if not cxx:
+            return None
+        root_dir = os.path.dirname(os.path.dirname(os.path.realpath(cxx)))
+        inc = join_path(root_dir, 'include')
+        if os.path.exists(join_path(inc, 'sycl', 'sycl.hpp')):
+            return inc
+        return None
 
     def _clangxx(self):
         """The clang++ of the llvm dependency, for CMAKE_CUDA_COMPILER.
