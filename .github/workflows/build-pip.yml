@@ -121,7 +121,7 @@ jobs:
         # does not bundle libfuse3.so.3 — end users get it from their
         # distro's fuse3 packages.
         CIBW_BEFORE_ALL: >
-          bash {project}/CI/retry.sh yum install -y curl patchelf fuse3-devel openssl-devel &&
+          yum clean all && bash {project}/CI/retry.sh yum install -y --refresh curl patchelf fuse3-devel openssl-devel &&
           bash {project}/installers/pip/build_deps_manylinux.sh
         CIBW_ENVIRONMENT: ${{ matrix.cibw_environment }}
         CIBW_REPAIR_WHEEL_COMMAND_LINUX: >
@@ -199,7 +199,7 @@ jobs:
         CIBW_BUILD: ${{ matrix.py }}-manylinux_x86_64
         CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
         CIBW_BEFORE_ALL: >
-          bash {project}/CI/retry.sh yum install -y curl patchelf fuse3-devel openssl-devel &&
+          yum clean all && bash {project}/CI/retry.sh yum install -y --refresh curl patchelf fuse3-devel openssl-devel &&
           bash {project}/installers/pip/install_gpu_toolchain.sh ${{ matrix.variant }} &&
           bash {project}/installers/pip/build_deps_manylinux.sh
         # The icx/icpx and nvcc paths need oneAPI's environment and CUDA on
