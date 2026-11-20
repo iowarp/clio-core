@@ -467,8 +467,20 @@ class ClioRuntime(Service):
         if self.config.get('ephemeral', True):
             cmd += ' --fresh --ephemeral'
 
+        # Start must not depend on configure-time state surviving between
+        # jarvis invocations. The distributed stop test's second
+        # `jarvis ppl start` launched runtimes whose CLIO_SERVER_CONF was
+        # unset ("Config at: " empty): with no config they load no hostfile
+        # and each comes up as a one-node 127.0.0.1 cluster no peer can
+        # reach. Recreate a missing config and always pass its path.
+        if not os.path.exists(self.config_file):
+            self.log(f"Runtime config {self.config_file} is missing; "
+                     f"regenerating it")
+            self._generate_config()
+        start_env = dict(self.env or {})
+        start_env['CLIO_SERVER_CONF'] = self.config_file
         exec_info = PsshExecInfo(
-            env=self.env,
+            env=start_env,
             hostfile=self.hostfile,
             exec_async=True,
             private_dir=self.private_dir,
