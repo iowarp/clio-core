@@ -74,7 +74,7 @@ jobs:
           - name: sycl
             toolchain: sycl
             spec: >-
-              %oneapi +sycl +clio_ml ~test ~benchmark
+              +sycl +clio_ml ~test ~benchmark %oneapi
             expect: >-
               include/clio_cte/gpu_vector/gpu_vector.h
 
@@ -201,7 +201,7 @@ jobs:
       - name: Concretize
         run: |
           . ./spack/share/spack/setup-env.sh
-          spack env create -d ci-env
+          spack env create --without-view -d ci-env
           spack -e ci-env develop --path "$GITHUB_WORKSPACE" iowarp@=dev
           spack -e ci-env add "iowarp@=dev ${SPEC}"
           spack -e ci-env concretize -f | tee concretized.txt

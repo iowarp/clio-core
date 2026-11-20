@@ -10,7 +10,7 @@ facts: cpu_vector | every build ; gpu_vector CUDA | CLIO_CORE_ENABLE_CUDA=ON CLI
 <ul>
   <li><strong>pip.</strong> <code>pip install iowarp-core</code> builds a CPU-only runtime with no C++ headers, so neither vector is usable from it. The GPU wheel variants (<code>iowarp-core-cuda12</code>, <code>iowarp-core-rocm6</code>, <code>iowarp-core-sycl</code>) install the same Python package with GPU support in the runtime; they ship no headers either, and the CUDA variant is compiled with nvcc, which does not build <code>gpu_vector</code>. For paged data from Python use <a href="/docs/ml/index.html">clio-ml</a>, whose datasets are paged vectors underneath.</li>
   <li><strong>conda.</strong> Installs the C++ libraries and headers from a CPU build, so <code>cpu_vector</code> is available and <code>gpu_vector</code> is not.</li>
-  <li><strong>Spack.</strong> A source build: <code>spack install iowarp +cuda cuda_arch=&lt;sm&gt; +gpu_vector</code> builds <code>gpu_vector</code> for NVIDIA, with clang as the CUDA compiler; <code>spack install iowarp %oneapi +sycl</code> builds it for Intel GPUs. A plain <code>spack install iowarp</code> gives <code>cpu_vector</code>.</li>
+  <li><strong>Spack.</strong> A source build: <code>spack install iowarp +cuda cuda_arch=&lt;sm&gt; +gpu_vector</code> builds <code>gpu_vector</code> for NVIDIA, with clang as the CUDA compiler; <code>spack install iowarp +sycl %oneapi</code> builds it for Intel GPUs. A plain <code>spack install iowarp</code> gives <code>cpu_vector</code>.</li>
   <li><strong>Source.</strong> Needed for <code>gpu_vector</code>. See below.</li>
 </ul>
 

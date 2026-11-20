@@ -48,7 +48,7 @@ git clone --recurse-submodules https://github.com/iowarp/clio-core.git
 spack repo add clio-core/installers/spack
 spack install iowarp +fuse                       # CPU build with the FUSE mount
 spack install iowarp +cuda cuda_arch=90 +gpu_vector +clio_ml   # NVIDIA
-spack install iowarp %oneapi +sycl +clio_ml      # Intel GPUs
+spack install iowarp +sycl +clio_ml %oneapi      # Intel GPUs
 ```
 
 | Feature | Variant |
@@ -62,7 +62,7 @@ spack install iowarp %oneapi +sycl +clio_ml      # Intel GPUs
 | NVIDIA GPUDirect Storage adapter | `+gds` (needs `+cuda +elf`) |
 | CUDA, with `gpu_vector` | `+cuda cuda_arch=<sm> +gpu_vector` (clang is the CUDA compiler) |
 | ROCm | `+rocm amdgpu_target=<gfx>` |
-| SYCL, with `gpu_vector` | `%oneapi +sycl` |
+| SYCL, with `gpu_vector` | `+sycl %oneapi` (the compiler last: variants after `%oneapi` apply to it) |
 | clio-ml | `+clio_ml` (backend follows `+cuda` / `+sycl`) |
 | Compression | `+compress` |
 | S3 / GCS / DAOS storage tiers | `+s3_bdev` / `+gcs_bdev` / `+daos` |
