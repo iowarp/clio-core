@@ -179,10 +179,11 @@ install(TARGETS clio_run_cxx ${_GPU_TARGET} ${_CEREAL_TARGET}
 # symlinks alongside the canonical libclio_run_cxx{,_gpu}.{so,dylib}* so
 # any external binary that loaded the historical name via LD_LIBRARY_PATH
 # or RPATH (dlopen / direct -lclio_run_cxx{,_gpu} link) keeps resolving.
+# NOTE: never return() inside install(CODE): it ends this directory's whole
+# cmake_install.cmake, silently skipping every install rule after it (on
+# Windows that dropped the clio_run CMake package and the module configs).
 install(CODE "
-  if(WIN32)
-    return()
-  endif()
+ if(NOT WIN32)
   set(_libdir \"\${CMAKE_INSTALL_PREFIX}/lib\")
   # SHARED libs land as e.g. libclio_run_cxx.so.1.5.7 on Linux with
   # libclio_run_cxx.so.1 and libclio_run_cxx.so symlinks; on macOS as
@@ -205,6 +206,7 @@ install(CODE "
       message(STATUS \"Installed legacy symlink \${_link_name} -> \${_real_name}\")
     endif()
   endforeach()
+ endif()
 ")
 
 # Install canonical headers.
@@ -226,6 +228,9 @@ install(DIRECTORY config/
 # read time as a fallback for users with pre-existing configs, but we
 # no longer seed it on install — that path is documented as legacy
 # in docs/deprecation-notes.md and will eventually be removed.
+option(CLIO_CORE_SEED_USER_CONFIG
+       "On install, copy clio_default.yaml to ~/.clio/clio.yaml if absent" ON)
+if(CLIO_CORE_SEED_USER_CONFIG)
 install(CODE "
   # Determine real user's home directory (handles sudo install)
   set(_HOME \"\")
@@ -247,8 +252,7 @@ install(CODE "
   set(_DEFAULT_SRC \"\${CMAKE_INSTALL_PREFIX}/etc/clio/clio_default.yaml\")
   if(NOT EXISTS \"\${_DEFAULT_SRC}\")
     message(STATUS \"Skipping user config seed (packaging install): \${_DEFAULT_SRC} not present\")
-    return()
-  endif()
+  else()
 
   # Per-destination seeding helper: directory + filename + optional chown
   foreach(_entry
@@ -269,7 +273,9 @@ install(CODE "
       message(STATUS \"User config already exists: \${_FILE} (not overwriting)\")
     endif()
   endforeach()
+  endif()
 ")
+endif()
 
 # Export targets file for main library
 install(EXPORT ${MAIN_EXPORT_NAME}
