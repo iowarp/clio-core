@@ -43,8 +43,14 @@
 
 #include <filesystem>
 #include <fstream>
-#include <unistd.h>
 #include <string>
+
+#ifdef _WIN32
+#include <process.h>  // _getpid: Windows has no unistd.h
+#define getpid _getpid
+#else
+#include <unistd.h>
+#endif
 
 namespace fs = std::filesystem;
 using clio::cae::core::PathPolicy;
