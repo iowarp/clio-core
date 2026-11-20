@@ -71,7 +71,7 @@ class BaseAssimilator {
 #endif
 }
 </pre>
-<p>Returning <code>nullptr</code> makes <code>ParseOmni</code> fail that transfer with result code -2 and the message <code>No assimilator found for source</code>, which is what <code>clio_cae</code> prints. Keep the <code>#ifdef</code> for any source that needs an SDK so a build without it still compiles and reports the missing option at run time.</p>
+<p>Returning <code>nullptr</code> makes <code>ParseOmni</code> fail that transfer with result code -2 and the message <code>No assimilator found for source</code>, which is what <code>clio-cae</code> prints. Keep the <code>#ifdef</code> for any source that needs an SDK so a build without it still compiles and reports the missing option at run time.</p>
 
 <h2>Build wiring</h2>
 <ul>

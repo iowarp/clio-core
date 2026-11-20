@@ -1,16 +1,16 @@
 <!--
 title: Design
 heading: Inside the <em>assimilation engine.</em>
-description: How the CAE is built: the clio_cae tool and OMNI loader, the core module, the assimilator factory and its per-source assimilators, ingest on fault with its off-worker I/O pool, pagify and page maps, and the summarizer interposer.
+description: How the CAE is built: the clio-cae tool and OMNI loader, the core module, the assimilator factory and its per-source assimilators, ingest on fault with its off-worker I/O pool, pagify and page maps, and the summarizer interposer.
 eyebrow: Docs · Context Assimilation Engine
 lede: The CAE is a runtime module that copies, or lazily maps, outside data into CTE tags. Its work is done by assimilators, one class per kind of source, chosen by the source URL. This page names the pieces and follows a transfer through them.
 facts: Module | clio_cae_core (pool 400.0) ; Methods | ParseOmni, ImportData (HDF5), ExportData, ProcessHdf5Dataset, plus CTE forwarding ; Fault I/O threads | CLIO_CAE_REF_IO_THREADS (32)
 -->
 <h2 id="pieces">The pieces</h2>
 <figure class="diagram">
-  <svg viewBox="0 0 860 360" role="img" aria-label="CAE pieces: the clio_cae tool and CEE submit transfers to the CAE core, which picks an assimilator per source and writes through the CTE chain">
+  <svg viewBox="0 0 860 360" role="img" aria-label="CAE pieces: the clio-cae tool and CEE submit transfers to the CAE core, which picks an assimilator per source and writes through the CTE chain">
     <defs><marker id="ca0" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10 z"/></marker></defs>
-    <rect class="box alt" x="20" y="20" width="250" height="56" rx="8"/><text class="title" x="32" y="44">clio_cae + OMNI loader</text><text class="muted" x="32" y="62">YAML → AssimilationCtx list</text>
+    <rect class="box alt" x="20" y="20" width="250" height="56" rx="8"/><text class="title" x="32" y="44">clio-cae + OMNI loader</text><text class="muted" x="32" y="62">YAML → AssimilationCtx list</text>
     <rect class="box alt" x="300" y="20" width="250" height="56" rx="8"/><text class="title" x="312" y="44">CEE / Python / C++</text><text class="muted" x="312" y="62">context_bundle, CAE client</text>
     <rect class="box hl" x="20" y="106" width="530" height="62" rx="8"/><text class="title" x="32" y="130">CAE core module</text><text class="muted" x="32" y="150">ParseOmni: run transfers in order · fault handler registry</text>
     <path class="edge hl" d="M145,76 L145,104" marker-end="url(#ca0)"/><path class="edge hl" d="M425,76 L425,104" marker-end="url(#ca0)"/>
@@ -29,7 +29,7 @@ facts: Module | clio_cae_core (pool 400.0) ; Methods | ParseOmni, ImportData (HD
 
 <h2 id="flow">A transfer, step by step</h2>
 <ol class="steps">
-  <li><strong>Load.</strong> The <code>clio_cae</code> tool's OMNI loader reads the YAML, expands each entry into an assimilation context (source, destination, format, range, dataset filters, credentials) and submits the list as one <code>ParseOmni</code> task. The CEE and the language clients build the same contexts directly.</li>
+  <li><strong>Load.</strong> The <code>clio-cae</code> tool's OMNI loader reads the YAML, expands each entry into an assimilation context (source, destination, format, range, dataset filters, credentials) and submits the list as one <code>ParseOmni</code> task. The CEE and the language clients build the same contexts directly.</li>
   <li><strong>Choose.</strong> In the runtime, the core asks the assimilator factory for the class that handles each source's scheme.</li>
   <li><strong>Assimilate.</strong> The assimilator's schedule coroutine reads the source and puts blobs into the destination tag through the CTE client: a <code>description</code> blob plus 1 MiB <code>chunk_N</code> blobs for files and objects, one tag per dataset for HDF5, one blob for a string. Puts go to the CAE's <code>next_pool_id</code>, so imports pass the cache, indexer and replication like any other write. The HTTP(S) and Globus assimilators are the exception: they download to a <code>file::</code> path (or, for Globus, another endpoint), not into a tag.</li>
   <li><strong>Finish.</strong> Transfers run in order, each completing before the next starts, and the task returns one status.</li>

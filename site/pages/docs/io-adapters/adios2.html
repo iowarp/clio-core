@@ -25,7 +25,7 @@ $ ls build/bin/libiowarp_engine.so
 
 <h2>2. Start a runtime</h2>
 <pre data-label="shell">
-$ build/bin/clio_run start &
+$ build/bin/clio-run start &
 </pre>
 <p>The engine attaches to the runtime on the local node when it is constructed. Its configuration must compose a CTE core pool; as for the HDF5 connectors, name it <code>clio_cte_core</code>, the name clients look up, or set <code>CLIO_CTE_POOL</code> to its id. If no runtime answers, the engine retries (60 attempts about 3 s apart by default) and then throws <code>IowarpEngine: CLIO_CTE_CLIENT_INIT failed after 60 attempts - is Clio runtime running?</code>.</p>
 

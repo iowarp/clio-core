@@ -20,7 +20,7 @@ facts: Flags | --viz-port, --viz-bind, --no-viz ; Environment | CLIO_VIZ_PORT, C
 <div class="tabs" data-label="Where the runtime runs">
   <section class="tab-panel" data-tab="Another port"><p class="tab-title">Another port</p>
 <pre data-label="shell">
-$ clio_run start --viz-port 9000 &
+$ clio-run start --viz-port 9000 &
 </pre></section>
   <section class="tab-panel" data-tab="Remote host"><p class="tab-title">Remote host</p>
 <pre data-label="shell">
@@ -37,7 +37,7 @@ services:
     ports:
       - "9413:9413"
       - "8080:8080"
-    command: ["clio_run", "start"]
+    command: ["clio-run", "start"]
 </pre></section>
   <section class="tab-panel" data-tab="YAML"><p class="tab-title">In clio.yaml</p>
 <pre data-label="yaml">

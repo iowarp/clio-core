@@ -26,7 +26,7 @@ $ cmake --build build -j"$(nproc)" && sudo cmake --install build
 
 <h2>2. Start the runtime and mount</h2>
 <pre data-label="shell">
-$ clio_run start &
+$ clio-run start &
 $ mkdir -p ~/clio-mnt
 $ CLIO_WITH_RUNTIME=0 clio_cte_fuse ~/clio-mnt -f
 </pre>

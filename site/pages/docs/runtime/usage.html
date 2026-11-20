@@ -395,7 +395,7 @@ $ cmake --build build
 <pre data-label="shell">
 $ export CLIO_REPO_PATH=$HOME/MOD_NAME/build
 $ export CLIO_SERVER_CONF=$HOME/clio.yaml
-$ clio_run start &
+$ clio-run start &
 </pre>
 
 <h2>8. Create the pool</h2>
@@ -426,26 +426,26 @@ int main() {
 }
 </pre>
 <h3>From the compose file</h3>
-<p>Add an entry to the <code>compose:</code> list of the runtime's configuration, or to a separate file given to <code>clio_run compose start</code>. The runtime reads four keys and <code>restart</code>; everything else in the entry is handed to the module as a YAML string for its <code>LoadConfig</code>.</p>
+<p>Add an entry to the <code>compose:</code> list of the runtime's configuration, or to a separate file given to <code>clio-run compose start</code>. The runtime reads four keys and <code>restart</code>; everything else in the entry is handed to the module as a YAML string for its <code>LoadConfig</code>.</p>
 <pre data-label="yaml · clio.yaml">
 compose:
   - mod_name: clio_MOD_NAME      # chimod_lib_name of the module
     pool_name: my_pool
     pool_query: local            # routing used for the create task
     pool_id: "7001.0"            # "major.minor"
-    restart: true                # recreate on the next clio_run start
+    restart: true                # recreate on the next clio-run start
     # module-specific keys follow; see the operator guide for next_pool_id
 </pre>
 <pre data-label="shell">
-$ clio_run compose start my_pool.yaml
-$ clio_run compose list
-$ clio_run compose stop my_pool.yaml
+$ clio-run compose start my_pool.yaml
+$ clio-run compose list
+$ clio-run compose stop my_pool.yaml
 </pre>
 <p>Each entry must come after the entry its <code>next_pool_id</code> names. The compose commands, the <code>pool_query</code> strings and the <code>PoolQuery</code> factories are in the <a href="/docs/runtime/api.html">API reference</a>.</p>
 
 <h2>Where to go next</h2>
 <ul>
   <li><a href="/develop/operator.html">Write a chain operator</a>: a complete module that sits in the storage chain, built and run end to end.</li>
-  <li><a href="/docs/runtime/api.html">API reference</a>: <code>clio_run</code>, <code>PoolQuery</code>, the macros, the container callbacks and the configuration keys.</li>
+  <li><a href="/docs/runtime/api.html">API reference</a>: <code>clio-run</code>, <code>PoolQuery</code>, the macros, the container callbacks and the configuration keys.</li>
   <li><a href="/design/runtime.html">Runtime and block devices</a>: tasks, transports, workers and routing inside the runtime.</li>
 </ul>

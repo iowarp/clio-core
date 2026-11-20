@@ -36,12 +36,12 @@ $ sudo cmake --install build-mac-fuse
 <div class="tabs" data-label="Backend">
   <section class="tab-panel" data-tab="FSKit"><p class="tab-title">FSKit</p>
 <pre data-label="shell">
-$ clio_run start &
+$ clio-run start &
 $ CLIO_WITH_RUNTIME=0 clio_cte_fuse /Volumes/clio-mnt -f -o backend=fskit
 </pre></section>
   <section class="tab-panel" data-tab="Kernel extension"><p class="tab-title">Kernel extension</p>
 <pre data-label="shell">
-$ clio_run start &
+$ clio-run start &
 $ mkdir -p ~/clio-mnt
 $ CLIO_WITH_RUNTIME=0 clio_cte_fuse ~/clio-mnt -f
 </pre></section>

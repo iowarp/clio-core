@@ -12,14 +12,14 @@ facts: Time | 10 minutes ; Driver | WinFsp 2.0 ; In the pip wheel | Yes
 <h2>2. Install CLIO Core</h2>
 <pre data-label="powershell">
 PS> py -3.12 -m pip install iowarp-core
-PS> clio_run --help
+PS> clio-run --help
 </pre>
 <p>The <code>clio_cte_fuse</code> command adds WinFsp's <code>bin</code> folder to <code>PATH</code> itself, so you do not need to edit the system <code>PATH</code>.</p>
 
 <h2>3. Start the runtime and mount</h2>
 <p>Use two PowerShell windows. In the first:</p>
 <pre data-label="powershell">
-PS> clio_run start
+PS> clio-run start
 </pre>
 <p>In the second:</p>
 <div class="tabs" data-label="Mount type">
@@ -56,7 +56,7 @@ PS> Add-MpPreference -ExclusionProcess "git.exe"
 <p>Stop the daemon, then the runtime:</p>
 <pre data-label="powershell">
 PS> Stop-Process -Name clio_cte_fuse -Force
-PS> clio_run stop
+PS> clio-run stop
 </pre>
 
 <h2>Building from source</h2>

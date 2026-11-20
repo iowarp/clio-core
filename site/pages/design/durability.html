@@ -18,7 +18,7 @@ level until a flush moves it to a persistent tier.</p>
 
 <h2 id="state">What is persisted, and where</h2>
 <p>Persistent state lives under a single storage root
-(<code>CLIO_STORAGE_ROOT</code> or <code>clio_run start --disk</code>,
+(<code>CLIO_STORAGE_ROOT</code> or <code>clio-run start --disk</code>,
 default <code>~/.clio</code>):</p>
 <table>
   <tr><th>Artifact</th><th>Owner</th><th>Contents</th><th>Sync policy</th></tr>
@@ -81,7 +81,7 @@ when one of these holds:</p>
 </div>
 
 <h2 id="restart">What a restart does</h2>
-<p><code>clio_run start</code> always recovers existing state.
+<p><code>clio-run start</code> always recovers existing state.
 <code>--fresh</code> is the only way to discard it.</p>
 <ol>
   <li><strong>Pools come back.</strong> The runtime replays its per-node

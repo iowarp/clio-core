@@ -70,7 +70,7 @@ $ export PYTHONPATH=/path/to/build/bin:$PYTHONPATH
 <h2>Check the install</h2>
 <p>Start the runtime, then run a round trip from Python. On Windows, set <code>CLIO_BIND_ADDR=127.0.0.1</code> and <code>CLIO_SERVER_ADDR=127.0.0.1</code> for both the runtime and the client.</p>
 <pre data-label="shell">
-$ clio_run start &
+$ clio-run start &
 $ python -c "import iowarp_core; print(iowarp_core.cee_available())"
 </pre>
 <pre data-label="python">

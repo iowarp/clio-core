@@ -74,7 +74,7 @@ Add `- kvs` to `modules:` in `context-transfer-engine/clio_repo.yaml`.
 Build `clio_run` (or use an installed one) and run:
 
 ```bash
-<build>/bin/clio_run refresh context-transfer-engine
+<build>/bin/clio-run refresh context-transfer-engine
 ```
 
 This regenerates **every** module listed in that `clio_repo.yaml`. Before
@@ -134,9 +134,8 @@ modules). Targets: `clio_cte_kvs_client` / `clio_cte_kvs_runtime`, aliases
 
 If the module is composed or has config keys: add a commented compose entry
 with every key and its default to `context-runtime/config/clio_default.yaml`
-(pick an unused fixed `pool_id`), and document the keys in
-`docs/docs/deployment/configuration.md` (the iowarp/docs checkout) in the same
-change.
+(pick an unused fixed `pool_id`), and document the keys on
+the module's page under `site/pages/modules/` in the same change.
 
 ### 10. Unit test
 
@@ -161,7 +160,7 @@ module (it scans for `*_runtime` libraries next to `clio_run_cxx`, in
 
 - [ ] Searched for an existing mechanism; the module is needed
 - [ ] `clio_mod.yaml` (ids 0-9 lifecycle, customs >= 10, interposer verbs >= 100) and `clio_repo.yaml` entry
-- [ ] Autogen regenerated with `clio_run refresh`; autogen diff reviewed; no hand edits in `autogen/`
+- [ ] Autogen regenerated with `clio-run refresh`; autogen diff reviewed; no hand edits in `autogen/`
 - [ ] `CreateParams::chimod_lib_name` == library basename; `CreateTask = GetOrCreatePoolTask<CreateParams>`
 - [ ] Every task: default + emplace ctor, `SerializeIn/Out` (base first, every field that must travel, `bulk` for payloads), `Copy`, `AggregateOut` (OUT fields only, never `Copy()`)
 - [ ] Client: `AsyncCreate` to `kAdminPoolId`, `Dynamic()`, user pool name, `chimod_lib_name`; other methods on `pool_id_`; no null queries
@@ -173,7 +172,7 @@ module (it scans for `*_runtime` libraries next to `clio_run_cxx`, in
 - [ ] Named constants (no raw queue ids, priorities, flags); singleton pointers stored before use
 - [ ] BSD header, doxygen docstrings, functions <= 100 lines, no stubs or mock code
 - [ ] CMake via `add_clio_module_client/_runtime`, `add_subdirectory` added, no absolute paths
-- [ ] `clio_default.yaml` + docs repo `configuration.md` updated for every key/default
+- [ ] `clio_default.yaml` + the module's page under `site/pages/modules/` updated for every key/default
 - [ ] `simple_test.h` unit test checking every Create rc; registered in ctest
 - [ ] Full build (no `--target`), warning-free, target confirmed built, tests pass
 - [ ] Multi-node behaviour checked (Aurora suites) if it routes across nodes or affects caching/consistency
@@ -188,7 +187,7 @@ Example: add `kStatKey` to `kvs`.
    of `module-anatomy.md`).
 2. **Task**: add `StatKeyTask` to the tasks header (constructors,
    Serialize In/Out, `Copy`, `AggregateOut`).
-3. **Regenerate**: `clio_run refresh <repo>`; review the autogen diff (the new
+3. **Regenerate**: `clio-run refresh <repo>`; review the autogen diff (the new
    case appears in `Run`, `SaveTask`, `LoadTask`, `AllocLoadTask`,
    `LocalLoad/Save`, `NewCopyTask`, `NewTask`, `AggregateOut/In`, and
    `Method::kStatKey` in the methods header).
@@ -229,7 +228,7 @@ Example: add `kStatKey` to `kvs`.
 2. Update `context-runtime/config/clio_default.yaml` (the key, its default,
    and a comment saying what it does and its options -- even if it stays
    commented out).
-3. Update `docs/docs/deployment/configuration.md` in the iowarp/docs checkout.
+3. Update the module's compose-key table under `site/pages/modules/`.
 4. Grep every config in the repo (`*.yaml` under `context-*/config`,
    `benchmark`, `test`, `CI`, `docker`) that relies on the default and check it
    still makes sense (sizes that must fit a segment, counts that must fit a

@@ -256,7 +256,7 @@ ctest --test-dir build/release -R comutex # synchronization tests
 ## Contributing
 
 1. Fork the repo and create a feature branch.
-2. Follow the standards in [AGENTS.md](../AGENTS.md).
+2. Follow the [contributing guide](../.claude-plugin/plugins/iowarp-contributing/skills/contributing/SKILL.md).
 3. `ctest --test-dir build/release` before opening a PR.
 4. Submit a PR against `iowarp/clio-core`.
 

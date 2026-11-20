@@ -183,7 +183,7 @@ ChiModInfo *ModuleManager::GetChiMod(const std::string &chimod_name) {
   // name here so older YAML configs (compose entries, persistent pool
   // metadata in the WAL) keep loading the module under the old `mod_name`.
   // The table is checked only on cache miss, so the rename does not slow
-  // down the hot path. See docs/deprecation-notes.md for the public list.
+  // down the hot path.
   static const std::pair<const char *, const char *> kAliases[] = {
       {"clio_bdev", "clio_bdev"},   // renamed 2026
       {"clio_admin", "clio_admin"}, // renamed 2026

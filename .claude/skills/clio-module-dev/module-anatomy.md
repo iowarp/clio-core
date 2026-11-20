@@ -83,13 +83,13 @@ Generator rules (`context-runtime/util/clio_run_cmd_refresh_repo.cc`):
 
 ### Regenerating
 
-After adding or renumbering a method, run the `clio_run` binary's refresh
+After adding or renumbering a method, run the `clio-run` binary's refresh
 command on the module repository directory (the one holding
 `clio_repo.yaml`):
 
 ```bash
-<build>/bin/clio_run refresh <path/to/repo>      # canonical form
-<build>/bin/clio_run repo refresh <path/to/repo> # legacy form, same thing
+<build>/bin/clio-run refresh <path/to/repo>      # canonical form
+<build>/bin/clio-run repo refresh <path/to/repo> # legacy form, same thing
 ```
 
 (`context-runtime/util/clio_run.cc:86-150`). It rewrites, for **every**
@@ -473,7 +473,7 @@ target_link_libraries(app clio::run::admin_client clio::run::bdev_client
                           clio::cte::core_client)
 ```
 
-Or individually: `find_package(ClioCtp)`, `find_package(clio_run)`,
+Or individually: `find_package(ClioCtp)`, `find_package(clio-run)`,
 `find_package(clio_admin)`, `find_package(clio_run_bdev)`,
 `find_package(clio_cte_core)`, `find_package(clio_cae_core)`. An external
 module repository uses the same `add_clio_module_*` functions after

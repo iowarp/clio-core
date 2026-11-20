@@ -92,7 +92,7 @@ filesystem 560.0 → cache 563.0 → indexer 564.0 → [compressor 562.0] → re
         score: 0.2                         # matches replication's replica_score
         persistence_level: "long_term"
 </pre>
-<p>Give the array a <code>persistence_level</code> other than <code>volatile</code>, or the replication operator will not put its copies there. Its score of 0.2 matches replication's default <code>replica_score</code>. Start the runtime and mount as usual. Files you write are copied to the array, and after <code>clio_run stop</code> and <code>clio_run start</code> they are read back from it.</p>
+<p>Give the array a <code>persistence_level</code> other than <code>volatile</code>, or the replication operator will not put its copies there. Its score of 0.2 matches replication's default <code>replica_score</code>. Start the runtime and mount as usual. Files you write are copied to the array, and after <code>clio-run stop</code> and <code>clio-run start</code> they are read back from it.</p>
 
 <h3>3. Check its health</h3>
 <pre data-label="shell">

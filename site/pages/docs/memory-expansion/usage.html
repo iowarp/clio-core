@@ -7,7 +7,7 @@ lede: Both vectors follow the same cycle: fetch the ranges you will touch, hold 
 facts: Host | clio::cte::cpu_vector::Vector&lt;T&gt; ; Device | clio::cte::gpu_vector::Vector&lt;T&gt; + DeviceVector&lt;T&gt; ; Ranges per call | up to 8 (offset, count) pairs
 -->
 <h2>Start the runtime and the client</h2>
-<p>A vector needs a CTE core pool with at least one storage tier. Point <code>CLIO_SERVER_CONF</code> at a configuration like the one on the <a href="/docs/memory-expansion/install.html">install page</a>. <code>CLIO_INIT(kClient, true)</code> starts a runtime inside the process when none is running, which is how the adapter tests run; <code>CLIO_INIT(kClient)</code> attaches to one started with <code>clio_run start</code>. Then attach the CTE client.</p>
+<p>A vector needs a CTE core pool with at least one storage tier. Point <code>CLIO_SERVER_CONF</code> at a configuration like the one on the <a href="/docs/memory-expansion/install.html">install page</a>. <code>CLIO_INIT(kClient, true)</code> starts a runtime inside the process when none is running, which is how the adapter tests run; <code>CLIO_INIT(kClient)</code> attaches to one started with <code>clio-run start</code>. Then attach the CTE client.</p>
 <pre data-label="cpp">
 #include <clio_runtime/clio_runtime.h>
 #include <clio_cte/core/core_client.h>

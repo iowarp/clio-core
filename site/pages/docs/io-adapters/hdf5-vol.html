@@ -28,7 +28,7 @@ $ ldd build/bin/libclio_hdf5_vol.so | grep hdf5      # must be the application's
 <h2>2. Start a runtime with a CTE pool</h2>
 <pre data-label="shell">
 $ export CLIO_SERVER_CONF=$PWD/context-transfer-engine/adapter/config/clio_hdf5_quickstart.yaml
-$ build/bin/clio_run start &
+$ build/bin/clio-run start &
 </pre>
 <p><code>clio_hdf5_quickstart.yaml</code> is a small configuration (a 256 MB RAM tier, no persistence) that starts anywhere. For real workloads, start from <code>context-runtime/config/clio_default.yaml</code>, add your tiers, and <strong>rename its CTE pool to <code>clio_cte_core</code></strong>: clients look the pool up by that exact name, and the default file's <code>cte_main</code> misses. Export the same <code>CLIO_SERVER_CONF</code> in the application's environment.</p>
 

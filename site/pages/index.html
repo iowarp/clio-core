@@ -65,7 +65,7 @@ $ conda activate iowarp
 <p class="panel-meta">amd64 and arm64. Port 9413 is the runtime.</p>
 <pre data-label="shell">
 $ docker run -d -p 9413:9413 --memory=8g --name iowarp \
-    iowarp/deploy-cpu:latest clio_run start
+    iowarp/deploy-cpu:latest clio-run start
 </pre></section>
       <section class="tab-panel" data-tab="vcpkg"><p class="tab-title">vcpkg</p>
 <p class="panel-meta">Windows x64 and Linux, for C++ projects. Builds the dev branch from source.</p>
@@ -246,7 +246,7 @@ compose:
       <ul class="checks">
         <li><strong>Two halves, one module.</strong> A runtime library holds the code that runs inside the daemon; a client library gives applications a typed way to call it. A short <code>clio_mod.yaml</code> names the module and its methods.</li>
         <li><strong>Drop into the data path.</strong> A module can sit in the chain in front of storage, handle the calls it cares about and pass the rest on, so the applications above it never change.</li>
-        <li><strong>Add and remove while it runs.</strong> <code>clio_run compose start</code> creates pools of your module in a running cluster, and <code>compose stop</code> removes them, while every other pool keeps serving.</li>
+        <li><strong>Add and remove while it runs.</strong> <code>clio-run compose start</code> creates pools of your module in a running cluster, and <code>compose stop</code> removes them, while every other pool keeps serving.</li>
         <li><strong>Upgrade without rebooting the machine.</strong> Installing a new module library, or a new version of one, takes a restart of the CLIO runtime only. Connected clients detect the restart, wait and reconnect, and pools recorded in the pool log come back by themselves.</li>
       </ul>
       <a class="text-link" href="/develop/index.html">Write your first module <span aria-hidden="true">→</span></a>
@@ -311,7 +311,7 @@ transfers:
     dst: iowarp::run42_notes
     format: binary
 
-$ clio_cae transfers.yaml
+$ clio-cae transfers.yaml
 </pre>
   </section>
 
@@ -384,7 +384,7 @@ data = ctx.context_retrieve("run42.*", ".*", max_results=5,
       <a class="text-link" href="/design/index.html">Read the design <span aria-hidden="true">→</span></a>
     </div>
     <div class="card-list single">
-      <a href="/design/runtime.html"><span class="feature-index">Runtime</span><h3>CLIO Runtime</h3><p>Runs modules as coroutine tasks on a few worker threads per node, over shared memory, TCP or Unix sockets.</p></a>
+      <a href="/design/runtime.html"><span class="feature-index">Runtime</span><h3>Context Runtime</h3><p>Runs modules as coroutine tasks on a few worker threads per node, over shared memory, TCP or Unix sockets.</p></a>
       <a href="/design/cte-core.html"><span class="feature-index">CTE</span><h3>Context Transfer Engine</h3><p>Tiered tag and blob storage with placement, replication, caching and an index. Context FS, the key-value store and the paged vectors are built on it.</p></a>
       <a href="/design/adapters.html"><span class="feature-index">Adapters</span><h3>FUSE, POSIX, HDF5, ADIOS2, MPI-IO</h3><p>Ways in for unmodified applications: a mount, preloaded interceptors, or I/O library plugins.</p></a>
       <a href="/docs/concepts.html"><span class="feature-index">CAE · CEE</span><h3>Assimilation and exploration</h3><p>Import data from files, HDF5, S3 or Google Cloud Storage, then bundle, query and retrieve it.</p></a>
@@ -401,7 +401,7 @@ data = ctx.context_retrieve("run42.*", ".*", max_results=5,
     <div>
       <details><summary>Is CLIO Core a filesystem?</summary><p>Not only. Context FS is one product built from CLIO Core's modules. The same runtime also composes into a key-value store, GPU and CPU memory expansion, and clio-ml. Use the one that fits each stage of your pipeline; they share data.</p></details>
       <details><summary>Do my applications need to change?</summary><p>No. Through the FUSE mount, CLIO Core looks like a local directory. Applications that use HDF5, ADIOS2 or MPI-IO can also use a plugin instead of the mount for lower overhead.</p></details>
-      <details><summary>Does my data survive a restart?</summary><p>Yes, with the default configuration. Every write is copied to a persistent disk tier and recorded in a metadata log under <code>~/.clio</code>. <code>clio_run start</code> recovers from that log. RAM-only setups are volatile by design.</p></details>
+      <details><summary>Does my data survive a restart?</summary><p>Yes, with the default configuration. Every write is copied to a persistent disk tier and recorded in a metadata log under <code>~/.clio</code>. <code>clio-run start</code> recovers from that log. RAM-only setups are volatile by design.</p></details>
       <details><summary>Can I use Amazon S3 or Google Cloud Storage?</summary><p>Yes, in two ways. The assimilation engine imports <code>s3://</code> and <code>gs://</code> objects into the filesystem. A build with the cloud options enabled can also use a bucket as a storage tier. See the <a href="/tutorials/cloud-storage.html">cloud storage tutorial</a> for what each one supports.</p></details>
       <details><summary>Does it scale past one machine?</summary><p>Yes. Runtimes on several nodes form a cluster from a hostfile. Each tier can place data on neighboring nodes, and the filesystem namespace has no central metadata server.</p></details>
       <details><summary>How mature is the project?</summary><p>CLIO Core is under active development. The filesystem, the runtime and the Python bindings run in CI on Linux, macOS and Windows. <a href="https://github.com/iowarp/clio-core/issues">Report an issue</a> if something does not work.</p></details>

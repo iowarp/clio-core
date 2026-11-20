@@ -13,7 +13,7 @@ facts: Adapter config file | None ; Runtime config | CLIO_SERVER_CONF ; HDF5 str
   <tr><td>HDF5 VOL, ADIOS2</td><td>A <code>clio_cte_core</code> pool with at least one storage tier</td><td>By pool name <code>clio_cte_core</code>, or <code>CLIO_CTE_POOL=major.minor</code>.</td></tr>
   <tr><td>HDF5 VFD</td><td>Nothing, unless the read tier is on; then both of the above</td><td>As above.</td></tr>
 </table>
-<p>The default configuration (<code>context-runtime/config/clio_default.yaml</code>, copied to <code>~/.clio/clio.yaml</code>) composes the filesystem pool at <code>560.0</code>, so the interceptors work with a plain <code>clio_run start</code>. Its CTE core pool is named <code>cte_main</code>, which the HDF5 connectors' lookup by name misses; rename it to <code>clio_cte_core</code>, or start from <code>context-transfer-engine/adapter/config/clio_hdf5_quickstart.yaml</code>, a small RAM-only configuration whose pool already has that name. The minimum for the HDF5 connectors and the ADIOS2 engine is the <code>compose</code> section of that file:</p>
+<p>The default configuration (<code>context-runtime/config/clio_default.yaml</code>, copied to <code>~/.clio/clio.yaml</code>) composes the filesystem pool at <code>560.0</code>, so the interceptors work with a plain <code>clio-run start</code>. Its CTE core pool is named <code>cte_main</code>, which the HDF5 connectors' lookup by name misses; rename it to <code>clio_cte_core</code>, or start from <code>context-transfer-engine/adapter/config/clio_hdf5_quickstart.yaml</code>, a small RAM-only configuration whose pool already has that name. The minimum for the HDF5 connectors and the ADIOS2 engine is the <code>compose</code> section of that file:</p>
 <pre data-label="yaml · clio-hdf5.yaml">
 compose:
   - mod_name: clio_bdev
@@ -40,7 +40,7 @@ compose:
 <table>
   <tr><th>Variable</th><th>Default</th><th>Effect</th></tr>
   <tr><td><code>CLIO_SERVER_CONF</code></td><td><code>~/.clio/clio.yaml</code></td><td>Runtime configuration. Clients read it too: set it to the file the runtime was started with. A missing or unparseable file aborts the client process.</td></tr>
-  <tr><td><code>CLIO_WITH_RUNTIME</code></td><td>unset (attach only)</td><td><code>1</code> makes the process try to become the runtime itself and attach if one already owns the port, as the adapters' tests do. <code>0</code> or unset attaches to a running <code>clio_run</code>.</td></tr>
+  <tr><td><code>CLIO_WITH_RUNTIME</code></td><td>unset (attach only)</td><td><code>1</code> makes the process try to become the runtime itself and attach if one already owns the port, as the adapters' tests do. <code>0</code> or unset attaches to a running <code>clio-run</code>.</td></tr>
   <tr><td><code>CLIO_WAIT_SERVER</code></td><td>30</td><td>Seconds a client waits for a runtime at attach. <code>0</code> fails immediately, <code>-1</code> waits forever.</td></tr>
   <tr><td><code>CLIO_X</code></td><td>TCP</td><td>Client transport to the runtime: <code>SHM</code>, <code>TCP</code> or <code>IPC</code>. See the <a href="/docs/runtime/index.html">runtime docs</a>.</td></tr>
   <tr><td><code>CLIO_REQUIRE_RUNTIME</code></td><td>off</td><td>HDF5 connectors only. Any value other than empty, <code>0</code>, <code>off</code>, <code>false</code> or <code>no</code> makes an open fail when the CLIO tier cannot be reached, instead of falling back to native-only. It does not override a cache that was switched off on purpose.</td></tr>
@@ -150,5 +150,5 @@ herr_t H5Pget_fapl_clio(hid_t fapl_id, hbool_t *cache_enabled /*out*/);
 <h2>Where to go next</h2>
 <ul>
   <li><a href="/docs/io-adapters/index.html">I/O adapters overview</a> and the per-adapter walkthroughs.</li>
-  <li><a href="/docs/runtime/api.html">Runtime reference</a>: <code>clio_run</code> and the compose file.</li>
+  <li><a href="/docs/runtime/api.html">Runtime reference</a>: <code>clio-run</code> and the compose file.</li>
 </ul>

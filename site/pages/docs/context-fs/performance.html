@@ -4,12 +4,12 @@ heading: Performance pitfalls <em>and tuning knobs.</em>
 description: Context FS performance pitfalls (cold RAM-tier page faults and CLIO_PREFAULT, kernel caching, multi-node coherence, write windows) and the main tuning variables, with defaults taken from source.
 eyebrow: Docs · Context FS
 lede: Context FS is usually fast out of the box, but a few defaults trade speed for memory or for coherence. This page lists the pitfalls that most often cost performance and the knobs that control them. Every default here is read from the source; measure on your own hardware before and after a change.
-facts: Biggest single knob | CLIO_PREFAULT ; Set in | The runtime's environment (clio_run) ; Mount-side knobs | CLIO_FUSE_* on clio_cte_fuse ; Tier knobs | populate_unit, alloc in compose YAML
+facts: Biggest single knob | CLIO_PREFAULT ; Set in | The runtime's environment (clio-run) ; Mount-side knobs | CLIO_FUSE_* on clio_cte_fuse ; Tier knobs | populate_unit, alloc in compose YAML
 -->
 <h2>Where each knob is read</h2>
 <p>Context FS has two processes, and a variable only works in the one that reads it.</p>
 <ul class="checks">
-  <li><strong>The runtime</strong> (<code>clio_run start</code>) owns the tiers and the block devices. <code>CLIO_PREFAULT</code> and the block-device YAML keys apply here.</li>
+  <li><strong>The runtime</strong> (<code>clio-run start</code>) owns the tiers and the block devices. <code>CLIO_PREFAULT</code> and the block-device YAML keys apply here.</li>
   <li><strong>The mount</strong> (<code>clio_cte_fuse</code>) owns the kernel interface. <code>CLIO_FUSE_*</code> and <code>CLIO_CFS_*</code> apply here.</li>
 </ul>
 <p>Set each variable in the environment of the right process before it starts. Changing one later has no effect until that process restarts.</p>
@@ -20,10 +20,10 @@ facts: Biggest single knob | CLIO_PREFAULT ; Set in | The runtime's environment 
 <p><strong>The fix is <code>CLIO_PREFAULT</code></strong>, which faults the RAM tier in when it is composed rather than while your job runs:</p>
 <pre data-label="bash">
 # Fault in the whole RAM tier at startup
-CLIO_PREFAULT=0 clio_run start
+CLIO_PREFAULT=0 clio-run start
 
 # Or only the first 4 GB of it
-CLIO_PREFAULT=4GB clio_run start
+CLIO_PREFAULT=4GB clio-run start
 </pre>
 <ul class="checks">
   <li><code>0</code> means the whole mapping. Any other value is a size string such as <code>512MB</code> or <code>4GB</code>, clamped to the tier's size. Unset (the default) keeps incremental population.</li>
@@ -79,7 +79,7 @@ CLIO_PREFAULT=4GB clio_run start
 <h2>A starting configuration</h2>
 <pre data-label="bash · single node, write-heavy">
 # Runtime: fault in the RAM tier up front (commits its full size)
-CLIO_PREFAULT=0 clio_run start &
+CLIO_PREFAULT=0 clio-run start &
 
 # Mount: larger write window for big sequential writes
 CLIO_WITH_RUNTIME=0 CLIO_FUSE_WRITE_INFLIGHT_MB=1024 clio_cte_fuse ~/clio-mnt -f

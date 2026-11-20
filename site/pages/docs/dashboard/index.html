@@ -4,12 +4,12 @@ heading: The runtime <em>dashboard.</em>
 description: The web dashboard every CLIO Core runtime serves: what the Cluster, node, Pools, Context Transfer Engine, block device and Config pages show, with screenshots, and how to open it.
 eyebrow: Docs · Dashboard
 lede: Every runtime serves a web dashboard, with nothing extra to install. It shows your nodes, worker threads, pools and storage tiers, refreshes on its own, and can add or remove pools and storage tiers from the browser.
-facts: Address | http://127.0.0.1:8080 ; Turn off | clio_run start --no-viz ; Authentication | None, so keep it on loopback ; Included in | every install, pip included
+facts: Address | http://127.0.0.1:8080 ; Turn off | clio-run start --no-viz ; Authentication | None, so keep it on loopback ; Included in | every install, pip included
 -->
 <h2>Open it</h2>
 <p>Start the runtime and open the address it logs:</p>
 <pre data-label="shell">
-$ clio_run start &
+$ clio-run start &
 </pre>
 <pre data-label="output">
 Viz: dashboard listening at http://127.0.0.1:8080

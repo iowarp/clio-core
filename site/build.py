@@ -143,6 +143,7 @@ NAV = {
             ("tutorials/compose.html", "Compose local tiers"),
             ("tutorials/operators.html", "Compose data operators"),
             ("tutorials/cloud-storage.html", "Amazon S3 and Google Cloud"),
+            ("tutorials/agent-compose.html", "Compose using an agent"),
         ]),
         ("Mount", [
             ("tutorials/fuse-linux.html", "FUSE on Linux"),

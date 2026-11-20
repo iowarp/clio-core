@@ -56,7 +56,7 @@ hid_t file = H5Fcreate("/scratch/run1/data.h5", H5F_ACC_TRUNC, H5P_DEFAULT, fapl
 <p>The read tier needs a running runtime and is kept in the CLIO filesystem module, so use a configuration that composes both a CTE pool named <code>clio_cte_core</code> and a <code>clio_cte_filesystem</code> pool. Then:</p>
 <pre data-label="shell">
 $ export CLIO_SERVER_CONF=$HOME/clio-hdf5.yaml
-$ build/bin/clio_run start &
+$ build/bin/clio-run start &
 $ export HDF5_PLUGIN_PATH=$PWD/build/bin HDF5_DRIVER=clio_vfd
 $ export CLIO_VFD_READ_TIER=1 CLIO_REQUIRE_RUNTIME=1
 $ ./my_hdf5_app

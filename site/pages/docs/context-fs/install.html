@@ -59,14 +59,14 @@ PS>cmake --build build --config Release
 <h2>Check that it works</h2>
 <p>Start the runtime, mount, write a file through the mount, and unmount. On Linux:</p>
 <pre data-label="shell">
-$ clio_run start &
+$ clio-run start &
 $ mkdir -p ~/clio-mnt
 $ CLIO_WITH_RUNTIME=0 clio_cte_fuse ~/clio-mnt -f &
 $ echo hello > ~/clio-mnt/hello.txt
 $ cat ~/clio-mnt/hello.txt
 hello
 $ fusermount3 -u ~/clio-mnt
-$ clio_run stop
+$ clio-run stop
 </pre>
 <p>On Windows mount a drive letter (<code>clio_cte_fuse Z: -f</code>) in a second PowerShell window with <code>$env:CLIO_WITH_RUNTIME = "0"</code>, and stop the daemon with <code>Stop-Process -Name clio_cte_fuse</code>. If <code>clio_cte_fuse</code> reports that its binary was not found, your install does not include the adapter; use one of the methods above that does.</p>
 <p>Next: <a href="/docs/context-fs/quickstart.html">Quickstart</a>.</p>

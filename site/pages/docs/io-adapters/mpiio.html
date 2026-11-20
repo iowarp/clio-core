@@ -20,7 +20,7 @@ $ ls build/bin/libclio_cte_mpiio.so
 
 <h2>2. Start a runtime on every node</h2>
 <pre data-label="shell">
-$ build/bin/clio_run start &
+$ build/bin/clio-run start &
 </pre>
 <p>Ranks attach to the runtime on their own node. Its configuration must compose a <code>clio_cte_filesystem</code> pool, as the default configuration does. For several nodes, start the runtime on each with a shared hostfile; see the <a href="/docs/runtime/index.html">Context Runtime docs</a>.</p>
 

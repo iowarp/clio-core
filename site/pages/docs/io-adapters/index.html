@@ -4,7 +4,7 @@ heading: I/O <em>adapters.</em>
 description: The CLIO Core I/O adapters: POSIX, STDIO and MPI-IO interceptors, the HDF5 VOL connector and VFD, and the ADIOS2 plugin engine. What each one does, where its data lives, the library it builds, and the source build they all require.
 eyebrow: Docs · I/O adapters
 lede: The I/O adapters let an application that uses POSIX, STDIO, MPI-IO, HDF5 or ADIOS2 store its data in the <a href="/docs/cte/index.html">Context Transfer Engine</a> without changing its I/O code. They come from <strong>source builds</strong>, with Spack or CMake; the pip wheel and conda do not include them, and the Docker image has only the HDF5 VOL connector and the ADIOS2 engine.
-facts: Adapters | POSIX, STDIO, MPI-IO, HDF5 VOL, HDF5 VFD, ADIOS2 ; Source | context-transfer-engine/adapter/ ; Install | Spack or a CMake source build ; Needs | A running clio_run runtime
+facts: Adapters | POSIX, STDIO, MPI-IO, HDF5 VOL, HDF5 VFD, ADIOS2 ; Source | context-transfer-engine/adapter/ ; Install | Spack or a CMake source build ; Needs | A running clio-run runtime
 -->
 <h2>The adapters</h2>
 <table>
@@ -42,7 +42,7 @@ facts: Adapters | POSIX, STDIO, MPI-IO, HDF5 VOL, HDF5 VFD, ADIOS2 ; Source | co
 
 <h2>What every adapter needs at run time</h2>
 <ol class="steps">
-  <li><h3>A runtime</h3><p>Start one with <code>clio_run start</code>. The adapters attach to it as clients; the runtime reads <code>CLIO_SERVER_CONF</code> (default <code>~/.clio/clio.yaml</code>), and so does every client.</p></li>
+  <li><h3>A runtime</h3><p>Start one with <code>clio-run start</code>. The adapters attach to it as clients; the runtime reads <code>CLIO_SERVER_CONF</code> (default <code>~/.clio/clio.yaml</code>), and so does every client.</p></li>
   <li><h3>The right pools</h3><p>The interceptors need a <code>clio_cte_filesystem</code> pool, which the default configuration composes at <code>560.0</code>. The HDF5 connectors and the ADIOS2 engine need a <code>clio_cte_core</code> pool; the HDF5 quickstart config names it <code>clio_cte_core</code>, the name clients look it up by. See the <a href="/docs/io-adapters/configuration.html">configuration reference</a>.</p></li>
   <li><h3>The adapter loaded</h3><p><code>LD_PRELOAD</code> for an interceptor, <code>HDF5_PLUGIN_PATH</code> plus a selector for HDF5, <code>ADIOS2_PLUGIN_PATH</code> plus the plugin engine for ADIOS2. Each adapter page shows the exact lines.</p></li>
 </ol>

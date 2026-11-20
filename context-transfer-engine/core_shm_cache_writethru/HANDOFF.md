@@ -99,8 +99,8 @@ Code map:
    writes synchronous. Non-clio-fs callers (lmcache, YCSB JNI, clio_cte_bench,
    bench_chain, Python bindings, test_multiput_defer, test_put_sieve, one VFD
    comment) can move now. List: `grep -rnE 'AsyncPutBlobDefer|AsyncGetBlobDefer|AwaitPendingPuts|AwaitPutsUntilSpace|DeferErrorCount|Defer[A-Z]\w*|FsyncDeferred|AwaitBatchPuts'`.
-6. Docs: `context-runtime/config/clio_default.yaml` is updated; the `docs/`
-   submodule (`docs/docs/deployment/configuration.md`) is not.
+6. Docs: `context-runtime/config/clio_default.yaml` is updated; the site has
+   no page for this module under `site/pages/modules/` yet.
 
 ## Things I would review first (unverified assumptions)
 

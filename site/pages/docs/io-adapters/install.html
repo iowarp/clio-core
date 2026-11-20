@@ -74,7 +74,7 @@ $ cmake --install build --prefix "$HOME/clio"      # optional: copies them to $H
 </ul>
 
 <h2>Check the build</h2>
-<p>With <code>CLIO_CORE_ENABLE_TESTS=ON</code>, each adapter registers its own tests. They start a runtime in-process with a test configuration, so no <code>clio_run</code> needs to be running:</p>
+<p>With <code>CLIO_CORE_ENABLE_TESTS=ON</code>, each adapter registers its own tests. They start a runtime in-process with a test configuration, so no <code>clio-run</code> needs to be running:</p>
 <pre data-label="shell">
 $ ctest --test-dir build -R 'clio_cte_(posix|stdio|mpiio)_unit_tests' --output-on-failure
 $ ctest --test-dir build -R 'clio_cte_vfd_unit_tests|cte_hdf5_vol' --output-on-failure

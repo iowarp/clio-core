@@ -4,7 +4,7 @@ heading: Extend the <em>runtime.</em>
 description: Every extension point of the Context Runtime: custom ChiMods, custom schedulers, task cost models, performance monitoring, dashboard pages, elasticity and recovery callbacks, collective aggregation, GPU containers, and how modules are installed and upgraded.
 eyebrow: Docs · Context Runtime
 lede: Most extensions are modules, and a module can hook into far more than its own methods. The scheduler is the one major extension point that is not a module. This page lists what you can extend, what it costs, and how each piece is wired in.
-facts: Module hooks | container callbacks ; Scheduler | runtime.local_sched ; Monitoring | clio_run monitor, dashboard, debug telemetry
+facts: Module hooks | container callbacks ; Scheduler | runtime.local_sched ; Monitoring | clio-run monitor, dashboard, debug telemetry
 -->
 <h2 id="points">Extension points</h2>
 <table>
@@ -43,12 +43,12 @@ runtime:
 <p>The size comes from the container's <code>GetTaskStats</code>, which by default reports zero. A module whose tasks carry variable payloads, such as a write of <em>n</em> bytes, should override it to report the real I/O size and compute estimate. Without it, every task of a method looks the same, and a 4 KiB write and a 1 GiB write are booked alike.</p>
 
 <h2 id="monitoring">Monitor performance</h2>
-<h3>clio_run monitor</h3>
+<h3>clio-run monitor</h3>
 <p>Prints per-worker statistics from the admin module's <code>Monitor</code> method: tasks processed, queued, blocked, periodic and in retry, the estimated load, whether the worker is running and active, and its idle and suspend state.</p>
 <pre data-label="shell">
-$ clio_run monitor              # refresh every second
-$ clio_run monitor -i 5         # every 5 seconds
-$ clio_run monitor --once --json
+$ clio-run monitor              # refresh every second
+$ clio-run monitor -i 5         # every 5 seconds
+$ clio-run monitor --once --json
 </pre>
 <h3>The dashboard</h3>
 <p>The node's dashboard shows the cluster, every pool and the configuration. Its JSON endpoints are usable from scripts: <code>/api/health</code>, <code>/api/topology</code>, <code>/api/pools</code>, <code>/api/config</code>, <code>/api/chimods</code>, and <code>/api/routes</code>, which lists every route including those modules added. See <a href="/tutorials/dashboard.html">Navigate the dashboard</a>.</p>
@@ -66,8 +66,8 @@ $ clio_run monitor --once --json
 <h2 id="elasticity">Elasticity and recovery</h2>
 <p>A module that keeps state must implement these callbacks; the defaults do nothing beyond re-initialising.</p>
 <dl class="notes">
-  <div><dt>Expand</dt><dd>A node joined the cluster (<code>clio_run start --induct</code>). Re-partition data if ownership depends on the node count.</dd></div>
-  <div><dt>Migrate</dt><dd>Move this container's state to another node (<code>clio_run migrate</code>).</dd></div>
+  <div><dt>Expand</dt><dd>A node joined the cluster (<code>clio-run start --induct</code>). Re-partition data if ownership depends on the node count.</dd></div>
+  <div><dt>Migrate</dt><dd>Move this container's state to another node (<code>clio-run migrate</code>).</dd></div>
   <div><dt>Recover</dt><dd>Rebuild this container after a restart or on a new node, for example by replaying the module's own log.</dd></div>
   <div><dt>ScheduleRecover</dt><dd>Choose which node rebuilds a lost container.</dd></div>
 </dl>
@@ -81,7 +81,7 @@ $ clio_run monitor --once --json
 <h2 id="install">Install and upgrade modules</h2>
 <ul class="checks">
   <li><strong>Install.</strong> Put the module's runtime library where the runtime looks (its own library directory, <code>CLIO_REPO_PATH</code> or <code>LD_LIBRARY_PATH</code>) and restart the runtime once. It is scanned at startup.</li>
-  <li><strong>Compose live.</strong> Once loaded, pools of the module are created and destroyed while the runtime serves, with <code>clio_run compose start</code> and <code>stop</code> or from a client. Other pools are unaffected.</li>
-  <li><strong>Upgrade.</strong> Replace the library and restart the runtime with <code>clio_run stop</code> and <code>clio_run start</code>. No machine reboot is needed. Clients notice the restart, wait and reconnect; compose files in the restart log and durable pools are recreated, and each container's <code>Recover</code> reloads its state.</li>
+  <li><strong>Compose live.</strong> Once loaded, pools of the module are created and destroyed while the runtime serves, with <code>clio-run compose start</code> and <code>stop</code> or from a client. Other pools are unaffected.</li>
+  <li><strong>Upgrade.</strong> Replace the library and restart the runtime with <code>clio-run stop</code> and <code>clio-run start</code>. No machine reboot is needed. Clients notice the restart, wait and reconnect; compose files in the restart log and durable pools are recreated, and each container's <code>Recover</code> reloads its state.</li>
   <li><strong>Not yet: in-place swap.</strong> The runtime's container handles are built to allow replacing a pool's code without a restart, but that path is currently dormant.</li>
 </ul>

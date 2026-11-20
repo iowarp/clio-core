@@ -231,8 +231,8 @@ install(DIRECTORY config/
 # (ConfigManager::GetServerConfigPath). Existing files are never
 # overwritten. Legacy ~/.clio/clio_run.yaml is still HONORED at
 # read time as a fallback for users with pre-existing configs, but we
-# no longer seed it on install — that path is documented as legacy
-# in docs/deprecation-notes.md and will eventually be removed.
+# no longer seed it on install, and the fallback will eventually be
+# removed.
 if(CLIO_CORE_SEED_USER_CONFIG)
 install(CODE "
   # Determine real user's home directory (handles sudo install)

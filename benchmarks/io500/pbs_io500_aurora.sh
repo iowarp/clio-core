@@ -45,7 +45,7 @@
 # the per-node du sampling and the teardown rm keep working through it.
 # DAOS_NATIVE_OPTS (unset): options appended to the daos:// path, e.g.
 # "chunk_size=4m&oclass=SX&prezero=0" (see
-# docs/docs/deployment/configuration.md). prezero=0 drops the transport's
+# the native DAOS bdev in context-runtime/config/clio_default.yaml). prezero=0 drops the transport's
 # zeroing of every read buffer; safe only once the DAOS client is known to
 # return zeros for holes.
 # META_RAM_MB (unset = off): MB of an extra DRAM target per node,
@@ -70,7 +70,8 @@
 # pfind-parallelize-single-dir-access-using-hashing = TRUE to io500.ini's
 # [find] section, so pfind splits one large directory across ranks by
 # telldir/seekdir offset. Needs directory offsets that are stable across
-# processes (clio-fs's are; see docs/docs/deployment/adapter.md).
+# processes (clio-fs's are; see DirEntryOff in
+# context-transfer-engine/filesystem/include/clio_cte/filesystem/filesystem_tasks.h).
 set -u
 MODE=${MODE:-cliofs}
 PPN=${PPN:-16}

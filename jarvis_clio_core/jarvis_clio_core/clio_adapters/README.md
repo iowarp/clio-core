@@ -304,7 +304,7 @@ pkgs:
 
 ## See Also
 
-- [CTE Core Documentation](../../../../docs/cte/cte.md)
-- [WRP CTE Service Package](../clio_cte/README.md)
-- [Jarvis-CD Package Development Guide](../../../../docs/jarvis/package_dev_guide.md)
+- [CTE Core Documentation](https://core.iowarp.ai/docs/cte/index.html)
+- [CTE Service Package](../clio_cte/README.md)
+- [Jarvis-CD](https://github.com/grc-iit/jarvis-cd)
 - [IoWarp Project Documentation](../../../../README.md)

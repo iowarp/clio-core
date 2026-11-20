@@ -342,14 +342,8 @@ Under write-back verify after fsync; under write-through verify immediately.
 ## 7. Where config is documented
 
 Every key above must appear, with its default and a comment, in
-`RT/config/clio_default.yaml`, and in the docs repo page
-`docs/deployment/configuration.md` (a checkout of github.com/iowarp/docs
-lives at `docs/` in this repository, so the file is
-`docs/docs/deployment/configuration.md`). At the time of writing that page
-lacks the shm cache's `flush_retries`, `flush_shards`, `flush_depth`,
-`evict_sample`, `half_life_ms`, `max_sharer_entries`, `data_pool`,
-`data_capacity`, and lists `invalidate_on_flush` under the `clio_cte_cache`
-(563) section, whose module does not have that key.
+`RT/config/clio_default.yaml`, and in the module's compose-key table under
+`site/pages/modules/`.
 
 ## 8. Known conflicts between design docs and code
 

@@ -22,7 +22,7 @@ $ ls build/bin/libclio_cte_posix.so
 <h2>2. Start a runtime</h2>
 <p>The interceptor needs a running runtime with a filesystem pool. The default configuration composes one (<code>clio_cte_filesystem</code> at <code>560.0</code>), so the plain command is enough:</p>
 <pre data-label="shell">
-$ build/bin/clio_run start &
+$ build/bin/clio-run start &
 </pre>
 <p>If you use your own configuration, it must contain a <code>clio_cte_filesystem</code> entry; the interceptor looks the pool up by that name and creates none. Set <code>CLIO_CFS_POOL</code> to use a pool with another name, or to name it by id (<code>CLIO_CFS_POOL=560.0</code>).</p>
 <p>When no runtime or no filesystem pool can be reached, opening a <code>clio::</code> path fails with <code>EIO</code>. The attach first waits for a server for <code>CLIO_WAIT_SERVER</code> seconds (30 by default).</p>
