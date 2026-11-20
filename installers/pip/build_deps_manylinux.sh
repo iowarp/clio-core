@@ -169,7 +169,7 @@ rm -rf /tmp/cppzmq-*
 # work too.
 echo "--- OpenSSL 3.0.15 ---"
 cd /tmp
-yum install -y perl-core >/dev/null
+bash "$(dirname "$0")/../../CI/retry.sh" yum install -y perl-core >/dev/null
 download_tar https://github.com/openssl/openssl/releases/download/openssl-3.0.15/openssl-3.0.15.tar.gz openssl.tar.gz
 tar xzf openssl.tar.gz && rm openssl.tar.gz
 (cd openssl-3.0.15 && \
