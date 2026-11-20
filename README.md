@@ -108,7 +108,7 @@ sudo cmake --install build
 For the per-feature apt / dnf dependency list and the complete
 `CLIO_*_ENABLE_*` flag checklist, see [INSTALL.md](INSTALL.md). Other install
 methods (Conda, Docker, Spack) are documented in
-[docs/getting-started/installation](https://github.com/iowarp/docs/blob/main/docs/getting-started/installation.mdx).
+[Install CLIO Core](https://core.iowarp.ai/docs/installation.html).
 
 ## Components
 
@@ -295,7 +295,7 @@ clio_cte_bench       --op PutGet --threads 8 --depth 16 --io-size 1m --io-count 
 
 ## Documentation
 
-- **[AGENTS.md](AGENTS.md)** — unified development guide and coding standards.
+- **[Contributing guide](.claude-plugin/plugins/iowarp-contributing/skills/contributing/SKILL.md)** — git workflow, code standards and codemap.
 - **[INSTALL.md](INSTALL.md)** — bare-metal source-build instructions.
 - **[Context Transport Primitives](context-transport-primitives/README.md)**
 - **[CLIO Runtime](context-runtime/README.md)**
@@ -328,7 +328,7 @@ streaming analytics.
 
 1. Fork the repository.
 2. Create a feature branch: `git checkout -b feature/amazing-feature`.
-3. Follow the standards in [AGENTS.md](AGENTS.md).
+3. Follow the [contributing guide](.claude-plugin/plugins/iowarp-contributing/skills/contributing/SKILL.md).
 4. `ctest --test-dir build/release` before opening a PR.
 5. Submit a pull request against `iowarp/clio-core`.
 

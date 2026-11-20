@@ -13,7 +13,7 @@ $ cmake --install build --prefix $HOME/clio-inst
 $ export PATH=$HOME/clio-inst/bin:$PATH
 $ export PYTHONPATH=$HOME/clio-inst/ext
 </pre>
-<p>Use the installed <code>clio_run</code> and <code>clio_cte_fuse</code> from now on, so the runtime and your module load the same CLIO Core libraries.</p>
+<p>Use the installed <code>clio-run</code> and <code>clio_cte_fuse</code> from now on, so the runtime and your module load the same CLIO Core libraries.</p>
 
 <h2>2. Lay out the module</h2>
 <pre data-label="files">
@@ -579,7 +579,7 @@ $ cmake --build bytecount/build
 <pre data-label="shell">
 $ export CLIO_REPO_PATH=$HOME/bytecount/build     # where the runtime finds the module
 $ export CLIO_SERVER_CONF=$HOME/clio-bytecount.yaml
-$ clio_run start &
+$ clio-run start &
 $ CLIO_WITH_RUNTIME=0 clio_cte_fuse ~/clio-mnt -f &
 </pre>
 <p>The runtime log shows <code>Loaded ChiMod: clio_demo_bytecount</code>, and the FUSE daemon prints <code>data pool 600.0 (filesystem chain)</code>. Write some files:</p>

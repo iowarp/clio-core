@@ -12,13 +12,13 @@ facts: C++ | clio::cte::core::Tag, Client ; Python | clio_cte_core_ext ; Default
 #include <clio_runtime/clio_runtime.h>
 #include <clio_cte/core/core_client.h>
 
-clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient);   // attach to a running clio_run
+clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient);   // attach to a running clio-run
 clio::cte::core::CLIO_CTE_CLIENT_INIT();                  // bind the shared client
 auto *client = CLIO_CTE_CLIENT;                           // clio::cte::core::Client *
 </pre>
 <pre data-label="python">
 import os
-os.environ["CLIO_WITH_RUNTIME"] = "0"     # attach to a running clio_run
+os.environ["CLIO_WITH_RUNTIME"] = "0"     # attach to a running clio-run
 os.environ["CLIO_CTE_POOL"] = "564.0"     # optional: the indexer, so SemanticSearch works
 
 import clio_cte_core_ext as cte

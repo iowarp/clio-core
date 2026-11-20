@@ -1,7 +1,7 @@
 <!--
 title: API reference
 heading: Context Assimilation Engine <em>API reference.</em>
-description: Reference for the Context Assimilation Engine: the OMNI YAML schema, the clio_cae tool, the AssimilationCtx fields, the C++ client, the compose keys of the core and summarizer modules, the ParseOmni result codes, and every environment variable the engine reads.
+description: Reference for the Context Assimilation Engine: the OMNI YAML schema, the clio-cae tool, the AssimilationCtx fields, the C++ client, the compose keys of the core and summarizer modules, the ParseOmni result codes, and every environment variable the engine reads.
 eyebrow: Docs · Context Assimilation Engine
 lede: Every key, field, signature and default on this page is taken from the source under context-assimilation-engine. Where a value has a default, it is stated. Where a feature needs a build option, the option is named.
 facts: OMNI parser | core/src/omni_loader.cc ; Context | factory/assimilation_ctx.h ; Client | clio_cae/core/core_client.h ; Compose keys | core_tasks.h, summarizer_tasks.h
@@ -20,17 +20,17 @@ facts: OMNI parser | core/src/omni_loader.cc ; Context | factory/assimilation_ct
     <tr><td><code>src_token</code></td><td>string</td><td><code>""</code></td><td>Source credential. Environment-expanded. Sent as <code>Authorization: Bearer</code> for HTTP sources and used as the Globus access token.</td></tr>
     <tr><td><code>dst_token</code></td><td>string</td><td><code>""</code></td><td>Destination credential. Environment-expanded. Carried in the context; no shipped assimilator reads it.</td></tr>
     <tr><td><code>dataset_filter</code></td><td>map</td><td>none</td><td>Holds <code>include_patterns</code> and <code>exclude_patterns</code>, each a sequence of glob patterns (<code>*</code>, <code>?</code>, <code>[]</code>; <code>*</code> crosses <code>/</code>). Used by the HDF5 assimilator. Empty include means include all.</td></tr>
-    <tr><td><code>run</code></td><td>path</td><td>none</td><td>Script run by <code>clio_cae</code> before submission, as <code>script &lt;source&gt; &lt;run_out&gt;</code>. Environment-expanded; relative to the OMNI file's directory. Requires <code>run_out</code>.</td></tr>
+    <tr><td><code>run</code></td><td>path</td><td>none</td><td>Script run by <code>clio-cae</code> before submission, as <code>script &lt;source&gt; &lt;run_out&gt;</code>. Environment-expanded; relative to the OMNI file's directory. Requires <code>run_out</code>.</td></tr>
     <tr><td><code>run_out</code></td><td>path</td><td>none</td><td>The file the script writes; it replaces the source. Same expansion rules. Requires <code>run</code>.</td></tr>
   </tbody>
 </table></div>
 <p>Fields of <code>AssimilationCtx</code> that have no OMNI key (<code>src_data</code>, <code>s3_region</code>, <code>s3_profile</code>, <code>on_fault</code>, <code>chunk_size</code>, <code>blob_prefix</code>) can only be set from code.</p>
 
-<h2>clio_cae tool</h2>
+<h2>clio-cae tool</h2>
 <pre data-label="shell">
-$ clio_cae <omni_file_path>
+$ clio-cae <omni_file_path>
 </pre>
-<p>One positional argument, the OMNI file. Any other argument count prints the usage and exits 1. <code>clio_cae_omni</code> is an installed alias. The tool:</p>
+<p>One positional argument, the OMNI file. Any other argument count prints the usage and exits 1. <code>clio_cae</code> and <code>clio_cae_omni</code> are installed aliases. The tool:</p>
 <ol class="steps">
   <li>Initializes a runtime client (<code>CLIO_INIT(kClient, false)</code>) and exits 1 if the runtime is unreachable.</li>
   <li>Loads the file with <code>LoadOmni</code>, collecting <code>run</code> steps.</li>
@@ -86,7 +86,7 @@ std::string CheckDependencies(const std::vector<AssimilationCtx>& ctxs);
 <p>The Python binding of this struct, with two constructors and the first nine fields as attributes, is on the <a href="/docs/cee/api.html#assimilationctx">CEE API page</a>.</p>
 
 <h2>OMNI loader functions</h2>
-<p>Linked into <code>clio_cae</code> from the static library <code>cae_omni_loader</code>. Headers <code>clio_cae/core/omni_loader.h</code> and <code>clio_cae/core/omni_run.h</code>.</p>
+<p>Linked into <code>clio-cae</code> from the static library <code>cae_omni_loader</code>. Headers <code>clio_cae/core/omni_loader.h</code> and <code>clio_cae/core/omni_run.h</code>.</p>
 <pre data-label="cpp">
 namespace clio::cae::core {
 std::vector<AssimilationCtx> LoadOmni(const std::string& omni_path,
@@ -180,7 +180,7 @@ if (f->result_code_ != 0) { /* f->error_message_ */ }
   <tbody>
     <tr><td><code>mod_name</code></td><td>required</td><td><code>clio_cae_core</code></td></tr>
     <tr><td><code>pool_name</code></td><td>required</td><td>Any name; the default file uses <code>cae_main</code>.</td></tr>
-    <tr><td><code>pool_id</code></td><td>required</td><td><code>"400.0"</code>. Clients, <code>clio_cae</code> and the CEE connect to <code>kCaePoolId</code>, so use this value.</td></tr>
+    <tr><td><code>pool_id</code></td><td>required</td><td><code>"400.0"</code>. Clients, <code>clio-cae</code> and the CEE connect to <code>kCaePoolId</code>, so use this value.</td></tr>
     <tr><td><code>pool_query</code></td><td>required</td><td><code>local</code> in the default file.</td></tr>
     <tr><td><code>next_pool_id</code></td><td>null</td><td><code>"major.minor"</code> of the pool the CAE writes through and forwards to. Null falls back to the CTE core, 512.0. The default file sets <code>"563.0"</code>.</td></tr>
   </tbody>
@@ -250,5 +250,5 @@ if (f->result_code_ != 0) { /* f->error_message_ */ }
 <h3>Client side</h3>
 <ul>
   <li><code>CLIO_CTE_POOL</code> (<code>major.minor</code>): binds the process's CTE client, which <code>CLIO_CAE_CLIENT_INIT</code> creates, to an interposing pool. Needed for semantic queries; see the <a href="/docs/cee/usage.html#connecting-to-the-runtime">CEE usage page</a>.</li>
-  <li><code>CLIO_WITH_RUNTIME</code>: <code>1</code> or <code>true</code> makes a client try to start a runtime in-process before attaching. <code>clio_cae</code> and the CEE default to attaching only.</li>
+  <li><code>CLIO_WITH_RUNTIME</code>: <code>1</code> or <code>true</code> makes a client try to start a runtime in-process before attaching. <code>clio-cae</code> and the CEE default to attaching only.</li>
 </ul>

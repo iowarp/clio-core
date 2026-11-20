@@ -99,7 +99,7 @@ inline long long ThalliumEnvSize(const char *suffix, long long dflt) {
 /**
  * Process-wide Thallium settings, read once from the environment.
  * Every field maps to one CLIO_LBM_THALLIUM_* variable (see
- * docs/docs/deployment/configuration.md).
+ * the networking section of context-runtime/config/clio_default.yaml).
  */
 struct ThalliumConfig {
   std::string protocol_;   /**< PROTOCOL: Mercury protocol, e.g. ofi+cxi */

@@ -16,7 +16,7 @@ facts: Time | 2 to 20 minutes ; Python | 3.10 to 3.13 for pip ; Needs root | Onl
 $ pip install iowarp-core
 $ python -c "import iowarp_core; print(iowarp_core.get_version())"
 </pre>
-<p>The wheel puts these commands on your <code>PATH</code>: <code>clio_run</code>, <code>clio_cte_fuse</code> (Linux and Windows), <code>clio_cte_bench</code> and <code>clio_run_thrpt_bench</code>. It also gives you the Python modules <code>iowarp_core</code>, <code>clio_cee</code> and <code>clio_cte_core_ext</code>.</p>
+<p>The wheel puts these commands on your <code>PATH</code>: <code>clio-run</code>, <code>clio_cte_fuse</code> (Linux and Windows), <code>clio_cte_bench</code> and <code>clio_run_thrpt_bench</code>. It also gives you the Python modules <code>iowarp_core</code>, <code>clio_cee</code> and <code>clio_cte_core_ext</code>.</p>
 <p>The first time Python imports <code>iowarp_core</code>, it copies the default configuration to <code>~/.clio/clio.yaml</code>. It never overwrites an existing file.</p>
 <div class="callout">
   <span class="callout-title">To mount the filesystem</span>
@@ -33,7 +33,7 @@ $ python -c "import iowarp_core; print(iowarp_core.get_version())"
 <pre data-label="shell">
 $ conda create -n iowarp -c iowarp -c conda-forge python=3.12 iowarp-core
 $ conda activate iowarp
-$ clio_run --help
+$ clio-run --help
 </pre>
 <h4>Build the recipe yourself</h4>
 <p>To enable other features, build the recipe yourself. <code>IOWARP_PRESET</code> picks a preset from <code>CMakePresets.json</code>:</p>
@@ -47,11 +47,11 @@ $ conda install -c conda-forge build/conda-output/*/iowarp-core-*.conda
   </section>
   <section class="tab-panel" id="docker" data-tab="Docker" data-note="Containers and Compose stacks."><p class="tab-title">Docker</p>
 <p class="panel-meta"><strong>Platforms:</strong> amd64, arm64</p>
-<p>The <code>iowarp/deploy-cpu</code> image is multi-arch (amd64 and arm64). It includes MPI, the HDF5 VOL connector, ADIOS2 and compression. It runs as the <code>iowarp</code> user. Its default command is a shell, so pass <code>clio_run start</code> yourself.</p>
+<p>The <code>iowarp/deploy-cpu</code> image is multi-arch (amd64 and arm64). It includes MPI, the HDF5 VOL connector, ADIOS2 and compression. It runs as the <code>iowarp</code> user. Its default command is a shell, so pass <code>clio-run start</code> yourself.</p>
 <pre data-label="shell">
 $ docker pull iowarp/deploy-cpu:latest
 $ docker run -d -p 9413:9413 -p 8080:8080 -e CLIO_VIZ_BIND=0.0.0.0 \
-    --memory=8g --name iowarp iowarp/deploy-cpu:latest clio_run start
+    --memory=8g --name iowarp iowarp/deploy-cpu:latest clio-run start
 </pre>
 <p>Port 9413 is the runtime RPC port and 8080 is the dashboard. <code>:latest</code> is rebuilt from the <code>main</code> branch.</p>
 <h4>As a long-running service</h4>
@@ -70,7 +70,7 @@ services:
       - "9413:9413"
       - "8080:8080"
     mem_limit: 8g
-    command: ["clio_run", "start"]
+    command: ["clio-run", "start"]
     restart: unless-stopped
 volumes:
   iowarp-state:

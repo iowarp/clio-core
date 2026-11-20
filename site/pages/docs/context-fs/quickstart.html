@@ -9,18 +9,18 @@ facts: Time | About 5 minutes ; Needs | An install with clio_cte_fuse and a FUSE
 <h2>1. Start the runtime</h2>
 <p>The runtime is one background process per machine. Every other component runs inside it.</p>
 <pre data-label="shell">
-$ clio_run start
+$ clio-run start
 </pre>
 <p>Leave it running in its own terminal, or add <code>&amp;</code> to run it in the background. It is ready when the log shows the client transport. Its port is the base RPC port, 9413, plus 3:</p>
 <pre data-label="output">
 IpcManager: TCP ROUTER transport bound on <address>:9416
 Viz: dashboard listening at http://127.0.0.1:8080
 </pre>
-<p>In another terminal, <code>clio_run status</code> prints <code>RUNNING</code>, <code>STOPPED (clean)</code>, or <code>STOPPED (stale artifacts)</code> when a crashed runtime left files behind.</p>
+<p>In another terminal, <code>clio-run status</code> prints <code>RUNNING</code>, <code>STOPPED (clean)</code>, or <code>STOPPED (stale artifacts)</code> when a crashed runtime left files behind.</p>
 <p>The runtime reads <code>~/.clio/clio.yaml</code>. To use a different file, set <code>CLIO_SERVER_CONF</code> <em>before</em> you start it:</p>
 <pre data-label="shell">
 $ export CLIO_SERVER_CONF=$HOME/my-clio.yaml
-$ clio_run start --disk /scratch/$USER/clio   # keep persistent state on scratch
+$ clio-run start --disk /scratch/$USER/clio   # keep persistent state on scratch
 </pre>
 <div class="callout">
   <span class="callout-title">What the default configuration gives you</span>
@@ -73,17 +73,17 @@ for hit in client.SemanticSearch(".*notes/.*", "[0-9]+", "sea ice extent", 5):
 <h2>5. Stop cleanly</h2>
 <pre data-label="shell">
 $ fusermount3 -u ~/clio-mnt     # Linux. macOS: umount ~/clio-mnt
-$ clio_run stop
+$ clio-run stop
 </pre>
-<p><code>clio_run stop</code> drains in-flight work for up to five seconds by default. Use <code>--grace-period &lt;ms&gt;</code> to change that, or <code>--force</code> to stop immediately.</p>
-<p>Your files survive the stop. <code>clio_run start</code> recovers them from the metadata log, so start again and mount the same directory to see the same files. To begin from an empty store instead, use <code>clio_run start --fresh</code>, which discards this node's persistent state.</p>
+<p><code>clio-run stop</code> drains in-flight work for up to five seconds by default. Use <code>--grace-period &lt;ms&gt;</code> to change that, or <code>--force</code> to stop immediately.</p>
+<p>Your files survive the stop. <code>clio-run start</code> recovers them from the metadata log, so start again and mount the same directory to see the same files. To begin from an empty store instead, use <code>clio-run start --fresh</code>, which discards this node's persistent state.</p>
 
 <h2>Troubleshooting</h2>
 <ul>
   <li><strong>Files written by the mount are invisible to Python.</strong> The FUSE daemon started its own runtime. Remount with <code>CLIO_WITH_RUNTIME=0</code>.</li>
   <li><strong><code>clio_cte_fuse</code> binary not found on macOS.</strong> The macOS wheel has no FUSE binary. Build with the <code>release-mac-fuse</code> preset (see <a href="/docs/context-fs/install.html">Install</a>).</li>
   <li><strong><code>fuse: device not found</code> on Linux.</strong> Install the FUSE 3 package: <code>sudo apt install fuse3 libfuse3-3</code>.</li>
-  <li><strong>No <code>Viz:</code> line, or nothing on port 8080.</strong> Another process holds the port (the runtime still starts), or the build lacks Poco. Try <code>clio_run start --viz-port 9000</code>.</li>
+  <li><strong>No <code>Viz:</code> line, or nothing on port 8080.</strong> Another process holds the port (the runtime still starts), or the build lacks Poco. Try <code>clio-run start --viz-port 9000</code>.</li>
   <li><strong><code>SemanticSearch</code> returns nothing.</strong> The client is bound to the core pool. Set <code>CLIO_CTE_POOL=564.0</code> before importing the module.</li>
 </ul>
 <p>Next: <a href="/docs/context-fs/usage.html">Usage</a> for the other platforms, the default composition and changing tiers.</p>

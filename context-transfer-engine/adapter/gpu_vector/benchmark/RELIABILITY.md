@@ -101,8 +101,8 @@ production layout: one runtime per node remains the design.
 ## Log
 
 - 2026-09-26: SWIM defaults changed (fdab7a1f): off everywhere, 300/150/3600 s.
-- 2026-09-26: rc=11 identified as "no storage targets registered" (AGENTS.md
-  and PITFALLS.md already said so; the 64-node diagnosis had guessed EAGAIN).
+- 2026-09-26: rc=11 identified as "no storage targets registered" (the build
+  hygiene notes and PITFALLS.md already said so; the 64-node diagnosis had guessed EAGAIN).
 - 2026-09-26: host:port hostfile entries added (types.h, ipc_manager.cc,
   ipc_run2run.cc); bench_config.sh (one yaml generator), run_colocated.sh,
   pbs_devnode_aurora.sh written. Defect-5 fix and nap-unit fix built into

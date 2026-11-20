@@ -12,6 +12,9 @@ Kernels read and write it through block-collective coroutine verbs: a block
 that has to wait for data **exits the kernel** and the host relaunches it when
 the data lands.
 
+Source paths in these files are relative to the root of the
+[iowarp/clio-core](https://github.com/iowarp/clio-core) repository.
+
 This skill is general. It describes the API, rules that hold for any access
 pattern, and measured costs. It deliberately contains no worked
 implementations: design your kernel from the workload in front of you.
@@ -20,7 +23,7 @@ implementations: design your kernel from the workload in front of you.
 
 | file | read when |
 |---|---|
-| **API.md** | before writing any code. The *current* contract; many older docs and comments in the tree describe a deleted API. |
+| **API.md** | before writing any code. The contract, from the headers. Where a comment in the tree disagrees, the code wins. |
 | **DESIGN.md** | before choosing a data layout or decomposition. The rules that decide whether a kernel is 1x or 10x its baseline. |
 | **COSTS.md** | before optimizing, choosing page/cache sizes, or adding a tier policy. |
 | **PITFALLS.md** | before running anything, and whenever a result looks too good, too bad, or hangs. Also: validation and debugging. |
@@ -58,4 +61,3 @@ implementations: design your kernel from the workload in front of you.
 - Plain `__shared__` and registers do not survive a park (C++20 coroutine locals do; coroc locals must be trivially copyable). Use `CLIO_SHARED_PERSIST` or re-stage after every suspend.
 - Check `HitRoundCap()` after every run: hitting the round cap is a livelock that otherwise looks like a pass.
 - A run with zero evictions proves nothing about out-of-core behavior.
-- Do not trust comments or docs that mention `FetchPagesBatched`, `WaitFetch`, `FlushBlockBatched`, `FlushAsync`/`AwaitFlush`, dirty bits, "the hold is the pin", private per-block tables, or a resident fast path: that API is gone (API.md, "Stale").

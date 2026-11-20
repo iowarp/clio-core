@@ -275,6 +275,6 @@ profiles to cover it.
 | module stats at stop | `RuntimeManager::AddStopHook` (`include/clio_runtime/manager.h:163-189`) | e.g. `[shm-cache stats] puts= refused: log= slot= buf= ... flush_batches= get_hits= get_misses= ...` at warning level. Add counters + a stop hook to any module you are optimizing. |
 | scheduler logs | debug level, every ~1 s | `[#781 PDF]`, `[#781 METHODS]` (top methods by wall time), `[sched]` per-worker load/queued |
 | `CLIO_WORKER_RATE=1`, `CLIO_NET_TRACE=1`, `CLIO_COLL_PROF` | env | worker loop rate, network send tick rate, collective profile |
-| `clio_run monitor [-i N] [-j]` | CLI (`util/clio_run_cmd_monitor.cc`) | per-worker queued/blocked/periodic/retry/processed |
+| `clio-run monitor [-i N] [-j]` | CLI (`util/clio_run_cmd_monitor.cc`) | per-worker queued/blocked/periodic/retry/processed |
 | viz dashboard | `CLIO_VIZ_ENABLE`, `viz:` YAML (default 127.0.0.1:8080) | pools, workers, config |
-| stack sampling | `benchmarks/io500/sample_stacks.sh <outdir> [delay] [samples] [gap]` (`top -H` + `eu-stack` of `clio_run`/`clio_cte_fuse`; `PROFILE=1` in `pbs_io500_aurora.sh`); `CLIO_SUITE_GDB=1` runs suite daemons under gdb | where workers actually spend time |
+| stack sampling | `benchmarks/io500/sample_stacks.sh <outdir> [delay] [samples] [gap]` (`top -H` + `eu-stack` of `clio-run`/`clio_cte_fuse`; `PROFILE=1` in `pbs_io500_aurora.sh`); `CLIO_SUITE_GDB=1` runs suite daemons under gdb | where workers actually spend time |

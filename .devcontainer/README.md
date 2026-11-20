@@ -355,7 +355,7 @@ cmake --preset=debug -DCLIO_CTE_ENABLE_COMPRESS=ON
 - **Complete DevContainer Guide**: [README_DEVCONTAINERS.md](README_DEVCONTAINERS.md)
 - **CUDA Setup**: [CUDA_SETUP.md](CUDA_SETUP.md)
 - **Project Documentation**: [../CLAUDE.md](../CLAUDE.md)
-- **Contributing Guide**: [../docs/contributing.md](../docs/contributing.md)
+- **Contributing Guide**: [../.claude-plugin/plugins/iowarp-contributing/skills/contributing/SKILL.md](../.claude-plugin/plugins/iowarp-contributing/skills/contributing/SKILL.md)
 - **Module Development**: [https://core.iowarp.ai/develop/](https://core.iowarp.ai/develop/)
 
 ## Quick Reference

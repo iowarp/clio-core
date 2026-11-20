@@ -43,7 +43,7 @@ kGetStats: 14           # Get performance statistics
     <tr><td>Let the storage engine accept it as a tier type</td><td>The <code>bdev_type</code> check in <code>context-transfer-engine/core/src/core_config.cc</code> and the string-to-type mapping in <code>context-transfer-engine/core/src/core_runtime.cc</code></td></tr>
   </tbody>
 </table></div>
-<p>Per the <a href="https://github.com/iowarp/clio-core/blob/main/AGENTS.md">contributor guide</a>, document new configuration keys in <code>context-runtime/config/clio_default.yaml</code>.</p>
+<p>Document new configuration keys, with their defaults and options, in <code>context-runtime/config/clio_default.yaml</code>.</p>
 
 <h2>Placement and tiering policies</h2>
 <p>Placement and tiering run inside the storage engine and use its internal state, so new policies are added to CLIO Core itself.</p>
