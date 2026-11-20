@@ -36,6 +36,7 @@
 
 #include <clio_ctp/util/env_compat.h>
 #include "clio_ctp/introspect/system_info.h"
+#include "clio_ctp/types/atomic.h"
 
 #include <atomic>
 #include <cerrno>
@@ -999,15 +1000,34 @@ bool SystemInfo::BulkFault(void *addr, size_t size) {
   // Fall through to the touch loop (e.g. pre-Win8, or an unmapped subrange).
 #endif
 
-  // Universal fallback (and the macOS primary path): write-touch one byte
-  // per page. A volatile read-modify-write faults the page for writing while
-  // preserving its contents. Same per-page cost as demand faulting, but paid
-  // here, at a controlled point, instead of scattered through a bulk memcpy.
-  volatile char *p = reinterpret_cast<volatile char *>(begin);
-  for (uintptr_t off = 0; off < end - begin; off += page) {
-    p[off] = p[off];
-  }
+  // Universal fallback (and the macOS primary path).
+  TouchPages(reinterpret_cast<void *>(begin), end - begin);
   return true;
+}
+
+void SystemInfo::TouchPages(void *addr, size_t size) {
+  if (addr == nullptr || size == 0) {
+    return;
+  }
+  const size_t page = static_cast<size_t>(GetPageSize());
+  uintptr_t begin = reinterpret_cast<uintptr_t>(addr);
+  const uintptr_t end = begin + size;
+  begin &= ~(static_cast<uintptr_t>(page) - 1);
+  // An atomic compare-exchange of the byte with itself, never `p = p`: the
+  // range is usually live (a RAM bdev populates the rest of a unit while
+  // other workers already write blocks inside it). A plain load + store is
+  // two accesses, and a write landing between them is overwritten with the
+  // stale byte -- one lost byte per page, which corrupted RAM bdev blocks on
+  // macOS (where this loop is the only populate path). The CAS stores only
+  // if the byte still holds what was loaded, so it faults the page for
+  // writing and never changes it; if a concurrent write won, that write
+  // already faulted the page. (Not fetch_add(0): clang folds an idempotent
+  // RMW whose result is unused into a bare fence, touching nothing.)
+  for (uintptr_t a = begin; a < end; a += page) {
+    ctp::ipc::atomic_ref<char> ref(*reinterpret_cast<char *>(a));
+    char seen = ref.load(std::memory_order_relaxed);
+    ref.compare_exchange_strong(seen, seen, std::memory_order_relaxed);
+  }
 }
 
 void *SystemInfo::AlignedAlloc(size_t alignment, size_t size) {
