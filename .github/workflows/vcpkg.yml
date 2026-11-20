@@ -74,7 +74,10 @@ jobs:
           # Run outside the checkout: installers/vcpkg/vcpkg.json would
           # otherwise switch vcpkg into manifest mode.
           cd "$RUNNER_TEMP"
-          "$VCPKG" install "iowarp-core[viz,hdf5]" --classic \
+          # pcre2[core]: Poco pulls in pcre2, whose default "jit" feature asks
+          # the GitHub REST API for a submodule pointer -- anonymously, so a
+          # shared runner IP hits the rate limit (HTTP 403). Poco needs no JIT.
+          "$VCPKG" install "pcre2[core]" "iowarp-core[viz,hdf5]" --classic \
             --triplet ${{ matrix.triplet }} \
             --overlay-ports="$W" --overlay-ports="$W/overlay-ports" \
             --x-install-root="$RUNNER_TEMP/vcpkg-installed" || {
