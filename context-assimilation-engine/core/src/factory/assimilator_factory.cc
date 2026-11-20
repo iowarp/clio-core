@@ -33,6 +33,7 @@
 
 #include <clio_cae/core/factory/assimilator_factory.h>
 #include <clio_cae/core/factory/binary_file_assimilator.h>
+#include <clio_cae/core/factory/csv_file_assimilator.h>
 #ifdef CAE_ENABLE_HTTP
 #include <clio_cae/core/factory/http_file_assimilator.h>
 #endif
@@ -101,6 +102,11 @@ std::unique_ptr<BaseAssimilator> AssimilatorFactory::Get(
     HLOG(kError, "AssimilatorFactory: http(s) sources need a POSIX build");
     return nullptr;
 #endif
+  } else if (protocol == "csv") {
+    HLOG(kDebug,
+         "AssimilatorFactory: Creating CsvFileAssimilator for 'csv' protocol");
+    // One CTE tag per (filtered) column, laid out like an HDF5 dataset
+    return std::make_unique<CsvFileAssimilator>(cte_client_);
   } else if (protocol == "string") {
     HLOG(kDebug,
          "AssimilatorFactory: Creating StringDataAssimilator for 'string' "

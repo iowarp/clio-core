@@ -171,6 +171,37 @@ assimilation time (no secrets are placed in the OMNI file):
   gcloud ADC, or the GCE/GKE metadata server), and an optional endpoint via
   `GCS_ENDPOINT` (e.g. fake-gcs-server).
 
+**CSV files (`csv::`, column by column):**
+
+```yaml
+transfers:
+  - src: csv::/data/Missouri_KansasCity_FINAL.csv
+    dst: iowarp::hedw/kansas_city
+    format: csv
+    dataset_filter:
+      include_patterns: ["/solar_*", "/load_mw"]
+      exclude_patterns: ["/solar_Minute"]
+```
+
+Each column is ingested like a root-level HDF5 dataset named `/<header>`, so
+`dataset_filter` globs select columns by that name (same matcher as HDF5:
+`*`, `?`, `[...]`, `\` escapes; excludes win; an include list that matches no
+column fails the transfer with -9). A selected column lands in tag
+`<dst>/<header>` as a `description` blob plus `chunk_0..chunk_N` blobs (each
+<= 1.5 MB) whose concatenation is the column's element image:
+
+| Column contents | Stored as | `description` |
+|---|---|---|
+| every field a base-10 integer that fits in int64 | int64 | `tensor<int64, N>` |
+| otherwise every non-empty field a number (`nan`/`inf` allowed) | float64, empty fields NaN | `tensor<float64, N>` |
+| anything else | char[N][W], NUL-padded, W = longest field | `tensor<char, N, W>` |
+
+Parsing follows RFC 4180: a header row; quoted fields may hold commas, line
+breaks and `""`; LF or CRLF line ends; a UTF-8 BOM is skipped. A record with
+a different field count than the header, a duplicate header name or a broken
+quote fails the transfer with -5. The file is read whole on the node running
+the transfer.
+
 **Transforming a source first (`run:`):**
 
 ```yaml
@@ -192,7 +223,8 @@ in order, as the user running `clio_cae`, and never inside the runtime.
   existing `run_out` is deleted first, so a file from an earlier run can't count
   as this run's output.
 - **What gets ingested:** the transfer then ingests `run_out`, as `hdf5::` when
-  `format` starts with `hdf5` and as `file::` otherwise. `range_off` and
+  `format` starts with `hdf5`, as `csv::` when it is `csv`, and as `file::`
+  otherwise. `range_off` and
   `range_size` apply to that output. A later `depends_on` that named the old
   `src` is updated to match.
 - **Failure:** if any step fails, no transfer is submitted.
@@ -207,12 +239,12 @@ in order, as the user running `clio_cae`, and never inside the runtime.
 
 | Field | Description |
 |---|---|
-| `src` | Source URL (`file::`, `string::`, `hdf5::`, `globus://`, `s3://`, `gs://`) |
+| `src` | Source URL (`file::`, `string::`, `hdf5::`, `csv::`, `globus://`, `s3://`, `gs://`) |
 | `dst` | CTE destination tag (`iowarp::tag_name`; `iowarp::` for `hdf5_vol`) |
-| `format` | `binary`, `hdf5`, `hdf5_vol`, or `globus` |
+| `format` | `binary`, `hdf5`, `hdf5_vol`, `csv`, or `globus` |
 | `range_off` / `range_size` | Byte range within source (0 = full file) |
 | `src_token` / `dst_token` | Auth tokens; environment variables are expanded |
-| `dataset_filter` | HDF5 dataset include/exclude glob patterns |
+| `dataset_filter` | HDF5 dataset / CSV column (`/<header>`) include/exclude glob patterns |
 | `run` / `run_out` | Script that turns `src` into `run_out` before ingest (see above) |
 
 A per-transfer key not in this table is logged as a warning and ignored.

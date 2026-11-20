@@ -81,14 +81,15 @@ std::string Quote(const std::string& a) {
 }  // namespace
 
 std::string RunSourceArg(const std::string& src) {
-  for (const char* scheme : {"file::", "hdf5::"}) {
+  for (const char* scheme : {"file::", "hdf5::", "csv::"}) {
     if (StartsWith(src, scheme)) return src.substr(std::strlen(scheme));
   }
   return src;
 }
 
 std::string RunOutputSrc(const std::string& format, const std::string& out) {
-  return (StartsWith(format, "hdf5") ? "hdf5::" : "file::") + out;
+  if (StartsWith(format, "hdf5")) return "hdf5::" + out;
+  return (format == "csv" ? "csv::" : "file::") + out;
 }
 
 int RunScript(const std::string& script, const std::vector<std::string>& args,
