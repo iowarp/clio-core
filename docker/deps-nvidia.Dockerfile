@@ -20,6 +20,10 @@ USER root
 
 # Docker Desktop networks can be unreliable with Ubuntu's default HTTP mirrors.
 # Use a HTTPS mirror and make apt retry slow/interrupted metadata downloads.
+# On noble (deb822 ubuntu.sources) the URIs line lists kernel.org first and
+# Ubuntu's own archive as a fallback: apt tries them in order, so an
+# unreachable kernel.org (seen in CI: connection timed out) no longer fails
+# the whole rebuild.
 RUN set -eux; \
     printf '%s\n' \
       'Acquire::Retries "10";' \
@@ -31,8 +35,8 @@ RUN set -eux; \
       > /etc/apt/apt.conf.d/99network-retries; \
     if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then \
       sed -i \
-        -e 's|http://archive.ubuntu.com/ubuntu|https://mirrors.kernel.org/ubuntu|g' \
-        -e 's|http://security.ubuntu.com/ubuntu|https://mirrors.kernel.org/ubuntu|g' \
+        -e 's|^URIs: http://archive.ubuntu.com/ubuntu/\?$|URIs: https://mirrors.kernel.org/ubuntu http://archive.ubuntu.com/ubuntu|' \
+        -e 's|^URIs: http://security.ubuntu.com/ubuntu/\?$|URIs: https://mirrors.kernel.org/ubuntu http://security.ubuntu.com/ubuntu|' \
         /etc/apt/sources.list.d/ubuntu.sources; \
     fi; \
     if [ -f /etc/apt/sources.list ]; then \
