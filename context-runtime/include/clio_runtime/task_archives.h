@@ -423,6 +423,10 @@ private:
     }
   }
 
+  /** Copy a received bulk into an owned buffer of the task's declared
+   *  size, never reading more than the message carried. */
+  ctp::ipc::FullPtr<char> CopyInBulk(const ctp::lbm::Bulk &bulk, size_t size);
+
 public:
   void bulk(ctp::ipc::ShmPtr<> &ptr, size_t size, uint32_t flags);
 

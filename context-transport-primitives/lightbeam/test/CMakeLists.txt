@@ -109,6 +109,22 @@ if(CLIO_CORE_ENABLE_ZMQ)
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 
+    # RecvBulks rejects a bulk frame whose length differs from its declared
+    # size (copy and zero-copy branches) and stays on a message boundary.
+    # Binds an ephemeral port, so it needs no port lock.
+    add_executable(zmq_bulk_size_mismatch_test zmq_bulk_size_mismatch_test.cc)
+    target_link_libraries(zmq_bulk_size_mismatch_test clio_ctp_host ctp::lightbeam ctp::serialize)
+    target_compile_definitions(zmq_bulk_size_mismatch_test PRIVATE CTP_ENABLE_ZMQ)
+    add_test(NAME ctp_zmq_bulk_size_mismatch COMMAND zmq_bulk_size_mismatch_test)
+    set_tests_properties(ctp_zmq_bulk_size_mismatch PROPERTIES
+        LABELS "msan_skip"
+        TIMEOUT 120
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}")
+    install(TARGETS zmq_bulk_size_mismatch_test
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+
     # Isolated reproduction of the runtime's concurrent ZMQ topology:
     # 4 client senders, 1 client receiver, 1 server receiver, 1 server sender,
     # the two receivers on separate ports. Driven per-scenario via argv.

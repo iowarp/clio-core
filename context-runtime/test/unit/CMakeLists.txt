@@ -55,6 +55,12 @@ set(TASK_STAT_MODEL_TEST_SOURCES
   test_task_stat_model.cc
 )
 
+# LoadTaskArchive::bulk size bounds
+set(TASK_ARCHIVE_BULK_TEST_TARGET clio_run_task_archive_bulk_tests)
+set(TASK_ARCHIVE_BULK_TEST_SOURCES
+  test_task_archive_bulk.cc
+)
+
 # Web dashboard test executable (issue #990). Needs Poco: the dashboard's HTTP
 # transport is Poco::Net, and the test drives it with Poco's HTTP client.
 set(VIZ_TEST_TARGET clio_run_viz_tests)
@@ -309,6 +315,28 @@ set_target_properties(${TASK_STAT_MODEL_TEST_TARGET} PROPERTIES
 )
 
 set_target_properties(${TASK_STAT_MODEL_TEST_TARGET} PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
+# Create LoadTaskArchive bulk bounds test executable
+add_executable(${TASK_ARCHIVE_BULK_TEST_TARGET} ${TASK_ARCHIVE_BULK_TEST_SOURCES})
+
+target_include_directories(${TASK_ARCHIVE_BULK_TEST_TARGET} PRIVATE
+  ${CLIO_RUN_ROOT}/include
+  ${CLIO_RUN_ROOT}/test  # For simple_test.h
+  ${CLIO_RUN_ROOT}/modules/admin/include
+)
+
+target_link_libraries(${TASK_ARCHIVE_BULK_TEST_TARGET}
+  clio_admin_runtime
+  clio_admin_client
+  ctp::cxx
+  ${CMAKE_THREAD_LIBS_INIT}
+)
+
+set_target_properties(${TASK_ARCHIVE_BULK_TEST_TARGET} PROPERTIES
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
@@ -1011,6 +1039,18 @@ if(CLIO_CORE_ENABLE_TESTS)
     TIMEOUT 300
   )
 
+  # LoadTaskArchive::bulk size bounds. Own process: in-process runtime.
+  add_test(
+    NAME cr_task_archive_bulk_tests
+    COMMAND ${TASK_ARCHIVE_BULK_TEST_TARGET}
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_task_archive_bulk_tests PROPERTIES
+    ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;CLIO_TEST_MODE=1;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
+    TIMEOUT 300
+    RESOURCE_LOCK "clio_runtime_port"
+  )
+
   # ChiMod ABI-fingerprint check: no runtime, just ModuleManager::LoadChiMod
   # on the stand-in libraries.
   add_test(
@@ -1683,6 +1723,7 @@ set(_install_test_targets
   ${SAVE_LOAD_TASK_TEST_TARGET}
   ${LOCAL_TASK_ARCHIVE_TEST_TARGET}
   ${TASK_STAT_MODEL_TEST_TARGET}
+  ${TASK_ARCHIVE_BULK_TEST_TARGET}
   ${STREAMING_TEST_TARGET}
   ${RUNTIME_CLEANUP_TEST_TARGET}
   ${IPC_ERRORS_TEST_TARGET}
