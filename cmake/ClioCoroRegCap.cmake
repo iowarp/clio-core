@@ -120,10 +120,13 @@ function(clio_coro_regcap tgt)
   set(_probe_dir ${CMAKE_CURRENT_BINARY_DIR}/${tgt}_regprobe)
   file(MAKE_DIRECTORY ${_probe_dir})
   set(_probe_srcs "")
+  set(_src_dirs "")
   foreach(_s IN LISTS _srcs)
     if(NOT IS_ABSOLUTE "${_s}")
       set(_s "${CMAKE_CURRENT_SOURCE_DIR}/${_s}")
     endif()
+    get_filename_component(_src_dir "${_s}" DIRECTORY)
+    list(APPEND _src_dirs "${_src_dir}")
     get_filename_component(_base "${_s}" NAME)
     set(_copy "${_probe_dir}/${_base}")
     add_custom_command(OUTPUT "${_copy}"
@@ -150,6 +153,11 @@ function(clio_coro_regcap tgt)
   # The original source dir, so quoted includes next to the source still resolve
   # from the staged copy.
   target_include_directories(${tgt}_regprobe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  # The copies sit flat in ${_probe_dir}, so a quoted include relative to the
+  # original file (cuda/gnn_launch_cuda.cc's "../gnn_launch.h") no longer
+  # resolves from the file's own directory; search each original one too.
+  list(REMOVE_DUPLICATES _src_dirs)
+  target_include_directories(${tgt}_regprobe PRIVATE ${_src_dirs})
   if(_incs)
     target_include_directories(${tgt}_regprobe PRIVATE ${_incs})
   endif()
