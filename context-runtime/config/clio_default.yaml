@@ -826,7 +826,7 @@ compose:
     pool_query: local
     pool_id: "400.0"
     next_pool_id: "564.0"               # chain top (indexer) — see entry above
-    # Local paths CAE may read (file:: and hdf5:: sources) and write
+    # Local paths CAE may read (file::, hdf5:: and csv:: sources) and write
     # (ExportData). Clients choose these paths and the runtime does not
     # authenticate clients, so list the data directories here. Unset: any
     # path except credential and system locations (.ssh, .aws, .config,

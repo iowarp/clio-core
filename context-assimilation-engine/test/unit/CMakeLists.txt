@@ -388,6 +388,29 @@ if(HDF5_ENABLED)
 endif()
 
 #------------------------------------------------------------------------------
+# Test: CSV assimilation (always on; no optional dependencies)
+#------------------------------------------------------------------------------
+# cae_csv_table: RFC 4180 parsing, type inference and encoding, and the
+# shared dataset_filter matcher -- plain executable, no runtime.
+add_executable(cae_csv_table
+  ${CMAKE_CURRENT_SOURCE_DIR}/csv_assim/test_csv_table.cc
+  ${CMAKE_SOURCE_DIR}/context-assimilation-engine/core/src/factory/csv_table.cc
+)
+target_include_directories(cae_csv_table
+  PRIVATE ${CMAKE_SOURCE_DIR}/context-assimilation-engine/core/include
+)
+install(TARGETS cae_csv_table DESTINATION bin)
+add_test(NAME cae_csv_table COMMAND cae_csv_table)
+set_tests_properties(cae_csv_table PROPERTIES LABELS "format;cae;csv" TIMEOUT 60)
+
+# cae_csv_assim: csv:: transfers with dataset_filters through ParseOmni on an
+# in-process runtime, each selected column verified byte-for-byte in CTE.
+add_cae_unit_test(cae_csv_assim
+  ${CMAKE_CURRENT_SOURCE_DIR}/csv_assim/test_csv_assim.cc
+)
+set_tests_properties(cae_csv_assim PROPERTIES LABELS "format;cae;csv;msan_skip")
+
+#------------------------------------------------------------------------------
 # Test: Cloud Assimilator Factory Guard (always on)
 #------------------------------------------------------------------------------
 # Exercises AssimilatorFactory protocol dispatch for s3://, gs://, gcs:// — the
@@ -416,7 +439,7 @@ endif()
 set_tests_properties(cae_cloud_factory_guard PROPERTIES LABELS "cloud;cae;factory;msan_skip")
 
 #------------------------------------------------------------------------------
-# Local path policy (path_policy.h): which paths file::/hdf5:: sources may read
+# Local path policy (path_policy.h): which paths file::/hdf5::/csv:: sources may read
 # and ExportData may write. No runtime; scratch files under the temp directory.
 #------------------------------------------------------------------------------
 add_cae_unit_test(cae_path_policy

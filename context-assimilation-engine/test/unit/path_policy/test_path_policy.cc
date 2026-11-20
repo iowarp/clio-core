@@ -33,7 +33,7 @@
 
 /**
  * test_path_policy.cc - CAE's local path policy (path_policy.h): which paths
- * file::/hdf5:: sources may read and ExportData may write. No runtime: each
+ * file::/hdf5::/csv:: sources may read and ExportData may write. No runtime: each
  * case builds a PathPolicy directly, in a scratch directory under the system
  * temp directory.
  */

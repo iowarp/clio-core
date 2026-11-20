@@ -40,7 +40,7 @@
 namespace clio::cae::core {
 
 /**
- * Which local paths CAE may read (file:: and hdf5:: sources) and write
+ * Which local paths CAE may read (file::, hdf5:: and csv:: sources) and write
  * (ExportData output).
  *
  * CAE opens these as the runtime user, at paths taken from the client's task.

@@ -44,7 +44,7 @@
  *
  * The script runs in the clio_cae client, before any transfer is submitted, as
  * the user who runs clio_cae. It never runs inside the runtime daemon. Its first
- * argument is the local path for file:: and hdf5:: sources and the source URL
+ * argument is the local path for file::, hdf5:: and csv:: sources and the source URL
  * otherwise. When it exits 0 and run_out exists, the transfer ingests run_out
  * instead of the original source. Any failure stops the whole ingest.
  */
@@ -68,14 +68,14 @@ struct RunStep {
 };
 
 /**
- * The argument a run script receives for a source URL: the path for file::
- * and hdf5:: URLs, the URL unchanged for every other scheme.
+ * The argument a run script receives for a source URL: the path for file::,
+ * hdf5:: and csv:: URLs, the URL unchanged for every other scheme.
  */
 std::string RunSourceArg(const std::string& src);
 
 /**
  * The source URL that ingests a run step's output: hdf5:: for formats that
- * start with "hdf5" (hdf5, hdf5_vol), file:: otherwise.
+ * start with "hdf5" (hdf5, hdf5_vol), csv:: for format csv, file:: otherwise.
  */
 std::string RunOutputSrc(const std::string& format, const std::string& out);
 

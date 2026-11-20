@@ -340,16 +340,18 @@ TEST_CASE("RunSourceArg - local schemes give the path, others the URL",
           "[cae][omni][run]") {
   REQUIRE(RunSourceArg("file::/data/a.csv") == "/data/a.csv");
   REQUIRE(RunSourceArg("hdf5::/data/a.h5") == "/data/a.h5");
+  REQUIRE(RunSourceArg("csv::/data/a.csv") == "/data/a.csv");
   REQUIRE(RunSourceArg("s3://bucket/key") == "s3://bucket/key");
   REQUIRE(RunSourceArg("https://host/x.zip") == "https://host/x.zip");
   REQUIRE(RunSourceArg("/bare/path") == "/bare/path");
 }
 
-TEST_CASE("RunOutputSrc - hdf5 formats get hdf5::, the rest file::",
+TEST_CASE("RunOutputSrc - hdf5 formats get hdf5::, csv csv::, the rest file::",
           "[cae][omni][run]") {
   REQUIRE(RunOutputSrc("binary", "/o/x.parquet") == "file::/o/x.parquet");
   REQUIRE(RunOutputSrc("hdf5", "/o/x.h5") == "hdf5::/o/x.h5");
   REQUIRE(RunOutputSrc("hdf5_vol", "/o/x.h5") == "hdf5::/o/x.h5");
+  REQUIRE(RunOutputSrc("csv", "/o/x.csv") == "csv::/o/x.csv");
 }
 
 #ifndef _WIN32  // POSIX paths and setenv
