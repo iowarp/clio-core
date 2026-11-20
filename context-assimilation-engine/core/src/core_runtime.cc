@@ -34,6 +34,7 @@
 #include <clio_cae/core/core_runtime.h>
 #include <clio_cae/core/factory/assimilation_ctx.h>
 #include <clio_cae/core/factory/assimilator_factory.h>
+#include <clio_cae/core/factory/path_policy.h>
 #ifdef CLIO_CAE_ENABLE_HDF5
 #include <hdf5.h>
 #include <clio_cae/core/factory/hdf5_file_assimilator.h>
@@ -911,6 +912,21 @@ clio::run::TaskResume Runtime::ExportData(clio::run::shared_ptr<ExportDataTask> 
 
   HLOG(kInfo, "ExportData: tag='{}', output='{}', format='{}'",
        tag_name, output_path, format);
+
+  // The output path and the bytes written there both come from the client.
+  // Check the path against the runtime's path policy before creating it.
+  {
+    std::string reason;
+    if (!PathPolicy::Get().Allows(output_path, /*write=*/true, reason)) {
+      HLOG(kError, "ExportData: refusing output '{}': {}", output_path,
+           reason);
+      task->result_code_ = -1;
+      const std::string message = "Output path refused: " + reason;
+      task->error_message_ =
+          clio::run::priv::string(message.c_str(), CTP_MALLOC);
+      CLIO_CO_RETURN;
+    }
+  }
 
   // Step 1: resolve the tag ID
   auto tag_future = cte_client_->AsyncGetOrCreateTag(tag_name);

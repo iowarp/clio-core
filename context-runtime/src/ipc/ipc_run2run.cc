@@ -1968,6 +1968,12 @@ void IpcManagerRun2Run::StartRecvThreads() {
         const unsigned long long ev_r0 = clio::run::evlat::Now();
         auto info = lbm_transport->Recv(archive);
         int rc = info.rc;
+        if (rc == EPROTO) {
+          // The transport dropped a malformed message whole (a bulk frame
+          // that did not match its declared size). Keep draining the rest.
+          HLOG(kError, "[PeerRecvThread] dropped a malformed peer message");
+          continue;
+        }
         if (rc != 0) {
           // EAGAIN (nothing left) or a peer-closed/transient error ends the
           // drain. rc == -1 is the routine peer-closed case (SocketTransport

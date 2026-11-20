@@ -44,7 +44,7 @@
  *
  * The script runs in the clio_cae client, before any transfer is submitted, as
  * the user who runs clio_cae. It never runs inside the runtime daemon. Its first
- * argument is the local path for file:: and hdf5:: sources and the source URL
+ * argument is the local path for file::, hdf5:: and csv:: sources and the source URL
  * otherwise. When it exits 0 and run_out exists, the transfer ingests run_out
  * instead of the original source. Any failure stops the whole ingest.
  */

@@ -439,6 +439,16 @@ endif()
 set_tests_properties(cae_cloud_factory_guard PROPERTIES LABELS "cloud;cae;factory;msan_skip")
 
 #------------------------------------------------------------------------------
+# Local path policy (path_policy.h): which paths file::/hdf5::/csv:: sources may read
+# and ExportData may write. No runtime; scratch files under the temp directory.
+#------------------------------------------------------------------------------
+add_cae_unit_test(cae_path_policy
+  ${CMAKE_CURRENT_SOURCE_DIR}/path_policy/test_path_policy.cc
+  EXTRA_LIBS clio_cae_core_runtime
+)
+set_tests_properties(cae_path_policy PROPERTIES LABELS "cae;unit")
+
+#------------------------------------------------------------------------------
 # http(s) sources: config-file rules (http_auth.h) and the offline parts of the
 # download engine (http_fetch.cc). No runtime, no network.
 #------------------------------------------------------------------------------

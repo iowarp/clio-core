@@ -18,7 +18,9 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
 #include <string>
+#include <thread>
 #include <vector>
 
 using ctp::SystemInfo;
@@ -336,4 +338,50 @@ TEST_CASE("SystemInfoShmLargerThan4GiB") {
   REQUIRE(SystemInfo::CreateNewSharedMemory(fd3, name, kPage));
   SystemInfo::CloseSharedMemory(fd3);
   SystemInfo::DestroySharedMemory(name);
+}
+
+/**
+ * Write 1 MiB blocks across a fresh region while another thread runs
+ * TouchPages over it, as a RAM bdev populates the rest of a unit while
+ * workers already write blocks inside it.
+ * @param bytes region size
+ * @return bytes that do not hold what was written (lost to the touch)
+ */
+static size_t LostBytesUnderTouch(size_t bytes) {
+  char *base = static_cast<char *>(SystemInfo::MapPrivateMemory(bytes));
+  REQUIRE(base != nullptr);
+  std::atomic<bool> go{false};
+  std::thread toucher([&] {
+    while (!go.load()) {
+    }
+    SystemInfo::TouchPages(base, bytes);
+  });
+  go.store(true);
+  constexpr size_t kBlock = 1u << 20;
+  for (size_t off = 0; off < bytes; off += kBlock) {
+    std::memset(base + off, 0x5a, kBlock);
+  }
+  toucher.join();
+  size_t lost = 0;
+  for (size_t i = 0; i < bytes; ++i) {
+    lost += base[i] != 0x5a;
+  }
+  SystemInfo::UnmapMemory(base, bytes);
+  return lost;
+}
+
+TEST_CASE("SystemInfoTouchPagesKeepsConcurrentWrites") {
+  // A plain `p[i] = p[i]` touch lost ~2000 bytes per 64 MiB round here
+  // (the write lands between its load and store); the atomic touch none.
+  size_t lost = 0;
+  for (int round = 0; round < 8; ++round) {
+    lost += LostBytesUnderTouch(size_t(64) << 20);
+  }
+  INFO("bytes lost to a concurrent TouchPages: " << lost);
+  REQUIRE(lost == 0);
+  // BulkFault keeps contents too (it may take the same touch path).
+  std::vector<char> v(size_t(1) << 20, 'q');
+  REQUIRE(SystemInfo::BulkFault(v.data(), v.size()));
+  REQUIRE(v[0] == 'q');
+  REQUIRE(v[v.size() - 1] == 'q');
 }

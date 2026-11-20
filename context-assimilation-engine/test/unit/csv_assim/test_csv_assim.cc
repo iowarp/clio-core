@@ -293,10 +293,20 @@ int main(int, char**) {
   rc = Parse({Ctx(bad, "csv_bad", {}, {})});
   HLOG(kInfo, "malformed CSV -> rc={} (want -5)", rc);
   failures += rc == -5 ? 0 : 1;
+  // A valid CSV under a credential directory: the path policy refuses csv::
+  // sources like file:: and hdf5:: ones, so no assimilator is created (-2).
+  const auto denied_dir = tmp / "cae_csv_policy" / ".ssh";
+  std::filesystem::create_directories(denied_dir);
+  const std::string denied = (denied_dir / "data.csv").generic_string();
+  std::ofstream(denied, std::ios::binary) << "a,b\n1,2\n";
+  rc = Parse({Ctx(denied, "csv_denied", {}, {})});
+  HLOG(kInfo, "csv:: under .ssh -> rc={} (want -2)", rc);
+  failures += rc == -2 ? 0 : 1;
 
   std::error_code ec;
   std::filesystem::remove(file, ec);
   std::filesystem::remove(bad, ec);
+  std::filesystem::remove_all(tmp / "cae_csv_policy", ec);
   if (failures == 0) {
     HLOG(kSuccess, "CSV ASSIMILATION ROUND TRIP PASSED");
     return 0;

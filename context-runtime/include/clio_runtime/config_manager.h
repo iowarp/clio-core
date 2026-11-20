@@ -459,7 +459,20 @@ class ConfigManager : public ctp::BaseConfig {
   void SetVizPort(u32 port) { viz_port_ = port; }
 
   /** Override the dashboard bind address (CLI `--viz-bind`). */
-  void SetVizBindAddr(const std::string &addr) { viz_bind_addr_ = addr; }
+  void SetVizBindAddr(const std::string &addr) {
+    viz_bind_addr_ = configured_viz_bind_addr_ = addr;
+  }
+
+  /** @return the bind address the runtime's own configuration chose (YAML,
+   *  environment or the daemon's `--viz-bind`), as opposed to one a
+   *  `viz_start` query picked for this run. */
+  std::string GetConfiguredVizBindAddr() const {
+    return configured_viz_bind_addr_;
+  }
+
+  /** Bind the dashboard to `addr` for this run only (a `viz_start` query),
+   *  leaving the configured address as it was. */
+  void UseVizBindAddr(const std::string &addr) { viz_bind_addr_ = addr; }
 
  private:
   /**
@@ -609,6 +622,7 @@ class ConfigManager : public ctp::BaseConfig {
   bool viz_enabled_explicit_ = false;
   u32 viz_port_ = 8080;
   std::string viz_bind_addr_ = "127.0.0.1";
+  std::string configured_viz_bind_addr_ = "127.0.0.1";
   u32 viz_max_threads_ = 16;
 
   // Compose configuration
