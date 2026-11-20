@@ -57,8 +57,8 @@ jobs:
           - name: cuda
             toolchain: cuda
             spec: >-
-              +cuda cuda_arch=89 +gpu_vector +gds +elf +clio_ml ^cuda@12.9
-              ~test ~benchmark
+              +cuda cuda_arch=89 +gpu_vector +gds +elf +clio_ml
+              ~test ~benchmark ^cuda@12.9
             expect: >-
               include/clio_cte/gpu_vector/gpu_vector.h
               include/clio_cte/gpu_vector/device_vector.h
