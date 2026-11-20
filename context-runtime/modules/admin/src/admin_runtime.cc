@@ -322,6 +322,25 @@ clio::run::TaskResume Runtime::Destroy(clio::run::shared_ptr<DestroyTask> &task)
   CLIO_TASK_BODY_END
 }
 
+/**
+ * Successor a pool leaves behind when it is unplugged on this node: the local
+ * container's GetUnplugSuccessor, or the static container's when this node
+ * hosts no real container. Null means no redirect.
+ * @param pool_manager Pool manager (already checked non-null by the caller)
+ * @param target_pool Pool being unplugged
+ * @return the successor pool id, or a null PoolId
+ */
+static clio::run::PoolId UnplugSuccessorOf(clio::run::PoolManager *pool_manager,
+                                           clio::run::PoolId target_pool) {
+  auto local = pool_manager->GetLocalContainer(target_pool).get();
+  if (local) {
+    return local->GetUnplugSuccessor();
+  }
+  auto static_container = pool_manager->GetStaticContainer(target_pool).get();
+  return static_container ? static_container->GetUnplugSuccessor()
+                          : clio::run::PoolId::GetNull();
+}
+
 clio::run::TaskResume Runtime::DestroyPool(clio::run::shared_ptr<DestroyPoolTask> &task) {
   CLIO_TASK_BODY_BEGIN
   HLOG(kDebug, "Admin: Executing DestroyPool task - Pool ID: {}",
@@ -342,11 +361,34 @@ clio::run::TaskResume Runtime::DestroyPool(clio::run::shared_ptr<DestroyPoolTask
       CLIO_CO_RETURN;
     }
 
-    // Use PoolManager to destroy the complete pool including metadata
-    // DestroyPool is now a coroutine for consistency
-    const bool keep_restartable =
-        (task->destruction_flags_ & kDestroyPoolKeepRestartable) != 0;
-    CLIO_CO_AWAIT(pool_manager->DestroyPool(target_pool, keep_restartable));
+    const clio::run::u32 flags = task->destruction_flags_;
+    const bool keep_restartable = (flags & kDestroyPoolKeepRestartable) != 0;
+    const bool quiesce_only = (flags & kDestroyPoolQuiesceOnly) != 0;
+    // Phase one of a two-phase destroy also runs the module Destroy; the pool
+    // itself stays. Only this node's real container has state to flush.
+    const bool hosts_real = target_pool != clio::run::kAdminPoolId &&
+                            pool_manager->GetLocalContainer(target_pool).IsValid();
+    if (hosts_real) {
+      CLIO_CO_AWAIT(RunModuleDestroy(task));
+      if (task->return_code_ != 0) {
+        CLIO_CO_RETURN;  // module Destroy failed: the pool stays running
+      }
+    }
+    if (quiesce_only) {
+      task->return_code_ = 0;
+      CLIO_CO_RETURN;
+    }
+
+    // Read the successor before the container is dropped by DestroyPool.
+    clio::run::PoolId successor = UnplugSuccessorOf(pool_manager, target_pool);
+    CLIO_CO_AWAIT(pool_manager->DestroyPool(target_pool, keep_restartable, successor));
+
+    if (hosts_real) {
+      unplugs_++;
+    }
+    if (!successor.IsNull() && !pool_manager->HasPool(target_pool)) {
+      redirects_installed_++;
+    }
 
     // Set success results
     task->return_code_ = 0;
@@ -363,6 +405,51 @@ clio::run::TaskResume Runtime::DestroyPool(clio::run::shared_ptr<DestroyPoolTask
         std::string("Exception during pool destruction: ") + e.what();
     task->error_message_ = clio::run::priv::string(CTP_MALLOC, error_msg);
     HLOG(kError, "Admin: Pool destruction failed with exception: {}", e.what());
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::RunModuleDestroy(
+    clio::run::shared_ptr<DestroyPoolTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  const clio::run::PoolId target_pool = task->target_pool_id_;
+  const clio::run::u32 flags = task->destruction_flags_;
+
+  // Sub-task to the pool's own kDestroy method, routed Local so it runs on
+  // this node's container. The same flags reach the module unchanged.
+  auto *ipc_manager = CLIO_IPC;
+  auto sub_task = ipc_manager->NewTask<DestroyPoolTask>(
+      clio::run::CreateTaskId(), target_pool, clio::run::PoolQuery::Local(),
+      target_pool, flags);
+  sub_task->method_ = Method::kDestroy;
+  clio::run::Future<DestroyPoolTask> sub_future = ipc_manager->Send(sub_task);
+  CLIO_CO_AWAIT(sub_future);
+
+  const clio::run::u32 rc = sub_future->GetReturnCode();
+  const clio::run::u64 blobs = sub_future->blobs_flushed_;
+  const clio::run::u64 bytes = sub_future->bytes_flushed_;
+  task->blobs_flushed_ += blobs;
+  task->bytes_flushed_ += bytes;
+  unplug_blobs_flushed_ += blobs;
+  unplug_bytes_flushed_ += bytes;
+  HLOG(kInfo, "Admin: pool {} module Destroy flushed {} blobs, {} bytes (rc={})",
+       target_pool, blobs, bytes, rc);
+
+  if (rc != 0) {
+    unplug_flush_failures_++;
+    if ((flags & kDestroyPoolNoFlush) != 0) {
+      // --force: the caller asked to discard unflushed data, so go on.
+      HLOG(kWarning, "Admin: pool {} module Destroy failed rc={}; forced past",
+           target_pool, rc);
+      CLIO_CO_RETURN;
+    }
+    task->SetReturnCode(rc);
+    std::string msg = "pool " + target_pool.ToString() +
+                      ": module Destroy failed rc=" + std::to_string(rc) +
+                      "; pool left running";
+    task->error_message_ = clio::run::priv::string(CTP_MALLOC, msg);
+    HLOG(kError, "Admin: {}", msg);
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -818,6 +905,10 @@ clio::run::TaskResume Runtime::Monitor(clio::run::shared_ptr<MonitorTask> &task)
     MonitorContainerStats(task);
   } else if (task->query_ == "get_host_info") {
     MonitorGetHostInfo(task);
+  } else if (task->query_ == "stats") {
+    MonitorStats(task);
+  } else if (task->query_.rfind("pool_id_of://", 0) == 0) {
+    MonitorPoolIdOf(task);
   } else if (task->query_.rfind("viz_", 0) == 0) {
     MonitorViz(task);
   } else {
@@ -1078,6 +1169,40 @@ clio::run::TaskResume Runtime::MonitorPoolStats(clio::run::shared_ptr<MonitorTas
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
+}
+
+void Runtime::MonitorStats(clio::run::shared_ptr<MonitorTask> &task) {
+  msgpack::sbuffer sbuf;
+  msgpack::packer<msgpack::sbuffer> pk(sbuf);
+  pk.pack_map(6);
+  pk.pack("pools_destroyed");
+  pk.pack(static_cast<clio::run::u64>(pools_destroyed_));
+  pk.pack("unplugs");
+  pk.pack(unplugs_.load());
+  pk.pack("unplug_blobs_flushed");
+  pk.pack(unplug_blobs_flushed_.load());
+  pk.pack("unplug_bytes_flushed");
+  pk.pack(unplug_bytes_flushed_.load());
+  pk.pack("unplug_flush_failures");
+  pk.pack(unplug_flush_failures_.load());
+  pk.pack("redirects_installed");
+  pk.pack(redirects_installed_.load());
+  task->results_[container_id_] = std::string(sbuf.data(), sbuf.size());
+  task->SetReturnCode(0);
+}
+
+void Runtime::MonitorPoolIdOf(clio::run::shared_ptr<MonitorTask> &task) {
+  const std::string kPrefix = "pool_id_of://";
+  const std::string pool_name = task->query_.substr(kPrefix.size());
+  auto *pool_manager = CLIO_POOL_MANAGER;
+  clio::run::PoolId found = pool_manager->FindPoolByName(pool_name);
+  // Empty string (not an error) when no pool on this node has that name.
+  const std::string text = found.IsNull() ? std::string() : found.ToString();
+  msgpack::sbuffer sbuf;
+  msgpack::packer<msgpack::sbuffer> pk(sbuf);
+  pk.pack(text);
+  task->results_[container_id_] = std::string(sbuf.data(), sbuf.size());
+  task->SetReturnCode(0);
 }
 
 void Runtime::MonitorSystemStats(clio::run::shared_ptr<MonitorTask> &task) {

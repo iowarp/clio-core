@@ -653,6 +653,19 @@ class Container {
   virtual PoolId GetNextPool() const { return PoolId::GetNull(); }
 
   /**
+   * The pool that takes this pool's traffic once it is unplugged (stopped or
+   * removed). When non-null, destroying this pool leaves a redirect behind:
+   * tasks still addressed to it -- from pools stacked above it that were
+   * never reconfigured -- are routed to the successor instead of failing.
+   * Opt-in, unlike GetNextPool: only a module whose next pool speaks its
+   * full interface and holds a superset of its data may name one (a cache
+   * over its backing store; not a compressor, whose next pool holds
+   * transformed bytes).
+   * @return the successor pool, or a null PoolId for no redirect
+   */
+  virtual PoolId GetUnplugSuccessor() const { return PoolId::GetNull(); }
+
+  /**
    * Fill the OUT fields of a create task that found this pool already
    * existing. Get-or-create on an existing pool never runs the module's
    * Create, so without this hook a later caller would receive only the

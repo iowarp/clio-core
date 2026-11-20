@@ -44,6 +44,7 @@
 #include <clio_ctp/memory/allocator/malloc_allocator.h>
 #include <clio_ctp/introspect/system_info.h>
 
+#include <atomic>
 #include <mutex>
 #include <random>
 #include <unordered_set>
@@ -82,6 +83,13 @@ private:
   clio::run::u32 create_count_ = 0;
   clio::run::u32 pools_created_ = 0;
   clio::run::u32 pools_destroyed_ = 0;
+  // Unplug counters, reported by Monitor query "stats". Atomic: the module
+  // Destroy path and the Monitor path may run on different workers.
+  std::atomic<clio::run::u64> unplugs_{0};              /**< module Destroys that removed a pool */
+  std::atomic<clio::run::u64> unplug_blobs_flushed_{0}; /**< blobs made durable by module Destroy */
+  std::atomic<clio::run::u64> unplug_bytes_flushed_{0}; /**< bytes made durable by module Destroy */
+  std::atomic<clio::run::u64> unplug_flush_failures_{0};/**< module Destroy calls that returned nonzero */
+  std::atomic<clio::run::u64> redirects_installed_{0};  /**< unplugs that left a redirect to a successor */
 
   // Runtime state
   bool is_shutdown_requested_ = false;
@@ -167,6 +175,21 @@ public:
    * This is a coroutine that can co_await pool destruction
    */
   clio::run::TaskResume DestroyPool(clio::run::shared_ptr<DestroyPoolTask> &task);
+
+  /**
+   * Run the target pool's module Destroy (kDestroy) on this node and fold its
+   * result into the admin task. A nonzero rc aborts the unplug (task rc set,
+   * pool left running) unless kDestroyPoolNoFlush is set.
+   * @param task Admin DestroyPool task; OUT counters are accumulated into it
+   * @return TaskResume coroutine handle
+   */
+  clio::run::TaskResume RunModuleDestroy(clio::run::shared_ptr<DestroyPoolTask> &task);
+
+  /** Monitor "stats": pack the admin unplug counters as a msgpack map. */
+  void MonitorStats(clio::run::shared_ptr<MonitorTask> &task);
+
+  /** Monitor "pool_id_of://<name>": msgpack string of the pool id, "" if none. */
+  void MonitorPoolIdOf(clio::run::shared_ptr<MonitorTask> &task);
 
   /**
    * Handle StopRuntime task - Stop the entire runtime
