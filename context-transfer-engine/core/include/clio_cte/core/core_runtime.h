@@ -1653,6 +1653,9 @@ private:
   /** fsync, close and drop every WAL shard (teardown). */
   void SyncAndCloseLogs();
 
+  /** fsync every WAL shard, leaving them open (a per-pool destroy). */
+  void SyncLogs();
+
   /** RuntimeManager stop-hook id (0 = none registered). */
   clio::run::u64 stop_hook_id_ = 0;
   /** Set first thing by the stop hook (#1137): the organizer starts no new

@@ -171,8 +171,31 @@ class CacheBase : public clio::cte::core::DualTargetInterposer {
   clio::run::PoolQuery ScheduleTask(
       const clio::run::shared_ptr<clio::run::Task> &task) override;
 
+  /**
+   * Module Destroy (kDestroy), honoring the admin destroy flags:
+   * write-back: stop buffering (draining_), wait for buffered puts, flush
+   * every dirty copy to persistent (unless NoFlush, which discards them),
+   * then on a final destroy drop the stop hook and, with DeleteData, every
+   * volatile copy. QuiesceOnly keeps the pool and its hook. Idempotent: a
+   * second call finds nothing dirty. A nonzero return keeps the pool running.
+   * @param task the destroy task (flags in, flush counts and error out)
+   * @return the coroutine resume handle
+   */
   clio::run::TaskResume Destroy(
       clio::run::shared_ptr<clio::run::admin::DestroyTask> &task);
+  /**
+   * Where tasks addressed to this pool go once it is removed: the persistent
+   * chain (the write-back or write-through cache's data lives there).
+   * @return the persistent chain's pool, or a null id without one
+   */
+  clio::run::PoolId GetUnplugSuccessor() const override {
+    return HasPersistent() ? CorePoolId() : clio::run::PoolId::GetNull();
+  }
+  /**
+   * Monitor queries: "stats" answers a msgpack map of the policy, draining
+   * state, dirty and cached totals and every counter (see PackStats);
+   * "dirty_count" answers the number of dirty blobs as msgpack.
+   */
   clio::run::TaskResume Monitor(
       clio::run::shared_ptr<clio::run::admin::MonitorTask> &task);
   clio::run::TaskResume PutBlob(
@@ -227,6 +250,51 @@ class CacheBase : public clio::cte::core::DualTargetInterposer {
     clio::run::u64 size_ = 0;      ///< logical size of the copy
     std::vector<Extent> dirty_;    ///< ranges newer than persistent
     clio::run::u64 last_ns_ = 0;   ///< LRU
+  };
+
+  /**
+   * One write-back put's claim on buffering (buffering_), taken before the
+   * put decides where its bytes go. Constructing it counts the put as
+   * buffering and then reads draining_ (both seq_cst, a Dekker pair with
+   * BeginDrain). A put that finds the cache draining gives its count back
+   * at once and takes the ordered path; a put that keeps the claim releases
+   * it when it is destroyed, so every CLIO_CO_RETURN gives it back.
+   */
+  class BufferSlot {
+   public:
+    /**
+     * @param buffering the cache's count of buffering puts
+     * @param draining the cache's draining flag
+     * @param write_back false for write-through: never admitted
+     */
+    BufferSlot(std::atomic<clio::run::u64> *buffering,
+               const std::atomic<bool> *draining, bool write_back)
+        : buffering_(buffering) {
+      if (!write_back) return;
+      buffering_->fetch_add(1, std::memory_order_seq_cst);
+      if (draining->load(std::memory_order_seq_cst)) {
+        buffering_->fetch_sub(1, std::memory_order_seq_cst);
+        return;
+      }
+      held_ = true;
+    }
+    ~BufferSlot() {
+      if (held_) buffering_->fetch_sub(1, std::memory_order_seq_cst);
+    }
+    BufferSlot(const BufferSlot &) = delete;
+    BufferSlot &operator=(const BufferSlot &) = delete;
+    /** @return true when the put may buffer its bytes in volatile */
+    bool Admitted() const { return held_; }
+
+   private:
+    std::atomic<clio::run::u64> *buffering_;
+    bool held_ = false;
+  };
+
+  /** Totals of one flush: the blobs and bytes it made durable. */
+  struct FlushStats {
+    clio::run::u64 blobs_ = 0;
+    clio::run::u64 bytes_ = 0;
   };
 
   static std::string Key(const TagId &tag, const std::string &name);
@@ -359,6 +427,8 @@ class CacheBase : public clio::cte::core::DualTargetInterposer {
     clio::run::u32 rc_ = 0;   ///< first failure among its ranges
     bool foreign_ = false;    ///< another node owns it: drop once landed
     clio::run::u32 owner_ = 0;  ///< its owner
+    clio::run::u64 bytes_ = 0;  ///< bytes of the dirty ranges it queued
+    bool flushed_ = false;      ///< every range landed: the blob is durable
   };
   /** Ranges of several blobs landing together on one owner (FlushAway). */
   struct LandBatch {
@@ -426,8 +496,60 @@ class CacheBase : public clio::cte::core::DualTargetInterposer {
    * @param tag the tag (ignored with all_tags)
    * @param all_tags flush every tag
    * @param rc set to the first failure, else 0
+   * @param stats when not null: the blobs and bytes this call made durable
+   *        (added to, not reset)
    */
-  clio::run::TaskResume FlushAll(TagId tag, bool all_tags, clio::run::u32 *rc);
+  clio::run::TaskResume FlushAll(TagId tag, bool all_tags, clio::run::u32 *rc,
+                                 FlushStats *stats = nullptr);
+  /**
+   * Add the blobs of a flush that landed (FlushKey::flushed_) to the stats
+   * and to the cache's counters.
+   * @param keys the flush's blobs
+   * @param stats the flush's totals, or null
+   */
+  void TallyFlush(const std::vector<FlushKey> &keys, FlushStats *stats);
+  /**
+   * Join the shared "flushall" round (every dirty copy of this container):
+   * the periodic flush, fill-level flushes, stop flushes and Destroy share it.
+   * @param rc set to the round's result
+   * @param stats set to the round's flushed blobs and bytes
+   */
+  clio::run::TaskResume FlushEverythingShared(clio::run::u32 *rc,
+                                              FlushStats *stats);
+  /**
+   * Flush everything dirty here until nothing is left, bounded in rounds, for
+   * a write-back Destroy (BeginDrain must have run). With no_flush only the
+   * dirty copies are counted as discarded.
+   * @param no_flush skip the flush and discard the dirty copies
+   * @param rc set to the failure (kSyncIoRc when dirty data remains), else 0
+   * @param stats the blobs and bytes this destroy made durable (added to)
+   * @param error set to a description when the flush failed
+   */
+  clio::run::TaskResume UnplugFlush(bool no_flush, clio::run::u32 *rc,
+                                    FlushStats *stats, std::string *error);
+  /**
+   * Stop buffering new write-back puts and wait until none is in flight: the
+   * first step of a write-back Destroy (draining_ and buffering_, seq_cst).
+   */
+  clio::run::TaskResume BeginDrain();
+  /**
+   * Drop every volatile copy this container holds (kDestroyPoolDeleteData),
+   * each under its blob's lock, then clear the bookkeeping.
+   */
+  clio::run::TaskResume DropEveryCopy();
+  /** Remove this cache's stop hook (the pool is going away). */
+  void RemoveStopFlush();
+  /**
+   * Sum the dirty copies held here.
+   * @param blobs set to the number of copies with dirty ranges
+   * @param bytes set to the dirty bytes they hold
+   */
+  void DirtyTotals(clio::run::u64 *blobs, clio::run::u64 *bytes);
+  /**
+   * @return the "stats" Monitor answer: a msgpack map of the policy, the
+   *         draining state, dirty and cached totals and every counter
+   */
+  std::string PackStats();
   /**
    * Flush blobs through a window of ranges in flight (see FlushAll). Blobs
    * another container owns (FlushKey::foreign_) land on their owner; the
@@ -455,13 +577,16 @@ class CacheBase : public clio::cte::core::DualTargetInterposer {
    *        LeaveRound; false when a round that covers it has completed
    * @param rc when not leader: the result of the round that covered it
    * @param out when not leader and not null: that round's SyncTag outputs
+   * @param flushed when not leader and not null: that round's flush totals
    */
   clio::run::TaskResume JoinRound(std::string id, bool *leader,
-                                  clio::run::u32 *rc, SyncOut *out = nullptr);
+                                  clio::run::u32 *rc, SyncOut *out = nullptr,
+                                  FlushStats *flushed = nullptr);
   /** End the round the caller led, publishing its result (and, for a sync,
-   *  its SyncTag outputs) to the sharers. */
+   *  its SyncTag outputs; for a flush, its totals) to the sharers. */
   void LeaveRound(const std::string &id, clio::run::u32 rc,
-                  const SyncOut *out = nullptr);
+                  const SyncOut *out = nullptr,
+                  const FlushStats *flushed = nullptr);
   void RegisterStopFlush(const clio::run::PoolId &self_pool);
 
   /**
@@ -480,6 +605,67 @@ class CacheBase : public clio::cte::core::DualTargetInterposer {
   clio::run::TaskResume PutThrough(
       clio::run::shared_ptr<clio::cte::core::PutBlobTask> task,
       clio::run::u32 owner);
+  /**
+   * A put that persistent takes first, with the blob's lock held: a special
+   * put (persistent decides) or, on write-back, a put that may not buffer
+   * (draining). The buffered copy is flushed and dropped first so an older
+   * dirty range cannot overwrite these bytes later; a write-through put
+   * then refreshes the volatile copy.
+   * @param task the put
+   * @param key its blob's key
+   * @param special true for a special put (persistent decides)
+   * @param off first byte the put writes
+   * @param end one past the last byte the put writes
+   */
+  clio::run::TaskResume PutPersistentFirst(
+      clio::run::shared_ptr<clio::cte::core::PutBlobTask> task,
+      std::string key, bool special, clio::run::u64 off, clio::run::u64 end);
+  /**
+   * Write-back absorb of a put this container owns or may buffer, with the
+   * blob's lock held: makes the copy whole, puts the range into volatile and
+   * logs it dirty, or writes the put through when volatile cannot hold it.
+   * @param task the put (its return code set)
+   * @param key its blob's key
+   * @param owner the blob's owner
+   * @param off first byte the put writes
+   * @param end one past the last byte the put writes
+   */
+  clio::run::TaskResume AbsorbLocked(
+      clio::run::shared_ptr<clio::cte::core::PutBlobTask> task,
+      std::string key, clio::run::u32 owner, clio::run::u64 off,
+      clio::run::u64 end);
+  /**
+   * A batch whose records are not all owned here: each record is sent to its
+   * owner at once (fan-out), and the batch's counts are set.
+   * @param task the batch
+   * @param batch its attached view
+   */
+  clio::run::TaskResume MultiPutFanOut(
+      clio::run::shared_ptr<clio::cte::core::MultiPutBlobTask> task,
+      clio::cte::core::MultiPutBatchView &batch);
+  /**
+   * Write-back absorb of a batch's records one by one (the path after
+   * AbsorbBatchFast declined): each blob is locked, made whole, put into
+   * volatile and logged dirty, or written through when volatile cannot hold
+   * it. Sets the batch's num_ok_ and first_rc_.
+   * @param task the batch
+   * @param batch its attached view
+   */
+  clio::run::TaskResume MultiPutAbsorbRecords(
+      clio::run::shared_ptr<clio::cte::core::MultiPutBlobTask> task,
+      clio::cte::core::MultiPutBatchView &batch);
+  /**
+   * A batch the cache does not absorb (write-through, draining, or a range
+   * another node flushed here): every record's lock is held across the
+   * forward and the drop of its copies (see MultiPutBlob), and persistent
+   * takes the batch.
+   * @param task the batch
+   * @param batch its attached view (when attached)
+   * @param attached false when the batch could not be attached
+   */
+  clio::run::TaskResume MultiPutThrough(
+      clio::run::shared_ptr<clio::cte::core::MultiPutBlobTask> task,
+      clio::cte::core::MultiPutBatchView &batch, bool attached);
   /**
    * Write-back: land this container's buffered copy of a blob another
    * container owns (flush it to the owner) and drop it, so the owner serves
@@ -571,6 +757,23 @@ class CacheBase : public clio::cte::core::DualTargetInterposer {
   /** on_hit_count fill: misses per uncached key. */
   std::unordered_map<std::string, clio::run::u32> miss_counts_;
   clio::run::u64 stop_hook_id_ = 0;
+  /**
+   * Set by a write-back Destroy: no put buffers any more, every put takes the
+   * ordered write-through path. Stays set once the cache is removed (or after
+   * a quiesce, until the removal that follows it).
+   */
+  std::atomic<bool> draining_{false};
+  /** Write-back puts holding a BufferSlot (Destroy waits for zero). */
+  std::atomic<clio::run::u64> buffering_{0};
+  /** Counters for Monitor "stats" (see PackStats). */
+  std::atomic<clio::run::u64> flush_rounds_{0};       ///< FlushAll calls
+  std::atomic<clio::run::u64> blobs_flushed_{0};      ///< blobs made durable
+  std::atomic<clio::run::u64> bytes_flushed_{0};      ///< bytes made durable
+  std::atomic<clio::run::u64> flush_failures_{0};     ///< FlushAll failures
+  std::atomic<clio::run::u64> unplug_flushes_{0};     ///< Destroys that flushed
+  std::atomic<clio::run::u64> unplug_blobs_flushed_{0};  ///< by Destroy
+  std::atomic<clio::run::u64> unplug_bytes_flushed_{0};  ///< by Destroy
+  std::atomic<clio::run::u64> discarded_blobs_{0};    ///< dirty, NoFlush
   /** Smallest put volatile refused for lack of room (0: not known full). */
   std::atomic<clio::run::u64> full_size_{0};
   /** When full_size_ was last set (ns). */
@@ -599,6 +802,7 @@ class CacheBase : public clio::cte::core::DualTargetInterposer {
     clio::run::u32 rc_ = 0;       ///< result of the last completed round
     clio::run::u32 users_ = 0;    ///< callers inside JoinRound..LeaveRound
     SyncOut out_;                 ///< SyncTag outputs of that round
+    FlushStats flushed_;          ///< flush totals of that round
   };
   std::unordered_map<std::string, Round> rounds_;
 };
