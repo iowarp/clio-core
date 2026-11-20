@@ -184,7 +184,17 @@ jobs:
           case "${{ matrix.toolchain }}" in
             cuda)
               spack external find --not-buildable --path /usr/local/cuda-12.9 cuda
-              spack external find --not-buildable --path /usr/lib/llvm-22 llvm
+              # Register apt.llvm.org's clang by its own prefix: `external find`
+              # reports it under /usr, whose bin/ has only clang++-22.
+              llvm_ver=$(/usr/lib/llvm-22/bin/clang++ --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+              cat >> "$(spack location -r)/etc/spack/packages.yaml" <<EOF2
+          packages:
+            llvm:
+              buildable: false
+              externals:
+              - spec: llvm@${llvm_ver}+clang
+                prefix: /usr/lib/llvm-22
+          EOF2
               ;;
             rocm)
               spack external find --not-buildable --path /opt/rocm \

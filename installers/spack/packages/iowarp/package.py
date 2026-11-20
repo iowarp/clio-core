@@ -3,6 +3,9 @@
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
+import glob
+import os
+
 from spack.package import *
 
 
@@ -355,7 +358,7 @@ class Iowarp(CMakePackage, CudaPackage, ROCmPackage):
             args.append(self.define('CUDAToolkit_ROOT', cuda_prefix))
             if '+gpu_vector' in spec:
                 # clang compiles the CUDA sources; point it at Spack's CUDA.
-                clangxx = join_path(spec['llvm'].prefix.bin, 'clang++')
+                clangxx = self._clangxx()
                 args.append(self.define('CMAKE_CUDA_COMPILER', clangxx))
                 args.append(self.define(
                     'CMAKE_CUDA_FLAGS',
@@ -368,6 +371,24 @@ class Iowarp(CMakePackage, CudaPackage, ROCmPackage):
                 args.append(self.define('CMAKE_HIP_ARCHITECTURES',
                                         ';'.join(targets)))
         return args
+
+    def _clangxx(self):
+        """The clang++ of the llvm dependency, for CMAKE_CUDA_COMPILER.
+
+        An llvm registered as an external from a distribution package may
+        have a prefix (/usr) whose bin/ holds only versioned names such as
+        clang++-22; fall back to the newest of those.
+
+        @return the path of the clang++ to use
+        """
+        bindir = self.spec['llvm'].prefix.bin
+        plain = join_path(bindir, 'clang++')
+        if os.path.exists(plain):
+            return plain
+        versioned = glob.glob(join_path(bindir, 'clang++-[0-9]*'))
+        versioned.sort(key=lambda p: int(p.rsplit("-", 1)[1])
+                       if p.rsplit("-", 1)[1].isdigit() else -1)
+        return versioned[-1] if versioned else plain
 
     def setup_run_environment(self, env):
         # Set up library and module paths
