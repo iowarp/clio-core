@@ -355,6 +355,20 @@ class ClioRuntime(Service):
             hostfile_path = hostfile_shared
         else:
             hostfile_path = self.hostfile.path if self.hostfile.path else ''
+        # Never hand the runtime an empty or missing hostfile while jarvis
+        # knows the hosts: the runtime then falls back to a one-node
+        # 127.0.0.1 cluster on EVERY node (each advertises itself as node 0 on
+        # loopback), which no peer can reach. Seen in the distributed stop
+        # test's phase-2 restart, where the per-run copy did not exist yet and
+        # the hostfile had no path: both runtimes came up as
+        # "127.0.0.1:9413 (node=0)" and the all-hosts port check failed.
+        hosts = list(self.hostfile.hosts) if self.hostfile.hosts else []
+        if hosts and not (hostfile_path and os.path.exists(hostfile_path)):
+            hostfile_path = os.path.join(str(self.shared_dir), 'hostfile')
+            with open(hostfile_path, 'w') as f:
+                f.write('\n'.join(hosts) + '\n')
+            self.log(f"Wrote the runtime hostfile ({len(hosts)} host(s)) "
+                     f"to {hostfile_path}")
 
         config_dict = {
             'memory': {
