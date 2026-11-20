@@ -275,15 +275,15 @@ void EncodeChar(const std::vector<std::string>& fields, CsvColumnTensor* t) {
 
 }  // namespace
 
-CsvColumnTensor EncodeCsvColumn(const std::vector<std::string>& fields) {
-  CsvColumnTensor t;
-  t.rows = fields.size();
+void EncodeCsvColumn(const std::vector<std::string>& fields,
+                     CsvColumnTensor* out) {
+  *out = CsvColumnTensor();
+  out->rows = fields.size();
   bool all_empty = true;
   for (const auto& f : fields) all_empty = all_empty && f.empty();
-  if (!fields.empty() && !all_empty && TryInt64(fields, &t)) return t;
-  if (TryFloat64(fields, &t)) return t;
-  EncodeChar(fields, &t);
-  return t;
+  if (!fields.empty() && !all_empty && TryInt64(fields, out)) return;
+  if (TryFloat64(fields, out)) return;
+  EncodeChar(fields, out);
 }
 
 }  // namespace clio::cae::core

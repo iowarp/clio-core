@@ -60,18 +60,17 @@ constexpr size_t kCsvMaxParallelTasks = 32;
  * Columns a dataset_filter selects, in file order.
  * @param names Header names.
  * @param ctx Context holding include/exclude patterns.
- * @return Indices of the selected columns.
+ * @param out Receives the indices of the selected columns.
  */
-std::vector<size_t> SelectColumns(const std::vector<std::string>& names,
-                                  const AssimilationCtx& ctx) {
-  std::vector<size_t> out;
+void SelectColumns(const std::vector<std::string>& names,
+                   const AssimilationCtx& ctx, std::vector<size_t>* out) {
+  out->clear();
   for (size_t c = 0; c < names.size(); ++c) {
     if (MatchesDatasetFilter(CsvFileAssimilator::DatasetName(names[c]),
                              ctx.include_patterns, ctx.exclude_patterns)) {
-      out.push_back(c);
+      out->push_back(c);
     }
   }
-  return out;
 }
 
 }  // namespace
@@ -115,7 +114,8 @@ clio::run::TaskResume CsvFileAssimilator::Schedule(const AssimilationCtx& ctx,
   }
   text.clear();
   text.shrink_to_fit();
-  std::vector<size_t> selected = SelectColumns(table.names, ctx);
+  std::vector<size_t> selected;
+  SelectColumns(table.names, ctx, &selected);
   HLOG(kInfo, "CsvFileAssimilator: '{}': {} column(s) x {} row(s), {} selected",
        src_path, table.names.size(), table.NumRows(), selected.size());
   if (selected.empty() && !ctx.include_patterns.empty()) {
@@ -131,7 +131,8 @@ clio::run::TaskResume CsvFileAssimilator::Schedule(const AssimilationCtx& ctx,
   int failures = 0;
   for (size_t k = 0; k < selected.size(); ++k) {
     const size_t c = selected[k];
-    CsvColumnTensor tensor = EncodeCsvColumn(table.fields[c]);
+    CsvColumnTensor tensor;
+    EncodeCsvColumn(table.fields[c], &tensor);
     table.fields[c].clear();
     table.fields[c].shrink_to_fit();
     int rc = 0;

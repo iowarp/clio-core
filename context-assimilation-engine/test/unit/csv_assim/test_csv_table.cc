@@ -122,6 +122,10 @@ void TestErrors() {
   Check(Fails("a\n\"open\n", "unterminated"), "unterminated quote");
   Check(Fails("a\n\"x\"y\n", "record 2"), "text after closing quote");
   Check(Fails("a\nx\"y\n", "record 2"), "quote inside unquoted field");
+  Check(Fails("\na,b\n1,2\n", "record 1: empty header"),
+        "blank first line is an empty header");
+  Check(Fails("a,b\n1,2\n3", "record 3: 1 field(s), header has 2"),
+        "bad last record without a line break");
 }
 
 template <typename T>
@@ -131,11 +135,12 @@ bool BytesEqual(const CsvColumnTensor& t, const std::vector<T>& want) {
 }
 
 void TestTypes() {
-  CsvColumnTensor t = EncodeCsvColumn({"1", "-2", "+3", "9223372036854775807"});
+  CsvColumnTensor t;
+  EncodeCsvColumn({"1", "-2", "+3", "9223372036854775807"}, &t);
   Check(t.type == CsvType::kInt64 && t.description == "tensor<int64, 4>" &&
             BytesEqual<int64_t>(t, {1, -2, 3, INT64_MAX}),
         "int64 column");
-  t = EncodeCsvColumn({"1", "", "2.5"});
+  EncodeCsvColumn({"1", "", "2.5"}, &t);
   bool f_ok = t.type == CsvType::kFloat64 &&
               t.description == "tensor<float64, 3>" &&
               t.bytes.size() == 3 * sizeof(double);
@@ -143,19 +148,19 @@ void TestTypes() {
   if (f_ok) std::memcpy(got, t.bytes.data(), sizeof(got));
   Check(f_ok && got[0] == 1.0 && std::isnan(got[1]) && got[2] == 2.5,
         "int with an empty field -> float64 with NaN");
-  t = EncodeCsvColumn({"1e3", "nan", "-inf", "0.1"});
+  EncodeCsvColumn({"1e3", "nan", "-inf", "0.1"}, &t);
   Check(t.type == CsvType::kFloat64 && t.rows == 4, "exponent/nan/inf parse");
-  t = EncodeCsvColumn({"9223372036854775808"});
+  EncodeCsvColumn({"9223372036854775808"}, &t);
   Check(t.type == CsvType::kFloat64, "int64 overflow -> float64");
-  t = EncodeCsvColumn({"", ""});
+  EncodeCsvColumn({"", ""}, &t);
   Check(t.type == CsvType::kFloat64 && t.description == "tensor<float64, 2>",
         "all-empty column -> float64 NaN");
-  t = EncodeCsvColumn({"ab", "", "xyz", " 1"});
+  EncodeCsvColumn({"ab", "", "xyz", " 1"}, &t);
   std::vector<char> chars = {'a', 'b', 0, 0, 0, 0, 'x', 'y', 'z', ' ', '1', 0};
   Check(t.type == CsvType::kChar && t.width == 3 &&
             t.description == "tensor<char, 4, 3>" && t.bytes == chars,
         "text column -> NUL-padded char[N][W]");
-  t = EncodeCsvColumn({});
+  EncodeCsvColumn({}, &t);
   Check(t.type == CsvType::kFloat64 && t.description == "tensor<float64, 0>" &&
             t.bytes.empty(),
         "zero-row column");

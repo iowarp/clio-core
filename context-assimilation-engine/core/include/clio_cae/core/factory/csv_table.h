@@ -107,9 +107,10 @@ struct CsvColumnTensor {
 /**
  * Infer a type for one column and encode it.
  * @param fields The column's field texts, one per row.
- * @return The encoded tensor.
+ * @param out Receives the encoded tensor (any previous contents are replaced).
  */
-CsvColumnTensor EncodeCsvColumn(const std::vector<std::string>& fields);
+void EncodeCsvColumn(const std::vector<std::string>& fields,
+                     CsvColumnTensor* out);
 
 }  // namespace clio::cae::core
 
