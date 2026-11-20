@@ -1,0 +1,120 @@
+<!--
+title: cpu_vector
+heading: An array larger than <em>host memory.</em>
+description: How to use cpu_vector, step by step: create a paged vector, fill it, fetch, hold, flush and unpin pages from ordinary CPU threads, share one vector between many threads, and link it into a program. No GPU or special compiler is needed.
+eyebrow: Docs · Memory expansion
+lede: <code>cpu_vector</code> gives ordinary C++ code an array that can be larger than the machine's RAM. Pages live in the <a href="/docs/cte/index.html">Context Transfer Engine</a>, and a cache in host memory holds the ones you are working on. It is plain C++: any compiler, any thread, no GPU.
+facts: Header | clio_cte/cpu_vector/cpu_vector.h ; Namespace | clio::cte::cpu_vector ; Compiler | any C++20 compiler ; GPU version | <a href="/docs/memory-expansion/gpu-vector.html">gpu_vector</a>
+-->
+<h2>The idea in four steps</h2>
+<p><code>cpu_vector</code> works like <a href="/docs/memory-expansion/gpu-vector.html"><code>gpu_vector</code></a>, but the cache is in host memory and the calls are ordinary blocking functions instead of coroutines. For each page you touch:</p>
+<ol class="steps">
+  <li><h3>Fetch</h3><p><code>v.Fetch(0, off, count)</code> makes elements <code>[off, off + count)</code> resident and pins their pages.</p></li>
+  <li><h3>Hold</h3><p><code>v.HoldPage(off, count)</code> returns a window onto the cached page that you index like an array.</p></li>
+  <li><h3>Flush</h3><p><code>v.Flush(0, off, count)</code> writes changed elements back to the CTE. Nothing is written back automatically.</p></li>
+  <li><h3>Unpin</h3><p><code>v.UnpinRange(off, count)</code> lets the cache reuse the page's slot.</p></li>
+</ol>
+
+<h2 id="example">Example: double every element</h2>
+<p>This program creates a 256 MiB vector of floats with a 32 MiB cache, fills it, doubles every element page by page, and reads the result back.</p>
+<pre data-label="cpp · double_example.cc">
+#include <clio_runtime/clio_runtime.h>
+#include <clio_cte/core/core_client.h>
+#include <clio_cte/cpu_vector/cpu_vector.h>
+#include <algorithm>
+#include <vector>
+
+namespace cv = clio::cte::cpu_vector;
+using clio::run::u64;
+
+// Double pages first, first + stride, first + 2*stride, ...
+void DoublePages(cv::Vector<float> &v, u64 first, u64 stride) {
+  const u64 epp = v.ElemsPerPage();                     // elements per page
+  for (u64 pg = first; pg < v.NumPages(); pg += stride) {
+    const u64 off = pg * epp;                           // first element of the page
+    const u64 count = std::min(epp, v.size() - off);
+
+    v.Fetch(0, off, count);                             // 1. bring the page in, pin it
+    auto h = v.HoldPage(off, count, /*write=*/true);    // 2. window onto the page
+    for (u64 i = off; i < off + h.run(); ++i) {
+      h[i] *= 2.0f;                                     // h is indexed by absolute offset
+    }
+    v.Flush(0, off, count);                             // 3. write the page back
+    v.UnpinRange(off, count);                           // 4. let the cache reuse the slot
+  }
+}
+
+int main() {
+  // Start a runtime in this process (or attach to one) and the CTE client.
+  if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true)) return 1;
+  if (!clio::cte::core::CLIO_CTE_CLIENT_INIT()) return 1;
+
+  // 64M floats (256 MiB) in 1 MiB pages; cache of 8 sets x 4 pages = 32 MiB.
+  const u64 n = 64ull << 20;
+  cv::Vector<float> v("doubled_cpu", /*page_bytes=*/1ull << 20, n,
+                      /*nsets=*/8, /*set_size=*/4);
+
+  std::vector<float> data(n, 1.5f);
+  v.Preload(data.data(), n);        // fill: writes straight to the CTE
+
+  DoublePages(v, /*first=*/0, /*stride=*/1);
+
+  v.Download(data.data(), n);       // read back: straight from the CTE
+  bool ok = (data[0] == 3.0f && data[n - 1] == 3.0f);
+
+  clio::run::CLIO_RUNTIME_FINALIZE();
+  return ok ? 0 : 2;
+}
+</pre>
+<dl class="notes">
+<div><dt><code>Vector(tag, page_bytes, n, nsets, set_size)</code></dt><dd>The tag names the vector in the CTE, and opening the same tag again gives the same data, even from a <code>gpu_vector</code> with the same page size and element type. <code>page_bytes</code> must be a multiple of <code>sizeof(T)</code>. The cache holds <code>nsets * set_size</code> pages.</dd></div>
+<div><dt>Holds use absolute offsets</dt><dd><code>h[i]</code> is valid for <code>i</code> from <code>h.begin_off()</code> to <code>h.begin_off() + h.run()</code>. <code>h.run()</code> is how many of the requested elements lie on this page.</dd></div>
+<div><dt>Errors throw</dt><dd>A caller error, such as holding elements that were never fetched, throws <code>std::runtime_error</code>. So does a fetch that waits 30 seconds for a free slot because every page of a set is still pinned.</dd></div>
+<div><dt>Unwritten pages read as zeros</dt><dd>You can skip <code>Preload</code> and start with <code>Fetch</code>; a page with nothing stored yet comes back filled with zeros.</dd></div>
+</dl>
+
+<h2 id="threads">From many threads</h2>
+<p>Every call is thread-safe, so threads can share one vector and one cache. Give each thread its own pages and reuse <code>DoublePages</code> from above:</p>
+<pre data-label="cpp">
+#include <thread>
+
+const u64 nthreads = 8;
+std::vector<std::thread> workers;
+for (u64 t = 0; t < nthreads; ++t) {
+  workers.emplace_back([&v, t, nthreads] { DoublePages(v, /*first=*/t, /*stride=*/nthreads); });
+}
+for (auto &w : workers) w.join();
+</pre>
+<p>A page read by several threads is fetched and cached once. Size the cache so each set has at least as many slots as threads that may hold one of its pages at the same time.</p>
+
+<h2 id="shortcuts">Shortcuts</h2>
+<ul>
+  <li><code>UpdateRange(off, count, write)</code> fetches the whole pages under a range and returns the hold in one call. Release it with <code>UnpinRange(v.PageLo(off), v.PageSpan(off, count))</code>.</li>
+  <li>One <code>Fetch</code> or <code>Flush</code> takes up to eight <code>(off, count)</code> pairs: <code>v.Fetch(0, a, 100, b, 100)</code>.</li>
+  <li><code>PreloadPages</code> and <code>DownloadPages</code> take a callback per page, for data that does not fit in host memory either.</li>
+  <li><code>Prefetch(pg_lo, pg_hi)</code> warms the cache without pinning. <code>ClearCache()</code> empties it and discards unflushed writes.</li>
+</ul>
+
+<h2 id="build">Build and run</h2>
+<p><code>cpu_vector</code> is header-only and is installed with every CLIO Core build that includes C++ headers, so no special flags are needed. In the CLIO Core build tree, link the interface target and the runtime pieces the in-process runtime needs, as the adapter's test does:</p>
+<pre data-label="cmake">
+add_executable(double_example double_example.cc)
+target_link_libraries(double_example
+    clio::cte::cpu_vector
+    clio_cte_core_runtime clio_cte_core_client
+    clio::run::admin_runtime clio::run::admin_client
+    clio::run::bdev_runtime clio::run::bdev_client
+    ctp::cxx ${CMAKE_THREAD_LIBS_INIT})
+</pre>
+<p>Against an installed tree, include the header and link the exported client targets; the <a href="/docs/memory-expansion/install.html">install page</a> shows how. The runtime needs a CTE pool with a storage tier large enough for the vector. The <code>clio.yaml</code> on the <a href="/docs/memory-expansion/gpu-vector.html#run">gpu_vector page</a> works here too (the <code>gpu</code> section is ignored):</p>
+<pre data-label="shell">
+$ CLIO_SERVER_CONF=$PWD/clio.yaml ./double_example; echo "exit $?"
+exit 0
+</pre>
+
+<h2>Where to go next</h2>
+<ul>
+  <li><a href="/docs/memory-expansion/gpu-vector.html">gpu_vector</a>: the same model inside a CUDA kernel.</li>
+  <li><a href="/docs/memory-expansion/usage.html">Usage</a>: lazy copies, checkpoints and tier placement hints.</li>
+  <li><a href="/docs/memory-expansion/api.html#cpu">API reference</a>: every constructor argument and method.</li>
+</ul>

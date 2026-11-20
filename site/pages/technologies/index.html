@@ -61,7 +61,16 @@ facts: Storage | Context FS, Context Transfer Engine ; Context | Assimilation an
     <li>Pages spill to DRAM and storage tiers; placement, coherence and persistence are handled for you.</li>
     <li>Measured within 0.88-1.19x of MPI, oneCCL and Intel SHMEM on up to 64 Aurora nodes.</li>
 </ul>
-<p><a href="/technologies/memory-expansion.html">Memory expansion overview</a> · <a href="/docs/memory-expansion/usage.html">Docs</a></p>
+<p><a href="/technologies/memory-expansion.html">Memory expansion overview</a> · <a href="/docs/memory-expansion/gpu-vector.html">Docs</a></p>
+
+<h2>I/O adapters</h2>
+<p class="eyebrow">Compatibility</p>
+<ul class="checks">
+    <li>Unmodified applications reach the stack through the I/O libraries they already use.</li>
+    <li>POSIX, STDIO and MPI-IO interceptors; HDF5 VOL and VFD connectors; an ADIOS2 engine plugin.</li>
+    <li>Built from source with Spack or CMake, each behind its own variant or option.</li>
+</ul>
+<p><a href="/technologies/io-adapters.html">I/O adapters overview</a> · <a href="/docs/io-adapters/index.html">Docs</a></p>
 
 <h2>Machine learning</h2>
 <p class="eyebrow">Compute</p>

@@ -8,6 +8,10 @@ facts: Written for | Scientists, HPC users and developers ; Works on | Linux, ma
 -->
 <h2>The short version</h2>
 <p>You start one background process per node, the runtime, with a YAML file that lists the modules and storage tiers you want. What you put in front of them decides the product you get: <a href="/technologies/context-fs.html">Context FS</a> mounts a directory that any program can use, the <a href="/technologies/context-transfer-engine.html">key-value store</a> gives C++ and Python direct access to tags and blobs, <a href="/technologies/memory-expansion.html">memory expansion</a> pages GPU and CPU arrays larger than memory, and <a href="/technologies/machine-learning.html">clio-ml</a> trains models on that data. The quickest way to see it work is the filesystem, so these docs start there.</p>
+<div class="callout">
+  <span class="callout-title">What the default install includes</span>
+  <p>pip, conda and Docker ship one fixed build centered on the cross-platform technologies that run the same on Linux, macOS and Windows: <a href="/docs/context-fs/index.html">Context FS</a> and the <a href="/docs/cte/index.html">Context Transfer Engine</a>, with the runtime under them. GPU <a href="/docs/memory-expansion/index.html">memory expansion</a>, most of the <a href="/docs/io-adapters/index.html">I/O adapters</a> and the cloud and DAOS tiers come from Spack or a source build. The <a href="/index.html#install">install matrix</a> on the home page shows what each method includes and writes one command for the features you tick; each technology's install page explains its options.</p>
+</div>
 <p>Underneath every product, CLIO Core decides where each piece of data lives. Recently used data stays in RAM. Colder data moves to NVMe or disk. A persistent copy protects it across restarts. An index records the words in each file, so you can later ask "which files mention sea ice extent?" and get a ranked answer.</p>
 
 <h2>What you can do with it</h2>
@@ -26,14 +30,16 @@ facts: Written for | Scientists, HPC users and developers ; Works on | Linux, ma
   <a href="/docs/cee/index.html"><span class="feature-index">03</span><h3>Context Exploration Engine</h3><p>Bundle, query and retrieve data by name, keywords or time, and compose storage for search.</p></a>
   <a href="/docs/cte/index.html"><span class="feature-index">04</span><h3>Context Transfer Engine</h3><p>Tags, blobs and scores: the data model and the C++ and Python APIs.</p></a>
   <a href="/docs/runtime/index.html"><span class="feature-index">05</span><h3>Context Runtime</h3><p>Build a ChiMod: modules, tasks, pools and pool queries.</p></a>
-  <a href="/docs/memory-expansion/index.html"><span class="feature-index">06</span><h3>Memory expansion</h3><p>CPU and GPU vectors larger than memory: API, configuration and examples.</p></a>
-  <a href="/docs/ml/index.html"><span class="feature-index">07</span><h3>Machine learning</h3><p>Compose storage and memory for clio-ml, and the API of each algorithm.</p></a>
+  <a href="/docs/dashboard/index.html"><span class="feature-index">06</span><h3>Dashboard</h3><p>The web dashboard every runtime serves: what each page shows, with screenshots, and its REST API.</p></a>
+  <a href="/docs/memory-expansion/index.html"><span class="feature-index">07</span><h3>Memory expansion</h3><p>CPU and GPU vectors larger than memory: step-by-step examples, API and configuration.</p></a>
+  <a href="/docs/io-adapters/index.html"><span class="feature-index">08</span><h3>I/O adapters</h3><p>POSIX, STDIO, MPI-IO, HDF5 VOL and VFD, and ADIOS2: build each from source and use it.</p></a>
+  <a href="/docs/ml/index.html"><span class="feature-index">09</span><h3>Machine learning</h3><p>Compose storage and memory for clio-ml, and the API of each algorithm.</p></a>
 </div>
 <p>The <a href="/docs/concepts.html">core concepts</a> page explains tags, blobs, scores and pools in more depth. The <a href="/design/index.html">design</a> section covers the internals.</p>
 
 <h2>Where to start</h2>
 <ol class="steps">
-  <li><h3>Install</h3><p><code>pip install iowarp-core</code> works on most workstations. See <a href="/docs/installation.html">Installation</a> for conda, Docker, Spack and source builds.</p></li>
+  <li><h3>Install</h3><p><code>pip install iowarp-core</code> works on most workstations. The <a href="/index.html#install">install matrix</a> on the home page shows what conda, Docker, Spack and source builds add, and gives one command for the features you tick.</p></li>
   <li><h3>Mount and copy a file</h3><p>Follow <a href="/docs/context-fs/quickstart.html">Basic usage</a> end to end.</p></li>
   <li><h3>Shape your storage</h3><p>Use <a href="/tutorials/compose.html">Compose local tiers</a> when the defaults no longer fit.</p></li>
 </ol>

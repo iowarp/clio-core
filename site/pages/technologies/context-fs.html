@@ -391,6 +391,17 @@ $ ls ~/clio-mnt/results
 <p class="bars-caption">Bars are the mean of two runs; the two runs were within 1,081-1,258 vs 2,347-3,838 MB/s for writes and 2,122-2,278 vs 965-1,354 MB/s for reads (NTFS vs Context FS).</p>
 <p>Read the write result carefully: in this run the runtime registered a single storage target, the DRAM tier, so Context FS writes landed in memory and were not on disk when fsync returned, which NTFS guarantees. With a persistent disk tier active, writes also pay for the replica. Reads, file creation and metadata cross the WinFsp kernel boundary on every call, which is where NTFS leads. Defender real-time scanning was on for both. Single machine, two runs each.</p>
 
+<h2 id="source-build">Build from source</h2>
+<p>A source build has many settings and configurations to optimize the installation for your specific system. We keep an <a href="https://github.com/iowarp/clio-core/blob/main/INSTALL.md"><code>INSTALL.md</code></a> in the root of the repository, written to help AI agents install CLIO Core. The default installers include Context FS on Linux and Windows. Build from source to mount on macOS, or to tune the build for your machine. To have a coding agent do it, give it a prompt like this:</p>
+<pre data-label="prompt for a coding agent">
+Clone https://github.com/iowarp/clio-core and follow INSTALL.md to build CLIO Core
+from source on this machine with the FUSE mount enabled
+(-DCLIO_CTE_ENABLE_FUSE_ADAPTER=ON). Install the system packages it lists for my
+OS, then start the runtime, mount a test directory and copy a file through it
+to verify the install.
+</pre>
+<p>The agent should name the options it chose for your system; the <a href="/docs/context-fs/install.html">install page</a> lists the options that matter here.</p>
+
 <h2>Where to go next</h2>
 <ul>
   <li><a href="/docs/context-fs/quickstart.html">Mount your first filesystem</a></li>

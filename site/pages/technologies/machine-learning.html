@@ -133,6 +133,17 @@ facts: Algorithms | 30+ modules; 13 benchmarked below ; Backends | CPU, CUDA, SY
 <p>clio-ml used 69-112 GB in total across cache sizes; Dask about 200 GB and Spark 333-455 GB for the same data. Dask's linear regression was ahead of clio-ml out of core (2.67 vs 4.34 s per iteration). These are single runs.</p>
 
 
+<h2 id="source-build">Build from source</h2>
+<p>A source build has many settings and configurations to optimize the installation for your specific system. We keep an <a href="https://github.com/iowarp/clio-core/blob/main/INSTALL.md"><code>INSTALL.md</code></a> in the root of the repository, written to help AI agents install CLIO Core. clio-ml is added to a source build with <code>CLIO_CORE_ENABLE_CLIO_ML</code>, and uses the GPU backend the build enables. To have a coding agent do it, give it a prompt like this:</p>
+<pre data-label="prompt for a coding agent">
+Clone https://github.com/iowarp/clio-core with its submodules and follow INSTALL.md
+to build CLIO Core from source on this machine with clio-ml
+(-DCLIO_CORE_ENABLE_CLIO_ML=ON) and, if this machine has an NVIDIA GPU, CUDA with
+clang (-DCLIO_CORE_ENABLE_CUDA=ON -DCLIO_GPU_CLANG=ON). Install the system packages
+it lists for my OS, then train one small model to verify the install.
+</pre>
+<p>The agent should name the options it chose for your system; the <a href="/docs/ml/install.html">install page</a> lists the options that matter here.</p>
+
 <h2>Where to go next</h2>
 <ul>
   <li><a href="/technologies/memory-expansion.html">Memory expansion: the paged vectors underneath</a></li>

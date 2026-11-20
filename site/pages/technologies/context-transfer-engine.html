@@ -215,6 +215,17 @@ print(tag.GetContainedBlobs())               # list keys in the tag
 <p class="bars-caption">Aggregate bandwidth: 1,474 MB/s at 1 MiB, 945 MB/s at 64 KiB, 106 MB/s at 4 KiB.</p>
 <p>One run each. Longer 64 KiB and 4 KiB runs (80,000 operations) stopped partway with put errors on this build, so the small-value rows use shorter runs.</p>
 
+<h2 id="source-build">Build from source</h2>
+<p>A source build has many settings and configurations to optimize the installation for your specific system. We keep an <a href="https://github.com/iowarp/clio-core/blob/main/INSTALL.md"><code>INSTALL.md</code></a> in the root of the repository, written to help AI agents install CLIO Core. The default installers include the Context Transfer Engine. Build from source to write ChiMods against the C++ headers, or to add optional backends such as compression or cloud storage. To have a coding agent do it, give it a prompt like this:</p>
+<pre data-label="prompt for a coding agent">
+Clone https://github.com/iowarp/clio-core and follow INSTALL.md to build CLIO Core
+from source on this machine with the Context Transfer Engine and its tests
+(-DCLIO_CORE_ENABLE_TESTS=ON). Also enable compression
+(-DCLIO_CTE_ENABLE_COMPRESS=ON). Install the system packages it lists for my OS,
+then run the cte tests with ctest to verify the install.
+</pre>
+<p>The agent should name the options it chose for your system; the <a href="/docs/cte/install.html">install page</a> lists the options that matter here.</p>
+
 <h2>Where to go next</h2>
 <ul>
   <li><a href="/docs/concepts.html">Core concepts: tags, blobs, scores</a></li>
