@@ -65,6 +65,25 @@ jobs:
           key: vcpkg-port-${{ matrix.triplet }}-${{ hashFiles('installers/vcpkg/vcpkg.json', 'installers/vcpkg/overlay-ports/**') }}
           restore-keys: vcpkg-port-${{ matrix.triplet }}-
 
+      # Poco pulls in pcre2 with its default "jit" feature, whose portfile asks
+      # the GitHub REST API for the sljit submodule pointer without a token, so
+      # a shared runner IP gets HTTP 403 (rate limit). Fetch that JSON once with
+      # the job's token into vcpkg's download cache: the response is
+      # byte-identical, so it matches the portfile's SHA512 and vcpkg never
+      # makes the anonymous call.
+      - name: Pre-fetch pcre2's sljit pointer
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ver=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['version'])" \
+                "${VCPKG_INSTALLATION_ROOT}/ports/pcre2/vcpkg.json")
+          mkdir -p "${VCPKG_INSTALLATION_ROOT}/downloads"
+          curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
+            "https://api.github.com/repos/PCRE2Project/pcre2/contents/deps/sljit?ref=pcre2-${ver}" \
+            -o "${VCPKG_INSTALLATION_ROOT}/downloads/pcre2-pcre2-${ver}-sljit-gitlink.json"
+          echo "cached the sljit gitlink for pcre2 ${ver}"
+
       - name: Install iowarp-core[viz,hdf5]
         shell: bash
         run: |
@@ -74,10 +93,7 @@ jobs:
           # Run outside the checkout: installers/vcpkg/vcpkg.json would
           # otherwise switch vcpkg into manifest mode.
           cd "$RUNNER_TEMP"
-          # pcre2[core]: Poco pulls in pcre2, whose default "jit" feature asks
-          # the GitHub REST API for a submodule pointer -- anonymously, so a
-          # shared runner IP hits the rate limit (HTTP 403). Poco needs no JIT.
-          "$VCPKG" install "pcre2[core]" "iowarp-core[viz,hdf5]" --classic \
+          "$VCPKG" install "iowarp-core[viz,hdf5]" --classic \
             --triplet ${{ matrix.triplet }} \
             --overlay-ports="$W" --overlay-ports="$W/overlay-ports" \
             --x-install-root="$RUNNER_TEMP/vcpkg-installed" || {
