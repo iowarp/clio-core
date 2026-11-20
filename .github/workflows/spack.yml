@@ -93,10 +93,27 @@ jobs:
 
       # clio-ml is its own repository. The package fetches it as a resource,
       # but a `spack develop` build uses this checkout as-is, so put it where
-      # the CMake build looks for it.
+      # the CMake build looks for it. iowarp/clio-ml is private: the job's
+      # GITHUB_TOKEN cannot read it, so +clio_ml is built only when a
+      # CLIO_ML_TOKEN secret (read access to iowarp/clio-ml) is configured,
+      # and dropped from the spec otherwise. SPEC is the spec every later step
+      # installs and verifies.
       - name: Fetch clio-ml
-        if: contains(matrix.spec, '+clio_ml')
-        run: git clone --depth 1 https://github.com/iowarp/clio-ml.git external/clio-ml
+        env:
+          CLIO_ML_TOKEN: ${{ secrets.CLIO_ML_TOKEN }}
+        run: |
+          SPEC="${{ matrix.spec }}"
+          if [[ "$SPEC" == *+clio_ml* ]]; then
+            if [ -n "$CLIO_ML_TOKEN" ]; then
+              git clone --depth 1 \
+                "https://x-access-token:${CLIO_ML_TOKEN}@github.com/iowarp/clio-ml.git" \
+                external/clio-ml
+            else
+              echo "::notice::CLIO_ML_TOKEN is not set and iowarp/clio-ml is private; building without +clio_ml"
+              SPEC="${SPEC//+clio_ml/}"
+            fi
+          fi
+          echo "SPEC=$(echo $SPEC)" >> "$GITHUB_ENV"
 
       - name: Checkout spack
         uses: actions/checkout@v4
@@ -186,7 +203,7 @@ jobs:
           . ./spack/share/spack/setup-env.sh
           spack env create -d ci-env
           spack -e ci-env develop --path "$GITHUB_WORKSPACE" iowarp@=dev
-          spack -e ci-env add "iowarp@=dev ${{ matrix.spec }}"
+          spack -e ci-env add "iowarp@=dev ${SPEC}"
           spack -e ci-env concretize -f | tee concretized.txt
 
       - name: Install
@@ -215,7 +232,7 @@ jobs:
               echo "found $(compgen -G "$prefix/$pat*" | head -1)"
             fi
           done
-          if [[ "${{ matrix.spec }}" == *+clio_ml* ]]; then
+          if [[ "${SPEC}" == *+clio_ml* ]]; then
             if ! find "$prefix" -iname '*clio_ml*' | grep -q .; then
               echo "::error::+clio_ml installed nothing named clio_ml"
               missing=1
