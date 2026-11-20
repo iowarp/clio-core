@@ -35,7 +35,7 @@ jobs:
   gate:
     name: dev full CI passed
     runs-on: ubuntu-latest
-    # Hosted jobs cap at 6 h. dev's full sweep takes ~3 h plus the 30 min quiet
+    # Hosted jobs cap at 6 h. dev's full sweep takes ~3 h plus the 5 min quiet
     # period; if this ever times out, re-run the job once the sweep is done.
     timeout-minutes: 350
     steps:
