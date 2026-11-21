@@ -24,7 +24,13 @@ install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/
 # functions launched with <<<>>> -- and sycl_cuda_compat.h making them PARSE
 # under SYCL is worse than useless: they would link against libsycl and then
 # launch nothing, because a __global__ function is not a SYCL kernel.
-add_subdirectory(benchmark)
+# Behind the benchmarks master switch like every other component's
+# benchmarks: a ~benchmark Spack build (or any -DCLIO_CORE_ENABLE_BENCHMARKS=OFF
+# configure) still compiled all 32 of these, and on the spack (cuda) CI job
+# clang 22 crashed compiling clio_lammps_md_paged_bench for sm_89.
+if(CLIO_CORE_ENABLE_BENCHMARKS)
+  add_subdirectory(benchmark)
+endif()
 
 if(CLIO_CORE_ENABLE_TESTS)
     if(CLIO_CORE_ENABLE_CUDA OR CLIO_CORE_ENABLE_ROCM)
