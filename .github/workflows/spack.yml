@@ -8,13 +8,10 @@ name: Spack Install
 # apt repositories and registered with Spack as externals.
 
 on:
+  # Never on pull requests: this runs only after a merge (push to dev/main).
   workflow_dispatch:
   push:
     branches: [main, dev]
-    paths:
-      - 'installers/spack/**'
-      - '.github/workflows/spack.yml'
-  pull_request:
     paths:
       - 'installers/spack/**'
       - '.github/workflows/spack.yml'

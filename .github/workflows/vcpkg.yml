@@ -8,15 +8,10 @@ name: vcpkg Port
 # builds; this is the one that tests the port itself.
 
 on:
+  # Never on pull requests: this runs only after a merge (push to dev/main).
   workflow_dispatch:
   push:
     branches: [main, dev]
-    paths:
-      - 'installers/vcpkg/**'
-      - '.github/workflows/vcpkg.yml'
-      - 'CMakeLists.txt'
-      - 'cmake/**'
-  pull_request:
     paths:
       - 'installers/vcpkg/**'
       - '.github/workflows/vcpkg.yml'

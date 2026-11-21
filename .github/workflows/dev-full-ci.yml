@@ -3,7 +3,7 @@
 # Pull requests run only the fast tier (build on Linux/macOS/Windows, Linux
 # unit tests, cpplint, VFD). The full matrix runs on dev, but NOT once per
 # merge: every push to dev restarts a quiet-period timer, and only when dev
-# has had no new merge for DEV_CI_QUIET_MINUTES (default 30) is the full
+# has had no new merge for DEV_CI_QUIET_MINUTES (default 5) is the full
 # sweep dispatched against the dev tip.
 #
 # How the debounce works: this workflow's concurrency group cancels the
@@ -44,7 +44,7 @@ jobs:
     steps:
       - name: Sleep
         env:
-          QUIET: ${{ inputs.quiet_minutes != '' && inputs.quiet_minutes || vars.DEV_CI_QUIET_MINUTES || '30' }}
+          QUIET: ${{ inputs.quiet_minutes != '' && inputs.quiet_minutes || vars.DEV_CI_QUIET_MINUTES || '5' }}
         run: |
           echo "Waiting ${QUIET} min; a new push to dev cancels this run and restarts the timer."
           sleep "$(( QUIET * 60 ))"
