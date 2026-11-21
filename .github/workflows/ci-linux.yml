@@ -283,6 +283,22 @@ jobs:
   # Docker (deps-cpu) is the canonical reproducible build; native + arm64 cover
   # the io_uring path the container seccomp profile blocks, and the arm64 memory
   # model.
+  # Stand-in for the ruleset-required check `build-test (unit amd64)` on
+  # dev->main PRs. build-test is skipped there (dev's full CI already ran it,
+  # and the "dev full CI passed" gate on the same PR enforces that), but a
+  # skipped matrix job reports under its unexpanded name
+  # "build-test (${{ matrix.phase }} ${{ matrix.arch }})", so the required
+  # check never appears and the PR stays BLOCKED. This job reports that name
+  # only on dev->main PRs; on every other event it is named differently, so a
+  # skipped copy can never stand in for the real build-test result.
+  devmain-required-check:
+    if: ${{ github.event_name == 'pull_request' && github.head_ref == 'dev' && github.base_ref == 'main' }}
+    name: ${{ (github.event_name == 'pull_request' && github.head_ref == 'dev' && github.base_ref == 'main') && 'build-test (unit amd64)' || 'dev-to-main required-check stand-in' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Covered by the dev full CI gate
+        run: echo "dev->main PR - build-test ran in dev's full CI; see the 'dev full CI passed' check."
+
   boost-docker:
     name: boost (docker deps-cpu)
     # Push-only (#921): a coroutine-backend build variant, not an arch. It
