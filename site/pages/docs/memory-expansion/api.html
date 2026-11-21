@@ -187,7 +187,7 @@ void UnpinRange2(u64 off0, u64 count0, u64 off1, u64 count1);
 <h2 id="config">Configuration</h2>
 <h3>Environment variables</h3>
 <ul>
-  <li><code>CLIO_GV_STORAGE_POOL</code>: the pool a <code>gpu_vector</code> uses when its constructor is given none, as <code>major.minor</code>. For example <code>563.0</code> sends pages through the CTE cache module for node-local caching of remote-owned pages. <code>cpu_vector</code> does not read it.</li>
+  <li><code>CLIO_GV_STORAGE_POOL</code>: the pool a <code>gpu_vector</code> uses when its constructor is given none, as <code>major.minor</code>. For example, <code>563.0</code> sends pages through the optional CTE cache module for node-local caching of remote-owned pages; that module is not in the default chain, so compose it first. <code>cpu_vector</code> does not read it.</li>
   <li><code>CLIO_SERVER_CONF</code>: the runtime configuration file, which must compose a <code>clio_cte_core</code> pool with at least one <code>storage</code> tier.</li>
   <li><code>CLIO_WITH_RUNTIME</code>: <code>0</code> attaches to a running runtime; <code>1</code> starts one in the process.</li>
 </ul>

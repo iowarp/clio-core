@@ -30,20 +30,25 @@ the CAE pool is created. Two placements are in use:</p>
   <li><strong>Side by side.</strong> The CAE pool is created at its own
   ID (400.0 by convention) and only ever acts when an OMNI file is
   submitted. Blobs are written to the global CTE core pool.</li>
-  <li><strong>As an interceptor.</strong> The CAE is created at the
-  CTE's own entry pool ID and given a <code>next_pool_id</code>. The
+  <li><strong>As an interceptor.</strong> The CAE keeps its own pool ID
+  (400.0) and is given a <code>next_pool_id</code>. The
   operations <code>GetOrCreateTag</code>, <code>PutBlob</code>,
   <code>GetBlob</code> and <code>SemanticSearch</code> that arrive at
   the CAE are forwarded unchanged to that next pool, which may be the
   CTE core directly or another interposer such as the
   <a href="/modules/summarizer.html">summarizer</a> or the
-  <a href="/modules/indexer.html">indexer</a>. A CTE client pointed at
-  the CAE pool works unchanged. When <code>next_pool_id</code> is not
-  set, forwarding falls back to the global CTE core pool ID.</li>
+  <a href="/modules/indexer.html">indexer</a>. The default configuration
+  points it at the chain top, the indexer at 564.0, so imported data is
+  indexed. When <code>next_pool_id</code> is not set, forwarding falls
+  back to the global CTE core pool ID.</li>
 </ul>
 <p>The method IDs of the forwarded operations are asserted at compile
 time to match the CTE core's, which is what lets a task built by the CTE
-client dispatch to a CAE handler.</p>
+client dispatch to a CAE handler. The CAE's own methods 10 to 13
+(<code>ParseOmni</code>, <code>ExportData</code> and the rest) reuse
+the IDs of the CTE core's target methods (<code>RegisterTarget</code> to
+<code>StatTargets</code>). So do not create the CAE at a CTE pool ID:
+a CTE client calling those methods would reach a CAE handler.</p>
 
 <h2 id="compose">Composing it</h2>
 <p>The minimal deployment from the module's example configuration
@@ -59,29 +64,22 @@ compose:
     pool_query: local
     pool_id: "400.0"
 </pre>
-<p>The interceptor placement, adapted from the summarizer test
-configuration, puts the real CTE core at 513.0 and the CAE at the entry
-ID 512.0 with a summarizer between them:</p>
+<p>The interceptor placement, from the default configuration, keeps
+the CAE at 400.0 and forwards to the top of the operator chain, the
+indexer at 564.0. The entry comes after the chain it forwards to:</p>
 <pre data-label="yaml">
 compose:
-  - mod_name: clio_cte_core
-    pool_name: cte_core
-    pool_query: local
-    pool_id: "513.0"
-  - mod_name: clio_cae_summarizer
-    pool_name: clio_cae_summarizer
-    pool_query: local
-    pool_id: "401.0"
-    next_pool_id: "513.0"
+  # ... CTE cores, write-back cache, shm cache (568.0), indexer (564.0)
   - mod_name: clio_cae_core
-    pool_name: cae_labeler
+    pool_name: cae_main
     pool_query: local
-    pool_id: "512.0"
-    next_pool_id: "401.0"
+    pool_id: "400.0"
+    next_pool_id: "564.0"
 </pre>
-<p>The only module-specific compose key is <code>next_pool_id</code>,
-written as <code>"major.minor"</code>. Any other key on the entry is
-ignored by this module. Dynamic routing queries on the forwarded
+<p>The module reads two compose keys. <code>next_pool_id</code> is
+written as <code>"major.minor"</code>. <code>allowed_roots</code> lists
+the local directories the CAE may read and export to; unset, any path
+is allowed except credential and system locations. Dynamic routing queries on the forwarded
 operations are resolved to the local container, so an intercepted task
 runs on the node that received it.</p>
 
@@ -187,7 +185,7 @@ what the dependency check accepts.</p>
   <li>Start the runtime with a configuration whose compose list includes
   the CTE and CAE pools:
 <pre data-label="shell">
-$ export CLIO_X=/path/to/clio_config.yaml
+$ export CLIO_SERVER_CONF=/path/to/clio_config.yaml
 $ clio-run start
 </pre></li>
   <li>Submit the OMNI file:

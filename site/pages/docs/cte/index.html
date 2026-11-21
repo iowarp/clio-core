@@ -23,7 +23,7 @@ facts: Module | clio_cte_core ; Core pool | 512.0 ; C++ | clio_cte/core/core_cli
 <p>Three kinds of query are answered without reading the blobs back into the caller. <strong>TagQuery</strong> and <strong>BlobQuery</strong> match names against regular expressions from metadata. <strong>SemanticSearch</strong> is BM25 keyword search over blob contents, served by the indexer module rather than the core. <strong>TemporalSearch</strong> returns blobs whose last-modified timestamp lies in a range. The <a href="/docs/cte/usage.html">usage guide</a> shows each one.</p>
 
 <h2>The interposition chain</h2>
-<p>The core is the bottom of a chain of modules that all speak its task interface: cache (563.0), indexer (564.0), optional compressor (562.0), replication (561.0), core (512.0). A client bound to the top of the chain gets all of their behavior. A client bound to 512.0 bypasses them. The <a href="/design/chain.html">chain design page</a> explains the mechanism and the <a href="/modules/cte-core.html">CTE core module page</a> lists every configuration key.</p>
+<p>The core is the bottom of a chain of modules that all speak its task interface: indexer (564.0), shm cache (568.0), optional compressor (562.0), write-back cache (567.0), then the volatile core (540.0), with replication (561.0) and the persistent core (512.0) behind the write-back flush. The cache module (563.0) is optional and not composed by default. A client bound to the top of the chain gets all of their behavior. A client bound to 512.0 bypasses them. The <a href="/design/chain.html">chain design page</a> explains the mechanism and the <a href="/modules/cte-core.html">CTE core module page</a> lists every configuration key.</p>
 
 <h2>How the other technologies use it</h2>
 

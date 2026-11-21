@@ -32,13 +32,14 @@ page</a>.</p>
 <p>In the default chain shipped in
 <code>context-runtime/config/clio_default.yaml</code> the order is:</p>
 <pre data-label="yaml">
-cache(563.0) -> indexer(564.0) -> [compressor(562.0) ->] replication(561.0) -> core(512.0)
+indexer(564.0) -> shm cache(568.0) -> [compressor(562.0) ->] write-back(567.0)
+  -> volatile core(540.0), and on flush -> replication(561.0) -> persistent core(512.0)
 </pre>
-<p>The indexer sits <em>above</em> the compressor so that when it has to
-read a blob back it sees logical, uncompressed bytes. It must be composed
-after the pool it forwards to and before the pools that forward into it
-(the <a href="/modules/cache.html">cache</a>, the filesystem module, the CAE
-core).</p>
+<p>The indexer is the chain top. It sits <em>above</em> the compressor so
+that when it has to read a blob back it sees logical, uncompressed bytes. It
+must be composed after the pool it forwards to and before the pools that
+forward into it (the filesystem module, the stream module and the CAE core).
+The CAE forwards to 564.0, so data it imports is indexed.</p>
 
 <h2>Composing it</h2>
 <p>Minimal composition, adapted from the indexer restart test and the default
@@ -69,9 +70,9 @@ compose:
 <p>Clients then bind to the indexer pool instead of the bare core. In C++
 that means constructing a <code>clio::cte::core::Client</code> on pool
 564.0; for the Python bindings and other processes that use the shared
-client singleton, set <code>CLIO_CTE_POOL=564.0</code> (or the id of the
-chain top, usually the cache at 563.0) before initializing. Writes that
-bypass the indexer are not indexed until a backfill picks them up.</p>
+client singleton, set <code>CLIO_CTE_POOL=564.0</code> (the chain top in
+the default configuration) before initializing. Writes that bypass the
+indexer are not indexed until a backfill picks them up.</p>
 
 <h2>Operations</h2>
 <p>From <code>indexer/clio_mod.yaml</code>, the module intercepts these core
@@ -182,9 +183,9 @@ client.</p>
 <h2>Configuration</h2>
 <dl class="notes">
   <dt><code>next_pool_id</code></dt>
-  <dd>The pool this indexer forwards to, as <code>"major.minor"</code>. Usually
-  the replication pool (561.0), or the compressor (562.0) when compression is
-  enabled. Unset falls back to the canonical core pool 512.0.</dd>
+  <dd>The pool this indexer forwards to, as <code>"major.minor"</code>. In the
+  default configuration this is the shm cache (568.0). Unset falls back to
+  the canonical core pool 512.0.</dd>
   <dt><code>index_sweep_period_ms</code></dt>
   <dd>Period of the background drain. Default 100. 0 disables the sweep;
   the index is then updated only when a search runs, and the write-ahead

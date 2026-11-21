@@ -28,9 +28,14 @@ distribution and concurrency model.</p>
 
 <h2 id="where">Where it sits</h2>
 <ul>
-  <li><strong>Pool.</strong> The core is composed at pool 512.0, the
-  constant <code>kCtePoolId</code> that every CTE client and adapter
-  resolves to by default. One container runs per node.</li>
+  <li><strong>Pool.</strong> The default configuration composes two
+  cores. The persistent core sits at pool 512.0, the constant
+  <code>kCtePoolId</code>. The volatile core (RAM) sits at 540.0. Each core
+  is either volatile or persistent, set by <code>durability</code>. The
+  cores never move data between each other; the write-back cache
+  (<code>clio_cte_core_persist_write_back</code>, 567.0) joins them. See
+  <a href="/design/durability.html">durability</a>. One container of each
+  core runs per node.</li>
   <li><strong>Below it.</strong> Each entry in its <code>storage</code>
   list becomes a <a href="/modules/bdev.html">bdev</a> pool that the core
   creates and registers as a target. A target can instead bind to an
@@ -38,32 +43,34 @@ distribution and concurrency model.</p>
   with <code>existing_pool_id</code>.</li>
   <li><strong>Above it.</strong> The interposer modules speak the core's
   own task interface and stack with <code>next_pool_id</code>. The
-  canonical chain in the default configuration is cache (563.0) to indexer
-  (564.0) to optional compressor (562.0) to replication (561.0) to core
-  (512.0). Each entry must be composed after the pool it forwards to.</li>
+  chain in the default configuration is indexer (564.0), shm cache
+  (568.0), optional compressor (562.0), write-back cache (567.0). The
+  write-back cache writes to the volatile core (540.0) and flushes through
+  replication (561.0) to the persistent core (512.0). Each entry must be
+  composed after the pool it forwards to.</li>
   <li><strong>CAE.</strong> The Context Assimilation Engine core sits at
   its own pool 400.0 and forwards tag creation, put, get and semantic
-  search to the CTE core. The default configuration warns against placing
-  CAE in front of the CTE at 512.0, because the two modules' method IDs
+  search to the chain top (the indexer, 564.0). Do not place CAE at a CTE
+  pool ID such as 512.0: the two modules' method IDs 10 to 13
   collide.</li>
 </ul>
 
 <h2 id="compose">Composing it</h2>
-<p>This entry is the CTE section of <code>context-runtime/config/clio_default.yaml</code>
+<p>These entries are the two cores in <code>context-runtime/config/clio_default.yaml</code>
 with the comments removed. A RAM tier with capacity <code>0g</code> takes
 80% of system DRAM; a file tier grows lazily, so its capacity is a cap, not
-an upfront allocation.</p>
+an upfront allocation. Every device of a persistent core must have
+<code>persistence_level</code> <code>temporary</code> or
+<code>long_term</code>. To move data between the two cores, compose the
+write-back cache after them.</p>
 <pre data-label="yaml">
 compose:
   - mod_name: clio_cte_core
     pool_name: cte_main
     pool_query: local
     pool_id: "512.0"
+    durability: persistent
     storage:
-      - path: "ram::cte_ram_tier1"
-        bdev_type: "ram"
-        capacity_limit: "0g"
-        score: 1.0
       - path: "${CLIO_STORAGE_ROOT}/cte_disk_tier.dat"
         bdev_type: "file"
         capacity_limit: "10GB"
@@ -78,6 +85,20 @@ compose:
       neighborhood: 1
       default_target_timeout_ms: 30000
       poll_period_ms: 5000
+  - mod_name: clio_cte_core
+    pool_name: cte_volatile
+    pool_query: local
+    pool_id: "540.0"
+    durability: volatile
+    storage:
+      - path: "ram::cte_ram_tier1"
+        bdev_type: "ram"
+        capacity_limit: "0g"
+        score: 1.0
+    dpe:
+      dpe_type: "max_bw"
+    targets:
+      neighborhood: 1
 </pre>
 <p>To use a pool that is already composed as a tier, replace the
 <code>path</code>, <code>bdev_type</code> and <code>capacity_limit</code>
@@ -159,8 +180,9 @@ the <code>Tag</code> wrapper adds blocking convenience calls.</p>
   expression. <strong>BlobQuery</strong> matches blobs by tag and blob
   name patterns. <strong>ListLocalBlobs</strong> lists blobs matching a
   name pattern on the queried containers.</li>
-  <li><strong>SemanticSearch</strong> runs BM25 keyword search over blob
-  contents with a tag and blob filter and a top-k limit.
+  <li><strong>SemanticSearch</strong> keeps its method ID in the core's
+  interface, but the core does not serve it. The
+  <a href="/modules/indexer.html">indexer</a> module answers it.
   <strong>TemporalSearch</strong> returns blobs whose last-modified time
   falls in an inclusive range, filtered by tag and blob patterns and
   sorted by timestamp.</li>
@@ -219,8 +241,8 @@ suffixes from <code>k</code> to <code>p</code> (powers of 1024).</p>
   file path for file tiers, a URL with a prefix for <code>s3</code> and
   <code>gcs</code>. Required unless binding to an existing pool.</li>
   <li><code>bdev_type</code>: <code>file</code>, <code>ram</code>,
-  <code>hbm</code>, <code>pinned</code>, <code>noop</code>, <code>s3</code>
-  or <code>gcs</code>.</li>
+  <code>hbm</code>, <code>pinned</code>, <code>noop</code>, <code>s3</code>,
+  <code>gcs</code> or <code>daos</code>.</li>
   <li><code>capacity_limit</code>: size string. <code>0</code> is valid only
   for <code>ram</code> and means 80% of system DRAM.</li>
   <li><code>score</code>: 0.0 to 1.0. Absent means automatic scoring from
@@ -235,21 +257,32 @@ suffixes from <code>k</code> to <code>p</code> (powers of 1024).</p>
   bind to an already composed pool; the module name is for logging
   only.</li>
 </ul>
+<h3>durability</h3>
+<ul>
+  <li><code>durability</code> (top level of the entry):
+  <code>persistent</code> or <code>volatile</code>. Unset, it is inferred
+  at Create: persistent if every device is <code>temporary</code> or
+  <code>long_term</code>, else volatile. A volatile core writes no WAL and
+  starts empty.</li>
+</ul>
 <h3>performance</h3>
 <ul>
-  <li><code>metadata_log_path</code>: directory for the metadata write-ahead
-  log and snapshots. Empty (the built-in default) disables metadata
-  durability; the shipped configuration sets it.</li>
+  <li><code>metadata_log_path</code>: a file path prefix, not a directory.
+  The snapshot is written to <code>&lt;path&gt;</code> and the WAL shards
+  to <code>&lt;path&gt;.blob.N</code> and <code>&lt;path&gt;.tag.N</code>.
+  Empty (the built-in default) disables metadata durability; the shipped
+  configuration sets it. A volatile core ignores it.</li>
   <li><code>transaction_log_capacity</code>: WAL capacity, default 32 MB. A
   full snapshot is rebuilt when the WAL exceeds it.</li>
-  <li><code>flush_metadata_period_ms</code> (5000) and
-  <code>flush_data_period_ms</code> (10000): periods of the metadata and
-  data flush tasks. <code>flush_data_min_persistence</code> (1) is the
-  lowest persistence level the data flush writes to.</li>
+  <li><code>flush_metadata_period_ms</code> (5000): how often the metadata
+  WAL is synced.</li>
+  <li>The core no longer flushes data. <code>flush_data_period_ms</code> and
+  <code>flush_data_min_persistence</code> are ignored with a warning; set
+  <code>flush_period_ms</code> on the write-back cache instead.</li>
   <li><code>fsync_mode</code>: <code>durable</code> (default) returns from
-  fsync once bytes sit on a tier at the minimum persistence and are synced
-  along with the WAL; <code>deferred</code> returns at once and relies on
-  the periodic flushes.</li>
+  fsync once the write-back cache has flushed the file's dirty copies and
+  the devices and the WAL are synced; <code>deferred</code> returns at once
+  and relies on the cache's periodic flush.</li>
   <li><code>stat_targets_period_ms</code> (1000): how often each target's
   capacity and free space are re-read. Validated to 10 to 60000.</li>
   <li><code>max_concurrent_operations</code> (64),
@@ -318,13 +351,14 @@ pool its <code>next_pool_id</code> names.</p>
   copies that <code>failover_to_successor</code> serves.</li>
   <li><strong>Compressor</strong> (562.0, optional) transforms bytes on the
   way down and marks the blob with a transform flag the core persists.</li>
-  <li><strong>Indexer</strong> (564.0) sits above the compressor so its
-  read-backs see logical bytes, and keeps its own index log.</li>
-  <li><strong>Cache</strong> (563.0) is the top of the chain. It keeps a raw
-  node-local copy, routes reads to the submitter's node, and keeps the
-  zero-IPC shared-memory path live even for compressed blobs. A client
-  bound to the chain attaches the core's metadata mirror with
-  <code>AttachShmCacheOf</code>.</li>
+  <li><strong>Indexer</strong> (564.0) is the top of the chain. It sits
+  above the compressor so its read-backs see logical bytes, serves
+  SemanticSearch, and keeps its own index log.</li>
+  <li><strong>Shm cache</strong> (568.0) sits below the indexer. It caches
+  tag and blob metadata in a shared-memory segment that client processes
+  map, so a hit completes with no task.</li>
+  <li><strong>Write-back cache</strong> (567.0) lands puts in the volatile
+  core and flushes them through replication to the persistent core.</li>
   <li><strong>Filesystem</strong> maps files to tags and blobs, and points at
   the top of whatever chain is composed. Its fsync becomes SyncTag.</li>
 </ul>

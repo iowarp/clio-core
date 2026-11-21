@@ -1,9 +1,9 @@
 <!--
 title: Cache module
 heading: The <em>cache</em> module
-description: The CTE cache: the top of the storage chain, keeping a node-local raw copy of each blob for fast reads while writing through to the authoritative chain below.
+description: The CTE cache: an optional chain layer that keeps a node-local raw copy of each blob for fast reads while writing through to the authoritative chain below.
 eyebrow: Modules · Context Transfer Engine
-lede: The cache module is the top of the standard interposition chain. It keeps an untransformed copy of each blob on the node that reads or writes it, stored in the CTE core's cache-replica slot, and pushes every write down the chain before acknowledging it. Reads that hit the local copy never leave the node.
+lede: The cache module is an optional layer of the interposition chain; the default configuration does not compose it. It keeps an untransformed copy of each blob on the node that reads or writes it, stored in the CTE core's cache-replica slot, and pushes every write down the chain before acknowledging it. Reads that hit the local copy never leave the node.
 facts: Library | clio_cte_cache ; Default pool | 563.0 ; Source | context-transfer-engine/cache ; Semantics | write-through, invalidation-coherent
 -->
 <h2>What it does</h2>
@@ -23,15 +23,16 @@ primary copy is already local.</p>
 <h2>Where it sits</h2>
 <p>The cache is an interposer on the core's task interface. It overrides the
 blob data verbs and forwards everything else to <code>next_pool_id</code>.
-The default chain in <code>context-runtime/config/clio_default.yaml</code>
-is:</p>
+It is <strong>not</strong> in the default chain. The default chain in
+<code>context-runtime/config/clio_default.yaml</code> is:</p>
 <pre data-label="yaml">
-cache(563.0) -> indexer(564.0) -> [compressor(562.0) ->] replication(561.0) -> core(512.0)
+indexer(564.0) -> shm cache(568.0) -> [compressor(562.0) ->] write-back(567.0)
 </pre>
-<p>The filesystem module, the stream module and the Context Assimilation
-Engine core all point their <code>next_pool_id</code> at the cache, so data
-written through them takes the whole chain. The cache must be composed after
-every pool it forwards to.</p>
+<p>There, the shm cache (<code>clio_cte_core_shm_cache_writethru</code>)
+answers metadata from shared memory and the write-back cache
+(<code>clio_cte_core_persist_write_back</code>) holds the bytes in RAM. To
+use this module, compose it yourself and point the pools above it at 563.0.
+The cache must be composed after every pool it forwards to.</p>
 
 <h2>Composing it</h2>
 <p>From the four-node coherence test configuration
@@ -67,7 +68,7 @@ compose:
     next_pool_id: "561.0"
     min_score: 0.5
 </pre>
-<p>Clients bind to the chain top: construct a
+<p>In this chain the cache is the top, so clients bind to it: construct a
 <code>clio::cte::core::Client</code> on pool 563.0, or set
 <code>CLIO_CTE_POOL=563.0</code> for processes that use the shared client
 singleton. The cache module's own client class exists only to create the
@@ -183,10 +184,9 @@ running, nodes may disagree.</p>
 <h2>Configuration</h2>
 <dl class="notes">
   <dt><code>next_pool_id</code></dt>
-  <dd>The pool authoritative writes go to, as <code>"major.minor"</code>. In
-  the default chain this is the indexer (564.0); in a chain without the
-  indexer it is the compressor or replication pool. Unset falls back to the
-  core pool 512.0.</dd>
+  <dd>The pool authoritative writes go to, as <code>"major.minor"</code>,
+  for example the replication pool (561.0). Unset falls back to the core
+  pool 512.0.</dd>
   <dt><code>min_score</code></dt>
   <dd>Score floor for the raw cache copies, propagated to the core as the
   replica's minimum score. Default 0.5. A higher value keeps copies on fast

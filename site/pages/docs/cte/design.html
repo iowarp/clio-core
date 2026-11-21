@@ -12,12 +12,12 @@ facts: Core module | clio_cte_core ; Placement | max_bw, round_robin, random ; O
     <defs><marker id="ce0" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10 z"/></marker></defs>
     <rect class="box alt" x="20" y="20" width="250" height="60" rx="8"/><text class="title" x="32" y="44">Core client</text><text class="muted" x="32" y="64">tags, blobs, batched puts/gets</text>
     <rect class="box alt" x="300" y="20" width="250" height="60" rx="8"/><text class="title" x="312" y="44">Shared-memory mirrors</text><text class="muted" x="312" y="64">zero-IPC reads and stats</text>
-    <rect class="box hl" x="20" y="110" width="530" height="60" rx="8"/><text class="title" x="32" y="134">Interposers (cache, indexer, compressor, replication)</text><text class="muted" x="32" y="154">same task interface; override data verbs, forward the rest</text>
+    <rect class="box hl" x="20" y="110" width="530" height="60" rx="8"/><text class="title" x="32" y="134">Interposers (indexer, shm cache, compressor, write-back, replication)</text><text class="muted" x="32" y="154">same task interface; override data verbs, forward the rest</text>
     <path class="edge hl" d="M145,80 L145,108" marker-end="url(#ce0)"/>
     <rect class="box hl" x="20" y="200" width="820" height="110" rx="8"/><text class="title" x="32" y="224">Core container (one per node)</text>
     <text class="muted" x="32" y="248">tag and blob tables for the keys this node owns (by hash)</text>
     <text class="muted" x="32" y="268">placement engine (DPE) · data organizer · blob transform flags</text>
-    <text class="muted" x="32" y="288">per-worker metadata log · flush and eviction · failover routing</text>
+    <text class="muted" x="32" y="288">per-worker metadata log · eviction · failover routing</text>
     <path class="edge hl" d="M285,170 L285,198" marker-end="url(#ce0)"/>
     <path class="edge" d="M425,80 L700,198" marker-end="url(#ce0)"/><text class="muted" x="600" y="120">metadata published</text><text class="muted" x="600" y="136">to shared memory</text>
     <rect class="box" x="20" y="340" width="194" height="40" rx="8"/><text x="32" y="365">bdev: RAM</text>
@@ -94,23 +94,23 @@ facts: Core module | clio_cte_core ; Placement | max_bw, round_robin, random ; O
 
 <h2 id="write-path">A write, step by step</h2>
 <figure class="diagram">
-  <svg viewBox="0 0 860 744" role="img" aria-label="A put passes the client, cache, indexer, optional compressor and replication layers to the core container on the blob's owner node, where the placement engine picks extents, the blob table and a per-worker log shard record them, and the shared-memory mirror is refreshed; the organizer and flush tasks reuse those steps; the log shards and snapshot sit on disk, and a same-node client reads RAM-resident blobs straight from the mirror">
+  <svg viewBox="0 0 860 744" role="img" aria-label="A put passes the client, indexer, shm cache, optional compressor and write-back cache layers to a core container on the blob's owner node, where the placement engine picks extents, the blob table and a per-worker log shard record them, and the shared-memory mirror is refreshed; the organizer reuses those steps; the log shards and snapshot sit on disk, and a same-node client reads RAM-resident blobs straight from the mirror">
     <defs><marker id="cte2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10 z"/></marker></defs>
     <rect class="box alt" x="20" y="20" width="126" height="76" rx="8"/><text class="title" x="32" y="42">Client</text><text class="muted" x="32" y="62">core client API</text><text class="muted" x="32" y="80">any process</text>
-    <rect class="box hl" x="158" y="20" width="126" height="76" rx="8"/><text class="title" x="170" y="42">cache</text><text class="muted" x="170" y="62">pool 563</text><text class="muted" x="170" y="80">raw local copy</text>
-    <rect class="box hl" x="296" y="20" width="126" height="76" rx="8"/><text class="title" x="308" y="42">indexer</text><text class="muted" x="308" y="62">pool 564</text><text class="muted" x="308" y="80">search index</text>
+    <rect class="box hl" x="158" y="20" width="126" height="76" rx="8"/><text class="title" x="170" y="42">indexer</text><text class="muted" x="170" y="62">pool 564</text><text class="muted" x="170" y="80">search index</text>
+    <rect class="box hl" x="296" y="20" width="126" height="76" rx="8"/><text class="title" x="308" y="42">shm cache</text><text class="muted" x="308" y="62">pool 568</text><text class="muted" x="308" y="80">metadata in shm</text>
     <rect class="box hl" x="434" y="20" width="126" height="76" rx="8" stroke-dasharray="4 4"/><text class="title" x="446" y="42">compressor</text><text class="muted" x="446" y="62">pool 562</text><text class="muted" x="446" y="80">optional codec</text>
-    <rect class="box hl" x="572" y="20" width="126" height="76" rx="8"/><text class="title" x="584" y="42">replication</text><text class="muted" x="584" y="62">pool 561</text><text class="muted" x="584" y="80">durable copies</text>
-    <rect class="box hl" x="710" y="20" width="130" height="76" rx="8"/><text class="title" x="722" y="42">core</text><text class="muted" x="722" y="62">pool 512</text><text class="muted" x="722" y="80">owner's tables</text>
+    <rect class="box hl" x="572" y="20" width="126" height="76" rx="8"/><text class="title" x="584" y="42">write-back</text><text class="muted" x="584" y="62">pool 567</text><text class="muted" x="584" y="80">ack in RAM, flush</text>
+    <rect class="box hl" x="710" y="20" width="130" height="76" rx="8"/><text class="title" x="722" y="42">cores</text><text class="muted" x="722" y="62">540 now; 512 on</text><text class="muted" x="722" y="80">flush, via 561</text>
     <path class="edge hl" d="M146,58 L156,58" marker-end="url(#cte2)"/><path class="edge hl" d="M284,58 L294,58" marker-end="url(#cte2)"/><path class="edge hl" d="M422,58 L432,58" marker-end="url(#cte2)"/><path class="edge hl" d="M560,58 L570,58" marker-end="url(#cte2)"/><path class="edge hl" d="M698,58 L708,58" marker-end="url(#cte2)"/>
     <text class="muted" x="20" y="118">Each layer overrides a few data verbs and forwards every other core method to its next_pool_id (shipped chain shown).</text>
-    <text class="muted" x="20" y="134">The cache answers on the caller's node; the indexer, replication and core run on the blob's owner node, chosen by hash.</text>
+    <text class="muted" x="20" y="134">The shm cache answers hits in the caller's process; the other layers route each blob to its owner node by hash, as the core does.</text>
 
     <rect class="box" x="20" y="150" width="820" height="288" rx="10" stroke-dasharray="6 5"/><text class="muted" x="32" y="168">CORE CONTAINER ON THE BLOB'S OWNER NODE</text>
     <rect class="box alt" x="36" y="178" width="388" height="104" rx="8"/><text class="title" x="48" y="200">Data organizer (optional)</text>
     <text class="muted" x="48" y="220">every 5 s: snapshot blob stats and rescore them</text><text class="muted" x="48" y="236">(hotset, frecency, cyclic, scatter, grayscott)</text><text class="muted" x="48" y="252">move a blob only if its score moved by 0.05 or more:</text><text class="muted" x="48" y="268">place a new copy, swap it in, log, then free the old</text>
-    <rect class="box alt" x="436" y="178" width="388" height="104" rx="8"/><text class="title" x="448" y="200">Flush and eviction</text>
-    <text class="muted" x="448" y="220">every 10 s: move bytes on volatile tiers to a</text><text class="muted" x="448" y="236">persistent one, by the same place, swap, free steps</text><text class="muted" x="448" y="252">eviction reclaims droppable copies when a tier is full</text><text class="muted" x="448" y="268">a graceful stop flushes RAM-tier data to disk</text>
+    <rect class="box alt" x="436" y="178" width="388" height="104" rx="8"/><text class="title" x="448" y="200">Eviction (and the write-back flush)</text>
+    <text class="muted" x="448" y="220">a core never moves data to another core; the</text><text class="muted" x="448" y="236">write-back cache flushes dirty volatile blobs to</text><text class="muted" x="448" y="252">the persistent core every 10 s, on fsync and at stop;</text><text class="muted" x="448" y="268">eviction is a DelBlob on the volatile core</text>
     <path class="edge" d="M160,282 L160,300" marker-end="url(#cte2)"/>
     <rect class="box hl" x="36" y="302" width="250" height="120" rx="8"/><text class="title" x="48" y="324">1 · Placement (max_bw)</text>
     <text class="muted" x="48" y="344">keep targets with room for the bytes</text><text class="muted" x="48" y="360">prefer score ≤ blob's, hottest first</text><text class="muted" x="48" y="376">then hotter tiers, closest first</text><text class="muted" x="48" y="392">ties: bandwidth; latency if &lt; 32 KiB</text><text class="muted" x="48" y="408">skip dead nodes, wrong persistence</text>
@@ -133,7 +133,7 @@ facts: Core module | clio_cte_core ; Placement | max_bw, round_robin, random ; O
   <figcaption>A put passes the interposers and reaches the core container that
   owns the blob. There the placement engine picks extents, the blob table
   takes them, the worker's log shard records them, and the node's
-  shared-memory mirror is refreshed. The organizer and the flush task move
+  shared-memory mirror is refreshed. The organizer moves
   blobs later through the same steps, always writing the new copy before
   freeing the old, and a reader on the same node copies a RAM-resident blob
   with no task at all.</figcaption>

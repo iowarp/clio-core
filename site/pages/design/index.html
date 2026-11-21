@@ -25,18 +25,19 @@ lede: A complete introduction to CLIO Core: what each piece of the stack is, how
     <rect class="box hl" x="20" y="208" width="536" height="46" rx="8"/><text class="title" x="32" y="230">Filesystem ChiMod (clio-fs)</text><text class="muted" x="32" y="246">directories, inodes and file handles, stored as blobs</text>
     <rect class="box hl" x="572" y="208" width="268" height="46" rx="8"/><text class="title" x="584" y="230">Stream</text><text class="muted" x="584" y="246">file sizes, ordered appends</text>
 
-    <text class="muted" x="20" y="284">CHIMOD CHAIN (optional data operators)</text>
-    <rect class="box hl" x="20" y="294" width="152" height="44" rx="8"/><text class="title" x="32" y="321">Cache</text>
-    <rect class="box hl" x="192" y="294" width="152" height="44" rx="8"/><text class="title" x="204" y="321">Indexer</text>
+    <text class="muted" x="20" y="284">CHIMOD CHAIN (optional data operators; add your own anywhere)</text>
+    <rect class="box hl" x="20" y="294" width="152" height="44" rx="8"/><text class="title" x="32" y="321">Indexer</text>
+    <rect class="box hl" x="192" y="294" width="152" height="44" rx="8"/><text class="title" x="204" y="321">Shm cache</text>
     <rect class="box" x="364" y="294" width="152" height="44" rx="8" stroke-dasharray="5 4"/><text class="title" x="376" y="321">Compressor</text>
-    <rect class="box hl" x="536" y="294" width="152" height="44" rx="8"/><text class="title" x="548" y="321">Replication</text>
-    <rect class="box" x="708" y="294" width="132" height="44" rx="8" stroke-dasharray="5 4"/><text class="title" x="720" y="321">Your module</text>
+    <rect class="box hl" x="536" y="294" width="152" height="44" rx="8"/><text class="title" x="548" y="321">Write-back</text>
+    <rect class="box hl" x="708" y="294" width="132" height="44" rx="8"/><text class="title" x="720" y="321">Replication</text>
     <path class="edge hl" d="M172,316 L190,316" marker-end="url(#ah0)"/>
     <path class="edge hl" d="M344,316 L362,316" marker-end="url(#ah0)"/>
     <path class="edge hl" d="M516,316 L534,316" marker-end="url(#ah0)"/>
+    <path class="edge hl" d="M688,316 L706,316" marker-end="url(#ah0)"/>
 
     <text class="muted" x="20" y="368">CONTEXT TRANSFER ENGINE (CTE core)</text>
-    <rect class="box hl" x="20" y="378" width="820" height="50" rx="8"/><text class="title" x="32" y="400">Tags and blobs, placed by score</text><text class="muted" x="32" y="418">hash-owned metadata · placement engine · metadata log · reorganize, flush, evict</text>
+    <rect class="box hl" x="20" y="378" width="820" height="50" rx="8"/><text class="title" x="32" y="400">Tags and blobs, placed by score</text><text class="muted" x="32" y="418">a volatile core and a persistent core · hash-owned metadata · placement engine · metadata log</text>
 
     <text class="muted" x="20" y="458">STORAGE (block-device pools)</text>
     <rect class="box" x="20" y="468" width="194" height="40" rx="8"/><text x="32" y="493">RAM / HBM</text>
@@ -236,8 +237,8 @@ other Design pages follows from one of them.</p>
   than serving stale data. Coherence stamps that cannot vouch for a file
   drop the cache.</li>
   <li><strong>Keep hot paths off the network.</strong> Zero-IPC reads from
-  shared memory, local path resolution from pushed caches, write sieves and
-  write-behind, and node-local cache copies all exist to turn common
+  shared memory, local path resolution from pushed caches, the shm
+  metadata cache and the write-back cache all exist to turn common
   operations into memory accesses.</li>
 </ol>
 
@@ -250,31 +251,24 @@ other Design pages follows from one of them.</p>
   daemon on node A. On a single node, the kernel's cached size supplies
   the append offset. On a multi-node mount, the append is staged locally
   and merged by the file's stream home.</li>
-  <li><strong>Sieve.</strong> The bytes are copied into the client's
-  write sieve: a 64 KiB shared-memory page for the file's 1 MiB page
-  blob. The write returns immediately.</li>
-  <li><strong>Ship.</strong> Within about 500 µs the sieve page is sent
-  as a put to the filesystem's chain. The cache layer routes it to node A.
-  The file's page blob is owned by node B, the hash of (file tag, page
-  number), so the authoritative put travels to B. B invalidates other
-  nodes' cache copies and registers A's copy.</li>
-  <li><strong>Owner.</strong> On B, replication writes the primary (and any
-  remote copies) and passes the put to the core. The core takes the blob's
-  write token, drains readers, places the bytes (the RAM tier, since the
-  blob's score defaults to 1.0), writes them, logs the new layout, and
-  acknowledges.</li>
-  <li><strong><code>fsync</code>.</strong> The daemon drains the sieve,
-  publishes the file's size to its stream home, and waits for replication.
-  It then syncs the file's tag: B moves the page blob to a persistent tier
-  (place, swap, log, free) and fsyncs that device and its metadata log. The
-  daemon then fsyncs the stream's size log and syncs the parent directory's
-  tag, so the name is durable too. Only then does <code>fsync</code>
+  <li><strong>Put.</strong> The daemon writes the bytes into the file's
+  1 MiB page blob with one put to the top of the filesystem's chain and
+  waits for it. Writes are synchronous; there is no write buffer.</li>
+  <li><strong>Chain.</strong> The indexer notes the write and forwards it.
+  The shm cache keeps the blob's metadata in shared memory. The write-back
+  cache lands the bytes in the volatile RAM core and acknowledges. The
+  write returns.</li>
+  <li><strong><code>fsync</code>.</strong> The daemon publishes the file's
+  size to its stream home. It then syncs the file's tag: the write-back
+  cache flushes the dirty page through replication to the persistent core,
+  which fsyncs the device and its metadata log. The daemon then fsyncs the
+  stream's size log and syncs the parent directory's tag and journal, so
+  the name is durable too. Only then does <code>fsync</code>
   return.</li>
 </ol>
-<p>Any later reader on node A finds the bytes in its node-local cache copy
-and reads them through shared memory without a request. A reader on node C
-fetches them from B and gets a cache copy of its own, registered against
-B's current version.</p>
+<p>A later reader finds the blob's metadata in the shm cache and reads the
+bytes from the volatile core while they are there, else from the
+persistent core.</p>
 
 <h2 id="ledger">Tradeoff summary</h2>
 <table class="tradeoffs">
@@ -285,11 +279,11 @@ B's current version.</p>
   <tr><td><a href="placement.html#evict">Eviction</a></td><td class="good">Authoritative data is never silently dropped</td><td class="cost">Full tiers of real data return ENOSPC; each eviction pass is a full scan</td></tr>
   <tr><td><a href="durability.html">Durability</a></td><td class="good">Memory-speed writes, durability on request</td><td class="cost">Seconds of power-loss exposure for un-synced data; one copy by default</td></tr>
   <tr><td><a href="durability.html#wal">Metadata log</a></td><td class="good">Uncontended per-worker logging, cheap snapshots</td><td class="cost">No per-record checksums; recovery continues on partial state</td></tr>
-  <tr><td><a href="chain.html#replication">Replication</a></td><td class="good">Availability while degraded</td><td class="cost">Not quorum-based: degraded writes keep fewer copies and are not re-replicated</td></tr>
+  <tr><td><a href="chain.html#replication">Replication</a></td><td class="good">Availability while degraded</td><td class="cost">Not quorum-based: degraded writes keep fewer copies until the missed copy is re-made, and the list of missed copies is lost if the owner restarts</td></tr>
   <tr><td><a href="chain.html#cache">Caching</a></td><td class="good">Strong coherence, local reads</td><td class="cost">Extra local writes and owner fan-out on invalidation</td></tr>
   <tr><td><a href="filesystem.html#consistency">Filesystem</a></td><td class="good">Never serves stale namespace state</td><td class="cost">Mutations can stall ~12 s behind a partitioned holder; rename is multi-step</td></tr>
-  <tr><td><a href="filesystem.html#fuse">FUSE</a></td><td class="good">Microsecond stat and write-behind data path</td><td class="cost">Fast paths are single-node; errors surface at close or fsync</td></tr>
-  <tr><td><a href="adapters.html">Adapters</a></td><td class="good">Drop-in acceleration without code changes</td><td class="cost">Interceptors relax fsync and MPI-IO semantics; HDF5 caching never speeds up writes</td></tr>
+  <tr><td><a href="filesystem.html#fuse">FUSE</a></td><td class="good">Microsecond stat; writes straight to page blobs</td><td class="cost">Fast paths are single-node; every write waits for its put</td></tr>
+  <tr><td><a href="adapters.html">Adapters</a></td><td class="good">Drop-in acceleration without code changes</td><td class="cost">Interceptors cover only part of each API; HDF5 caching never speeds up writes</td></tr>
   <tr><td><a href="runtime.html#network">Membership</a></td><td class="good">No false "dead" verdicts at scale</td><td class="cost">Slow failure detection; no automatic container recovery</td></tr>
 </table>
 

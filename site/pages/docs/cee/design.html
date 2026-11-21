@@ -53,7 +53,7 @@ facts: Core class | ContextInterface ; Operations | bundle, query, retrieve, des
     <path class="edge" d="M320,152 L330,152 L330,304 L320,304"/>
     <path class="edge hl" d="M320,228 L354,228" marker-end="url(#cee1)"/>
     <rect class="box" x="342" y="110" width="498" height="372" rx="10" stroke-dasharray="6 5"/>
-    <text class="muted" x="356" y="128">EACH NODE · CTE CHAIN: cache → indexer → … → core</text>
+    <text class="muted" x="356" y="128">EACH NODE · CTE CHAIN: indexer → shm cache → … → cores</text>
     <rect class="box hl" x="356" y="138" width="470" height="172" rx="8"/><text class="title" x="368" y="160">Indexer container</text><text class="muted" x="368" y="178">SemanticSearch ends here; every other verb passes down</text>
     <rect class="box" x="368" y="190" width="210" height="62" rx="6"/><text class="title" x="380" y="210">Pending keys</text><text class="muted" x="380" y="228">a put goes down first,</text><text class="muted" x="380" y="244">then marks its blob dirty</text>
     <rect class="box" x="604" y="190" width="210" height="62" rx="6"/><text class="title" x="616" y="210">Forward index</text><text class="muted" x="616" y="228">per blob: term counts, length</text><text class="muted" x="616" y="244">terms: a-z 0-9 runs of 2+</text>

@@ -111,17 +111,17 @@ ctx.context_bundle([
 <h2>Describing content in the I/O path</h2>
 <p>Because the CAE core and the summarizer speak the CTE's task interface, they can be placed where ordinary puts and gets pass through them, and describe data as it is written rather than in a later pass.</p>
 <ul>
-  <li><strong>Indexer.</strong> The default CAE entry forwards to the chain top at 563.0, which runs through the indexer at 564.0. Every imported blob is therefore tokenized and answers <code>SemanticSearch</code>. Point <code>next_pool_id</code> at 512.0 to skip that.</li>
+  <li><strong>Indexer.</strong> The default CAE entry forwards to the chain top, the indexer at 564.0. Every imported blob is therefore tokenized and answers <code>SemanticSearch</code>. Point <code>next_pool_id</code> at 512.0 to skip that.</li>
   <li><strong>Summarizer labels.</strong> <code>clio_cae_summarizer</code> forwards every verb and, after a successful <code>PutBlob</code> whose tag and blob names match a rule in <code>label_matches</code>, sends the bytes to the model named by the rule with the prompt named by the rule, and stores the reply as <code>{blob_name}_label</code> in the same tag with the same placement score. The label is an ordinary blob. Matching uses regex search, not full match, so <code>.*\.txt$</code> matches names ending in <code>.txt</code>. An invalid regex disables that rule with a warning. Inference is synchronous on the handling worker, so scope the rules tightly.</li>
-  <li><strong>CAE as interceptor.</strong> Compose <code>clio_cae_core</code> at 512.0 with <code>next_pool_id</code> pointing at the real core, and a CTE client or the filesystem runs through it unchanged. Only <code>GetOrCreateTag</code>, <code>PutBlob</code>, <code>GetBlob</code> and <code>SemanticSearch</code> are forwarded, so this layout is for dedicated configurations, not the default file.</li>
+  <li><strong>CAE as interceptor.</strong> A CTE client bound to the CAE pool (400.0) has its <code>GetOrCreateTag</code>, <code>PutBlob</code>, <code>GetBlob</code> and <code>SemanticSearch</code> forwarded to <code>next_pool_id</code>. Do not compose the CAE at a CTE pool ID such as 512.0: its methods 10 to 13 collide with the CTE core's target methods.</li>
 </ul>
-<p>To enable the summarizer in the default configuration, uncomment its block, put it after the cache entry, and point the CAE core's <code>next_pool_id</code> at it:</p>
+<p>To enable the summarizer in the default configuration, uncomment its block, put it after the indexer entry (and before the CAE entry), and point the CAE core's <code>next_pool_id</code> at it:</p>
 <pre data-label="yaml">
   - mod_name: clio_cae_summarizer
     pool_name: clio_cae_summarizer
     pool_query: local
     pool_id: "401.0"
-    next_pool_id: "563.0"
+    next_pool_id: "564.0"
     label_endpoint: "http://127.0.0.1:11434"
     label_api: ollama
     label_prompts:
