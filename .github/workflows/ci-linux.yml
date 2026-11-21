@@ -335,7 +335,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm, ubuntu-26.04, ubuntu-26.04-arm]
+        # x86_64 on the newer toolchain (the deps-cpu job covers 24.04 x86_64)
+        # and arm64 for its memory model and Boost.Context's aarch64 switch.
+        os: [ubuntu-26.04, ubuntu-24.04-arm]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
