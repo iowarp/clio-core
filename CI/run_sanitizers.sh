@@ -146,13 +146,26 @@ sanitizer_gate_status() {
         # The reports themselves are only in the MemoryChecker files (and the
         # job summary, which the API does not expose): print each one with
         # its stack, so the log alone says what the defect was.
+        # ASan's log_path appends the pid, so the files are
+        # MemoryChecker.<test#>.log.<pid> (one per process the test ran);
+        # the old MemoryChecker.*.log pattern matched none of them.
         local MEMCHECK_DIR="${BUILD_DIR}/Testing/Temporary"
         local f
-        for f in "${MEMCHECK_DIR}"/MemoryChecker.*.log; do
+        for f in "${MEMCHECK_DIR}"/MemoryChecker.*.log*; do
             [ -s "${f}" ] || continue
             grep -qE "ERROR: [A-Za-z]+Sanitizer|runtime error:" "${f}" || continue
             echo "==== sanitizer report: ${f}"
-            grep -E -A40 "ERROR: [A-Za-z]+Sanitizer|runtime error:" "${f}" | head -80
+            if grep -q "ERROR: LeakSanitizer" "${f}"; then
+                # Direct leaks name the allocation that was never freed; the
+                # indirect ones hang off them. Print every direct-leak stack
+                # (up to 8), then the summary.
+                awk '/^Direct leak of/ {n++; on = (n <= 8)}
+                     /^(Indirect leak of|-----|SUMMARY: )/ {on = 0}
+                     on {print}
+                     /^SUMMARY: / {print}' "${f}" | head -400
+            else
+                grep -E -A40 "ERROR: [A-Za-z]+Sanitizer|runtime error:" "${f}" | head -80
+            fi
         done
         return 1
     fi
@@ -213,12 +226,12 @@ emit_findings_summary() {
         # Surface a sample so a reader can judge real-vs-artifact without
         # fetching anything from CDash.
         local MEMCHECK_DIR="${BUILD_DIR}/Testing/Temporary"
-        if compgen -G "${MEMCHECK_DIR}/MemoryChecker.*.log" > /dev/null 2>&1; then
+        if compgen -G "${MEMCHECK_DIR}/MemoryChecker.*.log*" > /dev/null 2>&1; then
             echo "<details><summary>Sample sanitizer messages</summary>"
             echo ""
             echo '```'
             grep -hoE "(runtime error: .*|ERROR: [A-Za-z]+Sanitizer: .*|SUMMARY: [A-Za-z]+Sanitizer: .*)" \
-                 "${MEMCHECK_DIR}"/MemoryChecker.*.log 2>/dev/null \
+                 "${MEMCHECK_DIR}"/MemoryChecker.*.log* 2>/dev/null \
                  | sort | uniq -c | sort -rn | head -40 || true
             echo '```'
             echo ""
