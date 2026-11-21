@@ -59,6 +59,19 @@ jobs:
   # without a matching bump in installers/pip/repair_wheel.sh (which stamps
   # the platform tag) and a reason to drop RHEL8.
   #------------------------------------------------------------
+  #------------------------------------------------------------
+  # Wheel breadth by ref. dev's debounced full CI (dev-full-ci.yml) builds
+  # only the wheels the test jobs below install -- every tested wheel is
+  # still built and tested -- plus one GPU wheel per variant. main, tags and
+  # manual runs on any other ref build every Python version, so nothing is
+  # published that was not built in full first. A wheel bug is a packaging
+  # bug (RPATH, bundled libs, glibc floor, missing files): it shows up on the
+  # tested versions, not only on the untested ones.
+  #   Linux x86_64 tests: 22.04=3.10, debian12=3.11, 24.04/fedora40/rocky8=3.12,
+  #                       fedora43=3.14
+  #   Linux aarch64 tests: 22.04=3.10, 24.04/rocky8=3.12
+  #   macOS / Windows tests: 3.12, 3.15
+  #------------------------------------------------------------
   build-wheels:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
@@ -69,6 +82,7 @@ jobs:
           - runner: ubuntu-latest
             arch: x86_64
             cibw_build: "cp310-manylinux_x86_64 cp311-manylinux_x86_64 cp312-manylinux_x86_64 cp313-manylinux_x86_64 cp314-manylinux_x86_64 cp315-manylinux_x86_64"
+            cibw_build_dev: "cp310-manylinux_x86_64 cp311-manylinux_x86_64 cp312-manylinux_x86_64 cp314-manylinux_x86_64"
             cibw_image: manylinux_2_28
             cibw_environment: >-
               CMAKE_PREFIX_PATH=/usr/local
@@ -78,6 +92,7 @@ jobs:
           - runner: ubuntu-24.04-arm
             arch: aarch64
             cibw_build: "cp310-manylinux_aarch64 cp311-manylinux_aarch64 cp312-manylinux_aarch64 cp313-manylinux_aarch64 cp314-manylinux_aarch64 cp315-manylinux_aarch64"
+            cibw_build_dev: "cp310-manylinux_aarch64 cp312-manylinux_aarch64"
             cibw_image: manylinux_2_28
             cibw_environment: >-
               CMAKE_PREFIX_PATH=/usr/local
@@ -100,7 +115,7 @@ jobs:
 
     - name: Build wheels
       env:
-        CIBW_BUILD: ${{ matrix.cibw_build }}
+        CIBW_BUILD: ${{ github.ref == 'refs/heads/dev' && matrix.cibw_build_dev || matrix.cibw_build }}
         CIBW_MANYLINUX_X86_64_IMAGE: ${{ matrix.cibw_image }}
         CIBW_MANYLINUX_AARCH64_IMAGE: ${{ matrix.cibw_image }}
         # fuse3-devel: Linux wheels build the FUSE adapter by default
@@ -157,7 +172,8 @@ jobs:
       fail-fast: false
       matrix:
         variant: [cuda12, rocm6, sycl]
-        py: [cp310, cp311, cp312, cp313, cp314, cp315]
+        # dev: one Python per variant (see "Wheel breadth by ref" above).
+        py: ${{ fromJSON(github.ref == 'refs/heads/dev' && '["cp312"]' || '["cp310","cp311","cp312","cp313","cp314","cp315"]') }}
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
@@ -236,7 +252,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        abi: [cp310, cp311, cp312, cp313, cp314, cp315]
+        # dev: the two ABIs test-wheels-windows installs (see "Wheel breadth
+        # by ref" above).
+        abi: ${{ fromJSON(github.ref == 'refs/heads/dev' && '["cp312","cp315"]' || '["cp310","cp311","cp312","cp313","cp314","cp315"]') }}
 
     steps:
     - name: Checkout repository
@@ -366,6 +384,7 @@ jobs:
           - runner: macos-15
             arch: arm64
             cibw_build: "cp310-macosx_arm64 cp311-macosx_arm64 cp312-macosx_arm64 cp313-macosx_arm64 cp314-macosx_arm64 cp315-macosx_arm64"
+            cibw_build_dev: "cp312-macosx_arm64 cp315-macosx_arm64"
             brew_prefix: /opt/homebrew
             macosx_deployment_target: '15.0'
 
@@ -422,7 +441,7 @@ jobs:
 
     - name: Build macOS wheels
       env:
-        CIBW_BUILD: ${{ matrix.cibw_build }}
+        CIBW_BUILD: ${{ github.ref == 'refs/heads/dev' && matrix.cibw_build_dev || matrix.cibw_build }}
         # MACOSX_DEPLOYMENT_TARGET must match (or exceed) the minimum
         # macOS target of every dylib bundled by delocate. Homebrew
         # bottles on the macos-15 runner are built for macOS 15.0, so

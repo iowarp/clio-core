@@ -28,12 +28,15 @@ concurrency:
 
 jobs:
   # ---- Matrix tier selection (issue #921) -----------------------------------
-  # A pull request builds ONE representative macOS runner; the full arm64 +
-  # Intel, macOS sweep (including xcode-27) runs on push to main/dev. Breadth on every PR
-  # commit bought little: the five runners fail together on real breakage, so
-  # what the extra four mostly added was more chances to hit a flake, more
-  # queue time, and more reruns. The sweep still gates what lands, just at the
-  # merge point instead of on every push to a branch.
+  # A pull request builds ONE representative macOS runner (build only); the
+  # full sweep runs in dev's debounced full CI and on push to main. Breadth on
+  # every PR commit bought little: the runners fail together on real breakage,
+  # so the extras mostly added flake exposure, queue time, and reruns.
+  #
+  # The full sweep is three runners: macos-15 (arm64, oldest supported),
+  # xcode-27 (newest toolchain) and macos-15-intel (x86_64). macos-26 and
+  # macos-26-intel sat between those two ends and duplicated them; macOS
+  # runners are the scarcest in the org and set the dev->main gate's length.
   #
   # macos-15 (arm64) is the PR runner: current-generation Apple silicon, the
   # default arch for contributors, and where cr_cli_cfs_rename surfaced.
@@ -51,10 +54,10 @@ jobs:
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             echo 'os=["macos-15"]' >> "$GITHUB_OUTPUT"
           else
-            echo 'os=["macos-15","macos-15-intel","macos-26","macos-26-intel","xcode-27"]' >> "$GITHUB_OUTPUT"
+            echo 'os=["macos-15","macos-15-intel","xcode-27"]' >> "$GITHUB_OUTPUT"
           fi
 
-  # ---- Standard build + ctest (arm64 + Intel, macOS 15 -> 26, xcode-27) ------
+  # ---- Standard build + ctest (macos-15 arm64, macos-15-intel, xcode-27) ----
   build-test:
     # Skipped on dev -> main PRs: dev-to-main-gate.yml checks dev's full CI on the same commit instead.
     if: ${{ !(github.event_name == 'pull_request' && github.head_ref == 'dev' && github.base_ref == 'main') }}
@@ -194,52 +197,8 @@ jobs:
             build/Testing/Temporary/CTestCostData.txt
           if-no-files-found: warn
 
-  # ---- Boost.Context stackful coroutine backend (#620) ----------------------
-  boost:
-    name: boost (${{ matrix.os }})
-    # Push-only (#921): the Boost.Context coroutine backend is a build variant,
-    # not an arch. It gates main/dev rather than every PR commit.
-    if: github.event_name != 'pull_request'
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 120
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-15, xcode-27]
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v5
-        with:
-          submodules: recursive
-      - name: Install dependencies (conda env, incl. Boost.Context)
-        run: |
-          chmod +x CI/ci-deps.sh
-          ./CI/ci-deps.sh --only-deps release
-      - name: Build with Boost backend + run ctest
-        run: |
-          if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
-            source "$HOME/miniconda3/etc/profile.d/conda.sh"
-          elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
-            source "$HOME/anaconda3/etc/profile.d/conda.sh"
-          elif command -v conda &>/dev/null; then
-            eval "$(conda shell.bash hook)"
-          fi
-          conda activate iowarp
-          # Pin ar/ranlib to Xcode's, not conda's llvm-tools — see the
-          # "Configure and build" step above and #797.
-          AR_BIN="$(xcrun -f ar 2>/dev/null || echo /usr/bin/ar)"
-          RANLIB_BIN="$(xcrun -f ranlib 2>/dev/null || echo /usr/bin/ranlib)"
-          cmake --preset boost \
-            -DCMAKE_AR="${AR_BIN}" \
-            -DCMAKE_RANLIB="${RANLIB_BIN}"
-          cmake --build build-boost -j"$(sysctl -n hw.ncpu)"
-          # #619's fallback-runtime punting has no macOS support yet (#634);
-          # those cases are excluded until it lands.
-          ctest --test-dir build-boost --output-on-failure --timeout 180 --repeat until-pass:3 \
-            -LE "ollama|flaky" -E "cr_cli_cte_fallback|cr_cli_fallback_runtime|cte_tag_large|cte_tiered_storage_all|cte_tiered_dram_default_all|cte_reorganize_all"
-      - name: Report retried-but-passed tests
-        if: always()
-        shell: bash
-        # A green check must not mean "some test failed and we retried until it
-        # did not" (#919/#921). Reports only -- never fails the job.
-        run: bash CI/report_flaky_tests.sh build-boost/Testing/Temporary/LastTest.log "macos boost ${{ matrix.os }}"
+  # ---- Boost.Context stackful coroutine backend (#620): Linux only ---------
+  # The Boost backend is opt-in (CLIO_CORE_ENABLE_BOOST_COROUTINES=OFF by
+  # default) and only forced on for NVHPC, which is Linux. Nothing shipped on
+  # this platform uses it, so it is tested on Linux (ci-linux.yml: boost-docker,
+  # boost-native on x86_64 and arm64) and not here.
