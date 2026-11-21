@@ -47,7 +47,7 @@ jobs:
   # Previously ran inside `iowarp/clio-core-devcontainer:latest`, which is
   # not pulled into a public registry the GHA runner can access (Docker
   # pull failed with "access denied" at v1.9.0). Run natively on
-  # ubuntu-latest and `apt-get install` deps inline — same shape the RPM
+  # ubuntu-24.04 (pinned, see the matrix) and `apt-get install` deps inline -- same shape the RPM
   # job already uses for Fedora.
   #-----------------------------------------------------------------------
   build-deb:
@@ -60,8 +60,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Pinned, not ubuntu-latest: ubuntu-latest moved to 26.04, whose
+          # libfuse3 is soname 4, so the .deb/AppImage linked libfuse3.so.4
+          # and failed to load on 24.04 (Test DEB/AppImage, v2.4.1-v2.5.0).
+          # The packages target noble, so build on noble.
           - arch: x86_64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
           - arch: arm64
             runner: ubuntu-24.04-arm
     steps:
@@ -196,7 +200,7 @@ jobs:
       matrix:
         include:
           - arch: x86_64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
           # AppImageKit's continuous release ships appimagetool-aarch64.AppImage;
           # build_appimage.sh.in autodetects host arch and downloads the matching
           # binary, so the same script works on either runner.
@@ -268,7 +272,7 @@ jobs:
       matrix:
         include:
           - arch: x86_64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
           - arch: arm64
             runner: ubuntu-24.04-arm
     steps:
@@ -387,7 +391,7 @@ jobs:
       matrix:
         include:
           - arch: x86_64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
           - arch: arm64
             runner: ubuntu-24.04-arm
     steps:
@@ -667,7 +671,7 @@ jobs:
       run: ls -lh packages/
 
     - name: Attach packages to GitHub Release
-      uses: softprops/action-gh-release@v1
+      uses: softprops/action-gh-release@v2
       with:
         files: packages/*
         fail_on_unmatched_files: true
