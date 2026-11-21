@@ -598,6 +598,14 @@ class PoolManager {
   // always scoped to a single map operation so the lock is never held across
   // CreatePool's co_await.
   mutable std::shared_mutex pool_metadata_mutex_;
+  /**
+   * Containers of destroyed pools, as (chimod name, handle). Destroying a pool
+   * drops its handles, but other workers may still hold copies of them
+   * (cached in a RunContext), so the objects are not deleted then: they are
+   * kept here and deleted by DestroyAllContainers() once the workers have
+   * stopped. Guarded by pool_metadata_mutex_.
+   */
+  std::vector<std::pair<std::string, DynamicContainer>> retired_containers_;
   /** Pools destroyed on this node and not re-created (see WasDestroyed). */
   std::unordered_set<PoolId> destroyed_pools_;
   mutable std::mutex destroyed_pools_mu_;

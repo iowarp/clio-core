@@ -188,6 +188,16 @@ void PoolManager::DestroyAllContainers() {
     info.static_container_ = DynamicContainer();
     info.local_container_ = DynamicContainer();
   }
+  // Containers of pools destroyed earlier (see UnregisterAllContainers). Each
+  // was retired once, when its pool's handles were dropped, so none is also in
+  // a live pool's maps above.
+  for (auto &r : retired_containers_) {
+    if (ContainerHold c = r.second.get()) {
+      c.Destroy(r.first);
+      ++destroyed;
+    }
+  }
+  retired_containers_.clear();
   if (destroyed > 0) {
     HLOG(kInfo, "PoolManager: Destroyed {} container(s) on shutdown", destroyed);
   }
@@ -419,7 +429,22 @@ void PoolManager::UnregisterAllContainers(PoolId pool_id) {
     return;
   }
 
+  // Retire the pool's containers instead of just dropping the handles: nothing
+  // else owns them, so dropping them leaked every destroyed pool's real and
+  // static containers (the intermittent cte_cli_cache_unplug LSan failure --
+  // intermittent only because a stale handle copy sometimes kept them
+  // reachable). They cannot be deleted here, since other workers may still
+  // hold cached handles; DestroyAllContainers() deletes them after the
+  // workers stop. local_container_ is one of containers_, so it is not added.
   PoolInfo &info = it->second;
+  for (auto &cpair : info.containers_) {
+    if (cpair.second.IsValid()) {
+      retired_containers_.emplace_back(info.chimod_name_, cpair.second);
+    }
+  }
+  if (info.static_container_.IsValid()) {
+    retired_containers_.emplace_back(info.chimod_name_, info.static_container_);
+  }
   info.containers_.clear();
   info.static_container_ = DynamicContainer();
   info.local_container_ = DynamicContainer();
