@@ -52,6 +52,42 @@ cn_log() {
   echo "[cluster_node $(hostname 2>/dev/null || echo '?') $(date +%H:%M:%S)] $*"
 }
 
+# Run a command with a time limit, portably. GNU `timeout` is not on macOS
+# (Homebrew installs it as `gtimeout`, but runners need not have it), and the
+# restart integration tests run this script natively on macOS. Without either,
+# fall back to a background watchdog: TERM after <secs>, KILL 5 s later.
+# Like GNU timeout, the signal goes to the command's whole process group
+# (`set -m` gives the background job its own group), so a grandchild cannot
+# keep a caller's $( ... ) pipe open. The watchdog's own output goes to
+# /dev/null for the same reason.
+# @param $1 time limit in seconds
+# @param $@ command and arguments
+# @return the command's exit status (124/137 from timeout, 143/137 from the
+#         watchdog)
+cn_bounded() {
+  local secs="$1"; shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout -k 5 "$secs" "$@"; return
+  fi
+  if command -v gtimeout >/dev/null 2>&1; then
+    gtimeout -k 5 "$secs" "$@"; return
+  fi
+  (
+    # Job control prints "[1]+ Done ..." notices on the shell's stderr; send
+    # those to /dev/null and hand the command the caller's stderr (fd 3).
+    exec 3>&2 2>/dev/null
+    set -m
+    "$@" 2>&3 3>&- &
+    pid=$!
+    ( sleep "$secs"; kill -TERM -- "-$pid" 2>/dev/null; sleep 5
+      kill -KILL -- "-$pid" 2>/dev/null ) >/dev/null 2>&1 &
+    wd=$!
+    wait "$pid"; rc=$?
+    kill -- "-$wd" 2>/dev/null; wait "$wd" 2>/dev/null
+    exit "$rc"
+  )
+}
+
 # Count files matching <dir>/*<suffix>.
 # @param $1 directory
 # @param $2 file-name suffix (e.g. .ready)
@@ -75,10 +111,10 @@ cn_ready() {
   start=$(date +%s)
   if [ "$dir" != "-" ]; then mkdir -p "$dir"; fi
   while :; do
-    # status bounds its own connect (CLIO_WAIT_SERVER=2); `timeout` guards a
+    # status bounds its own connect (CLIO_WAIT_SERVER=2); cn_bounded guards a
     # wedged probe so one hung client cannot eat the whole cap.
     out=$(CLIO_WAIT_SERVER="${CN_STATUS_WAIT:-2}" \
-          timeout -k 5 30 "$CLIO_RUN_BIN" status 2>&1)
+          cn_bounded 30 "$CLIO_RUN_BIN" status 2>&1)
     rc=$?
     if [ "$rc" -eq 0 ]; then
       cn_log "runtime RUNNING after $(( $(date +%s) - start ))s: ${out##*$'\n'}"
