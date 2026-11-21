@@ -156,7 +156,7 @@ workers stop, so no handler can be left waiting on a task that will never run.
 | `GET /api/pools/{pool}/monitor` | forward `?query` to a pool's own `Monitor()` (`?routing=local\|broadcast\|…`) |
 | `GET /api/chimods` | loaded modules, and which registered a create form / shipped pages |
 | `POST /api/pools/compose` | create a pool of ANY module via the compose path (identity fields + raw YAML) |
-| `POST /api/pools/{pool}/destroy` | shut a pool down (the Pools tab's per-card "x"; the admin pool is refused) |
+| `POST /api/pools/{pool}/destroy` | shut a pool down after flushing it (the Pools tab's per-card "x"; the admin pool is refused) |
 
 `{node}` is a node id or `local`. Addressing this node by its own id routes
 locally, so the single-node case never touches the network.
@@ -206,7 +206,11 @@ opens the pool's website — its module's page with `?pool=<id>` preselected, or
 the generic pool page (`/viz/clio_admin/pool.html`) for modules that ship none —
 and the card's corner "x" shuts the pool down after a confirmation
 (`POST /api/pools/{pool}/destroy`; destroying the admin pool is refused, since
-that is the runtime itself). Every pool page shows the pool's **task
+that is the runtime itself). Shutting a pool down runs the module's Destroy
+first, so a write-back cache flushes its dirty data before the pool goes. If
+the flush fails the pool stays running and the response is HTTP 500 with the
+reason. The request waits for the flush up to the dashboard's create timeout;
+a longer flush answers 503 while the destroy keeps running. Every pool page shows the pool's **task
 predictions**: the learned per-method CPU/wall coefficients and their MAPE
 (average prediction error), served by `GET /api/nodes/{node}/containers` and
 rendered by the shared `renderPredictions()` helper in
@@ -214,7 +218,16 @@ rendered by the shared `renderPredictions()` helper in
 
 Known issue #1000: destroying a pool whose module runs periodic tasks
 (safe-bdev, CTE) currently leaves those periodics retrying against the
-destroyed pool.
+destroyed pool. A pool unplugged with a successor (the write-back CTE cache,
+whose backing store is the pool below it) is the exception: its periodic tasks
+are retired, and other tasks still addressed to it run on the successor.
+
+The admin pool's Monitor answers `stats`, which the Pools tab fetches for every
+card, so the admin card shows these counters with no page code:
+`pools_destroyed`, `unplugs` (pools removed after a module Destroy),
+`unplug_blobs_flushed`, `unplug_bytes_flushed`, `unplug_flush_failures` (module
+Destroy calls that returned nonzero), and `redirects_installed`. The counters
+are per node and reset when the runtime restarts.
 
 ## The module websites
 

@@ -279,7 +279,7 @@ void ConfigManager::ApplyEnvOverrides() {
   }
   if (const char *env = clio::run::env::GetCompat("VIZ_BIND")) {
     if (env[0] != '\0') {
-      viz_bind_addr_ = env;
+      viz_bind_addr_ = configured_viz_bind_addr_ = env;
     }
   }
   if (const char *env = clio::run::env::GetCompat("VIZ_MAX_THREADS")) {
@@ -485,7 +485,7 @@ void ConfigManager::LoadDefault() {
   viz_enabled_ = false;
   viz_enabled_explicit_ = false;
   viz_port_ = 8080;
-  viz_bind_addr_ = "127.0.0.1";
+  viz_bind_addr_ = configured_viz_bind_addr_ = "127.0.0.1";
   viz_max_threads_ = 16;
 }
 
@@ -674,7 +674,8 @@ void ConfigManager::ParseYAML(YAML::Node &yaml_conf) {
       viz_port_ = viz["port"].as<u32>();
     }
     if (viz["bind"]) {
-      viz_bind_addr_ = viz["bind"].as<std::string>();
+      viz_bind_addr_ = configured_viz_bind_addr_ =
+          viz["bind"].as<std::string>();
     }
     if (viz["max_threads"]) {
       viz_max_threads_ = viz["max_threads"].as<u32>();

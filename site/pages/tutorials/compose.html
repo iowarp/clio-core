@@ -100,9 +100,9 @@ $ sudo chown $USER /mnt/nvme/clio /mnt/ssd/clio /mnt/hdd/clio
 <h2>4. Start with the new tiers</h2>
 <p>Use a fresh storage root for the experiment, so the new layout does not meet metadata from the old one:</p>
 <pre data-label="shell">
-$ clio_run stop
+$ clio-run stop
 $ export CLIO_SERVER_CONF=~/clio-tiers.yaml
-$ clio_run start --disk /mnt/ssd/clio/state &
+$ clio-run start --disk /mnt/ssd/clio/state &
 $ CLIO_WITH_RUNTIME=0 clio_cte_fuse ~/clio-mnt -f &
 </pre>
 <p>If a tier is misconfigured, the runtime logs a <code>Config error:</code> line that names the key. Check for one before you mount.</p>
@@ -111,7 +111,7 @@ $ CLIO_WITH_RUNTIME=0 clio_cte_fuse ~/clio-mnt -f &
 <ol class="steps">
   <li><h4>List the pools</h4>
 <pre data-label="shell">
-$ clio_run compose list
+$ clio-run compose list
 </pre></li>
   <li><h4>Open the tier roster</h4><p>Go to <a href="http://127.0.0.1:8080">127.0.0.1:8080</a>, then <strong>Pools → clio_cte_core</strong>. You should see one row per tier, with its score, capacity and free space.</p></li>
   <li><h4>Write data and watch it land</h4>
@@ -174,7 +174,7 @@ $ curl -s --data-urlencode name=/mnt/nvme/clio/extra.dat -d bdev_type=file -d ca
 </pre>
 <p>To attach a block device you composed yourself, compose it first (for example the <code>tiers.yaml</code> on the <a href="/docs/runtime/api.html#compose">CLI page</a>), then pass its pool id:</p>
 <pre data-label="shell">
-$ clio_run compose start tiers.yaml
+$ clio-run compose start tiers.yaml
 $ curl -s --data-urlencode name=ram::scratch -d attach_pool_id=320.0     http://127.0.0.1:8080/api/mod/clio_cte_core/512.0/register_target
 </pre>
 <p>Tiers added this way start with score 0, so placement uses them last, and they last until the next restart. Add them to <code>clio.yaml</code> to keep them.</p>

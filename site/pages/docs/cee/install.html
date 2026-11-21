@@ -7,7 +7,7 @@ lede: The pip wheel is the easiest way to get CEE: it ships the C++ library and 
 facts: pip | pip install iowarp-core, then import clio_cee ; CMake | CLIO_CORE_ENABLE_CEE=ON, CLIO_CORE_ENABLE_PYTHON=ON ; Binding | nanobind v2.9.2, fetched by CMake ; MCP | mcp>=1.2,<2 and pyyaml
 -->
 <h2>What each package includes</h2>
-<p>The general <a href="/docs/installation.html">installation page</a> covers every method. This page says what each one gives you for CEE.</p>
+<p>The <a href="/index.html#install">install matrix</a> on the home page covers every method. This page says what each one gives you for CEE.</p>
 <ul class="checks">
   <li><strong>pip wheel</strong> (<code>pip install iowarp-core</code>). Built with <code>CLIO_CORE_ENABLE_CEE=ON</code> and <code>CLIO_CORE_ENABLE_PYTHON=ON</code>. The wheel contains <code>libclio_cee_api</code> and the <code>clio_cee</code> extension under <code>iowarp_core/ext</code>, and importing <code>iowarp_core</code> puts that directory on <code>sys.path</code>. <code>iowarp_core.cee_available()</code> reports whether the extension is present. Wheels exist for CPython 3.10 to 3.13 on Linux x86_64 and aarch64, Windows x64 and macOS on Apple Silicon.</li>
   <li><strong>conda</strong> (<code>iowarp-core</code> on the <code>iowarp</code> channel, linux-64, Python 3.12). Includes CEE and the <code>clio_cee</code> module in the environment's site-packages.</li>
@@ -70,7 +70,7 @@ $ export PYTHONPATH=/path/to/build/bin:$PYTHONPATH
 <h2>Check the install</h2>
 <p>Start the runtime, then run a round trip from Python. On Windows, set <code>CLIO_BIND_ADDR=127.0.0.1</code> and <code>CLIO_SERVER_ADDR=127.0.0.1</code> for both the runtime and the client.</p>
 <pre data-label="shell">
-$ clio_run start &
+$ clio-run start &
 $ python -c "import iowarp_core; print(iowarp_core.cee_available())"
 </pre>
 <pre data-label="python">

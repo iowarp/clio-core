@@ -650,8 +650,11 @@ void Runtime::RegisterViz(clio::run::viz::VizServer &viz,
          HLOG(kInfo, "Viz: destroyed pool {} ({}) from the dashboard",
               pool_str, pool_name);
          if (future->GetReturnCode() != 0) {
+           // A failed module flush leaves the pool running; say why.
+           std::string why = future->error_message_.str();
            resp.Error(500, "DestroyPool failed with rc=" +
-                               std::to_string(future->GetReturnCode()));
+                               std::to_string(future->GetReturnCode()) +
+                               (why.empty() ? "" : ": " + why));
            return;
          }
          JsonWriter w;

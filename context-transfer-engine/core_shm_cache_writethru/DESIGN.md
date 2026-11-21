@@ -434,7 +434,7 @@ pipeline); VOL/VFD and clio-fs bind to the top pool of the compose.
    client; migrate clio-fs, lmcache, YCSB/bench, Python bindings and the
    defer/sieve tests (see the migration table); move gpu_vector host
    readers onto plain tasks; rebench against the deferred pipeline.
-5. Docs: `clio_default.yaml`, `docs/docs/deployment/configuration.md`.
+5. Docs: `clio_default.yaml`, and a module page under `site/pages/modules/`.
 
 ## Implementation notes (as built)
 

@@ -41,7 +41,7 @@ facts: Unit of code | Module (ChiMod), run as a pool ; Unit of work | Task, run 
 </ul>
 
 <h2>Dynamic recomposition</h2>
-<p>The stack is described by a compose file, a list of pools and their settings. The runtime creates them at startup, and <code>clio_run compose start</code> and <code>compose stop</code> create or destroy the pools in a compose file while the runtime keeps serving. New modules are discovered from a library path, so an operator built outside the tree can be added to a running deployment. Pools are recorded in a durable registry, so a restarted node brings its composition back.</p>
+<p>The stack is described by a compose file, a list of pools and their settings. The runtime creates them at startup, and <code>clio-run compose start</code> and <code>compose stop</code> create or destroy the pools in a compose file while the runtime keeps serving. New modules are discovered from a library path, so an operator built outside the tree can be added to a running deployment. Pools are recorded in a durable registry, so a restarted node brings its composition back.</p>
 
 <h2>Scheduling</h2>
 <p>Each node runs a pool of worker threads with roles: scheduling, network send and receive, a GPU queue, and I/O workers in cost classes. Tasks are mapped by predicted cost, learned from observed run times: large I/O is spread across I/O workers, cheap tasks run inline, and everything else goes to the least-loaded worker in its class. A monitor moves the queue of a worker stuck on one task to a fresh worker, grows a class whose workers are saturated, and retires idle extra workers.</p>
@@ -58,3 +58,13 @@ facts: Unit of code | Module (ChiMod), run as a pool ; Unit of work | Task, run 
 </ul>
 <p><a href="/design/runtime.html">Runtime design</a> covers each mechanism and its tradeoffs, and <a href="/docs/runtime/usage.html">the Context Runtime docs</a> show how to build a module.</p>
 
+<h2 id="source-build">Build from source</h2>
+<p>A source build has many settings and configurations to optimize the installation for your specific system. We keep an <a href="https://github.com/iowarp/clio-core/blob/main/INSTALL.md"><code>INSTALL.md</code></a> in the root of the repository, written to help AI agents install CLIO Core. Build from source to write your own ChiMods, or to enable optional transports and backends such as MPI, libfabric or io_uring. To have a coding agent do it, give it a prompt like this:</p>
+<pre data-label="prompt for a coding agent">
+Clone https://github.com/iowarp/clio-core and follow INSTALL.md to build CLIO Core
+from source on this machine with MPI and libfabric enabled
+(-DCLIO_CORE_ENABLE_MPI=ON -DCLIO_CORE_ENABLE_LIBFABRIC=ON) and tests on
+(-DCLIO_CORE_ENABLE_TESTS=ON). Install the system packages it lists for my OS,
+then start clio-run and run the runtime tests with ctest to verify the install.
+</pre>
+<p>The agent should name the options it chose for your system; the <a href="/docs/runtime/install.html">install page</a> lists the options that matter here.</p>

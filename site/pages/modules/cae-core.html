@@ -3,8 +3,8 @@ title: Context Assimilation Engine core
 heading: Context Assimilation Engine <em>core.</em>
 description: The clio_cae_core module ingests external data (local files, HDF5, HTTP, S3, GCS, Globus) into Context Transfer Engine tags from an OMNI YAML description, and can sit in front of the CTE as a transparent interceptor.
 eyebrow: Modules · Assimilation
-lede: The Context Assimilation Engine (CAE) core is the module that moves data from outside the stack into it. You describe transfers in an OMNI YAML file, submit it with clio_cae, and the module reads each source and writes it as blobs into a CTE tag. The same module can also be placed in front of the CTE core so that ordinary put, get and tag operations flow through it.
-facts: Module | clio_cae_core ; Pool ID | 400.0 ; Submit tool | clio_cae ; Source | context-assimilation-engine/core
+lede: The Context Assimilation Engine (CAE) core is the module that moves data from outside the stack into it. You describe transfers in an OMNI YAML file, submit it with clio-cae, and the module reads each source and writes it as blobs into a CTE tag. The same module can also be placed in front of the CTE core so that ordinary put, get and tag operations flow through it.
+facts: Module | clio_cae_core ; Pool ID | 400.0 ; Submit tool | clio-cae ; Source | context-assimilation-engine/core
 -->
 <h2 id="what">What assimilation does</h2>
 <p>Assimilation copies a source (a file, a dataset, an object) into the
@@ -188,11 +188,11 @@ what the dependency check accepts.</p>
   the CTE and CAE pools:
 <pre data-label="shell">
 $ export CLIO_X=/path/to/clio_config.yaml
-$ clio_run start
+$ clio-run start
 </pre></li>
   <li>Submit the OMNI file:
 <pre data-label="shell">
-$ clio_cae /path/to/transfers.yaml
+$ clio-cae /path/to/transfers.yaml
 </pre></li>
 </ol>
 <p>The tool connects to the CAE pool at 400.0, loads the file, executes

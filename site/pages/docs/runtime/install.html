@@ -4,14 +4,14 @@ heading: Install the <em>Context Runtime.</em>
 description: The runtime ships in every CLIO Core install. Building your own modules needs a development install with headers and the CMake package; this page shows how to get one and how to find it from CMake.
 eyebrow: Docs · Context Runtime
 lede: Running the runtime needs nothing beyond a normal install. Writing a ChiMod needs the headers and the clio-core CMake package, which a source or Spack install provides.
-facts: Binary | clio_run ; CMake package | clio-core (alias of iowarp-core) ; Package dir | &lt;prefix&gt;/lib/cmake/clio-core
+facts: Binary | clio-run ; CMake package | clio-core (alias of iowarp-core) ; Package dir | &lt;prefix&gt;/lib/cmake/clio-core
 -->
 <h2>To run it</h2>
-<p>Every method on the <a href="/docs/installation.html">Installation</a> page installs the runtime: the top-level option <code>CLIO_CORE_ENABLE_RUNTIME</code> defaults to <code>ON</code> and the pip wheel pins it on. After any of them:</p>
+<p>Every method in the <a href="/index.html#install">install matrix</a> installs the runtime: the top-level option <code>CLIO_CORE_ENABLE_RUNTIME</code> defaults to <code>ON</code> and the pip wheel pins it on. After any of them:</p>
 <pre data-label="shell">
 $ pip install iowarp-core
-$ clio_run --help
-$ clio_run start
+$ clio-run --help
+$ clio-run start
 </pre>
 <p>The first import of <code>iowarp_core</code> in Python copies the default configuration to <code>~/.clio/clio.yaml</code>. The release packages do not create it; without a file the runtime uses built-in defaults, and <code>CLIO_SERVER_CONF</code> points it at your own. The installed copy at <code>&lt;prefix&gt;/etc/clio/clio_default.yaml</code> documents every key.</p>
 
@@ -71,10 +71,10 @@ $ cmake -S . -B build -DCMAKE_PREFIX_PATH=$HOME/clio-inst
 </pre>
 <p>The package config finds <code>yaml-cpp</code> and <code>Threads</code> for you, looks for Boost, cereal and msgpack quietly, includes the <code>ClioCoreCommon.cmake</code> helpers that define <code>add_clio_module_client</code> and <code>add_clio_module_runtime</code>, and loads the always-available targets <code>clio::run::cxx</code>, <code>clio::run::admin_client</code> and <code>clio::run::bdev_client</code>. It prints what it found:</p>
 <pre data-label="output">
--- IOWarp Core found:
+-- CLIO Core found:
 --   Version: ...
 --   Prefix: /home/you/clio-inst
---   Clio Runtime: Available (clio::run::cxx)
+--   Context Runtime: Available (clio::run::cxx)
 --   Admin: Available (clio::run::admin_client, clio::run::admin_runtime)
 --   Bdev: Available (clio::run::bdev_client, clio::run::bdev_runtime)
 </pre>
@@ -84,7 +84,7 @@ $ cmake -S . -B build -DCMAKE_PREFIX_PATH=$HOME/clio-inst
 <pre data-label="shell">
 $ ls $HOME/clio-inst/lib/cmake/clio-core
 clio-coreConfig.cmake  clio-coreConfigVersion.cmake
-$ clio_run status
+$ clio-run status
 clio runtime (port 9413): STOPPED (clean)
 </pre>
 <p>Next: <a href="/docs/runtime/usage.html">Usage</a> builds a module against this prefix.</p>

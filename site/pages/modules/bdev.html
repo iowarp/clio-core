@@ -97,7 +97,7 @@ compose:
   <dt>alloc_log</dt>
   <dd>Path of the allocator write-ahead log. A file device logs to
   <code>&lt;pool_name&gt;.alloc_log</code> when this is unset; setting it moves
-  the log and makes even <code>clio_run start --fresh</code> recover from
+  the log and makes even <code>clio-run start --fresh</code> recover from
   it.</dd>
   <dt>persistence_level</dt>
   <dd><code>volatile</code>, <code>temporary</code> or <code>long_term</code>.
@@ -204,33 +204,51 @@ name is parsed as <code>bucket</code>, <code>bucket/prefix</code> or
 <code>s3://bucket/prefix</code>. Requests are signed with AWS Signature
 Version 4 by a header-only REST client over Poco; no AWS SDK is linked. One
 keep-alive connection is kept per worker. The bucket is created if it does
-not exist and <code>S3_ALLOW_BUCKET_CREATE</code> is <code>1</code>.
-Configuration comes from the environment of the process that starts the
-runtime:</p>
-<ul>
-  <li><code>AWS_ACCESS_KEY_ID</code> and <code>AWS_SECRET_ACCESS_KEY</code>
-  are required; pool creation fails without them.
-  <code>AWS_SESSION_TOKEN</code> is optional.</li>
-  <li><code>AWS_DEFAULT_REGION</code>, default <code>us-east-1</code>.</li>
-  <li><code>S3_ENDPOINT</code> overrides the endpoint and switches to
-  path-style addressing, which is how MinIO and the test stub are reached.
-  Unset means real AWS with the bucket in the hostname.</li>
-</ul>
+not exist and bucket creation is allowed.</p>
+<p>Settings go in an <code>s3:</code> block of the pool's compose entry (or
+of a CTE storage tier). Each key falls back to an environment variable of the
+process that starts the runtime when the block does not set it:</p>
+<div class="table-wrap"><table>
+  <thead><tr><th><code>s3:</code> key</th><th>Environment variable</th><th>Default and meaning</th></tr></thead>
+  <tbody>
+    <tr><td><code>access_key_id</code></td><td><code>AWS_ACCESS_KEY_ID</code></td><td>Required with the secret; pool creation fails without them.</td></tr>
+    <tr><td><code>secret_access_key</code></td><td><code>AWS_SECRET_ACCESS_KEY</code></td><td>Required.</td></tr>
+    <tr><td><code>session_token</code></td><td><code>AWS_SESSION_TOKEN</code></td><td>Optional, for temporary credentials.</td></tr>
+    <tr><td><code>region</code></td><td><code>AWS_DEFAULT_REGION</code></td><td><code>us-east-1</code>.</td></tr>
+    <tr><td><code>endpoint</code></td><td><code>S3_ENDPOINT</code></td><td>Unset means real AWS with the bucket in the hostname. Setting it switches to path-style addressing, which is how MinIO, Cloudflare R2 and the test stub are reached.</td></tr>
+    <tr><td><code>allow_bucket_create</code></td><td><code>S3_ALLOW_BUCKET_CREATE=1</code></td><td><code>false</code>: the bucket must exist.</td></tr>
+  </tbody>
+</table></div>
+<pre data-label="yaml">
+compose:
+  - mod_name: clio_bdev
+    pool_name: "s3://my-lab-bucket/clio"
+    pool_query: local
+    pool_id: "320.0"
+    bdev_type: s3
+    capacity: "1TB"
+    s3:
+      region: us-east-2
+      access_key_id: AKIA...
+      secret_access_key: ...
+</pre>
 <h3>gcs</h3>
 <p>Compiled in when <code>CLIO_ENABLE_GOOGLE_CLOUD</code> is defined. Same
 object layout and zero-fill convention as s3, with the pool name parsed as
 <code>bucket</code>, <code>bucket/prefix</code> or
 <code>gcs://bucket/prefix</code>. Authentication is an OAuth2 bearer token; a
-fresh HTTPS session is opened per call.</p>
-<ul>
-  <li><code>GCS_ACCESS_TOKEN</code> is required, typically the output of
-  <code>gcloud auth print-access-token</code>. The service-account JWT flow is
-  not implemented.</li>
-  <li><code>GCS_ENDPOINT</code>, default
-  <code>https://storage.googleapis.com</code>.</li>
-  <li><code>GCS_PROJECT_ID</code>, used only when creating the bucket;
-  default <code>clio-prototype</code>.</li>
-</ul>
+fresh HTTPS session is opened per call. Settings go in a <code>gcs:</code>
+block, with the same fallback to the environment:</p>
+<div class="table-wrap"><table>
+  <thead><tr><th><code>gcs:</code> key</th><th>Environment variable</th><th>Default and meaning</th></tr></thead>
+  <tbody>
+    <tr><td><code>access_token</code></td><td><code>GCS_ACCESS_TOKEN</code></td><td>Required, typically the output of <code>gcloud auth print-access-token</code>. It expires after about an hour. The service-account JWT flow is not implemented.</td></tr>
+    <tr><td><code>endpoint</code></td><td><code>GCS_ENDPOINT</code></td><td><code>https://storage.googleapis.com</code>.</td></tr>
+    <tr><td><code>project_id</code></td><td><code>GCS_PROJECT_ID</code></td><td>Used only when creating the bucket; default <code>clio-prototype</code>.</td></tr>
+  </tbody>
+</table></div>
+<div class="callout warn"><span class="callout-title">Credentials in a config file</span>
+<p>Keys in the compose file are stored wherever the file is, and the runtime's pool log under <code>conf_dir</code> keeps the compose entry so it can recreate the pool after a restart. Keep both readable only by you, or leave the keys out and use the environment variables.</p></div>
 <h3>noop</h3>
 <p>No transport is created. Allocate, free, write and read return success
 without touching any storage. It exists to measure the runtime's own

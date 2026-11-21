@@ -1175,6 +1175,17 @@ void Runtime::SyncAndCloseLogs() {
   tag_txn_logs_.clear();
 }
 
+void Runtime::SyncLogs() {
+  // Only Sync(): the shard vectors and their files stay as they are, so a
+  // record appended concurrently still reaches the file.
+  for (auto &log : blob_txn_logs_) {
+    if (log) log->Sync();
+  }
+  for (auto &log : tag_txn_logs_) {
+    if (log) log->Sync();
+  }
+}
+
 Runtime::~Runtime() {
   // Mirror Destroy()'s cleanup so deleting the container on graceful shutdown
   // frees this module's runtime-heap state (the member containers below are
@@ -1201,39 +1212,29 @@ Runtime::~Runtime() {
 
 clio::run::TaskResume Runtime::Destroy(clio::run::shared_ptr<DestroyTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  // A per-pool destroy runs while other tasks of this container may still be
+  // in flight: their WAL appends and map accesses must stay valid. So this
+  // only makes the logs durable (SyncLogs leaves them open: closing them or
+  // clearing the shard vectors under a concurrent Log() would drop or crash
+  // that record), and the in-memory maps are kept. A stop (restartable) keeps
+  // the WAL for the next start; a removal with DeleteData discards it.
   try {
-    if (stop_hook_id_ != 0) {
-      auto *manager = CLIO_RUNTIME_MANAGER;
-      if (manager != nullptr) manager->RemoveStopHook(stop_hook_id_);
-      stop_hook_id_ = 0;
+    namespace admin = clio::run::admin;
+    const bool quiesce_only =
+        (task->destruction_flags_ & admin::kDestroyPoolQuiesceOnly) != 0;
+    const bool delete_data =
+        (task->destruction_flags_ & admin::kDestroyPoolDeleteData) != 0;
+    SyncLogs();
+    if (!quiesce_only) {
+      // The pool is going away: no stop-time work from this container.
+      if (stop_hook_id_ != 0) {
+        auto *manager = CLIO_RUNTIME_MANAGER;
+        if (manager != nullptr) manager->RemoveStopHook(stop_hook_id_);
+        stop_hook_id_ = 0;
+      }
+      if (delete_data) DiscardPersistentMetadata();
     }
-    // Close WAL files (durably) before clearing data structures
-    SyncAndCloseLogs();
-
-    // Clear all registered targets and their associated data
-    registered_targets_.clear();
-    target_list_.clear();
-    target_name_to_id_.clear();
-
-    // Clear tag and blob management structures
-    tag_name_to_id_.clear();
-    tag_id_to_info_.clear();
-    tag_blob_name_to_info_.clear();
-    BlobIndexClear();
-
-    // Reset atomic counters
-    next_tag_id_minor_.store(1);
-
-    // Clear storage device configuration
-    storage_devices_.clear();
-
-    // Clear lock vectors
-    target_locks_.clear();
-    tag_locks_.clear();
-
-    // Set success status
     task->return_code_ = 0;
-
   } catch (const std::exception &e) {
     task->return_code_ = 1;
   }
@@ -1504,7 +1505,9 @@ clio::run::TaskResume Runtime::RegisterTarget(clio::run::shared_ptr<RegisterTarg
           // at runtime, or no persistence_level key) passes -1 and keeps the
           // WAL -- GetPersistenceLevelForTarget's kVolatile fallback is not a
           // promise that its blocks are disposable.
-          ConfiguredPersistenceLevel(target_name));
+          ConfiguredPersistenceLevel(target_name),
+          // The tier's s3: / gcs: block (endpoint, region, credentials).
+          ConfiguredBdevExt(target_name));
       CLIO_CO_AWAIT(create_task);
       if (create_task->return_code_ == 0 && target_node != this_node) {
         // The pool exists only on target_node, so this node has no metadata
@@ -2541,11 +2544,9 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
       // wrote, never lowering one. Per extent, because two writers sharing a
       // blob otherwise release each other's waits -- see BlobBlock.
       if (task->context_.op_flags_ & Context::kGenerational) {
-        if (task->context_.generation_ > blob_info_ptr->generation_) {
-          blob_info_ptr->generation_ = task->context_.generation_;
-        }
-        blob_info_ptr->StampRangeGeneration(offset, size,
-                                            task->context_.generation_);
+        blob_info_ptr->PublishGeneration(
+            offset, size, task->context_.generation_,
+            (task->context_.transform_flags_ & kBlobTransformed) != 0);
       }
 
       task->return_code_ = 0;
@@ -2932,11 +2933,9 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     blob_info_ptr->score_ = blob_score;
     // GENERATIONAL PUT: see the note on the replica path above.
     if (task->context_.op_flags_ & Context::kGenerational) {
-      if (task->context_.generation_ > blob_info_ptr->generation_) {
-        blob_info_ptr->generation_ = task->context_.generation_;
-      }
-      blob_info_ptr->StampRangeGeneration(offset, size,
-                                          task->context_.generation_);
+      blob_info_ptr->PublishGeneration(
+          offset, size, task->context_.generation_,
+          (context.transform_flags_ & kBlobTransformed) != 0);
       // EMPTY IS OFF. docker-compose declares `CLIO_GEN_LOG=${CLIO_GEN_LOG:-}`
     // unconditionally, so the variable is always PRESENT in the container and
     // `getenv != nullptr` would leave this on for every run.
@@ -7249,6 +7248,20 @@ int Runtime::ConfiguredPersistenceLevel(const std::string &target_name) {
     }
   }
   return -1;  // not a configured device (registered at runtime)
+}
+
+std::string Runtime::ConfiguredBdevExt(const std::string &target_name) {
+  for (size_t i = 0; i < storage_devices_.size(); ++i) {
+    const auto &device = storage_devices_[i];
+    const std::string expected_target_name = "storage_device_" + std::to_string(i);
+    if (target_name == expected_target_name || target_name == device.path_ ||
+        (target_name.rfind(device.path_, 0) == 0 &&
+         (target_name.size() == device.path_.size() ||
+          target_name[device.path_.size()] == '_'))) {
+      return device.bdev_ext_yaml_;
+    }
+  }
+  return std::string();
 }
 
 clio::run::bdev::PersistenceLevel Runtime::GetPersistenceLevelForTarget(

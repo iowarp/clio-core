@@ -16,7 +16,7 @@ Paths are relative to `context-runtime/` unless they name another component
 
 ## 2. Processes
 
-- **Runtime (server) process**: `clio_run start` (kServer mode). Owns the
+- **Runtime (server) process**: `clio-run start` (kServer mode). Owns the
   shared-memory segments, the workers, every pool's containers, and the
   network endpoints. One runtime per node; nodes are listed in the hostfile.
 - **Client processes**: applications and adapters linking module client
@@ -42,8 +42,6 @@ Paths are relative to `context-runtime/` unless they name another component
   `ServerFinalize` then `ClientFinalize` (`:163-183`). Call
   `CLIO_RUNTIME_FINALIZE()` before exit in tests (ZMQ context teardown hangs
   otherwise).
-- There is no `CLIO_RUNTIME_INIT` macro any more (only a stale mention in a
-  comment, `clio_runtime.h:81`).
 
 ## 3. Managers (singletons)
 
@@ -222,7 +220,10 @@ Never hardcode `/tmp/clio_*`. Use (`CTP introspect/src/system_info.cc:524-573`):
   `/tmp/clio_$USER` (Windows: `%TEMP%/clio_<USERNAME>`).
 - `ctp::SystemInfo::GetMemfdPath(name)` -> `<dir>/<name>` (a leading `/` is
   stripped).
-- `ctp::SystemInfo::EnsureMemfdDir()` -> creates the directory (0700).
+- `ctp::SystemInfo::EnsureMemfdDir()` -> creates the directory (0700) and
+  returns false unless it is a real directory owned by this user that no
+  other user can write (`CheckMemfdDir()`). The runtime refuses to start and
+  SHM/IPC clients refuse to attach otherwise.
 - IPC socket: `ctp::SystemInfo::GetMemfdPath("clio_" + std::to_string(port) + ".ipc")`.
 
 ### Automatic cleanup at runtime start

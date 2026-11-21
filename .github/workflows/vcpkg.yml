@@ -1,0 +1,137 @@
+name: vcpkg Port
+
+# Installs the iowarp-core vcpkg port (installers/vcpkg) the way a consumer
+# would -- `vcpkg install iowarp-core[...]` with the overlay ports -- built from
+# THIS checkout (IOWARP_CORE_SOURCE_DIR), then compiles and runs a small program
+# against the installed package with find_package(iowarp-core). Other
+# workflows use installers/vcpkg only as a dependency manifest for in-tree
+# builds; this is the one that tests the port itself.
+
+on:
+  # Never on pull requests: this runs only after a merge (push to dev/main).
+  workflow_dispatch:
+  push:
+    branches: [main, dev]
+    paths:
+      - 'installers/vcpkg/**'
+      - '.github/workflows/vcpkg.yml'
+      - 'CMakeLists.txt'
+      - 'cmake/**'
+
+concurrency:
+  group: vcpkg-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  port:
+    name: vcpkg port (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            triplet: x64-windows
+          - os: ubuntu-24.04
+            triplet: x64-linux-dynamic
+    env:
+      IOWARP_CORE_SOURCE_DIR: ${{ github.workspace }}
+      VCPKG_KEEP_ENV_VARS: IOWARP_CORE_SOURCE_DIR
+      VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/.vcpkg-bincache,readwrite
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Linux build tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config autoconf \
+            autoconf-archive automake libtool bison flex libaio-dev
+
+      # Dependencies are rebuilt only when the manifest or an overlay changes.
+      - name: Restore vcpkg binary cache
+        uses: actions/cache@v4
+        with:
+          path: .vcpkg-bincache
+          key: vcpkg-port-${{ matrix.triplet }}-${{ hashFiles('installers/vcpkg/vcpkg.json', 'installers/vcpkg/overlay-ports/**') }}
+          restore-keys: vcpkg-port-${{ matrix.triplet }}-
+
+      # Poco pulls in pcre2 with its default "jit" feature, whose portfile asks
+      # the GitHub REST API for the sljit submodule pointer without a token, so
+      # a shared runner IP gets HTTP 403 (rate limit). Fetch that JSON once with
+      # the job's token into vcpkg's download cache: the response is
+      # byte-identical, so it matches the portfile's SHA512 and vcpkg never
+      # makes the anonymous call.
+      - name: Pre-fetch pcre2's sljit pointer
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ver=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['version'])" \
+                "${VCPKG_INSTALLATION_ROOT}/ports/pcre2/vcpkg.json")
+          mkdir -p "${VCPKG_INSTALLATION_ROOT}/downloads"
+          curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
+            "https://api.github.com/repos/PCRE2Project/pcre2/contents/deps/sljit?ref=pcre2-${ver}" \
+            -o "${VCPKG_INSTALLATION_ROOT}/downloads/pcre2-pcre2-${ver}-sljit-gitlink.json"
+          echo "cached the sljit gitlink for pcre2 ${ver}"
+
+      - name: Install iowarp-core[viz,hdf5]
+        shell: bash
+        run: |
+          mkdir -p .vcpkg-bincache
+          VCPKG="${VCPKG_INSTALLATION_ROOT}/vcpkg"
+          W="$GITHUB_WORKSPACE/installers/vcpkg"
+          # Run outside the checkout: installers/vcpkg/vcpkg.json would
+          # otherwise switch vcpkg into manifest mode.
+          cd "$RUNNER_TEMP"
+          "$VCPKG" install "iowarp-core[viz,hdf5]" --classic \
+            --triplet ${{ matrix.triplet }} \
+            --overlay-ports="$W" --overlay-ports="$W/overlay-ports" \
+            --x-install-root="$RUNNER_TEMP/vcpkg-installed" || {
+              echo "=== vcpkg build logs ==="
+              find "${VCPKG_INSTALLATION_ROOT}/buildtrees/iowarp-core" -name '*.log' \
+                -exec sh -c 'echo "--- $1"; tail -100 "$1"' _ {} \; 2>/dev/null
+              exit 1
+            }
+
+      - name: Check the installed package
+        shell: bash
+        run: |
+          P="$RUNNER_TEMP/vcpkg-installed/${{ matrix.triplet }}"
+          for f in share/iowarp-core/iowarp-coreConfig.cmake \
+                   include/clio_runtime/clio_runtime.h \
+                   include/clio_cte/cpu_vector/cpu_vector.h; do
+            test -e "$P/$f" || { echo "::error::port installed without $f"; exit 1; }
+            echo "found $f"
+          done
+          ls "$P/tools/iowarp-core" | head -20
+
+      - name: Build a consumer with find_package(iowarp-core)
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/consumer"
+          cd "$RUNNER_TEMP/consumer"
+          cat > CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.25)
+          project(iowarp_consumer CXX)
+          set(CMAKE_CXX_STANDARD 20)
+          find_package(iowarp-core CONFIG REQUIRED)
+          add_executable(consumer main.cc)
+          target_link_libraries(consumer PRIVATE clio::cte::core_client)
+          EOF
+          cat > main.cc <<'EOF'
+          #include <clio_cte/core/core_client.h>
+          #include <cstdio>
+          int main() { std::puts("iowarp-core headers and libraries link"); return 0; }
+          EOF
+          cmake -S . -B build \
+            -DCMAKE_TOOLCHAIN_FILE="${VCPKG_INSTALLATION_ROOT}/scripts/buildsystems/vcpkg.cmake" \
+            -DVCPKG_TARGET_TRIPLET=${{ matrix.triplet }} \
+            -DVCPKG_INSTALLED_DIR="$RUNNER_TEMP/vcpkg-installed" \
+            -DVCPKG_MANIFEST_MODE=OFF \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release

@@ -1,9 +1,9 @@
 # CLIO Core website
 
 The public website for CLIO Core, a composable I/O stack for data-intensive
-pipelines: **Overview**, **Technologies** (the composable stack and its
+pipelines: **Overview** (with the install feature matrix), **Technologies** (the composable stack and its
 products: Context FS, key-value store, memory expansion, machine learning,
-each with measured results against alternative systems), **Docs** (installation, basic
+each with measured results against alternative systems), **Docs** (basic
 usage, concepts, CLI, Python API), **Tutorials** (composing the context
 filesystem from RAM/NVMe/SSD/disk and S3/GCS, FUSE on Linux/macOS/Windows, the
 dashboard, Python semantic query, AI agents over MCP) and **Design** (how the
@@ -13,8 +13,7 @@ It follows the editorial style of the sibling Clio sites
 ([clio-coder](https://github.com/iowarp/clio-coder) and
 [clio-agent](https://github.com/iowarp/clio-agent)): black and warm ivory,
 cyan accent, copper secondary, Newsreader headings, IBM Plex text and code,
-dark by default with a light theme. It is separate from, and narrower than,
-the Docusaurus documentation in the [`docs/`](../docs) submodule.
+dark by default with a light theme. It is the documentation for CLIO Core.
 
 ## Build and preview
 
@@ -59,7 +58,7 @@ site/
   pages/                Page sources (one HTML fragment per page)
     index.html          Overview (landing layout)
     technologies/       The stack, Context FS, key-value store, memory expansion, machine learning
-    docs/               Introduction, installation, basic usage, concepts, CLI, Python API
+    docs/               Introduction, basic usage, concepts, CLI, Python API
     tutorials/          Compose, cloud storage, FUSE x3, dashboard, Python query, AI agents
     design/             Runtime, CTE, placement, durability, chain, filesystem, adapters
   assets/

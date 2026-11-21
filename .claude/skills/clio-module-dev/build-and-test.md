@@ -178,9 +178,7 @@ segfaulted under Catch2 and passed under `simple_test.h`). Use
 The entry point is the inline function `clio::run::CLIO_INIT(mode,
 default_with_runtime = false, is_restart = false)`
 (`context-runtime/include/clio_runtime/clio_runtime.h:120-123`), wrapping
-`ClioInitImpl`. Older documents call this `CLIO_RUNTIME_INIT(...)`; **no such
-macro exists in the tree any more** -- use `CLIO_INIT`. Do not call private or
-legacy initializers (`initializeBoth`, `initializeRuntime`,
+`ClioInitImpl`. Do not call private or legacy initializers (`initializeBoth`, `initializeRuntime`,
 `initializeClient`).
 
 - Mode: `clio::run::RuntimeMode::kClient` for unit tests.
@@ -305,7 +303,7 @@ Wheels are built by scikit-build-core from `pyproject.toml`
 (`build-backend = "scikit_build_core.build"`, Release build, CMake defines in
 `[tool.scikit-build.cmake.define]`): `python -m build --wheel`. The intent is a
 self-contained, relocatable wheel (IOWarp libraries, the command-line tools
-such as `clio_run`/`clio_cte`, headers and CMake config files, `$ORIGIN`
+such as `clio-run`/`clio_cte`, headers and CMake config files, `$ORIGIN`
 RPATHs, no `LD_LIBRARY_PATH`). `.github/workflows/build-pip.yml` is the
 reference recipe. Older notes mention an `IOWARP_BUNDLE_BINARIES=ON` switch,
 `BUILD_WHEEL.md` and `build_wheel.sh`; none of these exist in the tree any

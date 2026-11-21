@@ -1,0 +1,89 @@
+# Nightly multi-node tests on the Ares cluster (self-hosted runner + Slurm).
+#
+# Replaces the docker-compose "cluster" suites (cluster-tests.yml,
+# ci-docker-distributed.yml) as the distributed signal for main and dev: those
+# fake a cluster with containers on one VM and were too flaky to run on every
+# push. Here every test gets 4 REAL nodes.
+#
+# How it runs:
+#   * The self-hosted runners (labels: self-hosted, ares, slurm) live on the
+#     Ares head node. They do no heavy work themselves.
+#   * Each matrix leg builds on one compute node (srun -N1), then takes a
+#     4-node exclusive allocation (salloc -N4) and runs
+#     CI/ares/run_distributed.sh, which launches on those nodes with srun.
+#   * main and dev run at the same time. That needs TWO runner instances
+#     registered on Ares (one runner executes one job at a time) and up to 8
+#     free nodes; a leg waits in the Slurm queue until its nodes are free.
+#   * The runner work dir is on NFS (/mnt/common), so all allocated nodes see
+#     the checkout and the build.
+#
+# Reports, never gates: not a required check. A scheduled workflow only runs
+# from the default branch's copy of this file; it checks out main and dev
+# explicitly.
+name: Nightly Ares Distributed
+
+on:
+  schedule:
+    # 06:00 UTC daily (~midnight-1 AM US Central), after nightly-full-sweep.
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch to test (blank = main and dev)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  distributed:
+    name: 4-node distributed (${{ matrix.ref }})
+    runs-on: [self-hosted, ares, slurm]
+    timeout-minutes: 180
+    # One run per branch at a time; never cancel a run in progress.
+    concurrency:
+      group: nightly-ares-${{ matrix.ref }}
+      cancel-in-progress: false
+    strategy:
+      fail-fast: false
+      matrix:
+        ref: ${{ fromJSON(inputs.ref != '' && format('["{0}"]', inputs.ref) || '["main","dev"]') }}
+    env:
+      # Partition and per-step wall limits; override in the runner's .env.
+      SLURM_PARTITION: ${{ vars.ARES_SLURM_PARTITION || 'compute' }}
+      SLURM_JOB_TAG: gh-ci-${{ github.run_id }}-${{ matrix.ref }}
+    steps:
+      - name: Checkout ${{ matrix.ref }}
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ matrix.ref }}
+          submodules: recursive
+
+      - name: Build (1 compute node)
+        timeout-minutes: 60
+        run: |
+          srun -N1 -p "$SLURM_PARTITION" --exclusive --time=00:55:00 \
+               -J "$SLURM_JOB_TAG-build" bash CI/ares/build.sh
+
+      - name: Distributed tests (4 nodes)
+        timeout-minutes: 100
+        run: |
+          salloc -N4 -p "$SLURM_PARTITION" --exclusive --time=01:35:00 \
+                 -J "$SLURM_JOB_TAG" bash CI/ares/run_distributed.sh
+
+      - name: Upload logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ares-distributed-logs-${{ matrix.ref }}
+          path: ci-logs/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # A cancelled or timed-out step may not reach salloc's own teardown.
+      - name: Release Slurm allocations
+        if: always()
+        run: |
+          scancel -u "$USER" -n "$SLURM_JOB_TAG" 2>/dev/null || true
+          scancel -u "$USER" -n "$SLURM_JOB_TAG-build" 2>/dev/null || true

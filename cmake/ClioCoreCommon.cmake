@@ -1639,7 +1639,6 @@ message(STATUS "IowarpCoreCommon.cmake loaded successfully")
 # and the helper functions gained `clio` branding (e.g. add_chimod_client ->
 # add_clio_module_client). The legacy names below are macro wrappers that
 # forward to the new names so out-of-tree CMake code keeps building unchanged.
-# See docs/deprecation-notes.md.
 #==============================================================================
 
 # Function wrappers

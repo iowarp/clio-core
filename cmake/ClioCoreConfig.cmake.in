@@ -14,7 +14,7 @@ set(CLIO_CORE_ENABLE_MPI @CLIO_CORE_ENABLE_MPI@)
 set(CLIO_CORE_ENABLE_CUDA @CLIO_CORE_ENABLE_CUDA@)
 set(CLIO_CORE_ENABLE_ROCM @CLIO_CORE_ENABLE_ROCM@)
 set(CLIO_CORE_ENABLE_SYCL @CLIO_CORE_ENABLE_SYCL@)
-if(@CLIO_CORE_ENABLE_SYCL@)
+if("@CLIO_CORE_ENABLE_SYCL@")
     set(CLIO_SYCL_COMPILER "@CLIO_SYCL_COMPILER@" CACHE STRING "SYCL compiler flavor (DPCPP|ACPP)")
     set(SYCL_TARGET "@SYCL_TARGET@" CACHE STRING "SYCL target triple")
     set(SYCL_DEVICE "@SYCL_DEVICE@" CACHE STRING "SYCL AOT device")
@@ -50,6 +50,12 @@ include(CMakeFindDependencyMacro)
 # 3. The headers that external users include don't expose Boost/cereal types in public APIs
 find_package(Boost QUIET COMPONENTS fiber context filesystem)
 find_package(cereal QUIET CONFIG)
+# Some cereal installs (Spack's package, for one) export the target as plain
+# `cereal` rather than `cereal::cereal`, which ctp::serialize links.
+if(TARGET cereal AND NOT TARGET cereal::cereal)
+    add_library(cereal::cereal INTERFACE IMPORTED)
+    set_target_properties(cereal::cereal PROPERTIES INTERFACE_LINK_LIBRARIES cereal)
+endif()
 # msgpack-c provides the `msgpack-c-static` (or `msgpack-c`) imported target
 # referenced from ClioCtp's INTERFACE_LINK_LIBRARIES. Downstream projects
 # must have this target visible at find_package(iowarp-core) time, otherwise
@@ -76,24 +82,31 @@ endif()
 # not fail because a package it never uses is missing.
 find_dependency(yaml-cpp)
 find_dependency(Threads)
-if(@CLIO_CORE_ENABLE_MPI@ AND NOT TARGET MPI::MPI_CXX)
+# ctp::lightbeam links `libzmq`, the imported target of ZeroMQ's CMake config
+# (how vcpkg provides it). Without that config loaded, `libzmq` degrades to a
+# bare library name and the consumer's link fails ("cannot open libzmq.lib").
+# pkg-config builds export a library path instead and need nothing here.
+if("@CLIO_CORE_ENABLE_ZMQ@" AND NOT TARGET libzmq)
+    find_package(ZeroMQ CONFIG QUIET)
+endif()
+if("@CLIO_CORE_ENABLE_MPI@" AND NOT TARGET MPI::MPI_CXX)
     find_package(MPI QUIET COMPONENTS CXX)  # ctp::mpi needs MPI::MPI_CXX
 endif()
 # LibPressio's config pulls in zfp, which hard-requires OpenMP for C, so
 # only look it up when the consuming project has C enabled.
 get_property(_clio_enabled_langs GLOBAL PROPERTY ENABLED_LANGUAGES)
-if(@CLIO_CTP_ENABLE_LIBPRESSIO@ AND NOT TARGET LibPressio::libpressio
+if("@CLIO_CTP_ENABLE_LIBPRESSIO@" AND NOT TARGET LibPressio::libpressio
    AND "C" IN_LIST _clio_enabled_langs)
     find_package(LibPressio QUIET)
 endif()
 unset(_clio_enabled_langs)
-if(@CLIO_CORE_ENABLE_CAE@ AND NOT TARGET CURL::libcurl)
+if("@CLIO_CORE_ENABLE_CAE@" AND NOT TARGET CURL::libcurl)
     # The CAE summarizer links libcurl when summarization was built.
     find_package(CURL QUIET)
 endif()
 
 # Find HDF5 if CAE is enabled (required for CAE runtime)
-if(@CLIO_CORE_ENABLE_CAE@)
+if("@CLIO_CORE_ENABLE_CAE@")
     # Try CONFIG mode first (for HDF5 installed to non-standard cmake/ directory)
     find_package(HDF5 COMPONENTS C QUIET CONFIG)
     if(NOT HDF5_FOUND)
@@ -139,13 +152,13 @@ include("${CMAKE_CURRENT_LIST_DIR}/../clio_run_bdev/clio_run_bdevConfig.cmake")
 set(_IOWARP_OPTIONAL_CHIMODS "")
 
 # Context Transfer Engine (CTE) - only if enabled
-if(@CLIO_CORE_ENABLE_CTE@)
+if("@CLIO_CORE_ENABLE_CTE@")
     include("${CMAKE_CURRENT_LIST_DIR}/../clio_cte_core/clio_cte_coreConfig.cmake")
     list(APPEND _IOWARP_OPTIONAL_CHIMODS "clio_cte_core")
 endif()
 
 # Context Assimilation Engine (CAE) - only if enabled
-if(@CLIO_CORE_ENABLE_CAE@)
+if("@CLIO_CORE_ENABLE_CAE@")
     include("${CMAKE_CURRENT_LIST_DIR}/../clio_cae_core/clio_cae_coreConfig.cmake")
     list(APPEND _IOWARP_OPTIONAL_CHIMODS "clio_cae_core")
 endif()
@@ -172,7 +185,7 @@ unset(_legacy_ns)
 unset(_tgt)
 
 # RPATH configuration (conditional based on build-time setting)
-if(@CLIO_CORE_ENABLE_RPATH@)
+if("@CLIO_CORE_ENABLE_RPATH@")
     if(APPLE)
         list(APPEND CMAKE_INSTALL_RPATH "@loader_path" "@loader_path/../lib")
     elseif(UNIX)
@@ -181,16 +194,16 @@ if(@CLIO_CORE_ENABLE_RPATH@)
 endif()
 
 # Include the exported targets (if any core targets need to be exported)
-# This would be populated based on what the unified IOWarp Core exports
+# This would be populated based on what the unified CLIO Core exports
 
-message(STATUS "IOWarp Core found:")
+message(STATUS "CLIO Core found:")
 message(STATUS "  Version: ${IOWARP_CORE_VERSION}")
 message(STATUS "  Prefix: ${IOWARP_CORE_PREFIX}")
 message(STATUS "")
 message(STATUS "Core Components:")
 message(STATUS "  ClioCtp: Available (ctp::cxx, ctp::configure, ctp::serialize, etc.)")
-message(STATUS "  Clio Runtime: Available (clio::run::cxx)")
-message(STATUS "  IowarpCoreCommon: Available (ChiMod build utilities)")
+message(STATUS "  Context Runtime: Available (clio::run::cxx)")
+message(STATUS "  ClioCoreCommon: Available (ChiMod build utilities)")
 message(STATUS "")
 message(STATUS "Core ChiMods (Always Available):")
 message(STATUS "  Admin: Available (clio::run::admin_client, clio::run::admin_runtime)")

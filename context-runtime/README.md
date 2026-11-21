@@ -94,6 +94,27 @@ clio_run start --fresh  # discard this node's saved state and start empty
 metadata logs, allocators, data) — stopping and starting the runtime never
 loses data. Only `--fresh` discards it.
 
+### Start, stop and remove one pool
+
+`clio_run pool` manages a single pool of the running runtime; the runtime
+itself keeps running (`clio_run stop` stops the whole runtime, and
+`clio_run compose` manages every pool of a compose file).
+
+```bash
+clio_run pool stop <pool>          # flush, then stop the pool; restartable
+clio_run pool start <pool>         # re-create a stopped pool from the pool log
+clio_run pool rm <pool>            # flush, stop, then delete the pool's data
+clio_run pool stop <pool> --force  # skip the flush: unflushed writes are lost
+clio_run pool rm <pool> --force
+```
+
+`<pool>` is a pool name or a `major.minor` id. Before a pool is removed, its
+module's Destroy runs so a write-back cache flushes its dirty data; the command
+prints how many blobs and bytes were flushed. If the flush fails the pool stays
+running. `rm` re-creates a pool that is not running from its node pool log
+first, so its data can be deleted. Bare `clio_run stop` still stops the whole
+runtime.
+
 A default configuration is seeded at `~/.clio/clio.yaml` on install. To
 override it, point `CLIO_X` at your own YAML file:
 
@@ -256,7 +277,7 @@ ctest --test-dir build/release -R comutex # synchronization tests
 ## Contributing
 
 1. Fork the repo and create a feature branch.
-2. Follow the standards in [AGENTS.md](../AGENTS.md).
+2. Follow the [contributing guide](../.claude-plugin/plugins/iowarp-contributing/skills/contributing/SKILL.md).
 3. `ctest --test-dir build/release` before opening a PR.
 4. Submit a PR against `iowarp/clio-core`.
 

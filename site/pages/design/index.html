@@ -58,7 +58,7 @@ terms of the pieces under it.</p>
 
 <h3 id="runtime">1. The runtime: one process per node</h3>
 <p>The <strong>Context Runtime</strong> is a single long-running process
-on each machine, started with <code>clio_run start</code>. By itself it
+on each machine, started with <code>clio-run start</code>. By itself it
 stores nothing. It is a host for <em>modules</em>: it loads them, gives
 them worker threads, carries requests to them, and connects to the
 runtimes on the other machines of a cluster. Everything else on this page

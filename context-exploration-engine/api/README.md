@@ -374,5 +374,5 @@ target_link_libraries(my_app
 ## See Also
 
 - [CAE Documentation](../../context-assimilation-engine/README.md)
-- [CTE Documentation](../../context-transfer-engine/docs/cte/cte.md)
+- [CTE Documentation](https://core.iowarp.ai/docs/cte/index.html)
 - [IOWarp Core Development Guide](../../CLAUDE.md)

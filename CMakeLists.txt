@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(iowarp-core VERSION 2.4.0 LANGUAGES C CXX)
+project(iowarp-core VERSION 2.5.0 LANGUAGES C CXX)
 
 #------------------------------------------------------------------------------
 # MSVC-like front end detection
@@ -53,6 +53,7 @@ option(CLIO_CORE_ENABLE_COVERAGE "Enable code coverage instrumentation for all c
 option(CLIO_CORE_ENABLE_LEAK_CHECK "Enable allocator allocation-size tracking (CTP_ALLOC_TRACK_SIZE) so tests can assert no runtime memory is leaked. Adds a small per-allocation atomic; keep OFF in production." OFF)
 option(CLIO_CORE_ENABLE_DOXYGEN "Check how well the code is documented" OFF)
 option(CLIO_CORE_ENABLE_RPATH "Enable RPATH configuration with relative ($ORIGIN) paths" ON)
+option(CLIO_CORE_SEED_USER_CONFIG "On install, copy clio_default.yaml to ~/.clio/clio.yaml if absent (package builds turn this off)" ON)
 option(CLIO_CORE_ENABLE_CPACK "Enable CPack for package generation" OFF)
 option(CLIO_CORE_ENABLE_DEB_PACKAGE "Build Debian .deb package via CPack" OFF)
 option(CLIO_CORE_ENABLE_RPM_PACKAGE "Build RPM .rpm package via CPack" OFF)
@@ -396,6 +397,12 @@ find_package(cereal REQUIRED)
 if(cereal_FOUND)
     message(STATUS "found cereal at ${cereal_DIR}")
 endif()
+# Some cereal installs (Spack's package, for one) export the target as plain
+# `cereal` rather than `cereal::cereal`, which ctp::serialize links.
+if(TARGET cereal AND NOT TARGET cereal::cereal)
+    add_library(cereal::cereal INTERFACE IMPORTED)
+    set_target_properties(cereal::cereal PROPERTIES INTERFACE_LINK_LIBRARIES cereal)
+endif()
 
 # MessagePack C library (pure C, no Boost dependency)
 # Prefer static linkage so pip wheels don't need libmsgpack-c.so at runtime.
@@ -427,6 +434,13 @@ if(CLIO_CORE_ENABLE_MPI)
     find_package(MPI REQUIRED COMPONENTS C CXX)
     set(MPI_LIBS MPI::MPI_CXX)
     message(STATUS "found mpi.h at ${MPI_CXX_INCLUDE_DIRS}")
+endif()
+# The deprecated MPI C++ bindings are never used, but mpi.h pulls them in
+# (Intel MPI's mpicxx.h, OpenMPI's and MPICH's equivalents) and some of them
+# fail to compile under newer compilers, e.g. clang in CUDA mode. Skip them
+# everywhere, since clio_ctp.h includes mpi.h for every target when MPI is on.
+if(CLIO_CORE_ENABLE_MPI)
+    add_compile_definitions(OMPI_SKIP_MPICXX MPICH_SKIP_MPICXX)
 endif()
 
 # ROCm (conditional). Only require the HIP CMake package when HIP-AMD is
@@ -1420,7 +1434,11 @@ endif()
 # Use CLIO_CORE_MSVC_LIKE (not just MSVC) so clang-cl / icx.exe on Windows take
 # the MSVC-style flag path; GNU flags break icx's /Fo handling (see issue #555).
 if(NOT CLIO_CORE_MSVC_LIKE)
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC")
+    # -fPIC has no meaning on Windows (PE/COFF) and GNU-style clang++ targeting
+    # x86_64-pc-windows-msvc rejects it outright.
+    if(NOT WIN32)
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC")
+    endif()
     if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "NVHPC")
         # Add compiler flags following Google C++ style guide
         set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -pedantic")

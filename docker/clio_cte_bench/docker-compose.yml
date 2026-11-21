@@ -37,6 +37,9 @@ services:
     # Config lookup: CLIO_SERVER_CONF is checked first by the runtime
     environment:
       - CLIO_SERVER_CONF=/etc/iowarp/clio.yaml
+      # Listen beyond the container's loopback so the published port works
+      # (the runtime defaults to loopback).
+      - CLIO_BIND_ADDR=0.0.0.0
 
     # Expose ZeroMQ port for client connections
     ports:

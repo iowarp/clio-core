@@ -4,7 +4,7 @@ heading: Context Assimilation Engine: <em>bring any data in.</em>
 description: The Context Assimilation Engine (CAE) imports files, HDF5 datasets, web, Amazon S3, Google Cloud and Globus data into CLIO Core, ingests on fault, and labels and indexes data as it is written.
 eyebrow: Technologies · Context
 lede: Pipeline data rarely starts in one place. The Context Assimilation Engine turns files, datasets and objects from wherever they live into tags and blobs in the stack, so they can be tiered, replicated, searched, mounted and trained on like anything written through CLIO Core.
-facts: Module | clio_cae_core (pool 400.0) ; Sources | file, HDF5, HTTP(S), S3, Google Cloud, Globus ; Submit | clio_cae transfers.yaml ; Labels | clio_cae_summarizer
+facts: Module | clio_cae_core (pool 400.0) ; Sources | file, HDF5, HTTP(S), S3, Google Cloud, Globus ; Submit | clio-cae transfers.yaml ; Labels | clio_cae_summarizer
 -->
 <h2>Key takeaways</h2>
 <ul class="checks">
@@ -15,7 +15,7 @@ facts: Module | clio_cae_core (pool 400.0) ; Sources | file, HDF5, HTTP(S), S3, 
 </ul>
 
 <h2>One file describes the import</h2>
-<p>An OMNI file lists transfers: a source URL, a destination tag and a format, with optional byte ranges and dependencies. <code>clio_cae transfers.yaml</code> submits it to the running engine, and the source scheme selects the assimilator: <code>file::</code>, <code>hdf5::</code>, <code>http(s)://</code>, <code>s3://</code>, <code>gs://</code> or <code>globus://</code>. Each HDF5 dataset becomes its own tag, so later work can address one variable instead of a whole file.</p>
+<p>An OMNI file lists transfers: a source URL, a destination tag and a format, with optional byte ranges and dependencies. <code>clio-cae transfers.yaml</code> submits it to the running engine, and the source scheme selects the assimilator: <code>file::</code>, <code>hdf5::</code>, <code>http(s)://</code>, <code>s3://</code>, <code>gs://</code> or <code>globus://</code>. Each HDF5 dataset becomes its own tag, so later work can address one variable instead of a whole file.</p>
 <pre data-label="yaml · transfers.yaml">
 name: ocean_run_42
 transfers:
@@ -35,6 +35,16 @@ transfers:
 
 <h2>Pages for paged consumers</h2>
 <p>Memory expansion and clio-ml address data as page 0, page 1, and so on. The engine can serve numbered pages assembled from named blobs, and with an empty blob prefix an imported file's blobs are the pager's pages. That is how <a href="/docs/ml/usage.html">clio-ml trains on an assimilated CSV or Parquet table</a> without first loading it into memory.</p>
+
+<h2 id="source-build">Build from source</h2>
+<p>A source build has many settings and configurations to optimize the installation for your specific system. We keep an <a href="https://github.com/iowarp/clio-core/blob/main/INSTALL.md"><code>INSTALL.md</code></a> in the root of the repository, written to help AI agents install CLIO Core. Build from source to enable the assimilation formats and sources that are off by default, such as HDF5, Amazon S3, Google Cloud Storage and Globus. To have a coding agent do it, give it a prompt like this:</p>
+<pre data-label="prompt for a coding agent">
+Clone https://github.com/iowarp/clio-core and follow INSTALL.md to build CLIO Core
+from source on this machine with HDF5 support in the Context Assimilation Engine
+(-DCLIO_CORE_ENABLE_HDF5=ON). Install HDF5 and the other system packages it lists
+for my OS, then run the cae tests with ctest to verify the install.
+</pre>
+<p>The agent should name the options it chose for your system; the <a href="/docs/cae/install.html">install page</a> lists the options that matter here.</p>
 
 <h2>Where to go next</h2>
 <ul>

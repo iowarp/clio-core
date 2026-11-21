@@ -1,0 +1,54 @@
+<!--
+title: Overview
+heading: The runtime <em>dashboard.</em>
+description: The web dashboard every CLIO Core runtime serves: what the Cluster, node, Pools, Context Transfer Engine, block device and Config pages show, with screenshots, and how to open it.
+eyebrow: Docs · Dashboard
+lede: Every runtime serves a web dashboard, with nothing extra to install. It shows your nodes, worker threads, pools and storage tiers, refreshes on its own, and can add or remove pools and storage tiers from the browser.
+facts: Address | http://127.0.0.1:8080 ; Turn off | clio-run start --no-viz ; Authentication | None, so keep it on loopback ; Included in | every install, pip included
+-->
+<h2>Open it</h2>
+<p>Start the runtime and open the address it logs:</p>
+<pre data-label="shell">
+$ clio-run start &
+</pre>
+<pre data-label="output">
+Viz: dashboard listening at http://127.0.0.1:8080
+</pre>
+<p>The bar at the top has three tabs, <strong>Cluster</strong>, <strong>Pools</strong> and <strong>Config</strong>, and a connection indicator on the right. Pages for a module, such as <strong>CTE</strong>, add their own tab when you open them. To use another port, reach it on a remote node, or run it in Docker, see <a href="/docs/dashboard/usage.html">usage</a>.</p>
+<div class="callout warn">
+  <span class="callout-title">No authentication</span>
+  <p>Anyone who can reach the dashboard can create and destroy pools. It listens on loopback by default. Do not bind it to a public interface without a reverse proxy that controls access.</p>
+</div>
+<p>The screenshots below come from one Windows node running the default configuration while a short benchmark writes to it.</p>
+
+<h2 id="cluster">Cluster</h2>
+<p>The landing page. One card per node shows its address and whether it is alive, with <em>leader</em> and <em>this node</em> badges. Under <strong>This node</strong> are CPU and memory meters and a worker summary: how many tasks are queued, blocked and processed.</p>
+<figure class="figure"><img src="/assets/figures/dashboard-cluster.png" alt="The Cluster page: one node card marked alive, leader and this node, then CPU, Memory and Workers cards for this node" loading="lazy"><figcaption>Cluster: one node, its CPU and memory meters, and 16 workers with nothing queued or blocked.</figcaption></figure>
+
+<h2 id="node">A node</h2>
+<p>Click a node card to see its utilization and one row per worker thread: whether it is active, its queued, blocked, periodic and retried tasks, how many it has processed, its load and how long it sleeps between polls.</p>
+<figure class="figure"><img src="/assets/figures/dashboard-node.png" alt="A node page: CPU, Memory and Identity cards, then a table of workers with active, queued, blocked, periodic, retry, processed, load and suspend columns" loading="lazy"><figcaption>A node's workers. Rising <em>queued</em> counts mean the workers cannot keep up; many <em>blocked</em> tasks mean work is waiting on I/O.</figcaption></figure>
+
+<h2 id="pools">Pools</h2>
+<p>Everything composed on this node, grouped by module: the runtime itself (<code>clio_admin</code>), block devices (<code>clio_bdev</code>), the storage engine (<code>clio_cte_core</code>), the module chain, the filesystem and the importers. <strong>Add Pool</strong> creates a new one from a form, and the <strong>×</strong> on a card destroys that pool after you confirm. Click a card to open its page.</p>
+<figure class="figure"><img src="/assets/figures/dashboard-pools.png" alt="The Pools page: an Add Pool button and cards grouped under CLIO_ADMIN, CLIO_BDEV, CLIO_CAE_CORE, CLIO_CTE_CACHE and CLIO_CTE_CORE" loading="lazy"><figcaption>Pools grouped by module. Block device cards show free space and measured latency.</figcaption></figure>
+
+<h2 id="cte">Context Transfer Engine</h2>
+<p>The page of a <code>clio_cte_core</code> pool lists its storage tiers, the targets data placement chooses between, with each one's score, free space, capacity, latency, bandwidth and bytes moved. <strong>Register bdev</strong> adds a tier while the runtime runs; the button at the end of a row removes one.</p>
+<figure class="figure"><img src="/assets/figures/dashboard-cte.png" alt="The Context Transfer Engine page: a targets table with a RAM tier at score 1.0 and a disk file tier at score 0.2, and a form to register a new block device" loading="lazy"><figcaption>The tier roster of the main CTE pool: RAM at score 1.0 above a file on disk at 0.2.</figcaption></figure>
+
+<h2 id="bdev">A block device</h2>
+<p>A <code>clio_bdev</code> pool's page has a capacity meter and every statistic the device reports. Below it, like every module page, is the scheduler's learned cost model for the pool's methods.</p>
+<figure class="figure"><img src="/assets/figures/dashboard-bdev.png" alt="A block device page: a capacity meter at 6.7 percent used and a table of statistics such as total capacity, bandwidth, latency and bytes read and written, then task predictions" loading="lazy"><figcaption>The RAM tier's block device: capacity, statistics and learned task costs.</figcaption></figure>
+
+<h2 id="config">Config</h2>
+<p>What the daemon <em>actually</em> came up with after the config file, environment variables and command-line flags were applied: ports, hostfile, worker counts, scheduler, dashboard address and loaded modules. Below that is every REST route and the module that registered it. Check here first when a setting seems to have no effect.</p>
+<figure class="figure"><img src="/assets/figures/dashboard-config.png" alt="The Config page: Networking, Scheduling, Dashboard and Loaded ChiMods cards, then a table of REST routes" loading="lazy"><figcaption>The live configuration and the route table that the <a href="/docs/dashboard/api.html">REST API reference</a> describes.</figcaption></figure>
+
+<h2>Where to go next</h2>
+<ul>
+  <li><a href="/docs/dashboard/usage.html">Usage</a>: ports and remote access, creating pools and tiers from the browser, and watching real work.</li>
+  <li><a href="/docs/dashboard/api.html">REST API</a>: script the same data with <code>curl</code>.</li>
+  <li><a href="/tutorials/dashboard.html">Dashboard tutorial</a>: a ten-minute guided tour.</li>
+  <li><a href="/docs/runtime/index.html">Context Runtime</a>: the workers, pools and modules the dashboard shows.</li>
+</ul>

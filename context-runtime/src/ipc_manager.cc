@@ -117,13 +117,27 @@ static std::condition_variable g_heartbeat_cv;
 
 namespace clio::run {
 
-// Bind address for the local server sockets (client ROUTER, response listener,
-// single-node host). CLIO_BIND_ADDR wins; otherwise loopback under
-// CLIO_TEST_MODE so a unit-test binary binding a fresh port never trips the
-// Windows Defender Firewall "Allow access?" prompt — every unit test is
-// single-node loopback. Falls back to 0.0.0.0 for real multi-interface
-// deployments. Keep all bind sites going through this so none silently default
-// to 0.0.0.0 and accumulate per-binary firewall rules.
+/** Whether an address names this machine's loopback interface. */
+static bool IsLoopbackAddr(const std::string &addr) {
+  return addr == "localhost" || addr == "::1" || addr.rfind("127.", 0) == 0;
+}
+
+// Bind address for the server sockets that are not tied to a hostfile entry:
+// the client ROUTER, each client's response listener, the control channel, and
+// node 0 of a single-node runtime. Keep all bind sites going through this.
+//
+// The runtime does not authenticate peers or clients, so the default is
+// loopback and listening on the network is opt-in:
+//   1. CLIO_BIND_ADDR, when set, always wins. Set it (for example to 0.0.0.0)
+//      to serve clients on other hosts from a single-node runtime.
+//   2. CLIO_TEST_MODE: loopback, as before.
+//   3. A configured hostfile (multi-node): 0.0.0.0, unchanged, because peers
+//      and failover clients connect to every node. Multi-node deployments
+//      stay reachable until peers authenticate.
+//   4. A client of a runtime on another host (CLIO_SERVER_ADDR is not
+//      loopback): 0.0.0.0, so the runtime can dial back to this client's
+//      response listener.
+//   5. Otherwise: loopback. (This used to be 0.0.0.0.)
 static std::string DefaultServerBindAddr() {
   if (const char *env = clio::run::env::GetCompat("BIND_ADDR")) {
     if (*env) return std::string(env);
@@ -131,7 +145,14 @@ static std::string DefaultServerBindAddr() {
   if (const char *tm = clio::run::env::GetCompat("TEST_MODE")) {
     if (*tm && std::string(tm) != "0") return std::string("127.0.0.1");
   }
-  return std::string("0.0.0.0");
+  if (ConfigManager *config = CLIO_CONFIG_MANAGER) {
+    if (!config->GetHostfilePath().empty()) return std::string("0.0.0.0");
+    const std::string server = config->GetServerAddr();
+    if (!server.empty() && !IsLoopbackAddr(server)) {
+      return std::string("0.0.0.0");
+    }
+  }
+  return std::string("127.0.0.1");
 }
 
 // True for bind addresses that can only ever serve this machine. A loopback
@@ -210,6 +231,22 @@ inline std::string LocalZmqIpcPath(u32 port) {
 IpcMode IpcManager::SelectBestIpcMode() {
   ConfigManager *config = CLIO_CONFIG_MANAGER;
 
+  // Both probes look in the per-user memfd dir. If another user controls it,
+  // what is found there is not this user's runtime.
+  switch (ctp::SystemInfo::CheckMemfdDir()) {
+    case ctp::SystemInfo::MemfdDirState::kPrivate:
+      break;
+    case ctp::SystemInfo::MemfdDirState::kMissing:
+      HLOG(kDebug, "SelectBestIpcMode: no memfd dir -> TCP");
+      return IpcMode::kTcp;
+    case ctp::SystemInfo::MemfdDirState::kUnsafe:
+      HLOG(kWarning,
+           "SelectBestIpcMode: {} is not a private directory of this user; "
+           "using TCP",
+           ctp::SystemInfo::GetMemfdDir());
+      return IpcMode::kTcp;
+  }
+
   // 1. SHM: is the server's main segment present on this host?
   if (config) {
     std::string main_seg = config->GetSharedMemorySegmentName(kMainSegment);
@@ -275,6 +312,16 @@ bool IpcManager::ClientInit() {
          ipc_mode_ == IpcMode::kShm   ? "SHM"
          : ipc_mode_ == IpcMode::kIpc ? "IPC"
                                       : "TCP");
+  }
+
+  // SHM and IPC reach the runtime through the per-user memfd dir (and so does
+  // the local control socket on macOS); refuse a dir another user controls.
+  if ((ipc_mode_ != IpcMode::kTcp || UseLocalZmqIpc()) &&
+      !ctp::SystemInfo::EnsureMemfdDir()) {
+    HLOG(kError,
+         "IpcManager::ClientInit: {} is not a private directory of this user",
+         ctp::SystemInfo::GetMemfdDir());
+    return false;
   }
 
   // Parse retry timeout environment variable
@@ -523,6 +570,17 @@ bool IpcManager::ServerInit() {
     chi_cur_worker_key_created_ = true;
   }
   CTP_THREAD_MODEL->SetTls(chi_cur_worker_key_, static_cast<Worker *>(nullptr));
+
+  // Segments, the IPC socket and the pid record all go in the per-user memfd
+  // dir. Its default name under /tmp is predictable, so another user may have
+  // created it first; do not start in a dir this user does not own.
+  if (!ctp::SystemInfo::EnsureMemfdDir()) {
+    HLOG(kError,
+         "IpcManager::ServerInit: {} is not a private directory of this user; "
+         "refusing to start",
+         ctp::SystemInfo::GetMemfdDir());
+    return false;
+  }
 
   // Clear leftover shared memory segments from previous runs
   ClearUserIpcs();
@@ -1824,20 +1882,11 @@ bool IpcManager::LoadHostfile() {
   }
 
   if (hostfile_path.empty()) {
-    // No hostfile configured: bind on all local interfaces (0.0.0.0) by
-    // default. GetServerAddr() defaults to 127.0.0.1 — fine for the
-    // client DEALER target on a single host, but useless as a hostfile
-    // entry because IdentifyThisHost matches entries against
-    // gethostname() and on real multi-rail hosts (e.g. Aurora's
-    // `x4315c7s0b0n0`) the hostname is never literally `127.0.0.1`.
-    // Pushing "0.0.0.0" here, combined with the wildcard match in
-    // IdentifyThisHost, lets the runtime come up anywhere without
-    // forcing every user to write a one-line hostfile.
-    //
-    // CLIO_BIND_ADDR env override: when set, replaces the wildcard with
-    // the requested address. Used by tests on Windows to pin to
-    // 127.0.0.1 so the Defender Firewall doesn't pop "Allow access?"
-    // for every new test binary that binds a fresh port.
+    // No hostfile configured: a single-node runtime. Node 0 binds
+    // DefaultServerBindAddr(), which is loopback unless CLIO_BIND_ADDR asks
+    // for more (for example 0.0.0.0, to serve clients on other hosts).
+    // IdentifyThisHost treats both loopback and the 0.0.0.0 wildcard as this
+    // node, so neither needs a one-line hostfile.
     std::string bind_addr = DefaultServerBindAddr();
     HLOG(kDebug, "No hostfile configured, binding {} as node 0", bind_addr);
     Host host(bind_addr, 0);
@@ -4511,6 +4560,15 @@ void IpcManager::RecvZmqClientThread() {
       auto info = recv_transport->Recv(*archive);
       int rc = info.rc;
       if (rc == EAGAIN) break;
+      if (rc == EPROTO) {
+        // The transport dropped a malformed response whole (a bulk frame
+        // that did not match its declared size). Its future stays pending
+        // rather than receiving corrupt data; keep draining the rest.
+        recv_transport->ClearRecvHandles(*archive);
+        HLOG(kError, "RecvZmqClientThread: dropped a malformed response");
+        got_message = true;
+        continue;
+      }
       if (rc != 0) {
         recv_transport->ClearRecvHandles(*archive);
         if (!zmq_recv_running_.load()) break;
@@ -5200,6 +5258,30 @@ void Task::EnsureRunCtx() {
   }
 }
 
+/**
+ * Point a task addressed to an unplugged pool at that pool's successor.
+ * Used by RouteTask and Task::BeginRunContext, so a task still addressed to
+ * an unplugged pool (sent by a pool stacked above it that was never
+ * reconfigured) runs on the successor. Periodic tasks are NOT rewritten here:
+ * RouteTask retires them instead (see RouteTask).
+ * @param task Task whose pool_id_ may be rewritten in place
+ * @param pool_manager PoolManager holding the redirects; null is a no-op
+ * @return true if pool_id_ was rewritten
+ */
+static bool FollowUnplugRedirect(Task *task, PoolManager *pool_manager) {
+  if (pool_manager == nullptr) {
+    return false;
+  }
+  PoolId successor = pool_manager->RedirectOf(task->pool_id_);
+  if (successor.IsNull()) {
+    return false;
+  }
+  HLOG(kDebug, "Task: pool {} is unplugged; rerouting method {} to pool {}",
+       task->pool_id_, task->method_, successor);
+  task->pool_id_ = successor;
+  return true;
+}
+
 void Task::BeginRunContext() {
   // Reuse an existing RunContext (e.g. one created at RecvIn to hold the
   // response-routing state) rather than clobbering it — re-allocating here
@@ -5210,6 +5292,11 @@ void Task::BeginRunContext() {
   UnsetComplete();
   UnsetNewData();
 #if CTP_IS_HOST
+  // Network-received tasks arrive already routed and skip RouteTask's redirect
+  // step, so apply it here too (periodic tasks are retired by RouteTask).
+  if (!IsPeriodic()) {
+    FollowUnplugRedirect(this, CLIO_POOL_MANAGER);
+  }
   // Resolve the execution container: the real (local) container if one exists
   // (the common case), otherwise the static container.
   ExecContainer() = CLIO_POOL_MANAGER->GetRealOrStaticContainer(pool_id_);
@@ -5225,6 +5312,23 @@ RouteResult IpcManager::RouteTask(Future<Task> &future, bool force_enqueue) {
     HLOG(kWarning, "Worker {}: RouteTask - task_ptr is null",
          worker ? worker->GetId() : 0);
     return RouteResult::Dne;
+  }
+
+  // Pool unplugged with a successor (see PoolManager::RedirectOf). A periodic
+  // task of it (e.g. the cache's FlushData) must die, never run against the
+  // successor; any other task is rewritten to the successor and routed on.
+  // This runs before the collective and routed branches below.
+  PoolManager *redirect_pm = CLIO_POOL_MANAGER;
+  if (redirect_pm != nullptr &&
+      !redirect_pm->RedirectOf(task_ptr->pool_id_).IsNull()) {
+    if (task_ptr->IsPeriodic()) {
+      HLOG(kDebug, "RouteTask: retiring periodic task of unplugged pool {} "
+           "(method {})", task_ptr->pool_id_, task_ptr->method_);
+      task_ptr->SetReturnCode(1);
+      future.SetComplete();
+      return RouteResult::Dne;
+    }
+    FollowUnplugRedirect(task_ptr.get(), redirect_pm);
   }
 
   // Collective (ManyToOne / AllToOne) routing is handled before the normal

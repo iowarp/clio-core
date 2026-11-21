@@ -193,7 +193,7 @@ class GpuApi {
 #elif CTP_ENABLE_SYCL
     auto platforms = sycl::platform::get_platforms();
     for (auto &p : platforms) {
-      auto devs = p.get_devices(sycl::info::device_type::gpu);
+      auto devs = p.get_devices(SyclDeviceType());
       ngpu += static_cast<int>(devs.size());
     }
 #endif
@@ -268,7 +268,7 @@ class GpuApi {
     stream = s;
 #endif
 #if CTP_ENABLE_SYCL
-    stream = new sycl::queue(sycl::gpu_selector_v,
+    stream = new sycl::queue(&GpuApi::SyclSelect,
                              sycl::property::queue::in_order{});
 #endif
     return stream;
@@ -1196,16 +1196,50 @@ class GpuApi {
 
 #if CTP_ENABLE_SYCL
   /**
-   * True if at least one SYCL GPU device is visible. Cached on first use:
-   * enumerating platforms on every per-op IsDevicePointer call would be far too
-   * slow. This is the guard that keeps a GPU-enabled build running on a host
-   * with no GPU — see SyclQueue()/IsDevicePointer() for why constructing a queue
-   * unconditionally is fatal there.
+   * The SYCL device type every queue and device query here uses.
+   *
+   * GPU by default. CTP_SYCL_DEVICE_TYPE=cpu selects a CPU device instead, so
+   * the same SYCL kernels run on a host with no GPU (CI, through an OpenCL CPU
+   * runtime). Read once and cached.
+   *
+   * @return sycl::info::device_type::cpu if CTP_SYCL_DEVICE_TYPE is "cpu",
+   *         otherwise sycl::info::device_type::gpu
+   */
+  static sycl::info::device_type SyclDeviceType() {
+    static const sycl::info::device_type type = [] {
+      const char *e = std::getenv("CTP_SYCL_DEVICE_TYPE");
+      return (e != nullptr && std::string(e) == "cpu")
+                 ? sycl::info::device_type::cpu
+                 : sycl::info::device_type::gpu;
+    }();
+    return type;
+  }
+
+  /**
+   * SYCL device selector for SyclDeviceType(): exactly sycl::gpu_selector_v
+   * on the default path (so device choice on real GPUs is unchanged), and
+   * sycl::cpu_selector_v under CTP_SYCL_DEVICE_TYPE=cpu.
+   *
+   * @param dev candidate device
+   * @return the selector score for dev (negative rejects it)
+   */
+  static int SyclSelect(const sycl::device &dev) {
+    return SyclDeviceType() == sycl::info::device_type::cpu
+               ? sycl::cpu_selector_v(dev)
+               : sycl::gpu_selector_v(dev);
+  }
+
+  /**
+   * True if at least one SYCL device of SyclDeviceType() is visible. Cached on
+   * first use: enumerating platforms on every per-op IsDevicePointer call
+   * would be far too slow. This is the guard that keeps a GPU-enabled build
+   * running on a host with no such device — see SyclQueue()/IsDevicePointer()
+   * for why constructing a queue unconditionally is fatal there.
    */
   static bool HasSyclGpuDevice() {
     static const bool has = [] {
       try {
-        return !sycl::device::get_devices(sycl::info::device_type::gpu).empty();
+        return !sycl::device::get_devices(SyclDeviceType()).empty();
       } catch (const sycl::exception &) {
         return false;
       }
@@ -1216,13 +1250,12 @@ class GpuApi {
   /**
    * Shared SYCL queue backing the GPU host-side helpers (Memcpy, Free,
    * Synchronize) and the device-pointer probe. Only ever call this when
-   * HasSyclGpuDevice() is true: sycl::gpu_selector_v (and even the default
-   * selector on this environment) throws "No device of requested type
-   * available" when no SYCL device is present, and an unhandled throw inside a
-   * coroutine task aborts the whole runtime server.
+   * HasSyclGpuDevice() is true: the selector throws "No device of requested
+   * type available" when no such SYCL device is present, and an unhandled
+   * throw inside a coroutine task aborts the whole runtime server.
    */
   static sycl::queue &SyclQueue() {
-    static sycl::queue q{sycl::gpu_selector_v};
+    static sycl::queue q{&GpuApi::SyclSelect};
     return q;
   }
 

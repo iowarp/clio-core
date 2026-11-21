@@ -46,13 +46,18 @@
 #include <clio_cte/core/core_tasks.h>
 #include <clio_cte/core_shm_cache_writethru/core_shm_cache_writethru_client.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <fstream>
+#include <random>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -214,6 +219,62 @@ static std::string Payload(size_t n, char seed) {
   std::string v(n, '\0');
   for (size_t i = 0; i < n; ++i) v[i] = static_cast<char>(seed + (i % 53));
   return v;
+}
+
+/**
+ * Hex dump of up to `n` bytes of `s` starting at `off`, for failure messages.
+ * @param s   the buffer
+ * @param off first byte
+ * @param n   most bytes shown
+ * @return space-separated hex bytes
+ */
+static std::string HexAt(const std::string &s, size_t off, size_t n) {
+  static const char kHex[] = "0123456789abcdef";
+  std::string out;
+  for (size_t i = off; i < s.size() && i < off + n; ++i) {
+    const unsigned char c = static_cast<unsigned char>(s[i]);
+    if (!out.empty()) out += ' ';
+    out += kHex[c >> 4];
+    out += kHex[c & 0xF];
+  }
+  return out;
+}
+
+/**
+ * Describe how a read differs from what was written, so one CI failure says
+ * where the wrong bytes are and whose they look like.
+ * @param want the bytes written (a Payload, for the seed guess)
+ * @param got  the bytes read back
+ * @return "" when equal; else sizes, the first and last differing offsets
+ *         (and their 4 KiB granule), the differing byte count, both sides'
+ *         bytes at the first difference, and the Payload seed the read
+ *         bytes there fit (another blob's seed = its bytes; 0 bytes = a hole)
+ */
+static std::string DescribeMismatch(const std::string &want,
+                                    const std::string &got) {
+  if (want == got) return "";
+  std::ostringstream os;
+  os << "size want=" << want.size() << " got=" << got.size();
+  const size_t n = std::min(want.size(), got.size());
+  size_t first = n;
+  size_t last = 0;
+  size_t diff = 0;
+  for (size_t i = 0; i < n; ++i) {
+    if (want[i] == got[i]) continue;
+    if (first == n) first = i;
+    last = i;
+    ++diff;
+  }
+  if (first == n) return os.str();
+  const int seed = static_cast<unsigned char>(got[first]) -
+                   static_cast<int>(first % 53);
+  os << "; first diff at " << first << " (granule " << first / 4096
+     << "), last at " << last << " (granule " << last / 4096 << "), "
+     << diff << " bytes differ; want[" << first << "..]: "
+     << HexAt(want, first, 16) << "; got[" << first << "..]: "
+     << HexAt(got, first, 16) << "; got fits Payload seed "
+     << ((seed % 256) + 256) % 256;
+  return os.str();
 }
 
 /**
@@ -992,7 +1053,19 @@ TEST_CASE("ShmWtc - extent mode keeps bytes in leased RAM-bdev granules",
     for (int k = 0; k < kBlobs; ++k) {
       const std::string v = Payload(1u << 20, static_cast<char>(k));
       std::string back(v.size(), '\0');
+      const clio::run::u64 hits0 = st->get_hits_.load();
+      const clio::run::u64 fills0 = st->fills_.load();
       REQUIRE(io.GetBlob(tag, "e" + std::to_string(k), 0, back.size(), back.data()) == 0);
+      if (back != v) {
+        // Where the bytes came from (a cache hit, a fill, the chain) and
+        // whether the chain itself holds the right ones.
+        const std::string below =
+            CoreRead(tag, "e" + std::to_string(k), 0, v.size());
+        INFO("blob e" << k << " read wrong bytes: " << DescribeMismatch(v, back)
+             << "; cache hits +" << st->get_hits_.load() - hits0 << " fills +"
+             << st->fills_.load() - fills0 << "; chain copy "
+             << (below == v ? "correct" : DescribeMismatch(v, below)));
+      }
       REQUIRE(back == v);
     }
     REQUIRE(st->evictions_.load() > 0);
@@ -1309,6 +1382,353 @@ TEST_CASE("ShmWtc - a device out of space is ENOSPC, not an I/O error",
   get.Wait();
   REQUIRE(get->GetReturnCode() == 0);
   REQUIRE(back == val);
+}
+
+// ===========================================================================
+// Extent-mode stress: concurrent writers, readers, evictions and fills
+// ===========================================================================
+
+/** Stress: writer threads; each owns kStressBlobsPerThread blobs. */
+static constexpr int kStressThreads = 4;
+/** Stress: blobs each thread owns (writes and reads exactly). */
+static constexpr int kStressBlobsPerThread = 8;
+/** Stress: total blobs. */
+static constexpr int kStressBlobs = kStressThreads * kStressBlobsPerThread;
+/** Stress: largest blob (bytes); writes never grow a blob past it. */
+static constexpr clio::run::u64 kStressMaxBlob = 640ull << 10;
+/** Stress: default run time (ms); CLIO_WTC_STRESS_MS overrides. */
+static constexpr int kStressDefaultMs = 4000;
+/** Stress: most mismatch reports kept for the failure message. */
+static constexpr size_t kStressMaxReports = 8;
+
+/**
+ * One 8-byte stress word: the blob, the write that produced it and the
+ * word's own position, so any read can tell whose bytes it got.
+ * @param blob blob id (1-based; 0 never written: a hole reads as 0)
+ * @param ver  write number of that blob
+ * @param idx  word index inside the blob (byte offset / 8)
+ * @return the word
+ */
+static clio::run::u64 StressWord(clio::run::u32 blob, clio::run::u32 ver,
+                                 clio::run::u64 idx) {
+  return (static_cast<clio::run::u64>(blob & 0xFFFFu) << 48) |
+         (static_cast<clio::run::u64>(ver & 0xFFFFu) << 32) |
+         (idx & 0xFFFFFFFFull);
+}
+
+/**
+ * Bytes of write `ver` of `blob` over [off, off + size).
+ * @param blob blob id
+ * @param ver  write number
+ * @param off  byte offset in the blob (multiple of 8)
+ * @param size bytes (multiple of 8)
+ * @return the bytes
+ */
+static std::string StressBytes(clio::run::u32 blob, clio::run::u32 ver,
+                               clio::run::u64 off, clio::run::u64 size) {
+  std::string s(size, '\0');
+  for (clio::run::u64 i = 0; i < size; i += 8) {
+    const clio::run::u64 w = StressWord(blob, ver, (off + i) / 8);
+    std::memcpy(&s[i], &w, 8);
+  }
+  return s;
+}
+
+/**
+ * Decode one stress word for a failure message.
+ * @param s   buffer
+ * @param pos byte offset of the word in s
+ * @return "blob B ver V at byte X" or "zero"
+ */
+static std::string StressWordAt(const std::string &s, size_t pos) {
+  clio::run::u64 w = 0;
+  std::memcpy(&w, s.data() + pos, 8);
+  if (w == 0) return "zero";
+  std::ostringstream os;
+  os << "blob " << (w >> 48) << " ver " << ((w >> 32) & 0xFFFFu)
+     << " at byte " << (w & 0xFFFFFFFFull) * 8;
+  return os.str();
+}
+
+/**
+ * Compare an exact read of a blob range with the owner's model.
+ * @param want the model's bytes of the range
+ * @param got  the bytes read
+ * @param off  byte offset of the range in the blob
+ * @return "" when equal; else the first differing word decoded both ways
+ *         and how many words differ
+ */
+static std::string StressDiff(const std::string &want, const std::string &got,
+                              clio::run::u64 off) {
+  if (want == got) return "";
+  size_t first = want.size();
+  size_t nbad = 0;
+  for (size_t i = 0; i + 8 <= want.size(); i += 8) {
+    if (std::memcmp(want.data() + i, got.data() + i, 8) == 0) continue;
+    if (first == want.size()) first = i;
+    ++nbad;
+  }
+  if (first == want.size()) return "sizes differ";
+  std::ostringstream os;
+  os << nbad << " words differ; first at byte " << off + first
+     << " (granule " << (off + first) / 4096 << "): want "
+     << StressWordAt(want, first) << ", got " << StressWordAt(got, first);
+  return os.str();
+}
+
+/**
+ * Check a read of a blob another thread writes concurrently: each word must
+ * be a hole (0) or a word of THAT blob written at THAT position (any write).
+ * @param got  the bytes read
+ * @param blob the blob id read
+ * @param off  byte offset of the read in the blob
+ * @return "" when consistent, else the first foreign word decoded
+ */
+static std::string StressForeignCheck(const std::string &got,
+                                      clio::run::u32 blob,
+                                      clio::run::u64 off) {
+  for (size_t i = 0; i + 8 <= got.size(); i += 8) {
+    clio::run::u64 w = 0;
+    std::memcpy(&w, got.data() + i, 8);
+    if (w == 0) continue;
+    if ((w >> 48) == (blob & 0xFFFFu) &&
+        (w & 0xFFFFFFFFull) == (off + i) / 8) {
+      continue;
+    }
+    std::ostringstream os;
+    os << "byte " << off + i << " (granule " << (off + i) / 4096
+       << ") holds " << StressWordAt(got, i);
+    return os.str();
+  }
+  return "";
+}
+
+/** State the stress threads share. */
+struct StressShared {
+  clio::cte::core::Client *io_ = nullptr;
+  TagId tag_;
+  /** Size of each blob as of its owner's last COMPLETED write (only grows):
+   *  a concurrent reader stays inside it. */
+  std::atomic<clio::run::u64> sizes_[kStressBlobs];
+  std::atomic<bool> stop_{false};
+  std::atomic<clio::run::u64> writes_{0};
+  std::atomic<clio::run::u64> reads_{0};
+  std::atomic<clio::run::u64> bad_{0};
+  std::mutex mu_;
+  std::vector<std::string> reports_;
+
+  StressShared() {
+    for (auto &s : sizes_) s.store(0);
+  }
+
+  /**
+   * Record one wrong result (kept up to kStressMaxReports).
+   * @param what description
+   */
+  void Report(const std::string &what) {
+    bad_.fetch_add(1);
+    std::lock_guard<std::mutex> g(mu_);
+    if (reports_.size() < kStressMaxReports) reports_.push_back(what);
+  }
+};
+
+/** Name of stress blob `id`. */
+static std::string StressName(clio::run::u32 id) {
+  return "x" + std::to_string(id);
+}
+
+/** One owner thread's blobs: exact contents and write counters. */
+struct StressModel {
+  std::vector<std::string> bytes_;
+  std::vector<clio::run::u32> vers_;
+};
+
+/**
+ * Stress write: a random range of one owned blob (a rewrite, an append or a
+ * growth past a hole), of a random size class, then update the model.
+ * @param sh    shared state
+ * @param rng   this thread's generator
+ * @param m     this thread's model
+ * @param first id of this thread's first blob
+ */
+static void StressWrite(StressShared &sh, std::mt19937_64 &rng, StressModel &m,
+                        clio::run::u32 first) {
+  const size_t j = rng() % kStressBlobsPerThread;
+  const clio::run::u32 id = first + static_cast<clio::run::u32>(j);
+  std::string &model = m.bytes_[j];
+  clio::run::u64 off = 8 * (rng() % (model.size() / 8 + 2));
+  if (off + 8 > kStressMaxBlob) off = 0;
+  static const clio::run::u64 kClass[3] = {4096, 64 << 10, 384 << 10};
+  clio::run::u64 size = 8 * (1 + rng() % (kClass[rng() % 3] / 8));
+  size = std::min(size, kStressMaxBlob - off);
+  const clio::run::u32 ver = ++m.vers_[j];
+  const std::string b = StressBytes(id, ver, off, size);
+  const clio::run::u32 rc =
+      sh.io_->PutBlob(sh.tag_, StressName(id), off, size, b.data());
+  sh.writes_.fetch_add(1);
+  if (rc != 0) {
+    sh.Report("put " + StressName(id) + " rc=" + std::to_string(rc));
+    return;
+  }
+  if (off + size > model.size()) model.resize(off + size, '\0');
+  std::memcpy(&model[off], b.data(), size);
+  sh.sizes_[id - 1].store(model.size());
+}
+
+/**
+ * Stress read of an owned blob: a random sub-range or the whole blob, which
+ * must equal the model exactly (read-your-writes).
+ */
+static void StressReadOwn(StressShared &sh, std::mt19937_64 &rng,
+                          StressModel &m, clio::run::u32 first) {
+  const size_t j = rng() % kStressBlobsPerThread;
+  const clio::run::u32 id = first + static_cast<clio::run::u32>(j);
+  const std::string &model = m.bytes_[j];
+  if (model.empty()) return;
+  const clio::run::u64 words = model.size() / 8;
+  clio::run::u64 off = 0;
+  clio::run::u64 len = model.size();
+  if (rng() % 2 == 0) {
+    off = 8 * (rng() % words);
+    len = 8 * (1 + rng() % (words - off / 8));
+  }
+  std::string got(len, '\0');
+  const clio::run::u32 rc =
+      sh.io_->GetBlob(sh.tag_, StressName(id), off, len, got.data());
+  sh.reads_.fetch_add(1);
+  const std::string want = model.substr(off, len);
+  if (rc != 0 || got != want) {
+    sh.Report("own read " + StressName(id) + " [" + std::to_string(off) +
+              ", +" + std::to_string(len) + ") rc=" + std::to_string(rc) +
+              ": " + StressDiff(want, got, off));
+  }
+}
+
+/**
+ * Stress read of a blob another thread may be writing: inside its last
+ * completed size, every word must be that blob's (any write) or a hole.
+ */
+static void StressReadForeign(StressShared &sh, std::mt19937_64 &rng) {
+  const clio::run::u32 id = 1 + static_cast<clio::run::u32>(rng() % kStressBlobs);
+  const clio::run::u64 size = sh.sizes_[id - 1].load();
+  if (size < 8) return;
+  const clio::run::u64 words = size / 8;
+  const clio::run::u64 off = 8 * (rng() % words);
+  const clio::run::u64 len = 8 * (1 + rng() % (words - off / 8));
+  std::string got(len, '\0');
+  const clio::run::u32 rc =
+      sh.io_->GetBlob(sh.tag_, StressName(id), off, len, got.data());
+  sh.reads_.fetch_add(1);
+  const std::string why = rc != 0 ? "rc=" + std::to_string(rc)
+                                  : StressForeignCheck(got, id, off);
+  if (!why.empty()) {
+    sh.Report("foreign read " + StressName(id) + " [" + std::to_string(off) +
+              ", +" + std::to_string(len) + "): " + why);
+  }
+}
+
+/**
+ * One stress thread: random writes and exact reads of its own blobs, and
+ * consistency reads of everyone's, until told to stop.
+ * @param sh   shared state
+ * @param t    thread index (owns blobs t*kStressBlobsPerThread + 1 ...)
+ * @param seed generator seed
+ * @param m    out: this thread's final model
+ */
+static void StressThread(StressShared &sh, int t, clio::run::u64 seed,
+                         StressModel *m) {
+  std::mt19937_64 rng(seed + static_cast<clio::run::u64>(t) * 7919);
+  m->bytes_.assign(kStressBlobsPerThread, std::string());
+  m->vers_.assign(kStressBlobsPerThread, 0);
+  const clio::run::u32 first =
+      static_cast<clio::run::u32>(t * kStressBlobsPerThread + 1);
+  while (!sh.stop_.load()) {
+    const clio::run::u64 r = rng() % 10;
+    if (r < 5) {
+      StressWrite(sh, rng, *m, first);
+    } else if (r < 8) {
+      StressReadOwn(sh, rng, *m, first);
+    } else {
+      StressReadForeign(sh, rng);
+    }
+  }
+}
+
+/**
+ * After the threads stop and everything is flushed, every blob must read
+ * back exactly through the cache and from the chain below.
+ * @param sh     shared state
+ * @param models every thread's final model
+ */
+static void StressFinalCheck(StressShared &sh,
+                             const std::vector<StressModel> &models) {
+  for (int t = 0; t < kStressThreads; ++t) {
+    for (int j = 0; j < kStressBlobsPerThread; ++j) {
+      const std::string &want = models[t].bytes_[j];
+      if (want.empty()) continue;
+      const clio::run::u32 id =
+          static_cast<clio::run::u32>(t * kStressBlobsPerThread + j + 1);
+      std::string got(want.size(), '\0');
+      const clio::run::u32 rc = sh.io_->GetBlob(sh.tag_, StressName(id), 0,
+                                                got.size(), got.data());
+      if (rc != 0 || got != want) {
+        sh.Report("final cache read " + StressName(id) + " rc=" +
+                  std::to_string(rc) + ": " + StressDiff(want, got, 0));
+      }
+      const std::string below = CoreRead(sh.tag_, StressName(id), 0, want.size());
+      if (below != want) {
+        sh.Report("final chain read " + StressName(id) + ": " +
+                  StressDiff(want, below, 0));
+      }
+    }
+  }
+}
+
+TEST_CASE("ShmWtc - stress: leased extents stay exact under concurrent puts, "
+          "gets, evictions and fills",
+          "[cte][shm_wtc][extents][stress]") {
+  // A 2 MiB lease under a ~10 MiB working set of growing, rewritten blobs:
+  // nearly every put evicts and nearly every miss fills, while other
+  // threads read the same blobs and the flusher copies them out. Every
+  // owner read must match its model exactly; every other read must hold
+  // only the right blob's words at the right positions.
+  WtcFixture fx;
+  const clio::run::PoolId pool(582, 0);
+  CreateCache(pool, "shm_wtc_stress", 8ull << 20, false, 2ull << 20);
+  clio::cte::core::Client io(pool);
+  Connect(io, pool);
+  const wtc::Stats *st = io.CacheStats();
+  REQUIRE(st != nullptr);
+  StressShared sh;
+  sh.io_ = &io;
+  sh.tag_ = MakeTag(io, "wtc_stress");
+  const char *ms_env = std::getenv("CLIO_WTC_STRESS_MS");
+  const int ms = ms_env != nullptr ? std::atoi(ms_env) : kStressDefaultMs;
+  const char *seed_env = std::getenv("CLIO_WTC_STRESS_SEED");
+  const clio::run::u64 seed =
+      seed_env != nullptr ? std::strtoull(seed_env, nullptr, 10)
+                          : static_cast<clio::run::u64>(
+                                std::chrono::steady_clock::now()
+                                    .time_since_epoch()
+                                    .count());
+  INFO("stress seed " << seed << ", " << ms << " ms");
+  std::vector<StressModel> models(kStressThreads);
+  std::vector<std::thread> ths;
+  for (int t = 0; t < kStressThreads; ++t) {
+    ths.emplace_back(StressThread, std::ref(sh), t, seed, &models[t]);
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+  sh.stop_.store(true);
+  for (auto &th : ths) th.join();
+  REQUIRE(WaitFlushed(io));
+  StressFinalCheck(sh, models);
+  INFO("stress: writes " << sh.writes_.load() << " reads " << sh.reads_.load()
+       << " bad " << sh.bad_.load() << "; hits " << st->get_hits_.load()
+       << " misses " << st->get_misses_.load() << " fills "
+       << st->fills_.load() << "; " << RefusalCounters(st));
+  for (const std::string &r : sh.reports_) INFO("  " << r);
+  REQUIRE(sh.bad_.load() == 0);
+  REQUIRE(st->evictions_.load() > 0);
 }
 
 SIMPLE_TEST_MAIN()

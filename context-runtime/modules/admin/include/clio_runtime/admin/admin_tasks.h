@@ -540,7 +540,41 @@ using ComposeTask =
 GLOBAL_CROSS_CONST clio::run::u32 kDestroyPoolKeepRestartable = 0x1;
 
 /**
+ * Destroy levels. A pool is stopped or removed at one of four levels; the
+ * same flags reach the module's own Destroy method (kDestroy), which decides
+ * what each means for its data:
+ *
+ *  | command                        | flags                              |
+ *  |--------------------------------|------------------------------------|
+ *  | `clio_run pool stop <pool>`    | KeepRestartable                    |
+ *  | `... pool stop <pool> --force` | KeepRestartable | NoFlush          |
+ *  | `clio_run pool rm <pool>`      | DeleteData                         |
+ *  | `... pool rm <pool> --force`   | DeleteData | NoFlush               |
+ *
+ * `clio_run compose stop|rm <file> [--force]` applies the same levels to
+ * every pool of a compose file.
+ *
+ * Without NoFlush a module must make every acknowledged write durable before
+ * its Destroy returns 0 (a write-back cache flushes its dirty copies); a
+ * nonzero return aborts the destroy and leaves the pool running.
+ */
+/** Skip the flush: buffered, unflushed data is discarded (`--force`). */
+GLOBAL_CROSS_CONST clio::run::u32 kDestroyPoolNoFlush = 0x2;
+/** Delete the pool's data (backing files, metadata logs, cached copies). */
+GLOBAL_CROSS_CONST clio::run::u32 kDestroyPoolDeleteData = 0x4;
+/**
+ * Phase one of a two-phase destroy: run the module's Destroy (drain and
+ * flush) on every node but keep the pool. A multi-node pool's containers
+ * flush to each other, so none may be removed until all have flushed;
+ * phase two is the same DestroyPool without this flag.
+ */
+GLOBAL_CROSS_CONST clio::run::u32 kDestroyPoolQuiesceOnly = 0x8;
+
+/**
  * DestroyPoolTask - Destroy an existing ChiPool
+ *
+ * Also the standard DestroyTask every module's kDestroy method receives;
+ * a module reports what its teardown flushed in the OUT counters.
  */
 struct DestroyPoolTask : public clio::run::Task {
   // Pool destruction parameters
@@ -550,13 +584,17 @@ struct DestroyPoolTask : public clio::run::Task {
   // Output results
   OUT clio::run::priv::string
       error_message_;  ///< Error description if destruction failed
+  OUT clio::run::u64 blobs_flushed_;  ///< blobs the teardown made durable
+  OUT clio::run::u64 bytes_flushed_;  ///< bytes the teardown made durable
 
   /** SHM default constructor */
   DestroyPoolTask()
       : clio::run::Task(),
         target_pool_id_(),
         destruction_flags_(0),
-        error_message_(CLIO_PRIV_ALLOC) {}
+        error_message_(CLIO_PRIV_ALLOC),
+        blobs_flushed_(0),
+        bytes_flushed_(0) {}
 
   /** Emplace constructor */
   explicit DestroyPoolTask(const clio::run::TaskId &task_node,
@@ -567,7 +605,9 @@ struct DestroyPoolTask : public clio::run::Task {
       : clio::run::Task(task_node, pool_id, pool_query, 10),
         target_pool_id_(target_pool_id),
         destruction_flags_(destruction_flags),
-        error_message_(CLIO_PRIV_ALLOC) {
+        error_message_(CLIO_PRIV_ALLOC),
+        blobs_flushed_(0),
+        bytes_flushed_(0) {
     // Initialize task
     task_id_ = task_node;
     pool_id_ = pool_id;
@@ -588,12 +628,12 @@ struct DestroyPoolTask : public clio::run::Task {
 
   /**
    * Serialize OUT and INOUT parameters for network transfer
-   * This includes: error_message_
+   * This includes: error_message_, blobs_flushed_, bytes_flushed_
    */
   template <typename Archive>
   CTP_CROSS_FUN void SerializeOut(Archive &ar) {
     Task::SerializeOut(ar);
-    ar(error_message_);
+    ar(error_message_, blobs_flushed_, bytes_flushed_);
   }
 
   /**
@@ -608,6 +648,8 @@ struct DestroyPoolTask : public clio::run::Task {
     target_pool_id_ = other->target_pool_id_;
     destruction_flags_ = other->destruction_flags_;
     error_message_ = other->error_message_;
+    blobs_flushed_ = other->blobs_flushed_;
+    bytes_flushed_ = other->bytes_flushed_;
   }
 
   /** AggregateOut replica results into this task */
@@ -623,6 +665,9 @@ struct DestroyPoolTask : public clio::run::Task {
     if (error_message_.size() == 0 && replica->error_message_.size() > 0) {
       error_message_ = replica->error_message_;
     }
+    // Each node flushes its own containers: the pool's totals are the sum.
+    blobs_flushed_ += replica->blobs_flushed_;
+    bytes_flushed_ += replica->bytes_flushed_;
   }
 };
 

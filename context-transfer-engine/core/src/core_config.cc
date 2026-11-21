@@ -572,6 +572,11 @@ bool Config::ParseStorageConfig(const YAML::Node &node) {
       }
     } else {
       device_config.bdev_type_ = device_node["bdev_type"].as<std::string>();
+      // The type's own settings block (e.g. `s3:` with region and keys).
+      const YAML::Node ext = device_node[device_config.bdev_type_];
+      if (ext && ext.IsMap()) {
+        device_config.bdev_ext_yaml_ = YAML::Dump(ext);
+      }
 
       // Validate bdev_type
       // 's3' and 'gcs' name cloud object-store tiers. Their device paths are

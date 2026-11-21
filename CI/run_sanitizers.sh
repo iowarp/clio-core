@@ -143,17 +143,11 @@ sanitizer_gate_status() {
     [ "${MODE}" = "msan" ] && return 0
     if grep -qE "Defects: [1-9]" "${CTEST_LOG}" 2>/dev/null; then
         print_warning "${MODE}: tests reported sanitizer defects"
-        # The reports themselves are only in the MemoryChecker files (and the
-        # job summary, which the API does not expose): print each one with
-        # its stack, so the log alone says what the defect was.
-        local MEMCHECK_DIR="${BUILD_DIR}/Testing/Temporary"
-        local f
-        for f in "${MEMCHECK_DIR}"/MemoryChecker.*.log; do
-            [ -s "${f}" ] || continue
-            grep -qE "ERROR: [A-Za-z]+Sanitizer|runtime error:" "${f}" || continue
-            echo "==== sanitizer report: ${f}"
-            grep -E -A40 "ERROR: [A-Za-z]+Sanitizer|runtime error:" "${f}" | head -80
-        done
+        # ctest deletes each MemoryChecker.<test#>.log.<pid> file after parsing
+        # it, so the reports survive only in Testing/<tag>/DynamicAnalysis.xml
+        # (and on CDash). Print each defective test's report with its stack,
+        # so the log alone says what the defect was.
+        python3 "${SCRIPT_DIR}/memcheck_reports.py" "${BUILD_DIR}" stacks || true
         return 1
     fi
     if grep -qE "[0-9]+% tests passed, [1-9][0-9]* tests? failed" \
@@ -208,24 +202,17 @@ emit_findings_summary() {
             echo ""
         fi
 
-        # The per-defect detail lives in the MemoryChecker files, not stdout, so
-        # the console alone cannot tell you WHAT the undefined behaviour was.
-        # Surface a sample so a reader can judge real-vs-artifact without
-        # fetching anything from CDash.
-        local MEMCHECK_DIR="${BUILD_DIR}/Testing/Temporary"
-        if compgen -G "${MEMCHECK_DIR}/MemoryChecker.*.log" > /dev/null 2>&1; then
-            echo "<details><summary>Sample sanitizer messages</summary>"
-            echo ""
-            echo '```'
-            grep -hoE "(runtime error: .*|ERROR: [A-Za-z]+Sanitizer: .*|SUMMARY: [A-Za-z]+Sanitizer: .*)" \
-                 "${MEMCHECK_DIR}"/MemoryChecker.*.log 2>/dev/null \
-                 | sort | uniq -c | sort -rn | head -40 || true
-            echo '```'
-            echo ""
-            echo "</details>"
-        else
-            echo "_No MemoryChecker output files found under ${MEMCHECK_DIR}._"
-        fi
+        # The per-defect detail is not on stdout (ctest keeps it only in
+        # DynamicAnalysis.xml), so the console alone cannot tell you WHAT the
+        # defect was. Surface a sample so a reader can judge real-vs-artifact
+        # without fetching anything from CDash.
+        echo "<details><summary>Sample sanitizer messages</summary>"
+        echo ""
+        echo '```'
+        python3 "${SCRIPT_DIR}/memcheck_reports.py" "${BUILD_DIR}" messages || true
+        echo '```'
+        echo ""
+        echo "</details>"
     } >> "${GITHUB_STEP_SUMMARY}" 2>/dev/null || true
 
     return 0

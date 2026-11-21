@@ -1,0 +1,13 @@
+# Workflows that make up dev's full CI. Read by dev-full-ci.yml (dispatches
+# them once dev is quiet) and dev-to-main-gate.yml (waits for them on a
+# dev -> main PR). One file name per line; '#' starts a comment.
+ci-linux.yml
+ci-macos.yml
+ci-windows.yml
+ci-vfd.yml
+ci-adapters.yml
+gpu-tests.yml
+ci-md-benches.yml
+ci-cloud-bdev.yml
+build-pip.yml
+build-core-containers.yaml

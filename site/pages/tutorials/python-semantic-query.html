@@ -28,7 +28,7 @@ $ cp ~/papers/*.txt ~/clio-mnt/notes/          # any text you have
 <h2>2. Connect</h2>
 <pre data-label="python · find.py">
 import os, sys
-os.environ.setdefault("CLIO_WITH_RUNTIME", "0")   # attach to `clio_run start`
+os.environ.setdefault("CLIO_WITH_RUNTIME", "0")   # attach to `clio-run start`
 os.environ.setdefault("CLIO_CTE_POOL", "564.0")   # bind to the indexer layer
 
 import clio_cte_core_ext as cte

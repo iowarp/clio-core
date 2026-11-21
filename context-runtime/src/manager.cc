@@ -257,8 +257,9 @@ namespace {
  * Restart replay of this node's pool log -- the one restart registry: every
  * durable pool (compose `restart: true`, or API-created by a client with
  * SetPersistent) is re-created here, in creation order, taking the
- * Restart() path. A fresh start forgets them instead: it begins a new
- * cluster lifetime, and test pools must never come back.
+ * Restart() path. A fresh start forgets them instead (ServerInit clears the
+ * log before the server compose): it begins a new cluster lifetime, and test
+ * pools must never come back.
  * @param is_restart true for a recovering `clio_run start`, false for
  *        `clio_run start --fresh`
  */
@@ -266,8 +267,7 @@ void ReplayPoolLog(bool is_restart) {
   auto *pool_manager = CLIO_POOL_MANAGER;
   auto *admin = CLIO_ADMIN;
   if (!is_restart) {
-    pool_manager->ClearPoolLog();
-    return;
+    return;  // a fresh start cleared the log before its compose (ServerInit)
   }
   const auto pools = pool_manager->LoadPoolLog();
   if (pools.empty() || admin == nullptr) return;
@@ -449,6 +449,14 @@ bool RuntimeManager::ServerInit() {
   // composed explicitly (e.g. a spawned per-app runtime backed by a main
   // runtime via the fallback).
   const auto &compose_config = config_manager->GetComposeConfig();
+  // A fresh start forgets the previous lifetime's durable pools BEFORE the
+  // server compose runs: clearing after it (in ReplayPoolLog) also erased the
+  // entries the compose had just recorded for its own `restart: true` pools,
+  // so `clio_run pool start` and `compose list --restartable` could not see
+  // them until the next recovering start.
+  if (!is_restart_ && !config_manager->IsEphemeral()) {
+    pool_manager->ClearPoolLog();
+  }
   if (config_manager->IsEphemeral() && !compose_config.pools_.empty()) {
     HLOG(kInfo,
          "Ephemeral runtime: skipping default compose ({} pools in config)",

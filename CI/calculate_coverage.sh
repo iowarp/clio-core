@@ -292,7 +292,7 @@ if [ "$DO_BUILD" = true ]; then
     # HLOG(kDebug) lines only.
     cmake --preset=debug \
         -DCLIO_CORE_ENABLE_COVERAGE=ON \
-        -DCLIO_CORE_ENABLE_CONDA=ON \
+        -DCLIO_CORE_ENABLE_CONDA=$([ -n "${CONDA_PREFIX:-}" ] && echo ON || echo OFF) \
         -DCLIO_CORE_ENABLE_DOCKER_CI=OFF \
         -DCLIO_CTE_ENABLE_ADIOS2_ADAPTER=OFF \
         -DCLIO_CTE_ENABLE_COMPRESS=OFF \

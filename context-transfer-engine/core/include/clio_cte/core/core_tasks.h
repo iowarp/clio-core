@@ -1924,6 +1924,33 @@ struct BlobInfo {
     return lowest == ~0ull ? 0 : lowest;
   }
 
+  /**
+   * Record a generational put, per range or blob-wide.
+   *
+   * A put whose stored bytes are TRANSFORMED (e.g. compressed by the
+   * compressor chimod) carries offsets and sizes in stored-byte coordinates,
+   * which say nothing about which logical bytes it covers: a 64 KiB page
+   * compressed to 33 KB would publish [0, 33 KB) and leave every reader of
+   * [0, 64 KiB) waiting forever. Such a put replaces the whole blob, so it
+   * publishes its generation blob-wide. Untransformed puts publish the
+   * extent they wrote, as before.
+   *
+   * @param off          offset of the put, in stored bytes
+   * @param size         size of the put, in stored bytes
+   * @param gen          generation the writer published
+   * @param transformed  true if the stored bytes are not the caller's bytes
+   */
+  void PublishGeneration(clio::run::u64 off, clio::run::u64 size,
+                         clio::run::u64 gen, bool transformed) {
+    if (gen > generation_) generation_ = gen;
+    if (transformed) {
+      published_n_ = 0;
+      published_overflow_ = true;  // RangeGeneration -> generation_
+      return;
+    }
+    StampRangeGeneration(off, size, gen);
+  }
+
   /** Record that [off, off+size) is now published at `gen`. */
   void StampRangeGeneration(clio::run::u64 off, clio::run::u64 size,
                             clio::run::u64 gen) {

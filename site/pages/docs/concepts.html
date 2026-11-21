@@ -39,7 +39,7 @@ facts: Written for | Anyone configuring or scripting CLIO Core ; Read time | 8 m
 <p>The metadata log (<code>performance.metadata_log_path</code>) records which blobs exist and where. Without it, a disk tier's bytes survive but nothing remembers what they belong to.</p>
 
 <h2>Pools and modules</h2>
-<p>Everything inside the runtime is a <strong>module</strong> (also called a ChiMod) running in a <strong>pool</strong>. A pool has a name, a module type and an id such as <code>512.0</code>. The <code>compose</code> section of <code>clio.yaml</code> lists the pools to create at startup. <code>clio_run compose start file.yaml</code> adds more later.</p>
+<p>Everything inside the runtime is a <strong>module</strong> (also called a ChiMod) running in a <strong>pool</strong>. A pool has a name, a module type and an id such as <code>512.0</code>. The <code>compose</code> section of <code>clio.yaml</code> lists the pools to create at startup. <code>clio-run compose start file.yaml</code> adds more later.</p>
 <div class="table-wrap"><table>
   <thead><tr><th>Pool id</th><th>Module</th><th>Role</th></tr></thead>
   <tbody>

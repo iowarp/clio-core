@@ -16,6 +16,11 @@ services:
       - ./clio.yaml:/etc/iowarp/clio.yaml:ro
     environment:
       - CLIO_SERVER_CONF=/etc/iowarp/clio.yaml
+      # The runtime listens on loopback unless told otherwise. Inside the
+      # container that would make the published port unreachable, so listen on
+      # every container interface. The runtime does not authenticate clients;
+      # to keep the port to this machine, publish "127.0.0.1:9413:9413".
+      - CLIO_BIND_ADDR=0.0.0.0
     ports:
       - "9413:9413"
     mem_limit: 8g
