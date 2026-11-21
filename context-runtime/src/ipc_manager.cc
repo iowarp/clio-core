@@ -231,6 +231,22 @@ inline std::string LocalZmqIpcPath(u32 port) {
 IpcMode IpcManager::SelectBestIpcMode() {
   ConfigManager *config = CLIO_CONFIG_MANAGER;
 
+  // Both probes look in the per-user memfd dir. If another user controls it,
+  // what is found there is not this user's runtime.
+  switch (ctp::SystemInfo::CheckMemfdDir()) {
+    case ctp::SystemInfo::MemfdDirState::kPrivate:
+      break;
+    case ctp::SystemInfo::MemfdDirState::kMissing:
+      HLOG(kDebug, "SelectBestIpcMode: no memfd dir -> TCP");
+      return IpcMode::kTcp;
+    case ctp::SystemInfo::MemfdDirState::kUnsafe:
+      HLOG(kWarning,
+           "SelectBestIpcMode: {} is not a private directory of this user; "
+           "using TCP",
+           ctp::SystemInfo::GetMemfdDir());
+      return IpcMode::kTcp;
+  }
+
   // 1. SHM: is the server's main segment present on this host?
   if (config) {
     std::string main_seg = config->GetSharedMemorySegmentName(kMainSegment);
@@ -296,6 +312,16 @@ bool IpcManager::ClientInit() {
          ipc_mode_ == IpcMode::kShm   ? "SHM"
          : ipc_mode_ == IpcMode::kIpc ? "IPC"
                                       : "TCP");
+  }
+
+  // SHM and IPC reach the runtime through the per-user memfd dir (and so does
+  // the local control socket on macOS); refuse a dir another user controls.
+  if ((ipc_mode_ != IpcMode::kTcp || UseLocalZmqIpc()) &&
+      !ctp::SystemInfo::EnsureMemfdDir()) {
+    HLOG(kError,
+         "IpcManager::ClientInit: {} is not a private directory of this user",
+         ctp::SystemInfo::GetMemfdDir());
+    return false;
   }
 
   // Parse retry timeout environment variable
@@ -544,6 +570,17 @@ bool IpcManager::ServerInit() {
     chi_cur_worker_key_created_ = true;
   }
   CTP_THREAD_MODEL->SetTls(chi_cur_worker_key_, static_cast<Worker *>(nullptr));
+
+  // Segments, the IPC socket and the pid record all go in the per-user memfd
+  // dir. Its default name under /tmp is predictable, so another user may have
+  // created it first; do not start in a dir this user does not own.
+  if (!ctp::SystemInfo::EnsureMemfdDir()) {
+    HLOG(kError,
+         "IpcManager::ServerInit: {} is not a private directory of this user; "
+         "refusing to start",
+         ctp::SystemInfo::GetMemfdDir());
+    return false;
+  }
 
   // Clear leftover shared memory segments from previous runs
   ClearUserIpcs();
