@@ -15,6 +15,11 @@
 #     infrastructure. When it happens at 14:00 against a PR, it looks like the
 #     PR did it, and somebody spends an afternoon proving otherwise.
 #
+#  3. Build and test dev on Intel macOS (macos-15-intel). Dropped from the
+#     per-merge sweep to save the scarcest runners: no Intel macOS wheel
+#     ships, and x86_64 / macOS code is covered by the other jobs, so an
+#     Intel-Mac-only bug is rare. It still gets caught within a day.
+#
 # Reports, never gates: nothing here is a required check, and a failure means
 # "look at the environment or the quarantine list", not "your branch is bad".
 name: Nightly Full Sweep
@@ -165,3 +170,11 @@ jobs:
             ( cc --version 2>/dev/null || clang --version 2>/dev/null || cl 2>&1 ) | head -1
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---- Intel macOS (x86_64): ci-macos.yml's build-test against dev ---------
+  macos-intel:
+    name: macOS Intel (dev)
+    uses: ./.github/workflows/ci-macos.yml
+    with:
+      os: '["macos-15-intel"]'
+      ref: dev
