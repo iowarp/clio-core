@@ -220,7 +220,10 @@ Never hardcode `/tmp/clio_*`. Use (`CTP introspect/src/system_info.cc:524-573`):
   `/tmp/clio_$USER` (Windows: `%TEMP%/clio_<USERNAME>`).
 - `ctp::SystemInfo::GetMemfdPath(name)` -> `<dir>/<name>` (a leading `/` is
   stripped).
-- `ctp::SystemInfo::EnsureMemfdDir()` -> creates the directory (0700).
+- `ctp::SystemInfo::EnsureMemfdDir()` -> creates the directory (0700) and
+  returns false unless it is a real directory owned by this user that no
+  other user can write (`CheckMemfdDir()`). The runtime refuses to start and
+  SHM/IPC clients refuse to attach otherwise.
 - IPC socket: `ctp::SystemInfo::GetMemfdPath("clio_" + std::to_string(port) + ".ipc")`.
 
 ### Automatic cleanup at runtime start

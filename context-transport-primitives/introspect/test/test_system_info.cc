@@ -86,6 +86,52 @@ TEST_CASE("SystemInfoMemfdDir") {
   REQUIRE(!default_dir.empty());
 }
 
+#ifndef _WIN32
+TEST_CASE("SystemInfoMemfdDirMustBePrivate") {
+  using State = SystemInfo::MemfdDirState;
+  const std::string base =
+      "/tmp/ctp_memfd_private_test_" + std::to_string(getpid());
+  const std::string dir = base + "_dir";
+  const std::string link = base + "_link";
+  SystemInfo::Setenv("CLIO_MEMFD_DIR", dir, 1);
+
+  // Missing, then created by EnsureMemfdDir with mode 0700.
+  rmdir(dir.c_str());
+  REQUIRE(SystemInfo::CheckMemfdDir() == State::kMissing);
+  REQUIRE(SystemInfo::EnsureMemfdDir());
+  struct stat st;
+  REQUIRE(lstat(dir.c_str(), &st) == 0);
+  REQUIRE((st.st_mode & 0777) == 0700);
+  REQUIRE(SystemInfo::CheckMemfdDir() == State::kPrivate);
+
+  // Readable by others is fine; writable by others is not.
+  chmod(dir.c_str(), 0755);
+  REQUIRE(SystemInfo::EnsureMemfdDir());
+  chmod(dir.c_str(), 0777);
+  REQUIRE(SystemInfo::CheckMemfdDir() == State::kUnsafe);
+  REQUIRE_FALSE(SystemInfo::EnsureMemfdDir());
+  chmod(dir.c_str(), 0770);
+  REQUIRE_FALSE(SystemInfo::EnsureMemfdDir());
+  chmod(dir.c_str(), 0700);
+
+  // A link is refused even when it points at a private directory.
+  unlink(link.c_str());
+  REQUIRE(symlink(dir.c_str(), link.c_str()) == 0);
+  SystemInfo::Setenv("CLIO_MEMFD_DIR", link, 1);
+  REQUIRE(SystemInfo::CheckMemfdDir() == State::kUnsafe);
+  REQUIRE_FALSE(SystemInfo::EnsureMemfdDir());
+
+  // No segment is created in, or opened from, a refused directory.
+  ctp::File fd;
+  REQUIRE_FALSE(SystemInfo::CreateNewSharedMemory(fd, "/memfd_private_seg", 4096));
+  REQUIRE_FALSE(SystemInfo::SharedMemoryExists("/memfd_private_seg"));
+
+  unlink(link.c_str());
+  rmdir(dir.c_str());
+  SystemInfo::Unsetenv("CLIO_MEMFD_DIR");
+}
+#endif
+
 TEST_CASE("SystemInfoNormalizePath") {
   // Ordinary paths are untouched on every platform.
   REQUIRE(SystemInfo::NormalizePath("/tmp/clio_x") == "/tmp/clio_x");

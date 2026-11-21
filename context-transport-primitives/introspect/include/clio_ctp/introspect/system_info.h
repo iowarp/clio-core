@@ -334,8 +334,30 @@ class SystemInfo {
   /** Get the full path for a named file in the memfd directory */
   CTP_DLL static std::string GetMemfdPath(const std::string &name);
 
-  /** Ensure the per-user memfd directory exists */
-  CTP_DLL static void EnsureMemfdDir();
+  /** State of the per-user memfd directory, see CheckMemfdDir(). */
+  enum class MemfdDirState {
+    kPrivate,  ///< a real directory owned by this user, writable by no one else
+    kMissing,  ///< does not exist yet
+    kUnsafe,   ///< exists, but is a link, another user's, or writable by others
+  };
+
+  /**
+   * Whether the per-user memfd directory can be used.
+   *
+   * The directory holds the segment links, the IPC socket and the runtime pid
+   * record. Under /tmp its name is predictable, so another account can create
+   * it first. A directory that is a symbolic link, belongs to another user, or
+   * that a group or other users can write is reported as kUnsafe; another
+   * account could replace the entries in it.
+   */
+  CTP_DLL static MemfdDirState CheckMemfdDir();
+
+  /**
+   * Create the per-user memfd directory if needed (mode 0700) and check it.
+   * @return true when the directory is kPrivate; false otherwise, after
+   * logging which directory and why to stderr
+   */
+  CTP_DLL static bool EnsureMemfdDir();
 
   CTP_DLL static bool IsProcessAlive(int pid);
 
