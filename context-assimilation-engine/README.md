@@ -22,7 +22,8 @@ External Source          CAE Module              CTE Module
 **Supported formats:** `binary`, `hdf5`, `hdf5_vol`, `globus`
 
 **Supported source schemes:** `file::`, `string::`, `hdf5::`, `globus://`,
-`s3://` (Amazon S3 / MinIO), `gs://` and `gcs://` (Google Cloud Storage)
+`s3://` (Amazon S3 / MinIO), `gs://` and `gcs://` (Google Cloud Storage),
+`dataverse://` (files and zip members of a Dataverse dataset)
 
 ## Building
 
@@ -171,6 +172,46 @@ assimilation time (no secrets are placed in the OMNI file):
   gcloud ADC, or the GCE/GKE metadata server), and an optional endpoint via
   `GCS_ENDPOINT` (e.g. fake-gcs-server).
 
+**Dataverse datasets (`dataverse://`):**
+
+```yaml
+transfers:
+  - src: dataverse://dataverse.harvard.edu/doi:10.7910/DVN/LCCLLW
+    dst: iowarp::golf                  # or file::/some/dir to only stage
+    format: hdf5                       # HDF5 files per dataset; others binary
+    dataset_filter:
+      include_patterns:
+        - "Documentation.zip/*.csv"          # members of one zip file
+        - "P*.zip/*_stream_data.hdf5"        # one kind of member of many zips
+        - "hdf5:*/data"                      # datasets inside those HDF5 files
+      exclude_patterns:
+        - "*.mp4"
+```
+
+CAE lists the dataset with the Dataverse API and selects objects by path:
+`<directoryLabel/>filename` for a file of the dataset and
+`<file>.zip/<member>` for a member of a zip file. A pattern containing
+`.zip/` selects members, read straight out of the remote zip with HTTP range
+requests (ZIP64, stored or deflated, CRC-checked), so a few files can be taken
+from a large archive without downloading the rest. Patterns starting with
+`hdf5:` pick datasets inside the selected HDF5 files. Without include patterns
+every file is taken whole.
+
+- **Requests:** each data file's download link is resolved once and reused for
+  all its ranged reads, so the Dataverse server sees one request per file, not
+  one per member. Throttled or failed requests are retried with backoff.
+- **Staging:** objects are staged in `$CAE_DATAVERSE_CACHE` (default
+  `~/.clio/cae_dataverse/<pid>`) and reused by a later run when the size
+  matches (`CAE_HTTP_OVERWRITE=1` refetches). `CAE_DATAVERSE_JOBS` (default 8)
+  objects are fetched at a time.
+- **Tags:** each object becomes `<tag>/<path>` (and `<tag>/<path>/<dataset>`
+  for HDF5); the tag `<tag>` gets a `manifest` blob listing every object.
+- **Credentials:** `src_token` is sent as `X-Dataverse-key` to the Dataverse
+  host only (drafts, restricted files); other headers come from the http config
+  file below.
+- **Without a runtime:** `cae_dataverse_tool list|stage <src> [dir] -i <glob>
+  -x <glob>` lists a selection or stages it.
+
 **Transforming a source first (`run:`):**
 
 ```yaml
@@ -207,12 +248,12 @@ in order, as the user running `clio_cae`, and never inside the runtime.
 
 | Field | Description |
 |---|---|
-| `src` | Source URL (`file::`, `string::`, `hdf5::`, `globus://`, `s3://`, `gs://`) |
+| `src` | Source URL (`file::`, `string::`, `hdf5::`, `globus://`, `s3://`, `gs://`, `dataverse://`) |
 | `dst` | CTE destination tag (`iowarp::tag_name`; `iowarp::` for `hdf5_vol`) |
 | `format` | `binary`, `hdf5`, `hdf5_vol`, or `globus` |
 | `range_off` / `range_size` | Byte range within source (0 = full file) |
 | `src_token` / `dst_token` | Auth tokens; environment variables are expanded |
-| `dataset_filter` | HDF5 dataset include/exclude glob patterns |
+| `dataset_filter` | HDF5 dataset include/exclude glob patterns; for `dataverse://`, file and zip-member patterns |
 | `run` / `run_out` | Script that turns `src` into `run_out` before ingest (see above) |
 
 A per-transfer key not in this table is logged as a warning and ignored.

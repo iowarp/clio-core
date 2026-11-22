@@ -477,6 +477,31 @@ if(NOT WIN32)
 endif()
 
 #------------------------------------------------------------------------------
+# dataverse:// sources (dataverse.h): URL, JSON reader, dataset_filter rules and
+# the ZIP/ZIP64 directory parser, on archives built in memory. No network.
+#------------------------------------------------------------------------------
+if(NOT WIN32)
+  find_package(ZLIB QUIET)
+endif()
+if(NOT WIN32 AND ZLIB_FOUND)
+  add_executable(cae_dataverse_test
+    ${CMAKE_CURRENT_SOURCE_DIR}/dataverse/test_dataverse.cc
+  )
+  target_include_directories(cae_dataverse_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../core/include
+    ${CMAKE_SOURCE_DIR}/context-runtime/test         # simple_test.h
+  )
+  target_link_libraries(cae_dataverse_test PRIVATE ctp::cxx ZLIB::ZLIB)
+  set_target_properties(cae_dataverse_test PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+  )
+  add_test(NAME cae_dataverse COMMAND cae_dataverse_test)
+  set_tests_properties(cae_dataverse PROPERTIES TIMEOUT 60 LABELS "cae;unit")
+  install(TARGETS cae_dataverse_test DESTINATION bin)
+endif()
+
+#------------------------------------------------------------------------------
 # In-process AWS credential/region resolver (aws_creds.h). Pure functions --
 # env + INI parsing, no runtime, no network, no real ~/.aws -- so it is built
 # hermetically (no CLIO client libs, no live runtime), like cae_hdf5_export.
