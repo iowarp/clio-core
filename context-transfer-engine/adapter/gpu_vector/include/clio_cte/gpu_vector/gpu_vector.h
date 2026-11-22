@@ -23,7 +23,11 @@
 #include <clio_cte/gpu_vector/page.h>
 #include <clio_cte/gpu_vector/prefetch.h>
 
+#if defined(_WIN32)
+#include <io.h>  // _write: the async-signal-safe stderr write below
+#else
 #include <unistd.h>
+#endif
 
 #include <cmath>
 #include <csignal>
@@ -247,7 +251,11 @@ inline unsigned long long *FatalMirror() {
         char buf[512];
         const int w = FatalFormat(FatalMirror(), buf, sizeof(buf));
         if (w > 0) {
+#if defined(_WIN32)
+          const int r = ::_write(2, buf, static_cast<unsigned>(w));
+#else
           const ssize_t r = ::write(2, buf, static_cast<size_t>(w));
+#endif
           (void)r;
         }
         std::signal(sig, SIG_DFL);
