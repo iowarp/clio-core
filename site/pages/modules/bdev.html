@@ -233,6 +233,7 @@ compose:
       access_key_id: AKIA...
       secret_access_key: ...
 </pre>
+<p><code>${VAR}</code> references are expanded in a CTE tier's <code>path</code>, but not inside the <code>s3:</code> block: there they reach the runtime as literal text. The <a href="/tutorials/cloud-storage.html#try-an-s3-tier-from-pip">cloud storage tutorial</a> walks through a tier from AWS sign-in to objects in the bucket.</p>
 <h3>gcs</h3>
 <p>Compiled in when <code>CLIO_ENABLE_GOOGLE_CLOUD</code> is defined. Same
 object layout and zero-fill convention as s3, with the pool name parsed as
