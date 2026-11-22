@@ -222,6 +222,9 @@ struct VecHeader {
    *  doubling counted spin (up to 1<<20 iterations), so this number, times
    *  the spin's real cost on the device, is time a block spent not faulting. */
   GV_G unsigned long long *stat_alloc_waits_;
+  /** Pages CoAllocate / MAllocate claimed WITHOUT a read (wholly covered
+   *  by the named ranges). Each is one page `faults` did not count. */
+  GV_G unsigned long long *stat_allocs_;
   /** GV_COMM_TIMING: cycles in [0] CoFetch [1] CoHoldPage [2] CoBeginFlush +
    *  CoEndFlush [3] a benchmark's busy segments, [4] fetch calls [5] hold
    *  calls [6] flush calls. Null unless EnableStats() ran. */
@@ -490,7 +493,7 @@ class DeviceVector {
     // what it waits for (a peer's unpin) has no completion word.
     for (;;) {
       int ok = 0;
-      if (threadIdx.x == 0) ok = SubmitFetch(lo, hi, nr) ? 1 : 0;
+      if (threadIdx.x == 0) ok = SubmitFetch(lo, hi, nr, false) ? 1 : 0;
       if (__syncthreads_or(ok)) break;
       int once = 0;
       CLIO_CO_YIELD_WHEN(;, once++ == 0, 0ull);
@@ -590,6 +593,51 @@ class DeviceVector {
         co_await ::clio::run::gpu::YCoroSuspend{0ull};
       }
     }
+    co_return;
+  }
+#endif  // CLIO_HAS_YCORO
+
+  /**
+   * BeginFetch for ranges the caller is about to OVERWRITE: pages the ranges
+   * cover entirely are claimed and pinned with no transfer, pages covered in
+   * part are fetched. The caller must write every element it names before
+   * flushing. Full contract at CoBeginAllocate.
+   * @param generation the version the claimed frames are stamped with
+   * @param args       (offset, count) element ranges the caller overwrites
+   */
+#if CLIO_HAS_YCORO
+  template <typename... Args>
+  __device__ clio::run::gpu::YCoroTask BeginAllocate(clio::run::u64 generation,
+                                                     Args... args) {
+    if (threadIdx.x == 0) Tasks()->fetch_generation = generation;
+    __syncthreads();
+    clio::run::u64 lo[kMaxFetchRanges];
+    clio::run::u64 hi[kMaxFetchRanges];
+    clio::run::u32 nr = 0;
+    GatherRanges(lo, hi, nr, args...);
+    if (FetchBusy()) {
+      co_await AwaitFetch();
+    }
+    for (;;) {
+      int ok = 0;
+      if (threadIdx.x == 0) ok = SubmitFetch(lo, hi, nr, true) ? 1 : 0;
+      if (__syncthreads_or(ok)) break;
+      int once = 0;
+      CLIO_CO_YIELD_WHEN(;, once++ == 0, 0ull);
+    }
+    __syncthreads();
+    co_return;
+  }
+
+  /** BeginAllocate then AwaitFetch (which returns at once when every page
+   *  was covered whole). See CoBeginAllocate for the contract.
+   *  @param generation as for BeginAllocate
+   *  @param args       (offset, count) element ranges the caller overwrites */
+  template <typename... Args>
+  __device__ clio::run::gpu::YCoroTask Allocate(clio::run::u64 generation,
+                                                Args... args) {
+    co_await BeginAllocate(generation, args...);
+    co_await AwaitFetch();
     co_return;
   }
 #endif  // CLIO_HAS_YCORO
@@ -971,9 +1019,9 @@ class DeviceVector {
     // first attempt stays here so the common case is a predicated branch;
     // the retry loop lives in its own NOINLINE coroutine (see it for why).
     int ok = 0;
-    if (threadIdx.x == 0) ok = SubmitFetch(lo, hi, nr) ? 1 : 0;
+    if (threadIdx.x == 0) ok = SubmitFetch(lo, hi, nr, false) ? 1 : 0;
     if (!__syncthreads_or(ok)) {
-      CO_AWAIT(CoSubmitFetchYielding(lo, hi, nr));
+      CO_AWAIT(CoSubmitFetchYielding(lo, hi, nr, false));
     }
     __syncthreads();
   }
@@ -987,14 +1035,15 @@ class DeviceVector {
    *  code-shape bug of AURORA.md (4), whose fix was the same move. The
    *  ranges are pointers into the caller's frame, which outlives the
    *  suspend.
-   *  @param lo,hi,nr the element ranges CoBeginFetch gathered */
+   *  @param lo,hi,nr the element ranges CoBeginFetch gathered
+   *  @param allocate SubmitFetch's allocate flag (CoBeginAllocate) */
   CTP_GPU_FUN __attribute__((noinline)) void CoSubmitFetchYielding(
       const clio::run::u64 *lo, const clio::run::u64 *hi,
-      clio::run::u32 nr) {
+      clio::run::u32 nr, bool allocate) {
     for (;;) {
       CO_AWAIT(OnceWait{0}.Take());
       int ok = 0;
-      if (threadIdx.x == 0) ok = SubmitFetch(lo, hi, nr) ? 1 : 0;
+      if (threadIdx.x == 0) ok = SubmitFetch(lo, hi, nr, allocate) ? 1 : 0;
       if (__syncthreads_or(ok)) break;
     }
   }
@@ -1021,6 +1070,63 @@ class DeviceVector {
     // resident, BeginFetch submits no transfer and the block's fetch slot is
     // idle; CoAwaitFetch would still run its park guard (three group
     // collectives) and a barrier to learn that. One uniform vote decides.
+    if (__syncthreads_or(FetchBusy() ? 1 : 0)) {
+      CO_AWAIT(CoAwaitFetch());
+    }
+    CommStamp(0, gv_t0);
+  }
+
+  /**
+   * CoBeginFetch for ranges the caller is about to OVERWRITE.
+   *
+   * THE CONTRACT: the caller write-holds and writes every element of every
+   * range it names before it flushes them. Given that, the bytes in storage
+   * would be overwritten unread, so a page the ranges cover entirely (to the
+   * vector's end, for the last page) is claimed and pinned with NO transfer:
+   * its frame is published empty, and the write holds define it. A page the
+   * ranges cover only in part is fetched exactly as by CoBeginFetch, because
+   * its other elements must survive the write-back.
+   *
+   * Whether the page already exists in storage does not matter: the flush
+   * replaces it either way. What matters is that every named element is
+   * written -- a read hold on an allocated page before it is written fails
+   * Covers and stops the kernel, and an element named but never written is
+   * flushed as whatever the reused frame held.
+   *
+   * Pins like a fetch: release with UnpinRange after the flush has landed.
+   * @param generation as for CoBeginFetch: the version the frames are stamped
+   *                   with (0 = not generational)
+   * @param args       (offset, count) element ranges, as for CoBeginFetch
+   */
+  template <typename... Args>
+  CTP_GPU_FUN void CoBeginAllocate(clio::run::u64 generation, Args... args) {
+    if (threadIdx.x == 0) Tasks()->fetch_generation = generation;
+    __syncthreads();
+    clio::run::u64 lo[kMaxFetchRanges];
+    clio::run::u64 hi[kMaxFetchRanges];
+    clio::run::u32 nr = 0;
+    GatherRanges(lo, hi, nr, args...);
+    // One fetch in flight per block: a partly covered page still needs one.
+    if (FetchBusy()) {
+      CO_AWAIT(CoAwaitFetch());
+    }
+    int ok = 0;
+    if (threadIdx.x == 0) ok = SubmitFetch(lo, hi, nr, true) ? 1 : 0;
+    if (!__syncthreads_or(ok)) {
+      CO_AWAIT(CoSubmitFetchYielding(lo, hi, nr, true));
+    }
+    __syncthreads();
+  }
+
+  /** CoBeginAllocate, then wait for the reads of any partly covered pages.
+   *  When every page was covered whole nothing was submitted and this
+   *  returns without a round trip. See CoBeginAllocate for the contract.
+   *  @param generation as for CoFetch
+   *  @param args       (offset, count) element ranges the caller overwrites */
+  template <typename... Args>
+  CTP_GPU_FUN void CoAllocate(clio::run::u64 generation, Args... args) {
+    unsigned long long gv_t0 = GvCommClock();
+    CO_AWAIT(CoBeginAllocate(generation, args...));
     if (__syncthreads_or(FetchBusy() ? 1 : 0)) {
       CO_AWAIT(CoAwaitFetch());
     }
@@ -1260,7 +1366,7 @@ class DeviceVector {
     // A full set yields the round instead of spinning; see BeginFetch.
     for (;;) {
       ok = 0;
-      if (threadIdx.x == 0) ok = SubmitFetch(lo, hi, nr) ? 1 : 0;
+      if (threadIdx.x == 0) ok = SubmitFetch(lo, hi, nr, false) ? 1 : 0;
       if (__syncthreads_or(ok)) break;
       once = 0;
       CLIO_YIELD_IF_RESUME_WHEN(once++ == 0, 0ull);
@@ -1287,6 +1393,50 @@ class DeviceVector {
     CLIO_YFRAME();
     CLIO_YBEGIN();
     CLIO_YCALL(MBeginFetch(generation, args...));
+    CLIO_YCALL(MAwaitFetch());
+    CLIO_YEND();
+  }
+
+  /** Macro-form CoBeginAllocate: claim the ranges the caller will overwrite,
+   *  reading only the pages they cover in part. Same contract as
+   *  CoBeginAllocate.
+   *  @param generation as for MBeginFetch
+   *  @param args       (offset, count) element ranges the caller overwrites */
+  template <typename... Args>
+  CTP_GPU_FUN void MBeginAllocate(clio::run::u64 generation, Args... args) {
+    CLIO_YFRAME();
+    CLIO_YLOCAL(MRangeArr, lo);
+    CLIO_YLOCAL(MRangeArr, hi);
+    CLIO_YLOCAL_INIT(clio::run::u32, nr, 0);
+    CLIO_YLOCAL_INIT(int, ok, 0);
+    CLIO_YLOCAL_INIT(int, once, 0);
+    CLIO_YBEGIN();
+    if (threadIdx.x == 0) Tasks()->fetch_generation = generation;
+    __syncthreads();
+    nr = 0;
+    GatherRanges(lo, hi, nr, args...);
+    if (FetchBusy()) {
+      CLIO_YCALL(MAwaitFetch());
+    }
+    for (;;) {
+      ok = 0;
+      if (threadIdx.x == 0) ok = SubmitFetch(lo, hi, nr, true) ? 1 : 0;
+      if (__syncthreads_or(ok)) break;
+      once = 0;
+      CLIO_YIELD_IF_RESUME_WHEN(once++ == 0, 0ull);
+    }
+    __syncthreads();
+    CLIO_YEND();
+  }
+
+  /** Macro-form CoAllocate. Mirrors CoAllocate() above.
+   *  @param generation as for MFetch
+   *  @param args       (offset, count) element ranges the caller overwrites */
+  template <typename... Args>
+  CTP_GPU_FUN void MAllocate(clio::run::u64 generation, Args... args) {
+    CLIO_YFRAME();
+    CLIO_YBEGIN();
+    CLIO_YCALL(MBeginAllocate(generation, args...));
     CLIO_YCALL(MAwaitFetch());
     CLIO_YEND();
   }
@@ -2021,6 +2171,32 @@ class DeviceVector {
     }
   }
 
+  /**
+   * Make a frame this block just claimed for ALLOCATE visible, empty.
+   * Thread 0, set lock taken here.
+   *
+   * The claim (AllocatePage) left it in flight with valid = [0,0), which
+   * Find() hides. No transfer will land in it, so take the in-flight mark
+   * back the way PublishFetch would, but leave the valid interval empty:
+   * a write hold resolves the frame and defines what it writes, while a
+   * read hold before any write fails Covers and stops -- reading a page
+   * that was allocated and never written is the caller's bug, and it is
+   * loud.
+   * @param p the frame AllocatePage returned with is_new == true
+   */
+  CTP_GPU_FUN void PublishAllocated(GPage *p) {
+    GBlockTasks *bt = Tasks();
+    const clio::run::u32 set = SetOf(p->page_num);
+    LockSet(set);
+    p->generation = bt->fetch_generation;
+    p->score = kDefaultScore;
+    p->last_access = clock64();
+    p->fetch_tag = 0ull;
+    __threadfence();
+    atomicSub(&p->fetching, 1u);
+    UnlockSet(set);
+  }
+
   /** Claim a frame per missing page, fill the bulk get, send it. Thread 0.
    *
    *  RESUMABLE. A page whose home set stays full is not claimed; the call
@@ -2028,9 +2204,20 @@ class DeviceVector {
    *  a completed call would leave them), records where it stopped and
    *  returns false so the caller can yield the round and call again with the
    *  same ranges. Only after kMaxFetchStalls such yields does it trap.
+   *
+   *  ALLOCATE (allocate == true) is the same claim with the read skipped for
+   *  every page the ranges cover ENTIRELY (to the vector's end on the last
+   *  page): the caller promises to write every element it named before it
+   *  flushes, so the stored bytes would be overwritten unread. A page the
+   *  ranges cover only in part is fetched exactly as without the flag -- its
+   *  other elements must survive the write-back. A page another block already
+   *  holds is only pinned, as for a fetch.
+   *  @param lo,hi,nr the element ranges [lo[i], hi[i])
+   *  @param allocate skip the read for wholly covered pages
    *  @return true once the batch is submitted (or was empty) */
   CTP_GPU_FUN bool SubmitFetch(const clio::run::u64 *lo,
-                               const clio::run::u64 *hi, clio::run::u32 nr) {
+                               const clio::run::u64 *hi, clio::run::u32 nr,
+                               bool allocate) {
     GBlockTasks *bt = Tasks();
     auto *t = bt->fetch;
     clio::run::u32 n = 0;
@@ -2071,12 +2258,14 @@ class DeviceVector {
         // for the whole grid instead of once per block, which is the point of
         // sharing. Private tables keep the exact-range behaviour, where one
         // writer per frame makes the interval sound.
+        bool claim_only = false;
         {
           const clio::run::u64 pstart = pn * h_->elems_per_page_;
           const clio::run::u64 avail =
               h_->num_elems_ > pstart ? h_->num_elems_ - pstart : 0;
           const clio::run::u64 whole =
               avail < h_->elems_per_page_ ? avail : h_->elems_per_page_;
+          claim_only = allocate && a == 0u && b >= whole;
           a = 0;
           b = static_cast<clio::run::u32>(whole > b ? whole : b);
         }
@@ -2146,6 +2335,14 @@ class DeviceVector {
             FatalNote(kFatalSetFull, pn, SetOf(pn), PinnedInSet(SetOf(pn)),
                       t4, t5, t6);
             GvStop();
+          }
+          if (claim_only) {
+            // Every element will be overwritten: no get. A frame a peer
+            // already holds (resident, or in flight) is just pinned; the
+            // caller's write hold waits for an in-flight one as usual.
+            if (is_new) PublishAllocated(p);
+            if (h_->stat_allocs_ != nullptr) atomicAdd(h_->stat_allocs_, 1ull);
+            continue;
           }
           if (!is_new) {
             const bool stale = bt->fetch_generation != 0 &&

@@ -87,7 +87,7 @@ Other host calls:
 | `ClearCache(gpu_id=0)` | drop every frame. **Unflushed data is discarded.** Never on a cache that holds the only copy of live data. |
 | `Copy(new_name, sync=false)` | checkpoint: flushes resident frames, then a copy-on-write snapshot (lazy: ~0.4 ms). A lazy copy returns *later* bytes if the source is overwritten before the copy is read -- use `sync=true` (148 ms/GB) then. Needs the checkpoint module linked. |
 | `MaterializeAll(inflight=32)` | force a lazy `Copy` to real bytes, server side |
-| `EnableStats()`, `ReadStats(gpu)`, `ResetStats()` | counters (off by default). `ResetStats` only zeroes the first 5 of 17. |
+| `EnableStats()`, `ReadStats(gpu)`, `ResetStats()` | counters (off by default). `ResetStats` zeroes the first 5 and `allocs` (slot 17) of 18. |
 | `PrefetchNow(hints)`, `RegisterPrefetcher`, `SetPrefetchPolicy`, `YieldObserver()` | tier rescoring only -- never makes pages GPU-resident. See ORGANIZER.md. |
 | `FatalReport()` | the latched device-fatal note as a string |
 
@@ -118,6 +118,9 @@ void UnpinRange2(u64 off0, u64 n0, u64 off1, u64 n1);
 YCoroTask BeginFlush(u64 gen, u64 off, u64 count, ...);                  // submit
 YCoroTask EndFlush();                                                    // park until landed
 YCoroTask Flush(u64 gen, u64 off, u64 count, ...);                       // both
+// coroc / macro forms only (no YCoroTask spelling):
+void CoBeginAllocate(u64 gen, u64 off0, u64 n0, ...);  void CoAllocate(u64 gen, ...);
+void MBeginAllocate(u64 gen, u64 off0, u64 n0, ...);   void MAllocate(u64 gen, ...);
 ```
 
 **Fetch**
@@ -128,6 +131,13 @@ YCoroTask Flush(u64 gen, u64 off, u64 count, ...);                       // both
 - One fetch in flight per block: `BeginFetch` first retires the previous one. There is no in-block double buffering.
 - Full set: spins 4096 times, then yields the round and retries; traps (code 5) after 65536 stalled rounds.
 - `gen = 0`: any version. `gen = g > 0`: the runtime serves it only once the page's bytes carry generation >= g (waits up to 10 s, then refuses -> code 7). A resident frame older than g is refetched. The `co_await Fetch` form additionally waits until every named page shows >= g; **`CoFetch` and `MFetch` do not have that wait loop.**
+
+**Allocate** (`CoAllocate` / `MAllocate`) -- Fetch for ranges you are about to **overwrite**
+- Contract: write-hold and write **every element you name** before flushing it. Whether the page exists in storage does not matter; the flush replaces it.
+- A page the ranges cover **entirely** (to the vector's end for the last page) is claimed and pinned with **no transfer**; its frame is published empty and your write holds define it. Counted in `allocs`, not `faults`.
+- A page covered only **in part** is fetched exactly as by Fetch (its other elements must survive the write-back). So a padded tail page costs one read.
+- A page another block already holds is only pinned. A **read** hold on an allocated page before it is written traps (code 3); an element named but never written is flushed as whatever the reused frame held.
+- Same limits as Fetch (8 ranges, 64 pages, one in flight per block); release with `UnpinRange` after the flush lands.
 
 **HoldPage**
 - Does not fetch. If the page is being fetched (by you or a peer block) it waits; if it is absent it traps (code 2).
