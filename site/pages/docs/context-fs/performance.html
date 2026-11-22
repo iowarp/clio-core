@@ -55,19 +55,17 @@ CLIO_PREFAULT=4GB clio-run start
   <li><code>CLIO_FUSE_STATFS_TTL_MS</code> (default 1000): how long <code>statfs</code> results (free space) are cached.</li>
 </ul>
 
-<h2>Pitfall 5: write windows and memory</h2>
-<p>Writes return before they reach the tiers. They are kept in a shared-memory window and published in the background. That makes writes fast, but the window holds memory, and once it is full a writer waits for the oldest writes to finish.</p>
+<h2>Pitfall 5: writes wait for the store</h2>
+<p>Writes are synchronous: each one returns after its pages are stored, and there is no write window to size. Write speed is the speed of the chain's top layers. With the default chain, a put lands in the volatile RAM core and the write-back cache flushes it to disk later, so writes run at RAM speed until the RAM tier fills.</p>
 <ul class="checks">
-  <li><code>CLIO_FUSE_WRITE_INFLIGHT_MB</code> (default 256): the mount's in-flight write window in MiB. <code>0</code> removes the bound. Raise it for fast tiers and large sequential writes, and lower it when many writers fill memory.</li>
-  <li><code>CLIO_CFS_ASYNC_WRITES</code> (default on): asynchronous writes. <code>0</code> makes every write wait for completion. Use that only to rule out write-behind when debugging.</li>
-  <li><code>CLIO_CFS_WRITE_WINDOW_COUNT</code> (default 256) and <code>CLIO_CFS_WRITE_WINDOW_BYTES</code> (default 64 MiB): the client's write-behind window by count and by bytes. The byte budget is global, not per file.</li>
+  <li>Use large writes. Each 1 MiB page range of a write is one put, so many small writes cost one put each.</li>
+  <li><code>CLIO_FUSE_MAX_THREADS</code> (default 64): FUSE requests served at once. Raise it when many ranks on a node write at once.</li>
   <li><code>CLIO_FUSE_ASYNC_FLUSH</code> and <code>CLIO_FUSE_ASYNC_CLOSE</code> (both default on): <code>close()</code> does not wait for the server's bookkeeping round trip. Set them to <code>0</code> to make close wait.</li>
 </ul>
 
 <h2>Fast paths that are on by default</h2>
 <p>These are on by default and are worth checking only when a run is unexpectedly slow. Each has a switch to turn it off, meant for debugging.</p>
 <ul class="checks">
-  <li><code>CLIO_FUSE_SIEVE</code>: file data goes through the mount's buffer directly, and only namespace operations become runtime tasks. <code>0</code> sends all I/O through tasks.</li>
   <li><code>CLIO_CFS_SHM_READ</code>: reads are served from shared memory without a round trip to the runtime. <code>0</code> forces every read through the runtime.</li>
   <li><code>CLIO_DIRECT_READ</code> and <code>CLIO_DIRECT_WRITE</code>, read by the runtime: a node-local RAM tier is read and written in place, without dispatching a separate task.</li>
   <li><code>CLIO_TASK_BATCHING</code>, read by the runtime: workers dequeue tasks in batches.</li>
@@ -81,7 +79,7 @@ CLIO_PREFAULT=4GB clio-run start
 # Runtime: fault in the RAM tier up front (commits its full size)
 CLIO_PREFAULT=0 clio-run start &
 
-# Mount: larger write window for big sequential writes
-CLIO_WITH_RUNTIME=0 CLIO_FUSE_WRITE_INFLIGHT_MB=1024 clio_cte_fuse ~/clio-mnt -f
+# Mount: more FUSE threads for many concurrent writers
+CLIO_WITH_RUNTIME=0 CLIO_FUSE_MAX_THREADS=128 clio_cte_fuse ~/clio-mnt -f
 </pre>
 <p>Change one knob at a time and measure. The <a href="/docs/context-fs/api.html">API reference</a> lists every environment variable the mount reads, and the <a href="/docs/runtime/api.html">Context Runtime API</a> covers the runtime configuration file.</p>

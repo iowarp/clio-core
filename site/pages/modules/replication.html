@@ -34,9 +34,10 @@ and so that everything above it sees one logical blob.</p>
   <li><strong>Own verbs</strong>: ReplicateBlob and FlushTag are numbered
   above the core's method space and are reached through the
   replication client, which inherits the full core client API.</li>
-  <li><strong>Called by</strong>: whatever is above it in the chain (cache,
-  indexer, compressor, the filesystem module) or a core client pointed at
-  the replication pool.</li>
+  <li><strong>Called by</strong>: whatever is above it in the chain (in the
+  default configuration, the write-back cache's flush and the stream
+  module's staged appends) or a core client pointed at the replication
+  pool.</li>
   <li><strong>Calls</strong>: the core pool for primaries and replicas, and
   its own pool on other nodes for remote copies.</li>
 </ul>

@@ -627,7 +627,8 @@ compose:
   # and stack via next_pool_id, separating RELIABILITY (replication) from
   # LOCALITY (cache) from ENCODING (compression). The canonical full chain:
   #
-  #   indexer(564.0) -> [compressor(562.0) ->] core_persist_write_back(567.0)
+  #   indexer(564.0) -> shm cache(568.0) -> [compressor(562.0) ->]
+  #     core_persist_write_back(567.0)
   #     -> volatile core(540.0)
   #     -> replication(561.0) -> persistent core(512.0)
   #
@@ -753,8 +754,10 @@ compose:
   # === Compression (optional, issue #886) ===
   # Encoding layer: transparently compresses on the way down and
   # decompresses on the way out. Requires a build with
-  # CLIO_CTE_ENABLE_COMPRESS=ON; uncomment this entry AND re-point the
-  # indexer entry below at 562.0 to enable it.
+  # CLIO_CTE_ENABLE_COMPRESS=ON. It sits between the shm cache and the
+  # write-back cache (indexer 564 -> shm cache 568 -> compressor 562 ->
+  # write-back 567): uncomment this entry AND set the shm cache entry's
+  # next_pool_id below to 562.0 to enable it.
   # - mod_name: clio_cte_compressor
   #   pool_name: clio_cte_compressor
   #   pool_query: local
@@ -904,11 +907,11 @@ compose:
   # POSIX-style filesystem chimod that the libfuse / POSIX adapters drive. It
   # sits at the canonical filesystem pool 560.0 (clio::cte::filesystem::
   # kCfsPoolId) over the interposition chain at next_pool_id: paths map to CTE
-  # tags and offsets to 1 MiB page-blobs, and every page ride the full chain
-  # (cache -> [compressor ->] replication -> core). Composing it here means a
-  # filesystem pool exists out of the box; the adapters create-or-bind it
-  # idempotently, so this is safe whether or not an adapter is also used. Must
-  # come AFTER the chain entries above. Remove it if you do not need the
+  # tags and offsets to 1 MiB page-blobs, and every page rides the full chain
+  # (indexer -> shm cache -> [compressor ->] write-back -> cores). The
+  # adapters (FUSE, LD_PRELOAD) only look this pool up by pool_name and fail
+  # if it is not composed; they never create it. Must come AFTER the chain
+  # entries above. Remove it if you do not need the
   # filesystem layer; point next_pool_id at 512.0 to bypass the chain.
   #
   # The FUSE adapter's caching is set by environment variables on the

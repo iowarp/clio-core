@@ -170,18 +170,19 @@ $ cmake --build build -j"$(nproc)" && sudo cmake --install build
     <rect class="box hl" x="20" y="208" width="536" height="46" rx="8"/><text class="title" x="32" y="230">Filesystem ChiMod (clio-fs)</text><text class="muted" x="32" y="246">directories, inodes and file handles, stored as blobs</text>
     <rect class="box hl" x="572" y="208" width="268" height="46" rx="8"/><text class="title" x="584" y="230">Stream</text><text class="muted" x="584" y="246">file sizes, ordered appends</text>
 
-    <text class="muted" x="20" y="284">CHIMOD CHAIN (optional data operators)</text>
-    <rect class="box hl" x="20" y="294" width="152" height="44" rx="8"/><text class="title" x="32" y="321">Cache</text>
-    <rect class="box hl" x="192" y="294" width="152" height="44" rx="8"/><text class="title" x="204" y="321">Indexer</text>
+    <text class="muted" x="20" y="284">CHIMOD CHAIN (optional data operators; add your own anywhere)</text>
+    <rect class="box hl" x="20" y="294" width="152" height="44" rx="8"/><text class="title" x="32" y="321">Indexer</text>
+    <rect class="box hl" x="192" y="294" width="152" height="44" rx="8"/><text class="title" x="204" y="321">Shm cache</text>
     <rect class="box" x="364" y="294" width="152" height="44" rx="8" stroke-dasharray="5 4"/><text class="title" x="376" y="321">Compressor</text>
-    <rect class="box hl" x="536" y="294" width="152" height="44" rx="8"/><text class="title" x="548" y="321">Replication</text>
-    <rect class="box" x="708" y="294" width="132" height="44" rx="8" stroke-dasharray="5 4"/><text class="title" x="720" y="321">Your module</text>
+    <rect class="box hl" x="536" y="294" width="152" height="44" rx="8"/><text class="title" x="548" y="321">Write-back</text>
+    <rect class="box hl" x="708" y="294" width="132" height="44" rx="8"/><text class="title" x="720" y="321">Replication</text>
     <path class="edge hl" d="M172,316 L190,316" marker-end="url(#ah0)"/>
     <path class="edge hl" d="M344,316 L362,316" marker-end="url(#ah0)"/>
     <path class="edge hl" d="M516,316 L534,316" marker-end="url(#ah0)"/>
+    <path class="edge hl" d="M688,316 L706,316" marker-end="url(#ah0)"/>
 
     <text class="muted" x="20" y="368">CONTEXT TRANSFER ENGINE (CTE core)</text>
-    <rect class="box hl" x="20" y="378" width="820" height="50" rx="8"/><text class="title" x="32" y="400">Tags and blobs, placed by score</text><text class="muted" x="32" y="418">hash-owned metadata · placement engine · metadata log · reorganize, flush, evict</text>
+    <rect class="box hl" x="20" y="378" width="820" height="50" rx="8"/><text class="title" x="32" y="400">Tags and blobs, placed by score</text><text class="muted" x="32" y="418">a volatile core and a persistent core · hash-owned metadata · placement engine · metadata log</text>
 
     <text class="muted" x="20" y="458">STORAGE (block-device pools)</text>
     <rect class="box" x="20" y="468" width="194" height="40" rx="8"/><text x="32" y="493">RAM / HBM</text>
@@ -195,13 +196,10 @@ $ cmake --build build -j"$(nproc)" && sudo cmake --install build
       <details class="yaml-example"><summary>The YAML for a stack like this</summary>
 <pre data-label="yaml">
 compose:
-  - mod_name: clio_cte_core            # tiers and placement
+  - mod_name: clio_cte_core            # persistent tiers and placement
     pool_id: "512.0"
+    durability: persistent
     storage:
-      - path: "ram::hot"
-        bdev_type: "ram"
-        capacity_limit: "16GB"
-        score: 1.0
       - path: "/mnt/nvme/clio.dat"
         bdev_type: "file"
         capacity_limit: "1TB"
@@ -210,29 +208,45 @@ compose:
       - path: "s3://my-bucket/clio"
         bdev_type: "s3"
         score: 0.1
+        persistence_level: "long_term"
     dpe:
       dpe_type: "max_bw"
+
+  - mod_name: clio_cte_core            # volatile RAM tier
+    pool_id: "540.0"
+    durability: volatile
+    storage:
+      - path: "ram::hot"
+        bdev_type: "ram"
+        capacity_limit: "16GB"
+        score: 1.0
 
   - mod_name: clio_cte_replication     # durable copies
     pool_id: "561.0"
     next_pool_id: "512.0"
     replication_factor: 1
-    replica_score: 0.2
+
+  - mod_name: clio_cte_core_persist_write_back   # ack in RAM, flush to disk
+    pool_id: "567.0"
+    next_volatile: "540.0"
+    next_persistent: "561.0"
+    flush_period_ms: 10000
 
   - mod_name: clio_cte_compressor      # optional data operator
     pool_id: "562.0"
-    next_pool_id: "561.0"
+    next_pool_id: "567.0"
     default_compress: "zstd"
     default_preset: "balanced"
 
-  - mod_name: clio_cte_indexer         # keyword search
-    pool_id: "564.0"
+  - mod_name: clio_cte_core_shm_cache_writethru  # metadata in shared memory
+    pool_id: "568.0"
     next_pool_id: "562.0"
+    entry_pool_id: "564.0"
+    md_only: true
 
-  - mod_name: clio_cte_cache           # hot copies, top of the chain
-    pool_id: "563.0"
-    next_pool_id: "564.0"
-    min_score: 0.5
+  - mod_name: clio_cte_indexer         # keyword search, top of the chain
+    pool_id: "564.0"
+    next_pool_id: "568.0"
 </pre>
       </details>
     </div>

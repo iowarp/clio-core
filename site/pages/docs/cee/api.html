@@ -128,7 +128,7 @@ cee.AssimilationCtx(src, dst, format, src_data, depends_on="", range_off=0, rang
 
 <h2>Environment variables</h2>
 <ul>
-  <li><code>CLIO_CTE_POOL</code> (<code>major.minor</code>): binds the CTE client to an interposing pool. Set <code>563.0</code> or <code>564.0</code> for semantic queries to reach the indexer. A malformed value is ignored with an error in the log.</li>
+  <li><code>CLIO_CTE_POOL</code> (<code>major.minor</code>): binds the CTE client to an interposing pool. Set <code>564.0</code>, the indexer at the top of the default chain, for semantic queries. A malformed value is ignored with an error in the log.</li>
   <li><code>CLIO_WITH_RUNTIME</code>: <code>1</code> or <code>true</code> makes the client try to start a runtime in-process; otherwise it only attaches. CEE passes attach-only as the default.</li>
   <li><code>CLIO_SERVER_CONF</code>: the runtime configuration file the client reads. Must describe the same runtime the server started.</li>
   <li><code>CLIO_BIND_ADDR</code>, <code>CLIO_SERVER_ADDR</code>: bind and connect addresses; use <code>127.0.0.1</code> for both on Windows.</li>

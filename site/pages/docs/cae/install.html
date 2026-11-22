@@ -54,7 +54,7 @@ CAE summarization support: ENABLED (libcurl + nlohmann_json found)
 <p>The install puts <code>clio-cae</code> in <code>bin</code>, with <code>clio_cae</code> and <code>clio_cae_omni</code> as symlinks (copies on Windows) for older scripts, and <code>cae_s3_tool</code> and <code>cae_http_tool</code> beside it when built.</p>
 
 <h2>Runtime configuration</h2>
-<p>The default configuration already composes the CAE core at pool 400.0 with <code>next_pool_id: "563.0"</code>. If you wrote your own <code>clio.yaml</code>, the entry you need is:</p>
+<p>The default configuration already composes the CAE core at pool 400.0 with <code>next_pool_id: "564.0"</code>, the indexer at the top of the chain. If you wrote your own <code>clio.yaml</code>, the entry you need is:</p>
 <pre data-label="yaml">
 compose:
   # ... CTE core and chain entries first ...
@@ -62,9 +62,9 @@ compose:
     pool_name: cae_main
     pool_query: local
     pool_id: "400.0"
-    next_pool_id: "563.0"
+    next_pool_id: "564.0"
 </pre>
-<p>The entry must come after the pool its <code>next_pool_id</code> names. Point <code>next_pool_id</code> at <code>"512.0"</code> to write to the bare core, skipping the cache and the indexer. The summarizer entry is in the default file, commented out; see <a href="/docs/cae/usage.html#describing-content-in-the-i-o-path">the usage page</a> to enable it.</p>
+<p>The entry must come after the pool its <code>next_pool_id</code> names. Point <code>next_pool_id</code> at <code>"512.0"</code> to write to the bare persistent core, skipping the indexer and both caches. The summarizer entry is in the default file, commented out; see <a href="/docs/cae/usage.html#describing-content-in-the-i-o-path">the usage page</a> to enable it.</p>
 
 <h2>Check the install</h2>
 <p>Start the runtime with <code>clio-run start</code>. From a pip install, import an inline string through the CEE and list it back:</p>

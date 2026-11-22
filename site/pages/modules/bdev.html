@@ -44,8 +44,9 @@ depth.</p>
 
 <h2>Composing a bdev directly</h2>
 <p>The pool name doubles as the device location: a file path for the file
-type, a bucket (with optional prefix) for s3 and gcs, and an arbitrary unique
-name for memory types. The default configuration composes one RAM device this
+type, a bucket (with optional prefix) for s3 and gcs, a
+<code>daos://</code> URI for daos, and an arbitrary unique name for memory
+types. The default configuration composes one RAM device this
 way:</p>
 <pre data-label="yaml">
 compose:
@@ -53,7 +54,7 @@ compose:
     pool_name: "ram::chi_default_bdev"
     pool_query: local
     pool_id: "301.0"
-    bdev_type: ram          # file, ram, hbm, pinned, noop, s3, gcs
+    bdev_type: ram          # file, ram, hbm, pinned, noop, s3, gcs, daos
     capacity: "0g"          # 0 on a ram device = 80% of system DRAM
 
   - mod_name: clio_bdev
@@ -68,8 +69,8 @@ compose:
 <dl class="notes">
   <dt>bdev_type</dt>
   <dd>One of <code>file</code> (default), <code>ram</code>, <code>hbm</code>,
-  <code>pinned</code>, <code>noop</code>, <code>s3</code>, <code>gcs</code>.
-  Setting the type also sets default performance figures ordered so that hbm
+  <code>pinned</code>, <code>noop</code>, <code>s3</code>, <code>gcs</code>,
+  <code>daos</code>. Setting the type also sets default performance figures ordered so that hbm
   outranks ram, which outranks pinned, which outranks everything else.</dd>
   <dt>capacity</dt>
   <dd>A size string such as <code>2GB</code>. Default 0. For a RAM device 0
@@ -232,6 +233,7 @@ compose:
       access_key_id: AKIA...
       secret_access_key: ...
 </pre>
+<p><code>${VAR}</code> references are expanded in a CTE tier's <code>path</code>, but not inside the <code>s3:</code> block: there they reach the runtime as literal text. The <a href="/tutorials/cloud-storage.html#try-an-s3-tier-from-pip">cloud storage tutorial</a> walks through a tier from AWS sign-in to objects in the bucket.</p>
 <h3>gcs</h3>
 <p>Compiled in when <code>CLIO_ENABLE_GOOGLE_CLOUD</code> is defined. Same
 object layout and zero-fill convention as s3, with the pool name parsed as
@@ -249,6 +251,40 @@ block, with the same fallback to the environment:</p>
 </table></div>
 <div class="callout warn"><span class="callout-title">Credentials in a config file</span>
 <p>Keys in the compose file are stored wherever the file is, and the runtime's pool log under <code>conf_dir</code> keeps the compose entry so it can recreate the pool after a restart. Keep both readable only by you, or leave the keys out and use the environment variables.</p></div>
+<h3>daos</h3>
+<p>Compiled in only with <code>-DCLIO_ENABLE_DAOS=ON</code>; without it the
+pool is refused with an error that names the option. The device is one file
+of a DAOS POSIX container, read and written through libdfs. No dfuse mount
+is in the data path. The pool name is the location:</p>
+<pre data-label="yaml">
+  - mod_name: clio_bdev
+    pool_name: "daos://mypool/mycont/clio/chi_bdev.dat"
+    pool_query: local
+    pool_id: "303.0"
+    bdev_type: daos
+    capacity: "100GB"
+</pre>
+<ul>
+  <li>The pool and container are DAOS labels or UUIDs. The container must
+  exist and be of type POSIX. Missing directories of the file path are
+  created.</li>
+  <li>Options go after <code>?</code>: <code>chunk_size</code> (default 1m),
+  <code>oclass</code>, <code>alloc_log</code> (a local path),
+  <code>prezero</code> (default 1), <code>chunk_align</code> (default 1)
+  and <code>io_threads</code> (1 to 64).</li>
+  <li><code>capacity</code> is required and is a cap; DAOS allocates space
+  as data is written.</li>
+  <li>DAOS I/O runs on dedicated I/O threads, never on runtime workers.
+  <code>CLIO_DAOS_IO_THREADS</code> sets their count (default 4) and
+  <code>CLIO_DAOS_POLL_US</code> their poll wait (default 200).</li>
+  <li>There is no allocator log unless <code>alloc_log</code> names a local
+  path. Without one, a restart that keeps metadata may hand out blocks
+  still in use.</li>
+</ul>
+<p>As a CTE tier, use <code>bdev_type: "daos"</code> with a
+<code>daos://</code> path. See the comments in
+<code>context-runtime/config/clio_default.yaml</code> for the full option
+list.</p>
 <h3>noop</h3>
 <p>No transport is created. Allocate, free, write and read return success
 without touching any storage. It exists to measure the runtime's own

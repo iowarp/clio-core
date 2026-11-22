@@ -96,7 +96,7 @@ def read_file(path):
     pool_name: clio_cte_indexer
     pool_query: local
     pool_id: "564.0"
-    next_pool_id: "561.0"
+    next_pool_id: "568.0"               # shm cache, as in the default
     index_log_path: "${CLIO_STORAGE_ROOT}/cte_indexer_index"
     tag_re: ".*\\.(md|txt|csv|json)$"    # only index text-like files
     blob_re: ".*"
@@ -125,13 +125,13 @@ ctx.context_destroy(["climate_docs"])
 <p><code>context_query</code> returns blob names only, which is why the tutorial above uses <code>clio_cte_core_ext</code> for mounted files. The full signatures are in the <a href="/docs/cte/python.html">Python API reference</a>.</p>
 
 <h3>Keyword search over imported data</h3>
-<p><code>context_query(..., prompt="sea ice")</code> ranks imported blobs by BM25. In the default configuration it returns nothing: the import engine (pool <code>400.0</code>) writes straight to the storage core, below the indexer, so imports are never indexed. To index them, send imports through the top of the chain. In <code>clio.yaml</code>, move the <code>clio_cae_core</code> entry below the <code>clio_cte_cache</code> entry (an entry must come after the pool it forwards to) and change its <code>next_pool_id</code>:</p>
+<p><code>context_query(..., prompt="sea ice")</code> ranks imported blobs by BM25. In the default configuration the import engine (pool <code>400.0</code>) forwards to the top of the chain, the indexer, so imports are indexed:</p>
 <pre data-label="yaml">
   - mod_name: clio_cae_core
     pool_name: cae_main
     pool_query: local
     pool_id: "400.0"
-    next_pool_id: "563.0"               # chain top (cache), so imports get indexed
+    next_pool_id: "564.0"               # chain top (indexer), so imports get indexed
 </pre>
-<p>Restart the runtime and import again. Then <code>ctx.context_query("climate_docs", ".*", max_results=2, prompt="sea ice minimum")</code> returns <code>['ice', 'co2']</code>, best match first. As with <code>SemanticSearch</code>, blobs without any query word are still ranked, after the matches.</p>
+<p>After the import above, <code>ctx.context_query("climate_docs", ".*", max_results=2, prompt="sea ice minimum")</code> returns <code>['ice', 'co2']</code>, best match first. As with <code>SemanticSearch</code>, blobs without any query word are still ranked, after the matches.</p>
 <p>Next: <a href="/tutorials/dashboard.html">watch the same data in the dashboard</a>.</p>

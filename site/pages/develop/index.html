@@ -7,9 +7,9 @@ lede: Every write in CLIO Core passes through a chain of data operators, and you
 facts: Language | C++20 ; Builds against | An installed CLIO Core ; Loaded | At runtime start, from a shared library
 -->
 <h2>What a data operator is</h2>
-<p>The runtime hosts <strong>modules</strong>, each in its own <strong>pool</strong>. Some modules are data operators: they receive the storage engine's calls, act on them, and pass them on. The built-in ones are the cache, the indexer, the compressor and replication (see <a href="/tutorials/operators.html">Compose data operators</a>). A module of your own works the same way:</p>
+<p>The runtime hosts <strong>modules</strong>, each in its own <strong>pool</strong>. Some modules are data operators: they receive the storage engine's calls, act on them, and pass them on. The built-in ones are the indexer, the shm cache, the compressor, the write-back cache and replication (see <a href="/tutorials/operators.html">Compose data operators</a>). A module of your own works the same way:</p>
 <pre data-label="data path">
-filesystem 560.0 → your operator 600.0 → cache 563.0 → indexer 564.0 → replication 561.0 → core 512.0
+filesystem 560.0 → your operator 600.0 → indexer 564.0 → shm cache 568.0 → write-back 567.0 → cores 540.0 / 512.0
 </pre>
 <p>Because the operator speaks the storage engine's interface, everything above it works unchanged: the FUSE mount, the Python API and other operators. It sees every call that passes through, and handles only the ones it cares about. The rest go down the chain untouched.</p>
 

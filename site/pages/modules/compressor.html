@@ -25,18 +25,21 @@ without a copy.</p>
 compression primitives it links against.</p>
 
 <h2>Where it sits</h2>
-<p>The canonical chain is cache, then indexer, then compressor, then
-replication, then the core. The compressor sits below the indexer so the
-indexer's read-backs see logical bytes, and above replication so the
-durable copies are the stored, compressed form. The node-local cache
-above it keeps a raw copy, which is how a compressed blob keeps the
-zero-IPC shared-memory read path.</p>
+<p>When enabled, the compressor sits between the shm cache and the
+write-back cache: indexer (564.0), shm cache (568.0), compressor (562.0),
+write-back cache (567.0). The compressor sits below the indexer so the
+indexer's read-backs see logical bytes, and above the write-back cache so
+the volatile and persistent copies are both the stored, compressed
+form.</p>
 <ul>
   <li><strong>Interposed verbs</strong>: PutBlob, GetBlob, GetBlobSize and
   MultiPutBlob, plus the POD variants used by device producers such as the
-  GPU vector adapter. MultiPutBlob is forwarded verbatim: batch records
-  carry no per-record context, so compression cannot be requested on that
-  path.</li>
+  GPU vector adapter. A MultiPutBlob batch carries one context for the
+  whole batch. With no codec requested (and no default codec), the batch
+  is forwarded intact and stays raw. With a codec requested or a
+  <code>default_compress</code> set, the batch is split into single puts,
+  and each record is compressed or stored raw by the single-put
+  rules.</li>
   <li><strong>Own verbs</strong>: DynamicSchedule, Compress, Decompress,
   PollNodeLoad and PollConsumers, reached through the compressor client,
   which inherits the core client API and overrides put and get to route
@@ -47,16 +50,17 @@ zero-IPC shared-memory read path.</p>
 
 <h2>Composing it</h2>
 <p>The default configuration ships this entry commented out. Enabling it
-means uncommenting it and re-pointing the indexer's
-<code>next_pool_id</code> at 562.0. Order matters: each entry must follow
-the entry it forwards to.</p>
+means uncommenting it and setting the shm cache entry's
+<code>next_pool_id</code> to 562.0. Order matters: each entry must follow
+the entry it forwards to, so the compressor goes after the write-back
+cache and before the shm cache.</p>
 <pre data-label="yaml">
 compose:
   - mod_name: clio_cte_compressor
     pool_name: clio_cte_compressor
     pool_query: local
     pool_id: "562.0"
-    next_pool_id: "561.0"           # replication pool
+    next_pool_id: "567.0"           # write-back cache
     tracking_enabled: true
     default_compress: "zstd"        # library name, "dynamic", or unset
     default_preset: "balanced"      # "fast" | "balanced" | "best"
@@ -183,8 +187,8 @@ target's score and adds predicted compress and decompress times.</p>
   host path or stores raw. It never allocates.</li>
   <li>For nvcomp-family blobs read on a device page-fault path, several
   pages' chunks are combined into one batched decompress launch. A
-  further drain-thread batching mode exists but is incomplete and is off
-  unless <code>CLIO_COMPRESS_GPU_BATCH=1</code>.</li>
+  drain thread batches GPU decompresses into one launch per drain. It is
+  on by default; <code>CLIO_COMPRESS_GPU_BATCH=0</code> disables it.</li>
 </ul>
 
 <h2>Explicit client verbs</h2>
@@ -234,7 +238,8 @@ compressed sizes, the achieved ratio and the compress time.</p>
   <li>Whole-blob writes only. Appends and in-place range writes to a
   compressed blob are not supported by this layer; the filesystem module
   works around this with fixed-size page blobs.</li>
-  <li>Batched puts (MultiPutBlob) are never compressed.</li>
+  <li>A batched put (MultiPutBlob) that requests a codec loses its batch
+  amortization, because it is split into single puts.</li>
   <li>Codec selection is per blob and has no per-tag or per-tier rules.
   The only pool-wide knob is the default codec; tier awareness enters
   only through the time objective's bandwidth estimate.</li>

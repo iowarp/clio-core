@@ -17,7 +17,7 @@ dark by default with a light theme. It is the documentation for CLIO Core.
 
 ## Build and preview
 
-No dependencies beyond Python 3.8+:
+No dependencies beyond Python 3.12+ (build.py uses 3.12 f-string syntax):
 
 ```bash
 python3 site/build.py            # writes site/_site and checks every internal link

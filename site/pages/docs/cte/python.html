@@ -70,7 +70,6 @@ client = cte.get_cte_client()
     <tr><td><code>AsyncPutBlobIfVersion(tag_id, blob_name, data, version, off=0)</code></td><td><code>{"code", "version"}</code>; absent counts as version 0</td></tr>
     <tr><td><code>AsyncGetBlob(tag_id, blob_name, data_size, off=0)</code></td><td><code>bytes</code></td></tr>
     <tr><td><code>AsyncGetBlobVersioned(tag_id, blob_name, data_size, off=0)</code></td><td><code>{"code", "version", "data"}</code>; <code>data</code> is <code>None</code> on failure</td></tr>
-    <tr><td><code>AsyncGetBlobDefer(tag_id, blob_name, data_size, off=0)</code></td><td><code>bytes</code>, after any pending deferred put to the blob completes</td></tr>
     <tr><td><code>AsyncGetBlobSize(tag_id, blob_name, pool_query=Dynamic())</code></td><td><code>int</code></td></tr>
     <tr><td><code>AsyncGetContainedBlobs(tag_id, pool_query=Broadcast())</code></td><td><code>list[str]</code></td></tr>
     <tr><td><code>AsyncDelBlob(tag_id, blob_name)</code></td><td><code>None</code>; <code>wait()</code> gives the return code</td></tr>
@@ -93,11 +92,16 @@ client = cte.get_cte_client()
   <li><code>done()</code>: <code>True</code> when the task has completed.</li>
   <li><code>result(max_sec=-1)</code>: blocks, then returns the value in the table above. Raises <code>TimeoutError</code> if <code>max_sec</code> elapses.</li>
 </ul>
-<h3>Deferred puts</h3>
+<p>The Python bindings have no deferred puts. To overlap puts, submit
+several <code>AsyncPutBlob</code> calls and wait on their futures.</p>
+<h3>Shared-memory cache</h3>
 <ul>
-  <li><code>AsyncPutBlobDefer(tag_id, blob_name, data, off=0, max_inflight_bytes=0) -&gt; int</code>: stages a copy of <code>data</code> in shared memory and returns 0 when submitted. <code>data</code> is free to reuse as soon as the call returns. When shared memory is exhausted the call waits for the oldest puts; <code>max_inflight_bytes</code> adds an explicit ceiling (0 means none).</li>
-  <li><code>AwaitPutsUntilSpace(max_inflight_bytes) -&gt; int</code>: waits until at most that many payload bytes are in flight (0 drains all) and returns the bytes still in flight.</li>
-  <li><code>DeferErrorCount() -&gt; int</code>: deferred puts that completed with a non-zero return code. The count is sticky.</li>
+  <li><code>ConnectCache() -&gt; bool</code>: connects this client to the
+  node's shm cache segment, using the keys the CTE core's Create returns.
+  The client must be bound to the shm cache pool or its entry pool.
+  Returns <code>True</code> when connected.</li>
+  <li><code>HasCache() -&gt; bool</code>: <code>True</code> when this client
+  is connected to a shm cache segment.</li>
 </ul>
 
 <h2>Supporting types</h2>
