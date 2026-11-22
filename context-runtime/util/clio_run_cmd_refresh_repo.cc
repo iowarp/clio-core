@@ -424,7 +424,7 @@ class ChiModGenerator {
     oss << "}\n";
     oss << "\n";
     oss << "void Runtime::SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive& archive, \n";
-    oss << "                        clio::run::shared_ptr<clio::run::Task> task_ptr) {\n";
+    oss << "                        clio::run::shared_ptr<clio::run::Task>& task_ptr) {\n";
     oss << "  switch (method) {\n";
 
     // Add SaveTask switch cases
@@ -445,7 +445,7 @@ class ChiModGenerator {
     oss << "}\n";
     oss << "\n";
     oss << "void Runtime::LoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archive,\n";
-    oss << "                        clio::run::shared_ptr<clio::run::Task> task_ptr) {\n";
+    oss << "                        clio::run::shared_ptr<clio::run::Task>& task_ptr) {\n";
     oss << "  switch (method) {\n";
 
     // Add LoadTask switch cases
@@ -474,7 +474,7 @@ class ChiModGenerator {
     oss << "}\n";
     oss << "\n";
     oss << "void Runtime::LocalLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive& archive,\n";
-    oss << "                            clio::run::shared_ptr<clio::run::Task> task_ptr) {\n";
+    oss << "                            clio::run::shared_ptr<clio::run::Task>& task_ptr) {\n";
     oss << "  switch (method) {\n";
 
     // Add LocalLoadTask switch cases
@@ -504,7 +504,7 @@ class ChiModGenerator {
     oss << "}\n";
     oss << "\n";
     oss << "void Runtime::LocalSaveTask(clio::run::u32 method, clio::run::DefaultSaveArchive& archive, \n";
-    oss << "                             clio::run::shared_ptr<clio::run::Task> task_ptr) {\n";
+    oss << "                             clio::run::shared_ptr<clio::run::Task>& task_ptr) {\n";
     oss << "  switch (method) {\n";
 
     // Add LocalSaveTask switch cases
