@@ -154,6 +154,9 @@ NAV = {
             ("tutorials/dashboard.html", "Navigate the dashboard"),
             ("tutorials/python-semantic-query.html", "Query files from Python"),
         ]),
+        ("Deploy", [
+            ("tutorials/persistent-cluster.html", "Persistent Context FS on a cluster"),
+        ]),
     ],
     "develop": [
         ("Develop", [
