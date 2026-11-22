@@ -1,0 +1,272 @@
+<!--
+title: Stream module
+heading: Stream: <em>sizes and appends.</em>
+description: The clio_cte_stream module: authoritative logical sizes for byte streams over CTE tags, deferred appends staged on the writer's node and merged in one order at the stream's home, its verbs, data layout, configuration, restart behavior and limits.
+eyebrow: Modules · Transfer engine
+lede: The stream module owns what turns a CTE tag into a byte stream: its page layout, its logical size, and appends from many nodes merged into one order. Each stream has a home container that owns its size. An append is staged on the writer's node and returns at once; every node ships its batch to the home each millisecond, where it is ordered, given a range at the end of the stream, and copied into the pages.
+facts: Library | clio_cte_stream ; Default pool | 565.0 ; Build option | CLIO_CTE_ENABLE_STREAM (ON) ; Source | context-transfer-engine/stream
+-->
+<h2>What it does</h2>
+<p>A tag's stored bytes are not a file's size: truncating up, sparse writes
+and appends all make the two differ, and short reads at end of file depend on
+the logical one. The stream module keeps that number for every stream, in
+one place per stream, and serializes the operations that depend on it.</p>
+<p>The second job is <code>O_APPEND</code> from several nodes. Each writer
+needs the current end, which moves whenever any node appends. Instead of a
+round trip per append to learn it, the writer stages its bytes locally and
+the stream's home places every node's appends at the end in batches.</p>
+<p>The <a href="/modules/filesystem.html">filesystem module</a> is its main
+user: every Context FS file is a stream, and the FUSE daemon sends deferred
+appends here. Nothing in the module is filesystem-specific, so any client
+that manages page blobs in a tag can use it.</p>
+
+<h2>Where it sits</h2>
+<ul>
+  <li><strong>Called by</strong>: the filesystem module (size reads, raises,
+  truncates, drops and fsync), the filesystem client's <code>fsync</code>, and
+  the FUSE daemon's deferred <code>O_APPEND</code> path.</li>
+  <li><strong>Calls</strong>: the CTE pool at <code>next_pool_id</code> for
+  the stream's page blobs, the pool at <code>staging_pool_id</code> for staged
+  appends, and its own containers on other nodes to ship batches.</li>
+  <li><strong>Home container</strong>: chosen by the caller and fixed for the
+  stream's life. The filesystem uses the file's inode home, so the size lives
+  on the container that holds the file's record and is read in-process there.
+  Other callers can use <code>Client::DefaultHome(tag, n)</code>, a hash of
+  the tag id. Size operations are sent to the home by
+  <code>DirectId</code>; appends and flushes run on the caller's node.</li>
+  <li><strong>Page writes are not its job.</strong> Ordinary writes go
+  straight to the CTE chain from the filesystem or the FUSE daemon. The stream
+  module writes pages only when it merges appends.</li>
+</ul>
+<p>There is no fixed stream pool id. The filesystem names the pool in its
+<code>stream_pool_id</code>; if that is unset it creates a stream pool of its
+own, as described on the <a href="/modules/filesystem.html">filesystem
+page</a>.</p>
+
+<h2>Composing it</h2>
+<p>The entry shipped in <code>context-runtime/config/clio_default.yaml</code>.
+Compose it after the chain and before the filesystem, which then binds it by
+<code>stream_pool_id</code>.</p>
+<pre data-label="yaml">
+compose:
+  # ... chain entries; the replication pool 561.0 must exist first ...
+  - mod_name: clio_cte_stream
+    pool_name: clio_cte_stream
+    pool_query: local
+    pool_id: "565.0"
+    next_pool_id: "564.0"               # data path: the chain top (indexer)
+    staging_pool_id: "561.0"            # replication: durable, uncached
+    # log_path: "/mnt/nvme/$USER/clio/cte_stream_log"
+
+  - mod_name: clio_cte_filesystem
+    pool_name: clio_cte_filesystem
+    pool_query: local
+    pool_id: "560.0"
+    next_pool_id: "564.0"
+    stream_pool_id: "565.0"
+</pre>
+<p>Staged appends are written once and read at most once, after a restart,
+so the default configuration sends them to the replication pool below every
+cache layer rather than through the caches.</p>
+
+<h2>Operations</h2>
+<p>Every method in <code>stream/clio_mod.yaml</code>.</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Id</th><th>Method</th><th>Runs on</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td>0</td><td><code>kCreate</code></td><td>admin</td><td>Get-or-create the pool. Binds the data and staging clients, registers the staging tag, opens the size log (replaying it on a recovering start) and re-queues this node's staged appends.</td></tr>
+    <tr><td>1</td><td><code>kDestroy</code></td><td>admin</td><td>No-op teardown.</td></tr>
+    <tr><td>9</td><td><code>kMonitor</code></td><td>any</td><td>No-op; answers no queries.</td></tr>
+    <tr><td>10</td><td><code>kSizeOp</code></td><td>home</td><td>Read or change a stream's logical size. Returns the size before and after.</td></tr>
+    <tr><td>11</td><td><code>kAppend</code></td><td>caller's node</td><td>Stage the bytes as one blob, queue the append and return. The staged blob is the append's record from then on (a restart re-queues it); its offset is decided later at the home.</td></tr>
+    <tr><td>12</td><td><code>kFlush</code></td><td>caller's node</td><td>Wait until every append this node accepted for the stream before the flush is merged, then return the stream's size.</td></tr>
+    <tr><td>13</td><td><code>kSequence</code></td><td>each node</td><td>Periodic drain, every 1 ms: ship queued appends to their homes, finish merges left open by a restart, fsync the size log when due, delete merged staging blobs.</td></tr>
+    <tr><td>14</td><td><code>kPlan</code></td><td>home</td><td>Take one node's batch for one stream: drop duplicates, order it, reserve its range at the current end, log the plan, copy the bytes into the pages, mark it done.</td></tr>
+  </tbody>
+</table></div>
+<p><code>kSizeOp</code> takes one of these operations
+(<code>StreamSizeOp</code>):</p>
+<dl class="notes">
+  <dt><code>kGet</code> (0)</dt>
+  <dd>Read the size; 0 for a stream the home does not know.</dd>
+  <dt><code>kMax</code> (1)</dt>
+  <dd><code>size = max(size, value)</code>. A write or close pushes its end
+  with it.</dd>
+  <dt><code>kReserve</code> (2)</dt>
+  <dd>Return the old size and add <code>value</code>: a synchronous append
+  offset, linearized at the home.</dd>
+  <dt><code>kSet</code> (3)</dt>
+  <dd><code>size = value</code>, for truncate or extend.</dd>
+  <dt><code>kDrop</code> (4)</dt>
+  <dd>Forget the stream and discard its pending appends, for unlink.</dd>
+  <dt><code>kSync</code> (5)</dt>
+  <dd>fsync the home's size log; <code>EIO</code> if it fails. Sent by a
+  file's <code>fsync</code>.</dd>
+</dl>
+<p><code>kSet</code> and <code>kDrop</code> wait for a merge in progress on
+the stream, so a truncate lands after an append batch, never inside it. Other
+operation values are refused with <code>EINVAL</code>.</p>
+
+<h2>Append pipeline</h2>
+<ol class="steps">
+  <li><strong>Stage.</strong> <code>kAppend</code> stamps the append with the
+  origin node's clock (wall-clock nanoseconds, forced to increase on that
+  node), its node id and a per-node counter, and writes the bytes as one blob
+  in the staging tag. A zero-byte append returns at once.</li>
+  <li><strong>Queue.</strong> The entry, with a copy of its bytes, joins the
+  node's queue in acceptance order, and the periodic drain starts if it is not
+  running.</li>
+  <li><strong>Ship.</strong> Every 1 ms the drain groups the queue by stream
+  and home and sends each group to the home as <code>kPlan</code> tasks of at
+  most 16 MiB of inline bytes, one at a time. A home that cannot be reached is
+  retried after 100 ms, and nothing newer for that stream is shipped from this
+  node before the retry.</li>
+  <li><strong>Order.</strong> The home claims the stream (one merge at a
+  time), first re-runs any earlier plan of the stream whose copy failed, drops
+  entries it has already merged, and sorts the rest by clock, then origin,
+  then counter. One node's appends therefore keep their order; appends from
+  different nodes are ordered by their origin clocks.</li>
+  <li><strong>Reserve and log.</strong> The plan's base is the current size,
+  the size grows by the batch, and the plan and new size are written to the
+  log before any byte is copied.</li>
+  <li><strong>Copy.</strong> The bytes are put into the stream's page blobs,
+  read from the batch's inline payload or, for appends recovered after a
+  restart, from their staging blobs, in slices of up to 16 MiB. A failed copy
+  leaves the plan open, to be retried at the same offsets.</li>
+  <li><strong>Clean up.</strong> Merged staging blobs are queued for deletion
+  and removed by the drain, up to 512 per tick.</li>
+</ol>
+<p>Appends to a stream that was dropped are discarded at the home along with
+their staged bytes.</p>
+<p>The FUSE daemon chooses between this pipeline and the alternatives with
+<code>CLIO_FUSE_APPEND</code>: <code>kernel</code> (the kernel's cached size,
+the single-node default), <code>reserve</code> (<code>kReserve</code> at the
+home through the filesystem's <code>AdvanceSize</code>, then a normal write)
+or <code>deferred</code> (this pipeline, the multi-node default). See the
+<a href="/docs/context-fs/api.html">Context FS API reference</a>.</p>
+
+<h2>Data layout</h2>
+<dl class="notes">
+  <dt>Pages</dt>
+  <dd>A stream is a CTE tag in the pool at <code>next_pool_id</code>. Byte
+  <code>off</code> lives in the blob named by the decimal page index
+  <code>off / 1 MiB</code>, the same layout the filesystem uses for file
+  data. Merged pages follow the page-score rule the co-located filesystem
+  container set (<code>data_score</code>), otherwise the default score.</dd>
+  <dt>Staging tag</dt>
+  <dd><code>_clio_stream_staging</code> in the pool at
+  <code>staging_pool_id</code>, with the well-known id
+  <code>0x3FFFFFFF.2</code> so a node can use it without reaching the tag's
+  owner. Registration of the name is tried 5 times, 1 s apart, at create,
+  then the well-known id is used.</dd>
+  <dt>Staged blob names</dt>
+  <dd><code>sa.&lt;major&gt;.&lt;minor&gt;.&lt;home&gt;.&lt;clock&gt;.&lt;origin&gt;.&lt;counter&gt;</code>,
+  all in hex. The name carries everything needed to merge the append, so a
+  restarted node can find its staged appends by listing the tag.</dd>
+  <dt>Size log</dt>
+  <dd><code>&lt;log_path&gt;.&lt;container id&gt;</code>, a self-checking
+  record log with size, drop, plan, done and merged-name records. Records are
+  written with <code>write(2)</code>; the log is fsynced by
+  <code>kSync</code> and by the drain at most every 5 s while it holds
+  unsynced records. It is rewritten as a snapshot once 64 MiB have been
+  appended since the last compaction.</dd>
+</dl>
+
+<h2>Configuration</h2>
+<p>Keys read by <code>StreamConfig::LoadConfig</code>. Parsing is
+best-effort: a malformed value leaves the defaults.</p>
+<dl class="notes">
+  <dt><code>next_pool_id</code></dt>
+  <dd>Required, no default. The pool page blobs are read from and written to,
+  normally the chain top. Without it the pool's create fails. Default
+  configuration: <code>"564.0"</code>.</dd>
+  <dt><code>staging_pool_id</code></dt>
+  <dd>Default: <code>next_pool_id</code>. Where staged appends are written.
+  Default configuration: <code>"561.0"</code>, the replication pool.</dd>
+  <dt><code>log_path</code></dt>
+  <dd>Default unset. Base path of each container's size log; the container
+  id is appended. Unset, nothing is persisted by this module. The
+  configuration file's comment states that file sizes then do not survive a
+  stop and start. A stream pool created by the filesystem instead logs to the
+  filesystem's <code>metadata_log_path</code> plus <code>.stream</code>.</dd>
+</dl>
+<p>The module reads one environment variable:
+<code>CLIO_TRACE_STREAM=1</code> logs one line per merge plan (its node,
+base offset, bytes and the range of appends from each origin).</p>
+
+<h2>Failure and restart</h2>
+<ul>
+  <li><strong>Only the home merges.</strong> A plan sent to a stand-in for a
+  dead home is refused with <code>EIO</code>, because the stand-in does not
+  know the stream's end. Origins keep the staged appends queued and retry
+  until the home is back.</li>
+  <li><strong>Flush while the home is down.</strong> <code>kFlush</code>
+  fails with <code>EIO</code> once it has waited 5 s and the home's node is
+  dead; the appends stay queued. Any flush fails with
+  <code>ETIMEDOUT</code> after 120 s.</li>
+  <li><strong>Recovering start.</strong> With a log, a plain
+  <code>clio-run start</code> replays sizes, drops and open plans, then
+  compacts. <code>start --fresh</code> discards the log.</li>
+  <li><strong>Restored sizes are held.</strong> A restored size may be stale,
+  since the file may have been served elsewhere while the node was down. Size
+  operations and merges on a restored stream wait until its owner reconciles
+  it, at most 120 s. The filesystem does this when it loads the inode: it
+  applies the record's size as a floor, or sets it outright, discarding open
+  plans, when another container wrote the record meanwhile.</li>
+  <li><strong>Interrupted merges</strong> are finished from the drain after
+  reconciliation, at their logged offsets.</li>
+  <li><strong>Staged appends.</strong> At create, a restarted node lists the
+  staging tag on every container and re-queues the appends it originated.
+  Appends originated elsewhere are still queued on their own nodes.</li>
+  <li><strong>Exactly once.</strong> The home remembers merged staged names
+  and skips them in later batches, so a retried batch never merges twice. The
+  memory is pruned of names older than 600 s once it passes 2<sup>20</sup>
+  names, and kept in the log's snapshot.</li>
+  <li><strong>Before Create.</strong> Tasks that arrive before the
+  container's create has opened its log wait up to 120 s, then fail with
+  <code>EIO</code>.</li>
+</ul>
+
+<h2>Behaviors worth knowing</h2>
+<ul class="checks">
+  <li>An append returns once its bytes are durably staged, before it has an
+  offset. A reader sees it after a <code>kFlush</code>; the FUSE daemon
+  flushes a file's pending appends before it stats, reads or truncates the
+  file and when it publishes the file on close.</li>
+  <li>A flush waits only for appends accepted before it, so later writers
+  cannot starve it.</li>
+  <li>Order across nodes follows the origin nodes' wall clocks. Appends from
+  nodes with skewed clocks are still merged exactly once, but not in real
+  time order.</li>
+  <li><code>kMax</code> never lowers a size; only <code>kSet</code> and
+  <code>kDrop</code> do.</li>
+  <li>The home's size is in memory; <code>kGet</code> is a map lookup.</li>
+</ul>
+
+<h2>Limits</h2>
+<ul>
+  <li>Appends to a stream whose home is down are not merged until it returns,
+  and <code>fsync</code> on that stream fails meanwhile.</li>
+  <li>Appends staged but not yet merged when the home's node is lost for good
+  stay in the staging tag; only the home merges them.</li>
+  <li>Without <code>log_path</code>, sizes and open plans live only in
+  memory.</li>
+  <li>The home is chosen by the caller and must not change for the stream's
+  life.</li>
+</ul>
+
+<h2>How it is tested</h2>
+<ul>
+  <li><code>context-transfer-engine/test/unit/test_stream_append.cc</code>
+  (<code>cte_stream_append</code>): sizes, concurrent writers merging exactly
+  once in writer order, appends across page boundaries, append after
+  truncate, and appends to a dropped stream, on one node.</li>
+  <li><code>context-transfer-engine/test/integration/clio_fs_suite</code>
+  through the FUSE mount: <code>append_mode</code>
+  (<code>tests_posix.py</code>); <code>xnode_append_many_writers</code>,
+  <code>xnode_append_burst</code> and <code>append_then_truncate</code>
+  (<code>tests_dist.py</code>); <code>append_home_restart</code>, which kills
+  the stream's home during appends and checks that every fsynced append
+  survives exactly once in writer order, and
+  <code>truncate_during_failover</code> (<code>tests_fault.py</code>).</li>
+</ul>
