@@ -19,7 +19,7 @@ facts: Module | clio_cae_core (pool 400.0) ; Methods | ParseOmni, ImportData (HD
     <rect class="box" x="580" y="106" width="260" height="62" rx="8"/><text class="title" x="592" y="130">Reference I/O pool</text><text class="muted" x="592" y="150">blocking source reads off workers</text>
     <path class="edge" d="M550,137 L578,137" marker-end="url(#ca0)"/>
     <rect class="box" x="580" y="198" width="260" height="62" rx="8"/><text class="title" x="592" y="222">Summarizer (optional)</text><text class="muted" x="592" y="242">labels blobs via a model</text>
-    <rect class="box hl" x="20" y="290" width="820" height="50" rx="8"/><text class="title" x="32" y="320">CTE chain (next_pool_id: the cache, 563.0, in the shipped config)</text>
+    <rect class="box hl" x="20" y="290" width="820" height="50" rx="8"/><text class="title" x="32" y="320">CTE chain (next_pool_id: the indexer, 564.0, in the shipped config)</text>
     <path class="edge hl" d="M285,260 L285,288" marker-end="url(#ca0)"/><path class="edge" d="M710,260 L710,288" marker-end="url(#ca0)"/>
   </svg>
   <figcaption>Transfers arrive as one task. The core picks an assimilator
@@ -134,7 +134,7 @@ facts: Module | clio_cae_core (pool 400.0) ; Methods | ParseOmni, ImportData (HD
 <table class="tradeoffs">
   <tr><th>Decision</th><th>Buys</th><th>Costs</th></tr>
   <tr><td>One task per transfer list</td><td class="good">One round trip; ordered, simple status</td><td class="cost">Transfers in a list do not run in parallel</td></tr>
-  <tr><td>Writes through the chain</td><td class="good">Imported data is cached, indexed and replicated</td><td class="cost">Imports pay every composed module's cost</td></tr>
+  <tr><td>Writes through the chain</td><td class="good">Imported data is indexed, cached and made durable</td><td class="cost">Imports pay every composed module's cost</td></tr>
   <tr><td>Ingest on fault</td><td class="good">Instant registration of huge sources</td><td class="cost">First reads pay source latency</td></tr>
   <tr><td>Separate reference I/O pool</td><td class="good">Slow sources never stall workers</td><td class="cost">Extra threads per runtime</td></tr>
 </table>

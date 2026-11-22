@@ -39,10 +39,10 @@ system library or a config file.</p>
 filesystem client. An adapter owns only its handle table and seek
 offsets. Everything else lives in that layer:</p>
 <ul>
-  <li>write-behind staging;</li>
+  <li>synchronous writes;</li>
   <li>size tracking;</li>
   <li>zero-IPC reads;</li>
-  <li>error latching.</li>
+  <li>durable sync.</li>
 </ul>
 <p>CTE descriptors start at 8192 so they never collide with kernel
 descriptors. <code>stat</code> results are synthesized, with a fixed device
@@ -50,23 +50,18 @@ number, a path-derived inode number and 1 MiB blocks. Creating a file
 whose parent directories exist on the host but not yet in clio-fs creates
 them on the fly.</p>
 
-<h3>Write-behind</h3>
-<p>A <code>write()</code> copies the buffer into pooled shared-memory
-staging, submits it, and returns, unless the file was opened
-<code>O_SYNC</code> or <code>O_DSYNC</code>.</p>
+<h3>Synchronous writes</h3>
+<p>A <code>write()</code> copies the buffer into a runtime buffer, sends
+one Write task to the filesystem ChiMod and waits for it. The caller may
+reuse its buffer as soon as the call returns. <code>O_SYNC</code> and
+<code>O_DSYNC</code> change nothing, because every write already waits.</p>
 <ul>
-  <li><strong>In-flight window.</strong> Bounded per process at 256 writes
-  or 64 MiB. That count was the best measured setting. A byte-only limit
-  let 4 KiB writes queue 16k deep and cost 1.6× throughput.</li>
-  <li><strong>Reads see pending writes.</strong> A read that is fully
-  covered is served from staging; a partially covered read waits for the
-  overlapping writes.</li>
-  <li><strong>Errors surface late.</strong> A failed write is latched and
-  reported once, at <code>fsync</code> or <code>close</code>, the way the
-  kernel reports writeback errors.</li>
-  <li><strong>Draining first.</strong> <code>stat</code>,
-  <code>SEEK_END</code>, truncate, unlink and rename all drain the file's
-  pending writes before acting.</li>
+  <li><strong>Errors surface at once.</strong> A failed write returns -1
+  from that <code>write()</code>: <code>ENOSPC</code> for a full store,
+  <code>ENOMEM</code> when no buffer could be allocated, else
+  <code>EIO</code>.</li>
+  <li><strong>Reads see every write.</strong> A write has landed before it
+  returns, so a later read on any descriptor sees it.</li>
 </ul>
 
 <h3>Semantics and limits</h3>
@@ -81,15 +76,13 @@ staging, submits it, and returns, unless the file was opened
   there is no backing file on a parallel filesystem: the CTE's tier
   configuration alone decides durability.</p>
   <ul>
-    <li><strong>POSIX and STDIO.</strong> <code>fsync</code> drains pending
-    writes and reports errors, but does not force a sync to a persistent
-    device the way the FUSE mount does. Data reaches persistent tiers
-    through the periodic flush.</li>
-    <li><strong>MPI-IO.</strong> <code>MPI_File_sync</code> does nothing,
-    and the result of close is not checked. A failed deferred write
-    through MPI-IO can therefore go unreported. Applications that need
-    strict error reporting should use the FUSE mount or the POSIX
-    interceptor with <code>O_SYNC</code>.</li>
+    <li><strong>POSIX and STDIO.</strong> <code>fsync</code> (and
+    <code>fflush</code> for STDIO) makes the data durable the same way the
+    FUSE mount does: the file's tag is synced to a persistent device, then
+    its size, then the parent directory.</li>
+    <li><strong>MPI-IO.</strong> <code>MPI_File_sync</code> runs the same
+    durable sync. Errors from sync and close are mapped to MPI error
+    classes and returned.</li>
   </ul>
 </div>
 
@@ -182,8 +175,8 @@ free of allocators and locks.</p>
 <table class="tradeoffs">
   <tr><th>Decision</th><th>Buys</th><th>Costs</th></tr>
   <tr><td>Opt-in <code>clio::</code> paths</td><td class="good">Interception never captures unrelated files.</td><td class="cost">Producers and consumers must both use the marker, an interceptor, FUSE or the API.</td></tr>
-  <tr><td>One shared descriptor layer</td><td class="good">Every interceptor gets the same write-behind, error and size semantics.</td><td class="cost">A fixed 1 MiB page size for clio-fs files.</td></tr>
-  <tr><td>Write-behind in interceptors</td><td class="good">Small-write throughput close to the page cache's.</td><td class="cost">Errors arrive at fsync or close. Interceptor fsync is not a device sync.</td></tr>
+  <tr><td>One shared descriptor layer</td><td class="good">Every interceptor gets the same write, error, size and sync semantics.</td><td class="cost">A fixed 1 MiB page size for clio-fs files.</td></tr>
+  <tr><td>Synchronous writes in interceptors</td><td class="good">Errors arrive at the write that caused them. fsync is a device sync, as on the FUSE mount.</td><td class="cost">Every write waits for one round trip, so small writes are slower than a page cache.</td></tr>
   <tr><td>HDF5: native file is the authority</td><td class="good">No new data-loss window. The cache can always be discarded.</td><td class="cost">Writes are never faster than native. The gain is on re-reads.</td></tr>
   <tr><td>Cost-gated VOL admission</td><td class="good">Caching is skipped where it would lose (fast local disk, tiny datasets).</td><td class="cost">The model needs measurements, so early accesses may be mis-admitted.</td></tr>
   <tr><td>Simplified MPI-IO</td><td class="good">A drop-in for common independent-I/O codes.</td><td class="cost">Not suitable for codes relying on views, shared pointers or strict error reporting.</td></tr>

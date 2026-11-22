@@ -12,10 +12,10 @@ lede: clio-fs is a POSIX-shaped, distributed namespace built entirely out of CTE
     <rect class="box alt" x="20" y="16" width="250" height="56" rx="8"/><text class="title" x="36" y="40">Unmodified applications</text><text class="muted" x="36" y="58">through the kernel VFS</text>
     <rect class="box alt" x="300" y="16" width="250" height="56" rx="8"/><text class="title" x="316" y="40">LD_PRELOAD interceptors</text><text class="muted" x="316" y="58">POSIX, STDIO, MPI-IO, HDF5 VFD</text>
     <rect class="box hl" x="20" y="100" width="250" height="56" rx="8"/><text class="title" x="36" y="124">FUSE daemon</text><text class="muted" x="36" y="142">libfuse3 / macFUSE / WinFsp</text>
-    <rect class="box hl" x="20" y="184" width="530" height="56" rx="8"/><text class="title" x="36" y="208">Filesystem client</text><text class="muted" x="36" y="226">descriptor table, write-behind, zero-IPC read and stat mirrors</text>
+    <rect class="box hl" x="20" y="184" width="530" height="56" rx="8"/><text class="title" x="36" y="208">Filesystem client</text><text class="muted" x="36" y="226">descriptor table, synchronous writes, zero-IPC read and stat mirrors</text>
     <rect class="box hl" x="20" y="268" width="250" height="52" rx="8"/><text class="title" x="36" y="292">Filesystem ChiMod</text><text class="muted" x="36" y="310">directories, inodes, handles</text>
     <rect class="box" x="300" y="268" width="120" height="52" rx="8"/><text class="title" x="314" y="298">Stream</text>
-    <rect class="box" x="440" y="268" width="400" height="52" rx="8"/><text class="title" x="456" y="292">CTE chain (cache → … → core)</text><text class="muted" x="456" y="310">pages, directory blocks, inode records</text>
+    <rect class="box" x="440" y="268" width="400" height="52" rx="8"/><text class="title" x="456" y="292">CTE chain (indexer → … → cores)</text><text class="muted" x="456" y="310">pages, directory blocks, inode records</text>
     <path class="edge" d="M145,72 L145,98" marker-end="url(#ah5)"/>
     <path class="edge" d="M145,156 L145,182" marker-end="url(#ah5)"/>
     <path class="edge" d="M425,72 L425,182" marker-end="url(#ah5)"/>
@@ -266,7 +266,7 @@ every container, because it no longer knows who held the object.</p>
   <tr><th>Mechanism</th><th>Behavior</th><th>Scope</th></tr>
   <tr><td>Shared-memory attribute mirror</td><td>The runtime publishes per-path records that clients read lock-free. A generation counter invalidates a subtree after a directory rename. Records for complete directories make "not found" authoritative without asking the server.</td><td>Single-node by default</td></tr>
   <tr><td>Write-behind</td><td><code>write()</code> can return before the runtime has the bytes. Failures latch per file and surface at <code>fsync</code> or <code>close</code>, like kernel writeback errors. Reads see in-flight bytes.</td><td>On by default</td></tr>
-  <tr><td>Close-to-open</td><td>Closing a file drains its pages, merges deferred appends and publishes its size, so the next opener anywhere sees the result.</td><td>Multi-node, or when the handle wrote</td></tr>
+  <tr><td>Close-to-open</td><td>Closing a file merges deferred appends and publishes its size, so the next opener anywhere sees the result.</td><td>Multi-node, or when the handle wrote</td></tr>
 </table>
 <p>Overlapping writes from different clients that have not been synced
 are <em>not</em> ordered last-writer-wins. Applications that write the same
@@ -295,9 +295,11 @@ tier when one exists. A device-level flush, however, happens only on
   <code>stat</code>.</li>
   <li>A corrupted split tree is detected and reported as an I/O error.</li>
 </ul>
-<p><code>fsync</code> through FUSE drains pages, publishes the size, waits
-for replication, syncs the file's tag to a persistent device, fsyncs the
-size log and syncs the parent directory, in that order. If a node that may
+<p><code>fsync</code> through FUSE runs any queued close publish for the
+file, publishes the size, syncs the file's tag (the write-back cache
+flushes its dirty copies, replication brings replicas up to date, and the
+devices and WAL are synced), fsyncs the size log, syncs the parent
+directory's tag and syncs the directory journal, in that order. If a node that may
 have held unsynced writes for the file died since the last sync,
 <code>fsync</code> returns EIO.</p>
 
@@ -337,21 +339,24 @@ have held unsynced writes for the file died since the last sync,
 daemon does not use them by default. Instead, the daemon goes straight to
 the file's page blobs through the CTE client.</p>
 <ul>
-  <li><strong>Writes</strong> are copied into the client's write sieve:
-  64 KiB shared-memory pages, shipped when full or every 500 µs. The
-  file's logical size is tracked in the client and published at
-  <code>flush</code>, <code>fsync</code> or <code>release</code>. Pages
-  go to the top of the filesystem's chain, so they are cached and
-  replicated.</li>
-  <li><strong>Reads</strong> are served from in-flight staging first, then
-  the zero-IPC shared-memory path, then a request. Reads whose owner just
-  died are retried for about 10 s, then fail with EIO.</li>
+  <li><strong>Writes</strong> are synchronous. Each 1 MiB page range of a
+  <code>write</code> is one <code>PutBlob</code> to the file's page blob.
+  When the client is connected to the shm cache, the put is a copy into
+  shared memory with no task; otherwise it is a task. Errors return from
+  that <code>write</code>; nothing is latched for later. The file's
+  logical size is tracked in the daemon and published at
+  <code>flush</code>, <code>fsync</code> or <code>release</code>. Pages go
+  to the top of the filesystem's chain.</li>
+  <li><strong>Reads</strong> are served from the read-ahead pages (when
+  <code>CLIO_FUSE_READAHEAD_PAGES</code> is set), then the shm cache, then
+  a request. Reads whose owner just died are retried for about 10 s, then
+  fail with EIO.</li>
   <li><strong>Appends</strong> trust the kernel's size on a single node and
   use deferred, node-local staging (merged at the stream's home) on
   multi-node mounts. A synchronous reservation mode is also available.</li>
   <li><strong>Out of space</strong> is reported honestly. A refused page
-  fails the next write and the close with ENOSPC, and truncates the file
-  back to the last page that was stored.</li>
+  fails that <code>write</code> with ENOSPC. Pages stored earlier in the
+  same write are kept, and the write reports the bytes stored.</li>
   <li><strong>Close</strong> is fire-and-forget by default. Durability
   lives in <code>flush</code> and <code>fsync</code>.</li>
 </ul>
@@ -359,9 +364,9 @@ the file's page blobs through the CTE client.</p>
 fast paths in front. <code>stat</code> reads the shared-memory mirror
 first (about 10 µs, against about 290 µs through the ChiMod), and a
 complete-directory record answers "not found" without asking the server.
-Before unlink, rename and truncate, the daemon drains the file's pending
-writes, so a late size update cannot resurrect a truncated file or land
-data under an old name.</p>
+Before unlink, rename and truncate, the daemon runs the file's queued
+close publishes, so a late size update cannot resurrect a truncated file
+or land data under an old name.</p>
 
 <h2 id="performance">Performance notes</h2>
 <ul>
@@ -393,6 +398,6 @@ data under an old name.</p>
   <tr><td>Local resolution with pushed caches</td><td class="good">Warm path walks with no network traffic.</td><td class="cost">Each change pushes to every holder, and holders must be tracked.</td></tr>
   <tr><td>Leases, failing closed</td><td class="good">Never serves stale namespace state.</td><td class="cost">Mutations can stall about 12 s behind an unreachable holder, and cut-off nodes get EIO.</td></tr>
   <tr><td>Multi-step protocols instead of transactions</td><td class="good">No distributed locks or two-phase commit. Crashes leak instead of corrupting.</td><td class="cost">Rename is not one atomic step, and leaked link counts are possible after crashes.</td></tr>
-  <tr><td>FUSE data path straight to blobs</td><td class="good">Avoids a server-side hop and per-page serialization.</td><td class="cost">Write-behind means errors surface at close or fsync, not at write.</td></tr>
+  <tr><td>FUSE data path straight to blobs</td><td class="good">Avoids a server-side hop and per-page serialization.</td><td class="cost">Every write waits for its pages to be stored, so small writes cost one put each.</td></tr>
   <tr><td>Fast paths only on single node</td><td class="good">Microsecond <code>stat</code> locally.</td><td class="cost">Multi-node mounts pay a request per <code>stat</code> or lookup miss.</td></tr>
 </table>

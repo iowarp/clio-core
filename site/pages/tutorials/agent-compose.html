@@ -7,16 +7,25 @@ lede: CLIO Kit packages what an agent needs to know to compose CLIO Core: every 
 facts: Time | 15 minutes ; You need | A working install, uv, and Claude Code, Codex, Cursor or another agent that reads skills ; Result | A reviewed <code>clio.yaml</code> and a crash test of its durability claim
 -->
 <h2>1. What CLIO Kit gives your agent</h2>
-<p><a href="https://github.com/iowarp/clio-kit">CLIO Kit</a> is IOWarp's marketplace of agent skills, MCP servers and plugins for scientific computing. Its <code>clio-core</code> bundle holds three skills. A skill is a folder of instructions that the agent loads when your request matches it. These skills call no MCP server; the agent reads them, and the files you point it at.</p>
+<p><a href="https://github.com/iowarp/clio-kit">CLIO Kit</a> is IOWarp's marketplace of agent skills, MCP servers and plugins for scientific computing. Its <code>clio-core</code> bundle holds a skill for composing a storage system, one skill per shipped module, and skills for writing new modules and GPU kernels. A skill is a folder of instructions that the agent loads when your request matches it. Each module skill lists every configuration key with its default, the module's client API, and what it loses to each kind of failure, so the agent does not need the CLIO Core source. These skills call no MCP server.</p>
 <div class="table-wrap"><table>
   <thead><tr><th>Skill</th><th>The agent uses it to</th></tr></thead>
   <tbody>
     <tr><td><code>storage-compose</code></td><td>Choose and order modules, write the <code>compose</code> list, and state what is durable, consistent and available after each kind of failure</td></tr>
-    <tr><td><code>chimod-dev</code></td><td>Write a new ChiMod or a data-path operator: tasks, runtime, client, code generation, CMake and tests</td></tr>
+    <tr><td><code>clio-runtime-config</code></td><td>The config file outside <code>compose</code>, environment variables, the <code>clio-run</code> commands, multi-node and Docker</td></tr>
+    <tr><td><code>clio-bdev</code></td><td>Block devices and storage tiers, and the erasure-coded <code>safe_bdev</code> array</td></tr>
+    <tr><td><code>clio-cte-core</code></td><td>The CTE core's keys, and the C++ and Python blob API</td></tr>
+    <tr><td><code>clio-cte-caches</code></td><td>The write-back, write-thru, shared-memory and node-copy caches</td></tr>
+    <tr><td><code>clio-replication</code></td><td>Copies on other nodes, failover and hand-back</td></tr>
+    <tr><td><code>clio-compressor</code></td><td>Transparent compression and its codecs</td></tr>
+    <tr><td><code>clio-indexer</code></td><td>Keyword search over stored data</td></tr>
+    <tr><td><code>clio-fs</code></td><td>The filesystem and stream modules, and mounting with FUSE</td></tr>
+    <tr><td><code>clio-cae</code></td><td>Importing data with OMNI files and <code>clio-cae</code>, and the summarizer</td></tr>
+    <tr><td><code>chimod-dev</code></td><td>Write, build and load a new ChiMod or data-path operator outside the CLIO Core repository</td></tr>
     <tr><td><code>gpu-vector</code></td><td>Write and tune GPU kernels over the paged out-of-core vector</td></tr>
   </tbody>
 </table></div>
-<p>This tutorial uses <code>storage-compose</code>.</p>
+<p>This tutorial uses <code>storage-compose</code>, which loads the module skills as it writes each entry.</p>
 
 <h2>2. Install the launcher</h2>
 <p>The <code>clio-kit</code> command installs skills into an agent's skill directory.</p>
@@ -36,7 +45,7 @@ $ clio-kit skill list --bundle clio-core
 </pre>
 <p>Keep the checkout: an editable install reads the skills from it.</p></section>
 </div>
-<p>The list names <code>chimod-dev</code>, <code>gpu-vector</code> and <code>storage-compose</code>. If <code>clio-kit</code> is not found, run <code>uv tool update-shell</code> and open a new shell.</p>
+<p>The list names the twelve skills in the table above. If <code>clio-kit</code> is not found, run <code>uv tool update-shell</code> and open a new shell.</p>
 
 <h2>3. Install the skills into your agent</h2>
 <p>Run these from the project directory where you will work with the agent.</p>
@@ -92,7 +101,7 @@ fine. State what an acknowledged put means, and what a kill -9 loses.
   <li><strong>No volatile and persistent devices in one core.</strong> Two cores joined by the write-back cache, not one mixed core.</li>
   <li><strong>Search and labeling are scoped.</strong> The indexer's <code>tag_re</code> and the summarizer's rules match only the data you need searched or labeled.</li>
 </ul>
-<p>Every key is described in <code>context-runtime/config/clio_default.yaml</code> and on the <a href="/modules/index.html">module pages</a>.</p>
+<p>Every key is described in the module skills, in the commented default config (<code>~/.clio/clio.yaml</code> after a pip install), and on the <a href="/modules/index.html">module pages</a>.</p>
 
 <h2>6. Start it and test the claim</h2>
 <pre data-label="shell">

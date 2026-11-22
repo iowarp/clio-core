@@ -7,7 +7,7 @@ lede: This page shows how to do each common job with the CTE client, in C++ and 
 facts: C++ | clio::cte::core::Tag, Client ; Python | clio_cte_core_ext ; Default pool | 512.0, or CLIO_CTE_POOL
 -->
 <h2>Connect a client</h2>
-<p>Every program first initializes the runtime client, then the CTE client. The CTE client binds to the core pool 512.0 by default. The environment variable <code>CLIO_CTE_POOL</code>, as <code>major.minor</code>, binds it to another pool that speaks the core interface, such as the indexer at 564.0 or the cache at 563.0. Set it before initialization.</p>
+<p>Every program first initializes the runtime client, then the CTE client. The CTE client binds to the core pool 512.0 by default; a process that can map the runtime's shared memory is moved to the chain's entry pool (the indexer, 564.0) through the shm cache. The environment variable <code>CLIO_CTE_POOL</code>, as <code>major.minor</code>, binds it to another pool that speaks the core interface, such as the indexer at 564.0, the top of the default chain. Set it before initialization.</p>
 <pre data-label="cpp">
 #include <clio_runtime/clio_runtime.h>
 #include <clio_cte/core/core_client.h>
