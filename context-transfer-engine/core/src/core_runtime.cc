@@ -2293,6 +2293,9 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     // Check if blob exists and resolve score
     std::shared_ptr<BlobInfo> blob_info_ptr = CheckBlobExists(blob_name, tag_id);
     bool blob_found = (blob_info_ptr != nullptr);
+    if (blob_found && (task->context_.op_flags_ & Context::kKeepScore)) {
+      blob_score = blob_info_ptr->score_;  // a rewrite in place: the blob stays where its score put it
+    }
     if (blob_score < 0.0f) {
       blob_score = blob_found ? blob_info_ptr->score_ : 1.0f;
     }

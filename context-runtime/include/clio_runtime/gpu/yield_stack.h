@@ -946,13 +946,22 @@ class YieldStack {
     return v;
   }
 
+  /** Reset on `stream` and wait for it only (null: the legacy default stream and a device-wide wait). A runner
+   *  on its own stream must not wait here for unrelated work -- the model's compute, other runners' rounds. */
+  void SetStream(void *stream) { stream_ = stream; }
+
   void Reset() {
 #if CTP_ENABLE_CUDA && defined(__CUDACC__)
     const clio::run::u32 nlanes = nblocks_ * lanes_per_block_;
     const clio::run::u32 threads = 128;
     const clio::run::u32 blocks = (nlanes + threads - 1) / threads;
-    YieldStackInitKernel<<<blocks, threads>>>(View(), nlanes);
-    ctp::GpuApi::Synchronize();
+    if (stream_ != nullptr) {
+      YieldStackInitKernel<<<blocks, threads, 0, static_cast<cudaStream_t>(stream_)>>>(View(), nlanes);
+      ctp::GpuApi::Synchronize(stream_);
+    } else {
+      YieldStackInitKernel<<<blocks, threads>>>(View(), nlanes);
+      ctp::GpuApi::Synchronize();
+    }
 #elif CTP_ENABLE_SYCL
     // Out of line, into the kernel-owning TU. Both halves of this -- the
     // lane-header init kernel and the device_global publish -- are things
@@ -969,6 +978,7 @@ class YieldStack {
   char *d_base_ = nullptr;
   char *d_persist_ = nullptr;
   char *d_smem_ = nullptr;
+  void *stream_ = nullptr;
 };
 
 #if !CTP_IS_DEVICE_PASS

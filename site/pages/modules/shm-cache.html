@@ -486,7 +486,7 @@ warning level:</p>
   A put that must carry a score or a context should use
   <code>AsyncPutBlob</code>, which is always the task path. To keep one put
   out of the segment, set <code>Context::kBypassShmCache</code> (bit
-  <code>1u &lt;&lt; 10</code> of <code>op_flags_</code>) in the context
+  <code>1u &lt;&lt; 11</code> of <code>op_flags_</code>) in the context
   passed to <code>PutBlob</code>: the client sends a task instead. The
   <code>Async*</code> methods never consult the segment.</li>
   <li>An acknowledged put in data mode is in the segment, not the chain. It
