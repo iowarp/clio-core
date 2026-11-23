@@ -72,7 +72,7 @@ clio-run compose list  [--restartable]
   <li><code>mod_name</code>: the module's <code>chimod_lib_name</code>, such as <code>clio_bdev</code> or <code>clio_cte_core</code>.</li>
   <li><code>pool_name</code>: the pool's name. For block devices it is also the device path (<code>ram::name</code> or a file path).</li>
   <li><code>pool_query</code>: routing of the create task. One of <code>local</code>, <code>broadcast</code>, <code>dynamic</code>, <code>direct_id:N</code>, <code>direct_hash:N</code>, <code>range:OFFSET:COUNT</code>, <code>physical:NODE</code>, <code>many_to_one:HASH[:KEY[:NS]]</code>.</li>
-  <li><code>pool_id</code>: <code>"major.minor"</code> as a string.</li>
+  <li><code>pool_id</code>: <code>"major.minor"</code> as a string. Each entry needs its own: a compose that reuses a <code>pool_id</code> is refused at startup.</li>
   <li><code>restart</code>: <code>true</code> records the pool for recreation on the next start.</li>
 </ul>
 <pre data-label="yaml · tiers.yaml">

@@ -43,14 +43,16 @@ distribution and concurrency model.</p>
   with <code>existing_pool_id</code>.</li>
   <li><strong>Above it.</strong> The interposer modules speak the core's
   own task interface and stack with <code>next_pool_id</code>. The
-  chain in the default configuration is indexer (564.0), shm cache
-  (568.0), optional compressor (562.0), write-back cache (567.0). The
+  chain in the default configuration is shm cache (568.0), optional
+  compressor (562.0), write-back cache (567.0); the opt-in indexer (564.0)
+  goes on top when composed. The
   write-back cache writes to the volatile core (540.0) and flushes through
   replication (561.0) to the persistent core (512.0). Each entry must be
   composed after the pool it forwards to.</li>
   <li><strong>CAE.</strong> The Context Assimilation Engine core sits at
   its own pool 400.0 and forwards tag creation, put, get and semantic
-  search to the chain top (the indexer, 564.0). Do not place CAE at a CTE
+  search to the chain top (the shm cache, 568.0, or the indexer, 564.0,
+  when it is composed). Do not place CAE at a CTE
   pool ID such as 512.0: the two modules' method IDs 10 to 13
   collide.</li>
 </ul>
@@ -182,7 +184,8 @@ the <code>Tag</code> wrapper adds blocking convenience calls.</p>
   name pattern on the queried containers.</li>
   <li><strong>SemanticSearch</strong> keeps its method ID in the core's
   interface, but the core does not serve it. The
-  <a href="/modules/indexer.html">indexer</a> module answers it.
+  <a href="/modules/indexer.html">indexer</a> module answers it, so search
+  needs the indexer composed (it is not in the default compose).
   <strong>TemporalSearch</strong> returns blobs whose last-modified time
   falls in an inclusive range, filtered by tag and blob patterns and
   sorted by timestamp.</li>
@@ -351,10 +354,11 @@ pool its <code>next_pool_id</code> names.</p>
   copies that <code>failover_to_successor</code> serves.</li>
   <li><strong>Compressor</strong> (562.0, optional) transforms bytes on the
   way down and marks the blob with a transform flag the core persists.</li>
-  <li><strong>Indexer</strong> (564.0) is the top of the chain. It sits
-  above the compressor so its read-backs see logical bytes, serves
-  SemanticSearch, and keeps its own index log.</li>
-  <li><strong>Shm cache</strong> (568.0) sits below the indexer. It caches
+  <li><strong>Indexer</strong> (564.0, opt-in) is the top of the chain
+  when composed. It sits above the compressor so its read-backs see
+  logical bytes, serves SemanticSearch, and keeps its own index log.</li>
+  <li><strong>Shm cache</strong> (568.0) is the top of the default chain,
+  and sits below the indexer when that is composed. It caches
   tag and blob metadata in a shared-memory segment that client processes
   map, so a hit completes with no task.</li>
   <li><strong>Write-back cache</strong> (567.0) lands puts in the volatile

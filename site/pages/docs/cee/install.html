@@ -75,7 +75,7 @@ $ python -c "import iowarp_core; print(iowarp_core.cee_available())"
 </pre>
 <pre data-label="python">
 import os
-os.environ.setdefault("CLIO_CTE_POOL", "564.0")   # reach the indexer for keyword search
+# os.environ.setdefault("CLIO_CTE_POOL", "564.0")  # keyword search: only with the opt-in indexer composed
 import clio_cee as cee
 
 ctx = cee.ContextInterface()

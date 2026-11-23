@@ -4,7 +4,7 @@ heading: The <em>indexer</em> module
 description: The CTE indexer: a chain interposer that keeps a per-node keyword index of blob contents and serves BM25 semantic search without re-reading blobs.
 eyebrow: Modules · Context Transfer Engine
 lede: The indexer sits in the storage chain above the CTE core, watches every write that passes through it, and keeps a tokenized copy of each blob's text in memory. Keyword (BM25) searches are answered from that index, so a query never reads blob bytes.
-facts: Library | clio_cte_indexer ; Default pool | 564.0 ; Source | context-transfer-engine/indexer ; Module ids | kIndexSweep 100, kReindexScan 101
+facts: Library | clio_cte_indexer ; Default pool | 564.0 (opt-in, not composed by default) ; Source | context-transfer-engine/indexer ; Module ids | kIndexSweep 100, kReindexScan 101
 -->
 <h2>What it does</h2>
 <p>The CTE core once implemented <code>SemanticSearch</code> by reading and
@@ -29,21 +29,33 @@ handles a few verbs itself, and forwards everything else to
 nested calls on the co-located core container rather than issuing new client
 requests, as described on the <a href="/design/chain.html">chain design
 page</a>.</p>
-<p>In the default chain shipped in
-<code>context-runtime/config/clio_default.yaml</code> the order is:</p>
+<p>The indexer is <strong>not in the default compose</strong>. Indexing
+every written byte costs CPU, memory and write throughput, so
+<code>context-runtime/config/clio_default.yaml</code> ships its entry
+commented out, and keyword search needs it composed. To enable it:</p>
+<ol class="steps">
+  <li>Uncomment the <code>clio_cte_indexer</code> entry (564.0, forwarding
+  to the shm cache at 568.0).</li>
+  <li>Set the shm cache's <code>entry_pool_id</code> to <code>"564.0"</code>,
+  so clients that map the cache segment bind to the indexer.</li>
+  <li>Point the CAE, stream and filesystem entries'
+  <code>next_pool_id</code> at <code>"564.0"</code>, so the data they write
+  is indexed.</li>
+  <li>Scope it with <code>tag_re</code> and <code>blob_re</code>, so only
+  the data you will search is tokenized.</li>
+</ol>
+<p>Composed this way, the chain is:</p>
 <pre data-label="yaml">
 indexer(564.0) -> shm cache(568.0) -> [compressor(562.0) ->] write-back(567.0)
   -> volatile core(540.0), and on flush -> replication(561.0) -> persistent core(512.0)
 </pre>
-<p>The indexer is the chain top. It sits <em>above</em> the compressor so
+<p>The indexer is then the chain top. It sits <em>above</em> the compressor so
 that when it has to read a blob back it sees logical, uncompressed bytes. It
 must be composed after the pool it forwards to and before the pools that
-forward into it (the filesystem module, the stream module and the CAE core).
-The CAE forwards to 564.0, so data it imports is indexed.</p>
+forward into it (the filesystem module, the stream module and the CAE core).</p>
 
 <h2>Composing it</h2>
-<p>Minimal composition, adapted from the indexer restart test and the default
-configuration:</p>
+<p>Minimal composition, adapted from the indexer restart test:</p>
 <pre data-label="yaml">
 compose:
   - mod_name: clio_cte_core
@@ -70,8 +82,7 @@ compose:
 <p>Clients then bind to the indexer pool instead of the bare core. In C++
 that means constructing a <code>clio::cte::core::Client</code> on pool
 564.0; for the Python bindings and other processes that use the shared
-client singleton, set <code>CLIO_CTE_POOL=564.0</code> (the chain top in
-the default configuration) before initializing. Writes that bypass the
+client singleton, set <code>CLIO_CTE_POOL=564.0</code> before initializing. Writes that bypass the
 indexer are not indexed until a backfill picks them up.</p>
 
 <h2>Operations</h2>

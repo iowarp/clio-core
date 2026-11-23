@@ -49,7 +49,7 @@ the owner at once; see <a href="#write-path">the write path</a>.</p>
 <p>From <code>context-runtime/config/clio_default.yaml</code>, the canonical
 chain is:</p>
 <pre data-label="text">
-indexer(564.0) -> shm cache(568.0) -> [compressor(562.0) ->]
+[indexer(564.0) ->] shm cache(568.0) -> [compressor(562.0) ->]
   core_persist_write_back(567.0)
   -> volatile core(540.0)
   -> replication(561.0) -> persistent core(512.0)
@@ -72,7 +72,8 @@ with local queries, so the two cores stay disconnected.</p>
   chain after making it coherent (see <a href="#reads">reads</a>).</li>
 </ul>
 <p>Clients never address this pool directly in the default stack; they bind
-to the indexer at the top. The module's client class,
+to the shm cache at the top (or to the indexer, when the opt-in indexer is
+composed). The module's client class,
 <code>clio::cte::core_persist_write_back::Client</code>, is a core client
 plus <code>AsyncCreateCache</code> for creating the pool from code.</p>
 

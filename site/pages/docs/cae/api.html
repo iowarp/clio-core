@@ -182,7 +182,7 @@ if (f->result_code_ != 0) { /* f->error_message_ */ }
     <tr><td><code>pool_name</code></td><td>required</td><td>Any name; the default file uses <code>cae_main</code>.</td></tr>
     <tr><td><code>pool_id</code></td><td>required</td><td><code>"400.0"</code>. Clients, <code>clio-cae</code> and the CEE connect to <code>kCaePoolId</code>, so use this value.</td></tr>
     <tr><td><code>pool_query</code></td><td>required</td><td><code>local</code> in the default file.</td></tr>
-    <tr><td><code>next_pool_id</code></td><td>null</td><td><code>"major.minor"</code> of the pool the CAE writes through and forwards to. Null falls back to the CTE core, 512.0. The default file sets <code>"564.0"</code>, the indexer at the top of the chain.</td></tr>
+    <tr><td><code>next_pool_id</code></td><td>null</td><td><code>"major.minor"</code> of the pool the CAE writes through and forwards to. Null falls back to the CTE core, 512.0. The default file sets <code>"568.0"</code>, the shm cache at the top of the chain; set <code>"564.0"</code> when the opt-in indexer is composed.</td></tr>
   </tbody>
 </table></div>
 <p>Methods the module handles: <code>kParseOmni</code> (10), <code>kProcessHdf5Dataset</code> (11), <code>kExportData</code> (12), <code>kImportData</code> (13), and the CTE passthroughs <code>kGetOrCreateTag</code> (14), <code>kPutBlob</code> (15), <code>kGetBlob</code> (16) and <code>kSemanticSearch</code> (35), whose ids equal the CTE core's.</p>

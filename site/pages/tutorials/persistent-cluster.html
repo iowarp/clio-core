@@ -205,7 +205,7 @@ EOF
   <dt><code>replication_factor: 1</code></dt><dd>One durable copy per blob, the ext4 contract. Use 2 or more, with <code>targets.failover_to_successor: true</code> on the persistent core, if the filesystem must stay readable while a node is down. It multiplies the <code>/work</code> footprint.</dd>
   <dt>Order</dt><dd>Each <code>compose</code> entry must come after every pool it names.</dd>
 </dl>
-<p>The chain is the same as the default configuration's: indexer → shm cache → write-back cache → volatile core, and replication → persistent core. See <a href="/tutorials/operators.html">Compose data operators</a> for each layer.</p>
+<p>The chain is the default configuration's with the opt-in indexer composed on top: indexer → shm cache → write-back cache → volatile core, and replication → persistent core. Enabling the indexer is what the shm cache's <code>entry_pool_id: "564.0"</code> and the stream and filesystem entries' <code>next_pool_id: "564.0"</code> do; drop all three, and the indexer entry, if you do not need keyword search. See <a href="/tutorials/operators.html">Compose data operators</a> for each layer.</p>
 
 <h2>3. Start it in a Slurm job</h2>
 <p>The job script writes the hostfile, generates each node's configuration from its position in it, starts one runtime per node with its storage root on <code>/work</code>, and mounts the filesystem on every node.</p>

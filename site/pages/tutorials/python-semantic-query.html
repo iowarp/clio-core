@@ -3,7 +3,7 @@ title: Query files from Python
 heading: Query the filesystem <em>from Python.</em>
 description: Search files written through the CLIO Core FUSE mount by BM25 keyword relevance or name pattern, and read them back from Python.
 eyebrow: Tutorial · Explore
-lede: Files you write through the mount are indexed as they land. From Python you can rank them by keyword relevance, filter them by path, and read their bytes, all without going through the mount.
+lede: With the indexer composed, files you write through the mount are indexed as they land. From Python you can rank them by keyword relevance, filter them by path, and read their bytes, all without going through the mount.
 facts: Time | 15 minutes ; Modules | clio_cte_core_ext, clio_cee ; Search | BM25 over 1 MiB pages
 -->
 <h2>What you will build</h2>
@@ -14,6 +14,15 @@ facts: Time | 15 minutes ; Modules | clio_cte_core_ext, clio_cee ; Search | BM25
   <li>Its bytes are <strong>page blobs</strong> named <code>"0"</code>, <code>"1"</code>, … of 1 MiB each. A small blob named <code>~i</code> holds its attributes, so search patterns use <code>[0-9]+</code> to match pages only.</li>
   <li>The <strong>indexer</strong> (pool <code>564.0</code>) keeps a BM25 index of every page and serves search.</li>
 </ul>
+
+<h2>0. Compose the indexer</h2>
+<p>The indexer is not in the default configuration: indexing every written byte costs CPU, memory and write throughput, so it is opt-in. Enable it in <code>~/.clio/clio.yaml</code> before you write the files:</p>
+<ol>
+  <li>Uncomment the <code>clio_cte_indexer</code> entry (pool <code>564.0</code>, <code>next_pool_id: "568.0"</code>).</li>
+  <li>In the shm cache entry (<code>clio_cte_core_shm_cache_writethru</code>), set <code>entry_pool_id: "564.0"</code>.</li>
+  <li>In the CAE (<code>clio_cae_core</code>), stream (<code>clio_cte_stream</code>) and filesystem (<code>clio_cte_filesystem</code>) entries, set <code>next_pool_id: "564.0"</code>.</li>
+</ol>
+<p>Restart the runtime (<code>clio-run stop</code>, then <code>clio-run start</code>) and remount. <a href="#narrow-what-gets-indexed">Narrow what gets indexed</a> shows how to scope it to text files.</p>
 
 <h2>1. Put some text in the mount</h2>
 <pre data-label="shell">
@@ -89,14 +98,14 @@ def read_file(path):
 </pre>
 <p>This reads straight from the storage tiers and gives the same bytes as <code>open()</code> on the mount, without a FUSE round trip.</p>
 
-<h2>Narrow what gets indexed</h2>
+<h2 id="narrow-what-gets-indexed">Narrow what gets indexed</h2>
 <p>By default the indexer tokenizes everything. For large binary datasets, restrict it in <code>clio.yaml</code> to the files worth searching:</p>
 <pre data-label="yaml">
   - mod_name: clio_cte_indexer
     pool_name: clio_cte_indexer
     pool_query: local
     pool_id: "564.0"
-    next_pool_id: "568.0"               # shm cache, as in the default
+    next_pool_id: "568.0"               # shm cache, the default chain top
     index_log_path: "${CLIO_STORAGE_ROOT}/cte_indexer_index"
     tag_re: ".*\\.(md|txt|csv|json)$"    # only index text-like files
     blob_re: ".*"
@@ -125,13 +134,13 @@ ctx.context_destroy(["climate_docs"])
 <p><code>context_query</code> returns blob names only, which is why the tutorial above uses <code>clio_cte_core_ext</code> for mounted files. The full signatures are in the <a href="/docs/cte/python.html">Python API reference</a>.</p>
 
 <h3>Keyword search over imported data</h3>
-<p><code>context_query(..., prompt="sea ice")</code> ranks imported blobs by BM25. In the default configuration the import engine (pool <code>400.0</code>) forwards to the top of the chain, the indexer, so imports are indexed:</p>
+<p><code>context_query(..., prompt="sea ice")</code> ranks imported blobs by BM25. The import engine (pool <code>400.0</code>) forwards to the top of the chain, the shm cache, by default; with the indexer composed as in step 0, point it at the indexer so imports are indexed:</p>
 <pre data-label="yaml">
   - mod_name: clio_cae_core
     pool_name: cae_main
     pool_query: local
     pool_id: "400.0"
-    next_pool_id: "564.0"               # chain top (indexer), so imports get indexed
+    next_pool_id: "564.0"               # the indexer (step 0), so imports get indexed
 </pre>
 <p>After the import above, <code>ctx.context_query("climate_docs", ".*", max_results=2, prompt="sea ice minimum")</code> returns <code>['ice', 'co2']</code>, best match first. As with <code>SemanticSearch</code>, blobs without any query word are still ranked, after the matches.</p>
 <p>Next: <a href="/tutorials/dashboard.html">watch the same data in the dashboard</a>.</p>

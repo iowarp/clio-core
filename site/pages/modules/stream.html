@@ -54,7 +54,7 @@ compose:
     pool_name: clio_cte_stream
     pool_query: local
     pool_id: "565.0"
-    next_pool_id: "564.0"               # data path: the chain top (indexer)
+    next_pool_id: "568.0"               # data path: the chain top (shm cache)
     staging_pool_id: "561.0"            # replication: durable, uncached
     # log_path: "/mnt/nvme/$USER/clio/cte_stream_log"
 
@@ -62,7 +62,7 @@ compose:
     pool_name: clio_cte_filesystem
     pool_query: local
     pool_id: "560.0"
-    next_pool_id: "564.0"
+    next_pool_id: "568.0"
     stream_pool_id: "565.0"
 </pre>
 <p>Staged appends are written once and read at most once, after a restart,
@@ -179,7 +179,8 @@ best-effort: a malformed value leaves the defaults.</p>
   <dt><code>next_pool_id</code></dt>
   <dd>Required, no default. The pool page blobs are read from and written to,
   normally the chain top. Without it the pool's create fails. Default
-  configuration: <code>"564.0"</code>.</dd>
+  configuration: <code>"568.0"</code>, the shm cache (<code>"564.0"</code>
+  when the opt-in indexer is composed).</dd>
   <dt><code>staging_pool_id</code></dt>
   <dd>Default: <code>next_pool_id</code>. Where staged appends are written.
   Default configuration: <code>"561.0"</code>, the replication pool.</dd>

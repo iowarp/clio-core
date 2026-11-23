@@ -138,12 +138,14 @@ NAV = {
     "tutorials": [
         ("Overview", [
             ("tutorials/index.html", "All tutorials"),
+            ("tutorials/quickstart.html", "Quickstart"),
         ]),
         ("Compose", [
             ("tutorials/compose.html", "Compose local tiers"),
             ("tutorials/operators.html", "Compose data operators"),
             ("tutorials/cloud-storage.html", "Amazon S3 and Google Cloud"),
             ("tutorials/agent-compose.html", "Compose using an agent"),
+            ("tutorials/persistent-fs.html", "Persistent local filesystem"),
         ]),
         ("Mount", [
             ("tutorials/fuse-linux.html", "FUSE on Linux"),

@@ -26,7 +26,7 @@ facts: Time | 15 minutes ; You need | A working install, a few GB on each device
 </table></div>
 
 <h2>1. Start from the default configuration</h2>
-<p>Copy the default file, so you keep the module chain (replication, indexer, cache, filesystem) and change only the tiers:</p>
+<p>Copy the default file, so you keep the module chain (replication, write-back and shm caches, filesystem) and change only the tiers:</p>
 <pre data-label="shell">
 $ cp ~/.clio/clio.yaml ~/clio-tiers.yaml
 $ sudo mkdir -p /mnt/nvme/clio /mnt/ssd/clio /mnt/hdd/clio

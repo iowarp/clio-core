@@ -1,0 +1,166 @@
+<!--
+title: Persistent local filesystem
+heading: Keep your files <em>across restarts.</em>
+description: Turn the default temporary Context FS into a persistent local filesystem: a long_term disk tier in the persistent core, logs on durable storage, a stream size log, and a write-back cache that flushes to the persistent core.
+eyebrow: Tutorial · Compose
+lede: The default configuration is a temporary filesystem for scratch data. A few changes to one YAML file make it a persistent local filesystem whose files come back after <code>clio-run stop</code> and <code>clio-run start</code>, and whose fsynced files survive a crash of the runtime.
+facts: Time | 15 minutes ; Prerequisite | <a href="/tutorials/quickstart.html">Quickstart</a> ; Works in | Linux, macOS, Windows
+-->
+<h2>What makes it persistent</h2>
+<p>A file in Context FS is three kinds of state: its bytes (1 MiB page blobs), its logical size, and its name in a directory. Each must reach durable storage, and each must be found again after a restart:</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>State</th><th>Where it lives</th><th>Setting</th></tr></thead>
+  <tbody>
+    <tr><td>File bytes</td><td>The persistent core's (512.0) file tier, on a durable disk</td><td><code>persistence_level: long_term</code> on the tier. The write-back cache (567.0) flushes to it through replication (561.0)</td></tr>
+    <tr><td>Which blob owns which bytes</td><td>The persistent core's metadata log</td><td><code>performance.metadata_log_path</code> on the 512.0 entry</td></tr>
+    <tr><td>File sizes</td><td>The stream pool's size log</td><td><code>log_path</code> on <code>clio_cte_stream</code></td></tr>
+    <tr><td>Names and directories</td><td>The filesystem's namespace log</td><td><code>metadata_log_path</code> on <code>clio_cte_filesystem</code></td></tr>
+  </tbody>
+</table></div>
+<p>The default file sets the two metadata logs, but its only disk tier is <code>temporary</code> and its stream pool has no <code>log_path</code>, so file sizes are lost on a restart. Put every path on a durable disk, not under <code>/tmp</code> or another scratch directory.</p>
+<p>Writes are acknowledged once they are in the volatile core's RAM (540.0). They become durable when the write-back cache flushes them to the persistent core: every 10 s, on <code>fsync</code>, and during a graceful <code>clio-run stop</code>.</p>
+
+<h2>1. Write the configuration</h2>
+<p>Save this as <code>~/clio-persistent.yaml</code>. It is the default chain without the CAE, with the changes marked. Every path is under <code>${CLIO_STORAGE_ROOT}</code>, which <code>clio-run start --disk</code> sets in step 2:</p>
+<pre data-label="yaml · ~/clio-persistent.yaml">
+compose:
+  - mod_name: clio_bdev
+    pool_name: "ram::chi_default_bdev"
+    pool_query: local
+    pool_id: "301.0"
+    bdev_type: ram
+    capacity: "0g"
+
+  # Persistent core: the durable copy of every file lives here.
+  - mod_name: clio_cte_core
+    pool_name: cte_main
+    pool_query: local
+    pool_id: "512.0"
+    durability: persistent
+    storage:
+      - path: "${CLIO_STORAGE_ROOT}/cte_disk_tier.dat"
+        bdev_type: file
+        capacity_limit: 200GB          # the most data the filesystem can hold
+        score: 0.2
+        persistence_level: long_term   # (1) a durable tier
+    performance:
+      metadata_log_path: "${CLIO_STORAGE_ROOT}/cte_metadata_log"   # (2)
+
+  # Volatile core: where the write-back cache lands writes first.
+  - mod_name: clio_cte_core
+    pool_name: cte_volatile
+    pool_query: local
+    pool_id: "540.0"
+    durability: volatile
+    storage:
+      - path: "ram::cte_ram_tier1"
+        bdev_type: ram
+        capacity_limit: 8GB            # size it to your memory
+        score: 1.0
+
+  - mod_name: clio_cte_replication
+    pool_name: clio_cte_replication
+    pool_query: local
+    pool_id: "561.0"
+    next_pool_id: "512.0"
+    replication_factor: 1
+    replica_score: 0.2
+
+  - mod_name: clio_cte_core_persist_write_back
+    pool_name: clio_cte_core_persist_write_back
+    pool_query: local
+    pool_id: "567.0"
+    next_volatile: "540.0"
+    next_persistent: "561.0"           # (3) flushes reach the persistent core
+    flush_period_ms: 10000
+    flush_pool: "568.0"
+    fallback_to_persistent: true
+
+  - mod_name: clio_cte_core_shm_cache_writethru
+    pool_name: clio_cte_core_shm_cache_writethru
+    pool_query: local
+    pool_id: "568.0"
+    next_pool_id: "567.0"
+    md_only: true
+    invalidate_on_flush: true
+    capacity: "256M"
+
+  - mod_name: clio_cte_stream
+    pool_name: clio_cte_stream
+    pool_query: local
+    pool_id: "565.0"
+    next_pool_id: "568.0"
+    staging_pool_id: "561.0"
+    log_path: "${CLIO_STORAGE_ROOT}/cte_stream_log"   # (4) file sizes survive a restart
+
+  - mod_name: clio_cte_filesystem
+    pool_name: clio_cte_filesystem
+    pool_query: local
+    pool_id: "560.0"
+    next_pool_id: "568.0"
+    stream_pool_id: "565.0"
+    metadata_log_path: "${CLIO_STORAGE_ROOT}/cfs_namespace_log"   # (5)
+</pre>
+<ol>
+  <li><strong>A <code>long_term</code> tier in the persistent core.</strong> The default tier is <code>temporary</code>; <code>long_term</code> states that this one is meant to keep data. Put it on a durable disk (step 2).</li>
+  <li><strong>The persistent core's metadata log.</strong> Without it the tier's bytes are kept but nothing remembers which blob they belong to.</li>
+  <li><strong>A write-back cache that flushes to the persistent core.</strong> <code>next_persistent</code> points through replication (561.0) to the persistent core (512.0). Data that has only reached the volatile core is not durable.</li>
+  <li><strong>A stream size log.</strong> Without <code>log_path</code>, file sizes are lost on a restart.</li>
+  <li><strong>The filesystem's namespace log.</strong> It journals the directory tables; without it, names are not recovered from disk.</li>
+</ol>
+<p>Each <code>compose</code> entry must come after every pool it names, and each needs its own <code>pool_id</code>: a compose that reuses one is refused at startup.</p>
+
+<h2>2. Start the runtime on a durable disk</h2>
+<p><code>--disk</code> sets the storage root, <code>${CLIO_STORAGE_ROOT}</code>, so the tier, every log in the file above and the rest of the runtime's on-disk state go to that directory. Choose a directory on a durable disk.</p>
+<div class="tabs" data-label="Platform">
+  <section class="tab-panel" data-tab="Linux, macOS"><p class="tab-title">Linux, macOS</p>
+<pre data-label="shell">
+$ mkdir -p /data/clio
+$ export CLIO_SERVER_CONF=~/clio-persistent.yaml
+$ export CLIO_BIND_ADDR=127.0.0.1
+$ clio-run start --disk /data/clio
+</pre></section>
+  <section class="tab-panel" data-tab="Windows"><p class="tab-title">Windows</p>
+<pre data-label="powershell">
+PS> mkdir D:\clio
+PS> $env:CLIO_SERVER_CONF = "$HOME\clio-persistent.yaml"
+PS> $env:CLIO_BIND_ADDR = "127.0.0.1"
+PS> clio-run start --disk D:\clio
+</pre></section>
+</div>
+<p>Never pass <code>--fresh</code> to this runtime: it discards the node's persistent state.</p>
+
+<h2>3. Mount and write</h2>
+<p>Mount exactly as in the <a href="/tutorials/quickstart.html">quickstart</a>, with <code>CLIO_WITH_RUNTIME=0</code>, and write a file. <code>sync</code> (or <code>fsync</code> from a program) makes the write-back cache flush the file to the persistent core; it is the point after which a file survives a crash:</p>
+<div class="tabs" data-label="Platform">
+  <section class="tab-panel" data-tab="Linux, macOS"><p class="tab-title">Linux, macOS</p>
+<pre data-label="shell">
+$ cp -r ~/project ~/clio-mnt/
+$ sync
+</pre></section>
+  <section class="tab-panel" data-tab="Windows"><p class="tab-title">Windows</p>
+<pre data-label="powershell">
+PS> Copy-Item -Recurse $HOME\project Z:\
+</pre>
+  <p>Windows has no <code>sync</code> command; a program calls <code>FlushFileBuffers</code> (Python: <code>os.fsync</code>).</p></section>
+</div>
+
+<h2>4. Restart and check</h2>
+<p>Unmount, stop the runtime, start it again on the same configuration and storage root <em>without</em> <code>--fresh</code>, and mount. Your files are back:</p>
+<pre data-label="shell">
+$ fusermount3 -u ~/clio-mnt          # Windows: Stop-Process -Name clio_cte_fuse -Force
+$ clio-run stop
+$ clio-run start --disk /data/clio
+$ CLIO_WITH_RUNTIME=0 clio_cte_fuse ~/clio-mnt -f
+$ ls ~/clio-mnt/project
+</pre>
+
+<h2>What survives what</h2>
+<div class="table-wrap"><table>
+  <thead><tr><th>Event</th><th>Files written, not fsynced</th><th>Files fsynced</th><th>Checked by <code>cfs_persistence</code></th></tr></thead>
+  <tbody>
+    <tr><td><code>clio-run stop</code>, then <code>start</code></td><td>Kept: a graceful stop flushes the write-back cache first</td><td>Kept</td><td>Yes</td></tr>
+    <tr><td>Runtime killed or crashed</td><td>Not guaranteed: only what the write-back cache had flushed (it flushes every 10 s)</td><td>Kept</td><td>Yes</td></tr>
+  </tbody>
+</table></div>
+<p>The <code>cfs_persistence</code> unit test checks both rows: it runs this chain from one configuration file, writes files (several pages, a truncated file, a rename, and a file never fsynced), stops the runtime gracefully or kills it, restarts it without <code>--fresh</code>, and compares every file byte for byte. It sets the periodic flush to 10 minutes, so within the test only <code>fsync</code> and the graceful stop make data durable. <a href="/design/durability.html">Durability and recovery</a> explains the ordering behind the table.</p>

@@ -23,8 +23,9 @@ disk footprint and write latency.</p>
 <p>The module is an interposer: it speaks the CTE core's own task
 interface and forwards to the pool named by <code>next_pool_id</code>,
 normally the core at 512.0. The canonical chain in the default
-configuration is cache, then indexer, then optionally the compressor,
-then replication, then the core. Replication sits directly above the
+configuration is the shm cache, then optionally the compressor, then the
+write-back cache, whose flushes go through replication to the persistent
+core; the opt-in indexer sits on top when composed. Replication sits directly above the
 core so that the copies it writes are the stored form, compressed or not,
 and so that everything above it sees one logical blob.</p>
 <ul>

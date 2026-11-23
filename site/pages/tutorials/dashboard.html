@@ -57,7 +57,7 @@ services:
   <li><code>clio_admin</code>, the runtime itself</li>
   <li><code>clio_bdev</code>, the block devices: the default DRAM device and one per storage tier</li>
   <li><code>clio_cte_core</code>, the storage engine</li>
-  <li><code>clio_cte_cache</code>, <code>clio_cte_indexer</code> and <code>clio_cte_replication</code>, the layers of the module chain</li>
+  <li><code>clio_cte_core_shm_cache_writethru</code>, <code>clio_cte_core_persist_write_back</code> and <code>clio_cte_replication</code>, the layers of the module chain (plus <code>clio_cte_indexer</code> if you composed it)</li>
   <li><code>clio_cte_stream</code>, which keeps file sizes and orders appends</li>
   <li><code>clio_cae_core</code>, for imports</li>
   <li><code>clio_cte_filesystem</code>, which the FUSE mount drives</li>
