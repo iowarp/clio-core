@@ -122,10 +122,6 @@ static constexpr int kOpenVanishedErrno = ESTALE;
 #else
 static constexpr int kOpenVanishedErrno = ENOENT;
 #endif
-/** Re-sends of a page read that completed with the node-lost code. */
-static constexpr int kReadNodeLostRetries = 20;
-/** Pause between them (ms): node death is declared within ~10 s. */
-static constexpr int kReadNodeLostRetryMs = 500;
 
 using namespace clio::cae::fuse;
 
@@ -924,6 +920,18 @@ clio::run::u64 HiwaterFor(const std::string &path) {
   std::lock_guard<std::mutex> lk(g_hw_mtx);
   auto it = g_hiwater.find(path);
   return it == g_hiwater.end() ? 0 : it->second;
+}
+
+/**
+ * Size floor of a path taken BEFORE a size request: this mount's hiwater
+ * overlay and the clio-fs client's pending (shared-memory) size. A pending
+ * entry retired after this read had already landed at the home, so the
+ * request's reply covers it.
+ * @param path the path
+ * @return the floor
+ */
+clio::run::u64 SizeFloorFor(const std::string &path) {
+  return std::max(HiwaterFor(path), CLIO_CFS_CLIENT->PendingSizeOfPath(path));
 }
 void HiwaterErase(const std::string &path) {
   std::lock_guard<std::mutex> lk(g_hw_mtx);
@@ -1853,7 +1861,11 @@ static void FillStatFromAttrs(const StatAttrs &a, const std::string &p,
     stbuf->st_size = static_cast<cte_off_t>(t->size);
     // Direct page puts advance the chimod size only at close: overlay the
     // local hiwater in the meantime.
-    const clio::run::u64 hw = std::max(hw_floor, HiwaterFor(p));
+    const clio::run::u64 hw = std::max(
+        {hw_floor, HiwaterFor(p),
+         t->ino > 1 ? CLIO_CFS_CLIENT->PendingSize(
+                          clio::cte::filesystem::FsUnpack(t->ino))
+                    : clio::run::u64{0}});
     if (hw > static_cast<clio::run::u64>(stbuf->st_size)) {
       stbuf->st_size = static_cast<cte_off_t>(hw);
     }
@@ -2028,7 +2040,7 @@ static int cte_fuse_getattr_stat_inner(const char *path, cte_stat_t *stbuf,
   if (PrefetchTake(p, stbuf)) return 0;
   // Delegate to the filesystem chimod: it owns exists/is-dir/logical-size.
   // The size overlay is read first (see FillStatFromAttrs).
-  const clio::run::u64 hw_floor = HiwaterFor(p);
+  const clio::run::u64 hw_floor = SizeFloorFor(p);
   auto t = cfs->AsyncGetattr(p);
   t.Wait();
   // A lookup that FAILED (its directory block's home unreachable, a timeout)
@@ -2210,7 +2222,7 @@ static int GetattrStatImpl(const char *path, cte_stat_t *stbuf,
       FillStatFromAttrs(kept, key, stbuf, 0);
     } else {
       clio::run::Future<clio::cte::filesystem::GetattrTask> t;
-      const clio::run::u64 hw_floor = HiwaterFor(key);
+      const clio::run::u64 hw_floor = SizeFloorFor(key);
       rc = GetattrOpenHandle(handle, key, &t);
       if (rc == 0) {
         memset(stbuf, 0, sizeof(*stbuf));
@@ -2223,7 +2235,7 @@ static int GetattrStatImpl(const char *path, cte_stat_t *stbuf,
       // The name was renamed over between the mirror check and the lookup:
       // the descriptor's own file is still there.
       clio::run::Future<clio::cte::filesystem::GetattrTask> t;
-      const clio::run::u64 hw_floor = HiwaterFor(key);
+      const clio::run::u64 hw_floor = SizeFloorFor(key);
       rc = GetattrOpenHandle(handle, key, &t);
       if (rc == 0) {
         memset(stbuf, 0, sizeof(*stbuf));
@@ -2608,7 +2620,7 @@ static void PrefetchChunkStats(const std::string &dir, size_t raw_entries,
   };
   const int64_t pf_t0 = PfNowNs();
   for (const std::string &full : fulls) {
-    const clio::run::u64 hw_floor = HiwaterFor(full);
+    const clio::run::u64 hw_floor = SizeFloorFor(full);
     auto f = cfs->AsyncGetattr(full);
     inflight.push_back(Inflight{full, hw_floor, std::move(f)});
     if (inflight.size() >= static_cast<size_t>(win)) drain();
@@ -3987,6 +3999,11 @@ int cte_fuse_fsync(const char *path, int /*datasync*/,
     int rc = PublishOnClose(handle, p);
     if (rc != 0) return rc;
   }
+  // The size page writes raised in the shared-memory table reaches the home.
+  if (handle != nullptr) {
+    const int drc = CLIO_CFS_CLIENT->WaitSizeDrained(handle->tag);
+    if (drc != 0) return -drc;
+  }
   // Everything above landed the bytes on the store; fsync's contract is
   // that they are ON A PERSISTENT DEVICE when it returns.
   return SyncDurable(handle != nullptr ? handle->tag
@@ -4108,86 +4125,6 @@ static void TouchAtimeOnRead(CfsHandle *handle, const std::string &hp) {
 }
 
 /**
- * Read one range of one page blob into `dst`: from the shm cache when the
- * CTE client is connected and holds it, else a GetBlob task. The task is
- * waited in slices so a read whose completion never arrives is named in the
- * log; it still waits for the completion, since the runtime may yet write
- * into dst.
- * @param cte the CTE client of the file's data chain
- * @param tag the file's tag
- * @param page the page blob name
- * @param page_off offset inside the page
- * @param n bytes to read
- * @param dst destination
- * @return the GetBlob return code (0 read, 1 the page does not exist),
- *         ENOMEM when the task could not stage the read
- */
-static int ReadPageOnce(clio::cte::core::Client *cte,
-                        const clio::cte::core::TagId &tag,
-                        const std::string &page, clio::run::u64 page_off,
-                        clio::run::u64 n, char *dst) {
-  if (cte->TryGetCached(tag, page, page_off, n, dst)) return 0;
-  auto g = cte->AsyncGetBlob(tag, page, page_off, n, 0, dst);
-  if (g.get() == nullptr) return ENOMEM;
-  for (int slice = 1; !g.Wait(30.0f); ++slice) {
-    HLOG(kWarning, "clio_cte_fuse: read of tag {}.{} page {} (off {} len {}) "
-         "still outstanding after {} s", tag.major_, tag.minor_, page,
-         page_off, n, slice * 30);
-  }
-  return static_cast<int>(g->GetReturnCode());
-}
-
-/**
- * Read one page range, retrying the transient answers of a page whose owner
- * was just declared dead: sent again it routes to the stand-in, which
- * serves it. Only after the retries is it an error.
- * @param cte the CTE client of the file's data chain
- * @param tag the file's tag
- * @param cur file offset of the range
- * @param page_off offset inside the page
- * @param n bytes to read
- * @param dst destination
- * @return the final GetBlob return code (0 read, 1 a hole, else an error)
- */
-static int ReadPageRetrying(clio::cte::core::Client *cte,
-                            const clio::cte::core::TagId &tag,
-                            clio::run::u64 cur, clio::run::u64 page_off,
-                            clio::run::u64 n, char *dst) {
-  const std::string page = clio::cte::filesystem::PageName(cur);
-  const auto read_t0 = std::chrono::steady_clock::now();
-  int grc = 0;
-  int attempt = 0;
-  for (;; ++attempt) {
-    grc = ReadPageOnce(cte, tag, page, page_off, n, dst);
-    // Owner-down from a stand-in (#1280) can be as transient as node-lost:
-    // the stand-in's liveness view lags the router's until it too declares
-    // the owner dead and serves its copies.
-    const bool transient =
-        clio::cte::core::IsNodeLostRc(static_cast<clio::run::u32>(grc)) ||
-        static_cast<clio::run::u32>(grc) == clio::cte::core::kBlobOwnerDownRc;
-    if (!transient || attempt >= kReadNodeLostRetries) break;
-    std::this_thread::sleep_for(
-        std::chrono::milliseconds(kReadNodeLostRetryMs));
-  }
-  if (attempt > 0) {
-    // Where a slow failing read spent its time (#1169). Rate-limited: with
-    // a node down every page read of that node lands here.
-    static std::atomic<clio::run::u64> logged{0};
-    const clio::run::u64 k = logged.fetch_add(1, std::memory_order_relaxed);
-    if (k < 8 || k % 256 == 0) {
-      const double ms = std::chrono::duration<double, std::milli>(
-                            std::chrono::steady_clock::now() - read_t0)
-                            .count();
-      HLOG(kWarning, "clio_cte_fuse: read of tag {}.{} page {} got the "
-           "node-lost code {} time(s) over {} ms; final rc {} ({} such "
-           "reads so far)", tag.major_, tag.minor_, page, attempt, ms, grc,
-           k + 1);
-    }
-  }
-  return grc;
-}
-
-/**
  * Log a read that took more than 2 s, with where it spent its time (#1169).
  * Rate-limited.
  * @param tag the file's tag
@@ -4242,7 +4179,8 @@ static int ReadDirect(CfsHandle *handle, const std::string &hp,
   // it as soon as the chimod acknowledges the size push, so read after a
   // lookup answered just before the push landed, neither would cover the
   // file's bytes and the read returned EOF (see FillStatFromAttrs).
-  const clio::run::u64 hw_floor = HiwaterFor(hp);
+  const clio::run::u64 hw_floor =
+      std::max(SizeFloorFor(hp), CLIO_CFS_CLIENT->PendingSize(handle->tag));
   clio::run::u64 fsize = 0;
   const int src = ReadClampSize(
       handle, hp, static_cast<clio::run::u64>(offset), size, &fsize);
@@ -4254,7 +4192,8 @@ static int ReadDirect(CfsHandle *handle, const std::string &hp,
   // The descriptor's own file is gone on the server: a silent EOF would
   // read as a truncated file. ESTALE, as NFS reports a vanished file.
   if (src == -ENOENT) return -kOpenVanishedErrno;
-  fsize = std::max({fsize, hw_floor, HiwaterFor(hp)});
+  fsize = std::max({fsize, hw_floor, HiwaterFor(hp),
+                    CLIO_CFS_CLIENT->PendingSize(handle->tag)});
   ev::Span(ev::kRdSize, ev_sz0, ev::Now());
   const clio::run::u64 off = static_cast<clio::run::u64>(offset);
   if (off >= fsize) return 0;
@@ -4276,8 +4215,7 @@ static int ReadDirect(CfsHandle *handle, const std::string &hp,
     }
     const unsigned long long ev_pg0 = ev::Now();
     ++ev_pages;
-    const int grc =
-        ReadPageRetrying(cte, handle->tag, cur, page_off, n, buf + done);
+    const int grc = CLIO_CFS_CLIENT->ReadPage(handle->tag, cur, n, buf + done);
     ev::Span(ev::kRdPage, ev_pg0, ev::Now());
     // 0 = read, 1 = the page does not exist (a hole: the pre-zeroed buffer
     // is the right answer). Anything else -- above all the network-timeout
@@ -4353,32 +4291,20 @@ int cte_fuse_read(const char *path, char *buf, size_t size,
 static int WriteDirect(CfsHandle *handle, const std::string &hp,
                        clio::cte::core::Client *cte, const char *buf,
                        size_t size, cte_off_t offset) {
-  namespace ev = clio::run::evlat;
-  using clio::cte::filesystem::kFsPageSize;
-  size_t done = 0;
-  while (done < size) {
-    const clio::run::u64 cur = static_cast<clio::run::u64>(offset) + done;
-    const clio::run::u64 page_off = cur % kFsPageSize;
-    const clio::run::u64 n =
-        std::min<clio::run::u64>(kFsPageSize - page_off, size - done);
-    const unsigned long long ev_pg0 = ev::Now();
-    const clio::run::u32 rc = cte->PutBlob(
-        handle->tag, clio::cte::filesystem::PageName(cur), page_off, n,
-        buf + done, g_page_score.ScoreOf(cur / kFsPageSize));
-    ev::Span(ev::kWrPage, ev_pg0, ev::Now());
-    if (rc != 0) {
-      // Bytes already stored by earlier pages of this write are kept: the
-      // file grows to them, and write(2) reports what was stored.
-      if (done > 0) break;
-      // A full store is ENOSPC (as on ext4); anything else is EIO.
-      if (clio::cte::core::PutRcIsNoSpace(rc)) return -ENOSPC;
-      return rc == ENOMEM ? -ENOMEM : -EIO;
-    }
-    done += n;
-  }
+  (void)cte;
+  // The clio-fs client's page path: shm cache copies, size raised in the
+  // shared-memory size table. Only when the table could not take the size
+  // does this mount keep it in its hiwater overlay for close to carry.
+  bool recorded = true;
+  const clio::cte::filesystem::FsSsize n = CLIO_CFS_CLIENT->WritePages(
+      handle->tag, static_cast<clio::run::u64>(offset), buf, size, &recorded);
+  if (n < 0) return static_cast<int>(n);
   UnsyncedNote(handle->tag);
-  HiwaterRaise(hp, static_cast<clio::run::u64>(offset) + done);
-  return static_cast<int>(done);
+  if (!recorded) {
+    HiwaterRaise(hp, static_cast<clio::run::u64>(offset) +
+                         static_cast<clio::run::u64>(n));
+  }
+  return static_cast<int>(n);
 }
 
 /**
@@ -4525,6 +4451,11 @@ int cte_fuse_truncate(const char *path_in, cte_off_t size,
     }
     tr_old_extent = HiwaterFor(p);
     HiwaterClamp(p, static_cast<clio::run::u64>(size));
+  }
+  if (!tr_tag.IsNull()) {
+    // A pending size landing after the truncate would resurrect the length.
+    const int drc = cfs->WaitSizeDrained(tr_tag);
+    if (drc != 0) return -drc;
   }
   auto t = cfs->AsyncTruncate(
       std::string(path), static_cast<clio::run::u64>(size),

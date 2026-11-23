@@ -67,6 +67,7 @@
 #include "simple_test.h"
 
 namespace fs = std::filesystem;
+using clio::cte::filesystem::FsOff;
 using clio::cte::filesystem::FsSsize;
 
 namespace {
@@ -86,6 +87,7 @@ constexpr const char *kTrunc = "clio::/persist_trunc.bin";
 constexpr const char *kRenameSrc = "clio::/persist_rename_src.bin";
 constexpr const char *kRenameDst = "clio::/persist_renamed.bin";
 constexpr const char *kUnsynced = "clio::/persist_unsynced.bin";
+constexpr const char *kVisible = "clio::/persist_visible.bin";
 
 /** Env var naming the phase a child runs ("write" or "verify"). */
 constexpr const char *kPhaseEnv = "CLIO_PERSIST_PHASE";
@@ -177,7 +179,7 @@ std::string WriteConfig(const fs::path &work) {
        "    pool_query: local\n"
        "    pool_id: \"568.0\"\n"
        "    next_pool_id: \"567.0\"\n"
-       "    md_only: true\n"
+       "    md_only: false\n"
        "    invalidate_on_flush: true\n"
        "    capacity: \"64M\"\n"
        "  - mod_name: clio_cte_stream\n"
@@ -307,7 +309,40 @@ void CheckFile(clio::cte::filesystem::Client *cfs, const std::string &path,
 
 /** Child: write every file. Synced files are fsynced; one is not. */
 void WritePhase(clio::cte::filesystem::Client *cfs) {
+  // Native writes take the shared-memory page path: every page slice is a
+  // copy into the CTE shm cache (its put counter moves by at least one per
+  // page), not a Write task.
+  const clio::cte::core::wtc::Stats *st = cfs->Cte()->CacheStats();
+  REQUIRE(st != nullptr);
+  const clio::run::u64 puts0 = st->puts_.load();
   WriteFile(cfs, kSynced, Pattern(kSyncedBytes, 1), true);
+  const clio::run::u64 pages =
+      (kSyncedBytes + clio::cte::filesystem::kFsPageSize - 1) /
+      clio::cte::filesystem::kFsPageSize;
+  INFO("shm cache puts: " << st->puts_.load() - puts0 << " for " << pages
+                          << " pages");
+  REQUIRE(st->puts_.load() - puts0 >= pages);
+
+  // A size raised by page writes is visible before close, to stat and to a
+  // second descriptor, with no size task (it is pending in shared memory).
+  {
+    const std::vector<char> v = Pattern(kSmallBytes, 5);
+    int wfd = cfs->OpenFd(kVisible, O_CREAT | O_RDWR | O_TRUNC, 0644);
+    REQUIRE(wfd >= 0);
+    REQUIRE(cfs->WriteFd(wfd, v.data(), v.size()) ==
+            static_cast<FsSsize>(v.size()));
+    bool exists = false;
+    REQUIRE(SizeOf(cfs, kVisible, &exists) == v.size());
+    int rfd = cfs->OpenFd(kVisible, O_RDONLY, 0);
+    REQUIRE(rfd >= 0);
+    REQUIRE(cfs->SizeFd(rfd) == static_cast<FsOff>(v.size()));
+    std::vector<char> back(v.size(), 0);
+    REQUIRE(cfs->PreadFd(rfd, back.data(), back.size(), 0) ==
+            static_cast<FsSsize>(back.size()));
+    REQUIRE(back == v);
+    REQUIRE(cfs->CloseFd(rfd) == 0);
+    REQUIRE(cfs->CloseFd(wfd) == 0);
+  }
 
   int fd = cfs->OpenFd(kTrunc, O_CREAT | O_RDWR | O_TRUNC, 0644);
   REQUIRE(fd >= 0);

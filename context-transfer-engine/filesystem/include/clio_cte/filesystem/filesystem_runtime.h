@@ -1446,6 +1446,12 @@ class Runtime : public clio::run::Container {
   /** Drain queued purges (periodic ShardOp body). */
   clio::run::TaskResume PurgeDrain();
   /**
+   * Publish the sizes clients' page writes raised in the shared-memory size
+   * table (ShmSizeTable) to each inode's home, in one parallel batch, and
+   * retire the entries the homes now cover (periodic ShardOp body).
+   */
+  clio::run::TaskResume SizeDrain();
+  /**
    * Delete, on THIS container only, the pages of every id in `req.str_`
    * (packed u64s). One such request per container replaces a cluster-wide
    * broadcast per deleted file.

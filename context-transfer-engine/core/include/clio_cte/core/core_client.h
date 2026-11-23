@@ -735,8 +735,11 @@ class Client : public clio::run::ContainerClient {
     if (src == nullptr) {
       return EINVAL;
     }
+    // An explicit score is a placement the cache cannot record (it flushes
+    // with the auto score), so such a put takes the task path.
     const bool bypass =
-        ctx != nullptr && (ctx->op_flags_ & Context::kBypassShmCache) != 0;
+        score >= 0.0f ||
+        (ctx != nullptr && (ctx->op_flags_ & Context::kBypassShmCache) != 0);
     if (!bypass && TryPutCached(tag_id, blob_name, offset, size, src, flags)) {
       return 0;
     }
@@ -757,6 +760,12 @@ class Client : public clio::run::ContainerClient {
   /** Back-off cap between kBusy retries (us). With the start above the
    *  whole retry budget is under 1 ms before the task path takes over. */
   static constexpr clio::run::u64 kCacheBusyBackoffMaxUs = 256;
+  /** Poll interval while a full cache waits for the flusher (us). */
+  static constexpr clio::run::u64 kCacheRoomPollUs = 50;
+  /** How long a put refused for room waits for the flusher to land what
+   *  was buffered before it (ms), matching the task path's
+   *  nospace_wait_ms default, before it writes around the cache. */
+  static constexpr double kCacheRoomWaitMs = 250.0;
 
   /**
    * The SHM cache half of PutBlob alone: copy a write into the segment or
@@ -764,7 +773,11 @@ class Client : public clio::run::ContainerClient {
    * pinned (kBusy: a flush in flight, its buffer must grow) is retried
    * with a bounded exponential back-off, holding no lock while it sleeps,
    * so the flush that holds the pin (and the home's invalidation it
-   * waits on) can finish. Any other refusal returns at once.
+   * waits on) can finish. A put refused for room (kNoSpace: the log or the
+   * buffers are full) waits, in this process, for the flusher to land the
+   * ranges buffered before it -- landed ranges are clean and evictable --
+   * instead of sending a task; only a segment that frees nothing within
+   * kCacheRoomWaitMs writes around it. Any other refusal returns at once.
    * @param tag_id tag of the blob
    * @param blob_name blob name
    * @param offset offset within the blob
@@ -780,7 +793,11 @@ class Client : public clio::run::ContainerClient {
       return false;
     }
     clio::run::u64 backoff_us = kCacheBusyBackoffStartUs;
-    for (int attempt = 0;; ++attempt) {
+    int busy_tries = 0;
+    bool waiting_room = false;
+    clio::run::u64 room_target = 0;
+    std::chrono::steady_clock::time_point room_t0;
+    for (;;) {
       const wtc::Status st =
           cache_->TryPut(tag_id.major_, tag_id.minor_, blob_name.data(),
                          blob_name.size(), offset, size, src, flags,
@@ -788,9 +805,39 @@ class Client : public clio::run::ContainerClient {
       if (st == wtc::Status::kOk) {
         return true;
       }
-      if (st != wtc::Status::kBusy || attempt >= kCacheBusyRetries) {
+      if (st == wtc::Status::kNoSpace) {
+        if (!waiting_room) {
+          waiting_room = true;
+          room_target = cache_->PushedNow();
+          room_t0 = std::chrono::steady_clock::now();
+        }
+        const double waited_ms =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - room_t0)
+                .count();
+        // Room follows the flusher landing what was buffered before this
+        // put; once that has landed (or the wait ran out) nothing more is
+        // coming, so the put writes around the cache.
+        if (cache_->FlushedThrough(room_target) ||
+            waited_ms >= kCacheRoomWaitMs) {
+          if (cache_->FlushedThrough(room_target)) {
+            // Landed: one more try, now that those buffers are clean.
+            const wtc::Status st2 = cache_->TryPut(
+                tag_id.major_, tag_id.minor_, blob_name.data(),
+                blob_name.size(), offset, size, src, flags,
+                /*may_block=*/false);
+            if (st2 == wtc::Status::kOk) return true;
+          }
+          return false;
+        }
+        std::this_thread::sleep_for(
+            std::chrono::microseconds(kCacheRoomPollUs));
+        continue;
+      }
+      if (st != wtc::Status::kBusy || busy_tries >= kCacheBusyRetries) {
         return false;
       }
+      ++busy_tries;
       std::this_thread::sleep_for(std::chrono::microseconds(backoff_us));
       backoff_us = std::min(backoff_us * 2, kCacheBusyBackoffMaxUs);
     }

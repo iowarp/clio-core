@@ -108,6 +108,8 @@ class Client : public clio::cte::core::Client {
     shm_fs_root_ = other.shm_fs_root_;
     fds_ = other.fds_;
     next_fd_ = other.next_fd_;
+    page_score_ = other.page_score_;
+    page_score_loaded_ = other.page_score_loaded_;
   }
 
   Client &operator=(const Client &other) {
@@ -129,6 +131,8 @@ class Client : public clio::cte::core::Client {
     shm_fs_root_ = other.shm_fs_root_;
     fds_ = other.fds_;
     next_fd_ = other.next_fd_;
+    page_score_ = other.page_score_;
+    page_score_loaded_ = other.page_score_loaded_;
     return *this;
   }
 #endif
@@ -208,6 +212,8 @@ class Client : public clio::cte::core::Client {
       return false;
     }
     const std::string key = shm_fs_root_->Key(path);
+    // Taken before the record: see the pending-size merge below.
+    const clio::run::u64 retire_seq0 = shm_fs_root_->sizes_.RetireSeq();
     if (!shm_fs_root_->path_to_file_.TryGetBytes(key.data(), key.size(),
                                                  out, 16, absent)) {
       return false;
@@ -227,6 +233,26 @@ class Client : public clio::cte::core::Client {
         return false;
       }
       out->flags_ &= ~kShmDirComplete;
+    }
+    // A file's size includes what page writes raised in the size table and
+    // the module has not drained to the home yet.
+    if (!(out->flags_ & kShmFileIsDir) && !out->tag_id_.IsNull()) {
+      const clio::run::u64 pending = shm_fs_root_->sizes_.Get(
+          (static_cast<clio::run::u64>(out->tag_id_.major_) << 32) |
+          static_cast<clio::run::u64>(out->tag_id_.minor_));
+      if (pending > out->size_) {
+        out->size_ = pending;
+      } else if (shm_fs_root_->sizes_.RetireSeq() != retire_seq0) {
+        // An entry was retired while this lookup ran: the drain may have
+        // landed this file's size AFTER the record above was read. The home
+        // republished the record before retiring, so a re-read has it.
+        ShmFileRecord again;
+        if (shm_fs_root_->path_to_file_.TryGetBytes(key.data(), key.size(),
+                                                    &again, 16, nullptr) &&
+            again.tag_id_ == out->tag_id_ && again.size_ > out->size_) {
+          out->size_ = again.size_;
+        }
+      }
     }
     return true;
   }
@@ -783,6 +809,94 @@ class Client : public clio::cte::core::Client {
     return ret;
   }
 
+  // ---- Shared-memory data path (native API and FUSE share it) ----
+
+  /**
+   * Write a file range as page blobs through the CTE client: each page slice
+   * is Client::PutBlob, a copy into the CTE shm cache (no task). A write
+   * that extends the file raises its size in the shared-memory size table
+   * (no task); the filesystem module drains it to the home in the
+   * background.
+   * @param tag the file's tag
+   * @param off file offset
+   * @param buf source bytes
+   * @param count bytes to write
+   * @param size_recorded set false when the size table could not take the
+   *        new size (no table attached / full): the caller must publish it
+   * @return bytes written, or a negative errno (-ENOSPC full store, -ENOMEM,
+   *         else -EIO); bytes stored before a failing page are reported
+   */
+  FsSsize WritePages(const clio::cte::core::TagId &tag, clio::run::u64 off,
+                     const void *buf, size_t count, bool *size_recorded);
+
+  /**
+   * Read one page range through the CTE client: the shm cache when it holds
+   * the range, else a GetBlob task (the fill). Retries the transient answers
+   * of a page whose owner was just declared dead.
+   * @param tag the file's tag
+   * @param cur file offset of the range (inside one page)
+   * @param n bytes to read
+   * @param dst destination
+   * @return 0 read, 1 the page does not exist (a hole: dst untouched), else
+   *         an error code
+   */
+  int ReadPage(const clio::cte::core::TagId &tag, clio::run::u64 cur,
+               clio::run::u64 n, char *dst);
+
+  /**
+   * Read a file range: clamp to the logical size, zero holes, pages through
+   * ReadPage.
+   * @param tag the file's tag
+   * @param path bare path (for the size lookup)
+   * @param off file offset
+   * @param buf destination
+   * @param count bytes requested
+   * @return bytes read (0 at EOF), or a negative errno
+   */
+  FsSsize ReadPages(const clio::cte::core::TagId &tag, const std::string &path,
+                    clio::run::u64 off, void *buf, size_t count);
+
+  /**
+   * Logical size of a file: the shared-memory record (which includes pending
+   * sizes) when it has the file, else a StatSize task raised by the pending
+   * size.
+   * @param tag the file's tag
+   * @param path bare path
+   * @param size receives the size
+   * @return 0, or a negative errno
+   */
+  int FileSizeOf(const clio::cte::core::TagId &tag, const std::string &path,
+                 clio::run::u64 *size);
+
+  /**
+   * @param tag a file's tag
+   * @return the size its page writes raised and the module has not drained
+   *         to the home yet (0 when none, or no table attached)
+   */
+  clio::run::u64 PendingSize(const clio::cte::core::TagId &tag);
+
+  /**
+   * Pending size of the file a path names, through its shared-memory record
+   * (0 when the path has no record or nothing is pending). Read BEFORE a
+   * size request, it is a floor the reply cannot undercut: an entry retired
+   * after this read had already landed at the home.
+   * @param path bare path
+   * @return the pending size, or 0
+   */
+  clio::run::u64 PendingSizeOfPath(const std::string &path);
+
+  /**
+   * Wait until the home holds a file's pending size (fsync, truncate): the
+   * background drain retires the entry; a drain that does not come within
+   * kSizeDrainWaitMs is done here.
+   * @param tag the file's tag
+   * @return 0, or an errno
+   */
+  int WaitSizeDrained(const clio::cte::core::TagId &tag);
+
+  /** Longest wait for the background size drain before publishing here. */
+  static constexpr double kSizeDrainWaitMs = 1000.0;
+
   /**
    * stat(2)-shaped query: existence and logical size.
    *
@@ -855,6 +969,8 @@ class Client : public clio::cte::core::Client {
     std::string path;           ///< bare (stripped) path == CTE tag name
     clio::run::u64 off = 0;     ///< current seek offset
     int flags = 0;              ///< open() flags
+    /** The file's CTE tag (from the open reply); null = use the tasks. */
+    clio::cte::core::TagId tag = clio::cte::core::TagId::GetNull();
   };
 
   /** A path is intercepted iff it carries the clio:: marker. */
@@ -1202,6 +1318,10 @@ class Client : public clio::cte::core::Client {
   mutable std::mutex fd_mu_;
   std::unordered_map<int, OpenFile> fds_;
   int next_fd_ = kCfsFdBase;
+  /** Data-score rule for page writes (this filesystem's yaml), loaded on
+   *  first write; guarded by fd_mu_. */
+  clio::cte::core::PageScorePolicy page_score_;
+  bool page_score_loaded_ = false;
 #endif
 };
 

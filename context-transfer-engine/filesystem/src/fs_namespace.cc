@@ -247,6 +247,7 @@ clio::run::TaskResume Runtime::ShardOp(clio::run::shared_ptr<ShardOpTask> &task)
   FsReq req;
   FsResp resp;
   if (task->op_ == kShardPurgeDrain) {
+    CLIO_CO_AWAIT(SizeDrain());
     CLIO_CO_AWAIT(PurgeDrain());
   } else if (!DecReq(task->req_.str(), &req)) {
     resp.rc_ = EINVAL;
@@ -702,6 +703,41 @@ void Runtime::QueuePurge(const PurgeItem &item) {
   if (!item.data_ && !item.xattr_) return;
   std::lock_guard<std::mutex> g(purge_mu_);
   purge_pending_.push_back(item);
+}
+
+clio::run::TaskResume Runtime::SizeDrain() {
+  CLIO_TASK_BODY_BEGIN
+  ShmFsCacheRoot *root = shm_fs_cache_.root();
+  if (root == nullptr || !root->sizes_.Valid()) CLIO_CO_RETURN;
+  std::vector<ShmSizeTable::Entry> pending;
+  root->sizes_.Snapshot(&pending);
+  // One size advance per file, all in flight together; each goes to its
+  // inode's home (AdvanceSize forwards).
+  constexpr size_t kSizeBatch = 256;
+  for (size_t i = 0; i < pending.size(); i += kSizeBatch) {
+    const size_t end = std::min(pending.size(), i + kSizeBatch);
+    std::vector<clio::run::Future<AdvanceSizeTask>> futs;
+    futs.reserve(end - i);
+    for (size_t j = i; j < end; ++j) {
+      futs.push_back(self_.AsyncAdvanceSize(pending[j].key, pending[j].end,
+                                            pending[j].wtime));
+    }
+    for (size_t j = i; j < end; ++j) {
+      auto &f = futs[j - i];
+      CLIO_CO_AWAIT(f);
+      const clio::run::u32 rc = f->GetReturnCode();
+      // ENOENT: the file was removed; its size has nowhere to go.
+      if (rc == 0 || rc == ENOENT) {
+        root->sizes_.Retire(pending[j].key, pending[j].end);
+      } else {
+        HLOG(kWarning, "filesystem: size drain of inode {} to {} failed "
+             "(rc={}); retrying next period", pending[j].key, pending[j].end,
+             rc);
+      }
+    }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
 }
 
 clio::run::TaskResume Runtime::PurgeDrain() {
