@@ -498,6 +498,123 @@ struct AdvanceSizeTask : public clio::run::Task {
 };
 
 /**
+ * One (a, b, c) record of an IdentifyRange member list or offset map:
+ * (node, generation, length) on the way in, (node, generation, offset) on
+ * the way out. Fixed 16-byte records in a string.
+ */
+inline void PutRangeRec(std::string *s, clio::run::u32 a, clio::run::u32 b,
+                        clio::run::u64 c) {
+  char rec[16];
+  std::memcpy(rec, &a, 4);
+  std::memcpy(rec + 4, &b, 4);
+  std::memcpy(rec + 8, &c, 8);
+  s->append(rec, sizeof(rec));
+}
+
+/**
+ * Read record i of a PutRangeRec string.
+ * @return false past the end
+ */
+inline bool GetRangeRec(const std::string &s, size_t i, clio::run::u32 *a,
+                        clio::run::u32 *b, clio::run::u64 *c) {
+  if ((i + 1) * 16 > s.size()) return false;
+  std::memcpy(a, s.data() + i * 16, 4);
+  std::memcpy(b, s.data() + i * 16 + 4, 4);
+  std::memcpy(c, s.data() + i * 16 + 8, 8);
+  return true;
+}
+
+/**
+ * IdentifyRange: reserve where a node's sealed append generation goes in a
+ * file (see SHM_CACHE_DESIGN.md "Appends"). Sent with
+ * PoolQuery::ManyToOne(owner, batch_key = file id): every node's request
+ * for the file in a window is folded into one aggregate (AggregateIn appends
+ * the member to members_), which runs on the file's owner. The owner
+ * reserves the batch's total at the file's end WITHOUT publishing a size and
+ * returns every member's offset in offsets_ (broadcast to all members; each
+ * takes its own (node, gen) entry).
+ */
+struct IdentifyRangeTask : public clio::run::Task {
+  IN clio::run::u64 tag_packed_;
+  IN clio::run::u32 node_;
+  IN clio::run::u32 gen_;
+  IN clio::run::u64 len_;
+  /** Aggregate: (node, gen, len) of every member, in arrival order. */
+  IN clio::run::priv::string members_;
+  /** (node, gen, offset) of every member. */
+  OUT clio::run::priv::string offsets_;
+  OUT clio::run::u64 base_;
+  IdentifyRangeTask()
+      : clio::run::Task(), tag_packed_(0), node_(0), gen_(0), len_(0),
+        members_(CTP_MALLOC), offsets_(CTP_MALLOC), base_(0) {}
+  explicit IdentifyRangeTask(const clio::run::TaskId &task_id,
+                             const clio::run::PoolId &pool_id,
+                             const clio::run::PoolQuery &pool_query,
+                             clio::run::u64 tag_packed, clio::run::u32 node,
+                             clio::run::u32 gen, clio::run::u64 len)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kIdentifyRange),
+        tag_packed_(tag_packed), node_(node), gen_(gen), len_(len),
+        members_(CTP_MALLOC), offsets_(CTP_MALLOC), base_(0) {}
+  void Copy(const ctp::ipc::FullPtr<IdentifyRangeTask> &o) {
+    clio::run::Task::Copy(o.template Cast<clio::run::Task>());
+    tag_packed_ = o->tag_packed_; node_ = o->node_; gen_ = o->gen_;
+    len_ = o->len_; members_ = o->members_; offsets_ = o->offsets_;
+    base_ = o->base_;
+  }
+  template <typename Ar> void SerializeIn(Ar &ar) {
+    Task::SerializeIn(ar); ar(tag_packed_, node_, gen_, len_, members_);
+  }
+  template <typename Ar> void SerializeOut(Ar &ar) {
+    Task::SerializeOut(ar); ar(offsets_, base_);
+  }
+  /**
+   * Fold a batched member into this aggregate (ManyToOne, on the
+   * neighborhood leader): the aggregate starts as a copy of the first
+   * member, so its own request is listed first.
+   * @param member_base the member
+   */
+  void AggregateIn(const ctp::ipc::FullPtr<clio::run::Task> &member_base) {
+    auto m = member_base.template Cast<IdentifyRangeTask>();
+    std::string s = members_.str();
+    if (s.empty()) PutRangeRec(&s, node_, gen_, len_);
+    PutRangeRec(&s, m->node_, m->gen_, m->len_);
+    members_ = clio::run::priv::string(CTP_MALLOC, s);
+  }
+};
+
+/**
+ * CommitRange: an origin wrote its reserved range [offset, offset + len)
+ * of a file. Runs on the file's owner, which publishes the file's size as
+ * the end of the committed prefix of its reservations.
+ */
+struct CommitRangeTask : public clio::run::Task {
+  IN clio::run::u64 tag_packed_;
+  IN clio::run::u64 offset_;
+  IN clio::run::u64 len_;
+  IN clio::run::u64 mtime_ns_;
+  CommitRangeTask()
+      : clio::run::Task(), tag_packed_(0), offset_(0), len_(0),
+        mtime_ns_(0) {}
+  explicit CommitRangeTask(const clio::run::TaskId &task_id,
+                           const clio::run::PoolId &pool_id,
+                           const clio::run::PoolQuery &pool_query,
+                           clio::run::u64 tag_packed, clio::run::u64 offset,
+                           clio::run::u64 len, clio::run::u64 mtime_ns)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kCommitRange),
+        tag_packed_(tag_packed), offset_(offset), len_(len),
+        mtime_ns_(mtime_ns) {}
+  void Copy(const ctp::ipc::FullPtr<CommitRangeTask> &o) {
+    clio::run::Task::Copy(o.template Cast<clio::run::Task>());
+    tag_packed_ = o->tag_packed_; offset_ = o->offset_; len_ = o->len_;
+    mtime_ns_ = o->mtime_ns_;
+  }
+  template <typename Ar> void SerializeIn(Ar &ar) {
+    Task::SerializeIn(ar); ar(tag_packed_, offset_, len_, mtime_ns_);
+  }
+  template <typename Ar> void SerializeOut(Ar &ar) { Task::SerializeOut(ar); }
+};
+
+/**
  * SyncMeta: fsync the namespace log (inode-table blocks,
  * orphan inodes) so creates, renames and unlinks survive power loss.
  * Broadcast: every container fsyncs the log of the namespace shard it owns.

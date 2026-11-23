@@ -67,7 +67,8 @@ constexpr u64 kFreedId = ~0ull;
 
 inline bool View::Format(const std::string &name, const Limits &lim,
                          bool case_insensitive, u64 root_id,
-                         bool root_complete) {
+                         bool root_complete, u32 node_id,
+                         bool namespace_on) {
   const u32 ni = detail::Pow2(lim.max_inodes_);
   const u32 nd = detail::Pow2(lim.max_dentries_);
   const u32 nt = std::max<u32>(lim.max_targets_, 16);
@@ -76,7 +77,9 @@ inline bool View::Format(const std::string &name, const Limits &lim,
   const u64 ino_off = root_b;
   const u64 den_off = detail::Align64(ino_off + u64(ni) * sizeof(Inode));
   const u64 tgt_off = detail::Align64(den_off + u64(nd) * sizeof(Dentry));
-  const u64 log_off = detail::Align64(tgt_off + u64(nt) * sizeof(Target));
+  const u32 na = detail::Pow2(lim.max_append_files_);
+  const u64 app_off = detail::Align64(tgt_off + u64(nt) * sizeof(Target));
+  const u64 log_off = detail::Align64(app_off + u64(na) * sizeof(AppendSlot));
   const u64 total = log_off + lb + 4096;
   const ctp::ipc::MemoryBackendId bid(0x4653u,
                                       static_cast<u32>(detail::Mix(
@@ -92,6 +95,8 @@ inline bool View::Format(const std::string &name, const Limits &lim,
   root_->magic_ = Root::kMagic;
   root_->version_ = Root::kVersion;
   root_->case_insensitive_ = case_insensitive ? 1u : 0u;
+  root_->node_id_ = node_id;
+  root_->namespace_on_ = namespace_on ? 1u : 0u;
   root_->lock_.Init();
   root_->root_id_ = root_id;
   root_->n_inodes_ = ni;
@@ -100,6 +105,8 @@ inline bool View::Format(const std::string &name, const Limits &lim,
   root_->inodes_off_ = ino_off;
   root_->dentries_off_ = den_off;
   root_->targets_off_ = tgt_off;
+  root_->appends_off_ = app_off;
+  root_->n_appends_ = na;
   root_->log_off_ = log_off;
   root_->log_bytes_ = lb;
   Inode *r = InsertInodeLocked(root_id);
@@ -1106,6 +1113,137 @@ inline int View::ResolveAnyLocked(const std::string &path, Inode **ino) {
   if (d->state_ != kDentLive) return ENOENT;
   *ino = FindInodeLocked(d->child_);
   return *ino == nullptr ? kMiss : 0;
+}
+
+// ---------------------------------------------------------------------------
+// Appends
+// ---------------------------------------------------------------------------
+
+inline AppendSlot *View::AppendSlotLocked(u64 id, bool insert) {
+  const u32 mask = root_->n_appends_ - 1;
+  AppendSlot *t = Appends();
+  u32 i = static_cast<u32>(detail::Mix(id)) & mask;
+  AppendSlot *free_slot = nullptr;
+  for (u32 probes = 0; probes <= mask; ++probes, i = (i + 1) & mask) {
+    if (t[i].id_ == id) return &t[i];
+    if (t[i].id_ == detail::kFreedId) {
+      if (free_slot == nullptr) free_slot = &t[i];
+      continue;
+    }
+    if (t[i].id_ == 0) {
+      if (free_slot == nullptr) free_slot = &t[i];
+      break;
+    }
+  }
+  if (!insert || free_slot == nullptr) return nullptr;
+  std::memset(free_slot, 0, sizeof(AppendSlot));
+  free_slot->id_ = id;
+  return free_slot;
+}
+
+inline void View::MaybeFreeAppendLocked(AppendSlot *a) {
+  if (a->locked_ == 0 && a->bytes_[0] == 0 && a->bytes_[1] == 0 &&
+      a->inflight_[0] == 0 && a->inflight_[1] == 0) {
+    a->id_ = detail::kFreedId;
+  }
+}
+
+inline int View::AppendLock(u64 id) {
+  for (;;) {
+    root_->lock_.WriteLock();
+    AppendSlot *a = AppendSlotLocked(id, true);
+    if (a == nullptr) {
+      root_->lock_.WriteUnlock();
+      return ENOSPC;
+    }
+    if (a->locked_ == 0) {
+      a->locked_ = 1;
+      root_->lock_.WriteUnlock();
+      return 0;
+    }
+    root_->lock_.WriteUnlock();
+    std::this_thread::yield();
+  }
+}
+
+inline void View::AppendUnlock(u64 id) {
+  root_->lock_.WriteLock();
+  if (AppendSlot *a = AppendSlotLocked(id, false)) {
+    a->locked_ = 0;
+    MaybeFreeAppendLocked(a);
+  }
+  root_->lock_.WriteUnlock();
+}
+
+inline int View::AppendStage(u64 id, u64 len, u32 *gen, u64 *off) {
+  root_->lock_.WriteLock();
+  AppendSlot *a = AppendSlotLocked(id, true);
+  if (a == nullptr) {
+    root_->lock_.WriteUnlock();
+    return ENOSPC;
+  }
+  const u32 p = a->gen_ & 1u;
+  *gen = a->gen_;
+  *off = a->bytes_[p];
+  a->bytes_[p] += len;
+  a->inflight_[p]++;
+  root_->lock_.WriteUnlock();
+  return 0;
+}
+
+inline int View::AppendStaged(const std::string &path, u64 id, u32 gen) {
+  return Mutate(path.size(), 0, [&]() -> int {
+    if (AppendSlot *a = AppendSlotLocked(id, false)) {
+      a->inflight_[gen & 1u]--;
+    }
+    PushOpLocked(kOpAppend, path, std::string(), id, 0, gen, 0, 0, 0, 0, 0);
+    return 0;
+  });
+}
+
+inline bool View::AppendIdle(u64 id) {
+  root_->lock_.ReadLock();
+  const AppendSlot *a = AppendSlotLocked(id, false);
+  const bool idle = a == nullptr ||
+                    (a->bytes_[0] == 0 && a->bytes_[1] == 0 &&
+                     a->inflight_[0] == 0 && a->inflight_[1] == 0);
+  root_->lock_.ReadUnlock();
+  return idle;
+}
+
+inline bool View::AppendSeal(u64 id, u32 *gen) {
+  root_->lock_.WriteLock();
+  AppendSlot *a = AppendSlotLocked(id, false);
+  bool sealed = false;
+  if (a != nullptr && a->bytes_[a->gen_ & 1u] != 0) {
+    *gen = a->gen_;
+    a->gen_++;  // new appends stage into the next generation
+    sealed = true;
+  }
+  root_->lock_.WriteUnlock();
+  return sealed;
+}
+
+inline bool View::AppendInflight(u64 id, u32 gen, u64 *len) {
+  root_->lock_.ReadLock();
+  const AppendSlot *a = AppendSlotLocked(id, false);
+  bool busy = false;
+  *len = 0;
+  if (a != nullptr) {
+    busy = a->inflight_[gen & 1u] != 0;
+    *len = a->bytes_[gen & 1u];
+  }
+  root_->lock_.ReadUnlock();
+  return busy;
+}
+
+inline void View::AppendMerged(u64 id, u32 gen) {
+  root_->lock_.WriteLock();
+  if (AppendSlot *a = AppendSlotLocked(id, false)) {
+    a->bytes_[gen & 1u] = 0;
+    MaybeFreeAppendLocked(a);
+  }
+  root_->lock_.WriteUnlock();
 }
 
 }  // namespace clio::cte::filesystem::ns

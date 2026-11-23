@@ -159,6 +159,12 @@ class Runtime : public clio::run::Container {
   clio::run::TaskResume Close(clio::run::shared_ptr<CloseTask> &task);
   clio::run::TaskResume MultiCreate(clio::run::shared_ptr<MultiCreateTask> &task);
   clio::run::TaskResume AdvanceSize(clio::run::shared_ptr<AdvanceSizeTask> &task);
+  /** Reserve a sealed append generation's range (owner; ManyToOne). */
+  clio::run::TaskResume IdentifyRange(
+      clio::run::shared_ptr<IdentifyRangeTask> &task);
+  /** An append range is written; publish the committed prefix (owner). */
+  clio::run::TaskResume CommitRange(
+      clio::run::shared_ptr<CommitRangeTask> &task);
   /**
    * fsync this container's namespace log (Method::kSyncMeta).
    * @param task sync task; rc 5 (EIO) if the fsync failed
@@ -1458,6 +1464,19 @@ class Runtime : public clio::run::Container {
    * body). Also keeps the clients' id block topped up.
    */
   clio::run::TaskResume NsDrain();
+  /**
+   * Merge a file's staged appends (origin): seal its generation, reserve
+   * its range at the owner (IdentifyRange), write the bytes into the file's
+   * pages, commit, and drop the staging blob.
+   * @param id the file's packed id
+   */
+  clio::run::TaskResume MergeAppends(clio::run::u64 id);
+  /** Publish reservations whose origin never committed as holes. */
+  clio::run::TaskResume ExpireAppendRanges();
+  /** Raise a file's size at this (its home) container after appends. */
+  clio::run::TaskResume PublishAppendSize(clio::run::u64 tag_packed,
+                                          clio::run::u64 size,
+                                          clio::run::u64 mtime_ns);
   /** Hand the namespace segment a new block of the durable id reservation
    *  when the current one runs low. */
   clio::run::TaskResume RefillNsIds();
@@ -1473,7 +1492,7 @@ class Runtime : public clio::run::Container {
                                    const std::string &path2,
                                    clio::run::u32 &rc);
   /** Format the namespace segment next to the mirror (single node). */
-  void FormatNsSegment(const clio::run::PoolId &pool);
+  void FormatNsSegment(const clio::run::PoolId &pool, bool namespace_on);
   /**
    * Delete, on THIS container only, the pages of every id in `req.str_`
    * (packed u64s). One such request per container replaces a cluster-wide
@@ -1859,6 +1878,30 @@ class Runtime : public clio::run::Container {
   ShmFsCache shm_fs_cache_;
   /** The shared-memory namespace clients operate on (fs_ns_shm.h). */
   ns::View ns_view_;
+
+  /** One reserved append range of a file this container owns. */
+  struct AppendRange {
+    clio::run::u64 len_ = 0;
+    bool committed_ = false;
+    clio::run::u64 reserved_ms_ = 0;
+  };
+  /** A file's open append reservations, by offset. */
+  struct AppendRanges {
+    clio::run::u64 end_ = 0;  ///< next offset to reserve
+    std::map<clio::run::u64, AppendRange> ranges_;
+  };
+  /**
+   * Drop the committed (or expired) prefix of a file's reservations.
+   * @param r the file's reservations (append_mu_ held)
+   * @param now_ms steady ms
+   * @param frontier receives the new published size
+   * @return true when it advanced
+   */
+  bool AdvanceAppendFrontierLocked(AppendRanges &r, clio::run::u64 now_ms,
+                                   clio::run::u64 *frontier);
+  /** Guards append_ranges_ (never held across a wait). */
+  std::mutex append_mu_;
+  std::unordered_map<clio::run::u64, AppendRanges> append_ranges_;
   /** Publish a file's attributes under `path` (meta_mu_ held). */
   void MirrorFile(const std::string &path, const InodeState &fi,
                   clio::run::u32 extra_flags = 0);

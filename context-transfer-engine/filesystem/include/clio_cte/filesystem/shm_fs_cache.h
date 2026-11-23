@@ -338,7 +338,7 @@ class ShmSizeTable {
  * modules' roots rather than competing for one slot.
  */
 struct ShmFsCacheRoot {
-  static constexpr clio::run::u32 kLayoutVersion = 6;
+  static constexpr clio::run::u32 kLayoutVersion = 7;
 
   clio::run::u32 version_;
   clio::run::u32 ready_;  /**< 0 until fully constructed; clients must check */
@@ -358,14 +358,10 @@ struct ShmFsCacheRoot {
   ShmFsFileMap path_to_file_;
   /** Pending sizes raised by clients' page writes (see ShmSizeTable). */
   ShmSizeTable sizes_;
-  /** Runtime pid naming the namespace segment (fs_ns_shm.h SegmentName),
-   *  and nonzero once that segment is formatted. */
-  std::atomic<clio::run::u32> ns_pid_;
-  std::atomic<clio::run::u32> ns_ready_;
 
   ShmFsCacheRoot()
       : version_(0), ready_(0), overflow_(0), nsgen_(0),
-        case_insensitive_(0), ns_pid_(0), ns_ready_(0) {}
+        case_insensitive_(0) {}
 
   /**
    * The key a path's record is stored under.

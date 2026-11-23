@@ -171,6 +171,15 @@ if(TARGET clio_cte_fuse)
         LABELS "unit;adapter;fuse"
         ENVIRONMENT "CLIO_WITH_RUNTIME=1;CTP_LOG_LEVEL=error;CLIO_SERVER_CONF=${CMAKE_CURRENT_SOURCE_DIR}/cte_config.yaml;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
         RESOURCE_LOCK "clio_runtime")
+    # The same suite with every O_APPEND on the asynchronous merge path
+    # (staging blobs, IdentifyRange over ManyToOne, CommitRange), which a
+    # single node otherwise skips.
+    add_test(NAME fuse_ops_append_merge COMMAND test_fuse_ops)
+    set_tests_properties(fuse_ops_append_merge PROPERTIES
+        TIMEOUT 900
+        LABELS "unit;adapter;fuse"
+        ENVIRONMENT "CLIO_CFS_APPEND_MERGE=1;CLIO_WITH_RUNTIME=1;CTP_LOG_LEVEL=error;CLIO_SERVER_CONF=${CMAKE_CURRENT_SOURCE_DIR}/cte_config.yaml;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
+        RESOURCE_LOCK "clio_runtime")
 
     install(TARGETS test_fuse_ops RUNTIME DESTINATION bin)
   endif()

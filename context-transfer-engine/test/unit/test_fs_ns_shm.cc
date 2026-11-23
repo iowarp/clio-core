@@ -38,7 +38,10 @@
  * log is checked against what each mutation must record.
  */
 
+#include <atomic>
+#include <chrono>
 #include <set>
+#include <thread>
 #include <string>
 #include <vector>
 
@@ -76,7 +79,9 @@ struct Seg {
     lim.max_dentries_ = 4096;
     lim.max_targets_ = 64;
     lim.log_bytes_ = log_bytes;
-    REQUIRE(module.Format(name, lim, false, kRootId, root_complete));
+    REQUIRE(module.Format(name, lim, false, kRootId, root_complete,
+                          /*node_id=*/3, /*namespace_on=*/true));
+    REQUIRE(module.NodeId() == 3u);
     REQUIRE(client.Attach(name));
     module.SetIdBlock(kMajor, 100, 100000);
   }
@@ -311,6 +316,68 @@ TEST_CASE("ns shm - op log wraps and stays ordered", "[fs][ns]") {
     REQUIRE(seen[2 * i] == path);
     REQUIRE(seen[2 * i + 1] == path);
   }
+}
+
+TEST_CASE("ns shm - append generations stage, seal and merge", "[fs][ns]") {
+  Seg s("append", true);
+  const ns::u64 id = 0x4000000000000042ull;
+  ns::u32 g0 = 0;
+  ns::u32 g1 = 0;
+  ns::u64 off = 0;
+  REQUIRE(s.client.AppendIdle(id));
+  // Two appends into generation 0 get consecutive blob offsets.
+  REQUIRE(s.client.AppendStage(id, 100, &g0, &off) == 0);
+  REQUIRE(off == 0u);
+  REQUIRE(s.client.AppendStage(id, 50, &g1, &off) == 0);
+  REQUIRE(g1 == g0);
+  REQUIRE(off == 100u);
+  REQUIRE_FALSE(s.client.AppendIdle(id));
+  // Seal while one is still copying: inflight holds the merge back.
+  REQUIRE(s.client.AppendStaged("/f", id, g0) == 0);
+  ns::u32 sealed = 99;
+  REQUIRE(s.module.AppendSeal(id, &sealed));
+  REQUIRE(sealed == g0);
+  ns::u64 len = 0;
+  REQUIRE(s.module.AppendInflight(id, sealed, &len));
+  // New appends go to the next generation, from offset 0.
+  ns::u32 g2 = 0;
+  REQUIRE(s.client.AppendStage(id, 7, &g2, &off) == 0);
+  REQUIRE(g2 == g0 + 1);
+  REQUIRE(off == 0u);
+  REQUIRE(s.client.AppendStaged("/f", id, g1) == 0);
+  REQUIRE_FALSE(s.module.AppendInflight(id, sealed, &len));
+  REQUIRE(len == 150u);
+  s.module.AppendMerged(id, sealed);
+  REQUIRE(s.client.AppendStaged("/f", id, g2) == 0);
+  REQUIRE_FALSE(s.client.AppendIdle(id));  // generation 1 still staged
+  REQUIRE(s.module.AppendSeal(id, &sealed));
+  REQUIRE(sealed == g2);
+  REQUIRE_FALSE(s.module.AppendInflight(id, sealed, &len));
+  REQUIRE(len == 7u);
+  s.module.AppendMerged(id, sealed);
+  REQUIRE(s.client.AppendIdle(id));
+  REQUIRE_FALSE(s.module.AppendSeal(id, &sealed));  // nothing staged
+  REQUIRE((Drain(&s.module, nullptr) ==
+           std::vector<ns::u32>{ns::kOpAppend, ns::kOpAppend,
+                                ns::kOpAppend}));
+}
+
+TEST_CASE("ns shm - append lock serializes one file's appends", "[fs][ns]") {
+  Seg s("applock", true);
+  const ns::u64 id = 0x4000000000000043ull;
+  REQUIRE(s.client.AppendLock(id) == 0);
+  std::atomic<int> got{0};
+  std::thread other([&] {
+    REQUIRE(s.module.AppendLock(id) == 0);
+    got.store(1);
+    s.module.AppendUnlock(id);
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  REQUIRE(got.load() == 0);  // still held
+  s.client.AppendUnlock(id);
+  other.join();
+  REQUIRE(got.load() == 1);
+  REQUIRE(s.client.AppendIdle(id));
 }
 
 SIMPLE_TEST_MAIN()

@@ -746,6 +746,252 @@ clio::run::TaskResume Runtime::SizeDrain() {
   CLIO_TASK_BODY_END
 }
 
+// ===========================================================================
+// Appends: IdentifyRange / CommitRange at the owner, the merge at the origin
+// (SHM_CACHE_DESIGN.md "Appends")
+// ===========================================================================
+
+namespace {
+/** A reserved range whose origin never commits becomes a hole after this. */
+constexpr clio::run::u64 kAppendCommitTimeoutMs = 30000;
+/** Bytes of a staged generation moved per read/write slice. */
+constexpr clio::run::u64 kAppendSliceBytes = 16ull << 20;
+/** Poll interval while appends still copy into a sealed generation (us). */
+constexpr double kAppendInflightPollUs = 50.0;
+
+/** @return the staging blob of generation `gen` of node `node` */
+std::string AppendBlobName(clio::run::u32 node, clio::run::u32 gen) {
+  return "app." + std::to_string(node) + "." + std::to_string(gen);
+}
+}  // namespace
+
+bool Runtime::AdvanceAppendFrontierLocked(AppendRanges &r,
+                                          clio::run::u64 now_ms,
+                                          clio::run::u64 *frontier) {
+  bool advanced = false;
+  while (!r.ranges_.empty()) {
+    auto it = r.ranges_.begin();
+    const bool expired = now_ms - it->second.reserved_ms_ >=
+                         kAppendCommitTimeoutMs;
+    if (!it->second.committed_ && !expired) break;
+    if (!it->second.committed_) {
+      HLOG(kWarning, "filesystem: append range [{}, +{}) was never "
+           "committed; publishing it as a hole", it->first,
+           it->second.len_);
+    }
+    *frontier = it->first + it->second.len_;
+    r.ranges_.erase(it);
+    advanced = true;
+  }
+  return advanced;
+}
+
+clio::run::TaskResume Runtime::PublishAppendSize(clio::run::u64 tag_packed,
+                                                 clio::run::u64 size,
+                                                 clio::run::u64 mtime_ns) {
+  CLIO_TASK_BODY_BEGIN
+  {
+    // This container is the file's home: the ordinary size advance there
+    // (stream size, inode record, mirror).
+    auto f = self_.AsyncAdvanceSizeAt(
+        clio::run::PoolQuery::DirectId(
+            static_cast<clio::run::ContainerId>(container_id_)),
+        tag_packed, size, 0u, mtime_ns);
+    CLIO_CO_AWAIT(f);
+    if (f->GetReturnCode() != 0) {
+      HLOG(kWarning, "filesystem: publishing appended size {} of inode {} "
+           "failed (rc={})", size, tag_packed, f->GetReturnCode());
+    }
+    if (ns_view_.Ready()) ns_view_.RaiseSize(tag_packed, size, mtime_ns);
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::IdentifyRange(
+    clio::run::shared_ptr<IdentifyRangeTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  {
+    const clio::run::u64 tag = task->tag_packed_;
+    std::string members = task->members_.str();
+    if (members.empty()) {
+      PutRangeRec(&members, task->node_, task->gen_, task->len_);
+    }
+    // The file's size, when no reservation of it is open: reservations
+    // start at the end every node can already see.
+    bool need_size = false;
+    {
+      std::lock_guard<std::mutex> g(append_mu_);
+      need_size = append_ranges_[tag].ranges_.empty();
+    }
+    clio::run::u64 cur = 0;
+    if (need_size) {
+      clio::run::u32 rc = 0;
+      CLIO_CO_AWAIT(FileSizeOp(FsUnpack(tag),
+                               clio::cte::stream::StreamSizeOp::kGet, 0,
+                               nullptr, &cur, &rc));
+      if (rc != 0) {
+        task->return_code_ = EIO;
+        CLIO_CO_RETURN;
+      }
+    }
+    std::string offsets;
+    {
+      std::lock_guard<std::mutex> g(append_mu_);
+      AppendRanges &r = append_ranges_[tag];
+      if (need_size && r.ranges_.empty()) r.end_ = cur;
+      const clio::run::u64 now_ms = SteadyMs();
+      task->base_ = r.end_;
+      clio::run::u32 node = 0;
+      clio::run::u32 gen = 0;
+      clio::run::u64 len = 0;
+      for (size_t i = 0; GetRangeRec(members, i, &node, &gen, &len); ++i) {
+        if (len == 0) continue;
+        AppendRange &ar = r.ranges_[r.end_];
+        ar.len_ = len;
+        ar.committed_ = false;
+        ar.reserved_ms_ = now_ms;
+        PutRangeRec(&offsets, node, gen, r.end_);
+        r.end_ += len;
+      }
+    }
+    task->offsets_ = clio::run::priv::string(CTP_MALLOC, offsets);
+    task->return_code_ = 0;
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::CommitRange(
+    clio::run::shared_ptr<CommitRangeTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  {
+    clio::run::u64 frontier = 0;
+    bool advanced = false;
+    {
+      std::lock_guard<std::mutex> g(append_mu_);
+      auto it = append_ranges_.find(task->tag_packed_);
+      if (it != append_ranges_.end()) {
+        auto rit = it->second.ranges_.find(task->offset_);
+        if (rit != it->second.ranges_.end()) rit->second.committed_ = true;
+        advanced =
+            AdvanceAppendFrontierLocked(it->second, SteadyMs(), &frontier);
+      }
+    }
+    if (advanced) {
+      CLIO_CO_AWAIT(
+          PublishAppendSize(task->tag_packed_, frontier, task->mtime_ns_));
+    }
+    task->return_code_ = 0;
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::ExpireAppendRanges() {
+  CLIO_TASK_BODY_BEGIN
+  {
+    std::vector<std::pair<clio::run::u64, clio::run::u64>> publish;
+    {
+      std::lock_guard<std::mutex> g(append_mu_);
+      const clio::run::u64 now_ms = SteadyMs();
+      for (auto it = append_ranges_.begin(); it != append_ranges_.end();) {
+        clio::run::u64 frontier = 0;
+        if (AdvanceAppendFrontierLocked(it->second, now_ms, &frontier)) {
+          publish.emplace_back(it->first, frontier);
+        }
+        it = it->second.ranges_.empty() ? append_ranges_.erase(it)
+                                        : std::next(it);
+      }
+    }
+    for (size_t i = 0; i < publish.size(); ++i) {
+      CLIO_CO_AWAIT(PublishAppendSize(publish[i].first, publish[i].second,
+                                      0));
+    }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::MergeAppends(clio::run::u64 id) {
+  CLIO_TASK_BODY_BEGIN
+  {
+    clio::run::u32 gen = 0;
+    if (!ns_view_.AppendSeal(id, &gen)) CLIO_CO_RETURN;
+    // Appends that took their offset before the seal finish copying.
+    clio::run::u64 len = 0;
+    while (ns_view_.AppendInflight(id, gen, &len)) {
+      CLIO_CO_AWAIT(clio::run::yield(kAppendInflightPollUs));
+    }
+    const clio::cte::core::TagId tag = FsUnpack(id);
+    const clio::run::u32 node = ns_view_.NodeId();
+    const std::string blob = AppendBlobName(node, gen);
+    clio::run::u64 off = 0;
+    bool have = false;
+    if (len != 0) {
+      auto f = self_.AsyncIdentifyRange(id, node, gen, len);
+      CLIO_CO_AWAIT(f);
+      const std::string offsets = f->offsets_.str();
+      clio::run::u32 n = 0;
+      clio::run::u32 g = 0;
+      clio::run::u64 o = 0;
+      for (size_t i = 0; GetRangeRec(offsets, i, &n, &g, &o); ++i) {
+        if (n == node && g == gen) {
+          off = o;
+          have = true;
+          break;
+        }
+      }
+      if (f->GetReturnCode() != 0 || !have) {
+        HLOG(kError, "filesystem: no range for {} appended bytes of inode "
+             "{} (rc={}); they are dropped", len, id, f->GetReturnCode());
+      }
+    }
+    if (have) {
+      // The bytes move once: from this node's staging blob into the file's
+      // pages at the reserved offset.
+      std::vector<char> buf(
+          static_cast<size_t>(std::min(len, kAppendSliceBytes)));
+      clio::run::u64 done = 0;
+      while (done < len) {
+        const clio::run::u64 n = std::min(len - done, kAppendSliceBytes);
+        auto g = cte_.AsyncGetBlob(tag, blob, done, n, 0u, buf.data(),
+                                   clio::run::PoolQuery::Dynamic());
+        CLIO_CO_AWAIT(g);
+        if (g->GetReturnCode() != 0) {
+          HLOG(kError, "filesystem: reading staged appends {} of inode {} "
+               "failed (rc={})", blob, id, g->GetReturnCode());
+          break;
+        }
+        clio::run::u64 put = 0;
+        while (put < n) {
+          const clio::run::u64 cur = off + done + put;
+          const clio::run::u64 page_off = cur % kFsPageSize;
+          const clio::run::u64 k = std::min(kFsPageSize - page_off, n - put);
+          auto p = cte_.AsyncPutBlob(tag, PageName(cur), page_off, k,
+                                     buf.data() + put, -1.0f,
+                                     clio::cte::core::Context(), 0u,
+                                     clio::run::PoolQuery::Dynamic());
+          CLIO_CO_AWAIT(p);
+          put += k;
+        }
+        done += n;
+      }
+      auto c = self_.AsyncCommitRange(
+          id, off, len,
+          static_cast<clio::run::u64>(clio::cte::core::GetWallTimeNs()));
+      CLIO_CO_AWAIT(c);
+    }
+    if (len != 0) {
+      auto d = cte_.AsyncDelBlob(tag, blob);
+      CLIO_CO_AWAIT(d);
+    }
+    ns_view_.AppendMerged(id, gen);
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 clio::run::TaskResume Runtime::RefillNsIds() {
   CLIO_TASK_BODY_BEGIN
   // Top the block up while half of it is left, so clients never wait.
@@ -872,6 +1118,12 @@ clio::run::TaskResume Runtime::NsDrain() {
         if (!more) break;
         continue;
       }
+      if (rec.type_ == ns::kOpAppend) {
+        // Everything staged for the file up to now merges in one pass.
+        CLIO_CO_AWAIT(MergeAppends(rec.id_));
+        ns_view_.PopOp(rec.seq_);
+        continue;
+      }
       clio::run::u32 rc = 0;
       CLIO_CO_AWAIT(NsApplyOne(rec, path, path2, rc));
       if (rc != 0) {
@@ -882,6 +1134,7 @@ clio::run::TaskResume Runtime::NsDrain() {
     }
   }
   CLIO_CO_AWAIT(RefillNsIds());
+  CLIO_CO_AWAIT(ExpireAppendRanges());
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }

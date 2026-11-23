@@ -360,16 +360,16 @@ static FsSsize WriteOpenFile(Client *cfs, const Client::OpenFile &of,
     return cfs->Write(of.handle, of.path, off, buf, count,
                       Client::IsSyncFd(of.flags));
   }
-  if (of.handle == 0 && (of.flags & O_APPEND) != 0) {
-    // O_APPEND: at the current end (this process's appends do not
-    // interleave; appends across processes are not atomic here).
-    clio::run::u64 end = 0;
-    const int src = cfs->FileSizeOf(of.tag, of.path, &end);
-    if (src != 0) {
-      errno = -src;
-      return -1;
+  if ((of.flags & O_APPEND) != 0 && !of.tag.IsNull()) {
+    FsSsize n = 0;
+    const int arc = cfs->FsAppend(of.tag, of.path, buf, count, &n);
+    if (arc != Client::kNsUnavailable) {
+      if (arc != 0) {
+        errno = arc;
+        return -1;
+      }
+      return n;
     }
-    off = end;
   }
   bool recorded = true;
   const FsSsize n = cfs->WritePages(of.tag, off, buf, count, &recorded);
@@ -475,22 +475,108 @@ int NsRetry(Client *cfs, std::initializer_list<const std::string *> paths,
 }
 }  // namespace
 
+ns::View *Client::NsSegment() {
+  if (ns_view_ == nullptr) AttachNs();
+  return (ns_view_ != nullptr && ns_view_->Ready()) ? ns_view_.get()
+                                                     : nullptr;
+}
+
 ns::View *Client::Ns() {
-  if (ns_view_ == nullptr) {
-    if (!HasShmCache()) AttachShmCache();
-    if (ns_view_ == nullptr) return nullptr;
-  }
-  return ns_view_->Ready() ? ns_view_.get() : nullptr;
+  ns::View *v = NsSegment();
+  return (v != nullptr && v->NamespaceOn()) ? v : nullptr;
 }
 
 void Client::AttachNs() {
-  if (ns_view_ != nullptr || shm_fs_root_ == nullptr) return;
-  if (shm_fs_root_->ns_ready_.load(std::memory_order_acquire) == 0) return;
+  if (ns_view_ != nullptr) return;
+  auto *ipc = CLIO_CPU_IPC;
+  auto *alloc = ipc != nullptr ? ipc->GetMetadataAllocator() : nullptr;
+  auto *dir = ipc != nullptr ? ipc->GetMetadataDirectory() : nullptr;
+  if (alloc == nullptr || dir == nullptr) return;  // TCP client, remote
+  const clio::run::u64 off = dir->FindRoot(ns::LocatorKey(pool_id_.ToU64()));
+  if (off == 0) return;  // not formatted (yet): retried on the next call
+  const auto *l = reinterpret_cast<const ns::Locator *>(
+      reinterpret_cast<const char *>(alloc) + off);
+  if (l->magic_ != ns::Locator::kMagic ||
+      l->ready_.load(std::memory_order_acquire) != 1) {
+    return;
+  }
   auto v = std::make_shared<ns::View>();
-  const std::string name = ns::SegmentName(
-      shm_fs_root_->ns_pid_.load(std::memory_order_relaxed),
-      pool_id_.ToU64());
-  if (v->Attach(name)) ns_view_ = v;
+  if (v->Attach(ns::SegmentName(l->pid_, pool_id_.ToU64()))) ns_view_ = v;
+}
+
+namespace {
+/** @return true when CLIO_CFS_APPEND_MERGE=1 forces the merge path */
+bool AppendMergeForced() {
+  static const bool forced = [] {
+    const char *e = clio::run::env::GetCompat("CFS_APPEND_MERGE");
+    return e != nullptr && *e == '1';
+  }();
+  return forced;
+}
+/** Bytes of one append moved per page put into the staging blob. */
+constexpr size_t kAppendPutBytes = 16u << 20;
+}  // namespace
+
+int Client::FsAppend(const clio::cte::core::TagId &tag,
+                     const std::string &path, const void *buf, size_t count,
+                     FsSsize *written) {
+  ns::View *v = NsSegment();
+  if (v == nullptr) return kNsUnavailable;
+  *written = 0;
+  if (count == 0) return 0;
+  const clio::run::u64 id = PackTag(tag);
+  if (v->NamespaceOn() && !AppendMergeForced()) {
+    // One node: the file's end is exact here. The append lock makes the
+    // size read and the page writes one step for every appender.
+    if (v->AppendLock(id) != 0) return ENOSPC;
+    clio::run::u64 end = 0;
+    int rc = -FileSizeOf(tag, path, &end);
+    if (rc == 0) {
+      bool recorded = true;
+      const FsSsize n = WritePages(tag, end, buf, count, &recorded);
+      if (n < 0) {
+        rc = static_cast<int>(-n);
+      } else {
+        *written = n;
+      }
+    }
+    v->AppendUnlock(id);
+    return rc;
+  }
+  // Merge path: stage into this node's append blob (shared-memory puts),
+  // then log it; the module merges it at the file's end in the background.
+  clio::run::u32 gen = 0;
+  clio::run::u64 off = 0;
+  if (v->AppendStage(id, count, &gen, &off) != 0) return ENOSPC;
+  const std::string blob =
+      "app." + std::to_string(v->NodeId()) + "." + std::to_string(gen);
+  const char *src = static_cast<const char *>(buf);
+  int rc = 0;
+  for (size_t done = 0; done < count;) {
+    const size_t n = std::min(count - done, kAppendPutBytes);
+    const clio::run::u32 prc =
+        Cte()->PutBlob(tag, blob, off + done, n, src + done);
+    if (prc != 0) {
+      rc = clio::cte::core::PutRcIsNoSpace(prc) ? ENOSPC : EIO;
+      break;
+    }
+    done += n;
+  }
+  // Always: the generation's in-flight count must drop for it to merge.
+  v->AppendStaged(path, id, gen);
+  if (rc == 0) *written = static_cast<FsSsize>(count);
+  return rc;
+}
+
+int Client::WaitAppendsMerged(const clio::cte::core::TagId &tag) {
+  ns::View *v = NsSegment();
+  if (v == nullptr || tag.IsNull()) return 0;
+  const clio::run::u64 id = PackTag(tag);
+  if (v->AppendIdle(id)) return 0;
+  // Its kOpAppend records are in the log: waiting for the log to apply
+  // through the last push covers them.
+  if (!v->WaitApplied(v->PushedSeq(), kNsDrainWaitMs)) return EIO;
+  return 0;
 }
 
 int Client::NsFill(const std::string &path) {
@@ -630,6 +716,14 @@ int Client::FsRmdir(const std::string &path) {
 int Client::FsUnlink(const std::string &path) {
   ns::View *v = Ns();
   if (v == nullptr) return kNsUnavailable;
+  {
+    // Staged appends merge before the file goes.
+    ns::Attr a;
+    if (v->Lookup(path, &a) == 0 && a.type == kFsTypeFile) {
+      const int wrc = WaitAppendsMerged(FsUnpack(a.id));
+      if (wrc != 0) return wrc;
+    }
+  }
   return NsRetry(this, {&path}, std::string(),
                  [&] { return v->Unlink(path, NowNs()); });
 }
@@ -696,6 +790,8 @@ int Client::FsTruncate(const std::string &path, clio::run::u64 size) {
   int rc = FsStat(path, &a);
   if (rc != 0) return rc;
   if (a.type == kFsTypeDir) return EISDIR;
+  rc = WaitAppendsMerged(FsUnpack(a.id));  // the cut applies after them
+  if (rc != 0) return rc;
   // The size earlier page writes raised lands first, so the cut applies
   // after them (a wait on the drain).
   rc = WaitSizeDrained(FsUnpack(a.id));
@@ -721,7 +817,7 @@ int Client::FsReaddir(const std::string &path, std::vector<ns::DirEnt> *out) {
 }
 
 int Client::FsWaitApplied() {
-  ns::View *v = Ns();
+  ns::View *v = NsSegment();  // appends too, on a multi-node volume
   if (v == nullptr) return 0;
   return v->WaitApplied(v->PushedSeq(), kNsDrainWaitMs) ? 0 : EIO;
 }

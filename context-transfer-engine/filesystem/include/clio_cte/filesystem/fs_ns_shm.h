@@ -116,6 +116,7 @@ enum : u32 {
   kOpChown = 9,     ///< path, uid, gid
   kOpUtimens = 10,  ///< path, t1 = atime, t2 = mtime
   kOpTruncate = 11, ///< path, id, size
+  kOpAppend = 12,   ///< path, id: the file has staged appends to merge
   kOpWrap = 0xFFFFFFFFu,  ///< filler at the end of the ring
 };
 
@@ -194,6 +195,20 @@ struct Target {
   char s_[kMaxTarget + 1];
 };
 
+/**
+ * Per-file append state (see SHM_CACHE_DESIGN.md "Appends"). id 0 = empty,
+ * ~0 = freed. Generation g stages into blob app.<node>.<g> of the file's
+ * tag; bytes_/inflight_ are indexed by g & 1 (one generation is staged into
+ * while the previous one merges).
+ */
+struct AppendSlot {
+  u64 id_;
+  u32 gen_;       ///< generation new appends stage into
+  u32 locked_;    ///< one-node append path: the file's append lock
+  u64 bytes_[2];  ///< bytes staged per generation (by parity)
+  u32 inflight_[2];  ///< appends copying into a generation right now
+};
+
 /** Header of one op log record; path bytes follow. */
 struct OpRec {
   u32 len_;   ///< whole record, 8-byte aligned
@@ -238,18 +253,19 @@ struct Limits {
   u32 max_inodes_ = 256 * 1024;
   u32 max_dentries_ = 256 * 1024;
   u32 max_targets_ = 4096;
+  u32 max_append_files_ = 4096;
   u64 log_bytes_ = 16ull * 1024 * 1024;
 };
 
 /** Segment root. */
 struct Root {
   static constexpr u64 kMagic = 0x3153534E53464C43ull;  // "CLFSNSS1"
-  static constexpr u32 kVersion = 1;
+  static constexpr u32 kVersion = 2;
   u64 magic_;
   u32 version_;
   std::atomic<u32> ready_;
   u32 case_insensitive_;
-  u32 pad0_;
+  u32 node_id_;  ///< the node this segment belongs to
   RwSpin lock_;
   u64 root_id_;
   // Id block handed out by the module (durably reserved).
@@ -261,10 +277,15 @@ struct Root {
   u32 n_inodes_;     ///< power of two
   u32 n_dentries_;   ///< power of two
   u32 n_targets_;
+  u32 n_appends_;  ///< power of two
+  /** Nonzero when clients run the namespace here (one node owns it);
+   *  zero: the segment carries appends only (multi-node volume). */
+  u32 namespace_on_;
   u32 pad2_;
   u64 inodes_off_;
   u64 dentries_off_;
   u64 targets_off_;
+  u64 appends_off_;
   u64 log_off_;
   u64 log_bytes_;
   // Op log: byte offsets, monotonically increasing.
@@ -275,6 +296,20 @@ struct Root {
   std::atomic<u64> used_inodes_;
   std::atomic<u64> used_dentries_;
 };
+
+/**
+ * Published in the runtime's metadata segment and registered in its
+ * MetadataDirectory under LocatorKey(pool): how a client finds the segment.
+ */
+struct Locator {
+  static constexpr u64 kMagic = 0x31434F4C534E4643ull;  // "CFNSLOC1"
+  u64 magic_;
+  std::atomic<u32> ready_;
+  u32 pid_;
+};
+
+/** MetadataDirectory key of a filesystem pool's Locator. */
+inline u64 LocatorKey(u64 pool_u64) { return pool_u64 ^ (1ull << 63); }
 
 /** Segment name for a filesystem pool of a given runtime. */
 inline std::string SegmentName(u32 runtime_pid, u64 pool_u64) {
@@ -321,10 +356,19 @@ class View {
    * @param root_id the root directory's packed id
    * @param root_complete whether the root starts with a complete listing
    *        (a fresh filesystem: nothing exists that the table lacks)
+   * @param node_id this node
+   * @param namespace_on clients run the namespace here (one node)
    * @return true when formatted
    */
   bool Format(const std::string &name, const Limits &lim,
-              bool case_insensitive, u64 root_id, bool root_complete);
+              bool case_insensitive, u64 root_id, bool root_complete,
+              u32 node_id = 0, bool namespace_on = true);
+
+  /** @return the node this segment belongs to */
+  u32 NodeId() const { return root_->node_id_; }
+
+  /** @return true when clients run the namespace in this segment */
+  bool NamespaceOn() const { return root_->namespace_on_ != 0; }
 
   /**
    * Map an existing segment (a client).
@@ -483,6 +527,67 @@ class View {
   /** Record a directory's listing as complete (after filling it). */
   int MarkComplete(const std::string &dir_path);
 
+  // ---- appends ----
+
+  /**
+   * One-node append: take the file's append lock (spins while another
+   * append to the file holds it). The caller writes at the inode's size and
+   * calls AppendUnlock.
+   * @param id the file's id
+   * @return 0, or ENOSPC (append table full)
+   */
+  int AppendLock(u64 id);
+
+  /** Release AppendLock. */
+  void AppendUnlock(u64 id);
+
+  /**
+   * Merge path, step 1a: reserve `len` bytes in the file's current append
+   * generation.
+   * @param id the file's id
+   * @param len bytes to stage
+   * @param gen receives the generation (the blob is app.<node>.<gen>)
+   * @param off receives the offset inside that blob
+   * @return 0, or ENOSPC (append table full)
+   */
+  int AppendStage(u64 id, u64 len, u32 *gen, u64 *off);
+
+  /**
+   * Merge path, step 1b: the bytes are in the blob. Logs kOpAppend.
+   * @param path the file's path
+   * @param id the file's id
+   * @param gen the generation AppendStage returned
+   * @return 0
+   */
+  int AppendStaged(const std::string &path, u64 id, u32 gen);
+
+  /**
+   * @param id a file's id
+   * @return true when it has no staged bytes and no append in progress
+   */
+  bool AppendIdle(u64 id);
+
+  /**
+   * Module: seal the file's current generation (new appends go to the
+   * next one).
+   * @param id the file's id
+   * @param gen receives the sealed generation
+   * @return false when nothing is staged
+   */
+  bool AppendSeal(u64 id, u32 *gen);
+
+  /**
+   * Module: whether appends are still copying into a sealed generation.
+   * @param id the file's id
+   * @param gen the sealed generation
+   * @param len receives its staged bytes
+   * @return true while any are
+   */
+  bool AppendInflight(u64 id, u32 gen, u64 *len);
+
+  /** Module: the sealed generation is merged; reset it. */
+  void AppendMerged(u64 id, u32 gen);
+
   // ---- module side ----
 
   /**
@@ -538,6 +643,13 @@ class View {
   /** Free negative entries whose removal has been applied. */
   void ReapNegLocked();
   u32 SlotOf(const Dentry *d) { return static_cast<u32>(d - Dentries()); }
+  AppendSlot *Appends() {
+    return reinterpret_cast<AppendSlot *>(Ptr(root_->appends_off_));
+  }
+  /** Find (or insert) a file's append slot; lock held. */
+  AppendSlot *AppendSlotLocked(u64 id, bool insert);
+  /** Free an idle append slot; lock held. */
+  void MaybeFreeAppendLocked(AppendSlot *a);
 
   /**
    * Resolve a directory path to its inode.

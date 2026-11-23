@@ -4512,13 +4512,17 @@ int cte_fuse_write(const char *path, const char *buf, size_t size,
   // appending 200 records lost half of them. Either stage the bytes for the
   // file's stream home to append at the real end (deferred, no round trip
   // to the home per write), or reserve the end there first and write at it.
-  // Both act at the file's home, so a namespace-held file's create (and its
-  // pending size) must have landed there first.
-  if (handle->append && handle->fh == 0 && !handle->tag.IsNull()) {
-    const int nrc = CLIO_CFS_CLIENT->FsWaitApplied();
-    if (nrc != 0) return -nrc;
-    const int src = CLIO_CFS_CLIENT->WaitSizeDrained(handle->tag);
-    if (src != 0) return -src;
+  // With the namespace segment, appends are the clio-fs client's (one node:
+  // under the file's append lock; otherwise staged and merged by the
+  // module); the stream paths below serve mounts without it.
+  if (handle->append && !handle->tag.IsNull()) {
+    clio::cte::filesystem::FsSsize n = 0;
+    const int arc = CLIO_CFS_CLIENT->FsAppend(handle->tag, hp, buf, size, &n);
+    if (arc != clio::cte::filesystem::Client::kNsUnavailable) {
+      if (arc != 0) return -arc;
+      UnsyncedNote(handle->tag);
+      return static_cast<int>(n);
+    }
   }
   if (handle->append && !handle->tag.IsNull() &&
       AppendModeOf() == AppendMode::kDeferred &&
@@ -4642,8 +4646,10 @@ int cte_fuse_truncate(const char *path_in, cte_off_t size,
     HiwaterClamp(p, static_cast<clio::run::u64>(size));
   }
   if (!tr_tag.IsNull()) {
-    // A pending size landing after the truncate would resurrect the length.
-    const int drc = cfs->WaitSizeDrained(tr_tag);
+    // Staged appends and a pending size landing after the truncate would
+    // resurrect the length.
+    int drc = cfs->WaitAppendsMerged(tr_tag);
+    if (drc == 0) drc = cfs->WaitSizeDrained(tr_tag);
     if (drc != 0) return -drc;
   }
   auto t = cfs->AsyncTruncate(

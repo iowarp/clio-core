@@ -183,11 +183,10 @@ class Client : public clio::cte::core::Client {
       return false;
     }
     shm_fs_root_ = root;
-    AttachNs();
     return true;
   }
 
-  /** Map the namespace segment the mirror names, once it is formatted. */
+  /** Map the namespace segment its Locator names, once it is formatted. */
   void AttachNs();
 
   bool HasShmCache() const { return shm_fs_root_ != nullptr; }
@@ -437,6 +436,35 @@ class Client : public clio::cte::core::Client {
       clio::run::u64 tag_packed, clio::run::u64 len) {
     return AsyncAdvanceSizeAt(clio::run::PoolQuery::Local(), tag_packed, len,
                               1u);
+  }
+
+  /**
+   * Reserve where a sealed append generation goes (ManyToOne collective at
+   * the file's owner; see IdentifyRangeTask).
+   */
+  clio::run::Future<IdentifyRangeTask> AsyncIdentifyRange(
+      clio::run::u64 tag_packed, clio::run::u32 node, clio::run::u32 gen,
+      clio::run::u64 len) {
+    auto *ipc = CLIO_CPU_IPC;
+    auto task = ipc->NewTask<IdentifyRangeTask>(
+        clio::run::CreateTaskId(), pool_id_,
+        clio::run::PoolQuery::ManyToOne(FsIdHome(tag_packed),
+                                        /*batch_key=*/tag_packed),
+        tag_packed, node, gen, len);
+    return ipc->Send(task);
+  }
+
+  /** An append range is written (to the file's owner). */
+  clio::run::Future<CommitRangeTask> AsyncCommitRange(
+      clio::run::u64 tag_packed, clio::run::u64 offset, clio::run::u64 len,
+      clio::run::u64 mtime_ns) {
+    auto *ipc = CLIO_CPU_IPC;
+    auto task = ipc->NewTask<CommitRangeTask>(
+        clio::run::CreateTaskId(), pool_id_,
+        clio::run::PoolQuery::DirectId(
+            static_cast<clio::run::ContainerId>(FsIdHome(tag_packed))),
+        tag_packed, offset, len, mtime_ns);
+    return ipc->Send(task);
   }
 
   /** Batched sieve-flushed creation (see MultiCreateTask). */
@@ -829,8 +857,34 @@ class Client : public clio::cte::core::Client {
   /** Returned by the Fs* namespace calls when no segment is attached. */
   static constexpr int kNsUnavailable = -2;
 
-  /** @return the attached namespace view, or nullptr */
+  /** @return the attached namespace view when it runs the namespace, or
+   *  nullptr */
   ns::View *Ns();
+
+  /** @return the attached segment (namespace or appends only), or nullptr */
+  ns::View *NsSegment();
+
+  /**
+   * append(2) of `count` bytes (O_APPEND). One node: under the file's
+   * append lock, at its current size (shared-memory page writes). Otherwise
+   * (or CLIO_CFS_APPEND_MERGE=1): staged in this node's append blob and
+   * merged by the module in the background (SHM_CACHE_DESIGN.md "Appends").
+   * @param tag the file's tag
+   * @param path its path
+   * @param buf source
+   * @param count bytes
+   * @param written receives the bytes accepted
+   * @return 0, an errno, or kNsUnavailable (no segment: use the task path)
+   */
+  int FsAppend(const clio::cte::core::TagId &tag, const std::string &path,
+               const void *buf, size_t count, FsSsize *written);
+
+  /**
+   * Wait until a file's staged appends have merged (truncate, unlink).
+   * @param tag the file's tag
+   * @return 0, or EIO when the merge does not come
+   */
+  int WaitAppendsMerged(const clio::cte::core::TagId &tag);
 
   /**
    * stat(2): the name's attributes; a file's size includes its pending

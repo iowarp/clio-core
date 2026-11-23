@@ -46,8 +46,10 @@ GLOBAL_CROSS_CONST clio::run::u32 kAdvanceSize = 37;      // tag-keyed logical-s
 GLOBAL_CROSS_CONST clio::run::u32 kShardOp = 38;          // internal: op on hash-owned ns state
 GLOBAL_CROSS_CONST clio::run::u32 kSyncMeta = 39;         // fsync the namespace log (broadcast)
 GLOBAL_CROSS_CONST clio::run::u32 kReaddirRange = 40;     // one chunk of a listing, by offset
+GLOBAL_CROSS_CONST clio::run::u32 kIdentifyRange = 41;    // reserve an append range (ManyToOne)
+GLOBAL_CROSS_CONST clio::run::u32 kCommitRange = 42;      // an append range is written
 
-GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 41;
+GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 43;
 
 inline const std::vector<std::string>& GetMethodNames() {
   static const std::vector<std::string> names = [] {

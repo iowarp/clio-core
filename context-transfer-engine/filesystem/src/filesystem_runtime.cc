@@ -307,9 +307,11 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
                                     case_insensitive_)) {
       HLOG(kInfo, "filesystem: shared-memory attribute cache enabled "
            "(files={})", capacity);
-      FormatNsSegment(fields->new_pool_id_);
     }
   }
+  // The namespace segment: namespace and appends on one node, appends only
+  // on a multi-node volume (its namespace stays with the module).
+  FormatNsSegment(fields->new_pool_id_, shm_fs_cache_.IsEnabled());
   // The clients' first block of inode ids, before any of them can create.
   CLIO_CO_AWAIT(RefillNsIds());
   HLOG(kInfo, "filesystem: container {} over CTE pool {} (namespace hash "
@@ -394,16 +396,18 @@ void Runtime::EnsurePurgeDrain() {
                      clio::run::PoolQuery::Local(), 20000.0);
 }
 
-void Runtime::FormatNsSegment(const clio::run::PoolId &pool) {
-  // Same scope as the mirror it sits next to: one node owns the namespace.
+void Runtime::FormatNsSegment(const clio::run::PoolId &pool,
+                              bool namespace_on) {
   const char *off = clio::run::env::GetCompat("CFS_SHM_NAMESPACE");
   if (off != nullptr && *off == '0') {
     HLOG(kInfo, "filesystem: shared-memory namespace disabled "
          "(CLIO_CFS_SHM_NAMESPACE=0)");
     return;
   }
-  ShmFsCacheRoot *mroot = shm_fs_cache_.root();
-  if (mroot == nullptr) return;
+  auto *ipc = CLIO_IPC;
+  auto *alloc = ipc != nullptr ? ipc->GetMetadataAllocator() : nullptr;
+  auto *dir = ipc != nullptr ? ipc->GetMetadataDirectory() : nullptr;
+  if (alloc == nullptr || dir == nullptr) return;  // no metadata segment
   ns::Limits lim;
   if (const char *e = clio::run::env::GetCompat("CFS_SHM_NS_ENTRIES")) {
     const unsigned long long v = std::strtoull(e, nullptr, 10);
@@ -418,16 +422,30 @@ void Runtime::FormatNsSegment(const clio::run::PoolId &pool) {
   // A fresh volume has nothing the table lacks: its root starts complete.
   // After a restart the volume's names are filled in on first touch.
   if (!ns_view_.Format(name, lim, case_insensitive_, FsPack(FsRootId()),
-                       /*root_complete=*/!is_restart_)) {
+                       /*root_complete=*/!is_restart_,
+                       static_cast<clio::run::u32>(container_id_),
+                       namespace_on)) {
     HLOG(kWarning, "filesystem: could not create the shared-memory "
          "namespace segment {}; clients use namespace tasks", name);
     return;
   }
-  mroot->ns_pid_.store(pid, std::memory_order_relaxed);
-  mroot->ns_ready_.store(1, std::memory_order_release);
-  HLOG(kInfo, "filesystem: shared-memory namespace {} (inodes={}, "
-       "entries={}, log={} B)", name, lim.max_inodes_, lim.max_dentries_,
-       lim.log_bytes_);
+  auto loc = alloc->template Allocate<ns::Locator>(sizeof(ns::Locator));
+  if (loc.IsNull()) {
+    HLOG(kWarning, "filesystem: no room for the namespace locator; clients "
+         "use namespace tasks");
+    return;
+  }
+  ns::Locator *l = loc.ptr_;
+  l->magic_ = ns::Locator::kMagic;
+  l->pid_ = pid;
+  l->ready_.store(1, std::memory_order_release);
+  dir->RegisterRoot(ns::LocatorKey(pool.ToU64()),
+                    static_cast<clio::run::u64>(
+                        reinterpret_cast<char *>(l) -
+                        reinterpret_cast<char *>(alloc)));
+  HLOG(kInfo, "filesystem: shared-memory {} {} (inodes={}, entries={}, "
+       "log={} B)", namespace_on ? "namespace" : "append segment", name,
+       lim.max_inodes_, lim.max_dentries_, lim.log_bytes_);
 }
 
 // ===========================================================================
