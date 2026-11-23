@@ -37,6 +37,9 @@
 #ifdef CAE_ENABLE_HTTP
 #include <clio_cae/core/factory/http_file_assimilator.h>
 #endif
+#ifdef CAE_ENABLE_DATAVERSE
+#include <clio_cae/core/factory/dataverse_file_assimilator.h>
+#endif
 #include <clio_cae/core/factory/string_data_assimilator.h>
 #ifdef CLIO_CAE_ENABLE_HDF5
 #include <clio_cae/core/factory/hdf5_file_assimilator.h>
@@ -114,6 +117,18 @@ std::unique_ptr<BaseAssimilator> AssimilatorFactory::Get(
     return std::make_unique<HttpFileAssimilator>(cte_client_);
 #else
     HLOG(kError, "AssimilatorFactory: http(s) sources need a POSIX build");
+    return nullptr;
+#endif
+  } else if (protocol == "dataverse") {
+#ifdef CAE_ENABLE_DATAVERSE
+    HLOG(kDebug,
+         "AssimilatorFactory: Creating DataverseFileAssimilator for '{}'", src);
+    // Files and zip members of a Dataverse dataset (dataverse.h), fetched by
+    // the http engine; file:: or iowarp:: destinations.
+    return std::make_unique<DataverseFileAssimilator>(cte_client_);
+#else
+    HLOG(kError,
+         "AssimilatorFactory: dataverse sources need a POSIX build with zlib");
     return nullptr;
 #endif
   } else if (protocol == "string") {
