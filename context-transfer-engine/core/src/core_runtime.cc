@@ -5777,7 +5777,17 @@ clio::run::TaskResume Runtime::MultiPutBlob(
     task->SetReturnCode(batch.descs_.empty() ? 0 : 1);
     CLIO_CO_RETURN;
   }
+  // A flush batch can hold thousands of records; running them all without
+  // yielding held one worker for seconds, and every task queued behind it
+  // (file creates, reads) waited that long. Yield between runs once this
+  // task has worked kBatchYieldNs since it last yielded.
+  constexpr clio::run::u64 kBatchYieldNs = 2000000;  // 2 ms
+  clio::run::u64 since_yield_ns = GetCurrentTimeNs();
   for (size_t bi = 0; bi < batch.size();) {
+    if (GetCurrentTimeNs() - since_yield_ns >= kBatchYieldNs) {
+      CLIO_CO_AWAIT(clio::run::yield(BlobWriteLockPollUs()));
+      since_yield_ns = GetCurrentTimeNs();
+    }
     // RUN of consecutive records for one (tag, blob), shipped as ONE nested
     // VECTORED put (issue #820): one write-token acquire, one blob sizing,
     // one metadata mutation for the whole run instead of one each, with

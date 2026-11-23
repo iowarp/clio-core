@@ -2183,6 +2183,12 @@ struct Context {
    *  copy's own bytes, not a mutation of a source, and running the hook on
    *  them would recurse into the copy's own copies. */
   static constexpr clio::run::u32 kNoCow = 1u << 9;
+  /** kBypassShmCache -- keep THIS put or get out of the shm cache segment.
+   *  The client skips the segment and sends a task; the shm cache treats any
+   *  op flag as a non-plain operation, so it drains the blob's buffered
+   *  ranges, drops its copy and forwards the operation down the chain, and
+   *  the data is not held twice. Other layers ignore the bit. */
+  static constexpr clio::run::u32 kBypassShmCache = 1u << 10;
 
   /**
    * Fault-handler parameters (checkpointing / lazy copy). When the core

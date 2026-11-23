@@ -148,6 +148,12 @@ bool ConfigManager::ClientInit() {
   // path still honors CLIO_PORT et al.
   if (!config_file_path_.empty()) {
     if (!LoadYaml(config_file_path_)) {
+      if (compose_invalid_) {
+        // Composing it anyway would put two containers behind one id.
+        HLOG(kError, "Refusing to start with an invalid compose in {}",
+             config_file_path_);
+        return false;
+      }
       HLOG(kError,
             "Warning: Failed to load configuration from {}, using defaults",
             config_file_path_);
@@ -320,8 +326,9 @@ bool ConfigManager::LoadYaml(const std::string &config_path) {
     // values, and the runtime's operational config is never silently retargeted
     // by a config reload.
     LoadFromFile(config_path, true);
-    return true;
+    return !compose_invalid_;
   } catch (const std::exception &e) {
+    HLOG(kError, "Config: failed to parse {}: {}", config_path, e.what());
     return false;
   }
 }
@@ -689,7 +696,9 @@ void ConfigManager::ParseYAML(YAML::Node &yaml_conf) {
   // to consolidate worker thread configuration with other runtime parameters
 
   // Parse compose section
+  compose_invalid_ = false;
   if (yaml_conf["compose"]) {
+    const size_t first_new_pool = compose_config_.pools_.size();
     auto compose_list = yaml_conf["compose"];
     if (compose_list.IsSequence()) {
       for (const auto& pool_node : compose_list) {
@@ -744,7 +753,30 @@ void ConfigManager::ParseYAML(YAML::Node &yaml_conf) {
         compose_config_.pools_.push_back(pool_config);
       }
     }
+    ValidateComposePoolIds(first_new_pool);
   }
+}
+
+bool ConfigManager::ValidateComposePoolIds(size_t first) {
+  const auto &pools = compose_config_.pools_;
+  for (size_t i = first; i < pools.size(); ++i) {
+    if (pools[i].pool_id_.IsNull()) continue;
+    for (size_t j = i + 1; j < pools.size(); ++j) {
+      if (pools[j].pool_id_ == pools[i].pool_id_) {
+        HLOG(kError,
+             "Config: compose pools '{}' ({}) and '{}' ({}) both use pool_id "
+             "{}.{}; every pool needs its own id",
+             pools[i].pool_name_, pools[i].mod_name_, pools[j].pool_name_,
+             pools[j].mod_name_, pools[i].pool_id_.major_,
+             pools[i].pool_id_.minor_);
+        compose_invalid_ = true;
+        compose_config_.pools_.erase(compose_config_.pools_.begin() + first,
+                                     compose_config_.pools_.end());
+        return false;
+      }
+    }
+  }
+  return true;
 }
 
 size_t ConfigManager::CalculateMainSegmentSize() const {

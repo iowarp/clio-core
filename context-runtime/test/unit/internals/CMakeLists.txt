@@ -10,6 +10,11 @@ target_include_directories(${IPC_INTERNALS_TEST_TARGET} PRIVATE
   ${CLIO_RUN_ROOT}/test  # For simple_test.h
 )
 
+# The shipped default config is checked for duplicate pool ids.
+target_compile_definitions(${IPC_INTERNALS_TEST_TARGET} PRIVATE
+  CLIO_DEFAULT_CONFIG_PATH="${CLIO_RUN_ROOT}/config/clio_default.yaml"
+)
+
 target_link_libraries(${IPC_INTERNALS_TEST_TARGET}
   clio_admin_runtime
   clio_admin_client

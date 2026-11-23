@@ -716,7 +716,8 @@ class Client : public clio::run::ContainerClient {
    * @param size bytes to write
    * @param src source bytes (private memory; reusable when this returns)
    * @param score placement score (task path only)
-   * @param ctx operation context, or nullptr for none (task path only)
+   * @param ctx operation context, or nullptr for none (task path only;
+   *        Context::kBypassShmCache in op_flags_ skips the cache segment)
    * @param flags put flags (kCtePut*)
    * @param pool_query task-path routing
    * @return 0 on success; EINVAL for a null source, ENOMEM when the task
@@ -734,7 +735,9 @@ class Client : public clio::run::ContainerClient {
     if (src == nullptr) {
       return EINVAL;
     }
-    if (TryPutCached(tag_id, blob_name, offset, size, src, flags)) {
+    const bool bypass =
+        ctx != nullptr && (ctx->op_flags_ & Context::kBypassShmCache) != 0;
+    if (!bypass && TryPutCached(tag_id, blob_name, offset, size, src, flags)) {
       return 0;
     }
     const Context none;
