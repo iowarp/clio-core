@@ -1422,8 +1422,23 @@ class Client : public clio::cte::core::Client {
     }
     auto *cte = Cte();
     ShmFileRecord rec;
-    if (cte->pool_id_.IsNull() || !cte->HasCache() ||
-        !TryGetFileRecordShm(path, &rec) || !rec.IsFastPathable()) {
+    bool have = false;
+    if (ns::View *v = Ns()) {
+      // The namespace holds every file this node made, including ones whose
+      // create has not reached the module (and its mirror) yet.
+      ns::Attr a;
+      if (v->Lookup(path, &a) == 0 && a.type == kFsTypeFile) {
+        const clio::cte::core::TagId t = FsUnpack(a.id);
+        rec.tag_id_ = clio::run::UniqueId(t.major_, t.minor_);
+        rec.size_ = std::max(a.size, PendingSize(t));
+        rec.flags_ = kShmFileExists;
+        have = true;
+      }
+    }
+    if (!have) {
+      have = TryGetFileRecordShm(path, &rec) && rec.IsFastPathable();
+    }
+    if (cte->pool_id_.IsNull() || !cte->HasCache() || !have) {
       ShmReadMisses().fetch_add(1, std::memory_order_relaxed);
       return -1;
     }

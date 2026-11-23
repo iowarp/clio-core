@@ -735,7 +735,7 @@ clio::run::TaskResume Runtime::SizeDrain() {
                            ns_view_.HasInode(pending[j].key);
       if (rc == 0 || (rc == ENOENT && !not_yet)) {
         root->sizes_.Retire(pending[j].key, pending[j].end);
-      } else {
+      } else if (!not_yet) {
         HLOG(kWarning, "filesystem: size drain of inode {} to {} failed "
              "(rc={}); retrying next period", pending[j].key, pending[j].end,
              rc);
@@ -1096,6 +1096,7 @@ clio::run::TaskResume Runtime::NsDrain() {
       if (rec.type_ == ns::kOpCreate) {
         // Consecutive creates go as one batch; the client minted each id.
         std::vector<MultiCreateEnt> ents;
+        clio::run::u64 last_seq = 0;
         bool more = true;
         while (more && ents.size() < kCreateBatch &&
                rec.type_ == ns::kOpCreate) {
@@ -1105,7 +1106,8 @@ clio::run::TaskResume Runtime::NsDrain() {
           e.mode_ = rec.mode_;
           e.ctime_ns_ = rec.t1_;
           ents.push_back(std::move(e));
-          ns_view_.PopOp(rec.seq_);
+          last_seq = rec.seq_;
+          ns_view_.PopOp();
           more = ns_view_.PeekOp(&rec, &path, &path2);
         }
         auto f = self_.AsyncMultiCreate(EncodeMultiCreate(ents));
@@ -1115,13 +1117,16 @@ clio::run::TaskResume Runtime::NsDrain() {
                "failed (first rc={})", ents.size() - f->num_ok_,
                ents.size(), f->first_rc_);
         }
+        // Landed: only now may waiters (fsync, xattrs) see them as applied.
+        ns_view_.MarkApplied(last_seq);
         if (!more) break;
         continue;
       }
       if (rec.type_ == ns::kOpAppend) {
         // Everything staged for the file up to now merges in one pass.
         CLIO_CO_AWAIT(MergeAppends(rec.id_));
-        ns_view_.PopOp(rec.seq_);
+        ns_view_.PopOp();
+        ns_view_.MarkApplied(rec.seq_);
         continue;
       }
       clio::run::u32 rc = 0;
@@ -1130,7 +1135,8 @@ clio::run::TaskResume Runtime::NsDrain() {
         HLOG(kWarning, "filesystem: namespace drain: op {} on '{}' failed "
              "(rc={})", rec.type_, path, rc);
       }
-      ns_view_.PopOp(rec.seq_);
+      ns_view_.PopOp();
+      ns_view_.MarkApplied(rec.seq_);
     }
   }
   CLIO_CO_AWAIT(RefillNsIds());

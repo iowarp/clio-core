@@ -406,11 +406,14 @@ inline bool View::PeekOp(OpRec *rec, std::string *path, std::string *path2) {
   }
 }
 
-inline void View::PopOp(u64 seq) {
+inline void View::PopOp() {
   const u64 cap = root_->log_bytes_;
   const u64 head = root_->log_head_.load(std::memory_order_relaxed);
   const OpRec *r = reinterpret_cast<const OpRec *>(Log() + head % cap);
   root_->log_head_.store(head + r->len_, std::memory_order_release);
+}
+
+inline void View::MarkApplied(u64 seq) {
   root_->applied_seq_.store(seq, std::memory_order_release);
 }
 

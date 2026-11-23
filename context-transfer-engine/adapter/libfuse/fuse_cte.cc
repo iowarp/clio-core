@@ -3161,7 +3161,12 @@ int cte_fuse_open(const char *path, struct fuse_file_info *fi) {
   // moved off it: ESTALE makes the kernel look the real name up again.
   if (IsHiddenName(path)) return -kOpenVanishedErrno;
   std::string p(path);
-  if (NsOn()) return NsOpenFile(p, fi->flags & ~O_CREAT, 0644, fi);
+  if (NsOn()) {
+    // The kernel only opens a name it just looked up: gone now means a
+    // rename or unlink won the race (ESTALE makes the kernel look again).
+    const int nrc = NsOpenFile(p, fi->flags & ~O_CREAT, 0644, fi);
+    return nrc == -ENOENT ? -kOpenVanishedErrno : nrc;
+  }
   auto *cfs = CLIO_CFS_CLIENT;
   // The chimod honors O_CREAT: a plain open of a missing file returns
   // handle==0 so we can surface ENOENT.

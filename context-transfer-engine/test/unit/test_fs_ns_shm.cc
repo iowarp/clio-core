@@ -96,7 +96,8 @@ std::vector<ns::u32> Drain(ns::View *v, std::vector<std::string> *paths) {
   while (v->PeekOp(&rec, &p, &p2)) {
     types.push_back(rec.type_);
     if (paths != nullptr) paths->push_back(p + (p2.empty() ? "" : "|" + p2));
-    v->PopOp(rec.seq_);
+    v->PopOp();
+    v->MarkApplied(rec.seq_);
   }
   return types;
 }

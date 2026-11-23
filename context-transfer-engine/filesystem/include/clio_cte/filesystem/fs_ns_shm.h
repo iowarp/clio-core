@@ -610,8 +610,19 @@ class View {
    */
   bool PeekOp(OpRec *rec, std::string *path, std::string *path2);
 
-  /** Consume the record PeekOp returned and mark it applied. */
-  void PopOp(u64 seq);
+  /**
+   * Consume the record PeekOp returned (frees its log space). It is not
+   * applied yet: MarkApplied once its effect has landed.
+   */
+  void PopOp();
+
+  /**
+   * Every record through `seq` has landed at its home: waiters
+   * (WaitApplied: fsync, truncate, xattrs) may proceed, and negative
+   * entries they covered may be reclaimed.
+   * @param seq the last landed record's seq
+   */
+  void MarkApplied(u64 seq);
 
   /** @return true when an inode with this id is in the table */
   bool HasInode(u64 id);
