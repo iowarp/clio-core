@@ -4875,10 +4875,10 @@ static int cte_fuse_setxattr(const char *path, const char *name,
   // preserve its length rather than treating it as a C string. `flags` carries
   // XATTR_CREATE(1) / XATTR_REPLACE(2), matching the runtime's bit checks.
   auto *cfs = CLIO_CFS_CLIENT;
-  // Xattrs live at the file's home: its namespace changes land first.
-  if (NsOn()) {
-    const int nrc = cfs->FsWaitApplied();
-    if (nrc != 0) return -nrc;
+  {
+    const int nrc = cfs->FsSetxattr(path, name, std::string(value, size),
+                                    static_cast<clio::run::u32>(flags));
+    if (nrc != clio::cte::filesystem::Client::kNsUnavailable) return -nrc;
   }
   auto t = cfs->AsyncSetxattr(std::string(path), std::string(name),
                               std::string(value, size),
@@ -4915,10 +4915,16 @@ static int cte_fuse_getxattr(const char *path, const char *name, char *value,
     return -ENODATA;
   }
   auto *cfs = CLIO_CFS_CLIENT;
-  // Xattrs live at the file's home: its namespace changes land first.
-  if (NsOn()) {
-    const int nrc = cfs->FsWaitApplied();
-    if (nrc != 0) return -nrc;
+  {
+    std::string val;
+    const int nrc = cfs->FsGetxattr(path, name, &val);
+    if (nrc != clio::cte::filesystem::Client::kNsUnavailable) {
+      if (nrc != 0) return -nrc;
+      if (size == 0) return static_cast<int>(val.size());  // length query
+      if (size < val.size()) return -ERANGE;
+      std::memcpy(value, val.data(), val.size());
+      return static_cast<int>(val.size());
+    }
   }
   auto t = cfs->AsyncGetxattr(std::string(path), std::string(name));
   t.Wait();
@@ -4971,10 +4977,16 @@ static int cte_fuse_listxattr(const char *path, char *list, size_t size) {
   // Return the NUL-separated, NUL-terminated list of xattr names. size==0 is a
   // length query.
   auto *cfs = CLIO_CFS_CLIENT;
-  // Xattrs live at the file's home: its namespace changes land first.
-  if (NsOn()) {
-    const int nrc = cfs->FsWaitApplied();
-    if (nrc != 0) return -nrc;
+  {
+    std::string names;
+    const int nrc = cfs->FsListxattr(path, &names);
+    if (nrc != clio::cte::filesystem::Client::kNsUnavailable) {
+      if (nrc != 0) return -nrc;
+      if (size == 0) return static_cast<int>(names.size());  // length query
+      if (size < names.size()) return -ERANGE;
+      std::memcpy(list, names.data(), names.size());
+      return static_cast<int>(names.size());
+    }
   }
   auto t = cfs->AsyncListxattr(std::string(path));
   t.Wait();
@@ -4998,10 +5010,9 @@ static int cte_fuse_removexattr(const char *path, const char *name) {
   std::string hidden;
   if (const int hrc = MapHiddenPath(&path, &hidden)) return hrc;
   auto *cfs = CLIO_CFS_CLIENT;
-  // Xattrs live at the file's home: its namespace changes land first.
-  if (NsOn()) {
-    const int nrc = cfs->FsWaitApplied();
-    if (nrc != 0) return -nrc;
+  {
+    const int nrc = cfs->FsRemovexattr(path, name);
+    if (nrc != clio::cte::filesystem::Client::kNsUnavailable) return -nrc;
   }
   auto t = cfs->AsyncRemovexattr(std::string(path), std::string(name));
   t.Wait();

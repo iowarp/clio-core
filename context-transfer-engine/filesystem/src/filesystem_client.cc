@@ -830,6 +830,125 @@ int Client::FsReaddir(const std::string &path, std::vector<ns::DirEnt> *out) {
   });
 }
 
+int Client::NsFillXattrs(const std::string &path) {
+  ns::View *v = Ns();
+  if (v == nullptr) return kNsUnavailable;
+  // The module answers for the file as this node last told it: its
+  // changes land first.
+  if (FsWaitApplied() != 0) return EIO;
+  auto l = AsyncListxattr(path);
+  l.Wait();
+  if (l->GetReturnCode() != 0) {
+    const clio::run::u32 rc = l->GetReturnCode();
+    return rc < 4096 ? static_cast<int>(rc) : EIO;
+  }
+  const std::string names = l->names_.str();
+  std::vector<std::pair<std::string, std::string>> attrs;
+  for (size_t i = 0; i < names.size();) {
+    const size_t end = names.find('\0', i);
+    const std::string name =
+        names.substr(i, end == std::string::npos ? std::string::npos : end - i);
+    i = end == std::string::npos ? names.size() : end + 1;
+    if (name.empty()) continue;
+    auto g = AsyncGetxattr(path, name);
+    g.Wait();
+    if (g->GetReturnCode() != 0 || g->found_ == 0) continue;
+    attrs.emplace_back(name, g->value_.str());
+  }
+  return v->FillXattrs(path, attrs);
+}
+
+namespace {
+/**
+ * Run an xattr operation, filling the path and then the file's xattrs on
+ * a miss.
+ * @param cfs the client
+ * @param path the file
+ * @param op the operation (0, errno, ns::kMiss, or ns::kTooBig)
+ * @return its result; ns::kTooBig when the module holds the xattrs
+ */
+template <typename Op>
+int XattrRetry(Client *cfs, const std::string &path, Op op) {
+  for (int round = 0; round < 4; ++round) {
+    const int rc = op();
+    if (rc != ns::kMiss) return rc;
+    int frc = cfs->NsFill(path);
+    if (frc == 0) frc = cfs->NsFillXattrs(path);
+    if (frc == ns::kTooBig) return ns::kTooBig;
+    if (frc != 0) return frc;
+  }
+  return EIO;
+}
+}  // namespace
+
+int Client::FsSetxattr(const std::string &path, const std::string &name,
+                       const std::string &value, clio::run::u32 flags) {
+  ns::View *v = Ns();
+  if (v == nullptr) return kNsUnavailable;
+  const int rc = XattrRetry(this, path, [&] {
+    return v->Setxattr(path, name, value, flags, NowNs());
+  });
+  if (rc != ns::kTooBig) return rc;
+  // Held by the module: set it there once this node's changes landed, and
+  // let the next access refill the file's xattrs from it.
+  if (FsWaitApplied() != 0) return EIO;
+  auto t = AsyncSetxattr(path, name, value, flags);
+  t.Wait();
+  v->ForgetXattrs(path);
+  const clio::run::u32 trc = t->GetReturnCode();
+  return trc < 4096 ? static_cast<int>(trc) : EIO;
+}
+
+int Client::FsGetxattr(const std::string &path, const std::string &name,
+                       std::string *value) {
+  ns::View *v = Ns();
+  if (v == nullptr) return kNsUnavailable;
+  const int rc = XattrRetry(this, path,
+                            [&] { return v->Getxattr(path, name, value); });
+  if (rc != ns::kTooBig) return rc;
+  if (FsWaitApplied() != 0) return EIO;
+  auto t = AsyncGetxattr(path, name);
+  t.Wait();
+  if (t->GetReturnCode() != 0) {
+    const clio::run::u32 trc = t->GetReturnCode();
+    return trc < 4096 ? static_cast<int>(trc) : EIO;
+  }
+  if (t->found_ == 0) return ENODATA;
+  *value = t->value_.str();
+  return 0;
+}
+
+int Client::FsListxattr(const std::string &path, std::string *names) {
+  ns::View *v = Ns();
+  if (v == nullptr) return kNsUnavailable;
+  const int rc =
+      XattrRetry(this, path, [&] { return v->Listxattr(path, names); });
+  if (rc != ns::kTooBig) return rc;
+  if (FsWaitApplied() != 0) return EIO;
+  auto t = AsyncListxattr(path);
+  t.Wait();
+  if (t->GetReturnCode() != 0) {
+    const clio::run::u32 trc = t->GetReturnCode();
+    return trc < 4096 ? static_cast<int>(trc) : EIO;
+  }
+  *names = t->names_.str();
+  return 0;
+}
+
+int Client::FsRemovexattr(const std::string &path, const std::string &name) {
+  ns::View *v = Ns();
+  if (v == nullptr) return kNsUnavailable;
+  const int rc = XattrRetry(this, path, [&] {
+    return v->Removexattr(path, name, NowNs());
+  });
+  if (rc != ns::kTooBig) return rc;
+  if (FsWaitApplied() != 0) return EIO;
+  auto t = AsyncRemovexattr(path, name);
+  t.Wait();
+  const clio::run::u32 trc = t->GetReturnCode();
+  return trc < 4096 ? static_cast<int>(trc) : EIO;
+}
+
 int Client::FsWaitApplied() {
   ns::View *v = NsSegment();  // appends too, on a multi-node volume
   if (v == nullptr) return 0;

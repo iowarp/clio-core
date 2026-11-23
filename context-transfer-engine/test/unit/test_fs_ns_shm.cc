@@ -381,4 +381,48 @@ TEST_CASE("ns shm - append lock serializes one file's appends", "[fs][ns]") {
   REQUIRE(s.client.AppendIdle(id));
 }
 
+TEST_CASE("ns shm - xattrs set get list remove, fill, too big", "[fs][ns]") {
+  Seg s("xattr", true);
+  ns::Attr a;
+  bool c = false;
+  REQUIRE(s.client.Create("/f", 0644, 0, 0, true, 1, &a, &c) == 0);
+  std::string v;
+  REQUIRE(s.client.Getxattr("/f", "user.k", &v) == ENODATA);
+  REQUIRE(s.client.Setxattr("/f", "user.k", "v1", 0, 2) == 0);
+  REQUIRE(s.client.Setxattr("/f", "user.k", "v2", 1, 2) == EEXIST);
+  REQUIRE(s.client.Setxattr("/f", "user.n", "x", 2, 2) == ENODATA);
+  REQUIRE(s.client.Setxattr("/f", "user.k", "v2", 2, 2) == 0);
+  REQUIRE(s.client.Setxattr("/f", "user.z", std::string(3, '\0'), 0, 2) == 0);
+  REQUIRE(s.module.Getxattr("/f", "user.k", &v) == 0);
+  REQUIRE(v == "v2");
+  REQUIRE(s.client.Getxattr("/f", "user.z", &v) == 0);
+  REQUIRE(v == std::string(3, '\0'));
+  std::string names;
+  REQUIRE(s.client.Listxattr("/f", &names) == 0);
+  REQUIRE(names.size() == std::string("user.k\0user.z\0", 14).size());
+  REQUIRE(s.client.Removexattr("/f", "user.k", 3) == 0);
+  REQUIRE(s.client.Removexattr("/f", "user.k", 3) == ENODATA);
+  REQUIRE(s.client.Setxattr("/f", "user.big",
+                            std::string(ns::kMaxXattrValue + 1, 'b'), 0,
+                            4) == ns::kTooBig);
+  // A file filled from the module: xattrs unknown until filled.
+  ns::Attr filled;
+  filled.id = 0x4000000000000099ull;
+  filled.type = kFsTypeFile;
+  filled.nlink = 1;
+  REQUIRE(s.client.FillEntry("/", "old", filled) == 0);
+  REQUIRE(s.client.Getxattr("/old", "user.k", &v) == ns::kMiss);
+  REQUIRE(s.client.FillXattrs("/old", {{"user.k", "kept"}}) == 0);
+  REQUIRE(s.client.Getxattr("/old", "user.k", &v) == 0);
+  REQUIRE(v == "kept");
+  REQUIRE(s.client.ForgetXattrs("/old") == 0);
+  REQUIRE(s.client.Listxattr("/old", &names) == ns::kMiss);
+  // Unlink frees the file's xattr slots.
+  REQUIRE(s.client.Unlink("/f", 5) == 0);
+  REQUIRE((Drain(&s.module, nullptr) ==
+           std::vector<ns::u32>{ns::kOpCreate, ns::kOpSetxattr,
+                                ns::kOpSetxattr, ns::kOpSetxattr,
+                                ns::kOpRemovexattr, ns::kOpUnlink}));
+}
+
 SIMPLE_TEST_MAIN()

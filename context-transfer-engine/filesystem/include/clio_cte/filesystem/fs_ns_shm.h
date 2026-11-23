@@ -66,6 +66,7 @@
 #include <functional>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <clio_ctp/data_structures/ipc/ring_buffer.h>
@@ -89,10 +90,15 @@ static constexpr u32 kMaxPath = 4095;
 static constexpr u32 kNoSlot = 0xFFFFFFFFu;
 /** Returned by lookups that need a fill from the module. */
 static constexpr int kMiss = -1;
+/** An xattr value too large to hold inline: the module keeps it. */
+static constexpr int kTooBig = -3;
+/** Largest xattr value held in the segment. */
+static constexpr u32 kMaxXattrValue = 2048;
 
 /** Inode flags. */
 enum : u32 {
   kInodeComplete = 1u << 0,  ///< directory: every entry is in the table
+  kInodeXattrsKnown = 1u << 1,  ///< every xattr of the inode is held here
 };
 
 /** Directory entry states. */
@@ -117,6 +123,8 @@ enum : u32 {
   kOpUtimens = 10,  ///< path, t1 = atime, t2 = mtime
   kOpTruncate = 11, ///< path, id, size
   kOpAppend = 12,   ///< path, id: the file has staged appends to merge
+  kOpSetxattr = 13, ///< path, path2 = name NUL value, flags
+  kOpRemovexattr = 14,  ///< path, path2 = name
   kOpWrap = 0xFFFFFFFFu,  ///< filler at the end of the ring
 };
 
@@ -172,6 +180,8 @@ struct Inode {
   u64 ctime_;
   u32 first_child_;  ///< directory: head of its entry list (dentry slot)
   u32 target_;       ///< symlink: target slot
+  u32 nxattr_;       ///< xattr slots it holds
+  u32 pad_;
 };
 
 /** One directory entry, keyed by (parent id, canonical name). */
@@ -193,6 +203,17 @@ struct Target {
   u64 id_;  ///< owning inode, 0 = free
   u16 len_;
   char s_[kMaxTarget + 1];
+};
+
+/** One extended attribute. id 0 = empty, ~0 = freed. */
+struct XattrSlot {
+  u64 id_;
+  u64 hash_;
+  u16 name_len_;
+  u16 pad_;
+  u32 val_len_;
+  char name_[kMaxName + 1];
+  char val_[kMaxXattrValue];
 };
 
 /**
@@ -254,13 +275,14 @@ struct Limits {
   u32 max_dentries_ = 256 * 1024;
   u32 max_targets_ = 4096;
   u32 max_append_files_ = 4096;
+  u32 max_xattrs_ = 4096;
   u64 log_bytes_ = 16ull * 1024 * 1024;
 };
 
 /** Segment root. */
 struct Root {
   static constexpr u64 kMagic = 0x3153534E53464C43ull;  // "CLFSNSS1"
-  static constexpr u32 kVersion = 3;
+  static constexpr u32 kVersion = 4;
   u64 magic_;
   u32 version_;
   std::atomic<u32> ready_;
@@ -286,6 +308,9 @@ struct Root {
   u64 dentries_off_;
   u64 targets_off_;
   u64 appends_off_;
+  u64 xattrs_off_;
+  u32 n_xattrs_;  ///< power of two
+  u32 pad5_;
   u64 log_off_;
   u64 log_bytes_;
   // Op log: byte offsets, monotonically increasing.
@@ -545,6 +570,59 @@ class View {
   /** Record a directory's listing as complete (after filling it). */
   int MarkComplete(const std::string &dir_path);
 
+  // ---- extended attributes ----
+
+  /**
+   * setxattr(2).
+   * @param path the file
+   * @param name attribute name
+   * @param value attribute value
+   * @param flags XATTR_CREATE (1) / XATTR_REPLACE (2)
+   * @param now wall ns (the file's new ctime)
+   * @return 0, EEXIST, ENODATA, ENOENT, kMiss (fill the file's xattrs), or
+   *         kTooBig (the value is held by the module: use its task)
+   */
+  int Setxattr(const std::string &path, const std::string &name,
+               const std::string &value, u32 flags, u64 now);
+
+  /**
+   * getxattr(2).
+   * @param value receives the value
+   * @return 0, ENODATA, ENOENT, or kMiss
+   */
+  int Getxattr(const std::string &path, const std::string &name,
+               std::string *value);
+
+  /**
+   * listxattr(2).
+   * @param names receives every name, each NUL-terminated
+   * @return 0, ENOENT, or kMiss
+   */
+  int Listxattr(const std::string &path, std::string *names);
+
+  /**
+   * removexattr(2).
+   * @return 0, ENODATA, ENOENT, or kMiss
+   */
+  int Removexattr(const std::string &path, const std::string &name, u64 now);
+
+  /**
+   * Hold a file's xattrs as the module reported them (a fill), unless they
+   * are held already.
+   * @param path the file
+   * @param attrs its (name, value) pairs
+   * @return 0, kTooBig (a value too large: they stay with the module), or
+   *         an errno
+   */
+  int FillXattrs(const std::string &path,
+                 const std::vector<std::pair<std::string, std::string>> &attrs);
+
+  /**
+   * Forget a file's xattrs (one was set through the module): the next
+   * access fills them again.
+   */
+  int ForgetXattrs(const std::string &path);
+
   // ---- appends ----
 
   /**
@@ -672,6 +750,13 @@ class View {
   /** Free negative entries whose removal has been applied. */
   void ReapNegLocked();
   u32 SlotOf(const Dentry *d) { return static_cast<u32>(d - Dentries()); }
+  XattrSlot *Xattrs() {
+    return reinterpret_cast<XattrSlot *>(Ptr(root_->xattrs_off_));
+  }
+  /** Find (or insert) an xattr slot; lock held. */
+  XattrSlot *XattrSlotLocked(u64 id, const std::string &name, bool insert);
+  /** Free every xattr slot of an inode; lock held. */
+  void FreeXattrsLocked(Inode *ino);
   AppendSlot *Appends() {
     return reinterpret_cast<AppendSlot *>(Ptr(root_->appends_off_));
   }

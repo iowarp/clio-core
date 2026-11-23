@@ -946,6 +946,31 @@ class Client : public clio::cte::core::Client {
   /** readdir(2): every entry of a directory. */
   int FsReaddir(const std::string &path, std::vector<ns::DirEnt> *out);
   /**
+   * setxattr(2) through the namespace. A value too large to hold inline is
+   * set through the module (after this node's changes land) and the file's
+   * xattrs are refilled on next access.
+   * @param path bare path
+   * @param name attribute name
+   * @param value attribute value
+   * @param flags XATTR_CREATE (1) / XATTR_REPLACE (2)
+   * @return 0, an errno, or kNsUnavailable
+   */
+  int FsSetxattr(const std::string &path, const std::string &name,
+                 const std::string &value, clio::run::u32 flags);
+  /** getxattr(2); 0, ENODATA, an errno, or kNsUnavailable. */
+  int FsGetxattr(const std::string &path, const std::string &name,
+                 std::string *value);
+  /** listxattr(2): names, each NUL-terminated. */
+  int FsListxattr(const std::string &path, std::string *names);
+  /** removexattr(2). */
+  int FsRemovexattr(const std::string &path, const std::string &name);
+  /**
+   * Fill a file's xattrs from the module (a cold miss).
+   * @return 0, ns::kTooBig (a value the segment cannot hold), or an errno
+   */
+  int NsFillXattrs(const std::string &path);
+
+  /**
    * Wait until everything this node changed in the namespace so far has
    * been applied at the homes (fsync's namespace half).
    * @return 0, or EIO when it does not happen within the drain timeout

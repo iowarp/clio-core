@@ -1073,6 +1073,18 @@ clio::run::TaskResume Runtime::NsApplyOne(const ns::OpRec &rec,
     auto f = self_.AsyncUtimens(path, rec.t1_, rec.t2_, flags);
     CLIO_CO_AWAIT(f);
     rc = f->GetReturnCode();
+  } else if (rec.type_ == ns::kOpSetxattr) {
+    const size_t nul = path2.find('\0');
+    const std::string name = path2.substr(0, nul);
+    const std::string value =
+        nul == std::string::npos ? std::string() : path2.substr(nul + 1);
+    auto f = self_.AsyncSetxattr(path, name, value, rec.flags_);
+    CLIO_CO_AWAIT(f);
+    rc = f->GetReturnCode();
+  } else if (rec.type_ == ns::kOpRemovexattr) {
+    auto f = self_.AsyncRemovexattr(path, path2);
+    CLIO_CO_AWAIT(f);
+    rc = f->GetReturnCode();
   } else if (rec.type_ == ns::kOpTruncate) {
     auto f = self_.AsyncTruncate(path, rec.size_, rec.id_);
     CLIO_CO_AWAIT(f);

@@ -79,7 +79,9 @@ inline bool View::Format(const std::string &name, const Limits &lim,
   const u64 tgt_off = detail::Align64(den_off + u64(nd) * sizeof(Dentry));
   const u32 na = detail::Pow2(lim.max_append_files_);
   const u64 app_off = detail::Align64(tgt_off + u64(nt) * sizeof(Target));
-  const u64 log_off = detail::Align64(app_off + u64(na) * sizeof(AppendSlot));
+  const u32 nx = detail::Pow2(lim.max_xattrs_);
+  const u64 xat_off = detail::Align64(app_off + u64(na) * sizeof(AppendSlot));
+  const u64 log_off = detail::Align64(xat_off + u64(nx) * sizeof(XattrSlot));
   const u64 total = log_off + lb + 4096;
   const ctp::ipc::MemoryBackendId bid(0x4653u,
                                       static_cast<u32>(detail::Mix(
@@ -106,6 +108,8 @@ inline bool View::Format(const std::string &name, const Limits &lim,
   root_->dentries_off_ = den_off;
   root_->targets_off_ = tgt_off;
   root_->appends_off_ = app_off;
+  root_->xattrs_off_ = xat_off;
+  root_->n_xattrs_ = nx;
   root_->n_appends_ = na;
   root_->log_off_ = log_off;
   root_->log_bytes_ = lb;
@@ -116,6 +120,7 @@ inline bool View::Format(const std::string &name, const Limits &lim,
   r->first_child_ = kNoSlot;
   r->target_ = kNoSlot;
   r->flags_ = root_complete ? kInodeComplete : 0u;
+  r->flags_ |= root_complete ? kInodeXattrsKnown : 0u;
   root_->ready_.store(1, std::memory_order_release);
   return true;
 }
@@ -190,6 +195,7 @@ inline Inode *View::InsertInodeLocked(u64 id) {
 }
 
 inline void View::FreeInodeLocked(Inode *ino) {
+  if (ino->nxattr_ != 0) FreeXattrsLocked(ino);
   if (ino->target_ != kNoSlot) {
     Targets()[ino->target_].id_ = 0;
   }
@@ -528,6 +534,7 @@ inline int View::Create(const std::string &path, u32 mode, u32 uid, u32 gid,
       d->name_[leaf.size()] = '\0';
     }
     ino->type_ = kFsTypeFile;
+    ino->flags_ = kInodeXattrsKnown;  // a new file has none
     ino->mode_ = mode & 07777u;
     ino->uid_ = uid;
     ino->gid_ = gid;
@@ -577,7 +584,8 @@ inline int View::Mkdir(const std::string &path, u32 mode, u32 uid, u32 gid,
     ino->uid_ = uid;
     ino->gid_ = gid;
     ino->nlink_ = 2;
-    ino->flags_ = kInodeComplete;  // a new directory has no other entries
+    // A new directory has no other entries and no xattrs.
+    ino->flags_ = kInodeComplete | kInodeXattrsKnown;
     ino->atime_ = ino->mtime_ = ino->ctime_ = now;
     d->child_ = id;
     d->type_ = kFsTypeDir;
@@ -627,6 +635,7 @@ inline int View::Symlink(const std::string &target, const std::string &path,
     std::memcpy(tg[slot].s_, target.data(), target.size());
     tg[slot].s_[target.size()] = '\0';
     ino->type_ = kFsTypeSymlink;
+    ino->flags_ = kInodeXattrsKnown;
     ino->mode_ = 0777;
     ino->uid_ = uid;
     ino->gid_ = gid;
@@ -1255,6 +1264,186 @@ inline void View::AppendMerged(u64 id, u32 gen) {
   }
   root_->lock_.WriteUnlock();
 }
+
+// ---------------------------------------------------------------------------
+// Extended attributes
+// ---------------------------------------------------------------------------
+
+inline XattrSlot *View::XattrSlotLocked(u64 id, const std::string &name,
+                                        bool insert) {
+  const u32 mask = root_->n_xattrs_ - 1;
+  XattrSlot *t = Xattrs();
+  u64 h = detail::Mix(id);
+  for (unsigned char c : name) {
+    h ^= c;
+    h *= 1099511628211ull;
+  }
+  u32 i = static_cast<u32>(h) & mask;
+  XattrSlot *free_slot = nullptr;
+  for (u32 probes = 0; probes <= mask; ++probes, i = (i + 1) & mask) {
+    XattrSlot &x = t[i];
+    if (x.id_ == 0) {
+      if (free_slot == nullptr) free_slot = &x;
+      break;
+    }
+    if (x.id_ == detail::kFreedId) {
+      if (free_slot == nullptr) free_slot = &x;
+      continue;
+    }
+    if (x.id_ == id && x.hash_ == h && x.name_len_ == name.size() &&
+        std::memcmp(x.name_, name.data(), name.size()) == 0) {
+      return &x;
+    }
+  }
+  if (!insert || free_slot == nullptr) return nullptr;
+  free_slot->id_ = id;
+  free_slot->hash_ = h;
+  free_slot->name_len_ = static_cast<u16>(name.size());
+  std::memcpy(free_slot->name_, name.data(), name.size());
+  free_slot->name_[name.size()] = '\0';
+  free_slot->val_len_ = 0;
+  return free_slot;
+}
+
+inline void View::FreeXattrsLocked(Inode *ino) {
+  XattrSlot *t = Xattrs();
+  for (u32 i = 0; i < root_->n_xattrs_ && ino->nxattr_ != 0; ++i) {
+    if (t[i].id_ == ino->id_) {
+      t[i].id_ = detail::kFreedId;
+      ino->nxattr_--;
+    }
+  }
+  ino->nxattr_ = 0;
+}
+
+inline int View::Setxattr(const std::string &path, const std::string &name,
+                          const std::string &value, u32 flags, u64 now) {
+  if (name.empty() || name.size() > kMaxName) return ERANGE;
+  if (value.size() > kMaxXattrValue) return kTooBig;
+  std::string rec2 = name;
+  rec2.push_back('\0');
+  rec2.append(value);
+  return Mutate(path.size(), rec2.size(), [&]() -> int {
+    Inode *ino = nullptr;
+    int rc = ResolveAnyLocked(path, &ino);
+    if (rc != 0) return rc;
+    if ((ino->flags_ & kInodeXattrsKnown) == 0) return kMiss;
+    XattrSlot *x = XattrSlotLocked(ino->id_, name, false);
+    if (x != nullptr && (flags & 1u)) return EEXIST;   // XATTR_CREATE
+    if (x == nullptr && (flags & 2u)) return ENODATA;  // XATTR_REPLACE
+    if (x == nullptr) {
+      x = XattrSlotLocked(ino->id_, name, true);
+      if (x == nullptr) return ENOSPC;
+      ino->nxattr_++;
+    }
+    x->val_len_ = static_cast<u32>(value.size());
+    std::memcpy(x->val_, value.data(), value.size());
+    ino->ctime_ = now;
+    PushOpLocked(kOpSetxattr, path, rec2, ino->id_, 0, now, 0, 0, 0, 0,
+                 flags);
+    return 0;
+  });
+}
+
+inline int View::Getxattr(const std::string &path, const std::string &name,
+                          std::string *value) {
+  root_->lock_.ReadLock();
+  Inode *ino = nullptr;
+  int rc = ResolveAnyLocked(path, &ino);
+  if (rc == 0) {
+    if ((ino->flags_ & kInodeXattrsKnown) == 0) {
+      rc = kMiss;
+    } else if (XattrSlot *x = XattrSlotLocked(ino->id_, name, false)) {
+      value->assign(x->val_, x->val_len_);
+    } else {
+      rc = ENODATA;
+    }
+  }
+  root_->lock_.ReadUnlock();
+  return rc;
+}
+
+inline int View::Listxattr(const std::string &path, std::string *names) {
+  root_->lock_.ReadLock();
+  Inode *ino = nullptr;
+  int rc = ResolveAnyLocked(path, &ino);
+  if (rc == 0) {
+    if ((ino->flags_ & kInodeXattrsKnown) == 0) {
+      rc = kMiss;
+    } else {
+      names->clear();
+      const XattrSlot *t = Xattrs();
+      u32 left = ino->nxattr_;
+      for (u32 i = 0; i < root_->n_xattrs_ && left != 0; ++i) {
+        if (t[i].id_ != ino->id_) continue;
+        names->append(t[i].name_, t[i].name_len_);
+        names->push_back('\0');
+        --left;
+      }
+    }
+  }
+  root_->lock_.ReadUnlock();
+  return rc;
+}
+
+inline int View::Removexattr(const std::string &path, const std::string &name,
+                             u64 now) {
+  return Mutate(path.size(), name.size(), [&]() -> int {
+    Inode *ino = nullptr;
+    int rc = ResolveAnyLocked(path, &ino);
+    if (rc != 0) return rc;
+    if ((ino->flags_ & kInodeXattrsKnown) == 0) return kMiss;
+    XattrSlot *x = XattrSlotLocked(ino->id_, name, false);
+    if (x == nullptr) return ENODATA;
+    x->id_ = detail::kFreedId;
+    ino->nxattr_--;
+    ino->ctime_ = now;
+    PushOpLocked(kOpRemovexattr, path, name, ino->id_, 0, now, 0, 0, 0, 0,
+                 0);
+    return 0;
+  });
+}
+
+inline int View::FillXattrs(
+    const std::string &path,
+    const std::vector<std::pair<std::string, std::string>> &attrs) {
+  for (const auto &a : attrs) {
+    if (a.second.size() > kMaxXattrValue || a.first.size() > kMaxName) {
+      return kTooBig;
+    }
+  }
+  root_->lock_.WriteLock();
+  Inode *ino = nullptr;
+  int rc = ResolveAnyLocked(path, &ino);
+  if (rc == 0 && (ino->flags_ & kInodeXattrsKnown) == 0) {
+    for (const auto &a : attrs) {
+      XattrSlot *x = XattrSlotLocked(ino->id_, a.first, true);
+      if (x == nullptr) {
+        rc = ENOSPC;
+        break;
+      }
+      ino->nxattr_++;  // unknown until now, so none was held
+      x->val_len_ = static_cast<u32>(a.second.size());
+      std::memcpy(x->val_, a.second.data(), a.second.size());
+    }
+    if (rc == 0) ino->flags_ |= kInodeXattrsKnown;
+  }
+  root_->lock_.WriteUnlock();
+  return rc;
+}
+
+inline int View::ForgetXattrs(const std::string &path) {
+  root_->lock_.WriteLock();
+  Inode *ino = nullptr;
+  const int rc = ResolveAnyLocked(path, &ino);
+  if (rc == 0) {
+    if (ino->nxattr_ != 0) FreeXattrsLocked(ino);
+    ino->flags_ &= ~kInodeXattrsKnown;
+  }
+  root_->lock_.WriteUnlock();
+  return rc;
+}
+
 
 }  // namespace clio::cte::filesystem::ns
 
