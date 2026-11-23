@@ -1465,6 +1465,13 @@ class Runtime : public clio::run::Container {
    */
   clio::run::TaskResume NsDrain();
   /**
+   * Fast periodic body (kShardNsDrain, ~100 us): applies the namespace log
+   * whenever it holds records, and drains pending sizes while a client
+   * waits on them, so waits on the drain (truncate, fsync) take a fraction
+   * of a millisecond instead of the 20 ms purge period.
+   */
+  clio::run::TaskResume NsFastTick();
+  /**
    * Merge a file's staged appends (origin): seal its generation, reserve
    * its range at the owner (IdentifyRange), write the bytes into the file's
    * pages, commit, and drop the staging blob.
@@ -1942,6 +1949,7 @@ enum FsShardOp : clio::run::u32 {
   kTableLoadBlocks = 22,    ///< load a group of a directory's blocks into this container's cache
   kShardInodeCreate = 23,   ///< store a new file's record, keep it resident and open it
   kShardInodeDiscard = 24,  ///< undo kShardInodeCreate: close its handle, drop its record
+  kShardNsDrain = 25,       ///< periodic (fast): apply the shm namespace log
 };
 
 /** Insert flags (FsReq::flags_ of kTableInsert). */

@@ -246,10 +246,11 @@ clio::run::TaskResume Runtime::ShardOp(clio::run::shared_ptr<ShardOpTask> &task)
   CLIO_TASK_BODY_BEGIN
   FsReq req;
   FsResp resp;
-  if (task->op_ == kShardPurgeDrain) {
-    // Namespace first: a size advance needs its file's create applied.
-    CLIO_CO_AWAIT(NsDrain());
+  if (task->op_ == kShardNsDrain) {
+    CLIO_CO_AWAIT(NsFastTick());
+  } else if (task->op_ == kShardPurgeDrain) {
     CLIO_CO_AWAIT(SizeDrain());
+    CLIO_CO_AWAIT(ExpireAppendRanges());
     CLIO_CO_AWAIT(PurgeDrain());
   } else if (!DecReq(task->req_.str(), &req)) {
     resp.rc_ = EINVAL;
@@ -1140,7 +1141,17 @@ clio::run::TaskResume Runtime::NsDrain() {
     }
   }
   CLIO_CO_AWAIT(RefillNsIds());
-  CLIO_CO_AWAIT(ExpireAppendRanges());
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::NsFastTick() {
+  CLIO_TASK_BODY_BEGIN
+  if (!ns_view_.Ready()) CLIO_CO_RETURN;
+  CLIO_CO_AWAIT(RefillNsIds());
+  // Namespace first: a size advance needs its file's create applied.
+  if (!ns_view_.LogEmpty()) CLIO_CO_AWAIT(NsDrain());
+  if (ns_view_.Urgent()) CLIO_CO_AWAIT(SizeDrain());
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }

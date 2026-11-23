@@ -888,15 +888,22 @@ inline int View::Utimens(const std::string &path, u64 atime, u64 mtime,
 }
 
 inline bool View::WaitApplied(u64 seq, double timeout_ms) {
+  if (root_->applied_seq_.load(std::memory_order_acquire) >= seq) return true;
+  Urge();
   const auto t0 = std::chrono::steady_clock::now();
+  bool ok = true;
   while (root_->applied_seq_.load(std::memory_order_acquire) < seq) {
     const double ms = std::chrono::duration<double, std::milli>(
                           std::chrono::steady_clock::now() - t0)
                           .count();
-    if (ms >= timeout_ms) return false;
-    std::this_thread::sleep_for(std::chrono::microseconds(200));
+    if (ms >= timeout_ms) {
+      ok = false;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::microseconds(50));
   }
-  return true;
+  Unurge();
+  return ok;
 }
 
 inline int View::Truncate(const std::string &path, u64 size, u64 now,

@@ -2940,7 +2940,12 @@ int cte_fuse_readdir(const char *path, void *buf,
     const size_t start = off >= 3 ? static_cast<size_t>(off - 3) + 1 : 0;
     for (size_t i = start; i < ents.size(); ++i) {
       if (IsHiddenName(ents[i].name.c_str())) continue;
-      if (filler(buf, ents[i].name.c_str(), nullptr,
+      // d_ino and d_type, as the task path supplies them (generic/637).
+      cte_stat_t st;
+      memset(&st, 0, sizeof(st));
+      st.st_mode = DirentMode(ents[i].type);
+      st.st_ino = static_cast<decltype(st.st_ino)>(ents[i].id);
+      if (filler(buf, ents[i].name.c_str(), &st,
                  static_cast<cte_off_t>(3 + i),
                  static_cast<fuse_fill_dir_flags>(0)) != 0) {
         break;
@@ -4566,7 +4571,13 @@ int cte_fuse_unlink(const char *path) {
   DirAttrInvalidate(path);
   if (NsOn()) {
     HiwaterErase(std::string(path));
-    return -CLIO_CFS_CLIENT->FsUnlink(path);
+    const int nrc = CLIO_CFS_CLIENT->FsUnlink(path);
+    if (nrc == 0) {
+      for (const auto &sib : LinkGroupDrop(std::string(path))) {
+        InvalidatePath(sib);  // their nlink/ctime changed under the TTL
+      }
+    }
+    return -nrc;
   }
   // libfuse removes a hidden name when the file's last descriptor closes.
   // Unless the hide fell back to a server rename, the name never existed on
@@ -4786,7 +4797,14 @@ static int cte_fuse_fallocate(const char *path, int mode, cte_off_t offset,
 int cte_fuse_link(const char *from, const char *to) {
   DirAttrInvalidate(to);
   if (NameTooLong(to)) return -ENAMETOOLONG;
-  if (NsOn()) return -CLIO_CFS_CLIENT->FsLink(from, to);
+  if (NsOn()) {
+    const int nrc = CLIO_CFS_CLIENT->FsLink(from, to);
+    if (nrc == 0) {
+      LinkGroupJoin(std::string(from), std::string(to));
+      InvalidatePath(std::string(from));  // nlink/ctime changed under the TTL
+    }
+    return -nrc;
+  }
   if (IsHiddenName(from) || IsHiddenName(to)) return -ENOENT;
   // The new name resolves through the store, not this daemon's per-path
   // overlays, so the source's queued close-to-open publish must land first

@@ -394,6 +394,12 @@ void Runtime::EnsurePurgeDrain() {
   // path. A periodic task never completes, so the future is dropped.
   self_.AsyncShardOp(kShardPurgeDrain, std::string(),
                      clio::run::PoolQuery::Local(), 20000.0);
+  // Periodic (100 us): the shared-memory namespace's log, applied promptly
+  // (see NsFastTick). The only caller of NsDrain, so one drainer pops it.
+  if (ns_view_.Ready()) {
+    self_.AsyncShardOp(kShardNsDrain, std::string(),
+                       clio::run::PoolQuery::Local(), 100.0);
+  }
 }
 
 void Runtime::FormatNsSegment(const clio::run::PoolId &pool,

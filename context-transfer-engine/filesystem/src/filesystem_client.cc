@@ -146,7 +146,7 @@ constexpr int kReadNodeLostRetries = 20;
 /** Pause between those retries (ms). */
 constexpr int kReadNodeLostRetryMs = 500;
 /** Poll interval while waiting for the background size drain (us). */
-constexpr int kSizeDrainPollUs = 200;
+constexpr int kSizeDrainPollUs = 50;
 
 /** @return the packed (major << 32 | minor) form of a tag */
 clio::run::u64 PackTag(const clio::cte::core::TagId &tag) {
@@ -311,6 +311,15 @@ clio::run::u64 Client::PendingSizeOfPath(const std::string &path) {
 
 int Client::WaitSizeDrained(const clio::cte::core::TagId &tag) {
   if (tag.IsNull() || PendingSize(tag) == 0) return 0;
+  // Ask the module for its fast size drain while this waits.
+  ns::View *seg = NsSegment();
+  if (seg != nullptr) seg->Urge();
+  struct Unurge {
+    ns::View *v;
+    ~Unurge() {
+      if (v != nullptr) v->Unurge();
+    }
+  } unurge{seg};
   const auto t0 = std::chrono::steady_clock::now();
   for (;;) {
     const clio::run::u64 end = PendingSize(tag);
@@ -803,7 +812,12 @@ int Client::FsTruncate(const std::string &path, clio::run::u64 size) {
     return v->Truncate(path, size, NowNs(), &id, &old_size, &seq);
   });
   if (rc != 0) return rc;
-  if (size < old_size && !v->WaitApplied(seq, kNsDrainWaitMs)) return EIO;
+  // Every truncate waits for the module to apply it (a wait on the drain,
+  // not a task). A shrink must cut the cached pages before a later write or
+  // regrow can expose them; a grow zero-fills [old, new) in the pages, so
+  // applied after later writes it would erase them (xfstests fsx: 075, 263).
+  (void)old_size;
+  if (!v->WaitApplied(seq, kNsDrainWaitMs)) return EIO;
   return 0;
 }
 

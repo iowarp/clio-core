@@ -938,9 +938,9 @@ class Client : public clio::cte::core::Client {
   int FsUtimens(const std::string &path, clio::run::u64 atime_ns,
                 clio::run::u64 mtime_ns);
   /**
-   * truncate(2). A shrink waits for the module to cut the pages (a wait on
-   * the background drain, not a task): cached bytes past the new end must
-   * be gone before a later write or regrow can expose them.
+   * truncate(2). Waits for the module to apply it (a wait on the background
+   * drain, not a task): a shrink's page cut must precede later writes and
+   * regrows, and a grow's zero-fill must not land after later writes.
    */
   int FsTruncate(const std::string &path, clio::run::u64 size);
   /** readdir(2): every entry of a directory. */

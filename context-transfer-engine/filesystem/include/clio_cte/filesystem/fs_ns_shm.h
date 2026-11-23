@@ -260,7 +260,7 @@ struct Limits {
 /** Segment root. */
 struct Root {
   static constexpr u64 kMagic = 0x3153534E53464C43ull;  // "CLFSNSS1"
-  static constexpr u32 kVersion = 2;
+  static constexpr u32 kVersion = 3;
   u64 magic_;
   u32 version_;
   std::atomic<u32> ready_;
@@ -295,6 +295,9 @@ struct Root {
   std::atomic<u64> applied_seq_;
   std::atomic<u64> used_inodes_;
   std::atomic<u64> used_dentries_;
+  /** Clients waiting on the drain (WaitApplied, a pending size): the
+   *  module also drains sizes on its fast period while nonzero. */
+  std::atomic<u32> urgent_;
 };
 
 /**
@@ -467,6 +470,21 @@ class View {
    * @return true when applied
    */
   bool WaitApplied(u64 seq, double timeout_ms);
+
+  /** A client starts / stops waiting on the drain (see Root::urgent_). */
+  void Urge() { root_->urgent_.fetch_add(1, std::memory_order_acq_rel); }
+  void Unurge() { root_->urgent_.fetch_sub(1, std::memory_order_acq_rel); }
+
+  /** @return true while any client waits on the drain */
+  bool Urgent() const {
+    return root_->urgent_.load(std::memory_order_acquire) != 0;
+  }
+
+  /** @return true when every pushed record has been consumed */
+  bool LogEmpty() const {
+    return root_->log_head_.load(std::memory_order_acquire) ==
+           root_->log_tail_.load(std::memory_order_acquire);
+  }
 
   /** @return the seq of the last op pushed */
   u64 PushedSeq() const {
