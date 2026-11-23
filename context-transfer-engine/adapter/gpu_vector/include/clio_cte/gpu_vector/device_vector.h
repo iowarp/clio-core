@@ -225,6 +225,9 @@ struct VecHeader {
   /** Pages CoAllocate / MAllocate claimed WITHOUT a read (wholly covered
    *  by the named ranges). Each is one page `faults` did not count. */
   GV_G unsigned long long *stat_allocs_;
+  /** Dirty frames written back by a fetch that needed their frame: a dirty
+   *  frame is never dropped (see WriteBackOneIn). */
+  GV_G unsigned long long *stat_writebacks_;
   /** GV_COMM_TIMING: cycles in [0] CoFetch [1] CoHoldPage [2] CoBeginFlush +
    *  CoEndFlush [3] a benchmark's busy segments, [4] fetch calls [5] hold
    *  calls [6] flush calls. Null unless EnableStats() ran. */
@@ -1041,7 +1044,15 @@ class DeviceVector {
       const clio::run::u64 *lo, const clio::run::u64 *hi,
       clio::run::u32 nr, bool allocate) {
     for (;;) {
-      CO_AWAIT(OnceWait{0}.Take());
+      // Parked on this block's eviction write-back when one is in flight (the
+      // host relaunches the block when it lands), else for one round.
+      if (__syncthreads_or(threadIdx.x == 0 && FlushBusy() && !FlushDone() ? 1 : 0)) {
+        CO_AWAIT(FlushWait{Tasks()}.Take());
+      } else if (__syncthreads_or(threadIdx.x == 0 && Tasks()->park_tag != 0 ? 1 : 0)) {
+        CO_AWAIT(TagWait{Tasks()->park_tag, 0}.Take());  // a peer's write-back lands
+      } else {
+        CO_AWAIT(OnceWait{0}.Take());
+      }
       int ok = 0;
       if (threadIdx.x == 0) ok = SubmitFetch(lo, hi, nr, allocate) ? 1 : 0;
       if (__syncthreads_or(ok)) break;
@@ -1294,6 +1305,20 @@ class DeviceVector {
     }
     __syncthreads();
     CommStamp(2, gv_t0);
+  }
+
+  /** WRITE BACK IF IDLE: start writing back the page holding element `off`
+   *  when it is resident, dirty and nobody holds it (a cleaner for a
+   *  write-back cache: the frame's later eviction then needs no write-back).
+   *  A pinned or clean page is left alone. Pair with CoEndFlush before the
+   *  kernel ends, as for any flush. Block-collective. */
+  CTP_GPU_FUN void CoWriteBackIdle(clio::run::u64 off) {
+    CO_AWAIT(FlushWait{Tasks()}.Take());
+    if (threadIdx.x == 0) {
+      if (FlushBusy()) RetireFlush();
+      WriteBackPageIdle(PageOf(off));
+    }
+    __syncthreads();
   }
 
   /** Wait for the writeback started by CoBeginFlush. */
@@ -1818,6 +1843,135 @@ class DeviceVector {
   /** Set or clear frame `p`'s dirty word (see VecHeader::dirty_).
    *  @param p  the frame
    *  @param v  1 = written since its last fill or covering flush, 0 = clean */
+  /** True when frame `p` holds device writes not yet written back. Frames
+   *  of a vector without a dirty array count as clean here (nothing is
+   *  tracked, so nothing can be held back from eviction). */
+  CTP_GPU_FUN bool IsDirty(const GPage *p) const {
+    return h_->dirty_ != nullptr &&
+           *reinterpret_cast<volatile clio::run::u32 *>(&h_->dirty_[p - h_->pages_]) != 0u;
+  }
+
+  /**
+   * WRITE-BACK EVICTION: start writing back one dirty frame of `set` so it
+   * can be evicted. Thread 0, from a fetch that found no evictable frame.
+   *
+   * The cache is write-back: a write hold dirties the frame and nothing has
+   * to flush it before unpinning. FreeSomeIn never drops a dirty frame, so a
+   * set whose unpinned frames are all dirty would otherwise never free one.
+   * This submits a flush of the coldest such frame through this block's own
+   * flush slot; the flush clears its dirty word, and once it lands the frame
+   * is clean and evictable, so the fetch's retry claims it. Chosen and
+   * submitted under the set lock: a writer must pin the frame through
+   * AllocatePage (same lock) first, so its write hold re-dirties it after
+   * this clear, never before.
+   *
+   * @param set the set the fetch could not claim a frame in
+   * @return true if a write-back was submitted
+   */
+  CTP_GPU_FUN bool WriteBackOneIn(clio::run::u32 set) {
+    if (h_->dirty_ == nullptr) return false;
+    GBlockTasks *bt = Tasks();
+    if (FlushBusy()) {
+      if (!FlushLanded(bt)) return false;  // the slot's last flush is still in flight
+      RetireFlush();
+    }
+    // Up to kMaxFetchRanges of the coldest dirty frames in ONE MultiPut: a
+    // streaming walk dirties frames as fast as it claims them, and one
+    // writeback per stall would pay a runtime round trip per page.
+    //
+    // THE HOME SET FIRST, THEN ANY SET. A full cache is out of REGIONS, and
+    // AllocatePage reclaims those from any set (EvictForRegions) -- so the
+    // dirty frames holding them may all live in other sets. One set lock at
+    // a time (never nested: see AllocatePage).
+    clio::run::u32 n = 0;
+    const clio::run::u32 nsets = h_->nsets_;
+    for (clio::run::u32 k = 0; k < nsets && n == 0; ++k) n = WriteBackDirtyIn((set + k) % nsets);
+    return n != 0;
+  }
+
+  /** Write back up to kMaxFetchRanges of the coldest unpinned dirty frames of
+   *  `set` in one MultiPut through this block's flush slot (WriteBackOneIn).
+   *  Chosen AND submitted under the set lock: a writer pins through
+   *  AllocatePage (same lock) first, so its write hold re-dirties a frame
+   *  after the submit clears it, never before. Thread 0, slot free.
+   *  @return the number of frames submitted */
+  CTP_GPU_FUN clio::run::u32 WriteBackDirtyIn(clio::run::u32 set) {
+    clio::run::u64 lo[kMaxFetchRanges], hi[kMaxFetchRanges];
+    LockSet(set);
+    GPage *tbl = SetPages(set);
+    clio::run::u32 n = 0;
+    for (; n < kMaxFetchRanges; ++n) {
+      GPage *victim = nullptr;
+      for (clio::run::u32 i = 0; i < h_->set_size_; ++i) {
+        GPage *c = &tbl[i];
+        if (c->page_num == kNoPage || c->pins != 0u || c->fetching || c->flushing || !IsDirty(c)) continue;
+        bool taken = false;
+        for (clio::run::u32 j = 0; j < n; ++j) taken = taken || lo[j] / h_->elems_per_page_ == c->page_num;
+        if (taken) continue;
+        if (victim == nullptr || c->score < victim->score ||
+            (c->score == victim->score && c->last_access < victim->last_access)) {
+          victim = c;
+        }
+      }
+      if (victim == nullptr) break;
+      // ONLY THE VALID ELEMENTS. The rest of the frame holds whatever it held
+      // before (a partial fetch, a write to part of the page): writing it back
+      // would overwrite the stored page with bytes nobody put there. A flush
+      // over exactly the valid range also clears the dirty word.
+      lo[n] = victim->page_num * h_->elems_per_page_ + victim->valid_lo;
+      hi[n] = victim->page_num * h_->elems_per_page_ + victim->valid_hi;
+      if (n == 0) Tasks()->flush_generation = victim->generation;
+    }
+    if (n != 0) {
+      SubmitFlushRanges(lo, hi, n);
+      if (h_->stat_writebacks_ != nullptr) atomicAdd(h_->stat_writebacks_, static_cast<unsigned long long>(n));
+    }
+    UnlockSet(set);
+    return n;
+  }
+
+  /** The completion word of some write-back in flight on a frame, the home
+   *  set first: a block that cannot claim a frame while peers' write-backs
+   *  are freeing them parks on one (0 = none in flight). Thread 0; read
+   *  without the lock -- a stale answer only costs one extra round. */
+  CTP_GPU_FUN clio::run::u64 FlushingTag(clio::run::u32 set) const {
+    const clio::run::u32 nsets = h_->nsets_;
+    for (clio::run::u32 k = 0; k < nsets; ++k) {
+      GPage *tbl = SetPages((set + k) % nsets);
+      for (clio::run::u32 i = 0; i < h_->set_size_; ++i) {
+        volatile GPage *c = &tbl[i];
+        if (c->page_num != kNoPage && c->flushing != 0u && c->fetch_tag != 0) return c->fetch_tag;
+      }
+    }
+    return 0;
+  }
+
+  /** Start writing back page `pn` if it is resident, dirty and IDLE (no pin,
+   *  no transfer in flight), through this block's flush slot: a cleaner, so
+   *  a later eviction of the frame finds it clean. Checked and submitted
+   *  under the set lock, so a writer -- which pins through AllocatePage under
+   *  the same lock -- either pinned first (the page is skipped) or re-dirties
+   *  it at its hold after this clears it. Thread 0, flush slot free.
+   *  @return true if a write-back was submitted */
+  CTP_GPU_FUN bool WriteBackPageIdle(clio::run::u64 pn) {
+    if (h_->dirty_ == nullptr) return false;
+    const clio::run::u32 set = SetOf(pn);
+    LockSet(set);
+    GPage *p = Find(pn);
+    bool sent = false;
+    if (p != nullptr && p->pins == 0u && p->fetching == 0u && p->flushing == 0u && IsDirty(p) &&
+        p->valid_hi > p->valid_lo) {
+      const clio::run::u64 lo = pn * h_->elems_per_page_ + p->valid_lo;
+      const clio::run::u64 hi = pn * h_->elems_per_page_ + p->valid_hi;
+      Tasks()->flush_generation = p->generation;
+      SubmitFlushRanges(&lo, &hi, 1u);
+      if (h_->stat_writebacks_ != nullptr) atomicAdd(h_->stat_writebacks_, 1ull);
+      sent = true;
+    }
+    UnlockSet(set);
+    return sent;
+  }
+
   CTP_GPU_FUN void SetDirty(const GPage *p, clio::run::u32 v) const {
     if (h_->dirty_ != nullptr) h_->dirty_[p - h_->pages_] = v;
   }
@@ -2035,6 +2189,9 @@ class DeviceVector {
         GPage *c = &tbl[i];
         if (c->page_num == kNoPage) continue;
         if (c->pins != 0u || c->fetching || c->flushing) continue;
+        // A DIRTY FRAME IS NEVER DROPPED: its writes exist nowhere else.
+        // WriteBackOneIn cleans it first; then it is a victim like any other.
+        if (IsDirty(c)) continue;
         if (victim == nullptr || c->score < victim->score ||
             (c->score == victim->score &&
              c->last_access < victim->last_access)) {
@@ -2219,6 +2376,9 @@ class DeviceVector {
                                const clio::run::u64 *hi, clio::run::u32 nr,
                                bool allocate) {
     GBlockTasks *bt = Tasks();
+    // A landed flush (an eviction write-back among them) keeps its frames
+    // `flushing`, unevictable by anyone, until its block retires it.
+    if (FlushBusy() && FlushLanded(bt)) RetireFlush();
     auto *t = bt->fetch;
     clio::run::u32 n = 0;
     clio::run::u32 r0 = 0;
@@ -2314,6 +2474,21 @@ class DeviceVector {
           // kMaxFetchStalls rounds is treated as the true hold-set wedge.
           constexpr clio::run::u32 kMaxAllocRetries = 1u << 12;
           constexpr clio::run::u32 kMaxFetchStalls = 1u << 16;
+          // A WRITE-BACK IS NOT TRANSIENT PRESSURE. When the set's evictable
+          // frames are dirty, spinning cannot free one: start their
+          // write-back now and yield (the caller parks on its completion).
+          bt->park_tag = 0;
+          if (p == nullptr && !WriteBackOneIn(SetOf(pn)) && !(FlushBusy() && !FlushLanded(bt))) {
+            bt->park_tag = FlushingTag(SetOf(pn));  // a peer's write-back will free a frame
+          }
+          if (p == nullptr && (bt->park_tag != 0 || FlushBusy())) {
+            ++bt->fetch_stalls;
+            bt->fetch_partial = 1u;
+            bt->fetch_n = n;
+            bt->fetch_resume_r = r;
+            bt->fetch_resume_pn = pn;
+            return false;
+          }
           for (clio::run::u32 spins = 0;
                p == nullptr && spins < kMaxAllocRetries; ++spins) {
             if (h_->stat_alloc_waits_ != nullptr) {
@@ -2322,6 +2497,9 @@ class DeviceVector {
             if (FlushBusy() && FlushLanded(bt)) RetireFlush();
             p = AllocatePage(pn, &is_new);
           }
+          // Every evictable frame may be dirty: write one back (write-back
+          // eviction) and retry once it has landed.
+          if (p == nullptr) WriteBackOneIn(SetOf(pn));
           if (p == nullptr) {
             if (++bt->fetch_stalls < kMaxFetchStalls) {
               bt->fetch_partial = 1u;
@@ -2638,6 +2816,8 @@ class DeviceVector {
                                       sizeof(pn32));
         bt->flush_slot[n++] = static_cast<clio::run::u32>(p - h_->pages_);
         atomicAdd(&p->flushing, 1u);
+        // Whoever needs this frame while it is written back parks on the put.
+        p->fetch_tag = reinterpret_cast<clio::run::u64>(&bt->flush->fut_.is_complete_.x);
       }
     }
     bt->flush_n = n;
@@ -2675,6 +2855,11 @@ class DeviceVector {
     // and a plain assignment here wiped the generational bit that the flush
     // had just set -- so every generational put went out as an ordinary one.
     t->context_.op_flags_ |= clio::cte::core::Context::kBlobNameRawInt32;
+    // A write-back rewrites a stored page where it is: kVectorBlobScore only
+    // places a NEW page. Without this every write-back reset a promoted page's
+    // score to kVectorBlobScore while its bytes stayed on the fast tier, and
+    // the demotion that followed was skipped as "no score change".
+    t->context_.op_flags_ |= clio::cte::core::Context::kKeepScore;
     ClearRunCtx(t);
     if (h_->stat_puts_ != nullptr) {
       atomicAdd(h_->stat_puts_, static_cast<unsigned long long>(n));

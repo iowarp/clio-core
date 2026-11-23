@@ -181,6 +181,41 @@ __global__ void AllocateWriteKernel(clio::run::IpcManagerGpuInfo info,
   CLIO_YCORO_RUN(AllocateWriteCoro(v, base, count, salt));
 }
 
+/** v[base + i] = Val(base + i, salt), one page at a time, WITHOUT flushing:
+ *  each page is fetched, write-held, written and unpinned dirty. A working
+ *  set larger than the cache then evicts dirty frames, which the vector must
+ *  write back (write-back eviction) instead of dropping. */
+__device__ gy::YCoroMain WriteNoFlushCoro(gv::DeviceVector<u32> v, u64 base,
+                                          u64 count, u32 salt) {
+  for (u64 i = 0; i < count;) {
+    u64 run = 0;
+    co_await v.Fetch(0, v.PageLo(base + i), v.PageSpan(base + i, 1));
+    {
+      auto h = co_await v.HoldPage(base + i, count - i, /*write=*/true);
+      run = h.run();
+      for (u64 k = threadIdx.x; k < run; k += blockDim.x) {
+        h[base + i + k] = Val(base + i + k, salt);
+      }
+    }
+    __syncthreads();
+    v.UnpinRange(v.PageLo(base + i), v.PageSpan(base + i, 1));
+    i += run;
+  }
+  co_await v.EndFlush();  // eviction write-backs land (and retire) before the kernel ends
+}
+
+__global__ void WriteNoFlushKernel(clio::run::IpcManagerGpuInfo info,
+                                   gv::DeviceVector<u32> v, u64 base,
+                                   u64 count, u32 salt,
+                                   gy::YieldableView<> yv,
+                                   gy::YieldStackView ys) {
+  CLIO_GPU_INIT(info, nullptr);
+  v.Init(yv.Block());
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(WriteNoFlushCoro(v, base, count, salt));
+}
+
 /** Touch ONE element on each of `npages` pages, `passes` times. */
 __device__ gy::YCoroMain WalkCoro(gv::DeviceVector<u32> v, u64 first_page,
                                   u64 npages, u32 passes,
@@ -1706,6 +1741,44 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
       REQUIRE(HostPageMatchesBy(vec.TagId(), p, kPageElems, all34));
     }
     REQUIRE(HostPageMatchesBy(vec.TagId(), 3, kTail, all34));
+  }
+
+  // -------------------------------------------------------------------
+  // WRITE-BACK EVICTION. Pages written and unpinned WITHOUT a flush, through
+  // a cache a quarter of the working set: every eviction of a dirty frame
+  // has to write it back first. The re-read must see every value, and the
+  // writebacks counter must show the vector did it.
+  // -------------------------------------------------------------------
+  {
+    constexpr u64 kPages = 8;
+    Fixture f("gv_sem_writeback", 1, 2, kPages);
+    f.Reset();
+    RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
+                        gy::YieldStackView sv_) {
+      WriteNoFlushKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(
+          g_gpu, f.dev, 0, kPages * kPageElems, 41u, vw_, sv_);
+    });
+    Sync();
+    auto sw = f.Stats();
+    ctp::GpuApi::Memset(bad, 0, sizeof(unsigned long long));
+    RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
+                        gy::YieldStackView sv_) {
+      VerifyKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(
+          g_gpu, f.dev, 0, kPages * kPageElems, 41u, bad, vw_, sv_);
+    });
+    Sync();
+    const unsigned long long mism = ReadCounter(bad);
+    auto sv = f.Stats();
+    std::fprintf(stderr, "[writeback] writebacks=%llu evicts=%llu mismatches=%llu\n",
+                 (unsigned long long) sv.writebacks, (unsigned long long) sv.evicts, mism);
+    REQUIRE(mism == 0);
+    REQUIRE(sw.writebacks >= kPages - 2);  // all but the two frames still resident
+    // The host flush writes the still-dirty frames back: the CTE then has every page.
+    f.vec.FlushResidentToCte();
+    auto all41 = [](u64) { return 41u; };
+    for (u64 p = 0; p < kPages; ++p) {
+      REQUIRE(HostPageMatchesBy(f.vec.TagId(), p, kPageElems, all41));
+    }
   }
 
   ctp::GpuApi::Free(bad);

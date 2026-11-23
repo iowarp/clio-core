@@ -3,7 +3,7 @@
 ## 1. Correctness traps, most expensive first
 
 **Silent wrong answers**
-- **Lost writes.** Eviction does no I/O and there is no dirty bit. A written page that is unpinned before its flush lands can be evicted and the write is gone. Order: fetch -> write hold -> flush (`EndFlush` landed) -> `UnpinRange`. This includes data *generated* on the GPU: until it is flushed it exists only in the cache. `ClearCache` also discards unflushed data -- a code that called it mid-run silently reloaded its initial state with every check green.
+- **The cache is write-back; storage lags it.** A write hold marks the frame dirty; eviction never drops a dirty frame -- the fetch that needs it writes it back first (`writebacks`), so unpinning without a flush loses nothing. But until a flush, `Copy` or eviction, the written bytes exist **only in the cache**: a host read through the CTE, another process, or `ClearCache` (which discards dirty frames -- a code that called it mid-run silently reloaded its initial state with every check green) does not see them. Flush (or `FlushResidentToCte`) before anything outside this vector reads the data. Kernels that fetch end with `EndFlush`: an eviction write-back a block started keeps its frames unevictable until that block retires it.
 - **Flush of a non-resident page is silently skipped** (`flush_skipped`). One multi-node code lost every boundary publish this way.
 - **Non-disjoint writers.** Two blocks writing one page through whole-page flushes clobber each other; counters stay clean. One owner per destination (gather, not scatter).
 - **Write holds widen the valid range.** Two disjoint write holds mark the gap valid; a later read of the gap passes the check and returns garbage. Fetch before a partial write.

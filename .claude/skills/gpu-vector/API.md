@@ -87,7 +87,8 @@ Other host calls:
 | `ClearCache(gpu_id=0)` | drop every frame. **Unflushed data is discarded.** Never on a cache that holds the only copy of live data. |
 | `Copy(new_name, sync=false)` | checkpoint: flushes resident frames, then a copy-on-write snapshot (lazy: ~0.4 ms). A lazy copy returns *later* bytes if the source is overwritten before the copy is read -- use `sync=true` (148 ms/GB) then. Needs the checkpoint module linked. |
 | `MaterializeAll(inflight=32)` | force a lazy `Copy` to real bytes, server side |
-| `EnableStats()`, `ReadStats(gpu)`, `ResetStats()` | counters (off by default). `ResetStats` zeroes the first 5 and `allocs` (slot 17) of 18. |
+| `EnableStats()`, `ReadStats(gpu)`, `ResetStats()` | counters (off by default). `ResetStats` zeroes the first 5, `allocs` (slot 17) and `writebacks` (slot 18) of 19. `writebacks`: dirty frames written back so they could be evicted (eviction write-backs and `WriteBackIdle`). |
+| `NumBlocks()`, `CapacityPages()` | the CUDA blocks the vector was built for (a kernel over its device view launches exactly this many, or a range of them via `Init(block)`), and its page-sized frames (its HBM cost: `CapacityPages() * PageBytes()`). |
 | `PrefetchNow(hints)`, `RegisterPrefetcher`, `SetPrefetchPolicy`, `YieldObserver()` | tier rescoring only -- never makes pages GPU-resident. See ORGANIZER.md. |
 | `FatalReport()` | the latched device-fatal note as a string |
 
@@ -138,6 +139,9 @@ void MBeginAllocate(u64 gen, u64 off0, u64 n0, ...);   void MAllocate(u64 gen, .
 - A page covered only **in part** is fetched exactly as by Fetch (its other elements must survive the write-back). So a padded tail page costs one read.
 - A page another block already holds is only pinned. A **read** hold on an allocated page before it is written traps (code 3); an element named but never written is flushed as whatever the reused frame held.
 - Same limits as Fetch (8 ranges, 64 pages, one in flight per block); release with `UnpinRange` after the flush lands.
+
+**Write-back** -- the cache is write-back. A write hold marks the frame dirty; a dirty frame is never dropped by eviction. When a fetch finds no evictable frame because the candidates are dirty, it writes up to 8 of the coldest (any set, home set first) back in one MultiPut through its own flush slot, parks on that write-back, and retries. Only each frame's valid range is written. End a fetching kernel with `EndFlush` so those write-backs retire.
+- `CoWriteBackIdle(off)` (cleaner): start writing back the page holding `off` if it is resident, dirty and **unpinned** (checked under the set lock, so a writer that pinned first is skipped, and one that pins after re-dirties it). Lets a pager clean released pages ahead of their eviction. Pair with `CoEndFlush`.
 
 **HoldPage**
 - Does not fetch. If the page is being fetched (by you or a peer block) it waits; if it is absent it traps (code 2).
