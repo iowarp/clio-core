@@ -154,6 +154,42 @@ class FsBdevTransport : public BdevTransport {
   /** Return a bounce buffer of `size` bytes to the pool. */
   void GiveBounce(AlignedBuf buf, size_t size);
 
+  /**
+   * Host staging for task data that lives in device memory. Page-aligned, so
+   * the unbuffered fd reads / writes it directly (no aligned bounce copy), and
+   * reused, so no 64 MB allocation, zero-fill and page faults per page. Up to
+   * kStagingPinnedBytes of it is pinned (one DMA for the device copy instead
+   * of a pageable copy through the driver's bounce); that pinned set is
+   * allocated once and freed only in Destroy -- freeing pinned memory
+   * synchronizes the whole GPU. Beyond it a buffer is plain aligned memory,
+   * freed on return. Nothing ever waits for a buffer.
+   */
+  struct Staging {
+    char *p = nullptr;
+    size_t size = 0;
+    bool pinned = false;
+  };
+  static constexpr size_t kStagingPinnedBytes = size_t(1) << 30;
+  std::mutex staging_mu_;
+  std::vector<Staging> staging_pool_;  // free pinned buffers
+  size_t staging_pinned_ = 0;          // pinned bytes allocated (free + in use)
+  /** @return staging of exactly `size` bytes. */
+  Staging TakeStaging(size_t size);
+  /** Return staging: a pinned buffer to the pool, an unpinned one freed. */
+  void GiveStaging(Staging s);
+  /** Free one staging buffer. */
+  static void FreeStaging(Staging s);
+  /** Returns its Staging on every exit path of an I/O task. */
+  struct StagingGuard {
+    FsBdevTransport *t = nullptr;
+    Staging s;
+    void Release() {
+      if (t != nullptr && s.p != nullptr) t->GiveStaging(s);
+      s.p = nullptr;
+    }
+    ~StagingGuard() { Release(); }
+  };
+
   StandardBlockAllocator allocator_;
   std::vector<WorkerIOContext> io_contexts_;
   std::string file_path_;
