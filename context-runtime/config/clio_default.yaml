@@ -630,7 +630,7 @@ compose:
   #   [indexer(564.0) ->] shm cache(568.0) -> [compressor(562.0) ->]
   #     core_persist_write_back(567.0)
   #     -> volatile core(540.0)
-  #     -> replication(561.0) -> persistent core(512.0)
+  #     -> [replication(561.0) ->] persistent core(512.0)
   #
   # The default compose omits the layers in brackets; the shm cache is the
   # top of the chain.
@@ -654,14 +654,19 @@ compose:
   #     readable and writable while its owner is down, and changes made
   #     meanwhile are handed back when it returns.
   # Every other core op is forwarded to next_pool_id untouched.
-  - mod_name: clio_cte_replication
-    pool_name: clio_cte_replication
-    pool_query: local
-    pool_id: "561.0"
-    next_pool_id: "512.0"               # CTE core pool — see entry above
-    replication_factor: 1               # total durable copies (default 1)
-    cache_score: 1.0                    # DRAM re-cache placement score
-    replica_score: 0.2                  # disk copies' score = drop threshold
+  #
+  # NOT in the default compose: on one machine replication_factor 1 keeps no
+  # extra copy, so the layer only adds per-write bookkeeping. Enable it for a
+  # multi-node deployment: uncomment this entry and point the write-back
+  # cache's next_persistent and the stream's staging_pool_id at "561.0".
+  # - mod_name: clio_cte_replication
+  #   pool_name: clio_cte_replication
+  #   pool_query: local
+  #   pool_id: "561.0"
+  #   next_pool_id: "512.0"             # CTE core pool — see entry above
+  #   replication_factor: 1             # total durable copies (default 1)
+  #   cache_score: 1.0                  # DRAM re-cache placement score
+  #   replica_score: 0.2                # disk copies' score = drop threshold
     # ADVANCED overrides of what replication_factor sets:
     # remote_copies: copies on the next containers by hash (other nodes).
     #   Default: replication_factor - 1.
@@ -728,7 +733,7 @@ compose:
     pool_query: local
     pool_id: "567.0"
     next_volatile: "540.0"              # volatile core (required)
-    next_persistent: "561.0"            # replication -> persistent core;
+    next_persistent: "512.0"            # persistent core (561.0 with replication);
                                         #   omit for a volatile-only cache
     fill: on_hit_count:2                # on_hit_count:N | on_read_miss | none
     evict: lru                          # lru | lfu
@@ -806,8 +811,10 @@ compose:
   # there (and, unless md_only, blob bytes): a hit completes in the client
   # with no task; a miss fetches from the owner and caches the answer. Each
   # entry's home tracks which nodes cache it and invalidates them when it
-  # changes. md_only: true here because the write-back cache below already
-  # holds the bytes. The CTE core's Create returns this cache's segment keys
+  # changes. It holds blob bytes too (md_only: false): that is the clio-fs
+  # client-side data cache -- a page write is a memcpy into the segment, not
+  # a task -- and md_only: true would send every page write to the runtime.
+  # The CTE core's Create returns this cache's segment keys
   # (pid, pool, root offset, entry pool) for the core at the bottom of its
   # chain; CLIO_CTE_CLIENT_INIT then binds the process to entry_pool_id (this
   # pool unless set; the indexer's 564.0 when it is composed above) and maps
@@ -819,13 +826,13 @@ compose:
     pool_id: "568.0"
     next_pool_id: "567.0"               # write-back cache (562.0 with compressor)
     # entry_pool_id: "564.0"            # with the indexer composed above
-    md_only: true                       # bytes are cached by the write-back cache
+    md_only: false                      # cache blob bytes (clio-fs page writes)
     # Writes send no invalidation of their own: the write-back cache below
     # lands each flushed range through this pool on the blob's home, which
     # invalidates its sharers then. Only with a write-back cache below whose
     # flush_pool is this pool; false (default) invalidates on every write.
     invalidate_on_flush: true
-    capacity: "256M"                    # segment bytes: buffers + tables + log
+    capacity: "2G"                      # segment bytes: buffers + tables + log
     # Extent mode (only with md_only: false): keep blob bytes in a node-local
     # RAM bdev instead of this cache's own segment. The cache leases
     # data_capacity bytes of data_pool and stores each blob as up to 8 runs
@@ -841,7 +848,7 @@ compose:
     flush_shards: 8                     # parallel MultiPutBlob tasks for this node's own blobs
     flush_depth: 4                      # flush batches in flight (staging overlaps landing)
     max_tags: 4096                      # tags tracked (new-tag completeness)
-    max_blobs: 65536                    # blob entries (metadata + buffers)
+    max_blobs: 262144                   # blob entries (a kernel checkout is ~97k files)
     max_fill: "16M"                     # larger blobs are read, not cached
     evict_sample: 16                    # clean entries sampled per eviction
     half_life_ms: 10000                 # frecency decay half-life
@@ -907,7 +914,7 @@ compose:
     # Where staged (not yet merged) appends are written. They are written
     # once and read at most once, after a restart, so skip the cache.
     # Default: next_pool_id.
-    staging_pool_id: "561.0"            # replication (durable, uncached)
+    staging_pool_id: "512.0"            # persistent core (durable, uncached)
     # Node-local log of the sizes, merge plans and merged-append names of
     # the streams this node homes (the container id is appended). Without it
     # file sizes do not survive a stop and `clio_run start`. Default: unset.
