@@ -1,0 +1,548 @@
+<!--
+title: Shared-memory cache module
+heading: The <em>shared-memory</em> cache
+description: The CTE shared-memory write-through cache (clio_cte_core_shm_cache_writethru, pool 568.0): a per-node segment that client processes map to complete puts, gets, blob sizes and tag opens with no task, a background flusher that carries buffered writes down the chain, home-based invalidation across nodes, extent mode, every config key and its limits.
+eyebrow: Modules · Transfer engine
+lede: The shared-memory cache owns one segment per node that client processes map directly. A put the segment accepts is a memcpy plus a log entry, and a read or size query it can answer is a memcpy; neither creates a task. A periodic flusher drains the logged byte ranges into MultiPutBlob batches down the chain, and each blob's home node invalidates the other nodes' copies when it changes. In the default configuration it caches metadata only.
+facts: Library | clio_cte_core_shm_cache_writethru ; Default pool | 568.0 ; Build option | CLIO_CTE_ENABLE_SHM_WTC (ON) ; Source | context-transfer-engine/core_shm_cache_writethru
+-->
+<h2>What it does</h2>
+<p>Every CTE operation on the task path allocates a task, wakes a worker,
+walks the interposition chain and signals completion. For large transfers
+that overhead is noise; for a process doing many small puts, gets and size
+queries on one node it dominates. This module moves the common cases into
+the client process. The runtime creates a shared-memory segment per node;
+a connected <code>clio::cte::core::Client</code> maps it and runs
+<code>PutBlob</code>, <code>GetBlob</code>, <code>GetBlobSize</code> and
+<code>GetOrCreateTag</code> against it first.</p>
+<ul>
+  <li>A <strong>put</strong> copies the bytes into the blob's buffer in the
+  segment and appends the exact byte range written to one shared dirty-range
+  log, then returns. The chain has not seen the write yet.</li>
+  <li>A <strong>get</strong> copies out of the segment when the cached bytes
+  are known to be current for the requested range.</li>
+  <li>A <strong>size</strong> or <strong>tag open</strong> is answered from
+  the segment's blob and tag tables when they hold the answer.</li>
+  <li>The module's periodic <code>FlushLog</code> task is the log's only
+  consumer. It coalesces the logged ranges per blob and sends them down
+  <code>next_pool_id</code> as MultiPutBlob batches.</li>
+</ul>
+<p>The module also speaks the full core task interface, so task callers
+(remote nodes, processes that cannot map the segment, runtime-internal
+clients) see the same view. Anything it does not serve itself is forwarded
+after the writes buffered on this node have landed.</p>
+
+<h2>Where it sits</h2>
+<p>The default configuration composes the cache below the indexer and above
+the data transformations and data caches
+(<code>context-runtime/config/clio_default.yaml</code>):</p>
+<pre data-label="text">
+indexer(564.0) -> shm cache(568.0) -> [compressor(562.0) ->]
+  core_persist_write_back(567.0)
+  -> volatile core(540.0)
+  -> replication(561.0) -> persistent core(512.0)
+</pre>
+<p>The default entry sets <code>md_only: true</code>: the write-back cache
+at 567.0 already holds the bytes in RAM, so this layer caches tag and blob
+metadata only (blob sizes, tag name-to-id bindings, tag size and times).
+Every put and every get then takes the task path through the chain, and
+only size queries and tag opens complete in the client.</p>
+<p>With <code>md_only: false</code> (data mode) the cache also holds blob
+bytes and absorbs plain writes, either in its own segment or, in
+<a href="#extent-mode">extent mode</a>, in granules leased from a node-local
+RAM bdev. The four-node coherence suite runs it this way, directly over the
+<a href="/modules/cache.html">cache module</a>. The
+<a href="/design/chain.html">chain design page</a> covers how the layers
+stack.</p>
+
+<h2>Composing it</h2>
+<p>The default entry, trimmed of comments. Each compose entry must come
+after every pool it names, and the indexer that names 568.0 as its
+<code>next_pool_id</code> comes after it.</p>
+<pre data-label="yaml">
+- mod_name: clio_cte_core_shm_cache_writethru
+  pool_name: clio_cte_core_shm_cache_writethru
+  pool_query: local
+  pool_id: "568.0"
+  next_pool_id: "567.0"         # write-back cache (562.0 with compressor)
+  entry_pool_id: "564.0"        # clients bind to the indexer above
+  md_only: true                 # bytes are cached by the write-back cache
+  invalidate_on_flush: true
+  capacity: "256M"
+  # data_pool: "540.0"          # extent mode (only with md_only: false)
+  # data_capacity: "1G"
+  log_depth: 0
+  flush_batch_bytes: "16M"
+  flush_period_us: 50
+  flush_retries: 3
+  flush_shards: 8
+  flush_depth: 4
+  max_tags: 4096
+  max_blobs: 65536
+  max_fill: "16M"
+  evict_sample: 16
+  half_life_ms: 10000
+  max_sharer_entries: 65536
+  nospace_wait_ms: 250
+</pre>
+<p>A data-mode entry, from
+<code>context-transfer-engine/test/integration/shm_wtc_coherence/clio_config.yaml</code>
+(cache 568.0 over cache 563.0 over replication 561.0 over core 512.0):</p>
+<pre data-label="yaml">
+- mod_name: clio_cte_core_shm_cache_writethru
+  pool_name: clio_cte_core_shm_cache_writethru
+  pool_query: local
+  pool_id: "568.0"
+  next_pool_id: "563.0"
+  capacity: "128M"
+  log_depth: 16384
+  max_blobs: 16384
+</pre>
+<p>Compose it with <code>pool_query: local</code>: the cache addresses its
+peers by container id and assumes one container per node.</p>
+
+<h2>How clients connect</h2>
+<ol class="steps">
+  <li><strong>The runtime publishes a locator.</strong> When the pool is
+  created it formats the segment, named
+  <code>clio_wtc_&lt;runtime pid&gt;_&lt;major&gt;_&lt;minor&gt;</code>, and
+  registers a locator in the runtime's metadata segment under the cache's
+  pool id. The locator carries the runtime pid, the segment root's offset
+  and <code>entry_pool_id</code>.</li>
+  <li><strong>The core hands out the keys.</strong> The CTE core's Create,
+  and a get-or-create of a core pool that already exists, returns
+  <code>CreateParams::cache_keys_</code>: the keys of the cache whose chain
+  of next pools ends at that core. If several match, the last one
+  registered wins. With no such cache the keys are all zero.</li>
+  <li><strong><code>CLIO_CTE_CLIENT_INIT</code> binds and maps.</strong> It
+  get-or-creates the canonical core pool (512.0) and reads the keys. With
+  valid keys it rebinds the client to <code>entry_pool_id</code> (or the
+  cache pool when that is unset), so every task-path request passes every
+  module above the cache and then the cache itself, and calls
+  <code>Client::ConnectCache(keys)</code> to map the segment.</li>
+  <li><strong><code>CLIO_CTE_POOL</code> overrides the binding.</strong>
+  With <code>CLIO_CTE_POOL=major.minor</code> set, the client is bound to
+  that pool and then calls <code>ConnectCache()</code>, which fetches the
+  keys with the same get-or-create of 512.0. It connects only when the named
+  pool is the cache pool or its entry pool.</li>
+</ol>
+<p>Other clients connect explicitly. The filesystem module's client binds
+its data client to the filesystem pool's <code>next_pool</code> and calls
+<code>ConnectCache()</code>, and the Python bindings expose
+<code>ConnectCache</code> as well. <code>HasCache()</code> reports whether a
+client is connected.</p>
+<p>A client stays on the task path when:</p>
+<ul>
+  <li>the keys are zero: no cache fronts the core;</li>
+  <li>the client is bound to a pool that is neither the cache pool nor its
+  entry pool (for example <code>CLIO_CTE_POOL=561.0</code>), since its tasks
+  would bypass the cache;</li>
+  <li>the process is not attached to that runtime's shared memory: a TCP or
+  unix-socket client, a client on another node, or a runtime with a
+  different pid. Only the SHM transport attaches the runtime's metadata
+  segment;</li>
+  <li>the segment cannot be mapped, has another layout version, or (in
+  extent mode) the RAM bdev's segment cannot be mapped.</li>
+</ul>
+<p>When <code>CLIO_CTE_CLIENT_INIT</code> finds a cache but cannot map it,
+it logs <code>shm cache present but not mappable from this process</code>
+and leaves the client bound to the core pool. When it finds no keys it logs
+nothing.</p>
+
+<h2>Segment layout</h2>
+<p>Everything in the segment is addressed by offset, so it may map at a
+different address in each process. It is formatted as a multi-process
+allocator, and every page is mapped at format time so that a writing client
+does not take a page fault per 4 KiB of first touch. The first allocation
+is the root; the rest are:</p>
+<ul>
+  <li><strong>Root</strong>: magic and layout version, the
+  <code>pushed</code> and <code>flushed</code> range counters that make up
+  the barrier, the statistics counters, the tag lock and 64 stripe
+  locks.</li>
+  <li><strong>Blob table</strong>: <code>max_blobs</code> entries split into
+  64 stripes. A key hashes to one stripe and probes at most 64 slots inside
+  it, so one stripe lock covers every slot the key can occupy. An entry holds
+  the key (blob names up to 200 bytes), the buffer offset and capacity, the
+  logical size, the range known current, pending and pin counts, write and
+  invalidation generations, a seqlock over the bytes, and frecency
+  counters.</li>
+  <li><strong>Tag table</strong>: <code>max_tags</code> entries with the
+  created flag, the sticky flush error, and the cached name (up to 255
+  bytes), size and times.</li>
+  <li><strong>Name index</strong>: twice <code>max_tags</code> slots mapping
+  a tag name to its id, for tag opens.</li>
+  <li><strong>Dirty-range log</strong>: one multi-producer ring of
+  <code>log_depth</code> entries, each a 24-byte record of slot, generation,
+  offset and size.</li>
+  <li><strong>Owner map</strong>: one word per 4 KiB of segment naming the
+  entry whose buffer starts there, used by eviction to free contiguous
+  windows.</li>
+  <li><strong>Blob buffers</strong>: the rest of the segment. Each blob has
+  one contiguous buffer, at least 4 KiB, rounded to 4 KiB and grown by half
+  its size at a time. Holes read as zeros.</li>
+</ul>
+
+<h2>Write path</h2>
+<p>A segment write (<code>View::TryPut</code>) is accepted only in data
+mode, for a blob name of at most 200 bytes, with no put flag other than
+<code>kCtePutDroppable</code>. A metadata-only segment refuses every write,
+and so does a write whose droppable flag differs from what earlier writes
+of a buffered blob carried.</p>
+<ol class="steps">
+  <li><strong>Room in the log.</strong> Neither clients nor runtime workers
+  block on a full log: a write is refused when the log is within 1024
+  entries (or a quarter of its depth, if smaller) of full.</li>
+  <li><strong>Find or insert the entry</strong> under its stripe lock. If
+  the stripe has no free slot, the lowest-frecency entry in the stripe with
+  nothing pending or pinned is reclaimed, and the insert is retried.</li>
+  <li><strong>Make room in the buffer.</strong> A buffer that must grow is
+  reallocated, evicting clean buffers when the segment is full. A buffer
+  that is pinned (a flush or a read is copying it) is never grown or moved:
+  the write is refused as busy and nothing is changed.</li>
+  <li><strong>Publish.</strong> The logical size and the current range are
+  updated, the pending count and write generation are bumped, the seqlock is
+  opened and the entry is pinned, all under the stripe lock.</li>
+  <li><strong>Copy outside the lock.</strong> The bytes are copied into the
+  buffer with only the pin held, then the seqlock closes and the pin
+  drops.</li>
+  <li><strong>Log the range.</strong> The <code>pushed</code> counter is
+  bumped before the exact range written enters the log, so a barrier taken
+  afterwards always covers it.</li>
+</ol>
+<p>A client retries a busy refusal up to 8 times with back-off from 4 to
+256 microseconds, holding no lock, and takes the task path on any other
+refusal. On the task path the module's <code>PutBlob</code> handler tries
+the segment again with the task's bytes when the put is plain (no explicit
+score, a default context, no flag other than droppable). A put refused for
+room waits up to <code>nospace_wait_ms</code> for the ranges buffered before
+it to land, since flushed buffers are clean and evictable, then retries 20
+more times about 50 microseconds apart; a busy put retries 12 times with
+back-off from 10 microseconds to 1 ms. A put that still does not fit, and
+every put that is not plain, <strong>writes around</strong> the cache: the
+blob's pending ranges land first, the local copy is invalidated, the put is
+forwarded down the chain, and the local copy is invalidated again once it
+has landed. MultiPutBlob batches are absorbed record by record the same way;
+a record that does not fit is written around on its own.</p>
+
+<h2>Read path</h2>
+<ul>
+  <li><strong>Hit.</strong> A read is served from the segment when the entry
+  is resident and either holds the whole blob and the request is within its
+  size, or the request lies inside the range written through this cache
+  since its last invalidation. The copy is protected by the seqlock: a read
+  that overlaps a writer's copy is retried up to 256 times, then counts as a
+  miss.</li>
+  <li><strong>Whole-blob copies.</strong> An entry holds the whole blob when
+  it was filled from the chain, or when it was created by a write under a tag
+  that this cache saw created (a new tag has no older bytes anywhere).</li>
+  <li><strong>Miss.</strong> The client sends a GetBlob task. The handler
+  waits for the blob's own pending ranges to land, registers this node with
+  the blob's home, asks the chain for the blob's size, and when it is at
+  most <code>max_fill</code> fetches the whole blob and installs it, unless
+  a local write or an invalidation moved the entry's generations meanwhile.
+  It then serves the read from the fresh copy, or forwards the read down the
+  chain.</li>
+  <li><strong>Sizes.</strong> <code>GetBlobSize</code> is answered from the
+  segment when the entry holds the whole blob or a size fetched from the
+  chain. A miss is fetched and recorded the same way, also in metadata-only
+  mode.</li>
+  <li><strong>Tags.</strong> A plain <code>GetOrCreateTag</code> of an
+  existing name is answered from the name index when the tag's attributes
+  are cached too. A miss creates or opens the tag through the chain,
+  registers with the tag's home, confirms the binding and caches the name
+  and the tag's cluster-wide size and times.</li>
+</ul>
+<p>Reads that carry flags, a context, or vectored segments, and every read in
+metadata-only mode, skip the segment.</p>
+
+<h2>Flusher</h2>
+<p>Create starts one periodic <code>FlushLog</code> task per container,
+every <code>flush_period_us</code> microseconds. A barrier wakes it directly
+instead of waiting for the period. One pass runs until the log is empty:</p>
+<ol class="steps">
+  <li><strong>Pop and coalesce.</strong> A batch pops up to 8192 ranges,
+  65,536 log entries or <code>flush_batch_bytes</code> of payload. A range
+  whose bytes an earlier flush already carried is retired without a resend.
+  The rest are sorted and merged per blob where they overlap or touch.</li>
+  <li><strong>Group by home.</strong> Each blob's home is its hash modulo the
+  number of containers in the cache pool.</li>
+  <li><strong>Send.</strong> In segment mode the records are pinned and the
+  tasks point straight at the bytes in the segment: a record homed on this
+  node goes to <code>next_pool_id</code> as a MultiPutBlob, a remote one to
+  its home's cache as <code>HomeFlush</code>. When pinning fails, and always
+  in extent mode, the bytes are copied into one staging buffer per home
+  (waiting for room rather than dropping), the local group is split into
+  <code>flush_shards</code> tasks by blob so one blob's ranges stay ordered,
+  and each remote home gets one HomeFlush.</li>
+  <li><strong>Pipeline.</strong> Up to <code>flush_depth</code> batches are in
+  flight and land oldest first; a batch that touches a blob still landing in
+  an older one waits for it. The flusher stops starting batches while a
+  chain read of a blob is waiting.</li>
+  <li><strong>Land.</strong> A failed batch is replayed record by record up
+  to <code>flush_retries</code> times. A record that still fails sets its
+  tag's sticky error. Only then does <code>flushed</code> advance.</li>
+</ol>
+<p>Writes are acknowledged before they reach the chain. A write's failure
+surfaces at the next <code>SyncTag</code> of its tag, which returns the
+sticky error and clears it; a put refused for space is reported as the
+sync's no-space code.</p>
+
+<h2>Coherence and invalidation</h2>
+<p>Each blob has a home container: <code>BlobHash(tag, blob)</code> modulo
+the cache pool's container count. Tag metadata uses the same rule, under a
+reserved blob name. The home keeps a sharer directory of the other
+containers that cache each key, bounded by
+<code>max_sharer_entries</code>; overflow forgets an entry by invalidating
+its holders.</p>
+<ul>
+  <li><strong>Register.</strong> A container registers with the home before
+  it fetches a fill, a size or tag metadata. A write that lands at the home
+  afterwards invalidates it, which bumps the entry's epoch and voids a fill
+  still in flight.</li>
+  <li><strong>Invalidate on landing.</strong> <code>HomeFlush</code> forwards
+  the batch down the chain, then invalidates every sharer except the writer
+  before it acknowledges. The writer is invalidated too when another
+  container has also written the blob, since its buffer may lack those bytes.
+  A flush that lands on its own home invalidates the same way.</li>
+  <li><strong>Invalidate on write.</strong> Puts written around the cache and
+  blob deletes send their keys to the homes in batches: one lane per home,
+  keys de-duplicated, at most one Invalidate in flight per home.</li>
+  <li><strong><code>invalidate_on_flush</code>.</strong> With it set, those
+  writes and single-blob deletes send no invalidation of their own. The
+  default write-back cache names 568.0 as its <code>flush_pool</code>, so
+  each flushed range lands through this pool on the blob's home, which
+  invalidates its sharers then. Tag deletes, multi-blob deletes and
+  truncates still invalidate at once.</li>
+  <li><strong>Invalidated entries.</strong> The entry loses its whole-blob
+  flag, known size and current range. Its buffer is freed unless ranges are
+  still pending (they still flush, but are never served) or it is pinned
+  (eviction reclaims it later).</li>
+</ul>
+<p>Barriers: <code>DelTag</code>, <code>SyncTag</code> and every core verb the
+module does not handle itself wait until <code>flushed</code> reaches the
+<code>pushed</code> value seen on entry, polling every 10 microseconds.
+<code>SyncTag</code> also waits for the tag-metadata invalidations of the
+landed writes, syncs the tag on every remote home this node's ranges landed
+on, and then forwards. <code>DelTag</code> then broadcasts a drop of the
+tag's entries to every node. On a single-node runtime no invalidation
+messages are sent.</p>
+
+<h2 id="extent-mode">Extent mode</h2>
+<p>With <code>md_only: false</code>, a <code>data_pool</code> and a nonzero
+<code>data_capacity</code>, blob bytes live in a node-local RAM bdev instead
+of the segment. At Create the cache leases <code>data_capacity</code> from
+that bdev in 64 MiB requests until it has it all or the device is full, and
+uses whatever it got. Adjacent leased blocks merge into one extent.</p>
+<ul>
+  <li>Each blob is stored as up to 8 runs of 4 KiB granules. Growth appends
+  runs, so bytes already written never move and there is no power-of-two
+  rounding.</li>
+  <li>A <code>data_pool</code> minor of 0 means this node's own device of
+  that core: the minor becomes 1 plus the container id
+  (<code>"540.0"</code> is the first storage device of core 540 on this
+  node).</li>
+  <li>Clients map the RAM bdev's segment as well; if they cannot, they do not
+  use the cache at all. <code>CLIO_PREFAULT</code> in a client maps the
+  leased pages at attach time: <code>0</code> maps all of them, a size maps
+  that much.</li>
+  <li>The flusher always uses staging buffers in this mode.</li>
+  <li>Destroy returns the leased blocks to the bdev.</li>
+</ul>
+
+<h2>Configuration</h2>
+<p>Every key is optional. Sizes accept suffixes such as <code>M</code> and
+<code>G</code>. Parsing is best-effort: a malformed value leaves the
+remaining keys at their defaults without an error.</p>
+<dl class="notes">
+  <dt><code>next_pool_id</code></dt>
+  <dd>Pool below this one, as <code>"major.minor"</code>. Unset falls back
+  to the core pool 512.0. The default configuration uses 567.0.</dd>
+  <dt><code>entry_pool_id</code></dt>
+  <dd>Pool clients bind to so their tasks pass every module above the cache.
+  Unset means the cache pool itself. The default configuration uses 564.0,
+  the indexer.</dd>
+  <dt><code>md_only</code></dt>
+  <dd>Cache tag and blob metadata only; blob bytes go down the chain.
+  Default false; the default configuration sets true.</dd>
+  <dt><code>invalidate_on_flush</code></dt>
+  <dd>Writes send no invalidation of their own; set it only with a
+  write-back cache below whose <code>flush_pool</code> is this pool.
+  Default false; the default configuration sets true.</dd>
+  <dt><code>capacity</code></dt>
+  <dd>Segment bytes: buffers, tables and log. Default 256 MiB.</dd>
+  <dt><code>log_depth</code></dt>
+  <dd>Dirty-range log entries. Default 0: automatic, one entry per KiB of
+  <code>capacity</code> with a floor of 65,536 and a cap of
+  2<sup>28</sup>, or 65,536 in metadata-only mode.</dd>
+  <dt><code>flush_batch_bytes</code></dt>
+  <dd>Most payload one flush batch pops. Default 16 MiB.</dd>
+  <dt><code>flush_period_us</code></dt>
+  <dd>Flusher period in microseconds. Default 50. Each run drains the log
+  completely.</dd>
+  <dt><code>flush_retries</code></dt>
+  <dd>Per-record retries of a failed batch before the tag's error sticks.
+  Default 3.</dd>
+  <dt><code>flush_shards</code></dt>
+  <dd>Parallel MultiPutBlob tasks for this node's own blobs on the staged
+  path. Default 8.</dd>
+  <dt><code>flush_depth</code></dt>
+  <dd>Flush batches in flight. Default 4.</dd>
+  <dt><code>max_tags</code></dt>
+  <dd>Tag table entries. Default 4096.</dd>
+  <dt><code>max_blobs</code></dt>
+  <dd>Blob table entries, metadata and buffers alike, divided evenly among 64
+  stripes. Default 65,536.</dd>
+  <dt><code>max_fill</code></dt>
+  <dd>Largest blob a read miss copies into the cache; larger blobs are read
+  through but not cached. Default 16 MiB.</dd>
+  <dt><code>evict_sample</code></dt>
+  <dd>Clean entries sampled per eviction. Default 16.</dd>
+  <dt><code>half_life_ms</code></dt>
+  <dd>Frecency decay half-life: an entry's score is its hit count times
+  2<sup>-age/half_life</sup>. Default 10000.</dd>
+  <dt><code>max_sharer_entries</code></dt>
+  <dd>Sharer-directory entries on a home. Default 65,536.</dd>
+  <dt><code>nospace_wait_ms</code></dt>
+  <dd>Most a task-path put refused for room waits for earlier buffered
+  ranges to flush before it writes around the cache. Default 250.</dd>
+  <dt><code>data_pool</code></dt>
+  <dd>RAM bdev for extent mode, as <code>"major.minor"</code>. Unset: bytes
+  live in the segment.</dd>
+  <dt><code>data_capacity</code></dt>
+  <dd>Bytes leased from <code>data_pool</code>. Default 0, which leaves
+  extent mode off.</dd>
+</dl>
+<p>Environment: <code>CLIO_CTE_POOL</code> and <code>CLIO_PREFAULT</code>
+are read by clients (above); <code>CLIO_WTC_TRACE=1</code> makes the runtime
+log every flush group, home flush, sync and failed chain read with a
+<code>[WTC-TRACE]</code> prefix.</p>
+
+<h2>Operations</h2>
+<p>From <code>clio_mod.yaml</code> and the method header. The interposed
+verbs use the core's own method ids.</p>
+<ul>
+  <li><strong>Interposed</strong>: GetOrCreateTag (14), PutBlob (15), GetBlob
+  (16), DelBlob (18), DelTag (19), GetBlobSize (23), MultiPutBlob (48) and
+  SyncTag (56). PutBlob, GetBlob, GetBlobSize, MultiPutBlob, GetOrCreateTag,
+  DelTag and DelBlob run on the submitting node, since the segment is per
+  node.</li>
+  <li><strong>Forwarded</strong>: every other core method keeps the core's
+  routing, waits for this node's log to drain and is forwarded. Truncates,
+  multi-deletes, renames and tag-name updates then invalidate the keys they
+  changed.</li>
+  <li><strong>Own verbs</strong>: FlushLog (100), the periodic drain;
+  Invalidate (101), the coherence message (drop, register, fan out, drop a
+  tag); HomeFlush (102), a flush batch landing at its home, carrying the
+  core's MultiPutBlob task; and TagAttrs (103), which answers a
+  cluster-wide GetTagSize from the segment. A connected client sends a
+  broadcast <code>AsyncGetTagSize</code> to TagAttrs on the local cache.</li>
+</ul>
+<p>The module's own <code>clio::cte::shm_wtc::Client</code> only creates the
+pool (<code>AsyncCreate</code>) and runs a flush pass on demand
+(<code>AsyncFlushLog</code>). Data traffic goes through a core client bound
+to the cache or its entry pool. Monitor answers no queries.</p>
+
+<h2>Statistics</h2>
+<p>When the runtime stops, each container with a segment logs one line at
+warning level:</p>
+<pre data-label="text">
+[shm-cache stats] node= puts= put_MiB= refused: log= slot= buf= busy= miss= waits= flush_batches= flush_ranges= flush_MiB= flush_skipped= fills= md_fills= get_hits= get_misses= (absent= nonres= range= busy=) invalidations= evictions=
+</pre>
+<ul>
+  <li><code>refused</code> counts puts the segment turned away: log nearly
+  full, no blob slot, no buffer space, entry pinned, and <code>miss</code>
+  for a metadata-only segment or a flag the segment cannot carry. In the
+  default metadata-only configuration every put lands in
+  <code>miss</code>.</li>
+  <li><code>waits</code> counts the task path's retries for room or a
+  pin.</li>
+  <li><code>flush_skipped</code> counts ranges retired without a resend
+  because an earlier flush already carried their bytes.</li>
+  <li><code>get_misses</code> are split by reason: no entry, entry without
+  bytes, range not known current, and writer mid-copy.</li>
+</ul>
+<p>Clients read the same counters at any time through
+<code>Client::CacheStats()</code>.</p>
+
+<h2>Behaviors worth knowing</h2>
+<ul class="checks">
+  <li>A client that initializes while the runtime is still composing,
+  after the core exists but before the cache pool is created, gets zero keys
+  from the core's Create. <code>CLIO_CTE_CLIENT_INIT</code> then leaves the
+  client bound to the core pool (512.0) on the task path, logs nothing, and
+  never retries for the life of the process: the client bypasses the whole
+  chain above the core. Start clients after composition finishes.</li>
+  <li>The blob table is a fixed-size open-addressed table. Inserting a new
+  blob probes at most 64 slots of its stripe, and reclaiming a clean entry
+  only helps when that entry falls in the probe window. A node writing more
+  distinct blobs than <code>max_blobs</code> (default 65,536) therefore
+  starts refusing puts of new blobs (<code>refused: slot=</code>) and writes
+  them around the cache through the task path. Size it above the node's
+  working set of blobs.</li>
+  <li>A connected client's synchronous <code>PutBlob</code> tries the segment
+  whatever its score and context arguments; the cache does not carry them.
+  A put that must carry a score or a context should use
+  <code>AsyncPutBlob</code>, which is always the task path. The
+  <code>Async*</code> methods never consult the segment.</li>
+  <li>An acknowledged put in data mode is in the segment, not the chain. It
+  is durable, and visible to task callers on other nodes, once the flusher
+  lands it; <code>SyncTag</code> waits for that.</li>
+  <li>With <code>invalidate_on_flush</code> (the default configuration),
+  other nodes drop their cached metadata of a blob when the write-back cache
+  flushes the write, not when the write happens.</li>
+  <li>The barrier is node-wide: <code>SyncTag</code> of one tag waits for
+  every range buffered on the node before it, not only that tag's.</li>
+  <li>A blob larger than <code>max_fill</code> is never cached by a read;
+  only writes through this cache populate it.</li>
+</ul>
+
+<h2>Limits</h2>
+<ul>
+  <li>A blob's home is computed as hash modulo the cache pool's container
+  count and addressed directly, duplicating the core's placement. It is
+  only right while placement is plain hash modulo N with one container per
+  node: successor failover or migration below breaks it. Tracked as
+  iowarp/clio-core#1372.</li>
+  <li>Processes that cannot map the segment stay on the task path, and one
+  bound to the core directly instead of the cache's entry pool bypasses
+  invalidation.</li>
+  <li>The segment is formatted empty when the pool is created, and the
+  module's Destroy does not flush it. Nothing in it survives a runtime
+  restart: a data-mode write the flusher has not landed when the runtime
+  goes down is lost. <code>SyncTag</code> is the durability point.</li>
+  <li>Blob names longer than 200 bytes and tag names longer than 255 bytes
+  are never cached.</li>
+  <li>In extent mode an entry holds at most 8 runs. Growth that cannot be
+  placed in the remaining runs, even after evicting, writes around the
+  cache.</li>
+  <li>The flusher's zero-copy path sends one MultiPutBlob task per coalesced
+  record rather than one per home.</li>
+</ul>
+
+<h2>How it is tested</h2>
+<ul>
+  <li><code>context-transfer-engine/test/unit/test_shm_wtc.cc</code> (ctest
+  <code>cte_shm_wtc</code>, built with <code>CLIO_CTE_ENABLE_SHM_WTC</code>):
+  keys from the CTE Create, a connected PutBlob creating no task, the task
+  path without a cache, segment writes and reads with exact flushed ranges,
+  eviction, overwrite coalescing, metadata-only size caching, tag attribute
+  caching in both modes, truncate, large puts displacing small buffers, the
+  wait for room, extent mode, pinned-entry refusal, ENOSPC reporting and a
+  concurrent extent-mode stress case.</li>
+  <li><code>context-transfer-engine/test/integration/shm_wtc_coherence</code>:
+  a four-node Docker suite (<code>run_tests.sh</code>, built with
+  <code>CLIO_CORE_ENABLE_DOCKER_CI</code>) running
+  <code>test_shm_wtc_coherence</code> with clients bound by
+  <code>CLIO_CTE_POOL=568.0</code>: every node reads every node's writes,
+  overwrites invalidate other nodes' copies, N-1 writers to disjoint ranges
+  of one blob, and deletes. The directory also builds
+  <code>test_shm_wtc_stress</code> (rotating writers, torn-read checks,
+  working sets larger than the cache, tag delete and recreate, tag size
+  across nodes) and <code>test_shm_wtc_restart</code> (write, churn and
+  verify phases around runtime restarts and kills), with compose files for
+  the data-mode, write-back and metadata-only chains.</li>
+  <li><code>context-transfer-engine/benchmark/clio_cte_shm_wtc_bench.cc</code>
+  with <code>cte_config_shm_wtc.yaml</code>: per-operation timing of the
+  task path against the segment path.</li>
+</ul>

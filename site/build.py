@@ -169,15 +169,27 @@ NAV = {
         ("Modules", [
             ("modules/index.html", "Module reference"),
         ]),
+        ("Runtime", [
+            ("modules/admin.html", "Admin"),
+            ("modules/module-template.html", "Module template (MOD_NAME)"),
+        ]),
         ("Storage", [
             ("modules/bdev.html", "Block devices (bdev)"),
             ("modules/safe-bdev.html", "Erasure-coded arrays (safe_bdev)"),
             ("modules/cte-core.html", "CTE core"),
         ]),
         ("Data path", [
+            ("modules/shm-cache.html", "Shared-memory cache"),
+            ("modules/write-back.html", "Write-back cache"),
+            ("modules/write-through.html", "Write-through cache"),
             ("modules/cache.html", "Cache"),
             ("modules/replication.html", "Replication"),
             ("modules/compressor.html", "Compressor"),
+            ("modules/checkpoint.html", "Checkpoint"),
+        ]),
+        ("Files and streams", [
+            ("modules/filesystem.html", "Filesystem"),
+            ("modules/stream.html", "Stream"),
         ]),
         ("Context", [
             ("modules/indexer.html", "Indexer"),

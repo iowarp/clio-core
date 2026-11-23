@@ -41,10 +41,12 @@ import java.util.Vector;
 public class ClioClient extends DB {
 
   private static native int nativeInit();
+  private static native int nativeSync();
   private static native int nativePut(String key, byte[] value);
   private static native byte[] nativeGet(String key);
   private static native String[] nativeScanKeys(String startKey, int count);
-  private static native int nativePutDirect(String key, java.nio.ByteBuffer buf, int len);
+  private static native int nativePutDirect(String key, java.nio.ByteBuffer buf, int len,
+      boolean newKey);
   private static native int nativeGetDirect(String key, java.nio.ByteBuffer buf);
 
   static {
@@ -128,6 +130,24 @@ public class ClioClient extends DB {
     }
   }
 
+  /**
+   * Standalone entry point for the benchmark driver: {@code drain} waits
+   * until every put buffered by the shm cache reached the CTE core.
+   * Exits 0 on success.
+   */
+  public static void main(String[] args) {
+    if (args.length != 1 || !"drain".equals(args[0])) {
+      System.err.println("usage: ClioClient drain");
+      System.exit(2);
+    }
+    int rc = nativeInit();
+    if (rc == 0) {
+      rc = nativeSync();
+    }
+    System.out.println("clio drain rc=" + rc);
+    System.exit(rc == 0 ? 0 : 1);
+  }
+
   @Override
   public void init() throws DBException {
     int rc = nativeInit();
@@ -195,10 +215,20 @@ public class ClioClient extends DB {
   @Override
   public Status insert(String table, String key,
       Map<String, ByteIterator> values) {
+    return put(table, key, values, true);
+  }
+
+  /**
+   * Serialize a record into the per-thread direct buffer and put it.
+   * newKey adds the key to the scan index; an update of an existing key
+   * skips it, so updates never touch the index's lock.
+   */
+  private Status put(String table, String key,
+      Map<String, ByteIterator> values, boolean newKey) {
     try {
       java.nio.ByteBuffer wb = (java.nio.ByteBuffer) WRITE_BUF.get().clear();
       int len = serializeInto(wb, values);
-      int rc = nativePutDirect(blobName(table, key), wb, len);
+      int rc = nativePutDirect(blobName(table, key), wb, len, newKey);
       return rc == 0 ? Status.OK : Status.ERROR;
     } catch (IOException e) {
       return Status.ERROR;
@@ -221,7 +251,8 @@ public class ClioClient extends DB {
       }
     }
     merged.putAll(values);
-    return insert(table, key, merged);
+    // An update of a missing key creates it, so it must enter the index.
+    return put(table, key, merged, existing == null);
   }
 
   @Override

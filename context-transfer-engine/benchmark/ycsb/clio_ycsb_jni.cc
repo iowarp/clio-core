@@ -52,12 +52,24 @@ int g_init_rc = -100;  // set by the once-body; <0 means init failed
 // CTE has no ordered key scan, so the binding maintains its own sorted index
 // of blob names — the same approach the stock YCSB Redis binding takes (it
 // keeps a zset index for exactly this reason). Seeded from
-// Tag::GetContainedBlobs() at init (run phases start in a fresh process
-// against a loaded store) and updated on every put; scan = lower_bound +
-// walk. Guarded by its own mutex; scans copy the keys out under the lock and
-// fetch values outside it.
+// Tag::GetContainedBlobs() on the FIRST SCAN (run phases start in a fresh
+// process against a loaded store), not at init: the seed is a broadcast task
+// listing every key, and workloads without scans must not pay for it or wait
+// behind the runtime for it. Inserts add their key; updates of existing keys
+// do not. scan = lower_bound + walk. Guarded by its own mutex; scans copy the
+// keys out under the lock and fetch values outside it.
 std::mutex g_keys_mtx;
 std::set<std::string> g_keys;
+std::once_flag g_seed_once;
+
+/** Seed the scan index with every key already stored under the tag. */
+void SeedKeys() {
+  std::vector<std::string> names = g_tag->GetContainedBlobs();
+  std::lock_guard<std::mutex> lk(g_keys_mtx);
+  for (auto &name : names) {
+    g_keys.insert(name);
+  }
+}
 
 void InitOnce() {
   // The Clio SHM transport wakes waiters with tgkill(SIGUSR1); clio-aware
@@ -91,12 +103,6 @@ void InitOnce() {
   // CLIO_CTE_POOL interposer override, issue #886) and get-or-created the
   // pool — re-binding here would undo the override.
   g_tag = new clio::cte::core::Tag("ycsb");
-  {
-    std::lock_guard<std::mutex> lk(g_keys_mtx);
-    for (auto &name : g_tag->GetContainedBlobs()) {
-      g_keys.insert(name);
-    }
-  }
   g_init_rc = 0;
 }
 
@@ -135,6 +141,21 @@ JNIEXPORT jint JNICALL Java_site_ycsb_db_ClioClient_nativePut(
   return rc;
 }
 
+/**
+ * Wait until every put buffered by the shm cache has been written through
+ * to the CTE core (SyncTag on the "ycsb" tag). The benchmark driver calls it
+ * between runs, outside the timed window, so one run's background
+ * write-through never delays the next run.
+ * @return the SyncTag return code (0 on success), or -1 if not initialized
+ */
+JNIEXPORT jint JNICALL Java_site_ycsb_db_ClioClient_nativeSync(JNIEnv *,
+                                                               jclass) {
+  if (g_tag == nullptr) return -1;
+  auto task = CLIO_CTE_CLIENT->AsyncSyncTag(g_tag->GetTagId());
+  task.Wait();
+  return static_cast<jint>(task->GetReturnCode());
+}
+
 JNIEXPORT jobjectArray JNICALL Java_site_ycsb_db_ClioClient_nativeScanKeys(
     JNIEnv *env, jclass, jstring start, jint count) {
   if (g_tag == nullptr || count <= 0) return nullptr;
@@ -143,6 +164,7 @@ JNIEXPORT jobjectArray JNICALL Java_site_ycsb_db_ClioClient_nativeScanKeys(
   std::string start_str(start_chars);
   env->ReleaseStringUTFChars(start, start_chars);
 
+  std::call_once(g_seed_once, SeedKeys);
   std::vector<std::string> keys;
   keys.reserve(static_cast<size_t>(count));
   {
@@ -171,8 +193,19 @@ JNIEXPORT jobjectArray JNICALL Java_site_ycsb_db_ClioClient_nativeScanKeys(
  * reused the moment this returns.
  * @return 0 on success, -1/-2/-3 on bad arguments, -11 when the put failed
  */
+/**
+ * Put a record from a Java direct buffer.
+ * @param key blob name
+ * @param buf direct buffer holding the serialized record
+ * @param len record length in bytes
+ * @param new_key true for an insert: add the key to the scan index. Updates
+ *        of existing keys pass false and never take the index lock, which
+ *        would otherwise serialize every writer thread.
+ * @return 0 on success, negative on error
+ */
 JNIEXPORT jint JNICALL Java_site_ycsb_db_ClioClient_nativePutDirect(
-    JNIEnv *env, jclass, jstring key, jobject buf, jint len) {
+    JNIEnv *env, jclass, jstring key, jobject buf, jint len,
+    jboolean new_key) {
   if (g_tag == nullptr || len <= 0) return -1;
   const char *key_chars = env->GetStringUTFChars(key, nullptr);
   if (key_chars == nullptr) return -2;
@@ -184,8 +217,10 @@ JNIEXPORT jint JNICALL Java_site_ycsb_db_ClioClient_nativePutDirect(
                                static_cast<clio::run::u64>(len), src) != 0) {
     return -11;
   }
-  std::lock_guard<std::mutex> lk(g_keys_mtx);
-  g_keys.insert(key_str);
+  if (new_key) {
+    std::lock_guard<std::mutex> lk(g_keys_mtx);
+    g_keys.insert(key_str);
+  }
   return 0;
 }
 

@@ -1,10 +1,18 @@
-# YCSB benchmark config (issue #862): identical to the built-in defaults
-# (clio_bdev allocator pool + CTE core) except the CTE RAM tier is capped at
-# 256MB instead of 100MB so the default YCSB dataset (workload D grows it to ~200k records = ~300MB at dense blocks)
-# is fully memory-resident -- RocksDB's working set is likewise fully
-# memory-resident (memtable + page cache). Nothing else is tuned.
+# YCSB benchmark config (issue #862): the CTE core over one RAM tier, with
+# the shared-memory write-through cache (core_shm_cache_writethru, pool 568)
+# in front of it. The YCSB binding's synchronous PutBlob / GetBlobSize /
+# GetBlob are then served by copying between the JVM's buffer and the cache
+# segment in the client process: no task and no round trip to the runtime.
+# The cache writes every put through to the core in the background.
+#
+# Sized for the comparison's default dataset (1M records of ~1.1 KB, about
+# 1.1 GB): the cache holds every record (max_blobs above the record count,
+# capacity above the dataset), and the RAM tier below holds them again.
+# The other stores are likewise fully memory-resident: Redis by design,
+# RocksDB on tmpfs with a block cache larger than the dataset, DynamoDB
+# Local with -inMemory.
 runtime:
-  num_threads: 4
+  num_threads: 8
   queue_depth: 1024
 
 compose:
@@ -22,7 +30,7 @@ compose:
     storage:
       - path: "ram::cte_ram_tier1"
         bdev_type: "ram"
-        capacity_limit: "512MB"
+        capacity_limit: "4GB"
         score: 1.0
     dpe:
       dpe_type: "max_bw"
@@ -30,3 +38,13 @@ compose:
       neighborhood: 1
       default_target_timeout_ms: 30000
       poll_period_ms: 5000
+
+  - mod_name: clio_cte_core_shm_cache_writethru
+    pool_name: clio_cte_core_shm_cache_writethru
+    pool_query: local
+    pool_id: "568.0"
+    next_pool_id: "512.0"
+    md_only: false          # cache the bytes, not just metadata
+    capacity: "6G"          # segment: buffers + tables + dirty-range log
+    max_blobs: 2097152      # above the record count, or puts write around
+    max_tags: 64
