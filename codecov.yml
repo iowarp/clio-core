@@ -65,6 +65,10 @@ ignore:
   # download engine. It defines main(), so no test can link it; the engine
   # itself (http_fetch.cc) is covered by cae_http_fetch_test.
   - "**/factory/tools/http_tool_main.cc"
+  # cae_dataverse_tool process entry: argument parsing and one call into the
+  # stager. It defines main(), so no test can link it; the stager itself
+  # (dataverse_fetch.cc) is covered by cae_dataverse_stage_test.
+  - "**/factory/tools/dataverse_tool_main.cc"
   # cte_tiers process entry: CLIO_INIT plus one call. The report itself is
   # core/util/cte_tiers_report.h, covered by test_cte_tiers.
   - "**/util/cte_tiers.cc"

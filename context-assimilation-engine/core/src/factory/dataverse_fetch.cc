@@ -120,10 +120,12 @@ struct Run {
     return true;
   }
 
-  /** Wait before retry `attempt` (1, 2, ...): 2, 4, 8, ... s, at most 60. */
-  static void Backoff(int attempt) {
-    int s = std::min(60, 1 << std::min(attempt, 6));
-    std::this_thread::sleep_for(std::chrono::seconds(s));
+  /** Wait before retry `attempt` (1, 2, ...): CAE_HTTP_BACKOFF_MS doubled per
+   *  attempt (2, 4, 8, ... s by default), at most 60 s. */
+  void Backoff(int attempt) const {
+    const int64_t ms = std::min<int64_t>(
+        60000, static_cast<int64_t>(cfg.backoff_ms) << std::min(attempt, 6));
+    std::this_thread::sleep_for(std::chrono::milliseconds(ms));
   }
 
   /**
@@ -214,6 +216,15 @@ struct Run {
     return true;
   }
 
+  /**
+   * A 403 from storage is most often an expired presigned link. The probe
+   * reports it as "HTTP 403"; a failed data GET only as curl's exit 22.
+   */
+  static bool LinkMayHaveExpired(const std::string &err) {
+    return err.find("HTTP 403") != std::string::npos ||
+           err.find("curl 22") != std::string::npos;
+  }
+
   /** Bytes [off, off+len) of data file `id`, via its resolved link, retried. */
   bool GetData(int64_t id, uint64_t off, uint64_t len, std::string *out,
                std::string *err) {
@@ -223,8 +234,7 @@ struct Run {
       if (!DataUrl(id, refresh, &url, err)) return false;
       if (Get(url, off, len, out, err)) return true;
       if (attempt >= cfg.part_retries) return false;
-      // A 403 from storage is most often an expired presigned link.
-      refresh = err->find("HTTP 403") != std::string::npos;
+      refresh = LinkMayHaveExpired(*err);
       Say("data file " + std::to_string(id) + ": " + *err + "; retrying");
       Backoff(attempt + 1);
     }
@@ -260,21 +270,29 @@ struct Run {
     return ok;
   }
 
-  int64_t Size(const std::string &url, std::string *err) {
-    HttpAuth a;
-    if (!Auth(url, &a, err)) return -1;
-    HttpProbe p = HttpProbeUrl(a, cfg);
-    requests += 1;
-    if (!p.error.empty() || p.status >= 400 || p.status == 0) {
+  /** Size of data file `id`, from a probe of its resolved link, retried. */
+  int64_t Size(int64_t id, std::string *err) {
+    bool refresh = false;
+    for (int attempt = 0;; ++attempt) {
+      std::string url;
+      HttpAuth a;
+      if (!DataUrl(id, refresh, &url, err) || !Auth(url, &a, err)) return -1;
+      HttpProbe p = HttpProbeUrl(a, cfg);
+      requests += 1;
+      if (p.error.empty() && p.status > 0 && p.status < 400) {
+        if (!p.ranges || p.total < 0) {
+          *err = url + ": the server does not support ranged reads";
+          return -1;
+        }
+        return p.total;
+      }
       *err = url + ": probe " +
              (p.error.empty() ? "HTTP " + std::to_string(p.status) : p.error);
-      return -1;
+      if (attempt >= cfg.part_retries) return -1;
+      refresh = LinkMayHaveExpired(*err);
+      Say("data file " + std::to_string(id) + ": " + *err + "; retrying");
+      Backoff(attempt + 1);
     }
-    if (!p.ranges || p.total < 0) {
-      *err = url + ": the server does not support ranged reads";
-      return -1;
-    }
-    return p.total;
   }
 };
 
@@ -314,7 +332,7 @@ bool ListZip(Run &run, const DataverseFile &f,
              const DataverseSelection &sel, std::vector<Job> *jobs,
              std::string *err) {
   const std::string url = DataverseFileUrl(run.src, f.id);
-  int64_t total = f.size >= 0 ? f.size : run.Size(url, err);
+  int64_t total = f.size >= 0 ? f.size : run.Size(f.id, err);
   if (total < 0) return false;
   auto get = [&](uint64_t off, uint64_t len, std::string *out) {
     return run.GetData(f.id, off, len, out, err);
@@ -431,22 +449,35 @@ bool StageMember(Run &run, Job &j, std::string *err) {
   return WriteFileAtomic(j.obj.local, data.data(), data.size(), err);
 }
 
+/**
+ * A whole data file, fetched from its resolved link (not the API URL: curl
+ * would carry the API key along the redirect to the storage host).
+ */
 bool StageWhole(Run &run, Job &j, std::string *err) {
-  HttpFetchRequest req;
-  if (!run.Auth(j.url, &req.auth, err)) return false;
-  req.dst_path = j.obj.local;
-  HttpFetchResult r = HttpFetch(req, run.cfg, [&](const std::string &m) {
-    run.Say(j.obj.path + ": " + m);
-  });
-  run.requests += 1 + r.parts;
-  if (!r.ok) {
+  bool refresh = false;
+  for (int attempt = 0;; ++attempt) {
+    HttpFetchRequest req;
+    std::string url;
+    if (!run.DataUrl(j.obj.file_id, refresh, &url, err) ||
+        !run.Auth(url, &req.auth, err))
+      return false;
+    req.dst_path = j.obj.local;
+    HttpFetchResult r = HttpFetch(req, run.cfg, [&](const std::string &m) {
+      run.Say(j.obj.path + ": " + m);
+    });
+    run.requests += 1 + r.parts;
+    if (r.ok) {
+      run.fetched += r.skipped ? 0 : r.bytes;
+      j.obj.size = r.bytes;
+      j.obj.skipped = r.skipped;
+      return true;
+    }
     *err = j.obj.path + ": " + r.error;
-    return false;
+    if (attempt >= run.cfg.part_retries) return false;
+    refresh = Run::LinkMayHaveExpired(r.error);
+    run.Say(*err + "; retrying");
+    run.Backoff(attempt + 1);
   }
-  run.fetched += r.skipped ? 0 : r.bytes;
-  j.obj.size = r.bytes;
-  j.obj.skipped = r.skipped;
-  return true;
 }
 
 /** Run fn over [0, n) on `jobs` threads; the first error stops new work. */
@@ -519,7 +550,7 @@ DataverseStageResult DataverseStage(const std::string &src,
     if (run.Get(DataverseDatasetApiUrl(run.src), 0, 0, &body, &res.error)) break;
     if (attempt >= run.cfg.part_retries) return res;
     run.Say(res.error + "; retrying");
-    Run::Backoff(attempt + 1);
+    run.Backoff(attempt + 1);
   }
   std::vector<DataverseFile> files;
   if (!ParseDataverseFiles(body, &files, &res.version, &res.error)) return res;

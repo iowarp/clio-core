@@ -499,6 +499,36 @@ if(NOT WIN32 AND ZLIB_FOUND)
   add_test(NAME cae_dataverse COMMAND cae_dataverse_test)
   set_tests_properties(cae_dataverse PROPERTIES TIMEOUT 60 LABELS "cae;unit")
   install(TARGETS cae_dataverse_test DESTINATION bin)
+
+  # DataverseStage (dataverse_fetch.cc) end to end against a fake Dataverse on
+  # 127.0.0.1 inside the test, through the real curl. Nothing leaves the host.
+  if(TARGET clio_cae_core_runtime)
+    find_package(Threads REQUIRED)
+    add_executable(cae_dataverse_stage_test
+      ${CMAKE_CURRENT_SOURCE_DIR}/dataverse/test_dataverse_stage.cc
+    )
+    target_include_directories(cae_dataverse_stage_test PRIVATE
+      ${CMAKE_SOURCE_DIR}/context-runtime/test         # simple_test.h
+    )
+    target_link_libraries(cae_dataverse_stage_test PRIVATE
+      clio_cae_core_runtime
+      clio_cte_core_client
+      clio::run::cxx
+      Threads::Threads
+      ZLIB::ZLIB
+    )
+    set_target_properties(cae_dataverse_stage_test PROPERTIES
+      CXX_STANDARD 20
+      CXX_STANDARD_REQUIRED ON
+    )
+    add_test(NAME cae_dataverse_stage COMMAND cae_dataverse_stage_test)
+    set_tests_properties(cae_dataverse_stage PROPERTIES
+      TIMEOUT 120
+      LABELS "cae;http;msan_skip"
+      ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
+    )
+    install(TARGETS cae_dataverse_stage_test DESTINATION bin)
+  endif()
 endif()
 
 #------------------------------------------------------------------------------
