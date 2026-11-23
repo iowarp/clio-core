@@ -117,6 +117,57 @@ is submitted by the client. Fills are not on the steady-state path: a
 directory listed once is `kComplete`, files created here are complete from
 birth.
 
+## Appends
+
+Visibility rule: a node's view of a file may **lag** (it sees a shorter
+file), but nothing it sees is ever provisional. Every byte inside the size
+a node reports is final; no offset a reader or appender observes ever moves.
+
+**One node** (the namespace segment is on and this node holds the file):
+an append takes the file's append lock in the segment, writes its pages at
+the inode's current size (shared-memory page puts), raises the size, and
+releases the lock. Exact and immediate; no merge.
+
+**Asynchronous merge** (other nodes may append to the same file; forced on
+one node with `CLIO_CFS_APPEND_MERGE=1`):
+
+1. *Stage.* The client reserves `[off, off+len)` in the file's current
+   **append generation** in the segment (per-file `{gen, bytes[2],
+   inflight[2]}`) and copies the bytes into the blob `app.<node>.<gen>` of
+   the file's tag with a plain `PutBlob` (the CTE shm cache: no task). The
+   offset comes from the segment, not from the cache entry, which can be
+   dropped under capacity pressure. It then pushes `kOpAppend` onto the op
+   log. `write(O_APPEND)` returns here.
+2. *Seal.* The module's drain, on `kOpAppend`, switches the file to
+   generation `gen+1` (new appends go there), waits for `inflight[gen]`
+   to reach zero, and takes `L = bytes[gen]`.
+3. *IdentifyRange.* One `IdentifyRange(file, node, gen, L)` per sealed
+   generation, sent with `PoolQuery::ManyToOne(owner, batch_key = file id)`
+   so every node's request for the file in a window is one collective. At
+   the neighborhood leader `AggregateIn` appends `(node, gen, L)` to the
+   aggregate's member list in arrival order. The aggregate runs on the
+   file's owner, which reserves `[end, end + total)` **without publishing a
+   size** and returns the map `node -> offset` (base + prefix); it is
+   broadcast to every member and each origin takes its own entry. A node
+   has at most one generation of a file in flight, so (node, gen) is unique.
+4. *Write.* The origin reads `app.<node>.<gen>` and writes it to the file's
+   page blobs at its offset (bytes move once, origin to page homes).
+5. *CommitRange.* The origin tells the owner the range is written. The
+   owner publishes the size as the end of the committed prefix: a range
+   reserved but not committed blocks the size, so readers never see bytes
+   that are not written. The origin deletes `app.<node>.<gen>`.
+6. *Dead origin.* A reserved range not committed within
+   `append_commit_timeout` (or whose origin the cluster declares dead) is
+   committed as a hole (zeros): its appends were never fsynced.
+
+fsync, truncate and unlink of a file with staged appends first wait for its
+generations to merge. A node's appends keep their order (one generation in
+flight per file); across nodes the owner orders batches by arrival.
+
+The stream module's deferred-append pipeline (staging tag, Sequence/Plan)
+is replaced by this; the module's remaining job (file sizes) moves to the
+filesystem module's inode records in a later step.
+
 ## Background propagation (module)
 
 A single flusher drains the OpLog continuously:
