@@ -2183,6 +2183,12 @@ struct Context {
    *  copy's own bytes, not a mutation of a source, and running the hook on
    *  them would recurse into the copy's own copies. */
   static constexpr clio::run::u32 kNoCow = 1u << 9;
+  /** kKeepScore -- a put of an EXISTING blob keeps the blob's score; the put's score applies only to a new blob.
+   *  For writers that rewrite bytes they did not place, such as a page cache writing a frame back: the rewrite
+   *  lands where the blob already is, so recording the writer's default score would describe a placement that did
+   *  not happen -- and a later ReorganizeBlob to that score would see no difference and leave the blob where it
+   *  is (a page promoted to a fast tier, then written back, could never be demoted). */
+  static constexpr clio::run::u32 kKeepScore = 1u << 10;
 
   /**
    * Fault-handler parameters (checkpointing / lazy copy). When the core

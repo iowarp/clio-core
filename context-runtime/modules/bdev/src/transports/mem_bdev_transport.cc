@@ -3,6 +3,7 @@
  * All rights reserved.
  */
 
+#include <cstddef>  // size_t, for the extern "C" declarations below (GCC does not get it from cycle_counter.h)
 #include "clio_runtime/cycle_counter.h"
 extern "C" void clio_evlat_add(int which, unsigned long long cycles);
 extern "C" void ctp_copy_kernel_launch(char *dst, const char *src, size_t n,

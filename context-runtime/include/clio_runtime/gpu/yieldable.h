@@ -276,6 +276,11 @@ class Yieldable {
 
   clio::run::u32 NumBlocks() const { return nblocks_; }
   clio::run::u32 NumThreads() const { return nthreads_; }
+  /** Run this driver on its own (non-blocking) stream: the launch callback must launch on Stream(), and a round
+   *  then waits for and copies on that stream only. Null (the default) is the legacy default stream. Two drivers
+   *  on different streams run their rounds concurrently instead of queueing behind each other's kernels. */
+  void SetStream(void *stream) { stream_ = stream; }
+  void *Stream() const { return stream_; }
   /** Blocks that have not finished. */
   clio::run::u32 NumPending() const { return num_pending_; }
   /** Host copy of one block's state (as of the last completed round). */
@@ -330,7 +335,11 @@ class Yieldable {
     // construction leaves it in, or it is not a reset.
 #if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
     if (d_user_ != nullptr) {
-      ctp::GpuApi::Memset(d_user_, 0, nblocks_ * sizeof(StateT));
+      if (stream_ != nullptr) {  // on its own stream: no implicit join with the legacy stream
+        ctp::GpuApi::MemsetAsync(d_user_, 0, nblocks_ * sizeof(StateT), stream_);
+      } else {
+        ctp::GpuApi::Memset(d_user_, 0, nblocks_ * sizeof(StateT));
+      }
     }
 #endif
     Upload();
@@ -429,10 +438,15 @@ class Yieldable {
     // The kernels launch on the legacy default stream, so that is what has to
     // be waited on. Clio's streams are created cudaStreamNonBlocking, so they
     // do not implicitly join it and are correctly excluded here.
-    ctp::GpuApi::Synchronize(/*stream=*/nullptr);
+    ctp::GpuApi::Synchronize(stream_);
     const auto _t1 = std::chrono::steady_clock::now();
-    ctp::GpuApi::Memcpy(host_yield_.data(), d_yield_,
-                        nblocks_ * sizeof(YieldBlockState));
+    if (stream_ != nullptr) {  // on its own stream: no implicit join with the legacy stream
+      ctp::GpuApi::MemcpyAsync(host_yield_.data(), d_yield_, nblocks_ * sizeof(YieldBlockState), stream_);
+      ctp::GpuApi::Synchronize(stream_);
+    } else {
+      ctp::GpuApi::Memcpy(host_yield_.data(), d_yield_,
+                          nblocks_ * sizeof(YieldBlockState));
+    }
     const auto _t2 = std::chrono::steady_clock::now();
     const double _rms =
         std::chrono::duration<double, std::milli>(_t1 - _t0).count();
@@ -657,8 +671,13 @@ class Yieldable {
 
   void Upload() {
 #if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
-    ctp::GpuApi::Memcpy(d_yield_, host_yield_.data(),
-                        nblocks_ * sizeof(YieldBlockState));
+    if (stream_ != nullptr) {
+      ctp::GpuApi::MemcpyAsync(d_yield_, host_yield_.data(), nblocks_ * sizeof(YieldBlockState), stream_);
+      ctp::GpuApi::Synchronize(stream_);  // host_yield_ may change before the copy would run
+    } else {
+      ctp::GpuApi::Memcpy(d_yield_, host_yield_.data(),
+                          nblocks_ * sizeof(YieldBlockState));
+    }
 #endif
     UploadPending();
   }
@@ -666,8 +685,13 @@ class Yieldable {
   void UploadPending() {
 #if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
     if (num_pending_ > 0) {
-      ctp::GpuApi::Memcpy(d_pending_, host_pending_.data(),
-                          num_pending_ * sizeof(clio::run::u32));
+      if (stream_ != nullptr) {
+        ctp::GpuApi::MemcpyAsync(d_pending_, host_pending_.data(), num_pending_ * sizeof(clio::run::u32), stream_);
+        ctp::GpuApi::Synchronize(stream_);  // host_pending_ is rewritten before the next upload
+      } else {
+        ctp::GpuApi::Memcpy(d_pending_, host_pending_.data(),
+                            num_pending_ * sizeof(clio::run::u32));
+      }
     }
 #endif
   }
@@ -675,6 +699,8 @@ class Yieldable {
   clio::run::u32 nblocks_ = 0;
   clio::run::u32 nthreads_ = 0;
   clio::run::u32 num_pending_ = 0;
+  /** The stream this driver's kernels run on (SetStream); null = the legacy default stream. */
+  void *stream_ = nullptr;
   /** Set when a service callback returned false; see RunToCompletion. */
   bool aborted_ = false;
   /** See HitRoundCap(). Sticky across Reset(). */

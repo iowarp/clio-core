@@ -48,9 +48,11 @@ struct Page {
   clio::run::u64 page_num;    // kNoPage when free
   void *data;                 // this page's bytes
   clio::run::u64 last_access; // breaks score ties (LRU)
-  /** THE CLAIMER'S COMPLETION WORD: the address of the fetch future of the
-   *  block that claimed this frame to fill it (0 = none recorded). A block
-   *  that finds the frame claimed by someone else parks on this word, so the
+  /** THE COMPLETION WORD OF THE TRANSFER IN FLIGHT ON THIS FRAME: the fetch
+   *  future of the block that claimed it to fill it, or the flush future of
+   *  the block writing it back (0 = none recorded). A block that finds the
+   *  frame claimed by someone else -- or needs a frame while this one is
+   *  being written back so it can be evicted -- parks on this word, so the
    *  host relaunches it when that transfer lands instead of every round.
    *  (Fields reordered so the record stays 64 bytes.) */
   clio::run::u64 fetch_tag;
@@ -85,6 +87,9 @@ struct BlockTasks {
   clio::run::u32 flush_busy;  // a flush is in flight
   clio::run::u32 fetch_busy;  // a fetch is in flight
   clio::run::u32 seq;         // bumped per submission so TaskIds differ
+  /** A partial fetch waiting on another block's write-back parks on this
+   *  completion word (0 = no such wait: retry next round). */
+  clio::run::u64 park_tag;
   /** Page table index each record came from, so completion can clear the
    *  right frames' flags. */
   clio::run::u32 flush_slot[clio::cte::core::kPodMultiMax];

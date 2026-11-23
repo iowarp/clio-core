@@ -23,7 +23,11 @@
 #include <clio_cte/gpu_vector/page.h>
 #include <clio_cte/gpu_vector/prefetch.h>
 
+#if defined(_WIN32)
+#include <io.h>  // _write: the async-signal-safe stderr write below
+#else
 #include <unistd.h>
+#endif
 
 #include <cmath>
 #include <csignal>
@@ -247,7 +251,11 @@ inline unsigned long long *FatalMirror() {
         char buf[512];
         const int w = FatalFormat(FatalMirror(), buf, sizeof(buf));
         if (w > 0) {
+#if defined(_WIN32)
+          const int r = ::_write(2, buf, static_cast<unsigned>(w));
+#else
           const ssize_t r = ::write(2, buf, static_cast<size_t>(w));
+#endif
           (void)r;
         }
         std::signal(sig, SIG_DFL);
@@ -293,6 +301,8 @@ class Vector {
     clio::run::u64 flush_skipped = 0;  // flush pages not resident: DROPPED
     clio::run::u64 put_errors = 0;   // writebacks that returned non-zero
     clio::run::u64 alloc_waits = 0;  // page-cache backoff retries (FaultPage)
+    clio::run::u64 allocs = 0;       // pages Allocate claimed without a read
+    clio::run::u64 writebacks = 0;   // dirty frames written back so they could be evicted
     // GV_COMM_TIMING only (zero otherwise): GPU cycles in the Fetch, Hold
     // and Flush calls, a benchmark's busy segments, and the call counts.
     clio::run::u64 fetch_cyc = 0, hold_cyc = 0, flush_cyc = 0, busy_cyc = 0;
@@ -667,6 +677,11 @@ class Vector {
   clio::cte::core::TagId TagId() const { return tag_id_; }
   clio::run::u64 PageBytes() const { return page_bytes_; }
   clio::run::u64 ElemsPerPage() const { return page_bytes_ / sizeof(T); }
+  /** CUDA blocks the vector was built for: a kernel over its device view
+   *  launches exactly this many (block b uses block b's task set). */
+  clio::run::u32 NumBlocks() const { return nblocks_; }
+  /** Page-sized device frames the cache owns (what it costs in HBM). */
+  clio::run::u32 CapacityPages() const { return capacity_pages_; }
   clio::run::u64 NumPages() const {
     const clio::run::u64 epp = ElemsPerPage();
     return (num_elems_ + epp - 1) / epp;
@@ -676,7 +691,7 @@ class Vector {
 #if CTP_ENABLE_GPU
     for (auto &kv : devs_) {
       if (kv.second.stats != nullptr) continue;
-      const size_t bytes = 17 * sizeof(unsigned long long);
+      const size_t bytes = 19 * sizeof(unsigned long long);
       auto *c = reinterpret_cast<unsigned long long *>(
           ctp::GpuApi::Malloc<char>(bytes));
       if (c == nullptr) throw std::runtime_error("gpu_vector: stats alloc failed");
@@ -696,6 +711,8 @@ class Vector {
       kv.second.hdr.stat_flush_skipped_ = c + 8;
       kv.second.hdr.stat_alloc_waits_ = c + 9;
       kv.second.hdr.stat_cyc_ = c + 10;        // 7 slots: see VecHeader
+      kv.second.hdr.stat_allocs_ = c + 17;     // after the timing slots
+      kv.second.hdr.stat_writebacks_ = c + 18;
       PublishHeader(kv.second);
     }
 #endif
@@ -839,6 +856,8 @@ class Vector {
     for (auto &kv : devs_) {
       if (kv.second.stats == nullptr) continue;
       ctp::GpuApi::Memset(kv.second.stats, 0, 5 * sizeof(unsigned long long));
+      // allocs (slot 17) pairs with faults: a read and a skipped read.
+      ctp::GpuApi::Memset(kv.second.stats + 17, 0, 2 * sizeof(unsigned long long));  // + writebacks (18)
     }
 #endif
   }
@@ -889,7 +908,7 @@ class Vector {
 #if CTP_ENABLE_GPU
     auto it = devs_.find(gpu_id);
     if (it == devs_.end() || it->second.stats == nullptr) return s;
-    unsigned long long h[17] = {};
+    unsigned long long h[19] = {};
     ctp::GpuApi::Memcpy(h, it->second.stats, sizeof(h));
     s.fetch_cyc = h[10];
     s.hold_cyc = h[11];
@@ -908,6 +927,8 @@ class Vector {
     s.gen_busy = h[7];
     s.flush_skipped = h[8];
     s.put_errors = h[4];
+    s.allocs = h[17];
+    s.writebacks = h[18];
 #else
     (void) gpu_id;
 #endif
@@ -1329,6 +1350,8 @@ class Vector {
     st.hdr.stat_flush_skipped_ = nullptr;
     st.hdr.stat_put_errors_ = nullptr;
     st.hdr.stat_alloc_waits_ = nullptr;
+    st.hdr.stat_allocs_ = nullptr;
+    st.hdr.stat_writebacks_ = nullptr;
     st.hdr.stat_cyc_ = nullptr;
     st.hdr.fatal_ = FatalSlots();
     st.hdr.fatal_mirror_ = FatalMirror();
