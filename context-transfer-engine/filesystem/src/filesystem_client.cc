@@ -11,6 +11,8 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <initializer_list>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -126,8 +128,10 @@ void Client::MakeParents(const std::string &path) {
   // is fine -- the create that follows reports any real failure.
   size_t pos = 1;
   while ((pos = path.find('/', pos)) != std::string::npos) {
-    auto m = AsyncMkdir(path.substr(0, pos));
-    m.Wait();
+    if (FsMkdir(path.substr(0, pos), 0755) == kNsUnavailable) {
+      auto m = AsyncMkdir(path.substr(0, pos));
+      m.Wait();
+    }
     ++pos;
   }
 }
@@ -196,6 +200,9 @@ FsSsize Client::WritePages(const clio::cte::core::TagId &tag,
       static_cast<clio::run::u64>(clio::cte::core::GetWallTimeNs());
   *size_recorded = shm_fs_root_ != nullptr &&
                    shm_fs_root_->sizes_.Raise(PackTag(tag), end, wtime);
+  // The namespace's own inode holds the file's size and mtime locally; the
+  // size table carries them to the home.
+  if (ns::View *v = Ns()) v->RaiseSize(PackTag(tag), end, wtime);
   return static_cast<FsSsize>(done);
 }
 
@@ -229,6 +236,14 @@ int Client::ReadPage(const clio::cte::core::TagId &tag, clio::run::u64 cur,
 
 int Client::FileSizeOf(const clio::cte::core::TagId &tag,
                        const std::string &path, clio::run::u64 *size) {
+  {
+    ns::Attr a;
+    const int nrc = FsStatId(FsPack(tag), &a);
+    if (nrc == 0) {
+      *size = a.size;  // includes the pending size
+      return 0;
+    }
+  }
   if (!HasShmCache()) AttachShmCache();
   ShmFileRecord rec;
   if (TryGetFileRecordShm(path, &rec) && rec.Exists() && !rec.IsDir() &&
@@ -325,6 +340,7 @@ int Client::WaitSizeDrained(const clio::cte::core::TagId &tag) {
  * @param of the open file
  */
 static bool UsesPagePath(const Client::OpenFile &of) {
+  if (of.handle == 0) return true;  // namespace-held: no module handle
   return !of.tag.IsNull() && (of.flags & O_APPEND) == 0 && !Client::IsSyncFd(of.flags);
 }
 
@@ -344,6 +360,17 @@ static FsSsize WriteOpenFile(Client *cfs, const Client::OpenFile &of,
     return cfs->Write(of.handle, of.path, off, buf, count,
                       Client::IsSyncFd(of.flags));
   }
+  if (of.handle == 0 && (of.flags & O_APPEND) != 0) {
+    // O_APPEND: at the current end (this process's appends do not
+    // interleave; appends across processes are not atomic here).
+    clio::run::u64 end = 0;
+    const int src = cfs->FileSizeOf(of.tag, of.path, &end);
+    if (src != 0) {
+      errno = -src;
+      return -1;
+    }
+    off = end;
+  }
   bool recorded = true;
   const FsSsize n = cfs->WritePages(of.tag, off, buf, count, &recorded);
   if (n < 0) {
@@ -357,6 +384,15 @@ static FsSsize WriteOpenFile(Client *cfs, const Client::OpenFile &of,
         off + static_cast<clio::run::u64>(n));
     t.Wait();
     if (t->GetReturnCode() != 0) {
+      errno = EIO;
+      return -1;
+    }
+  }
+  if (of.handle == 0 && Client::IsSyncFd(of.flags) && n > 0) {
+    // O_SYNC/O_DSYNC: durable before write(2) returns.
+    const int drc = cfs->WaitSizeDrained(of.tag);
+    if (drc != 0 || cfs->FsWaitApplied() != 0 ||
+        cfs->SyncDurable(of.tag, FsParentDir(of.path)) != 0) {
       errno = EIO;
       return -1;
     }
@@ -385,12 +421,344 @@ static FsSsize ReadOpenFile(Client *cfs, const Client::OpenFile &of,
   return n;
 }
 
+// ---------------------------------------------------------------------------
+// Namespace: the shared-memory namespace (fs_ns_shm.h)
+// ---------------------------------------------------------------------------
+
+namespace {
+/** Fill rounds before a namespace call gives up on a missing name. */
+constexpr int kNsFillRounds = 8;
+/** Longest wait for a block of inode ids (ms). */
+constexpr double kNsIdWaitMs = 10000.0;
+/** "Leave alone" owner / the mounting user, as the module stores it. */
+constexpr clio::run::u32 kNoOwner = 0xFFFFFFFFu;
+
+/** @return wall-clock ns */
+clio::run::u64 NowNs() {
+  return static_cast<clio::run::u64>(clio::cte::core::GetWallTimeNs());
+}
+
+/**
+ * Run a namespace operation, filling missing names and waiting for ids.
+ * @param cfs the client
+ * @param paths the paths the operation resolves (filled on a miss)
+ * @param dir_fill a directory whose listing a miss may need (rmdir, a
+ *        rename over a directory, readdir); empty for none
+ * @param op the operation (0, errno, ns::kMiss, or EAGAIN for ids)
+ */
+template <typename Op>
+int NsRetry(Client *cfs, std::initializer_list<const std::string *> paths,
+            const std::string &dir_fill, Op op) {
+  const auto t0 = std::chrono::steady_clock::now();
+  for (int round = 0;; ) {
+    const int rc = op();
+    if (rc == EAGAIN) {
+      // The module tops the id block up every period; wait for it.
+      const double ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - t0)
+                            .count();
+      if (ms >= kNsIdWaitMs) return EIO;
+      std::this_thread::sleep_for(std::chrono::microseconds(500));
+      continue;
+    }
+    if (rc != ns::kMiss) return rc;
+    if (++round > kNsFillRounds) return EIO;
+    for (const std::string *p : paths) {
+      const int frc = cfs->NsFill(*p);
+      if (frc != 0) return frc;
+    }
+    if (!dir_fill.empty() && round > 1) {
+      const int frc = cfs->NsFillDir(dir_fill);
+      if (frc != 0 && frc != ENOENT && frc != ENOTDIR) return frc;
+    }
+  }
+}
+}  // namespace
+
+ns::View *Client::Ns() {
+  if (ns_view_ == nullptr) {
+    if (!HasShmCache()) AttachShmCache();
+    if (ns_view_ == nullptr) return nullptr;
+  }
+  return ns_view_->Ready() ? ns_view_.get() : nullptr;
+}
+
+void Client::AttachNs() {
+  if (ns_view_ != nullptr || shm_fs_root_ == nullptr) return;
+  if (shm_fs_root_->ns_ready_.load(std::memory_order_acquire) == 0) return;
+  auto v = std::make_shared<ns::View>();
+  const std::string name = ns::SegmentName(
+      shm_fs_root_->ns_pid_.load(std::memory_order_relaxed),
+      pool_id_.ToU64());
+  if (v->Attach(name)) ns_view_ = v;
+}
+
+int Client::NsFill(const std::string &path) {
+  ns::View *v = Ns();
+  if (v == nullptr) return kNsUnavailable;
+  const std::vector<std::string> comps = ns::SplitPath(path);
+  std::string parent = "/";
+  for (size_t i = 0; i < comps.size(); ++i) {
+    const std::string cur =
+        (parent == "/" ? std::string("/") : parent + "/") + comps[i];
+    ns::Attr have;
+    const int lrc = v->Lookup(cur, &have);
+    if (lrc == 0) {
+      parent = cur;
+      continue;
+    }
+    if (lrc == ENOENT || lrc == ENOTDIR) return 0;  // answered locally
+    // Not held (or held without its inode): ask the module once.
+    auto t = AsyncGetattr(cur);
+    t.Wait();
+    if (t->GetReturnCode() != 0) return EIO;
+    if (t->exists_ == 0) {
+      const int frc = v->FillAbsent(parent, comps[i]);
+      return frc == 0 ? 0 : frc;
+    }
+    ns::Attr a;
+    a.id = t->ino_;
+    a.type = t->is_dir_ ? kFsTypeDir
+                        : (t->is_symlink_ ? kFsTypeSymlink : kFsTypeFile);
+    a.mode = t->mode_ != kNoOwner ? (t->mode_ & 07777u)
+                                  : (t->is_dir_ ? 0755u : 0644u);
+    a.uid = t->uid_;
+    a.gid = t->gid_;
+    a.nlink = t->is_dir_ ? 2u : t->nlink_;
+    a.size = t->size_;
+    a.atime = t->atime_;
+    a.mtime = t->mtime_;
+    a.ctime = t->ctime_;
+    std::string target;
+    if (t->is_symlink_) {
+      auto r = AsyncReadlink(cur);
+      r.Wait();
+      if (r->GetReturnCode() == 0) target = r->target_.str();
+    }
+    const int frc = v->FillEntry(parent, comps[i], a, target);
+    if (frc != 0) return frc;
+    parent = cur;
+  }
+  return 0;
+}
+
+int Client::NsFillDir(const std::string &path) {
+  ns::View *v = Ns();
+  if (v == nullptr) return kNsUnavailable;
+  const int prc = NsFill(path);
+  if (prc != 0) return prc;
+  auto t = AsyncReaddir(path);
+  t.Wait();
+  if (t->GetReturnCode() != 0) return EIO;
+  const size_t n = t->entries_.size();
+  for (size_t i = 0; i < n; ++i) {
+    const clio::run::u64 id = i < t->inos_.size() ? t->inos_[i] : 0;
+    const clio::run::u32 type = i < t->types_.size() ? t->types_[i] : 0;
+    if (id == 0) continue;
+    const int frc = v->FillName(path, t->entries_[i].str(), id,
+                                type != 0 ? type : kFsTypeFile);
+    if (frc != 0) return frc;
+  }
+  return v->MarkComplete(path);
+}
+
+int Client::FsStat(const std::string &path, ns::Attr *a) {
+  ns::View *v = Ns();
+  if (v == nullptr) return kNsUnavailable;
+  const int rc = NsRetry(this, {&path}, std::string(),
+                         [&] { return v->Lookup(path, a); });
+  if (rc == 0 && a->type == kFsTypeFile) {
+    a->size = std::max(a->size, PendingSize(FsUnpack(a->id)));
+  }
+  return rc;
+}
+
+int Client::FsStatId(clio::run::u64 id, ns::Attr *a) {
+  ns::View *v = Ns();
+  if (v == nullptr) return kNsUnavailable;
+  if (!v->StatId(id, a)) return ENOENT;
+  if (a->type == kFsTypeFile) {
+    a->size = std::max(a->size, PendingSize(FsUnpack(id)));
+  }
+  return 0;
+}
+
+int Client::FsOpen(const std::string &path, int flags, clio::run::u32 mode,
+                   ns::Attr *a, bool *created) {
+  ns::View *v = Ns();
+  if (v == nullptr) return kNsUnavailable;
+  *created = false;
+  int rc = 0;
+  if (flags & O_CREAT) {
+    const bool excl = (flags & O_EXCL) != 0;
+    rc = NsRetry(this, {&path}, std::string(), [&] {
+      return v->Create(path, mode, kNoOwner, kNoOwner, excl, NowNs(), a,
+                       created);
+    });
+  } else {
+    rc = NsRetry(this, {&path}, std::string(),
+                 [&] { return v->Lookup(path, a); });
+  }
+  if (rc != 0) return rc;
+  if (a->type == kFsTypeDir && (flags & (O_WRONLY | O_RDWR)) != 0) return EISDIR;
+  if ((flags & O_TRUNC) && !*created && a->type == kFsTypeFile) {
+    rc = FsTruncate(path, 0);
+    if (rc != 0) return rc;
+    a->size = 0;
+  }
+  if (a->type == kFsTypeFile) {
+    a->size = std::max(a->size, PendingSize(FsUnpack(a->id)));
+  }
+  return 0;
+}
+
+int Client::FsMkdir(const std::string &path, clio::run::u32 mode) {
+  ns::View *v = Ns();
+  if (v == nullptr) return kNsUnavailable;
+  return NsRetry(this, {&path}, std::string(), [&] {
+    return v->Mkdir(path, mode, kNoOwner, kNoOwner, NowNs());
+  });
+}
+
+int Client::FsRmdir(const std::string &path) {
+  ns::View *v = Ns();
+  if (v == nullptr) return kNsUnavailable;
+  return NsRetry(this, {&path}, path,
+                 [&] { return v->Rmdir(path, NowNs()); });
+}
+
+int Client::FsUnlink(const std::string &path) {
+  ns::View *v = Ns();
+  if (v == nullptr) return kNsUnavailable;
+  return NsRetry(this, {&path}, std::string(),
+                 [&] { return v->Unlink(path, NowNs()); });
+}
+
+int Client::FsRename(const std::string &src, const std::string &dst,
+                     bool noreplace) {
+  ns::View *v = Ns();
+  if (v == nullptr) return kNsUnavailable;
+  return NsRetry(this, {&src, &dst}, dst, [&] {
+    return v->Rename(src, dst, noreplace, NowNs());
+  });
+}
+
+int Client::FsLink(const std::string &src, const std::string &dst) {
+  ns::View *v = Ns();
+  if (v == nullptr) return kNsUnavailable;
+  return NsRetry(this, {&src, &dst}, std::string(),
+                 [&] { return v->Link(src, dst, NowNs()); });
+}
+
+int Client::FsSymlink(const std::string &target, const std::string &path) {
+  ns::View *v = Ns();
+  if (v == nullptr) return kNsUnavailable;
+  return NsRetry(this, {&path}, std::string(), [&] {
+    return v->Symlink(target, path, kNoOwner, kNoOwner, NowNs());
+  });
+}
+
+int Client::FsReadlink(const std::string &path, std::string *target) {
+  ns::View *v = Ns();
+  if (v == nullptr) return kNsUnavailable;
+  return NsRetry(this, {&path}, std::string(),
+                 [&] { return v->Readlink(path, target); });
+}
+
+int Client::FsChmod(const std::string &path, clio::run::u32 mode) {
+  ns::View *v = Ns();
+  if (v == nullptr) return kNsUnavailable;
+  return NsRetry(this, {&path}, std::string(),
+                 [&] { return v->Chmod(path, mode, NowNs()); });
+}
+
+int Client::FsChown(const std::string &path, clio::run::u32 uid,
+                    clio::run::u32 gid) {
+  ns::View *v = Ns();
+  if (v == nullptr) return kNsUnavailable;
+  return NsRetry(this, {&path}, std::string(),
+                 [&] { return v->Chown(path, uid, gid, NowNs()); });
+}
+
+int Client::FsUtimens(const std::string &path, clio::run::u64 atime_ns,
+                      clio::run::u64 mtime_ns) {
+  ns::View *v = Ns();
+  if (v == nullptr) return kNsUnavailable;
+  return NsRetry(this, {&path}, std::string(), [&] {
+    return v->Utimens(path, atime_ns, mtime_ns, NowNs());
+  });
+}
+
+int Client::FsTruncate(const std::string &path, clio::run::u64 size) {
+  ns::View *v = Ns();
+  if (v == nullptr) return kNsUnavailable;
+  ns::Attr a;
+  int rc = FsStat(path, &a);
+  if (rc != 0) return rc;
+  if (a.type == kFsTypeDir) return EISDIR;
+  // The size earlier page writes raised lands first, so the cut applies
+  // after them (a wait on the drain).
+  rc = WaitSizeDrained(FsUnpack(a.id));
+  if (rc != 0) return rc;
+  clio::run::u64 id = 0;
+  clio::run::u64 old_size = 0;
+  clio::run::u64 seq = 0;
+  rc = NsRetry(this, {&path}, std::string(), [&] {
+    return v->Truncate(path, size, NowNs(), &id, &old_size, &seq);
+  });
+  if (rc != 0) return rc;
+  if (size < old_size && !v->WaitApplied(seq, kNsDrainWaitMs)) return EIO;
+  return 0;
+}
+
+int Client::FsReaddir(const std::string &path, std::vector<ns::DirEnt> *out) {
+  ns::View *v = Ns();
+  if (v == nullptr) return kNsUnavailable;
+  return NsRetry(this, {&path}, path, [&] {
+    out->clear();
+    return v->Readdir(path, out);
+  });
+}
+
+int Client::FsWaitApplied() {
+  ns::View *v = Ns();
+  if (v == nullptr) return 0;
+  return v->WaitApplied(v->PushedSeq(), kNsDrainWaitMs) ? 0 : EIO;
+}
+
 int Client::OpenFd(const std::string &raw_path, int flags, int mode) {
   if (!EnsureInit()) {
     errno = EIO;
     return -1;
   }
   std::string path = StripClioPrefix(raw_path);
+  {
+    ns::Attr a;
+    bool created = false;
+    int nrc = FsOpen(path, flags, static_cast<clio::run::u32>(mode), &a,
+                     &created);
+    if (nrc == ENOENT && (flags & O_CREAT) != 0) {
+      MakeParents(path);  // a clio:: path mirrors a host path (see below)
+      nrc = FsOpen(path, flags, static_cast<clio::run::u32>(mode), &a,
+                   &created);
+    }
+    if (nrc != kNsUnavailable) {
+      if (nrc != 0) {
+        errno = nrc;
+        return -1;
+      }
+      std::lock_guard<std::mutex> g(fd_mu_);
+      const int fd = next_fd_++;
+      OpenFile of;
+      of.handle = 0;  // no module handle: the namespace holds the file
+      of.path = path;
+      of.flags = flags;
+      of.off = (flags & O_APPEND) ? a.size : 0;
+      of.tag = FsUnpack(a.id);
+      fds_[fd] = of;
+      return fd;
+    }
+  }
   auto t = AsyncOpen(path, static_cast<clio::run::u32>(flags),
                           static_cast<clio::run::u32>(mode));
   t.Wait();
@@ -560,7 +928,10 @@ int Client::SyncFd(int fd) {
   // Otherwise they stay on whatever tier took them (RAM) until the periodic
   // flush, while the same file fsynced through the FUSE mount was durable
   // (#1188).
-  const int drc = WaitSizeDrained(of.tag);
+  int drc = WaitSizeDrained(of.tag);
+  // The namespace changes made so far (this file's create among them)
+  // reach their homes before the file is made durable.
+  if (drc == 0) drc = FsWaitApplied();
   if (drc != 0) {
     errno = drc;
     return -1;
@@ -704,6 +1075,16 @@ int Client::TruncatePath(const std::string &raw_path, FsOff length) {
     return -1;
   }
   std::string path = StripClioPrefix(raw_path);
+  {
+    const int nrc = FsTruncate(path, static_cast<clio::run::u64>(length));
+    if (nrc != kNsUnavailable) {
+      if (nrc != 0) {
+        errno = nrc;
+        return -1;
+      }
+      return 0;
+    }
+  }
   // A size page writes raised and the drain has not landed would otherwise
   // be applied AFTER this truncate and resurrect the cut length.
   {
@@ -732,6 +1113,16 @@ int Client::RemovePath(const std::string &raw_path) {
     return -1;
   }
   std::string path = StripClioPrefix(raw_path);
+  {
+    const int nrc = FsUnlink(path);
+    if (nrc != kNsUnavailable) {
+      if (nrc != 0) {
+        errno = nrc;
+        return -1;
+      }
+      return 0;
+    }
+  }
   auto t = AsyncUnlink(path);
   t.Wait();
   if (t->GetReturnCode() != 0) {
@@ -748,6 +1139,16 @@ int Client::RenamePath(const std::string &raw_src, const std::string &raw_dst) {
   }
   std::string src = StripClioPrefix(raw_src);
   std::string dst = StripClioPrefix(raw_dst);
+  {
+    const int nrc = FsRename(src, dst, /*noreplace=*/false);
+    if (nrc != kNsUnavailable) {
+      if (nrc != 0) {
+        errno = nrc;
+        return -1;
+      }
+      return 0;
+    }
+  }
   auto t = AsyncRename(src, dst);
   t.Wait();
   if (t->GetReturnCode() != 0) {
@@ -763,6 +1164,20 @@ int Client::ReaddirPath(const std::string &raw_path, std::vector<std::string> *o
     return -1;
   }
   std::string path = StripClioPrefix(raw_path);
+  {
+    std::vector<ns::DirEnt> ents;
+    const int nrc = FsReaddir(path, &ents);
+    if (nrc != kNsUnavailable) {
+      if (nrc != 0) {
+        errno = nrc;
+        return -1;
+      }
+      out->clear();
+      out->reserve(ents.size());
+      for (auto &e : ents) out->emplace_back(std::move(e.name));
+      return 0;
+    }
+  }
   auto t = AsyncReaddir(path);
   t.Wait();
   if (t->GetReturnCode() != 0) {
@@ -792,7 +1207,9 @@ int Client::CloseFd(int fd) {
     handle = it->second.handle;
     fds_.erase(it);
   }
-  // Writes are synchronous, so nothing is pending against the handle.
+  // A namespace-held file has no module handle: its size travels through
+  // the size table, so close(2) has nothing to send.
+  if (handle == 0) return 0;
   auto t = AsyncClose(handle);
   t.Wait();
   return (t->GetReturnCode() == 0) ? 0 : -1;

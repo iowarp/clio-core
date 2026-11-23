@@ -877,19 +877,32 @@ inline int View::Utimens(const std::string &path, u64 atime, u64 mtime,
       kOpUtimens, 0, atime, mtime, 0, 0, 0);
 }
 
+inline bool View::WaitApplied(u64 seq, double timeout_ms) {
+  const auto t0 = std::chrono::steady_clock::now();
+  while (root_->applied_seq_.load(std::memory_order_acquire) < seq) {
+    const double ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - t0)
+                          .count();
+    if (ms >= timeout_ms) return false;
+    std::this_thread::sleep_for(std::chrono::microseconds(200));
+  }
+  return true;
+}
+
 inline int View::Truncate(const std::string &path, u64 size, u64 now,
-                          u64 *id) {
+                          u64 *id, u64 *old_size, u64 *seq) {
   return Mutate(path.size(), 0, [&]() -> int {
     Inode *ino = nullptr;
     int rc = ResolveAnyLocked(path, &ino);
     if (rc != 0) return rc;
     if (ino->type_ == kFsTypeDir) return EISDIR;
     if (ino->type_ != kFsTypeFile) return EINVAL;
+    *old_size = ino->size_;
     ino->size_ = size;
     ino->mtime_ = ino->ctime_ = now;
     *id = ino->id_;
-    PushOpLocked(kOpTruncate, path, std::string(), ino->id_, size, now, 0, 0,
-                 0, 0, 0);
+    *seq = PushOpLocked(kOpTruncate, path, std::string(), ino->id_, size, now,
+                        0, 0, 0, 0, 0);
     return 0;
   });
 }
@@ -959,7 +972,25 @@ inline int View::FillEntry(const std::string &parent_path,
     u64 h = 0;
     Dentry *d = FindDentLocked(parent->id_, name, &h);
     // Never replace what the table holds: a live or negative entry here is
-    // newer than the module's answer (its op may not be applied yet).
+    // newer than the module's answer (its op may not be applied yet). A
+    // live name whose inode is not held yet (a listing fill) gets it.
+    if (d != nullptr && d->state_ == kDentLive && d->child_ == a.id &&
+        FindInodeLocked(a.id) == nullptr) {
+      Inode *ino = InsertInodeLocked(a.id);
+      if (ino == nullptr) {
+        rc = ENOSPC;
+      } else {
+        ino->type_ = a.type;
+        ino->mode_ = a.mode;
+        ino->uid_ = a.uid;
+        ino->gid_ = a.gid;
+        ino->nlink_ = a.nlink;
+        ino->size_ = a.size;
+        ino->atime_ = a.atime;
+        ino->mtime_ = a.mtime;
+        ino->ctime_ = a.ctime;
+      }
+    }
     if (d == nullptr) {
       Inode *ino = InsertInodeLocked(a.id);
       d = ino != nullptr ? InsertDentLocked(parent->id_, h, name) : nullptr;
@@ -1016,6 +1047,31 @@ inline int View::FillAbsent(const std::string &parent_path,
       if (d == nullptr) {
         rc = ENOSPC;
       } else {
+        LinkDentLocked(parent, d);
+      }
+    }
+  }
+  root_->lock_.WriteUnlock();
+  return rc;
+}
+
+inline int View::FillName(const std::string &parent_path,
+                          const std::string &name, u64 id, u32 type) {
+  if (name.size() > kMaxName || id == 0) return EINVAL;
+  root_->lock_.WriteLock();
+  Inode *parent = nullptr;
+  int rc = ResolveAnyLocked(parent_path, &parent);
+  if (rc == 0 && parent->type_ != kFsTypeDir) rc = ENOTDIR;
+  if (rc == 0) {
+    u64 h = 0;
+    if (FindDentLocked(parent->id_, name, &h) == nullptr) {
+      Dentry *d = InsertDentLocked(parent->id_, h, name);
+      if (d == nullptr) {
+        rc = ENOSPC;
+      } else {
+        d->child_ = id;
+        d->type_ = type;
+        d->state_ = kDentLive;
         LinkDentLocked(parent, d);
       }
     }

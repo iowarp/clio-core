@@ -408,9 +408,26 @@ class View {
 
   /**
    * truncate(2).
-   * @param id receives the file's id (for the data cut)
+   * @param id receives the file's id
+   * @param old_size receives its size before the call
+   * @param seq receives the op's log seq (a shrink waits for it: WaitApplied)
    */
-  int Truncate(const std::string &path, u64 size, u64 now, u64 *id);
+  int Truncate(const std::string &path, u64 size, u64 now, u64 *id,
+               u64 *old_size, u64 *seq);
+
+  /**
+   * Wait until the module has applied the log through `seq` (a wait on the
+   * background drain, never a task).
+   * @param seq a seq a mutation returned, or PushedSeq()
+   * @param timeout_ms give up after this long
+   * @return true when applied
+   */
+  bool WaitApplied(u64 seq, double timeout_ms);
+
+  /** @return the seq of the last op pushed */
+  u64 PushedSeq() const {
+    return root_->pushed_seq_.load(std::memory_order_acquire);
+  }
 
   /**
    * List a directory.
@@ -450,6 +467,18 @@ class View {
    * @return 0, or an errno
    */
   int FillAbsent(const std::string &parent_path, const std::string &name);
+
+  /**
+   * Insert one name of a listing the module reported (id and type only; its
+   * inode's attributes are filled on first stat), unless the table holds it.
+   * @param parent_path its directory (must resolve)
+   * @param name the name
+   * @param id the inode it names
+   * @param type its kFsType*
+   * @return 0, or an errno
+   */
+  int FillName(const std::string &parent_path, const std::string &name,
+               u64 id, u32 type);
 
   /** Record a directory's listing as complete (after filling it). */
   int MarkComplete(const std::string &dir_path);

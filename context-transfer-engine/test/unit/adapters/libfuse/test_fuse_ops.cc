@@ -208,6 +208,38 @@ TEST_CASE("FUSE ops - getattr root and missing", "[fuse][ops]") {
 }
 
 // ============================================================================
+// The namespace runs in shared memory: a create is one record in the
+// segment's op log (no task), applied by the module in the background under
+// the id the client minted.
+// ============================================================================
+
+TEST_CASE("FUSE ops - namespace runs in shared memory", "[fuse][ops][ns]") {
+  Fx();
+  auto *cfs = CLIO_CFS_CLIENT;
+  auto *v = cfs->Ns();
+  REQUIRE(v != nullptr);
+  const char *path = "/ns_probe.bin";
+  const clio::run::u64 pushed0 = v->PushedSeq();
+  auto fi = MakeFi();
+  REQUIRE(cte_fuse_create(path, 0644, &fi) == 0);
+  REQUIRE(v->PushedSeq() == pushed0 + 1);
+  cte_stat_t st;
+  REQUIRE(cte_fuse_getattr(path, &st, nullptr) == 0);
+  REQUIRE(S_ISREG(st.st_mode));
+  REQUIRE(cte_fuse_release(path, &fi) == 0);
+  // Once the module applied the log, it holds the file under the same id.
+  REQUIRE(cfs->FsWaitApplied() == 0);
+  auto t = cfs->AsyncGetattr(path);
+  t.Wait();
+  REQUIRE(t->GetReturnCode() == 0);
+  REQUIRE(t->exists_ != 0);
+  INFO("module ino " << t->ino_ << " stat ino " << static_cast<clio::run::u64>(st.st_ino) << " sizeof(st_ino) " << sizeof(st.st_ino));
+  REQUIRE(t->ino_ == static_cast<clio::run::u64>(st.st_ino));
+  REQUIRE(cte_fuse_unlink(path) == 0);
+  REQUIRE(cte_fuse_getattr(path, &st, nullptr) == -ENOENT);
+}
+
+// ============================================================================
 // create / write / read / release + getattr on a regular file
 // ============================================================================
 

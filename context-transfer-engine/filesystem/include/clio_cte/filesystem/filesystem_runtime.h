@@ -1452,6 +1452,29 @@ class Runtime : public clio::run::Container {
    */
   clio::run::TaskResume SizeDrain();
   /**
+   * Apply the shared-memory namespace's op log (fs_ns_shm.h) in order, at
+   * each name's home, through the namespace handlers: consecutive creates
+   * as one MultiCreate batch, every other op on its own (periodic ShardOp
+   * body). Also keeps the clients' id block topped up.
+   */
+  clio::run::TaskResume NsDrain();
+  /** Hand the namespace segment a new block of the durable id reservation
+   *  when the current one runs low. */
+  clio::run::TaskResume RefillNsIds();
+  /**
+   * Apply one non-create op from the namespace log.
+   * @param rec the record
+   * @param path its path
+   * @param path2 its second path (rename/link destination, symlink target)
+   * @param rc receives the handler's return code
+   */
+  clio::run::TaskResume NsApplyOne(const ns::OpRec &rec,
+                                   const std::string &path,
+                                   const std::string &path2,
+                                   clio::run::u32 &rc);
+  /** Format the namespace segment next to the mirror (single node). */
+  void FormatNsSegment(const clio::run::PoolId &pool);
+  /**
    * Delete, on THIS container only, the pages of every id in `req.str_`
    * (packed u64s). One such request per container replaces a cluster-wide
    * broadcast per deleted file.
@@ -1834,6 +1857,8 @@ class Runtime : public clio::run::Container {
 
   // ---- issue #817: shared-memory attribute mirror (single-node only) ----
   ShmFsCache shm_fs_cache_;
+  /** The shared-memory namespace clients operate on (fs_ns_shm.h). */
+  ns::View ns_view_;
   /** Publish a file's attributes under `path` (meta_mu_ held). */
   void MirrorFile(const std::string &path, const InodeState &fi,
                   clio::run::u32 extra_flags = 0);

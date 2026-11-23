@@ -265,8 +265,13 @@ TEST_CASE("ns shm - rmdir link symlink attrs truncate", "[fs][ns]") {
   REQUIRE(r.size == 5000u);
   REQUIRE(r.mtime == 100u);
   ns::u64 id = 0;
-  REQUIRE(s.client.Truncate("/h", 10, 7, &id) == 0);
+  ns::u64 old_size = 0;
+  ns::u64 seq = 0;
+  REQUIRE(s.client.Truncate("/h", 10, 7, &id, &old_size, &seq) == 0);
   REQUIRE(id == a.id);
+  REQUIRE(old_size == 5000u);
+  REQUIRE(seq == s.client.PushedSeq());
+  REQUIRE_FALSE(s.client.WaitApplied(seq, 1.0));
   REQUIRE(s.client.Lookup("/h", &r) == 0);
   REQUIRE(r.size == 10u);
   REQUIRE((Drain(&s.module, nullptr) ==

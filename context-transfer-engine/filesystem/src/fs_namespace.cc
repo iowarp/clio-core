@@ -247,6 +247,8 @@ clio::run::TaskResume Runtime::ShardOp(clio::run::shared_ptr<ShardOpTask> &task)
   FsReq req;
   FsResp resp;
   if (task->op_ == kShardPurgeDrain) {
+    // Namespace first: a size advance needs its file's create applied.
+    CLIO_CO_AWAIT(NsDrain());
     CLIO_CO_AWAIT(SizeDrain());
     CLIO_CO_AWAIT(PurgeDrain());
   } else if (!DecReq(task->req_.str(), &req)) {
@@ -726,8 +728,12 @@ clio::run::TaskResume Runtime::SizeDrain() {
       auto &f = futs[j - i];
       CLIO_CO_AWAIT(f);
       const clio::run::u32 rc = f->GetReturnCode();
-      // ENOENT: the file was removed; its size has nowhere to go.
-      if (rc == 0 || rc == ENOENT) {
+      // ENOENT for a file the shared-memory namespace still holds is its
+      // create not applied yet: keep the size for the next period. For a
+      // removed file the size has nowhere to go.
+      const bool not_yet = rc == ENOENT && ns_view_.Ready() &&
+                           ns_view_.HasInode(pending[j].key);
+      if (rc == 0 || (rc == ENOENT && !not_yet)) {
         root->sizes_.Retire(pending[j].key, pending[j].end);
       } else {
         HLOG(kWarning, "filesystem: size drain of inode {} to {} failed "
@@ -736,6 +742,146 @@ clio::run::TaskResume Runtime::SizeDrain() {
       }
     }
   }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::RefillNsIds() {
+  CLIO_TASK_BODY_BEGIN
+  // Top the block up while half of it is left, so clients never wait.
+  constexpr clio::run::u32 kNsIdBlock = 8192;
+  if (!ns_view_.Ready() || ns_view_.IdsLeft() >= kNsIdBlock / 2) {
+    CLIO_CO_RETURN;
+  }
+  bool ok = false;
+  CLIO_CO_AWAIT(EnsureIdReserve(kNsIdBlock, ok));
+  if (!ok) CLIO_CO_RETURN;  // retried next period
+  {
+    clio::run::u32 major = 0;
+    clio::run::u64 first = 0;
+    bool have = false;
+    {
+      std::lock_guard<std::mutex> g(meta_mu_);
+      if (next_minor_ + kNsIdBlock <= minted_hi_) {
+        first = next_minor_;
+        next_minor_ += kNsIdBlock;
+        // Home 0: the namespace segment exists on single-node volumes only.
+        major = kFsIdFlag | kFsIdMinterFlag |
+                ((container_id_ & kFsIdMinterMask) << kFsIdMinterShift);
+        have = true;
+      }
+    }
+    if (have) ns_view_.SetIdBlock(major, first, kNsIdBlock);
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::NsApplyOne(const ns::OpRec &rec,
+                                          const std::string &path,
+                                          const std::string &path2,
+                                          clio::run::u32 &rc) {
+  CLIO_TASK_BODY_BEGIN
+  rc = 0;
+  if (rec.type_ == ns::kOpMkdir) {
+    auto f = self_.AsyncMkdir(path);
+    CLIO_CO_AWAIT(f);
+    rc = f->GetReturnCode();
+    if (rc == 0 && rec.mode_ != 0755u) {
+      auto c = self_.AsyncChmod(path, rec.mode_);
+      CLIO_CO_AWAIT(c);
+      rc = c->GetReturnCode();
+    }
+  } else if (rec.type_ == ns::kOpUnlink) {
+    auto f = self_.AsyncUnlink(path);
+    CLIO_CO_AWAIT(f);
+    rc = f->GetReturnCode();
+  } else if (rec.type_ == ns::kOpRmdir) {
+    auto f = self_.AsyncRmdir(path);
+    CLIO_CO_AWAIT(f);
+    rc = f->GetReturnCode();
+  } else if (rec.type_ == ns::kOpRename) {
+    auto f = self_.AsyncRename(path, path2);
+    CLIO_CO_AWAIT(f);
+    rc = f->GetReturnCode();
+  } else if (rec.type_ == ns::kOpLink) {
+    auto f = self_.AsyncLink(path, path2);
+    CLIO_CO_AWAIT(f);
+    rc = f->GetReturnCode();
+  } else if (rec.type_ == ns::kOpSymlink) {
+    auto f = self_.AsyncSymlink(path2, path);
+    CLIO_CO_AWAIT(f);
+    rc = f->GetReturnCode();
+  } else if (rec.type_ == ns::kOpChmod) {
+    auto f = self_.AsyncChmod(path, rec.mode_);
+    CLIO_CO_AWAIT(f);
+    rc = f->GetReturnCode();
+  } else if (rec.type_ == ns::kOpChown) {
+    auto f = self_.AsyncChown(path, rec.uid_, rec.gid_);
+    CLIO_CO_AWAIT(f);
+    rc = f->GetReturnCode();
+  } else if (rec.type_ == ns::kOpUtimens) {
+    const clio::run::u32 flags =
+        (rec.t1_ != 0 ? 1u : 0u) | (rec.t2_ != 0 ? 2u : 0u);
+    auto f = self_.AsyncUtimens(path, rec.t1_, rec.t2_, flags);
+    CLIO_CO_AWAIT(f);
+    rc = f->GetReturnCode();
+  } else if (rec.type_ == ns::kOpTruncate) {
+    auto f = self_.AsyncTruncate(path, rec.size_, rec.id_);
+    CLIO_CO_AWAIT(f);
+    rc = f->GetReturnCode();
+  } else {
+    rc = EINVAL;
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::NsDrain() {
+  CLIO_TASK_BODY_BEGIN
+  if (!ns_view_.Ready()) CLIO_CO_RETURN;
+  CLIO_CO_AWAIT(RefillNsIds());
+  {
+    constexpr size_t kCreateBatch = 256;
+    ns::OpRec rec;
+    std::string path;
+    std::string path2;
+    while (ns_view_.PeekOp(&rec, &path, &path2)) {
+      if (rec.type_ == ns::kOpCreate) {
+        // Consecutive creates go as one batch; the client minted each id.
+        std::vector<MultiCreateEnt> ents;
+        bool more = true;
+        while (more && ents.size() < kCreateBatch &&
+               rec.type_ == ns::kOpCreate) {
+          MultiCreateEnt e;
+          e.path_ = path;
+          e.tag_packed_ = rec.id_;
+          e.mode_ = rec.mode_;
+          e.ctime_ns_ = rec.t1_;
+          ents.push_back(std::move(e));
+          ns_view_.PopOp(rec.seq_);
+          more = ns_view_.PeekOp(&rec, &path, &path2);
+        }
+        auto f = self_.AsyncMultiCreate(EncodeMultiCreate(ents));
+        CLIO_CO_AWAIT(f);
+        if (f->first_rc_ != 0 || f->GetReturnCode() != 0) {
+          HLOG(kWarning, "filesystem: namespace drain: {} of {} creates "
+               "failed (first rc={})", ents.size() - f->num_ok_,
+               ents.size(), f->first_rc_);
+        }
+        if (!more) break;
+        continue;
+      }
+      clio::run::u32 rc = 0;
+      CLIO_CO_AWAIT(NsApplyOne(rec, path, path2, rc));
+      if (rc != 0) {
+        HLOG(kWarning, "filesystem: namespace drain: op {} on '{}' failed "
+             "(rc={})", rec.type_, path, rc);
+      }
+      ns_view_.PopOp(rec.seq_);
+    }
+  }
+  CLIO_CO_AWAIT(RefillNsIds());
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }

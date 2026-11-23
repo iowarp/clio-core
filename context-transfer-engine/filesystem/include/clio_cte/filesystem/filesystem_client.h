@@ -24,10 +24,12 @@
 #include <cerrno>
 #include <unordered_map>
 #include <vector>
+#include <memory>
 #include <mutex>
 #include <clio_cte/filesystem/filesystem_tasks.h>
 #include <clio_cte/stream/stream_client.h>
 #include <clio_cte/filesystem/fs_shard.h>
+#include <clio_cte/filesystem/fs_ns_shm.h>
 #include <clio_cte/filesystem/shm_fs_cache.h>
 
 namespace clio::cte::filesystem {
@@ -108,6 +110,7 @@ class Client : public clio::cte::core::Client {
     shm_fs_root_ = other.shm_fs_root_;
     fds_ = other.fds_;
     next_fd_ = other.next_fd_;
+    ns_view_ = other.ns_view_;
     page_score_ = other.page_score_;
     page_score_loaded_ = other.page_score_loaded_;
   }
@@ -131,6 +134,7 @@ class Client : public clio::cte::core::Client {
     shm_fs_root_ = other.shm_fs_root_;
     fds_ = other.fds_;
     next_fd_ = other.next_fd_;
+    ns_view_ = other.ns_view_;
     page_score_ = other.page_score_;
     page_score_loaded_ = other.page_score_loaded_;
     return *this;
@@ -179,8 +183,12 @@ class Client : public clio::cte::core::Client {
       return false;
     }
     shm_fs_root_ = root;
+    AttachNs();
     return true;
   }
+
+  /** Map the namespace segment the mirror names, once it is formatted. */
+  void AttachNs();
 
   bool HasShmCache() const { return shm_fs_root_ != nullptr; }
 
@@ -809,6 +817,105 @@ class Client : public clio::cte::core::Client {
     return ret;
   }
 
+  // ---- Namespace: the shared-memory namespace (fs_ns_shm.h) ----
+  //
+  // Every namespace operation of the native API and the FUSE adapter is one
+  // of these. With the namespace segment attached each runs in this process
+  // against shared memory -- no task; names this node has never seen are
+  // filled from the module once (a cold miss). Without it (TCP client,
+  // multi-node volume) each returns kNsUnavailable and the caller uses its
+  // task path. Other returns: 0 or a positive errno.
+
+  /** Returned by the Fs* namespace calls when no segment is attached. */
+  static constexpr int kNsUnavailable = -2;
+
+  /** @return the attached namespace view, or nullptr */
+  ns::View *Ns();
+
+  /**
+   * stat(2): the name's attributes; a file's size includes its pending
+   * (not yet drained) size.
+   * @param path bare path
+   * @param a receives the attributes
+   */
+  int FsStat(const std::string &path, ns::Attr *a);
+
+  /**
+   * Attributes of an open file by its id (fstat of a descriptor whose name
+   * has moved or gone).
+   * @param id the file's packed id
+   * @param a receives the attributes
+   * @return 0, ENOENT, or kNsUnavailable
+   */
+  int FsStatId(clio::run::u64 id, ns::Attr *a);
+
+  /**
+   * open(2)/creat(2) of a regular file. O_CREAT creates, O_EXCL is
+   * exclusive, O_TRUNC empties an existing file (FsTruncate).
+   * @param path bare path
+   * @param flags open flags
+   * @param mode permission bits for a new file
+   * @param a receives the file's attributes
+   * @param created set true when this call created the file
+   */
+  int FsOpen(const std::string &path, int flags, clio::run::u32 mode,
+             ns::Attr *a, bool *created);
+
+  /** mkdir(2). */
+  int FsMkdir(const std::string &path, clio::run::u32 mode);
+  /** rmdir(2). */
+  int FsRmdir(const std::string &path);
+  /** unlink(2). */
+  int FsUnlink(const std::string &path);
+  /** rename(2); noreplace = RENAME_NOREPLACE. */
+  int FsRename(const std::string &src, const std::string &dst,
+               bool noreplace);
+  /** link(2): dst becomes another name of src. */
+  int FsLink(const std::string &src, const std::string &dst);
+  /** symlink(2): path names a new link to target. */
+  int FsSymlink(const std::string &target, const std::string &path);
+  /** readlink(2). */
+  int FsReadlink(const std::string &path, std::string *target);
+  /** chmod(2). */
+  int FsChmod(const std::string &path, clio::run::u32 mode);
+  /** chown(2); 0xFFFFFFFF leaves a field alone. */
+  int FsChown(const std::string &path, clio::run::u32 uid, clio::run::u32 gid);
+  /** utimens(2); 0 leaves a time alone. */
+  int FsUtimens(const std::string &path, clio::run::u64 atime_ns,
+                clio::run::u64 mtime_ns);
+  /**
+   * truncate(2). A shrink waits for the module to cut the pages (a wait on
+   * the background drain, not a task): cached bytes past the new end must
+   * be gone before a later write or regrow can expose them.
+   */
+  int FsTruncate(const std::string &path, clio::run::u64 size);
+  /** readdir(2): every entry of a directory. */
+  int FsReaddir(const std::string &path, std::vector<ns::DirEnt> *out);
+  /**
+   * Wait until everything this node changed in the namespace so far has
+   * been applied at the homes (fsync's namespace half).
+   * @return 0, or EIO when it does not happen within the drain timeout
+   */
+  int FsWaitApplied();
+
+  /**
+   * Fill a path's missing components from the module, top down (a cold
+   * miss: a name this node has never seen).
+   * @param path bare path
+   * @return 0, or an errno
+   */
+  int NsFill(const std::string &path);
+
+  /**
+   * Fill a directory's whole listing and mark it complete.
+   * @param path bare directory path
+   * @return 0, or an errno
+   */
+  int NsFillDir(const std::string &path);
+
+  /** Longest wait for the background namespace drain (ms). */
+  static constexpr double kNsDrainWaitMs = 60000.0;
+
   // ---- Shared-memory data path (native API and FUSE share it) ----
 
   /**
@@ -907,6 +1014,20 @@ class Client : public clio::cte::core::Client {
    *         whether the file is there.
    */
   bool GetAttr(const std::string &path, bool *exists, clio::run::u64 *size) {
+    {
+      ns::Attr a;
+      const int nrc = FsStat(path, &a);
+      if (nrc != kNsUnavailable) {
+        if (nrc == 0) {
+          *exists = true;
+          *size = a.size;
+          return true;
+        }
+        *exists = false;
+        *size = 0;
+        return nrc == ENOENT || nrc == ENOTDIR;
+      }
+    }
     // Serve from the filesystem's shared-memory mirror when it has the path:
     // stat(2) is the most frequent metadata call a filesystem sees, and the
     // record the runtime publishes carries both answers. Writes are
@@ -1318,6 +1439,9 @@ class Client : public clio::cte::core::Client {
   mutable std::mutex fd_mu_;
   std::unordered_map<int, OpenFile> fds_;
   int next_fd_ = kCfsFdBase;
+  /** The namespace segment, attached with the mirror (shared by copies
+   *  of this client). */
+  std::shared_ptr<ns::View> ns_view_;
   /** Data-score rule for page writes (this filesystem's yaml), loaded on
    *  first write; guarded by fd_mu_. */
   clio::cte::core::PageScorePolicy page_score_;
