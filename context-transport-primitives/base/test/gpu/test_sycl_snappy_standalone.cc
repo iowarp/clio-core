@@ -86,8 +86,26 @@ int main(int argc, char **argv) {
     u32 cs = (u32)sl; memcpy(cont.data() + sizeof(Header), &cs, sizeof(u32));
     memcpy(cont.data() + sizeof(Header) + sizeof(u32), sc.data(), sl);
     std::vector<u8> out(clen); size_t os = 0;
-    dec_ok = clio_sycl_snappy_decompress(q, cont.data(), cont.size(), out.data(), clen, &os)
-             && os == clen && !memcmp(out.data(), orig.data(), clen);
+    if (sl >= clen) {
+      // Incompressible: libsnappy's block is LARGER than the chunk. The SYCL
+      // encoder stores such a chunk raw; the decoder must REJECT the oversized
+      // block (it would overrun its chunk-sized local buffer) and accept the
+      // stored-raw form of the same chunk.
+      bool rejected = !clio_sycl_snappy_decompress(q, cont.data(), cont.size(),
+                                                   out.data(), clen, &os);
+      std::vector<u8> st(sizeof(Header) + sizeof(u32) + clen);
+      memcpy(st.data(), &h, sizeof(Header));
+      u32 rs = clen | kStoredFlag; memcpy(st.data() + sizeof(Header), &rs, sizeof(u32));
+      memcpy(st.data() + sizeof(Header) + sizeof(u32), orig.data(), clen);
+      dec_ok = rejected &&
+               clio_sycl_snappy_decompress(q, st.data(), st.size(), out.data(), clen, &os) &&
+               os == clen && !memcmp(out.data(), orig.data(), clen);
+      std::printf("    (incompressible: oversized block %s, raw form %s)\n",
+                  rejected ? "rejected" : "ACCEPTED", dec_ok ? "ok" : "bad");
+    } else {
+      dec_ok = clio_sycl_snappy_decompress(q, cont.data(), cont.size(), out.data(), clen, &os)
+               && os == clen && !memcmp(out.data(), orig.data(), clen);
+    }
   }
   std::printf("[c] libsnappy block decodes via SYCL %s\n", dec_ok ? "PASS" : "FAIL");
   double gb = n / 1e9;

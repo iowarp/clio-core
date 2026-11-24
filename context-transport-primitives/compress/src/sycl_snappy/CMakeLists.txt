@@ -37,3 +37,9 @@ target_link_options(clio_ctp_sycl_snappy INTERFACE -fsycl)
 if(SYCL_TARGET)
   target_link_options(clio_ctp_sycl_snappy INTERFACE -fsycl-targets=${SYCL_TARGET})
 endif()
+# AOT (spir64_gen, e.g. Aurora's PVC): the device image is finalized at the
+# CONSUMER's link, so the consumer link needs the same -device as the compile.
+if(SYCL_TARGET STREQUAL "spir64_gen" AND SYCL_DEVICE)
+  target_link_options(clio_ctp_sycl_snappy INTERFACE
+      "SHELL:-Xsycl-target-backend \"-device ${SYCL_DEVICE}\"")
+endif()

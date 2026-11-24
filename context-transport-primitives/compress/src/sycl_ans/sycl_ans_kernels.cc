@@ -23,6 +23,8 @@
 
 #include <sycl/sycl.hpp>
 
+#include <algorithm>
+
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -335,11 +337,23 @@ int clio_sycl_ans_decompress(void *qbv, const void *src, size_t src_size,
     std::vector<u32> csize(nc);
     if (nc) q.memcpy(csize.data(), d_src + sizeof(Header),
                      (size_t)nc * sizeof(u32)).wait();
+    // Validate the size table BEFORE launch. The encoder stores a chunk raw
+    // whenever compression does not shrink it, so a valid stream never has a
+    // block larger than its chunk; a foreign or corrupt one can, and the
+    // decoder's chunk-sized buffers (and dst) would be overrun. Reject it.
+    if (chunk_size == 0 || chunk_size > kChunkSize ||
+        (u64)nc * chunk_size < orig ||
+        (nc && (u64)(nc - 1) * chunk_size >= orig))
+      throw std::runtime_error("bad geometry");
     std::vector<u32> coff(nc);
     u64 acc = 0;
     for (u32 c = 0; c < nc; ++c) {
+      const u32 raw = csize[c] & ~kStoredFlag;
+      const u64 dlen = std::min<u64>(chunk_size, orig - (u64)c * chunk_size);
+      if (raw > chunk_size || ((csize[c] & kStoredFlag) && raw != dlen))
+        throw std::runtime_error("bad chunk size");
       coff[c] = (u32)acc;
-      acc += (csize[c] & ~kStoredFlag);
+      acc += raw;
     }
     if (hdr + acc > src_size) throw std::runtime_error("payload short");
 
