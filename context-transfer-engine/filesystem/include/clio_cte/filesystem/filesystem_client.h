@@ -943,6 +943,30 @@ class Client : public clio::cte::core::Client {
    * regrows, and a grow's zero-fill must not land after later writes.
    */
   int FsTruncate(const std::string &path, clio::run::u64 size);
+  /** fallocate(2) mode bits (the Linux values). */
+  static constexpr clio::run::u32 kFallocKeepSize = 0x01;
+  static constexpr clio::run::u32 kFallocZeroRange = 0x10;
+
+  /**
+   * fallocate(2). Page blobs are created on write and holes read as zeros,
+   * so nothing is reserved ahead of time:
+   *  - mode 0: grow the file to off + len (never shrinks);
+   *  - kFallocKeepSize: no size change;
+   *  - kFallocZeroRange: [off, off + len) reads as zeros afterwards (written
+   *    as zeros; with kFallocKeepSize the size is restored if it grew).
+   * A request larger than the store's remaining capacity fails with ENOSPC
+   * now, as on ext4. Layout-changing modes (punch, collapse, insert) are
+   * EOPNOTSUPP.
+   * @param tag the file's tag
+   * @param path the file's path
+   * @param mode fallocate mode bits
+   * @param off offset
+   * @param len length
+   * @return 0, an errno, or kNsUnavailable
+   */
+  int FsFallocate(const clio::cte::core::TagId &tag, const std::string &path,
+                  clio::run::u32 mode, clio::run::u64 off, clio::run::u64 len);
+
   /** readdir(2): every entry of a directory. */
   int FsReaddir(const std::string &path, std::vector<ns::DirEnt> *out);
   /**
@@ -991,6 +1015,22 @@ class Client : public clio::cte::core::Client {
    * @return 0, or an errno
    */
   int NsFillDir(const std::string &path);
+
+  /**
+   * Open a file's unsynced-write window (issue #1133) if it is not open:
+   * the first write after an fsync. SyncDurable then fails with EIO when a
+   * node that may have held those bytes died since the window opened.
+   * @param tag the file's tag (null: nothing to track)
+   */
+  static void UnsyncedNote(const clio::cte::core::TagId &tag);
+
+  /**
+   * Make one tag durable (SyncTagDurable) and apply its unsynced-write
+   * window (see UnsyncedNote).
+   * @param tag the tag (null is a no-op)
+   * @return 0, -ENOSPC when no persistent tier had room, or -EIO
+   */
+  int SyncTagWindow(const clio::cte::core::TagId &tag);
 
   /** Longest wait for the background namespace drain (ms). */
   static constexpr double kNsDrainWaitMs = 60000.0;

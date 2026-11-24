@@ -16,6 +16,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace clio::cte::filesystem {
@@ -196,6 +197,7 @@ FsSsize Client::WritePages(const clio::cte::core::TagId &tag,
     done += n;
   }
   const clio::run::u64 end = off + done;
+  if (done > 0) UnsyncedNote(tag);
   const clio::run::u64 wtime =
       static_cast<clio::run::u64>(clio::cte::core::GetWallTimeNs());
   *size_recorded = shm_fs_root_ != nullptr &&
@@ -573,6 +575,7 @@ int Client::FsAppend(const clio::cte::core::TagId &tag,
   }
   // Always: the generation's in-flight count must drop for it to merge.
   v->AppendStaged(path, id, gen);
+  if (rc == 0) UnsyncedNote(tag);
   if (rc == 0) *written = static_cast<FsSsize>(count);
   return rc;
 }
@@ -819,6 +822,47 @@ int Client::FsTruncate(const std::string &path, clio::run::u64 size) {
   (void)old_size;
   if (!v->WaitApplied(seq, kNsDrainWaitMs)) return EIO;
   return 0;
+}
+
+int Client::FsFallocate(const clio::cte::core::TagId &tag,
+                        const std::string &path, clio::run::u32 mode,
+                        clio::run::u64 off, clio::run::u64 len) {
+  if (Ns() == nullptr) return kNsUnavailable;
+  if ((mode & ~(kFallocKeepSize | kFallocZeroRange)) != 0) return EOPNOTSUPP;
+  if (len == 0) return EINVAL;
+  clio::run::u64 size = 0;
+  int rc = -FileSizeOf(tag, path, &size);
+  if (rc != 0) return rc;
+  if (mode & kFallocZeroRange) {
+    // Holes read as zeros, but bytes already written must be cleared.
+    static const std::vector<char> zeros(kFsPageSize, 0);
+    for (clio::run::u64 done = 0; done < len;) {
+      const size_t n = static_cast<size_t>(
+          std::min<clio::run::u64>(len - done, kFsPageSize));
+      bool recorded = true;
+      const FsSsize w = WritePages(tag, off + done, zeros.data(), n, &recorded);
+      if (w <= 0) return w < 0 ? static_cast<int>(-w) : EIO;
+      if (!recorded) {
+        auto t = AsyncAdvanceSize(PackTag(tag), off + done + w);
+        t.Wait();
+      }
+      done += static_cast<clio::run::u64>(w);
+    }
+    if ((mode & kFallocKeepSize) && off + len > size) {
+      return FsTruncate(path, size);  // the zero writes may not grow it
+    }
+    return 0;
+  }
+  // The space is promised: a request the store cannot hold fails now.
+  {
+    auto t = Cte()->AsyncGetCapacity(clio::run::PoolQuery::Broadcast());
+    t.Wait();
+    if (t->GetReturnCode() == 0 && len > t->remaining_capacity_) {
+      return ENOSPC;
+    }
+  }
+  if (mode & kFallocKeepSize) return 0;
+  return off + len > size ? FsTruncate(path, off + len) : 0;
 }
 
 int Client::FsReaddir(const std::string &path, std::vector<ns::DirEnt> *out) {
@@ -1259,14 +1303,82 @@ clio::cte::core::TagId Client::TagOfPath(const std::string &path,
   return FsUnpack(t->ino_);
 }
 
+// Unsynced-write windows (issue #1133). With replication_factor 1 the bytes
+// a node holds between two fsyncs (RAM tier, write-behind) die with it, and
+// failover makes the next SyncTag succeed on the survivors. So each file
+// written since its last fsync remembers when (wall clock) that window
+// opened; fsync fails with EIO when a peer that has since died was last
+// heard from after the window opened (SyncTagTask::liveness_change_ns_) --
+// it may have accepted, and lost, some of those bytes. Conservative: the
+// node may have held none of them. Reported once, like Linux's errseq.
+namespace {
+std::mutex &UnsyncedMu() {
+  static std::mutex mu;
+  return mu;
+}
+std::unordered_map<clio::run::u64, clio::run::u64> &Unsynced() {
+  static std::unordered_map<clio::run::u64, clio::run::u64> m;
+  return m;
+}
+
+/**
+ * Close a file's unsynced window (taken BEFORE the sync, so a write racing
+ * it opens a new one).
+ * @param tag the file's tag
+ * @param opened_ns receives the wall-clock ns the window opened at
+ * @return true if the file had a window
+ */
+bool UnsyncedTake(const clio::cte::core::TagId &tag,
+                  clio::run::u64 *opened_ns) {
+  std::lock_guard<std::mutex> g(UnsyncedMu());
+  auto it = Unsynced().find(PackTag(tag));
+  if (it == Unsynced().end()) return false;
+  *opened_ns = it->second;
+  Unsynced().erase(it);
+  return true;
+}
+}  // namespace
+
+void Client::UnsyncedNote(const clio::cte::core::TagId &tag) {
+  if (tag.IsNull()) return;
+  std::lock_guard<std::mutex> g(UnsyncedMu());
+  Unsynced().emplace(PackTag(tag), NowNs());  // keeps an open window
+}
+
+int Client::SyncTagWindow(const clio::cte::core::TagId &tag) {
+  if (FsyncDeferred() || tag.IsNull()) return 0;
+  clio::run::u64 opened_ns = 0;
+  const bool unsynced = UnsyncedTake(tag, &opened_ns);
+  bool lost_node = false;
+  clio::run::u64 liveness_ns = 0;
+  const int rc = SyncTagDurable(tag, &lost_node, &liveness_ns);
+  if (rc != 0) return rc;
+  // The live containers synced. A container whose node is down answers with
+  // the lost-node code; once the cluster declares the node dead the sync
+  // routes around it and succeeds. Either way, bytes written since the last
+  // fsync that the node held are gone (#1133): fail if the window saw one.
+  const bool moved = liveness_ns >= opened_ns;
+  if (unsynced && (lost_node || moved)) {
+    HLOG(kError, "clio-fs: fsync of tag {}.{}: a node {} while the file had "
+         "unsynced writes; they may be lost, reporting EIO", tag.major_,
+         tag.minor_, lost_node ? "is down" : "died");
+    return -EIO;
+  }
+  if (lost_node) {
+    HLOG(kWarning, "clio-fs: fsync of tag {}.{}: a container's node is down; "
+         "the file had no unsynced writes", tag.major_, tag.minor_);
+  }
+  return 0;
+}
+
 int Client::SyncDurable(const clio::cte::core::TagId &tag,
                         const std::string &dir) {
-  int rc = SyncTagDurable(tag);
+  int rc = SyncTagWindow(tag);
   if (rc != 0) return rc;
   if (FsyncDeferred()) return 0;
   rc = SyncFileSize(tag);
   if (rc != 0) return rc;
-  rc = SyncTagDurable(TagOfPath(dir, /*want_dir=*/true));
+  rc = SyncTagWindow(TagOfPath(dir, /*want_dir=*/true));
   if (rc != 0) return rc;
   return SyncMetaDurable();
 }

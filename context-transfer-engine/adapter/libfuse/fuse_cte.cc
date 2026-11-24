@@ -625,111 +625,6 @@ static int FlushReplicationBarrier(const clio::cte::core::TagId &tag) {
   return fut->GetReturnCode() == 0 ? 0 : -EIO;
 }
 
-// Unsynced-write windows (issue #1133). With replication_factor 1 the bytes
-// a node holds between two fsyncs (RAM tier, write-behind) die with it, and
-// failover makes the next SyncTag succeed on the survivors. So each file
-// written since its last fsync remembers when (wall clock) that window
-// opened; fsync fails with EIO when a peer that has since died was last
-// heard from after the window opened (SyncTagTask::liveness_change_ns_) --
-// it may have accepted, and lost, some of those bytes. Writes made after
-// it went silent went to live successors and fsync cleanly. Conservative:
-// the node may have held none of them. Reported once, like Linux's errseq.
-static std::mutex g_unsynced_mtx;
-static std::unordered_map<clio::run::u64, clio::run::u64> g_unsynced;
-
-/**
- * Note that `tag` was written and is not yet fsynced; the first write after
- * an fsync opens the window at the current wall-clock time.
- * @param tag the file's tag (null: nothing to track)
- */
-static void UnsyncedNote(const clio::cte::core::TagId &tag) {
-  if (tag.IsNull()) return;
-  const clio::run::u64 k = PackTag(tag);
-  std::lock_guard<std::mutex> lk(g_unsynced_mtx);
-  if (g_unsynced.count(k) != 0) return;
-  g_unsynced.emplace(
-      k, static_cast<clio::run::u64>(
-             std::chrono::duration_cast<std::chrono::nanoseconds>(
-                 std::chrono::system_clock::now().time_since_epoch())
-                 .count()));
-}
-
-/**
- * Close `tag`'s unsynced window (taken BEFORE the sync, so a write racing
- * it opens a new one).
- * @param tag the file's tag
- * @param opened_ns receives the wall-clock ns the window opened at
- * @return true if the tag had a window
- */
-static bool UnsyncedTake(const clio::cte::core::TagId &tag,
-                         clio::run::u64 *opened_ns) {
-  const clio::run::u64 k = PackTag(tag);
-  std::lock_guard<std::mutex> lk(g_unsynced_mtx);
-  auto it = g_unsynced.find(k);
-  if (it == g_unsynced.end()) return false;
-  *opened_ns = it->second;
-  g_unsynced.erase(it);
-  return true;
-}
-
-/**
- * Make one CTE tag durable (the filesystem client's SyncTagDurable), and
- * apply this mount's unsynced-write window (#1133) on top.
- * @param tag the tag (null is a no-op)
- * @return 0, -ENOSPC when no persistent tier had room, or -EIO
- */
-static int SyncOneTag(const clio::cte::core::TagId &tag) {
-  using clio::cte::filesystem::Client;
-  if (Client::FsyncDeferred()) return 0;
-  if (CLIO_CFS_CLIENT->Cte() == nullptr || tag.IsNull()) return 0;
-  clio::run::u64 opened_ns = 0;
-  const bool unsynced = UnsyncedTake(tag, &opened_ns);
-  bool lost_node = false;
-  clio::run::u64 liveness_ns = 0;
-  int rc = Client::SyncTagDurable(tag, &lost_node, &liveness_ns);
-  if (rc != 0 || Client::FsyncDeferred()) return rc;
-  // The live containers synced. A container whose node is down answers with
-  // the lost-node code; once the cluster declares the node dead the sync
-  // routes around it and succeeds. Either way, bytes written since the last
-  // fsync that the node held are gone (#1133): fail if the window saw one.
-  const bool moved = liveness_ns >= opened_ns;
-  if (unsynced && (lost_node || moved)) {
-    HLOG(kError, "clio_cte_fuse: fsync of tag {}.{}: a node {} while the "
-         "file had unsynced writes; they may be lost, reporting EIO",
-         tag.major_, tag.minor_,
-         lost_node ? "is down" : "died");
-    return -EIO;
-  }
-  if (lost_node) {
-    HLOG(kWarning, "clio_cte_fuse: fsync of tag {}.{}: a container's node "
-         "is down; the file had no unsynced writes", tag.major_, tag.minor_);
-  }
-  return 0;
-}
-
-/**
- * fsync(2)'s durability step, as the filesystem client's SyncDurable but
- * through this mount's SyncOneTag: the file's blobs, its size, then the
- * directory blocks naming it.
- * @param tag the file's tag (null: only the directory)
- * @param dir the directory whose entries must be durable
- * @return 0, -ENOSPC when no persistent tier had room, or -EIO
- */
-static int SyncDurable(const clio::cte::core::TagId &tag,
-                       const std::string &dir) {
-  using clio::cte::filesystem::Client;
-  int rc = SyncOneTag(tag);
-  if (rc != 0) return rc;
-  if (Client::FsyncDeferred()) return 0;
-  rc = Client::SyncFileSize(tag);
-  if (rc != 0) return rc;
-  auto *cfs = CLIO_CFS_CLIENT;
-  if (cfs == nullptr) return 0;
-  rc = SyncOneTag(cfs->TagOfPath(dir, /*want_dir=*/true));
-  if (rc != 0) return rc;
-  return cfs->SyncMetaDurable();  // the directory journal
-}
-
 // Logical-size high-water for files written through direct page puts: the chimod
 // only learns the size at close (CloseTask::advance_size_), so getattr and
 // read-clamping consult this in the meantime. Path-keyed; renames move the
@@ -4156,7 +4051,7 @@ int cte_fuse_fsync(const char *path, int /*datasync*/,
   }
   // Everything above landed the bytes on the store; fsync's contract is
   // that they are ON A PERSISTENT DEVICE when it returns.
-  return SyncDurable(handle != nullptr ? handle->tag
+  return CLIO_CFS_CLIENT->SyncDurable(handle != nullptr ? handle->tag
                                        : clio::cte::core::TagId::GetNull(),
                      clio::cte::filesystem::FsParentDir(p));
 }
@@ -4173,7 +4068,7 @@ int cte_fuse_fsyncdir(const char *path, int /*datasync*/,
   // A directory's entries live in blocks in its own tag: syncing it makes
   // creates, renames and unlinks under the directory durable (the
   // write-tmp, fsync, rename, fsync-dir pattern).
-  return SyncDurable(clio::cte::core::TagId::GetNull(),
+  return CLIO_CFS_CLIENT->SyncDurable(clio::cte::core::TagId::GetNull(),
                      path != nullptr ? std::string(path) : std::string("/"));
 }
 
@@ -4480,7 +4375,6 @@ static int WriteDirect(CfsHandle *handle, const std::string &hp,
   const clio::cte::filesystem::FsSsize n = CLIO_CFS_CLIENT->WritePages(
       handle->tag, static_cast<clio::run::u64>(offset), buf, size, &recorded);
   if (n < 0) return static_cast<int>(n);
-  UnsyncedNote(handle->tag);
   if (!recorded) {
     HiwaterRaise(hp, static_cast<clio::run::u64>(offset) +
                          static_cast<clio::run::u64>(n));
@@ -4530,14 +4424,13 @@ int cte_fuse_write(const char *path, const char *buf, size_t size,
     const int arc = CLIO_CFS_CLIENT->FsAppend(handle->tag, hp, buf, size, &n);
     if (arc != clio::cte::filesystem::Client::kNsUnavailable) {
       if (arc != 0) return -arc;
-      UnsyncedNote(handle->tag);
       return static_cast<int>(n);
     }
   }
   if (handle->append && !handle->tag.IsNull() &&
       AppendModeOf() == AppendMode::kDeferred &&
       clio::cte::filesystem::FsIdHasHome(PackTag(handle->tag))) {
-    UnsyncedNote(handle->tag);
+    clio::cte::filesystem::Client::UnsyncedNote(handle->tag);
     return DeferredAppend(handle, buf, size);
   }
   if (handle->append && !handle->tag.IsNull() &&
@@ -4555,7 +4448,7 @@ int cte_fuse_write(const char *path, const char *buf, size_t size,
     return WriteDirect(handle, hp, cte, buf, size, offset);
   }
   auto *cfs = CLIO_CFS_CLIENT;
-  UnsyncedNote(handle->tag);
+  clio::cte::filesystem::Client::UnsyncedNote(handle->tag);
   ssize_t wrote = CfsWriteCompat(cfs, handle->fh, hp,
                                  static_cast<clio::run::u64>(offset), buf,
                                  size);
@@ -4736,6 +4629,28 @@ static int cte_fuse_fallocate(const char *path, int mode, cte_off_t offset,
                               cte_off_t length, struct fuse_file_info *fi) {
   g_setattr_epoch.fetch_add(1);  // attributes kept from a create are stale
   RaAllGuard ra_guard;  // read-ahead pages are dropped again once it is done
+  if (NsOn()) {
+    if (offset < 0 || length <= 0) return -EINVAL;
+    CfsHandle *h = fi != nullptr ? GetHandle(fi) : nullptr;
+    clio::cte::filesystem::ns::Attr a;
+    clio::cte::core::TagId tag =
+        h != nullptr ? h->tag : clio::cte::core::TagId::GetNull();
+    if (tag.IsNull()) {
+      const int src = CLIO_CFS_CLIENT->FsStat(path, &a);
+      if (src != 0) return -src;
+      tag = clio::cte::filesystem::FsUnpack(a.id);
+    }
+    const int nrc = CLIO_CFS_CLIENT->FsFallocate(
+        tag, h != nullptr ? HandlePath(h, path) : std::string(path),
+        static_cast<clio::run::u32>(mode), static_cast<clio::run::u64>(offset),
+        static_cast<clio::run::u64>(length));
+    // The kernel drops its own cached pages only for PUNCH_HOLE: zeros
+    // written here must invalidate them (generic/075 fsx).
+    if (nrc == 0 && (mode & FALLOC_FL_ZERO_RANGE) && path != nullptr) {
+      InvalidatePath(std::string(path));
+    }
+    return -nrc;
+  }
   const int kSupportedModes = FALLOC_FL_KEEP_SIZE | FALLOC_FL_ZERO_RANGE;
   if (mode & ~kSupportedModes) {
     return -EOPNOTSUPP;  // punch/collapse/insert: layout-changing
