@@ -567,6 +567,8 @@ class Runtime : public clio::run::Container {
   clio::run::u32 next_minor_ = 1;     ///< next id minor (guarded by meta_mu_)
   clio::run::u32 minted_hi_ = 0;      ///< durably reserved up to (meta_mu_)
   bool reserving_ = false;            ///< a reservation write is in flight
+  /** A RefillNsIds is running (the drain and kShardNsIds both call it). */
+  std::atomic<bool> ns_refilling_{false};
   clio::run::u32 num_containers_ = 0; ///< pool size, fetched lazily
 
   // ---- deferred data purge (unlinked files' pages + xattrs) ----
@@ -1950,6 +1952,7 @@ enum FsShardOp : clio::run::u32 {
   kShardInodeCreate = 23,   ///< store a new file's record, keep it resident and open it
   kShardInodeDiscard = 24,  ///< undo kShardInodeCreate: close its handle, drop its record
   kShardNsDrain = 25,       ///< periodic (fast): apply the shm namespace log
+  kShardNsIds = 26,         ///< periodic: top up the shm namespace's inode ids
 };
 
 /** Insert flags (FsReq::flags_ of kTableInsert). */

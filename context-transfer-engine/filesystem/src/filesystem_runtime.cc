@@ -399,6 +399,12 @@ void Runtime::EnsurePurgeDrain() {
   if (ns_view_.Ready()) {
     self_.AsyncShardOp(kShardNsDrain, std::string(),
                        clio::run::PoolQuery::Local(), 100.0);
+    // Periodic (1 ms): the clients' inode-id block, refilled on its own. The
+    // drain also refills, but only between log ops: one op stuck behind a
+    // slow chain call (a delete waiting on the shm cache's flush) left the
+    // clients without ids, and every create failed EIO after 10 s.
+    self_.AsyncShardOp(kShardNsIds, std::string(),
+                       clio::run::PoolQuery::Local(), 1000.0);
   }
 }
 

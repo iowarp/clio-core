@@ -468,12 +468,22 @@ int NsRetry(Client *cfs, std::initializer_list<const std::string *> paths,
       const double ms = std::chrono::duration<double, std::milli>(
                             std::chrono::steady_clock::now() - t0)
                             .count();
-      if (ms >= kNsIdWaitMs) return EIO;
+      if (ms >= kNsIdWaitMs) {
+        HLOG(kError, "filesystem: no inode id block after {:.0f} ms (the "
+             "module did not refill it); reporting EIO for '{}'", ms,
+             paths.size() != 0 ? **paths.begin() : std::string());
+        return EIO;
+      }
       std::this_thread::sleep_for(std::chrono::microseconds(500));
       continue;
     }
     if (rc != ns::kMiss) return rc;
-    if (++round > kNsFillRounds) return EIO;
+    if (++round > kNsFillRounds) {
+      HLOG(kError, "filesystem: namespace still missing '{}' after {} fill "
+           "rounds; reporting EIO",
+           paths.size() != 0 ? **paths.begin() : std::string(), kNsFillRounds);
+      return EIO;
+    }
     for (const std::string *p : paths) {
       const int frc = cfs->NsFill(*p);
       if (frc != 0) return frc;

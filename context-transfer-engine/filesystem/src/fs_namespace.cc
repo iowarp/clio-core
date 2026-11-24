@@ -248,6 +248,8 @@ clio::run::TaskResume Runtime::ShardOp(clio::run::shared_ptr<ShardOpTask> &task)
   FsResp resp;
   if (task->op_ == kShardNsDrain) {
     CLIO_CO_AWAIT(NsFastTick());
+  } else if (task->op_ == kShardNsIds) {
+    CLIO_CO_AWAIT(RefillNsIds());
   } else if (task->op_ == kShardPurgeDrain) {
     CLIO_CO_AWAIT(SizeDrain());
     CLIO_CO_AWAIT(ExpireAppendRanges());
@@ -995,14 +997,32 @@ clio::run::TaskResume Runtime::MergeAppends(clio::run::u64 id) {
 
 clio::run::TaskResume Runtime::RefillNsIds() {
   CLIO_TASK_BODY_BEGIN
-  // Top the block up while half of it is left, so clients never wait.
-  constexpr clio::run::u32 kNsIdBlock = 8192;
+  // Top the block up while half of it is left, so clients never wait. A
+  // checkout creates ~700 files/s: half a block is ~23 s of slack.
+  constexpr clio::run::u32 kNsIdBlock = 32768;
   if (!ns_view_.Ready() || ns_view_.IdsLeft() >= kNsIdBlock / 2) {
     CLIO_CO_RETURN;
   }
+  // One refill at a time: a second would replace the first's fresh block.
+  if (ns_refilling_.exchange(true, std::memory_order_acq_rel)) {
+    CLIO_CO_RETURN;
+  }
   bool ok = false;
+  const auto t_reserve = std::chrono::steady_clock::now();
   CLIO_CO_AWAIT(EnsureIdReserve(kNsIdBlock, ok));
-  if (!ok) CLIO_CO_RETURN;  // retried next period
+  {
+    const double ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - t_reserve)
+                          .count();
+    if (ms > 1000.0) {
+      HLOG(kWarning, "filesystem: reserving inode ids took {:.0f} ms ({} "
+           "left in the clients' block, ok={})", ms, ns_view_.IdsLeft(), ok);
+    }
+  }
+  if (!ok) {
+    ns_refilling_.store(false, std::memory_order_release);
+    CLIO_CO_RETURN;  // retried next period
+  }
   {
     clio::run::u32 major = 0;
     clio::run::u64 first = 0;
@@ -1020,6 +1040,7 @@ clio::run::TaskResume Runtime::RefillNsIds() {
     }
     if (have) ns_view_.SetIdBlock(major, first, kNsIdBlock);
   }
+  ns_refilling_.store(false, std::memory_order_release);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
