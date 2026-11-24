@@ -205,16 +205,17 @@ std::unique_ptr<BaseAssimilator> AssimilatorFactory::Get(
 }
 
 std::string AssimilatorFactory::GetUrlProtocol(const std::string& url) {
-  // Check for standard URI format first (e.g., "globus://")
-  size_t pos_standard = url.find("://");
+  // Standard URI format (e.g., "globus://") or custom format (e.g.,
+  // "file::"), whichever separator comes first: "dataverse::https://host/pid"
+  // is the dataverse protocol wrapping a URL, not protocol "dataverse::https".
+  const size_t pos_standard = url.find("://");
+  const size_t pos_custom = url.find("::");
+  if (pos_custom != std::string::npos &&
+      (pos_standard == std::string::npos || pos_custom < pos_standard)) {
+    return url.substr(0, pos_custom);
+  }
   if (pos_standard != std::string::npos) {
     return url.substr(0, pos_standard);
-  }
-
-  // Fall back to custom format (e.g., "file::")
-  size_t pos_custom = url.find("::");
-  if (pos_custom != std::string::npos) {
-    return url.substr(0, pos_custom);
   }
 
   return "";

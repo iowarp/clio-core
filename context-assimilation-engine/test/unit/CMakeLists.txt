@@ -529,6 +529,24 @@ if(NOT WIN32 AND ZLIB_FOUND)
     )
     install(TARGETS cae_dataverse_stage_test DESTINATION bin)
   endif()
+
+  # The same sources through a runtime (ParseOmni): dataverse:// and http(s)
+  # zips ingested into CTE, HDF5 members through the HDF5 assimilator.
+  if(HDF5_ENABLED AND TARGET clio_cae_core_runtime)
+    find_package(Threads REQUIRED)
+    add_cae_unit_test(cae_dataverse_ingest
+      ${CMAKE_CURRENT_SOURCE_DIR}/dataverse/test_dataverse_ingest.cc
+      EXTRA_LIBS ${HDF5_LIBRARIES} ZLIB::ZLIB Threads::Threads
+      EXTRA_INCLUDES ${HDF5_INCLUDE_DIRS}
+                     ${CMAKE_SOURCE_DIR}/context-runtime/test  # simple_test.h
+    )
+    set_target_properties(cae_dataverse_ingest PROPERTIES
+      CXX_STANDARD 20
+      CXX_STANDARD_REQUIRED ON
+    )
+    set_tests_properties(cae_dataverse_ingest PROPERTIES
+      LABELS "cae;http;hdf5;msan_skip")
+  endif()
 endif()
 
 #------------------------------------------------------------------------------
