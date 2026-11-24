@@ -564,6 +564,11 @@ int Client::FsAppend(const clio::cte::core::TagId &tag,
     v->AppendUnlock(id);
     return rc;
   }
+  // Several nodes: the stream path (staged at the file's stream home and
+  // merged there), as before 213b097f7. The merge below lost acknowledged
+  // appends with 4 writing nodes (clio_fs_suite xnode_append_burst,
+  // append_home_restart); CLIO_CFS_APPEND_MERGE=1 opts in to it.
+  if (!v->NamespaceOn() && !AppendMergeForced()) return kNsUnavailable;
   // Merge path: stage into this node's append blob (shared-memory puts),
   // then log it; the module merges it at the file's end in the background.
   clio::run::u32 gen = 0;

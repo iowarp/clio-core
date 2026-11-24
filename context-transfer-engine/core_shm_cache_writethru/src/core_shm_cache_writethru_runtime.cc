@@ -79,6 +79,24 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   // through `task` is undefined behaviour, which UBSan reports.
   auto &fields = task.template Cast<clio::run::admin::CreatePoolFields>();
   config_ = fields->GetParamsAs<WtcConfig>();
+  // Data mode is single-node only for now. On a multi-node volume cached
+  // bytes went stale or read as zeros after another node's fsynced
+  // overwrite, and a flush to a dead home failed fsync with EIO (HomeOf
+  // does not fail over): clio_fs_suite cache_*_storm, *_page_owner_down.
+  // Metadata-only there, as before d96de3237. CLIO_WTC_MULTINODE_DATA=1
+  // keeps data mode for testing.
+  {
+    auto *ipc = CLIO_IPC;
+    const char *keep = clio::run::env::GetCompat("WTC_MULTINODE_DATA");
+    if (!config_.md_only_ && ipc != nullptr && ipc->GetNumHosts() > 1 &&
+        !(keep != nullptr && *keep == '1')) {
+      HLOG(kWarning, "core_shm_cache_writethru {}: data mode is single-node "
+           "only; caching metadata only on this {}-node volume "
+           "(CLIO_WTC_MULTINODE_DATA=1 overrides)", pool_id_.ToString(),
+           ipc->GetNumHosts());
+      config_.md_only_ = true;
+    }
+  }
   interposer_next_pool_ = config_.next_pool_id_;
   next_client_ = std::make_unique<clio::cte::core::Client>(CorePoolId());
   if (!config_.data_pool_.IsNull() && !config_.md_only_ &&
