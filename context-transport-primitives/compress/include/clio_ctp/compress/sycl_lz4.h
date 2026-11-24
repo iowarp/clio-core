@@ -9,6 +9,7 @@
 #if CTP_ENABLE_COMPRESS && CTP_ENABLE_SYCL_LZ4
 
 #include <cstddef>
+#include <vector>
 
 #include "compress.h"
 
@@ -23,6 +24,14 @@ int clio_sycl_lz4_compress(void *q, const void *src, size_t src_size, void *dst,
                            size_t dst_cap, size_t *out);
 int clio_sycl_lz4_decompress(void *q, const void *src, size_t src_size,
                              void *dst, size_t dst_cap, size_t *out);
+int clio_sycl_lz4_compress_batch(void *q, size_t n, const void *const *srcs,
+                                 const size_t *src_sizes, void *const *dsts,
+                                 const size_t *dst_caps, size_t *out_sizes,
+                                 int *oks);
+int clio_sycl_lz4_decompress_batch(void *q, size_t n, const void *const *srcs,
+                                   const size_t *src_sizes, void *const *dsts,
+                                   const size_t *dst_caps, size_t *out_sizes,
+                                   int *oks);
 }
 
 namespace ctp {
@@ -79,7 +88,44 @@ class SyclLz4 : public Compressor {
     return true;
   }
 
+  /** ONE launch per phase for the whole batch (nvcomp's batched model). */
+  bool CompressBatch(CompressJob *jobs, size_t n) override {
+    return RunBatch(jobs, n, /*compress=*/true);
+  }
+  bool DecompressBatch(CompressJob *jobs, size_t n) override {
+    return RunBatch(jobs, n, /*compress=*/false);
+  }
+
  private:
+  bool RunBatch(CompressJob *jobs, size_t n, bool compress) {
+    if (n == 0) return true;
+    if (!queue_) {
+      for (size_t i = 0; i < n; ++i) { jobs[i].ok = false; jobs[i].out_size = 0; }
+      return false;
+    }
+    std::vector<const void *> src(n);
+    std::vector<void *> dst(n);
+    std::vector<size_t> ssz(n), cap(n), out(n, 0);
+    std::vector<int> ok(n, 0);
+    for (size_t i = 0; i < n; ++i) {
+      src[i] = jobs[i].src;
+      ssz[i] = jobs[i].src_size;
+      dst[i] = jobs[i].dst;
+      cap[i] = jobs[i].dst_capacity;
+    }
+    auto fn = compress ? &clio_sycl_lz4_compress_batch
+                       : &clio_sycl_lz4_decompress_batch;
+    fn(queue_, n, src.data(), ssz.data(), dst.data(), cap.data(), out.data(),
+       ok.data());
+    bool all = true;
+    for (size_t i = 0; i < n; ++i) {
+      jobs[i].ok = ok[i] != 0;
+      jobs[i].out_size = out[i];
+      all &= jobs[i].ok;
+    }
+    return all;
+  }
+
   void *queue_;  // opaque QueueBox* owned by the kernels library
 };
 

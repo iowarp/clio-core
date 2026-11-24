@@ -18,14 +18,21 @@
  * direction. Chunks are independent -> one WORK-GROUP handles each (its hash
  * table and data staged in local memory; decode is cooperative across the
  * sub-group's lanes), thousands of chunks in flight -- nvcomp's parallelism
- * model. See build_and_test.sh for the validated build recipe.
+ * model. Batched entry points (clio_sycl_lz4_*_batch) issue ONE launch per
+ * phase for every chunk of every job -- see BATCHED EXECUTION below. See
+ * build_and_test.sh for the validated build recipe.
  */
 
 #include <sycl/sycl.hpp>
 
+#include <algorithm>
+
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <stdexcept>
 #include <vector>
 
 namespace {
@@ -200,17 +207,539 @@ inline u32 Lz4DecompressChunk(const u8 *src, u32 n, u8 *dst, u32 dst_cap) {
   return op;
 }
 
-// A GPU queue (device selector), created once and reused. Buffers may be host
-// or device USM; we detect and stage minimally, like NvComp does with CUDA.
+// ============================================================================
+// BATCHED EXECUTION -- the nvcomp model, and what ctp::Compressor::CompressBatch
+// asks of a GPU codec: ONE launch per phase for EVERY chunk of EVERY job, no
+// scratch allocation per call, and a single host synchronization.
+//
+// Compress (all on one in-order queue, one wait at the end):
+//   1. encode   one launch over the global chunk list; chunk c belongs to job
+//               chunk_job[c]. Each chunk -> scratch slot c (CompressBound).
+//   2. scan     one WORK-GROUP per job: exclusive scan of its chunk sizes ->
+//               per-chunk payload offsets; writes the header + size table
+//               straight into dst; ok = (total <= dst_capacity).
+//   3. gather   one work-group per chunk: cooperative copy of the chunk from
+//               scratch into dst at its offset (skipped for failed jobs).
+//   4. copy the per-job {out_size, ok} back; wait.
+// Decompress:
+//   1. read every job's Header on the device, copy back, wait (the only extra
+//      sync: the chunk count decides the launch shape).
+//   2. scan     per job: validate the size table (a block larger than its
+//               chunk would overrun the decoder's local buffers; a stored chunk
+//               must be exactly its length) and compute payload offsets.
+//   3. decode   one work-group per chunk (skipped for failed jobs).
+//   4. copy statuses back; wait.
+// Host buffers are staged through grow-only device scratch; device buffers are
+// used in place -- the CompressJob contract.
+// ============================================================================
+
+struct JobDev {
+  const u8 *src;
+  u8 *dst;
+  u64 src_size;
+  u64 dst_cap;
+  u64 orig;        // decompress: original size from the header
+  u64 chunk_base;  // first global chunk index of this job
+  u32 n_chunks;
+  u32 chunk_size;
+  u32 hdr_bytes;   // sizeof(Header) + 4 * n_chunks
+  u32 valid;       // host pre-validation passed
+};
+struct JobOut {
+  u64 out_size;
+  u32 ok;
+  u32 pad;
+};
+
+// Unaligned-safe byte access: dst/src are caller buffers of any alignment.
+inline void St32(u8 *p, u32 v) {
+  p[0] = (u8)v; p[1] = (u8)(v >> 8); p[2] = (u8)(v >> 16); p[3] = (u8)(v >> 24);
+}
+inline u32 Ld32(const u8 *p) {
+  return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24);
+}
+
+constexpr u32 kScanWG = 256;
+
+// Grow-only device scratch. Reallocated only when a batch needs more.
+struct DevBuf {
+  void *p = nullptr;
+  size_t cap = 0;
+  template <typename T>
+  T *Get(sycl::queue &q, size_t n) {
+    size_t bytes = std::max<size_t>(n * sizeof(T), 1);
+    if (bytes > cap) {
+      if (p) sycl::free(p, q);
+      size_t want = std::max(bytes, cap + cap / 2);
+      p = sycl::malloc_device(want, q);
+      if (!p) { cap = 0; throw std::bad_alloc(); }
+      cap = want;
+    }
+    return static_cast<T *>(p);
+  }
+  void Free(sycl::queue &q) { if (p) sycl::free(p, q); p = nullptr; cap = 0; }
+};
+
+enum class Enc { kGroup, kItem };
+
+// A GPU queue (device selector, in-order), created once and reused with its
+// scratch. The mutex makes one instance safe to share across threads.
 struct QueueBox {
   sycl::queue q;
-  QueueBox() : q(sycl::gpu_selector_v) {}
+  std::mutex mu;
+  Enc enc;
+  DevBuf jobs, outs, chunk_job, csize, coff, scratch, stage_in, stage_out, hdrs;
+  QueueBox()
+      : q(sycl::gpu_selector_v, sycl::property::queue::in_order{}) {
+    const char *e = std::getenv("CLIO_SYCL_LZ4_ENC");
+    // Default: one chunk per WORK-GROUP (measured 1.5-2.7x faster on PVC
+    // than one chunk per work-item). CLIO_SYCL_LZ4_ENC=item selects the other.
+    enc = (e && std::strcmp(e, "item") == 0) ? Enc::kItem : Enc::kGroup;
+  }
+  ~QueueBox() {
+    for (DevBuf *b : {&jobs, &outs, &chunk_job, &csize, &coff, &scratch,
+                      &stage_in, &stage_out, &hdrs})
+      b->Free(q);
+  }
 };
 
 inline bool IsDevicePtr(const sycl::queue &q, const void *p) {
   if (!p) return false;
   auto kind = sycl::get_pointer_type(p, q.get_context());
   return kind == sycl::usm::alloc::device || kind == sycl::usm::alloc::shared;
+}
+
+// Items per work-group for the one-chunk-per-ITEM encoder. Each item needs a
+// private 4 KiB hash table in local memory: 16 x 4 KiB = 64 KiB per group,
+// half of a PVC Xe-core's SLM, so two groups can be co-resident.
+constexpr u32 kEncItems = 16;
+
+int CompressBatchImpl(QueueBox *qb, size_t n, const void *const *srcs,
+                      const size_t *src_sizes, void *const *dsts,
+                      const size_t *dst_caps, size_t *out_sizes, int *oks) {
+  std::lock_guard<std::mutex> lk(qb->mu);
+  sycl::queue &q = qb->q;
+  const u32 chunk = kChunkSize, bound = CompressBound(kChunkSize);
+  std::vector<JobDev> jobs(n);
+  std::vector<u32> chunk_job;
+  std::vector<u64> in_off(n, ~0ull), out_off(n, ~0ull);
+  u64 stage_in = 0, stage_out = 0, C = 0;
+  for (size_t j = 0; j < n; ++j) {
+    JobDev &J = jobs[j];
+    J.src_size = src_sizes[j];
+    J.dst_cap = dst_caps[j];
+    // A zero-length job may pass null src (an empty vector's data()).
+    J.valid = (srcs[j] || J.src_size == 0) && dsts[j] && J.src_size < (1ull << 40);
+    J.n_chunks = J.valid ? (u32)((J.src_size + chunk - 1) / chunk) : 0;
+    J.chunk_size = chunk;
+    J.hdr_bytes = (u32)(sizeof(Header) + 4ull * J.n_chunks);
+    J.chunk_base = C;
+    J.orig = J.src_size;
+    C += J.n_chunks;
+    if (!J.valid) continue;
+    if (!IsDevicePtr(q, srcs[j])) { in_off[j] = stage_in; stage_in += J.src_size; }
+    if (!IsDevicePtr(q, dsts[j])) { out_off[j] = stage_out; stage_out += J.dst_cap; }
+  }
+  chunk_job.resize(C);
+  for (size_t j = 0; j < n; ++j)
+    for (u32 c = 0; c < jobs[j].n_chunks; ++c)
+      chunk_job[jobs[j].chunk_base + c] = (u32)j;
+
+  u8 *sin = stage_in ? qb->stage_in.Get<u8>(q, stage_in) : nullptr;
+  u8 *sout = stage_out ? qb->stage_out.Get<u8>(q, stage_out) : nullptr;
+  for (size_t j = 0; j < n; ++j) {
+    if (in_off[j] != ~0ull) {
+      if (jobs[j].src_size)
+        q.memcpy(sin + in_off[j], srcs[j], jobs[j].src_size);
+      jobs[j].src = sin + in_off[j];
+    } else {
+      jobs[j].src = static_cast<const u8 *>(srcs[j]);
+    }
+    jobs[j].dst = out_off[j] != ~0ull ? sout + out_off[j]
+                                      : static_cast<u8 *>(dsts[j]);
+  }
+  JobDev *d_jobs = qb->jobs.Get<JobDev>(q, n);
+  JobOut *d_out = qb->outs.Get<JobOut>(q, n);
+  u32 *d_cj = qb->chunk_job.Get<u32>(q, C);
+  u32 *d_cs = qb->csize.Get<u32>(q, C);
+  u64 *d_co = qb->coff.Get<u64>(q, C);
+  u8 *d_scr = qb->scratch.Get<u8>(q, C * (u64)bound);
+  q.memcpy(d_jobs, jobs.data(), n * sizeof(JobDev));
+  if (C) q.memcpy(d_cj, chunk_job.data(), C * sizeof(u32));
+
+  // ---- 1. encode ----
+  if (C && qb->enc == Enc::kGroup) {
+    q.submit([&](sycl::handler &h) {
+      sycl::local_accessor<u8, 1> s_src(sycl::range<1>(chunk), h);
+      sycl::local_accessor<u16, 1> s_hash(sycl::range<1>(kHashSize), h);
+      h.parallel_for(sycl::nd_range<1>(C * kGroup, kGroup),
+                     [=](sycl::nd_item<1> it) {
+        const u64 c = it.get_group(0);
+        const u32 lid = (u32)it.get_local_id(0);
+        const JobDev J = d_jobs[d_cj[c]];
+        const u64 off = (c - J.chunk_base) * chunk;
+        const u32 len = (u32)std::min<u64>(chunk, J.src_size - off);
+        u8 *ss = &s_src[0];
+        for (u32 k = lid; k < len; k += kGroup) ss[k] = J.src[off + k];
+        sycl::group_barrier(it.get_group());
+        if (lid == 0) {
+          u8 *cd = d_scr + c * bound;
+          u32 z = Lz4CompressChunk(ss, len, cd, bound, &s_hash[0]);
+          if (z == 0 || z >= len) {
+            for (u32 k = 0; k < len; ++k) cd[k] = ss[k];
+            d_cs[c] = len | kStoredFlag;
+          } else {
+            d_cs[c] = z;
+          }
+        }
+      });
+    });
+  } else if (C) {
+    const u64 G = (C + kEncItems - 1) / kEncItems;
+    q.submit([&](sycl::handler &h) {
+      sycl::local_accessor<u16, 1> s_hash(sycl::range<1>(kEncItems * kHashSize),
+                                          h);
+      h.parallel_for(sycl::nd_range<1>(G * kEncItems, kEncItems),
+                     [=](sycl::nd_item<1> it) {
+        const u64 c = it.get_global_id(0);
+        if (c >= C) return;
+        const JobDev J = d_jobs[d_cj[c]];
+        const u64 off = (c - J.chunk_base) * chunk;
+        const u32 len = (u32)std::min<u64>(chunk, J.src_size - off);
+        const u8 *src = J.src + off;
+        u8 *cd = d_scr + c * bound;
+        u32 z = Lz4CompressChunk(src, len, cd, bound,
+                                 &s_hash[it.get_local_id(0) * kHashSize]);
+        if (z == 0 || z >= len) {
+          for (u32 k = 0; k < len; ++k) cd[k] = src[k];
+          d_cs[c] = len | kStoredFlag;
+        } else {
+          d_cs[c] = z;
+        }
+      });
+    });
+  }
+
+  // ---- 2. per-job scan + header/size table into dst ----
+  q.parallel_for(sycl::nd_range<1>(n * kScanWG, kScanWG),
+                 [=](sycl::nd_item<1> it) {
+    const u64 j = it.get_group(0);
+    const u32 t = (u32)it.get_local_id(0);
+    const JobDev J = d_jobs[j];
+    const u32 nc = J.n_chunks;
+    const u32 per = (nc + kScanWG - 1) / kScanWG;
+    const u32 b = std::min(nc, t * per), e = std::min(nc, b + per);
+    u64 part = 0;
+    for (u32 i = b; i < e; ++i) part += d_cs[J.chunk_base + i] & ~kStoredFlag;
+    u64 pre = sycl::exclusive_scan_over_group(it.get_group(), part,
+                                              sycl::plus<u64>());
+    u64 total = sycl::reduce_over_group(it.get_group(), part,
+                                        sycl::plus<u64>());
+    for (u32 i = b; i < e; ++i) {
+      d_co[J.chunk_base + i] = pre;
+      pre += d_cs[J.chunk_base + i] & ~kStoredFlag;
+    }
+    const u64 out = J.hdr_bytes + total;
+    const bool ok = J.valid && out <= J.dst_cap;
+    if (ok) {
+      for (u32 i = b; i < e; ++i)
+        St32(J.dst + sizeof(Header) + 4ull * i, d_cs[J.chunk_base + i]);
+      if (t == 0) {
+        St32(J.dst + 0, kMagic);
+        St32(J.dst + 4, kChunkSize);
+        St32(J.dst + 8, (u32)J.src_size);
+        St32(J.dst + 12, (u32)(J.src_size >> 32));
+        St32(J.dst + 16, nc);
+        St32(J.dst + 20, 0);
+      }
+    }
+    if (t == 0) d_out[j] = JobOut{ok ? out : 0, ok ? 1u : 0u, 0};
+  });
+
+  // ---- 3. gather payloads ----
+  if (C) {
+    q.parallel_for(sycl::nd_range<1>(C * kGroup, kGroup),
+                   [=](sycl::nd_item<1> it) {
+      const u64 c = it.get_group(0);
+      const u32 lid = (u32)it.get_local_id(0);
+      const u32 j = d_cj[c];
+      if (!d_out[j].ok) return;
+      const JobDev J = d_jobs[j];
+      const u32 raw = d_cs[c] & ~kStoredFlag;
+      const u8 *s = d_scr + c * bound;
+      u8 *d = J.dst + J.hdr_bytes + d_co[c];
+      for (u32 k = lid; k < raw; k += kGroup) d[k] = s[k];
+    });
+  }
+
+  // ---- 4. statuses back, staged outputs back, ONE wait ----
+  std::vector<JobOut> res(n);
+  q.memcpy(res.data(), d_out, n * sizeof(JobOut)).wait();
+  bool any_back = false;
+  for (size_t j = 0; j < n; ++j)
+    if (out_off[j] != ~0ull && res[j].ok) {
+      q.memcpy(dsts[j], sout + out_off[j], res[j].out_size);
+      any_back = true;
+    }
+  if (any_back) q.wait();
+  int all = 1;
+  for (size_t j = 0; j < n; ++j) {
+    out_sizes[j] = res[j].ok ? res[j].out_size : 0;
+    oks[j] = (int)res[j].ok;
+    all &= oks[j];
+  }
+  return all;
+}
+
+int DecompressBatchImpl(QueueBox *qb, size_t n, const void *const *srcs,
+                        const size_t *src_sizes, void *const *dsts,
+                        const size_t *dst_caps, size_t *out_sizes, int *oks) {
+  std::lock_guard<std::mutex> lk(qb->mu);
+  sycl::queue &q = qb->q;
+  std::vector<JobDev> jobs(n);
+  std::vector<u64> in_off(n, ~0ull);
+  u64 stage_in = 0;
+  for (size_t j = 0; j < n; ++j) {
+    jobs[j].src_size = src_sizes[j];
+    jobs[j].dst_cap = dst_caps[j];
+    if (!IsDevicePtr(q, srcs[j])) { in_off[j] = stage_in; stage_in += src_sizes[j]; }
+  }
+  u8 *sin = stage_in ? qb->stage_in.Get<u8>(q, stage_in) : nullptr;
+  for (size_t j = 0; j < n; ++j) {
+    if (in_off[j] != ~0ull) {
+      if (src_sizes[j]) q.memcpy(sin + in_off[j], srcs[j], src_sizes[j]);
+      jobs[j].src = sin + in_off[j];
+    } else {
+      jobs[j].src = static_cast<const u8 *>(srcs[j]);
+    }
+  }
+  // ---- 1. headers (the one extra sync) ----
+  u8 *d_h = qb->hdrs.Get<u8>(q, n * sizeof(Header));
+  // Host arrays read by ASYNC copies must outlive the wait below -- declare
+  // them at function scope, never inside a block.
+  std::vector<const u8 *> srcp(n);
+  std::vector<u64> ss(n);
+  for (size_t j = 0; j < n; ++j) srcp[j] = jobs[j].src;
+  {
+    const u8 **d_srcp = reinterpret_cast<const u8 **>(
+        qb->jobs.Get<JobDev>(q, std::max<size_t>(n, 1)));
+    q.memcpy(d_srcp, srcp.data(), n * sizeof(u8 *));
+    for (size_t j = 0; j < n; ++j) ss[j] = src_sizes[j];
+    u64 *d_ss = qb->coff.Get<u64>(q, n);
+    q.memcpy(d_ss, ss.data(), n * sizeof(u64));
+    q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) {
+      const u64 j = i[0];
+      for (u32 k = 0; k < sizeof(Header); ++k)
+        d_h[j * sizeof(Header) + k] = k < d_ss[j] ? d_srcp[j][k] : 0;
+    });
+  }
+  std::vector<Header> H(n);
+  q.memcpy(H.data(), d_h, n * sizeof(Header)).wait();
+
+  std::vector<u64> out_off(n, ~0ull);
+  u64 stage_out = 0, C = 0;
+  for (size_t j = 0; j < n; ++j) {
+    JobDev &J = jobs[j];
+    const Header &h = H[j];
+    const u64 nc = h.n_chunks, cs = h.chunk_size, orig = h.orig_size;
+    // An empty output may have a null dst (an empty vector's data()).
+    bool v = srcs[j] && (dsts[j] || orig == 0) && J.src_size >= sizeof(Header) &&
+             h.magic == kMagic && cs > 0 && cs <= kChunkSize &&
+             nc * cs >= orig && (nc == 0 || (nc - 1) * cs < orig) &&
+             orig <= J.dst_cap && sizeof(Header) + 4 * nc <= J.src_size;
+    J.valid = v;
+    J.n_chunks = v ? (u32)nc : 0;
+    J.chunk_size = (u32)cs;
+    J.orig = v ? orig : 0;
+    J.hdr_bytes = (u32)(sizeof(Header) + 4 * J.n_chunks);
+    J.chunk_base = C;
+    C += J.n_chunks;
+    if (v && !IsDevicePtr(q, dsts[j])) { out_off[j] = stage_out; stage_out += orig; }
+  }
+  u8 *sout = stage_out ? qb->stage_out.Get<u8>(q, stage_out) : nullptr;
+  for (size_t j = 0; j < n; ++j)
+    jobs[j].dst = out_off[j] != ~0ull ? sout + out_off[j]
+                                      : static_cast<u8 *>(dsts[j]);
+  std::vector<u32> chunk_job(C);
+  for (size_t j = 0; j < n; ++j)
+    for (u32 c = 0; c < jobs[j].n_chunks; ++c)
+      chunk_job[jobs[j].chunk_base + c] = (u32)j;
+  JobDev *d_jobs = qb->jobs.Get<JobDev>(q, n);
+  JobOut *d_out = qb->outs.Get<JobOut>(q, n);
+  u32 *d_cj = qb->chunk_job.Get<u32>(q, C);
+  u64 *d_co = qb->coff.Get<u64>(q, C);
+  q.memcpy(d_jobs, jobs.data(), n * sizeof(JobDev));
+  if (C) q.memcpy(d_cj, chunk_job.data(), C * sizeof(u32));
+
+  // ---- 2. per-job validate + scan ----
+  q.parallel_for(sycl::nd_range<1>(n * kScanWG, kScanWG),
+                 [=](sycl::nd_item<1> it) {
+    const u64 j = it.get_group(0);
+    const u32 t = (u32)it.get_local_id(0);
+    const JobDev J = d_jobs[j];
+    const u32 nc = J.n_chunks, per = (nc + kScanWG - 1) / kScanWG;
+    const u32 b = std::min(nc, t * per), e = std::min(nc, b + per);
+    const u8 *tab = J.src + sizeof(Header);
+    u64 part = 0;
+    u32 bad = 0;
+    for (u32 i = b; i < e; ++i) {
+      const u32 v = Ld32(tab + 4ull * i);
+      const u32 raw = v & ~kStoredFlag;
+      const u64 dlen = std::min<u64>(J.chunk_size, J.orig - (u64)i * J.chunk_size);
+      bad |= raw > J.chunk_size || ((v & kStoredFlag) && raw != dlen) || raw == 0;
+      part += raw;
+    }
+    u64 pre = sycl::exclusive_scan_over_group(it.get_group(), part,
+                                              sycl::plus<u64>());
+    u64 total = sycl::reduce_over_group(it.get_group(), part, sycl::plus<u64>());
+    u32 anybad = sycl::reduce_over_group(it.get_group(), bad,
+                                         sycl::bit_or<u32>());
+    for (u32 i = b; i < e; ++i) {
+      d_co[J.chunk_base + i] = pre;
+      pre += Ld32(tab + 4ull * i) & ~kStoredFlag;
+    }
+    if (t == 0) {
+      const bool ok = J.valid && !anybad && J.hdr_bytes + total <= J.src_size;
+      d_out[j] = JobOut{ok ? J.orig : 0, ok ? 1u : 0u, 0};
+    }
+  });
+
+  // ---- 3. decode: one work-group (= one 32-lane sub-group) per chunk ----
+  if (C) {
+    q.submit([&](sycl::handler &h) {
+      sycl::local_accessor<u8, 1> s_in(sycl::range<1>(kChunkSize), h);
+      sycl::local_accessor<u8, 1> s_out(sycl::range<1>(kChunkSize), h);
+      h.parallel_for(
+          sycl::nd_range<1>(C * kGroup, kGroup),
+          [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+            const u64 c = it.get_group(0);
+            const u32 lane = (u32)it.get_local_id(0);
+            const u32 j = d_cj[c];
+            // Read once and broadcast: another chunk of this job may clear
+            // ok concurrently, and every lane must take the same path here.
+            const u32 jok = sycl::group_broadcast(it.get_group(),
+                                                  lane == 0 ? d_out[j].ok : 0u,
+                                                  0);
+            if (!jok) return;
+            const JobDev J = d_jobs[j];
+            auto sg = it.get_sub_group();
+            const u32 i = (u32)(c - J.chunk_base);
+            const u32 v = Ld32(J.src + sizeof(Header) + 4ull * i);
+            const u32 raw = v & ~kStoredFlag;
+            const bool stored = (v & kStoredFlag) != 0;
+            const u64 doff = (u64)i * J.chunk_size;
+            const u32 dlen = (u32)std::min<u64>(J.chunk_size, J.orig - doff);
+            const u8 *csrc = J.src + J.hdr_bytes + d_co[c];
+            u8 *si = &s_in[0];
+            u8 *so = &s_out[0];
+            for (u32 k = lane; k < raw; k += kGroup) si[k] = csrc[k];
+            sycl::group_barrier(it.get_group());
+            u32 op_final = dlen;
+            if (stored) {
+              for (u32 k = lane; k < raw; k += kGroup) so[k] = si[k];
+            } else {
+              u32 ip = 0, op = 0;
+              while (true) {
+                u32 litlen = 0;
+                int stop = 0;
+                u8 tok = 0;
+                if (lane == 0) {
+                  if (ip >= raw) {
+                    stop = 1;
+                  } else {
+                    tok = si[ip++];
+                    litlen = tok >> 4;
+                    if (litlen == 15) {
+                      u8 bb;
+                      do { bb = si[ip++]; litlen += bb; } while (bb == 255 && ip < raw);
+                    }
+                    // Corrupt input: clamp so the copies stay inside the
+                    // chunk-sized local buffers (output then fails roundtrip
+                    // checks, but never overruns).
+                    if (op + litlen > dlen || ip + litlen > raw) { stop = 1; }
+                  }
+                }
+                stop = sycl::group_broadcast(sg, stop, 0);
+                if (stop) break;
+                litlen = sycl::group_broadcast(sg, litlen, 0);
+                const u32 lip = sycl::group_broadcast(sg, ip, 0);
+                const u32 lop = sycl::group_broadcast(sg, op, 0);
+                for (u32 base = 0; base < litlen; base += kGroup) {
+                  u32 k = base + lane;
+                  if (k < litlen) so[lop + k] = si[lip + k];
+                }
+                sycl::group_barrier(sg);
+                int last = 0;
+                if (lane == 0) {
+                  ip = lip + litlen;
+                  op = lop + litlen;
+                  if (ip >= raw) last = 1;
+                }
+                last = sycl::group_broadcast(sg, last, 0);
+                if (last) break;
+                u32 off = 0, ml = 0;
+                int badm = 0;
+                if (lane == 0) {
+                  off = (u32)si[ip] | ((u32)si[ip + 1] << 8);
+                  ip += 2;
+                  ml = tok & 0x0F;
+                  if (ml == 15) {
+                    u8 bb;
+                    do { bb = si[ip++]; ml += bb; } while (bb == 255 && ip < raw);
+                  }
+                  ml += kMinMatch;
+                  badm = off == 0 || off > op || op + ml > dlen;
+                }
+                badm = sycl::group_broadcast(sg, badm, 0);
+                if (badm) break;
+                off = sycl::group_broadcast(sg, off, 0);
+                ml = sycl::group_broadcast(sg, ml, 0);
+                const u32 mop = sycl::group_broadcast(sg, op, 0);
+                if (off >= ml) {
+                  for (u32 base = 0; base < ml; base += kGroup) {
+                    u32 k = base + lane;
+                    if (k < ml) so[mop + k] = so[mop - off + k];
+                  }
+                } else if (lane == 0) {
+                  u32 mp = mop - off;
+                  for (u32 k = 0; k < ml; ++k) so[mop + k] = so[mp++];
+                }
+                if (lane == 0) op = mop + ml;
+                sycl::group_barrier(sg);
+              }
+              op_final = op;  // meaningful on lane 0, which checks it
+            }
+            // A chunk that did not decode to exactly its length is corrupt:
+            // fail the whole job (relaxed store; the host reads it after wait).
+            if (lane == 0 && !stored && op_final != dlen) {
+              sycl::atomic_ref<u32, sycl::memory_order::relaxed,
+                               sycl::memory_scope::device,
+                               sycl::access::address_space::global_space>(
+                  d_out[j].ok)
+                  .store(0u);
+            }
+            sycl::group_barrier(it.get_group());
+            for (u32 k = lane; k < dlen; k += kGroup) J.dst[doff + k] = so[k];
+          });
+    });
+  }
+
+  std::vector<JobOut> res(n);
+  q.memcpy(res.data(), d_out, n * sizeof(JobOut)).wait();
+  bool any_back = false;
+  for (size_t j = 0; j < n; ++j)
+    if (out_off[j] != ~0ull && res[j].ok) {
+      q.memcpy(dsts[j], sout + out_off[j], res[j].out_size);
+      any_back = true;
+    }
+  if (any_back) q.wait();
+  int all = 1;
+  for (size_t j = 0; j < n; ++j) {
+    out_sizes[j] = res[j].ok ? res[j].out_size : 0;
+    oks[j] = (int)res[j].ok;
+    all &= oks[j];
+  }
+  return all;
 }
 
 }  // namespace
@@ -226,299 +755,58 @@ void *clio_sycl_lz4_queue_create() {
 }
 void clio_sycl_lz4_queue_destroy(void *qb) { delete static_cast<QueueBox *>(qb); }
 
-// Compress src[0..src_size) -> dst (cap dst_cap); *out set to bytes written.
-// Returns 1 on success, 0 on failure. src/dst may each be host or device USM.
-int clio_sycl_lz4_compress(void *qbv, const void *src, size_t src_size,
-                           void *dst, size_t dst_cap, size_t *out) {
-  if (!qbv || !src || !dst || !out) return 0;
-  QueueBox *qb = static_cast<QueueBox *>(qbv);
-  sycl::queue &q = qb->q;
-  const u32 chunk_size = kChunkSize;
-  const u32 n_chunks =
-      (u32)((src_size + chunk_size - 1) / (src_size ? chunk_size : 1));
-  const u32 nc = src_size ? n_chunks : 0;
-  const size_t hdr = sizeof(Header) + (size_t)nc * sizeof(u32);
-  bool ok = false;
-  u8 *d_src = nullptr, *d_scratch = nullptr, *d_out = nullptr;
-  u32 *d_csize = nullptr, *d_coff = nullptr;
+// Batched entry points: n independent jobs, ONE launch per phase. Each job's
+// src/dst may be host or device USM independently. Per-job out_sizes/oks;
+// returns 1 iff every job succeeded.
+int clio_sycl_lz4_compress_batch(void *qbv, size_t n, const void *const *srcs,
+                                 const size_t *src_sizes, void *const *dsts,
+                                 const size_t *dst_caps, size_t *out_sizes,
+                                 int *oks) {
+  if (!qbv || (n && (!srcs || !src_sizes || !dsts || !dst_caps || !out_sizes ||
+                     !oks)))
+    return 0;
+  if (n == 0) return 1;
   try {
-    const bool src_dev = IsDevicePtr(q, src);
-    d_src = src_dev ? const_cast<u8 *>(static_cast<const u8 *>(src))
-                    : sycl::malloc_device<u8>(src_size ? src_size : 1, q);
-    if (!d_src) throw std::bad_alloc();
-    if (!src_dev) q.memcpy(d_src, src, src_size).wait();
-
-    const u32 bound = CompressBound(chunk_size);
-    d_scratch = sycl::malloc_device<u8>((size_t)nc * bound + 1, q);
-    d_csize = sycl::malloc_device<u32>(nc + 1, q);
-    if (!d_scratch || !d_csize) throw std::bad_alloc();
-
-    // One WORK-GROUP per chunk: stage the chunk's source AND its hash table in
-    // local memory (fast), then lane 0 runs the serial LZ4 encode against that
-    // local state. The group's other lanes cooperatively load the source. This
-    // removes the two killers of the naive version: uncached global hash probes
-    // and a mere handful of work-items.
-    const u32 bound_c = bound;
-    const u32 chunk_c = chunk_size;
-    q.submit([&](sycl::handler &h) {
-       sycl::local_accessor<u8, 1> s_src(sycl::range<1>(chunk_c), h);
-       sycl::local_accessor<u16, 1> s_hash(sycl::range<1>(kHashSize), h);
-       h.parallel_for(
-           sycl::nd_range<1>(sycl::range<1>((size_t)(nc ? nc : 1) * kGroup),
-                             sycl::range<1>(kGroup)),
-           [=](sycl::nd_item<1> it) {
-             u32 c = (u32)it.get_group(0);
-             u32 lid = (u32)it.get_local_id(0);
-             if (c >= nc) return;
-             u32 off = c * chunk_c;
-             u32 len = (off + chunk_c <= src_size) ? chunk_c
-                                                   : (u32)(src_size - off);
-             u8 *ss = &s_src[0];
-             for (u32 k = lid; k < len; k += kGroup) ss[k] = d_src[off + k];
-             it.barrier(sycl::access::fence_space::local_space);
-             if (lid == 0) {
-               u8 *cdst = d_scratch + (size_t)c * bound_c;
-               u32 z = Lz4CompressChunk(ss, len, cdst, bound_c, &s_hash[0]);
-               if (z == 0 || z >= len) {  // incompressible -> store raw
-                 for (u32 k = 0; k < len; ++k) cdst[k] = ss[k];
-                 d_csize[c] = len | kStoredFlag;
-               } else {
-                 d_csize[c] = z;
-               }
-             }
-           });
-     }).wait();
-
-    // Pull per-chunk sizes to host, compute packed offsets (prefix sum).
-    std::vector<u32> csize(nc);
-    if (nc) q.memcpy(csize.data(), d_csize, (size_t)nc * sizeof(u32)).wait();
-    std::vector<u64> coff(nc + 1, 0);
-    for (u32 c = 0; c < nc; ++c) {
-      u32 raw = csize[c] & ~kStoredFlag;
-      coff[c + 1] = coff[c] + raw;
-    }
-    const u64 payload = coff[nc];
-    const u64 total = hdr + payload;
-    if (total > dst_cap) throw std::runtime_error("dst too small");
-
-    // Gather chunks into their packed positions (device kernel), then copy the
-    // packed payload out. Offsets/sizes pushed back to device for the gather.
-    const bool dst_dev = IsDevicePtr(q, dst);
-    d_out = dst_dev ? static_cast<u8 *>(dst)
-                    : sycl::malloc_device<u8>(total ? total : 1, q);
-    d_coff = sycl::malloc_device<u32>(nc + 1, q);
-    if (!d_out || !d_coff) throw std::bad_alloc();
-    std::vector<u32> coff32(nc);
-    for (u32 c = 0; c < nc; ++c) coff32[c] = (u32)coff[c];
-    if (nc) q.memcpy(d_coff, coff32.data(), (size_t)nc * sizeof(u32)).wait();
-
-    const u32 bound_k = bound, chunk_k = chunk_size;
-    u8 *payload_base = d_out + hdr;
-    q.parallel_for(sycl::range<1>(nc ? nc : 1), [=](sycl::id<1> idx) {
-       u32 c = (u32)idx[0];
-       if (c >= nc) return;
-       u32 raw = d_csize[c] & ~kStoredFlag;
-       const u8 *csrc = d_scratch + (size_t)c * bound_k;
-       u8 *cdst = payload_base + d_coff[c];
-       for (u32 k = 0; k < raw; ++k) cdst[k] = csrc[k];
-     }).wait();
-
-    // Write the header + size table into d_out[0..hdr).
-    {
-      std::vector<u8> h(hdr);
-      Header *H = reinterpret_cast<Header *>(h.data());
-      H->magic = kMagic;
-      H->chunk_size = chunk_size;
-      H->orig_size = src_size;
-      H->n_chunks = nc;
-      H->rsvd = 0;
-      std::memcpy(h.data() + sizeof(Header), csize.data(),
-                  (size_t)nc * sizeof(u32));
-      q.memcpy(d_out, h.data(), hdr).wait();
-    }
-    if (!dst_dev) q.memcpy(dst, d_out, total).wait();
-    *out = total;
-    ok = true;
+    return CompressBatchImpl(static_cast<QueueBox *>(qbv), n, srcs, src_sizes,
+                             dsts, dst_caps, out_sizes, oks);
   } catch (...) {
-    ok = false;
+    for (size_t j = 0; j < n; ++j) { oks[j] = 0; out_sizes[j] = 0; }
+    return 0;
   }
-  if (d_src && !IsDevicePtr(q, src)) sycl::free(d_src, q);
-  if (d_scratch) sycl::free(d_scratch, q);
-  if (d_csize) sycl::free(d_csize, q);
-  if (d_coff) sycl::free(d_coff, q);
-  if (d_out && !IsDevicePtr(q, dst)) sycl::free(d_out, q);
-  return ok ? 1 : 0;
 }
 
-// Decompress src[0..src_size) -> dst (cap dst_cap); *out set to bytes written.
+int clio_sycl_lz4_decompress_batch(void *qbv, size_t n,
+                                   const void *const *srcs,
+                                   const size_t *src_sizes, void *const *dsts,
+                                   const size_t *dst_caps, size_t *out_sizes,
+                                   int *oks) {
+  if (!qbv || (n && (!srcs || !src_sizes || !dsts || !dst_caps || !out_sizes ||
+                     !oks)))
+    return 0;
+  if (n == 0) return 1;
+  try {
+    return DecompressBatchImpl(static_cast<QueueBox *>(qbv), n, srcs,
+                               src_sizes, dsts, dst_caps, out_sizes, oks);
+  } catch (...) {
+    for (size_t j = 0; j < n; ++j) { oks[j] = 0; out_sizes[j] = 0; }
+    return 0;
+  }
+}
+
+// Single-buffer calls: a batch of one (same scratch reuse, same syncs).
+int clio_sycl_lz4_compress(void *qbv, const void *src, size_t src_size,
+                           void *dst, size_t dst_cap, size_t *out) {
+  if (!out) return 0;
+  int ok = 0;
+  return clio_sycl_lz4_compress_batch(qbv, 1, &src, &src_size, &dst, &dst_cap,
+                                      out, &ok);
+}
 int clio_sycl_lz4_decompress(void *qbv, const void *src, size_t src_size,
                              void *dst, size_t dst_cap, size_t *out) {
-  if (!qbv || !src || !dst || !out || src_size < sizeof(Header)) return 0;
-  QueueBox *qb = static_cast<QueueBox *>(qbv);
-  sycl::queue &q = qb->q;
-  bool ok = false;
-  u8 *d_src = nullptr, *d_out = nullptr;
-  u32 *d_csize = nullptr, *d_coff = nullptr;
-  try {
-    const bool src_dev = IsDevicePtr(q, src);
-    d_src = src_dev ? const_cast<u8 *>(static_cast<const u8 *>(src))
-                    : sycl::malloc_device<u8>(src_size, q);
-    if (!d_src) throw std::bad_alloc();
-    if (!src_dev) q.memcpy(d_src, src, src_size).wait();
-
-    Header H;
-    q.memcpy(&H, d_src, sizeof(Header)).wait();
-    if (H.magic != kMagic) throw std::runtime_error("bad magic");
-    const u32 nc = H.n_chunks;
-    const u32 chunk_size = H.chunk_size;
-    const u64 orig = H.orig_size;
-    if (orig > dst_cap) throw std::runtime_error("dst too small");
-    const size_t hdr = sizeof(Header) + (size_t)nc * sizeof(u32);
-    if (src_size < hdr) throw std::runtime_error("truncated");
-
-    std::vector<u32> csize(nc);
-    if (nc) q.memcpy(csize.data(), d_src + sizeof(Header),
-                     (size_t)nc * sizeof(u32)).wait();
-    std::vector<u32> coff(nc);
-    u64 acc = 0;
-    for (u32 c = 0; c < nc; ++c) {
-      coff[c] = (u32)acc;
-      acc += (csize[c] & ~kStoredFlag);
-    }
-    if (hdr + acc > src_size) throw std::runtime_error("payload short");
-
-    const bool dst_dev = IsDevicePtr(q, dst);
-    d_out = dst_dev ? static_cast<u8 *>(dst)
-                    : sycl::malloc_device<u8>(orig ? orig : 1, q);
-    d_csize = sycl::malloc_device<u32>(nc + 1, q);
-    d_coff = sycl::malloc_device<u32>(nc + 1, q);
-    if (!d_out || !d_csize || !d_coff) throw std::bad_alloc();
-    if (nc) {
-      q.memcpy(d_csize, csize.data(), (size_t)nc * sizeof(u32)).wait();
-      q.memcpy(d_coff, coff.data(), (size_t)nc * sizeof(u32)).wait();
-    }
-    const u8 *payload_base = d_src + hdr;
-    const u32 chunk_d = chunk_size;
-    // One WORK-GROUP per chunk: stage the compressed block in local memory, lane
-    // 0 decodes it into a local output buffer (so the dependent match copies hit
-    // local memory, not global), then the group cooperatively flushes the result
-    // to the global output.
-    q.submit([&](sycl::handler &h) {
-       sycl::local_accessor<u8, 1> s_in(sycl::range<1>(chunk_d), h);
-       sycl::local_accessor<u8, 1> s_out(sycl::range<1>(chunk_d), h);
-       h.parallel_for(
-           sycl::nd_range<1>(sycl::range<1>((size_t)(nc ? nc : 1) * kGroup),
-                             sycl::range<1>(kGroup)),
-           [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
-             u32 c = (u32)it.get_group(0);
-             u32 lane = (u32)it.get_local_id(0);  // 0..31 (kGroup == 32)
-             if (c >= nc) return;
-             auto sg = it.get_sub_group();
-             u32 raw = d_csize[c] & ~kStoredFlag;
-             bool stored = (d_csize[c] & kStoredFlag) != 0;
-             u32 doff = c * chunk_d;
-             u32 dlen = (doff + chunk_d <= orig) ? chunk_d : (u32)(orig - doff);
-             const u8 *csrc = payload_base + d_coff[c];
-             u8 *si = &s_in[0];
-             u8 *so = &s_out[0];
-             for (u32 k = lane; k < raw; k += kGroup) si[k] = csrc[k];
-             sycl::group_barrier(it.get_group());
-             if (stored) {
-               for (u32 k = lane; k < raw; k += kGroup) so[k] = si[k];
-             } else {
-               // Cooperative LZ4 decode: lane 0 parses each sequence header,
-               // the whole sub-group copies the literals and match body.
-               u32 ip = 0, op = 0;
-               while (true) {
-                 // ---- lane 0 parses token + literal length ----
-                 u32 litlen = 0;
-                 int stop = 0;
-                 u8 match_tok = 0;  // lane-0 only: token's match nibble source
-                 if (lane == 0) {
-                   if (ip >= raw) {
-                     stop = 1;
-                   } else {
-                     u8 token = si[ip++];
-                     litlen = token >> 4;
-                     if (litlen == 15) {
-                       u8 b;
-                       do {
-                         b = si[ip++];
-                         litlen += b;
-                       } while (b == 255 && ip < raw);
-                     }
-                     // stash token's match nibble for the match phase below
-                     match_tok = token;
-                   }
-                 }
-                 stop = sycl::group_broadcast(sg, stop, 0);
-                 if (stop) break;
-                 litlen = sycl::group_broadcast(sg, litlen, 0);
-                 u32 lit_ip = sycl::group_broadcast(sg, ip, 0);
-                 u32 lit_op = sycl::group_broadcast(sg, op, 0);
-                 // ---- all lanes copy literals (no hazard: si is read-only) ----
-                 for (u32 base = 0; base < litlen; base += kGroup) {
-                   u32 k = base + lane;
-                   if (k < litlen) so[lit_op + k] = si[lit_ip + k];
-                 }
-                 int last = 0;
-                 if (lane == 0) {
-                   ip = lit_ip + litlen;
-                   op = lit_op + litlen;
-                   if (ip >= raw) last = 1;  // final sequence: literals only
-                 }
-                 last = sycl::group_broadcast(sg, last, 0);
-                 if (last) break;
-                 // ---- lane 0 parses offset + match length ----
-                 u32 off = 0, matchlen = 0;
-                 if (lane == 0) {
-                   off = (u32)si[ip] | ((u32)si[ip + 1] << 8);
-                   ip += 2;
-                   matchlen = match_tok & 0x0F;
-                   if (matchlen == 15) {
-                     u8 b;
-                     do {
-                       b = si[ip++];
-                       matchlen += b;
-                     } while (b == 255 && ip < raw);
-                   }
-                   matchlen += kMinMatch;
-                 }
-                 off = sycl::group_broadcast(sg, off, 0);
-                 matchlen = sycl::group_broadcast(sg, matchlen, 0);
-                 u32 m_op = sycl::group_broadcast(sg, op, 0);
-                 // ---- copy match body ----
-                 // If off >= matchlen the source region is entirely before m_op
-                 // (already written) -> safe to copy cooperatively. Otherwise the
-                 // match self-overlaps (RLE-like); lane 0 copies it serially.
-                 if (off >= matchlen) {
-                   for (u32 base = 0; base < matchlen; base += kGroup) {
-                     u32 k = base + lane;
-                     if (k < matchlen) so[m_op + k] = so[m_op - off + k];
-                   }
-                 } else if (lane == 0) {
-                   u32 mp = m_op - off;
-                   for (u32 k = 0; k < matchlen; ++k) so[m_op + k] = so[mp++];
-                 }
-                 if (lane == 0) op = m_op + matchlen;
-               }
-             }
-             sycl::group_barrier(it.get_group());
-             for (u32 k = lane; k < dlen; k += kGroup) d_out[doff + k] = so[k];
-           });
-     }).wait();
-
-    if (!dst_dev) q.memcpy(dst, d_out, orig).wait();
-    *out = orig;
-    ok = true;
-  } catch (...) {
-    ok = false;
-  }
-  if (d_src && !IsDevicePtr(q, src)) sycl::free(d_src, q);
-  if (d_csize) sycl::free(d_csize, q);
-  if (d_coff) sycl::free(d_coff, q);
-  if (d_out && !IsDevicePtr(q, dst)) sycl::free(d_out, q);
-  return ok ? 1 : 0;
+  if (!out) return 0;
+  int ok = 0;
+  return clio_sycl_lz4_decompress_batch(qbv, 1, &src, &src_size, &dst,
+                                        &dst_cap, out, &ok);
 }
 
 }  // extern "C"

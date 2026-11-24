@@ -318,6 +318,63 @@ TEST_CASE("TestSyclLz4RoundTrip") {
     REQUIRE(std::memcmp(orig.data(), deco.data(), n) == 0);  // LOSSLESS
   }
 }
+
+// The batched path (ONE launch per phase for all jobs). Mixed sizes, an empty
+// job, an incompressible job, and one job whose dst is too small: that job
+// must fail ALONE -- per-job status, neighbours unaffected.
+TEST_CASE("TestSyclLz4Batch") {
+  using ctp::CompressionFactory;
+  using ctp::CompressionPreset;
+  using ctp::CompressJob;
+  const std::vector<size_t> sizes = {65536, 1u << 20, 0, 4097, 100, 65536,
+                                     300000, 65536};
+  const size_t kTooSmall = 5;  // index of the job with an undersized dst
+  std::vector<std::vector<char>> orig(sizes.size()), cmp(sizes.size()),
+      deco(sizes.size());
+  for (size_t j = 0; j < sizes.size(); ++j) {
+    orig[j].resize(sizes[j]);
+    unsigned x = 12345u + (unsigned)j;
+    for (size_t i = 0; i < sizes[j]; ++i) {
+      x = x * 1103515245u + 12345u;
+      // job 6 is incompressible noise; the rest repeat every 64 bytes.
+      orig[j][i] = (j == 6) ? (char)(x >> 16) : (char)((i % 64) * 3 + j);
+    }
+    cmp[j].resize(j == kTooSmall ? 16 : sizes[j] + sizes[j] / 255 + 4096);
+    deco[j].resize(sizes[j]);
+  }
+  auto codec =
+      CompressionFactory::GetPreset("sycl-lz4", CompressionPreset::BALANCED);
+  REQUIRE(codec != nullptr);
+  std::vector<CompressJob> cj(sizes.size());
+  for (size_t j = 0; j < sizes.size(); ++j)
+    cj[j] = CompressJob{orig[j].data(), sizes[j], cmp[j].data(),
+                        cmp[j].size(), 0, false};
+  REQUIRE_FALSE(codec->CompressBatch(cj.data(), cj.size()));  // one fails
+  for (size_t j = 0; j < sizes.size(); ++j) {
+    INFO("job " << j);
+    REQUIRE(cj[j].ok == (j != kTooSmall));
+  }
+  std::vector<CompressJob> dj;
+  std::vector<size_t> idx;
+  for (size_t j = 0; j < sizes.size(); ++j) {
+    if (j == kTooSmall) continue;
+    dj.push_back(CompressJob{cmp[j].data(), cj[j].out_size, deco[j].data(),
+                             deco[j].size(), 0, false});
+    idx.push_back(j);
+  }
+  REQUIRE(codec->DecompressBatch(dj.data(), dj.size()));
+  for (size_t k = 0; k < idx.size(); ++k) {
+    const size_t j = idx[k];
+    INFO("job " << j);
+    REQUIRE(dj[k].out_size == sizes[j]);
+    REQUIRE(std::memcmp(orig[j].data(), deco[j].data(), sizes[j]) == 0);
+  }
+  // A corrupted size table must be rejected, not decoded past its buffers.
+  std::vector<char> bad(cmp[0].begin(), cmp[0].begin() + cj[0].out_size);
+  bad[24] = (char)0xFF; bad[25] = (char)0x7F;  // chunk 0 size -> 32767
+  size_t bsz = deco[0].size();
+  REQUIRE_FALSE(codec->Decompress(deco[0].data(), bsz, bad.data(), bad.size()));
+}
 #endif  // CTP_ENABLE_SYCL_LZ4
 
 // Characterization test for the compressor registry's frozen ID mappings.

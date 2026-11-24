@@ -161,10 +161,32 @@ int main(int argc, char **argv) {
       std::memcpy(cont.data() + sizeof(Header) + sizeof(u32), lz.data(), z);
       std::vector<u8> out(clen);
       size_t os = 0;
-      decoder_ok = clio_sycl_lz4_decompress(q, cont.data(), cont.size(),
-                                            out.data(), clen, &os) &&
-                   os == clen &&
-                   std::memcmp(out.data(), orig.data(), clen) == 0;
+      if ((u32)z >= clen) {
+        // Incompressible: liblz4's block is LARGER than the chunk. The SYCL
+        // encoder stores such a chunk raw, and the decoder must REJECT the
+        // oversized block (it would overrun its chunk-sized local buffer),
+        // then accept the same chunk in the encoder's stored-raw form.
+        bool rejected = !clio_sycl_lz4_decompress(q, cont.data(), cont.size(),
+                                                  out.data(), clen, &os);
+        std::vector<u8> st(sizeof(Header) + sizeof(u32) + clen);
+        std::memcpy(st.data(), &h, sizeof(Header));
+        u32 rs = clen | kStoredFlag;
+        std::memcpy(st.data() + sizeof(Header), &rs, sizeof(u32));
+        std::memcpy(st.data() + sizeof(Header) + sizeof(u32), orig.data(),
+                    clen);
+        decoder_ok = rejected &&
+                     clio_sycl_lz4_decompress(q, st.data(), st.size(),
+                                              out.data(), clen, &os) &&
+                     os == clen &&
+                     std::memcmp(out.data(), orig.data(), clen) == 0;
+        std::printf("    (incompressible: oversized block %s, raw form %s)\n",
+                    rejected ? "rejected" : "ACCEPTED", decoder_ok ? "ok" : "bad");
+      } else {
+        decoder_ok = clio_sycl_lz4_decompress(q, cont.data(), cont.size(),
+                                              out.data(), clen, &os) &&
+                     os == clen &&
+                     std::memcmp(out.data(), orig.data(), clen) == 0;
+      }
     }
   }
   std::printf("[c] liblz4 block decodes via SYCL %s\n",
