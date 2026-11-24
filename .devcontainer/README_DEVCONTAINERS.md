@@ -214,10 +214,10 @@ When contributing code:
 
 ## Additional Resources
 
-- **Contributing Guide**: `docs/contributing.md`
+- **Contributing Guide**: `.claude-plugin/plugins/iowarp-contributing/skills/contributing/SKILL.md`
 - **CUDA Setup**: `.devcontainer/CUDA_SETUP.md`
 - **Project Documentation**: `CLAUDE.md`
-- **Module Development**: `docs/docs/sdk/context-runtime/2.module_dev_guide.md`
+- **Module Development**: https://core.iowarp.ai/develop/
 
 ## Quick Reference
 

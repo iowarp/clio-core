@@ -875,6 +875,27 @@ set_tests_properties(
         ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1;STRESS_THREADS=8;STRESS_ITERS=1500"
 )
 
+# MultiDelBlob / MultiDelTag: delete a set of blobs or tags in one task.
+add_executable(test_multi_del test_multi_del.cc)
+target_link_libraries(test_multi_del
+    clio_cte_core_runtime
+    clio_cte_core_client
+    clio::run::admin_runtime
+    clio::run::admin_client
+    clio::run::bdev_runtime
+    clio::run::bdev_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+add_test(NAME cte_multi_del COMMAND test_multi_del)
+set_tests_properties(
+    cte_multi_del
+    PROPERTIES
+        TIMEOUT 300
+        LABELS "unit;cte"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
+)
+
 # Regression: blocks freed by DelBlob return to their bdev partition.
 add_test(NAME cte_block_reuse_all
     COMMAND test_blob_block_reuse)
@@ -922,6 +943,19 @@ set_tests_properties(
         ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
 )
 
+# Runtime log level for the throughput-bound regressions below
+# (cte_concurrent_same_blob_* and cte_bdev_free_visibility). In a Debug build
+# with CLIO_CTP_LOG_LEVEL=0 -- what the macOS and Windows CI jobs run -- every
+# kDebug HLOG is written and fflush'ed to stderr, i.e. into ctest's pipe:
+# 150-250k lines / 34-51 MB per test. When ctest drains that pipe slowly
+# (the 113-420 s passing macOS runs imply ~0.1-0.3 MB/s) the workers block in
+# the write -- holding the per-blob write token every other writer is queued
+# on -- so the run takes bytes / drain rate and trips the 300/600 s TIMEOUT
+# (measured: same test, stderr read at 1 MB/s: 34 s; at "info": 1.7 s). The tests
+# assert on data, not logs, and warnings/errors (HANGWATCH, SLOW-PUT, the
+# mismatch diagnostics) still print at "info".
+set(CLIO_THROUGHPUT_TEST_LOG_LEVEL "CTP_LOG_LEVEL=info")
+
 add_test(NAME cte_concurrent_same_blob_all
     COMMAND test_concurrent_same_blob)
 
@@ -930,7 +964,7 @@ set_tests_properties(
     PROPERTIES
         TIMEOUT 300  # 5 minute timeout -> a hang trips this
         LABELS "regression;concurrent;cte"
-        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1;SAME_BLOB_THREADS=8;SAME_BLOB_ITERS=100"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1;SAME_BLOB_THREADS=8;SAME_BLOB_ITERS=100;${CLIO_THROUGHPUT_TEST_LOG_LEVEL}"
 )
 
 # issue #820: run the SAME rigorous same-blob correctness test again, this time
@@ -940,9 +974,12 @@ set_tests_properties(
 # of the merge path was ~0. Reusing this test means the merged path is checked
 # by the strongest correctness assertion there is (each thread's disjoint region
 # must survive intact), not a bespoke smoke test.
-# Same-blob writes racing the periodic FlushData move to a persistent tier
-# (RELIABILITY.md defect 14): the flush must hold the write token across its
-# place-and-swap and size the move under it.
+# Same-blob writes racing the write-back cache's periodic flush to the
+# persistent core (successor of RELIABILITY.md defect 14, which raced the
+# core's own flush): no writer's region may be lost.
+if(CLIO_CTE_ENABLE_POLICY_CACHES)
+  add_dependencies(test_concurrent_same_blob clio_cte_core_persist_write_back_runtime)
+endif()
 add_test(NAME cte_concurrent_same_blob_flush
     COMMAND test_concurrent_same_blob)
 
@@ -951,7 +988,7 @@ set_tests_properties(
     PROPERTIES
         TIMEOUT 300  # 5 minute timeout -> a hang trips this
         LABELS "regression;concurrent;cte"
-        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1;SAME_BLOB_THREADS=8;SAME_BLOB_ITERS=100;SAME_BLOB_FLUSH=1"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1;SAME_BLOB_THREADS=8;SAME_BLOB_ITERS=100;SAME_BLOB_FLUSH=1;${CLIO_THROUGHPUT_TEST_LOG_LEVEL}"
 )
 
 # issue #820: run the SAME rigorous same-blob correctness test again, this time
@@ -968,7 +1005,7 @@ set_tests_properties(
     PROPERTIES
         TIMEOUT 300
         LABELS "regression;concurrent;cte;batching"
-        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1;SAME_BLOB_THREADS=8;SAME_BLOB_ITERS=100;CLIO_CTE_BATCHING=1;CLIO_BATCH_LANE=1"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1;SAME_BLOB_THREADS=8;SAME_BLOB_ITERS=100;CLIO_CTE_BATCHING=1;CLIO_BATCH_LANE=1;${CLIO_THROUGHPUT_TEST_LOG_LEVEL}"
 )
 
 # issue #820: vectored PutBlob/GetBlob correctness (equivalence with N single
@@ -1005,7 +1042,7 @@ add_test(NAME cte_bdev_free_visibility
 set_tests_properties(cte_bdev_free_visibility PROPERTIES
     TIMEOUT 600
     LABELS "regression;bdev;cte;919"
-    ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1")
+    ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1;${CLIO_THROUGHPUT_TEST_LOG_LEVEL}")
 
 # Add reorganize blob tests
 # NOTE: These tests are chained (Put -> Move -> Integrity -> Promote -> Cleanup)
@@ -1024,65 +1061,6 @@ set_tests_properties(
         TIMEOUT 600
         LABELS "unit;reorganize;cte"
         ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
-)
-
-# Deferred-put pipeline + multiput batches (issue #862)
-add_executable(test_multiput_defer test_multiput_defer.cc)
-target_link_libraries(test_multiput_defer
-    clio_cte_core_runtime
-    clio_cte_core_client
-    clio::run::admin_runtime
-    clio::run::admin_client
-    clio::run::bdev_runtime
-    clio::run::bdev_client
-    ctp::cxx
-    ${CMAKE_THREAD_LIBS_INIT}
-)
-
-add_test(NAME cte_multiput_defer
-    COMMAND test_multiput_defer)
-
-set_tests_properties(
-    cte_multiput_defer
-    PROPERTIES
-        TIMEOUT 300
-        LABELS "unit;multiput;cte"
-        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
-)
-
-# Client-side data sieving (issue #1007). The same binary runs twice: once
-# with the sieve (default-on) and once with CLIO_CTE_PUT_SIEVE=0, so every
-# case is also a kill-switch parity check against the plain batch pipeline.
-add_executable(test_put_sieve test_put_sieve.cc)
-target_link_libraries(test_put_sieve
-    clio_cte_core_runtime
-    clio_cte_core_client
-    clio::run::admin_runtime
-    clio::run::admin_client
-    clio::run::bdev_runtime
-    clio::run::bdev_client
-    ctp::cxx
-    ${CMAKE_THREAD_LIBS_INIT}
-)
-
-add_test(NAME cte_put_sieve
-    COMMAND test_put_sieve)
-add_test(NAME cte_put_sieve_disabled
-    COMMAND test_put_sieve)
-
-set_tests_properties(
-    cte_put_sieve
-    PROPERTIES
-        TIMEOUT 300
-        LABELS "unit;sieve;cte"
-        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
-)
-set_tests_properties(
-    cte_put_sieve_disabled
-    PROPERTIES
-        TIMEOUT 300
-        LABELS "unit;sieve;cte"
-        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1;CLIO_CTE_PUT_SIEVE=0"
 )
 
 # Blob replicas + replication chimod (issue #886). Gated on the module: the
@@ -1392,6 +1370,38 @@ set_tests_properties(
         LABELS "unit;checkpoint;cte"
         ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
 )
+
+# Copy-on-write (lazy checkpoints): a copy taken with vector.Copy(sync=false)
+# holds the source's bytes as of the copy, however the source is overwritten
+# or deleted afterwards.
+add_executable(test_checkpoint_cow test_checkpoint_cow.cc)
+target_include_directories(test_checkpoint_cow PRIVATE
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+    ${CMAKE_SOURCE_DIR}/context-transfer-engine/checkpoint/include
+)
+target_link_libraries(test_checkpoint_cow
+    clio_cte_core_runtime
+    clio_cte_core_client
+    clio_cte_checkpoint_runtime
+    clio_cte_checkpoint_client
+    clio::run::admin_runtime
+    clio::run::admin_client
+    clio::run::bdev_runtime
+    clio::run::bdev_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+add_test(NAME cte_checkpoint_cow
+    COMMAND test_checkpoint_cow)
+
+set_tests_properties(
+    cte_checkpoint_cow
+    PROPERTIES
+        TIMEOUT 300
+        LABELS "unit;checkpoint;cte;cow"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
+)
 endif()  # TARGET clio_cte_checkpoint_client
 
 #------------------------------------------------------------------------------
@@ -1470,6 +1480,97 @@ set_tests_properties(
         ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
 )
 endif()  # full 4-layer cache stack
+
+# Policy caches over disconnected volatile/persistent cores.
+if(CLIO_CTE_ENABLE_POLICY_CACHES)
+add_executable(test_policy_cache test_policy_cache.cc)
+target_include_directories(test_policy_cache PRIVATE
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+)
+target_link_libraries(test_policy_cache
+    clio_cte_core_runtime
+    clio_cte_core_client
+    clio_cte_core_persist_write_thru_runtime
+    clio_cte_core_persist_write_thru_client
+    clio_cte_core_persist_write_back_runtime
+    clio_cte_core_persist_write_back_client
+    clio::run::admin_runtime
+    clio::run::admin_client
+    clio::run::bdev_runtime
+    clio::run::bdev_client
+)
+add_test(NAME cte_policy_cache COMMAND test_policy_cache)
+set_tests_properties(
+    cte_policy_cache
+    PROPERTIES
+        TIMEOUT 300
+        LABELS "unit;cache;cte"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
+)
+
+# Unplugging (stopping) a write-back cache flushes its dirty data, counts it
+# and leaves a redirect. Own in-process runtime, one cache pool per case.
+add_executable(test_cache_unplug test_cache_unplug.cc)
+target_include_directories(test_cache_unplug PRIVATE
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+)
+target_link_libraries(test_cache_unplug
+    clio_cte_core_runtime
+    clio_cte_core_client
+    clio_cte_core_persist_write_back_runtime
+    clio_cte_core_persist_write_back_client
+    clio::run::admin_runtime
+    clio::run::admin_client
+    clio::run::bdev_runtime
+    clio::run::bdev_client
+)
+add_test(NAME cte_cache_unplug COMMAND test_cache_unplug)
+set_tests_properties(
+    cte_cache_unplug
+    PROPERTIES
+        TIMEOUT 300
+        RESOURCE_LOCK "clio_runtime"
+        LABELS "unit;cache;cte;persistence"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
+)
+
+# `clio_run pool stop|start|rm <cache>` end to end: a real daemon, then a restart on the same
+# storage. UNIX-only (RuntimeServer / re-launching this binary).
+if(UNIX)
+add_executable(test_cli_cache_unplug test_cli_cache_unplug.cc)
+target_include_directories(test_cli_cache_unplug PRIVATE
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+)
+target_compile_definitions(test_cli_cache_unplug PRIVATE
+    CLIO_RUN_EXE="$<TARGET_FILE:clio_run>")
+target_link_libraries(test_cli_cache_unplug
+    clio_cte_core_client
+    # Config helpers of the client live in the runtime library; keep it after
+    # the client on the link line.
+    clio_cte_core_runtime
+    clio::run::admin_client
+    clio::run::bdev_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+add_dependencies(test_cli_cache_unplug
+    clio_run
+    clio_cte_core_runtime
+    clio_cte_core_persist_write_back_runtime
+    clio_bdev_runtime
+    clio_admin_runtime)
+add_test(NAME cte_cli_cache_unplug
+    COMMAND test_cli_cache_unplug
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+set(_cli_cache_unplug_env
+    "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1")
+set_tests_properties(cte_cli_cache_unplug PROPERTIES
+    RESOURCE_LOCK "clio_runtime"
+    TIMEOUT 300
+    ENVIRONMENT "${_cli_cache_unplug_env}"
+    LABELS "unit;cache;cte;persistence;msan_skip")
+endif()  # UNIX
+endif()  # policy caches
 
 # Add score-driven eviction tests (Method::kEvict)
 add_test(NAME cte_evict
@@ -1926,105 +2027,9 @@ set_tests_properties(
         ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1"
 )
 
-# ------------------------------------------------------------------------------
-# GPU metadata cache unit tests — pure POD header, CPU-testable
-# ------------------------------------------------------------------------------
-add_executable(test_cte_shm_metadata_cache
-    test_cte_shm_metadata_cache.cc
-)
-
-target_link_libraries(test_cte_shm_metadata_cache
-    clio_cte_core_runtime
-    clio_cte_core_client
-    clio::run::admin_runtime
-    clio::run::admin_client
-    clio::run::bdev_runtime
-    clio::run::bdev_client
-    ctp::cxx
-    ${CMAKE_THREAD_LIBS_INIT}
-)
-
-add_test(NAME cte_shm_metadata_cache_all
-    COMMAND test_cte_shm_metadata_cache)
-
-set_tests_properties(
-    cte_shm_metadata_cache_all
-    PROPERTIES TIMEOUT 120
-)
-
-# ------------------------------------------------------------------------------
-# clio-fs zero-IPC read path (issue #817): correctness + latency
-#
-# UNIX-only, but no longer because of the descriptor layer: that has a Windows
-# port now (FsOff/FsSsize via posix_compat.h) and is compiled on every platform.
-# What keeps this binary UNIX-only is its own harness -- RuntimeServer forks a
-# real clio_run daemon through unistd.h/sys/wait.h, which is the whole point of
-# the test (see the InitRuntime comment).
-# ------------------------------------------------------------------------------
-if(UNIX)
-add_executable(test_cfs_shm_read
-    test_cfs_shm_read.cc
-)
-
-target_include_directories(test_cfs_shm_read PRIVATE
-    ${CMAKE_SOURCE_DIR}/context-runtime/test
-)
-
-# Spawns its own clio_run daemon (RuntimeServer) and composes it from YAML, so
-# the fast path is exercised across a real process boundary. A co-located
-# runtime cannot prove that -- it shares the address space and hand-registers
-# its targets, which is precisely how the production-dead locality check
-# (issue #817) stayed invisible.
-target_compile_definitions(test_cfs_shm_read PRIVATE
-    CLIO_RUN_EXE="$<TARGET_FILE:clio_run>")
-
-target_link_libraries(test_cfs_shm_read
-    clio_cte_filesystem_client  # descriptor layer + chimod client
-    clio_cte_filesystem_client
-    clio_cte_core_client
-    # The client library's Config helpers are defined in the RUNTIME library,
-    # so it has to come after the client on the link line: this binary calls
-    # nothing in it directly, and --as-needed would otherwise drop it before
-    # the client's undefined reference is even seen.
-    clio_cte_core_runtime
-    clio::run::admin_client
-    clio::run::bdev_client
-    ctp::cxx
-    ${CMAKE_THREAD_LIBS_INIT}
-)
-
-# The co-located runtime dlopens the chimods from CLIO_REPO_PATH.
-add_dependencies(test_cfs_shm_read
-    clio_run
-    clio_cte_core_runtime
-    clio_cte_filesystem_runtime
-    clio_bdev_runtime
-    clio_admin_runtime)
-
-add_test(NAME cfs_shm_read
-    COMMAND test_cfs_shm_read
-    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
-
-# This test spawns a live daemon, so it inherits the macOS caveat from the CLI
-# live-runtime tests (issue #482): the local ZMQ DEALER->ROUTER control plane
-# does not deliver ClientConnect replies on the macOS runners, so drive the
-# client over the unix-socket IPC transport there.
-set(_cfs_shm_read_env
-    "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1")
-if(APPLE)
-  string(APPEND _cfs_shm_read_env ";CLIO_IPC_MODE=ipc")
-endif()
-
-set_tests_properties(cfs_shm_read PROPERTIES
-    ENVIRONMENT "${_cfs_shm_read_env}"
-    RESOURCE_LOCK "clio_runtime"
-    TIMEOUT 180
-    LABELS "unit;cte;cfs;msan_skip")
-endif()  # UNIX
-
 # Private-memory AsyncGetBlob (issue #823). UNIX-only because the "separate"
 # configuration forks a real clio_run daemon (RuntimeServer / unistd.h), the
-# same shape the cfs_shm_read test uses. The two ctest entries below run the
+# same shape the other daemon-spawning tests use. The two ctest entries below run the
 # SAME binary in the two runtime configurations the issue calls for: inline
 # (co-located runtime -> direct write into private memory) and separate (pure
 # client -> SHM staging + PostWait copy).
@@ -2043,7 +2048,7 @@ target_compile_definitions(test_getblob_priv PRIVATE
 target_link_libraries(test_getblob_priv
     clio_cte_core_client
     # Config helpers used by the client live in the runtime library; keep it
-    # after the client on the link line (see the cfs_shm_read note above).
+    # after the client on the link line (--as-needed would otherwise drop it).
     clio_cte_core_runtime
     clio::run::admin_client
     clio::run::bdev_client
@@ -2320,13 +2325,12 @@ set_tests_properties(
 endif()
 
 #------------------------------------------------------------------------------
-# Regression: renaming a published directory under a parent whose name has not
-# arrived yet must re-key the whole index subtree (pending_rekey_).
+# Flat tag names: every name verb, batched and single (test_tag_names.cc).
 #------------------------------------------------------------------------------
-add_executable(test_tag_name_rekey test_tag_name_rekey.cc)
-target_include_directories(test_tag_name_rekey PRIVATE
+add_executable(test_tag_names test_tag_names.cc)
+target_include_directories(test_tag_names PRIVATE
     ${CMAKE_SOURCE_DIR}/context-runtime/test)
-target_link_libraries(test_tag_name_rekey
+target_link_libraries(test_tag_names
     clio_cte_core_runtime
     clio_cte_core_client
     clio::run::admin_runtime
@@ -2335,8 +2339,8 @@ target_link_libraries(test_tag_name_rekey
     clio::run::bdev_client
     ctp::cxx
     ${CMAKE_THREAD_LIBS_INIT})
-add_test(NAME cte_tag_name_rekey COMMAND test_tag_name_rekey)
-set_tests_properties(cte_tag_name_rekey PROPERTIES
+add_test(NAME cte_tag_names COMMAND test_tag_names)
+set_tests_properties(cte_tag_names PROPERTIES
     TIMEOUT 120
     LABELS "unit;cte"
     ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1")
@@ -2359,7 +2363,7 @@ set_tests_properties(cte_well_known_pool_ids PROPERTIES
 
 # fsync through the descriptor layer must reach a persistent tier (#1188).
 # Spawns its own clio_run daemon, composed with a RAM tier over a file tier;
-# UNIX-only for the same reason as cfs_shm_read (RuntimeServer).
+# UNIX-only: it forks a daemon through RuntimeServer (unistd.h).
 if(UNIX)
 add_executable(test_cfs_fsync_durable
     test_cfs_fsync_durable.cc
@@ -2372,8 +2376,8 @@ target_compile_definitions(test_cfs_fsync_durable PRIVATE
 target_link_libraries(test_cfs_fsync_durable
     clio_cte_filesystem_client
     clio_cte_core_client
-    # Config helpers of the client live in the runtime library (see
-    # test_cfs_shm_read above).
+    # Config helpers of the client live in the runtime library; keep it after
+    # the client on the link line.
     clio_cte_core_runtime
     clio::run::admin_client
     clio::run::bdev_client
@@ -2384,14 +2388,52 @@ add_dependencies(test_cfs_fsync_durable
     clio_run
     clio_cte_core_runtime
     clio_cte_filesystem_runtime
+    clio_cte_stream_runtime
+    clio_cte_core_persist_write_back_runtime
     clio_bdev_runtime
     clio_admin_runtime)
 add_test(NAME cfs_fsync_durable
     COMMAND test_cfs_fsync_durable
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+# Drive the client over the unix-socket IPC transport on macOS, where the
+# local ZMQ control plane does not deliver ClientConnect replies (#482).
+set(_cfs_fsync_durable_env
+    "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1")
+if(APPLE)
+  string(APPEND _cfs_fsync_durable_env ";CLIO_IPC_MODE=ipc")
+endif()
 set_tests_properties(cfs_fsync_durable PROPERTIES
     RESOURCE_LOCK "clio_runtime"
     TIMEOUT 180
-    ENVIRONMENT "${_cfs_shm_read_env}"
+    ENVIRONMENT "${_cfs_fsync_durable_env}"
     LABELS "unit;cte;cfs;msan_skip")
 endif()  # UNIX
+
+#------------------------------------------------------------------------------
+# core_shm_cache_writethru: client SHM path + chimod flusher (DESIGN.md)
+#------------------------------------------------------------------------------
+if(CLIO_CTE_ENABLE_SHM_WTC)
+  add_executable(test_shm_wtc test_shm_wtc.cc)
+  target_include_directories(test_shm_wtc PRIVATE
+      ${CMAKE_SOURCE_DIR}/context-runtime/test
+      ${CMAKE_SOURCE_DIR}/context-transfer-engine/core_shm_cache_writethru/include
+  )
+  target_link_libraries(test_shm_wtc
+      clio_cte_core_runtime
+      clio_cte_core_client
+      clio_cte_core_shm_cache_writethru_runtime
+      clio_cte_core_shm_cache_writethru_client
+      clio::run::admin_runtime
+      clio::run::admin_client
+      clio::run::bdev_runtime
+      clio::run::bdev_client
+      ctp::cxx
+      ${CMAKE_THREAD_LIBS_INIT}
+  )
+  add_test(NAME cte_shm_wtc COMMAND test_shm_wtc)
+  set_tests_properties(cte_shm_wtc PROPERTIES
+      TIMEOUT 300
+      LABELS "unit;shm_wtc;cte"
+      ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
+  )
+endif()

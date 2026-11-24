@@ -46,6 +46,9 @@ add_subdirectory(grayscott)
 add_subdirectory(gmx)
 add_subdirectory(weights)
 add_subdirectory(lbann)
+if(CLIO_CORE_ENABLE_CUDA AND TARGET clio_cte_compressor_runtime)
+  add_subdirectory(newcoro)  # clio-coroc editions (see newcoro/CMakeLists.txt)
+endif()
 # lammps_md joined them: its seam split (md_kernels.h over md_common.h, plus
 # lammps_md/cuda and lammps_md/sycl) was the last one, and the __shared__ usage
 # that made it the outlier turned out to be only the reduction scratch -- the

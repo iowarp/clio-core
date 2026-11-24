@@ -987,7 +987,9 @@ TEST_CASE("Viz pools can be shut down from the dashboard", "[viz]") {
     CTP_MSAN_UNPOISON_OBJ(address);
     Poco::Net::StreamSocket socket(address);
     CTP_MSAN_UNPOISON_OBJ(socket);
-    socket.setReceiveTimeout(Poco::Timespan(10, 0));
+    // 30 s: far above any honest answer on a slow runner, yet below the
+    // server's 60 s body-receive timeout that the regression waited out.
+    socket.setReceiveTimeout(Poco::Timespan(30, 0));
     const std::string raw =
         "POST /api/pools/4995.0/destroy HTTP/1.1\r\n"
         "Host: 127.0.0.1\r\nConnection: close\r\n\r\n";
@@ -1001,7 +1003,8 @@ TEST_CASE("Viz pools can be shut down from the dashboard", "[viz]") {
     std::cout << "  bare POST answered in " << sec << "s" << std::endl;
     REQUIRE(n > 0);
     REQUIRE(Contains(std::string(buf, static_cast<size_t>(n)), "404"));
-    REQUIRE(sec < 5.0);
+    // No wall-clock assert: a regressed bridge answers only after Poco's
+    // 60 s receive timeout, so receiveBytes() above throws first.
   }
 }
 
@@ -1028,18 +1031,22 @@ TEST_CASE("Viz dashboard starts and stops without wedging", "[viz][shutdown]") {
   REQUIRE(server.GetPort() != 0);
   REQUIRE(server.GetBindAddr() == "127.0.0.1");
 
-  // The regression: this call is what used to never return. Time it, and hold
-  // it to a budget far below the watchdog's, so a reintroduced deadlock fails
-  // the test instead of quietly slowing every shutdown down.
+  // The regression: this call is what used to never return. Stop() bounds the
+  // Poco teardown by a budget and reports whether it finished or was
+  // abandoned. Give it a budget no runner needs (60 s) and require a clean
+  // finish: a reintroduced deadlock is abandoned and fails here, while a slow
+  // runner merely takes longer.
+  SIMPLE_TEST_SETENV("CLIO_VIZ_STOP_BUDGET_MS", "60000");
   auto t0 = std::chrono::steady_clock::now();
-  server.Stop();
+  const bool clean = server.Stop();
+  SIMPLE_TEST_SETENV("CLIO_VIZ_STOP_BUDGET_MS", "");
   double ms = std::chrono::duration<double, std::milli>(
                   std::chrono::steady_clock::now() - t0)
                   .count();
   std::cout << "  Stop() took " << ms << " ms" << std::endl;
   REQUIRE(!server.IsRunning());
   REQUIRE(server.GetPort() == 0);
-  REQUIRE(ms < 3000.0);  // the teardown budget; a deadlock would spend it all
+  REQUIRE(clean);  // finished, not abandoned at the budget
 
   // Idempotent: stopping an already-stopped dashboard is a no-op, not a crash.
   server.Stop();
@@ -1066,7 +1073,8 @@ TEST_CASE("Viz teardown abandons a slow dashboard instead of blocking",
                   .count();
   std::cout << "  Stop() with a 0 ms budget took " << ms << " ms" << std::endl;
   REQUIRE(!server.IsRunning());
-  REQUIRE(ms < 1000.0);  // must not wait out anything
+  // No wall-clock bound: with a 0 ms budget Stop() never waits on the Poco
+  // teardown (wait_for(0)), so how long it took only measures the runner.
 
   SIMPLE_TEST_SETENV("CLIO_VIZ_STOP_BUDGET_MS", "");
 }

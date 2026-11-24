@@ -146,6 +146,76 @@ __global__ void VerifyKernel(clio::run::IpcManagerGpuInfo info,
   CLIO_YCORO_RUN(VerifyCoro(v, base, count, salt, bad, yv.Block()));
 }
 
+/** v[base + i] = Val(base + i, salt) for i < count through ONE Allocate of
+ *  the whole range (the overwrite path: wholly covered pages are not read),
+ *  then one flush of the range, landed before the unpin. The range must fit
+ *  the cache: every page of it is pinned at once. */
+__device__ gy::YCoroMain AllocateWriteCoro(gv::DeviceVector<u32> v, u64 base,
+                                           u64 count, u32 salt) {
+  co_await v.Allocate(0, base, count);
+  for (u64 i = 0; i < count;) {
+    u64 run = 0;
+    {
+      auto h = co_await v.HoldPage(base + i, count - i, /*write=*/true);
+      run = h.run();
+      for (u64 k = threadIdx.x; k < run; k += blockDim.x) {
+        h[base + i + k] = Val(base + i + k, salt);
+      }
+    }
+    i += run;
+  }
+  __syncthreads();
+  co_await v.Flush(0, base, count);
+  v.UnpinRange(base, count);
+}
+
+__global__ void AllocateWriteKernel(clio::run::IpcManagerGpuInfo info,
+                                    gv::DeviceVector<u32> v, u64 base,
+                                    u64 count, u32 salt,
+                                    gy::YieldableView<> yv,
+                                    gy::YieldStackView ys) {
+  CLIO_GPU_INIT(info, nullptr);
+  v.Init(yv.Block());
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(AllocateWriteCoro(v, base, count, salt));
+}
+
+/** v[base + i] = Val(base + i, salt), one page at a time, WITHOUT flushing:
+ *  each page is fetched, write-held, written and unpinned dirty. A working
+ *  set larger than the cache then evicts dirty frames, which the vector must
+ *  write back (write-back eviction) instead of dropping. */
+__device__ gy::YCoroMain WriteNoFlushCoro(gv::DeviceVector<u32> v, u64 base,
+                                          u64 count, u32 salt) {
+  for (u64 i = 0; i < count;) {
+    u64 run = 0;
+    co_await v.Fetch(0, v.PageLo(base + i), v.PageSpan(base + i, 1));
+    {
+      auto h = co_await v.HoldPage(base + i, count - i, /*write=*/true);
+      run = h.run();
+      for (u64 k = threadIdx.x; k < run; k += blockDim.x) {
+        h[base + i + k] = Val(base + i + k, salt);
+      }
+    }
+    __syncthreads();
+    v.UnpinRange(v.PageLo(base + i), v.PageSpan(base + i, 1));
+    i += run;
+  }
+  co_await v.EndFlush();  // eviction write-backs land (and retire) before the kernel ends
+}
+
+__global__ void WriteNoFlushKernel(clio::run::IpcManagerGpuInfo info,
+                                   gv::DeviceVector<u32> v, u64 base,
+                                   u64 count, u32 salt,
+                                   gy::YieldableView<> yv,
+                                   gy::YieldStackView ys) {
+  CLIO_GPU_INIT(info, nullptr);
+  v.Init(yv.Block());
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(WriteNoFlushCoro(v, base, count, salt));
+}
+
 /** Touch ONE element on each of `npages` pages, `passes` times. */
 __device__ gy::YCoroMain WalkCoro(gv::DeviceVector<u32> v, u64 first_page,
                                   u64 npages, u32 passes,
@@ -641,6 +711,42 @@ bool HostPageMatches(const clio::cte::core::TagId &tag, u64 page, u32 salt) {
       std::fprintf(stderr, "  host mismatch %s elem %llu: got %u want %u\n",
                    name.c_str(), (unsigned long long) i, buf[static_cast<size_t>(i)],
                    Val(idx, salt));
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * HostPageMatches with a per-element salt: element idx (absolute) must hold
+ * Val(idx, salt_of(idx)). For checks where one page mixes two writers.
+ * @param tag     the vector's tag
+ * @param page    page number
+ * @param elems   elements to compare from the page start (a short tail page)
+ * @param salt_of absolute element index -> expected salt
+ * @return true when every compared element matches
+ */
+template <typename SaltFn>
+bool HostPageMatchesBy(const clio::cte::core::TagId &tag, u64 page, u64 elems,
+                       SaltFn salt_of) {
+  clio::cte::core::Client core(clio::cte::core::kCtePoolId);
+  std::vector<u32> buf(static_cast<size_t>(kPageElems), 0u);
+  const std::string name = std::to_string(page);
+  auto f = core.AsyncGetBlob(tag, std::string(name), 0, elems * sizeof(u32), 0,
+                             reinterpret_cast<char *>(buf.data()));
+  f.Wait();
+  if (f->GetReturnCode() != 0) {
+    std::fprintf(stderr, "  host read of %s failed rc=%d\n", name.c_str(),
+                 f->GetReturnCode());
+    return false;
+  }
+  for (u64 i = 0; i < elems; ++i) {
+    const u64 idx = page * kPageElems + i;
+    const u32 want = Val(idx, salt_of(idx));
+    if (buf[static_cast<size_t>(i)] != want) {
+      std::fprintf(stderr, "  host mismatch %s elem %llu: got %u want %u\n",
+                   name.c_str(), (unsigned long long) i,
+                   buf[static_cast<size_t>(i)], want);
       return false;
     }
   }
@@ -1550,6 +1656,129 @@ TEST_CASE("gpu_vector: paging semantics", "[gpu_vector][semantics]") {
     });
     Sync();
     REQUIRE(ReadCounter(bad) == 0);
+  }
+
+  // -------------------------------------------------------------------
+  // ALLOCATE: the overwrite path. (1) Pages a range covers whole are claimed
+  // with NO read, even into frames that held other pages: after a walk that
+  // leaves the 8-frame cache full of pages 8..15, allocating pages 0..7 must
+  // fault 0 times and store exactly the new values. (2) Pages a range covers
+  // in part ARE read, and keep the elements the range did not name. (3) A
+  // short last page counts as whole when the range reaches the vector's end.
+  // -------------------------------------------------------------------
+  {
+    const u64 kPages = 16;
+    Fixture f("gv_sem_allocate", 1, 8, kPages);
+    RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
+                        gy::YieldStackView sv_) {
+      WriteKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(
+          g_gpu, f.dev, 0, kPages * kPageElems, 31u, 1, vw_, sv_);
+    });
+    Sync();
+
+    // (1) whole pages, reused frames
+    f.Reset();
+    RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
+                        gy::YieldStackView sv_) {
+      AllocateWriteKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(
+          g_gpu, f.dev, 0, 8 * kPageElems, 32u, vw_, sv_);
+    });
+    Sync();
+    auto s = f.Stats();
+    std::fprintf(stderr, "[allocate-whole] faults=%llu allocs=%llu\n",
+                 (unsigned long long) s.faults, (unsigned long long) s.allocs);
+    REQUIRE(s.faults == 0);
+    REQUIRE(s.allocs == 8);
+    REQUIRE(s.get_errors == 0);
+    for (u64 p = 0; p < 8; ++p) {
+      REQUIRE(HostPageMatches(f.vec.TagId(), p, 32u));
+    }
+
+    // (2) a range from the middle of page 8 to the middle of page 10: pages
+    // 8 and 10 are read (their other halves keep salt 31), page 9 is not.
+    const u64 half = kPageElems / 2;
+    const u64 lo = 8 * kPageElems + half;
+    const u64 hi = 10 * kPageElems + half;
+    f.Reset();
+    RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
+                        gy::YieldStackView sv_) {
+      AllocateWriteKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(
+          g_gpu, f.dev, lo, hi - lo, 33u, vw_, sv_);
+    });
+    Sync();
+    s = f.Stats();
+    std::fprintf(stderr, "[allocate-partial] faults=%llu allocs=%llu\n",
+                 (unsigned long long) s.faults, (unsigned long long) s.allocs);
+    REQUIRE(s.allocs == 1);
+    // (1) left all 8 frames holding pages 0..7, so pages 8 and 10 are absent.
+    REQUIRE(s.faults == 2);
+    auto mixed = [&](u64 idx) { return idx >= lo && idx < hi ? 33u : 31u; };
+    for (u64 p = 8; p <= 10; ++p) {
+      REQUIRE(HostPageMatchesBy(f.vec.TagId(), p, kPageElems, mixed));
+    }
+  }
+  {
+    // (3) a vector whose last page is 100 elements long
+    const u64 kTail = 100;
+    const u64 n = 3 * kPageElems + kTail;
+    gv::Vector<u32> vec("gv_sem_allocate_tail", {0}, kPageBytes, 1, 8, n,
+                        clio::run::PoolId::GetNull(), 0, 1, /*nsets=*/1);
+    vec.EnableStats();
+    auto dev = vec.GetDevice(0);
+    RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
+                        gy::YieldStackView sv_) {
+      AllocateWriteKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(
+          g_gpu, dev, 0, n, 34u, vw_, sv_);
+    });
+    Sync();
+    auto s = vec.ReadStats(0);
+    std::fprintf(stderr, "[allocate-tail] faults=%llu allocs=%llu\n",
+                 (unsigned long long) s.faults, (unsigned long long) s.allocs);
+    REQUIRE(s.faults == 0);
+    REQUIRE(s.allocs == 4);
+    auto all34 = [](u64) { return 34u; };
+    for (u64 p = 0; p < 3; ++p) {
+      REQUIRE(HostPageMatchesBy(vec.TagId(), p, kPageElems, all34));
+    }
+    REQUIRE(HostPageMatchesBy(vec.TagId(), 3, kTail, all34));
+  }
+
+  // -------------------------------------------------------------------
+  // WRITE-BACK EVICTION. Pages written and unpinned WITHOUT a flush, through
+  // a cache a quarter of the working set: every eviction of a dirty frame
+  // has to write it back first. The re-read must see every value, and the
+  // writebacks counter must show the vector did it.
+  // -------------------------------------------------------------------
+  {
+    constexpr u64 kPages = 8;
+    Fixture f("gv_sem_writeback", 1, 2, kPages);
+    f.Reset();
+    RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
+                        gy::YieldStackView sv_) {
+      WriteNoFlushKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(
+          g_gpu, f.dev, 0, kPages * kPageElems, 41u, vw_, sv_);
+    });
+    Sync();
+    auto sw = f.Stats();
+    ctp::GpuApi::Memset(bad, 0, sizeof(unsigned long long));
+    RunYieldable(1, [&](dim3 g_, dim3 b_, gy::YieldableView<> vw_,
+                        gy::YieldStackView sv_) {
+      VerifyKernel<<<g_, b_, CLIO_YIELD_SMEM_BYTES>>>(
+          g_gpu, f.dev, 0, kPages * kPageElems, 41u, bad, vw_, sv_);
+    });
+    Sync();
+    const unsigned long long mism = ReadCounter(bad);
+    auto sv = f.Stats();
+    std::fprintf(stderr, "[writeback] writebacks=%llu evicts=%llu mismatches=%llu\n",
+                 (unsigned long long) sv.writebacks, (unsigned long long) sv.evicts, mism);
+    REQUIRE(mism == 0);
+    REQUIRE(sw.writebacks >= kPages - 2);  // all but the two frames still resident
+    // The host flush writes the still-dirty frames back: the CTE then has every page.
+    f.vec.FlushResidentToCte();
+    auto all41 = [](u64) { return 41u; };
+    for (u64 p = 0; p < kPages; ++p) {
+      REQUIRE(HostPageMatchesBy(f.vec.TagId(), p, kPageElems, all41));
+    }
   }
 
   ctp::GpuApi::Free(bad);

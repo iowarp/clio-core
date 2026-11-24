@@ -26,7 +26,7 @@ struct MonitorOptions {
 };
 
 void PrintMonitorUsage() {
-  HIPRINT("Usage: clio monitor [OPTIONS]");
+  HIPRINT("Usage: clio-run monitor [OPTIONS]");
   HIPRINT("");
   HIPRINT("Options:");
   HIPRINT("  -h, --help        Show this help message");

@@ -30,11 +30,10 @@ name: Cluster Tests
 # run.)
 
 on:
-  push:
-    branches: [main, dev]
-  # Merge queue (issue #1013): same full-matrix-before-merge rationale as the
-  # other gates -- see ci-adapters.yml.
-  merge_group:
+  # Manual only. These docker-compose multi-node suites were too flaky to run
+  # on every push to main/dev (they were never required checks). Distributed
+  # coverage for main/dev now comes from the nightly Ares Slurm run in
+  # nightly-ares-distributed.yml. Run this by hand from the Actions tab.
   workflow_dispatch:
 
 concurrency:
@@ -152,6 +151,13 @@ jobs:
               chown -R "$HOST_UID:$HOST_GID" . 2>/dev/null || true
             '
 
+      # Every docker suite below waits through CI/compose_wait.sh: readiness is
+      # `clio_run status` on each node (no fixed sleeps), and all waits share
+      # ONE deadline that the suite's run_tests.sh sizes ~3 min below the
+      # step's timeout-minutes, so a hang prints every node's logs, processes
+      # and thread state before the step limit would kill it silently. If you
+      # change a timeout-minutes, change that suite's *_BUDGET_SEC default too.
+      #
       # ---- AllToOne: count-based barrier on a real 4-node cluster.
       - name: AllToOne barrier test (4-node cluster)
         timeout-minutes: 20

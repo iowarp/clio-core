@@ -162,6 +162,16 @@ clio::run::TaskResume Runtime::Run(clio::run::u32 method, clio::run::shared_ptr<
       CLIO_CO_AWAIT(MultiPutBlob(typed_task));
       break;
     }
+    case Method::kMultiDelBlob: {
+      auto& typed_task = task_ptr.template Cast<MultiDelBlobTask>();
+      CLIO_CO_AWAIT(MultiDelBlob(typed_task));
+      break;
+    }
+    case Method::kMultiDelTag: {
+      auto& typed_task = task_ptr.template Cast<MultiDelTagTask>();
+      CLIO_CO_AWAIT(MultiDelTag(typed_task));
+      break;
+    }
     case Method::kRegisterReplicaContainer: {
       auto& typed_task = task_ptr.template Cast<RegisterReplicaContainerTask>();
       CLIO_CO_AWAIT(RegisterReplicaContainer(typed_task));
@@ -198,6 +208,11 @@ clio::run::TaskResume Runtime::Run(clio::run::u32 method, clio::run::shared_ptr<
       CLIO_CO_AWAIT(TagXattr(typed_task));
       break;
     }
+    case Method::kSetDurability: {
+      auto& typed_task = task_ptr.template Cast<SetDurabilityTask>();
+      CLIO_CO_AWAIT(SetDurability(typed_task));
+      break;
+    }
     case Method::kGetTagSize: {
       // Cast task FullPtr to specific type
       auto& typed_task = task_ptr.template Cast<GetTagSizeTask>();
@@ -220,6 +235,12 @@ clio::run::TaskResume Runtime::Run(clio::run::u32 method, clio::run::shared_ptr<
       // Cast task FullPtr to specific type
       auto& typed_task = task_ptr.template Cast<UpdateTagNamesTask>();
       CLIO_CO_AWAIT(UpdateTagNames(typed_task));
+      break;
+    }
+    case Method::kCowLink: {
+      // Cast task FullPtr to specific type
+      auto& typed_task = task_ptr.template Cast<CowLinkTask>();
+      CLIO_CO_AWAIT(CowLink(typed_task));
       break;
     }
     case Method::kPollTelemetryLog: {
@@ -439,6 +460,16 @@ void Runtime::SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive& archiv
       archive << *typed_task;
       break;
     }
+    case Method::kMultiDelBlob: {
+      auto& typed_task = task_ptr.template Cast<MultiDelBlobTask>();
+      archive << *typed_task;
+      break;
+    }
+    case Method::kMultiDelTag: {
+      auto& typed_task = task_ptr.template Cast<MultiDelTagTask>();
+      archive << *typed_task;
+      break;
+    }
     case Method::kRegisterReplicaContainer: {
       auto& typed_task = task_ptr.template Cast<RegisterReplicaContainerTask>();
       archive << *typed_task;
@@ -474,6 +505,11 @@ void Runtime::SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive& archiv
       archive << *typed_task;
       break;
     }
+    case Method::kSetDurability: {
+      auto& typed_task = task_ptr.template Cast<SetDurabilityTask>();
+      archive << *typed_task;
+      break;
+    }
     case Method::kGetTagSize: {
       auto& typed_task = task_ptr.template Cast<GetTagSizeTask>();
       archive << *typed_task;
@@ -491,6 +527,11 @@ void Runtime::SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive& archiv
     }
     case Method::kUpdateTagNames: {
       auto& typed_task = task_ptr.template Cast<UpdateTagNamesTask>();
+      archive << *typed_task;
+      break;
+    }
+    case Method::kCowLink: {
+      auto& typed_task = task_ptr.template Cast<CowLinkTask>();
       archive << *typed_task;
       break;
     }
@@ -689,6 +730,16 @@ void Runtime::LoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archiv
       archive >> *typed_task;
       break;
     }
+    case Method::kMultiDelBlob: {
+      auto& typed_task = task_ptr.template Cast<MultiDelBlobTask>();
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kMultiDelTag: {
+      auto& typed_task = task_ptr.template Cast<MultiDelTagTask>();
+      archive >> *typed_task;
+      break;
+    }
     case Method::kRegisterReplicaContainer: {
       auto& typed_task = task_ptr.template Cast<RegisterReplicaContainerTask>();
       archive >> *typed_task;
@@ -724,6 +775,11 @@ void Runtime::LoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archiv
       archive >> *typed_task;
       break;
     }
+    case Method::kSetDurability: {
+      auto& typed_task = task_ptr.template Cast<SetDurabilityTask>();
+      archive >> *typed_task;
+      break;
+    }
     case Method::kGetTagSize: {
       auto& typed_task = task_ptr.template Cast<GetTagSizeTask>();
       archive >> *typed_task;
@@ -741,6 +797,11 @@ void Runtime::LoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archiv
     }
     case Method::kUpdateTagNames: {
       auto& typed_task = task_ptr.template Cast<UpdateTagNamesTask>();
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kCowLink: {
+      auto& typed_task = task_ptr.template Cast<CowLinkTask>();
       archive >> *typed_task;
       break;
     }
@@ -962,6 +1023,18 @@ void Runtime::LocalLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive
       archive >> *typed_task;
       break;
     }
+    case Method::kMultiDelBlob: {
+      auto& typed_task = task_ptr.template Cast<MultiDelBlobTask>();
+      // Use archive operator which respects msg_type
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kMultiDelTag: {
+      auto& typed_task = task_ptr.template Cast<MultiDelTagTask>();
+      // Use archive operator which respects msg_type
+      archive >> *typed_task;
+      break;
+    }
     case Method::kRegisterReplicaContainer: {
       auto& typed_task = task_ptr.template Cast<RegisterReplicaContainerTask>();
       // Use archive operator which respects msg_type
@@ -1001,6 +1074,12 @@ void Runtime::LocalLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive
       archive >> *typed_task;
       break;
     }
+    case Method::kSetDurability: {
+      auto& typed_task = task_ptr.template Cast<SetDurabilityTask>();
+      // Use archive operator which respects msg_type
+      archive >> *typed_task;
+      break;
+    }
     case Method::kGetTagSize: {
       auto& typed_task = task_ptr.template Cast<GetTagSizeTask>();
       // Use archive operator which respects msg_type
@@ -1021,6 +1100,12 @@ void Runtime::LocalLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive
     }
     case Method::kUpdateTagNames: {
       auto& typed_task = task_ptr.template Cast<UpdateTagNamesTask>();
+      // Use archive operator which respects msg_type
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kCowLink: {
+      auto& typed_task = task_ptr.template Cast<CowLinkTask>();
       // Use archive operator which respects msg_type
       archive >> *typed_task;
       break;
@@ -1257,6 +1342,18 @@ void Runtime::LocalSaveTask(clio::run::u32 method, clio::run::DefaultSaveArchive
       archive << *typed_task;
       break;
     }
+    case Method::kMultiDelBlob: {
+      auto& typed_task = task_ptr.template Cast<MultiDelBlobTask>();
+      // Use archive operator which respects msg_type
+      archive << *typed_task;
+      break;
+    }
+    case Method::kMultiDelTag: {
+      auto& typed_task = task_ptr.template Cast<MultiDelTagTask>();
+      // Use archive operator which respects msg_type
+      archive << *typed_task;
+      break;
+    }
     case Method::kRegisterReplicaContainer: {
       auto& typed_task = task_ptr.template Cast<RegisterReplicaContainerTask>();
       // Use archive operator which respects msg_type
@@ -1296,6 +1393,12 @@ void Runtime::LocalSaveTask(clio::run::u32 method, clio::run::DefaultSaveArchive
       archive << *typed_task;
       break;
     }
+    case Method::kSetDurability: {
+      auto& typed_task = task_ptr.template Cast<SetDurabilityTask>();
+      // Use archive operator which respects msg_type
+      archive << *typed_task;
+      break;
+    }
     case Method::kGetTagSize: {
       auto& typed_task = task_ptr.template Cast<GetTagSizeTask>();
       // Use archive operator which respects msg_type
@@ -1316,6 +1419,12 @@ void Runtime::LocalSaveTask(clio::run::u32 method, clio::run::DefaultSaveArchive
     }
     case Method::kUpdateTagNames: {
       auto& typed_task = task_ptr.template Cast<UpdateTagNamesTask>();
+      // Use archive operator which respects msg_type
+      archive << *typed_task;
+      break;
+    }
+    case Method::kCowLink: {
+      auto& typed_task = task_ptr.template Cast<CowLinkTask>();
       // Use archive operator which respects msg_type
       archive << *typed_task;
       break;
@@ -1645,6 +1754,24 @@ clio::run::shared_ptr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 metho
       }
       break;
     }
+    case Method::kMultiDelBlob: {
+      auto new_task_ptr = ipc_manager->NewTask<MultiDelBlobTask>();
+      if (!new_task_ptr.IsNull()) {
+        auto& task_typed = orig_task_ptr.template Cast<MultiDelBlobTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<MultiDelBlobTask>(task_typed.get()));
+        return new_task_ptr.template Cast<clio::run::Task>();
+      }
+      break;
+    }
+    case Method::kMultiDelTag: {
+      auto new_task_ptr = ipc_manager->NewTask<MultiDelTagTask>();
+      if (!new_task_ptr.IsNull()) {
+        auto& task_typed = orig_task_ptr.template Cast<MultiDelTagTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<MultiDelTagTask>(task_typed.get()));
+        return new_task_ptr.template Cast<clio::run::Task>();
+      }
+      break;
+    }
     case Method::kRegisterReplicaContainer: {
       auto new_task_ptr = ipc_manager->NewTask<RegisterReplicaContainerTask>();
       if (!new_task_ptr.IsNull()) {
@@ -1710,6 +1837,15 @@ clio::run::shared_ptr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 metho
       }
       break;
     }
+    case Method::kSetDurability: {
+      auto new_task_ptr = ipc_manager->NewTask<SetDurabilityTask>();
+      if (!new_task_ptr.IsNull()) {
+        auto& task_typed = orig_task_ptr.template Cast<SetDurabilityTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<SetDurabilityTask>(task_typed.get()));
+        return new_task_ptr.template Cast<clio::run::Task>();
+      }
+      break;
+    }
     case Method::kGetTagSize: {
       // Allocate new task
       auto new_task_ptr = ipc_manager->NewTask<GetTagSizeTask>();
@@ -1750,6 +1886,17 @@ clio::run::shared_ptr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 metho
         // Copy task fields (includes base Task fields)
         auto& task_typed = orig_task_ptr.template Cast<UpdateTagNamesTask>();
         new_task_ptr->Copy(ctp::ipc::FullPtr<UpdateTagNamesTask>(task_typed.get()));
+        return new_task_ptr.template Cast<clio::run::Task>();
+      }
+      break;
+    }
+    case Method::kCowLink: {
+      // Allocate new task
+      auto new_task_ptr = ipc_manager->NewTask<CowLinkTask>();
+      if (!new_task_ptr.IsNull()) {
+        // Copy task fields (includes base Task fields)
+        auto& task_typed = orig_task_ptr.template Cast<CowLinkTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<CowLinkTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -2025,6 +2172,14 @@ clio::run::shared_ptr<clio::run::Task> Runtime::NewTask(clio::run::u32 method) {
       auto new_task_ptr = ipc_manager->NewTask<MultiPutBlobTask>();
       return new_task_ptr.template Cast<clio::run::Task>();
     }
+    case Method::kMultiDelBlob: {
+      auto new_task_ptr = ipc_manager->NewTask<MultiDelBlobTask>();
+      return new_task_ptr.template Cast<clio::run::Task>();
+    }
+    case Method::kMultiDelTag: {
+      auto new_task_ptr = ipc_manager->NewTask<MultiDelTagTask>();
+      return new_task_ptr.template Cast<clio::run::Task>();
+    }
     case Method::kRegisterReplicaContainer: {
       auto new_task_ptr = ipc_manager->NewTask<RegisterReplicaContainerTask>();
       return new_task_ptr.template Cast<clio::run::Task>();
@@ -2053,6 +2208,10 @@ clio::run::shared_ptr<clio::run::Task> Runtime::NewTask(clio::run::u32 method) {
       auto new_task_ptr = ipc_manager->NewTask<TagXattrTask>();
       return new_task_ptr.template Cast<clio::run::Task>();
     }
+    case Method::kSetDurability: {
+      auto new_task_ptr = ipc_manager->NewTask<SetDurabilityTask>();
+      return new_task_ptr.template Cast<clio::run::Task>();
+    }
     case Method::kGetTagSize: {
       auto new_task_ptr = ipc_manager->NewTask<GetTagSizeTask>();
       return new_task_ptr.template Cast<clio::run::Task>();
@@ -2067,6 +2226,10 @@ clio::run::shared_ptr<clio::run::Task> Runtime::NewTask(clio::run::u32 method) {
     }
     case Method::kUpdateTagNames: {
       auto new_task_ptr = ipc_manager->NewTask<UpdateTagNamesTask>();
+      return new_task_ptr.template Cast<clio::run::Task>();
+    }
+    case Method::kCowLink: {
+      auto new_task_ptr = ipc_manager->NewTask<CowLinkTask>();
       return new_task_ptr.template Cast<clio::run::Task>();
     }
     case Method::kPollTelemetryLog: {
@@ -2249,6 +2412,16 @@ void Runtime::AggregateOut(clio::run::u32 method, clio::run::shared_ptr<clio::ru
       typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
+    case Method::kMultiDelBlob: {
+      auto& typed_task = orig_task.template Cast<MultiDelBlobTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
+      break;
+    }
+    case Method::kMultiDelTag: {
+      auto& typed_task = orig_task.template Cast<MultiDelTagTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
+      break;
+    }
     case Method::kRegisterReplicaContainer: {
       auto& typed_task = orig_task.template Cast<RegisterReplicaContainerTask>();
       typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
@@ -2284,6 +2457,11 @@ void Runtime::AggregateOut(clio::run::u32 method, clio::run::shared_ptr<clio::ru
       typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
+    case Method::kSetDurability: {
+      auto& typed_task = orig_task.template Cast<SetDurabilityTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
+      break;
+    }
     case Method::kGetTagSize: {
       auto& typed_task = orig_task.template Cast<GetTagSizeTask>();
       typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
@@ -2301,6 +2479,11 @@ void Runtime::AggregateOut(clio::run::u32 method, clio::run::shared_ptr<clio::ru
     }
     case Method::kUpdateTagNames: {
       auto& typed_task = orig_task.template Cast<UpdateTagNamesTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
+      break;
+    }
+    case Method::kCowLink: {
+      auto& typed_task = orig_task.template Cast<CowLinkTask>();
       typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }

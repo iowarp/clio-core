@@ -24,7 +24,8 @@ using TagId = clio::cte::core::TagId;
  *  shared id resolved Vector::Copy's fault handler to the stream pool (#1186).
  *  test_well_known_pool_ids keeps the CTE ids distinct. */
 static constexpr clio::run::PoolId kCheckpointPoolId(566, 0);
-static constexpr const char *kCheckpointPoolName = "clio_cte_checkpoint";
+static constexpr const char *kCheckpointPoolName =
+    clio::cte::core::kCowFaultPoolName;
 
 /**
  * Container creation params. next_pool_id_ is the pool the handler reads

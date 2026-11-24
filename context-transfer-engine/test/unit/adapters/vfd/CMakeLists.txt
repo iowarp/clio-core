@@ -81,7 +81,7 @@ if(CLIO_CORE_ENABLE_TESTS)
     set_tests_properties(clio_cte_vfd_unit_tests PROPERTIES
         # CLIO_RESTART_LOG comes from the top-level per-test isolation default;
         # see the VOL I/O suite's note.
-        ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1"
+        ENVIRONMENT "CLIO_SERVER_CONF=${CMAKE_CURRENT_SOURCE_DIR}/../cfs_adapter_config.yaml;CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1"
         RESOURCE_LOCK "clio_runtime"
         # 300 rather than 120, matching the other runtime-based suites here.
         # Warm, this binary runs in ~15s; the first run after a reboot took over
@@ -106,7 +106,7 @@ if(CLIO_CORE_ENABLE_TESTS)
         WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     )
     set_tests_properties(clio_cte_vfd_unit_tests_vector_io PROPERTIES
-        ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_VFD_VECTOR_IO=1"
+        ENVIRONMENT "CLIO_SERVER_CONF=${CMAKE_CURRENT_SOURCE_DIR}/../cfs_adapter_config.yaml;CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_VFD_VECTOR_IO=1"
         RESOURCE_LOCK "clio_runtime"
         TIMEOUT 300
         LABELS "msan_skip")
@@ -122,7 +122,7 @@ if(CLIO_CORE_ENABLE_TESTS)
         WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     )
     set_tests_properties(clio_cte_vfd_unit_tests_read_tier PROPERTIES
-        ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_VFD_READ_TIER=1"
+        ENVIRONMENT "CLIO_SERVER_CONF=${CMAKE_CURRENT_SOURCE_DIR}/../cfs_adapter_config.yaml;CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_VFD_READ_TIER=1"
         RESOURCE_LOCK "clio_runtime"
         TIMEOUT 300
         LABELS "msan_skip")

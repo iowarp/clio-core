@@ -421,7 +421,7 @@ TEST_CASE("Client - AsyncGetTagSize", "[core][client][tag]") {
   REQUIRE(create_task->GetReturnCode() == 0);
 
   // Get tag size
-  auto size_task = client->AsyncGetTagSize(create_task->tag_id_);
+  auto size_task = client->AsyncGetTagSize(create_task->tag_id_, clio::run::PoolQuery::Broadcast(0.0f));
   size_task.Wait();
 
   REQUIRE(size_task->GetReturnCode() == 0);
@@ -660,7 +660,7 @@ TEST_CASE("Client - AsyncGetContainedBlobs Direct", "[core][client][blob]") {
   }
 
   // Get contained blobs
-  auto blobs_task = client->AsyncGetContainedBlobs(tag_task->tag_id_);
+  auto blobs_task = client->AsyncGetContainedBlobs(tag_task->tag_id_, clio::run::PoolQuery::Broadcast());
   blobs_task.Wait();
 
   REQUIRE(blobs_task->GetReturnCode() == 0);

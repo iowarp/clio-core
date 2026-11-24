@@ -39,6 +39,7 @@
 #include <clio_runtime/clio_runtime.h>
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/core/blob_batch.h>
+#include <clio_cte/core/core_task_stats.h>
 
 namespace clio::cte::core {
 
@@ -62,50 +63,28 @@ class CoreInterposer : public clio::run::Container {
 
  public:
   /**
-   * Cost estimate for the blob verbs every interposer forwards.
+   * The pool this interposer forwards to (see Container::GetNextPool).
+   * @return CorePoolId()
+   */
+  clio::run::PoolId GetNextPool() const override { return CorePoolId(); }
+
+  /**
+   * Cost estimate for every core verb an interposer forwards.
    *
-   * Each interposer chain (cache, compressor, replication, indexer) sits in
-   * front of the same core blob path, so the size-driven estimate belongs
-   * here once rather than in each of them; a derived chimod overrides this
-   * only for its OWN module verbs and delegates the rest back.
-   *
-   * compute_ is what Container::InferCpuTime scales its learned coefficient
-   * by — with it left at 0 the CPU model degenerates to a per-method constant
-   * that cannot tell a 4 KiB blob from a 1 MiB one. Payload handling is a
-   * copy at roughly 10 KB per CPU microsecond; wall time seeds at the
-   * ~500 MB/s convention the bdev and core modules already use.
+   * Each interposer chain (cache, compressor, replication, indexer,
+   * write-back / write-through) sits in front of the same core, so the
+   * estimate is the core's own (CoreTaskStats in core_task_stats.h): data
+   * verbs — PutBlob/GetBlob (vectored segments summed), the Pod* scalar and
+   * batched variants, MultiPutBlob (data_len_), Evict — scale with their
+   * payload, every control and metadata verb is an explicit constant. A
+   * derived chimod overrides this only for its OWN module verbs (ids >= 100)
+   * and delegates the rest back here.
+   * @param task the task to estimate
+   * @return the task's cost features
    */
   clio::run::TaskStat GetTaskStats(
       const clio::run::Task *task) const override {
-    clio::run::TaskStat stat;
-    if (task == nullptr) {
-      return stat;
-    }
-    constexpr float kBytesPerComputeUs = 10000.0f;
-    constexpr float kBytesPerWallUs = 500.0f;
-    switch (task->method_) {
-      case Method::kPutBlob: {
-        const auto *t = static_cast<const PutBlobTask *>(task);
-        stat.io_size_ = t->size_;
-        stat.compute_ = static_cast<size_t>(t->size_ / kBytesPerComputeUs) + 2;
-        stat.wall_time_ = static_cast<float>(t->size_) / kBytesPerWallUs;
-        return stat;
-      }
-      case Method::kGetBlob: {
-        const auto *t = static_cast<const GetBlobTask *>(task);
-        stat.io_size_ = t->size_;
-        stat.compute_ = static_cast<size_t>(t->size_ / kBytesPerComputeUs) + 2;
-        stat.wall_time_ = static_cast<float>(t->size_) / kBytesPerWallUs;
-        return stat;
-      }
-      case Method::kGetBlobSize:
-        // Metadata lookup only — no payload touched.
-        stat.compute_ = 5;
-        stat.wall_time_ = 10.0f;
-        return stat;
-      default:
-        return stat;
-    }
+    return CoreTaskStats(task);
   }
 
   /**
@@ -235,6 +214,44 @@ class CoreInterposer : public clio::run::Container {
       core->AggregateIn(method, agg_task, member_task);
     }
   }
+};
+
+/**
+ * Interposer with TWO next pools: a
+ * volatile core and a persistent chain. The persistent chain is the base's
+ * single next pool, so every forwarded verb, the wire serialization defaults
+ * and owner routing (ScheduleTask) all keep going to the authoritative side.
+ * The volatile pool is reached only through an ordinary core client
+ * (tasks sent with PoolQuery::Local()), by the policy that decides what to
+ * keep in it: the two cores stay disconnected, and nothing runs inline on
+ * the volatile container.
+ *
+ * A deployment with no persistent chain sets only the volatile pool; the
+ * base's next pool is then the volatile core and HasPersistent() is false.
+ */
+class DualTargetInterposer : public CoreInterposer {
+ protected:
+  /** The volatile core this interposer keeps copies in. */
+  clio::run::PoolId volatile_pool_ = clio::run::PoolId::GetNull();
+  /** Whether a persistent chain was configured (else next == volatile). */
+  bool has_persistent_ = false;
+
+  /**
+   * Bind both targets. Call from the derived Create().
+   * @param volatile_pool pool id of the volatile core (required)
+   * @param persistent_pool pool id of the persistent chain, or null for a
+   *        purely volatile deployment
+   */
+  void SetTargets(const clio::run::PoolId &volatile_pool,
+                  const clio::run::PoolId &persistent_pool) {
+    volatile_pool_ = volatile_pool;
+    has_persistent_ = !persistent_pool.IsNull();
+    interposer_next_pool_ = has_persistent_ ? persistent_pool : volatile_pool;
+  }
+
+  /** Whether writes have a durable destination below this module. */
+  bool HasPersistent() const { return has_persistent_; }
+
 };
 
 }  // namespace clio::cte::core

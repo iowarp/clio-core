@@ -8,7 +8,7 @@ facts: Time | 10 minutes ; Address | http://127.0.0.1:8080 ; Authentication | No
 -->
 <h2>1. Open it</h2>
 <pre data-label="shell">
-$ clio_run start &
+$ clio-run start &
 </pre>
 <p>The runtime logs where the dashboard listens:</p>
 <pre data-label="output">
@@ -18,7 +18,7 @@ Viz: dashboard listening at http://127.0.0.1:8080
 <div class="tabs" data-label="Where the runtime runs">
   <section class="tab-panel" data-tab="Another port"><p class="tab-title">Another port</p>
 <pre data-label="shell">
-$ clio_run start --viz-port 9000 &
+$ clio-run start --viz-port 9000 &
 </pre></section>
   <section class="tab-panel" data-tab="Remote host"><p class="tab-title">Remote host</p>
 <pre data-label="shell">
@@ -35,7 +35,7 @@ services:
     ports:
       - "9413:9413"
       - "8080:8080"
-    command: ["clio_run", "start"]
+    command: ["clio-run", "start"]
 </pre></section>
 </div>
 <div class="callout warn">
@@ -104,4 +104,5 @@ $ curl -s http://127.0.0.1:8080/api/health
 $ curl -s http://127.0.0.1:8080/api/pools | python -m json.tool
 $ curl -s http://127.0.0.1:8080/api/topology     # node ids for /api/nodes/{node}/...
 </pre>
-<p>Other routes include <code>/api/config</code>, <code>/api/nodes/{node}/bdevs</code>, <code>/api/nodes/{node}/workers</code> and <code>/api/nodes/{node}/system_stats</code>. To turn the dashboard off, use <code>clio_run start --no-viz</code>.</p>
+<p>Other routes include <code>/api/config</code>, <code>/api/nodes/{node}/bdevs</code>, <code>/api/nodes/{node}/workers</code> and <code>/api/nodes/{node}/system_stats</code>. To turn the dashboard off, use <code>clio-run start --no-viz</code>.</p>
+<p>The <a href="/docs/dashboard/index.html">dashboard docs</a> have screenshots of every page and the full <a href="/docs/dashboard/api.html">REST API</a>.</p>

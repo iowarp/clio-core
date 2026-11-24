@@ -168,8 +168,8 @@ and `BENCH_EXE` (a differently named binary).
    constructed the old 1152-byte layout; the library's `bulk()` used the
    new 1176-byte one. The special members now live in `task_archive.cc`,
    so the layout has one owner and a stale binary fails to link instead of
-   corrupting memory. Same lesson as the task-struct ABI note in AGENTS.md,
-   one level up: after changing a header that crosses a library boundary,
+   corrupting memory. Same lesson as task-struct ABI changes (rebuild
+   every target, not one), one level up: after changing a header that crosses a library boundary,
    relink every executable, not only the libraries.
 
 7. **Device memory on the wire, the reply.** With (5) and (6) in, rank 0

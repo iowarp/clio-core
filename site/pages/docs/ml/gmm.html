@@ -1,0 +1,63 @@
+<!--
+title: gmm
+heading: <em>gmm:</em> Gaussian mixture model.
+description: API reference for clio-ml's Gaussian mixture module (EM with diagonal covariance): Python fit_gmm with init_means, C++ FitGmm and GmmPredict, GmmOptions and the weight, mean and var fields.
+eyebrow: Docs · Machine learning
+lede: A Gaussian mixture model fitted by expectation-maximisation with diagonal covariance, the equivalent of Spark MLlib's GaussianMixture restricted to diagonal covariances. Each EM iteration is one paged pass: the E-step runs per row in the kernel and the host does the M-step.
+facts: Module | ml_gmm ; Header | clio_ml/gmm.h ; Rows | features, then one ignored column
+-->
+<h2>What it does</h2>
+<p>The kernel computes responsibilities by log-sum-exp and accumulates <code>[sum r, sum r x, sum r x^2]</code> per component together with the log-likelihood. Weights start uniform and variances at 1; you supply the initial means. Bit-reproducible across paging and block counts.</p>
+
+<h2>Rows</h2>
+<p><code>n_features</code> feature columns followed by one ignored column (a label, for instance), so the <code>Dataset</code> has <code>n_features + 1</code> columns. <code>clio_ml.COLUMNS["gmm"]</code> is 1.</p>
+
+<h2>Python</h2>
+<pre data-label="python">
+import numpy as np, clio_ml as cm
+rng = np.random.default_rng(1)
+X = rng.normal(size=(4096, 7)).astype(np.float32)
+data = np.column_stack([X, np.zeros(4096)]).astype(np.float32)
+
+r = cm.fit_gmm(data, k=2, iters=5)          # init_means defaults to X[:k]
+m = r.model
+print(m.weight, np.asarray(m.mean).reshape(m.K, m.nf))
+print(r.loglik[0], "->", r.loglik[-1])      # mean log-likelihood per E-step
+print(cm.predict("gmm", r, data[0, :7]))    # most likely component
+</pre>
+<ul>
+  <li><code>fit_gmm(X, init_means=None, **options)</code>. For an in-memory array the initial means default to the first <code>k</code> rows' features; for a <code>Dataset</code> you must pass <code>init_means</code> (shape <code>k x features</code>).</li>
+  <li>Options (<code>GmmOptions</code>): <code>k</code> (2), <code>iters</code> (20), <code>var_floor</code> (1e-6), <code>threads</code> (256).</li>
+  <li>Result <code>GmmResult</code>: <code>model</code>, <code>loglik</code> (mean log-likelihood at each E-step), <code>stats</code>. <code>model</code> (<code>GmmModel</code>): <code>nf</code>, <code>K</code>, <code>weight</code> (K), <code>mean</code> (K*nf), <code>var</code> (K*nf).</li>
+  <li><code>predict("gmm", r, x)</code> returns the most likely component.</li>
+</ul>
+
+<h2>C++</h2>
+<pre data-label="cpp">
+struct GmmOptions {
+  u32 k = 2;
+  u32 iters = 20;
+  float var_floor = 1e-6f;
+  u32 threads = 256;
+  ClusterExchange cluster;
+};
+struct GmmModel {
+  u32 nf = 0, K = 0;
+  std::vector<float> weight, mean, var;  // K, K*nf, K*nf
+  std::vector<float> Flatten() const;
+};
+struct GmmResult {
+  GmmModel model;
+  std::vector<double> loglik;
+  VecStats stats;
+};
+GmmResult FitGmm(Dataset &ds, const std::vector<float> &init_means, const GmmOptions &opt);
+GmmResult FitGmmPlain(const float *data, u64 n_rows, u32 nf, u64 elems_per_page,
+                      u32 nblocks, const std::vector<float> &init_means,
+                      const GmmOptions &opt);
+GmmResult FitGmmReference(/* same arguments */);
+u32 GmmPredict(const GmmModel &m, const float *x);
+</pre>
+<p>The ChiMod is module <code>ml_gmm</code>.</p>
+
+<p>Related: <a href="/docs/ml/kmeans.html">k-means</a>, fuzzy c-means.</p>

@@ -66,12 +66,57 @@ public:
   // as TaskStat.compute_ lets Container::InferCpuTime (coef*(compute+1)) converge
   // — after a few runs the model predicts ~spin_us, so RuntimeMapTask can route
   // by predicted cost instead of treating every Custom task as identical.
+  /**
+   * Per-task cost estimate for every MOD_NAME method.
+   * @param task the task to estimate
+   * @return the task's cost features (clio_runtime/task_cost.h)
+   */
   clio::run::TaskStat GetTaskStats(const clio::run::Task *task) const override {
-    clio::run::TaskStat stat;
-    if (task != nullptr && task->method_ == Method::kCustom) {
-      stat.compute_ = static_cast<const CustomTask *>(task)->spin_us_;
+    namespace cost = clio::run::cost;
+    if (task == nullptr) {
+      return clio::run::TaskStat();
     }
-    return stat;
+    switch (task->method_) {
+      case Method::kCustom: {
+        // Spins spin_us_ on the CPU, or sleeps block_us_ without yielding:
+        // both occupy the worker for that long.
+        const auto *t = static_cast<const CustomTask *>(task);
+        return cost::Fixed(t->spin_us_,
+                           static_cast<float>(t->spin_us_) +
+                               static_cast<float>(t->block_us_));
+      }
+      case Method::kTestLargeOutput:
+        // Fills and returns a 1 MiB output vector.
+        return cost::Data(1024 * 1024, cost::kCopyBytesPerCpuUs,
+                          cost::kMemoryBytesPerWallUs);
+      case Method::kWaitTest:
+        // One nested self-call per remaining recursion level.
+        return cost::PerItem(static_cast<const WaitTestTask *>(task)->depth_,
+                             5, 5, 10.0f, 10.0f);
+      case Method::kSubtaskTest:
+        // Spawns and awaits num_subtasks_ children.
+        return cost::PerItem(
+            static_cast<const SubtaskTestTask *>(task)->num_subtasks_, 5, 2,
+            10.0f, 5.0f);
+      case Method::kManyToOneSum:
+      case Method::kAllReduce:
+      case Method::kBarrier:
+        // Collective: a small reduction plus a broadcast of the result.
+        return cost::Fixed(10, 50.0f);
+      case Method::kCoMutexTest:
+      case Method::kCoRwLockTest:
+      case Method::kGpuSubmit:
+        // Lock tests yield while holding; GpuSubmit adds two integers.
+        return cost::Fixed(5, 10.0f);
+      case Method::kCreate:
+        return cost::ContainerCreate();
+      case Method::kDestroy:
+        return cost::ContainerDestroy();
+      case Method::kMonitor:
+        return cost::Fixed(10, 15.0f);
+      default:
+        return cost::Metadata();
+    }
   }
 
 private:

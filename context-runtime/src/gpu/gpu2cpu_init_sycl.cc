@@ -41,7 +41,8 @@ namespace clio::run {
 bool gpu::IpcManager::ServerInitGpuQueues(u32 queue_depth) {
   if (!per_gpu_devices_.empty()) return true;
 
-  auto sycl_devices = sycl::device::get_devices(sycl::info::device_type::gpu);
+  // GPU devices, or CPU devices under CTP_SYCL_DEVICE_TYPE=cpu (CI).
+  auto sycl_devices = sycl::device::get_devices(ctp::GpuApi::SyclDeviceType());
   if (sycl_devices.empty()) {
     HLOG(kInfo, "ServerInitGpuQueues (SYCL): no GPU devices detected — "
          "GPU queues will not be initialized (CPU-only mode)");

@@ -23,7 +23,11 @@
 #include <clio_cte/gpu_vector/page.h>
 #include <clio_cte/gpu_vector/prefetch.h>
 
+#if defined(_WIN32)
+#include <io.h>  // _write: the async-signal-safe stderr write below
+#else
 #include <unistd.h>
+#endif
 
 #include <cmath>
 #include <csignal>
@@ -247,7 +251,11 @@ inline unsigned long long *FatalMirror() {
         char buf[512];
         const int w = FatalFormat(FatalMirror(), buf, sizeof(buf));
         if (w > 0) {
+#if defined(_WIN32)
+          const int r = ::_write(2, buf, static_cast<unsigned>(w));
+#else
           const ssize_t r = ::write(2, buf, static_cast<size_t>(w));
+#endif
           (void)r;
         }
         std::signal(sig, SIG_DFL);
@@ -293,6 +301,8 @@ class Vector {
     clio::run::u64 flush_skipped = 0;  // flush pages not resident: DROPPED
     clio::run::u64 put_errors = 0;   // writebacks that returned non-zero
     clio::run::u64 alloc_waits = 0;  // page-cache backoff retries (FaultPage)
+    clio::run::u64 allocs = 0;       // pages Allocate claimed without a read
+    clio::run::u64 writebacks = 0;   // dirty frames written back so they could be evicted
     // GV_COMM_TIMING only (zero otherwise): GPU cycles in the Fetch, Hold
     // and Flush calls, a benchmark's busy segments, and the call counts.
     clio::run::u64 fetch_cyc = 0, hold_cyc = 0, flush_cyc = 0, busy_cyc = 0;
@@ -445,8 +455,10 @@ class Vector {
           clio::cte::checkpoint::kCheckpointPoolId, storage_pool_id_);
       clio::cte::checkpoint::CheckpointConfig params;
       params.next_pool_id_ = storage_pool_id_;
+      // Dynamic, not Local: a fault on a copy resolves on the container that
+      // owns the blob, so the checkpoint pool must exist on every node.
       auto cf = ckpt.AsyncCreateCheckpoint(
-          clio::run::PoolQuery::Local(),
+          clio::run::PoolQuery::Dynamic(),
           clio::cte::checkpoint::kCheckpointPoolName,
           clio::cte::checkpoint::kCheckpointPoolId, params);
       cf.Wait();
@@ -594,42 +606,82 @@ class Vector {
   }
 
   /**
-   * HOST-SIDE writeback of every resident frame's valid elements, on every
-   * GPU this vector has views for. There is no dirty bit (write-site publish
-   * is the kernel-side contract), so this publishes ALL resident valid
-   * ranges: for pages the kernels already flushed the put is byte-identical,
-   * and for anything they had not yet published this is what makes the CTE
-   * current. No-op with no device views or an empty cache.
+   * HOST-SIDE writeback of the DIRTY resident frames' valid elements, on
+   * every GPU this vector has views for: frames a device write hold touched
+   * since they were filled or last covered by a flush (VecHeader::dirty_).
+   * Clean frames hold bytes the store already has and are skipped. No-op
+   * with no device views or an empty cache.
+   * @param inflight puts kept outstanding at once (one staging buffer each)
    */
-  void FlushResidentToCte() {
+  void FlushResidentToCte(clio::run::u32 inflight = 32) {
+    last_flush_pages_ = 0;
+    last_flush_bytes_ = 0;
 #if CTP_ENABLE_GPU
+    // ONLY DIRTY FRAMES. A frame no device write touched since it was filled
+    // holds bytes the store already has; rewriting it made the checkpoint's
+    // bytes and time scale with the cache size (a 16 GB cache of clean
+    // kmeans points was rewritten in full before every Copy).
+    // PIPELINED: `inflight` puts outstanding, one staging buffer each,
+    // instead of copy + put + wait per page.
     clio::cte::core::Client core(storage_pool_id_);
-    std::vector<char> buf(static_cast<size_t>(page_bytes_));
+    std::vector<std::vector<char>> bufs(
+        inflight, std::vector<char>(static_cast<size_t>(page_bytes_)));
+    std::vector<clio::run::Future<clio::cte::core::PutBlobTask>> futs;
+    futs.reserve(inflight);
+    auto reap = [&]() {
+      for (auto &f : futs) f.Wait();
+      futs.clear();
+    };
+    const clio::run::u64 nslots =
+        static_cast<clio::run::u64>(nsets_) * set_size_;
     for (auto &kv : devs_) {
       const std::vector<Page> tbl = ReadTable(kv.first);
-      for (const Page &p : tbl) {
+      std::vector<clio::run::u32> dirty(static_cast<size_t>(nslots), 1u);
+      if (kv.second.hdr.dirty_ != nullptr) {
+        ctp::GpuApi::Memcpy(reinterpret_cast<char *>(dirty.data()),
+                            reinterpret_cast<const char *>(kv.second.hdr.dirty_),
+                            static_cast<size_t>(nslots * sizeof(clio::run::u32)));
+      }
+      for (size_t i = 0; i < tbl.size(); ++i) {
+        const Page &p = tbl[i];
         if (p.page_num == kNoPage || p.data == nullptr) continue;
         if (p.valid_hi <= p.valid_lo) continue;
+        if (i < dirty.size() && dirty[i] == 0u) continue;
+        if (futs.size() == inflight) reap();
         const clio::run::u64 lo_b =
             static_cast<clio::run::u64>(p.valid_lo) * sizeof(T);
         const clio::run::u64 hi_b =
             static_cast<clio::run::u64>(p.valid_hi) * sizeof(T);
-        ctp::GpuApi::Memcpy(buf.data(),
-                            static_cast<const char *>(p.data) + lo_b,
+        char *buf = bufs[futs.size()].data();
+        ctp::GpuApi::Memcpy(buf, static_cast<const char *>(p.data) + lo_b,
                             static_cast<size_t>(hi_b - lo_b));
-        auto f = core.AsyncPutBlob(tag_id_, PageName(p.page_num), lo_b,
-                                   hi_b - lo_b, buf.data(), 0.5f,
-                                   PageContext(), 0u,
-                                   clio::run::PoolQuery::Dynamic());
-        f.Wait();
+        futs.push_back(core.AsyncPutBlob(tag_id_, PageName(p.page_num), lo_b,
+                                         hi_b - lo_b, buf, 0.5f,
+                                         PageContext(), 0u,
+                                         clio::run::PoolQuery::Dynamic()));
+        ++last_flush_pages_;
+        last_flush_bytes_ += hi_b - lo_b;
       }
+      reap();
     }
+#else
+    (void) inflight;
 #endif
   }
+
+  /** Frames written back by the last FlushResidentToCte (dirty ones only). */
+  clio::run::u64 LastFlushPages() const { return last_flush_pages_; }
+  /** Bytes written back by the last FlushResidentToCte. */
+  clio::run::u64 LastFlushBytes() const { return last_flush_bytes_; }
 
   clio::cte::core::TagId TagId() const { return tag_id_; }
   clio::run::u64 PageBytes() const { return page_bytes_; }
   clio::run::u64 ElemsPerPage() const { return page_bytes_ / sizeof(T); }
+  /** CUDA blocks the vector was built for: a kernel over its device view
+   *  launches exactly this many (block b uses block b's task set). */
+  clio::run::u32 NumBlocks() const { return nblocks_; }
+  /** Page-sized device frames the cache owns (what it costs in HBM). */
+  clio::run::u32 CapacityPages() const { return capacity_pages_; }
   clio::run::u64 NumPages() const {
     const clio::run::u64 epp = ElemsPerPage();
     return (num_elems_ + epp - 1) / epp;
@@ -639,7 +691,7 @@ class Vector {
 #if CTP_ENABLE_GPU
     for (auto &kv : devs_) {
       if (kv.second.stats != nullptr) continue;
-      const size_t bytes = 17 * sizeof(unsigned long long);
+      const size_t bytes = 19 * sizeof(unsigned long long);
       auto *c = reinterpret_cast<unsigned long long *>(
           ctp::GpuApi::Malloc<char>(bytes));
       if (c == nullptr) throw std::runtime_error("gpu_vector: stats alloc failed");
@@ -659,6 +711,8 @@ class Vector {
       kv.second.hdr.stat_flush_skipped_ = c + 8;
       kv.second.hdr.stat_alloc_waits_ = c + 9;
       kv.second.hdr.stat_cyc_ = c + 10;        // 7 slots: see VecHeader
+      kv.second.hdr.stat_allocs_ = c + 17;     // after the timing slots
+      kv.second.hdr.stat_writebacks_ = c + 18;
       PublishHeader(kv.second);
     }
 #endif
@@ -731,6 +785,9 @@ class Vector {
     // lists as they were would strand the storage those slots held: the tags
     // say the cache is empty and the allocator says it has nothing to give.
     RebuildFreeLists(it->second, 0);
+    ctp::GpuApi::Memset(
+        reinterpret_cast<char *>(DirtyBase(it->second, nslots)), 0,
+        static_cast<size_t>(nslots * sizeof(clio::run::u32)));
 #else
     (void) gpu_id;
 #endif
@@ -799,6 +856,8 @@ class Vector {
     for (auto &kv : devs_) {
       if (kv.second.stats == nullptr) continue;
       ctp::GpuApi::Memset(kv.second.stats, 0, 5 * sizeof(unsigned long long));
+      // allocs (slot 17) pairs with faults: a read and a skipped read.
+      ctp::GpuApi::Memset(kv.second.stats + 17, 0, 2 * sizeof(unsigned long long));  // + writebacks (18)
     }
 #endif
   }
@@ -849,7 +908,7 @@ class Vector {
 #if CTP_ENABLE_GPU
     auto it = devs_.find(gpu_id);
     if (it == devs_.end() || it->second.stats == nullptr) return s;
-    unsigned long long h[17] = {};
+    unsigned long long h[19] = {};
     ctp::GpuApi::Memcpy(h, it->second.stats, sizeof(h));
     s.fetch_cyc = h[10];
     s.hold_cyc = h[11];
@@ -868,6 +927,8 @@ class Vector {
     s.gen_busy = h[7];
     s.flush_skipped = h[8];
     s.put_errors = h[4];
+    s.allocs = h[17];
+    s.writebacks = h[18];
 #else
     (void) gpu_id;
 #endif
@@ -1163,6 +1224,9 @@ class Vector {
   /** Source tag name when this Vector is a Copy(); empty otherwise. Only
    *  MaterializeAll needs it, and only a copy can be materialised. */
   std::string ckpt_src_;
+  /** What the last FlushResidentToCte wrote back (see LastFlushPages). */
+  clio::run::u64 last_flush_pages_ = 0;
+  clio::run::u64 last_flush_bytes_ = 0;
 
 
   struct DevState {
@@ -1207,9 +1271,11 @@ class Vector {
     st.pages_alloc = ipc->AllocateAndRegisterGpuBackend(
         gpu_id, clio::run::gpu::IpcManager::MemKind::kDeviceMem,
         static_cast<size_t>(nregions) * page_bytes_, &st.pages_base);
+    // The table and, right after it, one dirty word per frame
+    // (VecHeader::dirty_).
     st.table_alloc = ipc->AllocateAndRegisterGpuBackend(
         gpu_id, clio::run::gpu::IpcManager::MemKind::kDeviceMem,
-        nslots * sizeof(Page), &st.table_base);
+        nslots * (sizeof(Page) + sizeof(clio::run::u32)), &st.table_base);
     st.tasks_alloc = ipc->AllocateAndRegisterGpuBackend(
         gpu_id, clio::run::gpu::IpcManager::MemKind::kDeviceMem,
         nblocks_ * kTaskSetBytes, &st.tasks_base);
@@ -1248,6 +1314,7 @@ class Vector {
     InitTasks(st);
 
     st.hdr.pages_ = reinterpret_cast<Page *>(st.table_base);
+    st.hdr.dirty_ = DirtyBase(st, nslots);
     st.hdr.tasks_ = reinterpret_cast<BlockTasks *>(st.btbl_base);
     st.hdr.page_bytes_ = page_bytes_;
     st.hdr.elems_per_page_ = page_bytes_ / sizeof(T);
@@ -1283,6 +1350,8 @@ class Vector {
     st.hdr.stat_flush_skipped_ = nullptr;
     st.hdr.stat_put_errors_ = nullptr;
     st.hdr.stat_alloc_waits_ = nullptr;
+    st.hdr.stat_allocs_ = nullptr;
+    st.hdr.stat_writebacks_ = nullptr;
     st.hdr.stat_cyc_ = nullptr;
     st.hdr.fatal_ = FatalSlots();
     st.hdr.fatal_mirror_ = FatalMirror();
@@ -1424,6 +1493,19 @@ class Vector {
       p.fetching = 0;
     }
     UploadBytes(tbl.data(), st.table_base, nslots * sizeof(Page));
+    ctp::GpuApi::Memset(reinterpret_cast<char *>(DirtyBase(st, nslots)), 0,
+                        static_cast<size_t>(nslots * sizeof(clio::run::u32)));
+  }
+
+  /**
+   * The per-frame dirty words, stored right after the Page table.
+   * @param st     the device state
+   * @param nslots frames in the table
+   * @return device pointer to nslots u32 words
+   */
+  static clio::run::u32 *DirtyBase(const DevState &st, clio::run::u64 nslots) {
+    return reinterpret_cast<clio::run::u32 *>(
+        st.table_base + static_cast<size_t>(nslots) * sizeof(Page));
   }
 
   /**

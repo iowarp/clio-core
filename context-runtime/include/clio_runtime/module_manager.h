@@ -52,6 +52,7 @@ typedef Container* (*alloc_chimod_t)();
 typedef Container* (*new_chimod_t)(const PoolId* pool_id, const char* pool_name);
 typedef const char* (*get_chimod_name_t)(void);
 typedef void (*destroy_chimod_t)(Container* container);
+typedef const char* (*get_chimod_abi_t)(void);
 
 /**
  * ChiMod metadata and shared library wrapper
@@ -220,6 +221,20 @@ class ModuleManager {
    * @return true if library has required functions
    */
   bool ValidateChiMod(ctp::SharedLibrary& lib) const;
+
+  /**
+   * Check that a ChiMod was built against the same runtime headers as this
+   * runtime, by comparing its get_chimod_abi() export with the runtime's own
+   * CLIO_RUNTIME_ABI_FINGERPRINT. A mismatched module (typically a stale .so
+   * left in a build or install directory) is laid out differently and would
+   * corrupt memory once instantiated. Setting CLIO_CHIMOD_ABI_CHECK=0 in the
+   * environment disables the check.
+   * @param lib Shared library already validated by ValidateChiMod
+   * @param lib_path Path of the library, for the log message
+   * @return true if the library may be loaded
+   */
+  bool IsAbiCompatible(ctp::SharedLibrary& lib,
+                       const std::string& lib_path) const;
 
   bool is_initialized_ = false;
   

@@ -250,6 +250,17 @@ void ConfigManager::ApplyEnvOverrides() {
     }
   }
 
+  // issue #1359: CLIO_CLIENT_DATA_SEGMENT_SIZE sizes each client's first data
+  // segment (runtime.client_data_segment_size in yaml); 0 restores 512 MB.
+  if (const char *env =
+          clio::run::env::GetCompat("CLIENT_DATA_SEGMENT_SIZE")) {
+    size_t parsed = 0;
+    if (ParseSegmentSizeText(env, "CLIO_CLIENT_DATA_SEGMENT_SIZE", parsed)) {
+      client_data_segment_size_ =
+          parsed ? parsed : kDefaultClientDataSegmentSize;
+    }
+  }
+
   // issue #990: web dashboard. CLIO_VIZ_ENABLE=1/0 counts as an explicit
   // choice, so `clio_run runtime start` will not override it. CLIO_VIZ_PORT=0
   // asks for an ephemeral port (VizServer::GetPort() reports what was bound),
@@ -268,7 +279,7 @@ void ConfigManager::ApplyEnvOverrides() {
   }
   if (const char *env = clio::run::env::GetCompat("VIZ_BIND")) {
     if (env[0] != '\0') {
-      viz_bind_addr_ = env;
+      viz_bind_addr_ = configured_viz_bind_addr_ = env;
     }
   }
   if (const char *env = clio::run::env::GetCompat("VIZ_MAX_THREADS")) {
@@ -319,7 +330,7 @@ std::string ConfigManager::GetServerConfigPath() const {
   // Check env var first: CLIO_SERVER_CONF preferred, CLIO_SERVER_CONF legacy.
   const char *env_path = clio::run::env::GetCompat("SERVER_CONF");
   if (env_path) {
-    return std::string(env_path);
+    return ctp::SystemInfo::NormalizePath(env_path);
   }
 
   // Unit tests are hermetic: never fall back to the developer's per-user
@@ -441,7 +452,7 @@ void ConfigManager::LoadDefault() {
   conf_dir_ = ctp::SystemInfo::GetMemfdDir();
 
   main_segment_size_ = 0;                         // 0 means auto-calculate
-  client_data_segment_size_ = 512 * 1024 * 1024;  // 512MB
+  client_data_segment_size_ = kDefaultClientDataSegmentSize;
 
   port_ = 9413;
   neighborhood_size_ = 32;
@@ -474,7 +485,7 @@ void ConfigManager::LoadDefault() {
   viz_enabled_ = false;
   viz_enabled_explicit_ = false;
   viz_port_ = 8080;
-  viz_bind_addr_ = "127.0.0.1";
+  viz_bind_addr_ = configured_viz_bind_addr_ = "127.0.0.1";
   viz_max_threads_ = 16;
 }
 
@@ -516,7 +527,8 @@ void ConfigManager::ParseYAML(YAML::Node &yaml_conf) {
     // Configuration directory for persistent runtime config; the default is
     // the per-user directory set in LoadDefault (see there).
     if (runtime["conf_dir"]) {
-      conf_dir_ = runtime["conf_dir"].as<std::string>();
+      conf_dir_ =
+          ctp::ConfigParse::ExpandPath(runtime["conf_dir"].as<std::string>());
     }
 
     // Task load prediction model learning rate
@@ -558,6 +570,19 @@ void ConfigManager::ParseYAML(YAML::Node &yaml_conf) {
       if (ParseSegmentSizeNode(runtime["main_segment_size"],
                                "main_segment_size", parsed)) {
         main_segment_size_ = parsed;
+      }
+    }
+
+    // Size of each client's first data segment, clio_<pid>_0 (issue #1359).
+    // Every client process maps one; it grows by adding segments when full,
+    // so a desktop embedding can start small. Byte count or size string;
+    // 0 restores the 512 MB default.
+    if (runtime["client_data_segment_size"]) {
+      size_t parsed = 0;
+      if (ParseSegmentSizeNode(runtime["client_data_segment_size"],
+                               "client_data_segment_size", parsed)) {
+        client_data_segment_size_ =
+            parsed ? parsed : kDefaultClientDataSegmentSize;
       }
     }
 
@@ -649,7 +674,8 @@ void ConfigManager::ParseYAML(YAML::Node &yaml_conf) {
       viz_port_ = viz["port"].as<u32>();
     }
     if (viz["bind"]) {
-      viz_bind_addr_ = viz["bind"].as<std::string>();
+      viz_bind_addr_ = configured_viz_bind_addr_ =
+          viz["bind"].as<std::string>();
     }
     if (viz["max_threads"]) {
       viz_max_threads_ = viz["max_threads"].as<u32>();

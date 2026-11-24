@@ -15,6 +15,10 @@
 #include <clio_runtime/bdev/transports/gcs_bdev_transport.h>
 #endif
 
+#ifdef CLIO_ENABLE_DAOS
+#include <clio_runtime/bdev/transports/daos_bdev_transport.h>
+#endif
+
 namespace clio::run::bdev {
 
 std::unique_ptr<BdevTransport> BdevTransportFactory::Create(BdevType type) {
@@ -32,6 +36,17 @@ std::unique_ptr<BdevTransport> BdevTransportFactory::Create(BdevType type) {
 #ifdef CLIO_ENABLE_GOOGLE_CLOUD
     case BdevType::kGcs:
       return std::make_unique<GcsBdevTransport>();
+#endif
+    case BdevType::kDaos:
+#ifdef CLIO_ENABLE_DAOS
+      return std::make_unique<DaosBdevTransport>();
+#else
+      HLOG(kError,
+           "bdev_type 'daos' needs the native DAOS transport, which this "
+           "build does not contain. Reconfigure with -DCLIO_ENABLE_DAOS=ON "
+           "(Spack: iowarp +daos) on a system with the DAOS client "
+           "development files.");
+      return nullptr;
 #endif
     default:
       return nullptr;

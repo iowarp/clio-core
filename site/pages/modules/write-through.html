@@ -1,0 +1,286 @@
+<!--
+title: Write-through cache module
+heading: Write-through: <em>persistent first.</em>
+description: The CTE write-through cache: acknowledges a put only after the persistent chain has taken it, keeps a never-dirty copy in the volatile RAM core for reads. Consistency model, routing, reads, eviction, composing it in place of the write-back cache, configuration and limits.
+eyebrow: Modules · Transfer engine
+lede: The write-through cache sits over the same two CTE cores as the write-back cache and shares its code, with the opposite policy. A put goes to the persistent chain first and is acknowledged only after that write and the refresh of the volatile copy. The copy in RAM is never dirty, so there is nothing to flush and nothing to lose on a crash. It is built by default but not composed in the default configuration.
+facts: Library | clio_cte_core_persist_write_thru ; Default pool | 566.0 (not composed by default) ; Build option | CLIO_CTE_ENABLE_POLICY_CACHES (ON) ; Source | context-transfer-engine/core_persist_write_thru
+-->
+<h2>What it does</h2>
+<p>The CTE runs two cores that never move data between each other: a
+volatile core (540.0) on DRAM, which has no write-ahead log and is empty
+after every start, and a persistent core (512.0), normally reached through
+the replication module (561.0). A policy cache joins them. The write-through
+policy writes every put to the persistent chain, then updates a copy of the
+blob in the volatile core so later reads are served from RAM.</p>
+<p>All logic lives in the shared policy-cache base,
+<code>context-transfer-engine/cache_base</code> (<code>CacheBase</code>,
+derived from the core's <code>DualTargetInterposer</code>). This module only
+fixes the policy. The <a href="/modules/write-back.html">write-back
+module</a>, which the default configuration composes at 567.0, is the same
+code with the other policy, and most of its mechanics (locking, fill,
+eviction, tag deletes) apply here unchanged.</p>
+
+<h2>Consistency model</h2>
+<p>Write-through is <strong>strongly consistent</strong> at this module's
+interface:</p>
+<ul>
+  <li>Every blob verb runs on the blob's owner container (chosen by hashing
+  tag and blob name), so each blob has at most one volatile copy in the
+  cluster, and every operation on a blob is serialized there by a per-blob
+  lock.</li>
+  <li>A put is acknowledged after the persistent chain has accepted it and
+  the owner's volatile copy has been brought up to date (or removed, if it
+  could not be). A read from any node
+  after the acknowledgement sees the write, with no fsync needed.</li>
+  <li>The volatile copy never holds bytes the persistent chain lacks. A crash
+  of the cache loses nothing that was acknowledged.</li>
+  <li>Acknowledged means accepted by the persistent chain, not synced to a
+  device. Device durability still comes from the chain itself: its tiers,
+  its write-ahead log, replication and SyncTag (fsync). See <a
+  href="/design/durability.html">durability</a>.</li>
+</ul>
+
+<h2>Where it sits</h2>
+<p>It takes the write-back cache's place in the chain:</p>
+<pre data-label="text">
+indexer(564.0) -> shm cache(568.0) -> [compressor(562.0) ->]
+  core_persist_write_thru
+  -> volatile core(540.0)
+  -> replication(561.0) -> persistent core(512.0)
+</pre>
+<p>The persistent chain (<code>next_persistent</code>) is the interposer's
+single next pool: every verb the module does not handle is forwarded there
+and owner routing follows the core's rules. The volatile core
+(<code>next_volatile</code>) is reached only through a core client with local
+queries.</p>
+<ul>
+  <li><strong>Interposed core verbs</strong>, with the core's method ids:
+  PutBlob (15), GetBlob (16), DelBlob (18), DelTag (19), GetBlobSize (23),
+  FlushData (34), TruncateBlob (37), MultiPutBlob (48) and SyncTag (56), plus
+  Create, Destroy and Monitor.</li>
+  <li><strong>Own verb</strong>: DropTagCopies (100), sent by the cache to
+  its own containers to drop a tag's copies. <code>clio_mod.yaml</code> also
+  lists ids 101 and 102, which the dispatch table does not implement.</li>
+  <li><strong>Every other core verb</strong> is forwarded to the persistent
+  chain.</li>
+</ul>
+
+<h2>Composing it</h2>
+<p><strong>Choose a pool id other than 566.0.</strong> The default id in
+<code>core_persist_write_thru_tasks.h</code> is the same as the
+<a href="/modules/checkpoint.html">checkpoint module</a>'s fixed id, which
+vector copies look up by number. Set <code>pool_id</code> explicitly in the
+compose entry, as below, whenever checkpoints may be used.</p>
+<p>The default configuration does not compose this module. To use it, put an
+entry like this in place of the write-back entry, after the volatile core,
+replication and the persistent core:</p>
+<pre data-label="yaml">
+compose:
+  - mod_name: clio_cte_core_persist_write_thru
+    pool_name: clio_cte_core_persist_write_thru
+    pool_query: local
+    pool_id: "566.0"
+    next_volatile: "540.0"              # volatile core (required)
+    next_persistent: "561.0"            # replication -> persistent core
+    fill: on_hit_count:2                # on_hit_count:N | on_read_miss | none
+</pre>
+<p>Then point the <a href="/modules/shm-cache.html">shm cache</a>'s <code>next_pool_id</code> (or the compressor's,
+when composed) at <code>"566.0"</code>, and set the shm cache's
+<code>invalidate_on_flush</code> to <code>false</code>. That option relies on
+a write-back cache below landing each flushed range through the shm cache;
+this module flushes nothing, so the shm cache must invalidate on every write
+instead. The pool id is free to choose: the clio-fs test suite composes this
+module at 567.0 when run with <code>--cache write_thru</code>.</p>
+<p>Create fails with return code 1 when <code>next_volatile</code> is missing.
+Without <code>next_persistent</code> the module is volatile-only and forwards
+every verb to the volatile core. The client class,
+<code>clio::cte::core_persist_write_thru::Client</code>, is a core client
+plus <code>AsyncCreateCache</code>.</p>
+
+<h2>Configuration</h2>
+<p>The module reads the same keys as the write-back cache
+(<code>PolicyCacheParams</code> in
+<code>cache_base/include/clio_cte/cache_base/cache_config.h</code>). A
+malformed value is logged and leaves that key at its default.</p>
+<dl class="notes">
+  <dt><code>next_volatile</code></dt>
+  <dd>The volatile core, as <code>"major.minor"</code>. Required.</dd>
+  <dt><code>next_persistent</code></dt>
+  <dd>The persistent chain. Unset: volatile-only.</dd>
+  <dt><code>fill</code></dt>
+  <dd>When a read miss copies the blob into the volatile core:
+  <code>on_hit_count:N</code> on the Nth miss (default
+  <code>on_hit_count:2</code>; N of 0 is treated as 1),
+  <code>on_read_miss</code> on every miss, <code>none</code> never. It governs
+  reads only; writes always refresh or create the copy.</dd>
+  <dt><code>evict</code></dt>
+  <dd><code>lru</code> (default) or <code>lfu</code>. Parsed, but eviction
+  orders victims by last access time only, so both evict least-recently-used
+  copies.</dd>
+</dl>
+<p>Ignored by this policy: <code>flush_period_ms</code>,
+<code>flush_fill_pct</code>, <code>flush_dirty_mb</code>,
+<code>flush_pool</code> and <code>fallback_to_persistent</code>. No flusher
+or stop hook is started, since nothing is ever dirty.</p>
+
+<h2>Routing</h2>
+<ul>
+  <li><strong>Blob verbs</strong> (PutBlob, GetBlob, GetBlobSize, DelBlob,
+  TruncateBlob) are routed exactly as the core routes them: to the blob's
+  owner, with the core's failover applied.</li>
+  <li><strong>FlushData and DropTagCopies</strong> stay on the container
+  they were sent to.</li>
+  <li>When a blob verb reaches a container that does not own the blob
+  (an interposer above forwards to its local container), it is sent on to
+  the owner. If the owner dies in flight, the request is resent up to ten
+  times, one second apart, to whichever container failover then names.
+  Appends are not resent, since a lost one may have landed.</li>
+</ul>
+
+<h2>Write path</h2>
+<ol class="steps">
+  <li><strong>Lock the blob</strong> on its owner.</li>
+  <li><strong>Special puts</strong> (append, replace, put-if-absent,
+  put-if-version) depend on the persistent copy's state: the volatile copy
+  is dropped, the put goes to the persistent chain, and no copy is
+  kept.</li>
+  <li><strong>Write persistent.</strong> The put is forwarded to the
+  persistent chain. If it fails, the put fails and the copy is left as it
+  was.</li>
+  <li><strong>Refresh the copy.</strong> If the blob has no copy yet and the
+  write covers only part of an existing persistent blob, the whole blob is
+  first read from the persistent chain into the volatile core, so a copy is
+  always the entire blob. The written regions are then put into the volatile
+  core. On no-space, up to four least-recently-used copies are evicted and the
+  put is retried once.</li>
+  <li><strong>If the copy cannot be refreshed</strong>, it is deleted from
+  the volatile core. The put still succeeds: persistent holds the bytes, and
+  the next read goes there.</li>
+  <li><strong>Acknowledge.</strong></li>
+</ol>
+<h3>Batched writes</h3>
+<p>A MultiPutBlob whose records the receiving container all owns locks every
+record's blob in key order, drops their volatile copies, forwards the batch
+to the persistent chain, and releases the locks only afterwards, so no read
+can refill a copy that misses the batch's bytes. The next read refills per
+<code>fill</code>. A batch with records owned elsewhere is split into one
+PutBlob per record, each sent to its owner, where it takes the write path
+above.</p>
+
+<h2>Reads</h2>
+<ul>
+  <li><strong>GetBlob</strong> on the owner: a present copy serves the read
+  from the volatile core. If the copy fails to serve, it is dropped and the
+  read goes to the persistent chain.</li>
+  <li><strong>Miss</strong>: the read is served by the persistent chain.
+  If <code>fill</code> admits the blob, the whole blob is then copied into
+  the volatile core (a partial read fills the whole blob).</li>
+  <li><strong>GetBlobSize</strong> answers from the copy's size when a copy
+  exists, else from the persistent chain.</li>
+  <li><strong>Other reads</strong> (tag sizes, blob listings, searches, Pod
+  reads) go straight to the persistent chain: the copies hold nothing it
+  lacks.</li>
+</ul>
+
+<h2>Deletes, truncates and writes behind the cache</h2>
+<ul>
+  <li><strong>DelBlob</strong> drops the copy, then deletes on the persistent
+  chain.</li>
+  <li><strong>TruncateBlob</strong> drops the copy, then truncates the
+  persistent blob.</li>
+  <li><strong>DelTag</strong> is forwarded to the persistent chain, then
+  broadcast as a tag delete on the persistent chain and as DropTagCopies to
+  every container of this pool.</li>
+  <li><strong>PodPutBlob and PodMultiPutBlob</strong> write behind the cache:
+  every live container drops its copies of the tag before the write and
+  again after it.</li>
+  <li>Writes sent straight to the persistent pools, bypassing this module,
+  invalidate nothing; an existing copy keeps serving the old bytes.</li>
+</ul>
+
+<h2>fsync and flush</h2>
+<p>SyncTag finds nothing dirty and is forwarded to the persistent chain,
+which syncs its devices. Concurrent syncs of the same tag with the same
+arguments share one round. FlushData completes at once with nothing flushed;
+the module starts no periodic flush.</p>
+
+<h2>Eviction and capacity</h2>
+<ul>
+  <li>Eviction is a DelBlob of the copy on the volatile core, choosing among
+  up to 256 least-recently-used unlocked copies. Every copy is clean, so
+  eviction never writes anything.</li>
+  <li>A full volatile core never fails a put. The put is already on the
+  persistent chain; only the copy is skipped.</li>
+  <li>The cache has no size setting of its own; it uses the volatile core's
+  tiers and their <code>capacity_limit</code>.</li>
+</ul>
+
+<h2>Stop, unplug and restart</h2>
+<ul>
+  <li><code>clio_run pool stop &lt;pool&gt;</code> has nothing to flush. After
+  the pool is removed, tasks addressed to it are redirected to the persistent
+  chain. <code>clio_run pool rm &lt;pool&gt;</code> also drops every volatile
+  copy.</li>
+  <li>On restart the volatile core is empty and the cache's bookkeeping is
+  gone. Every acknowledged write is on the persistent chain; copies refill on
+  read per <code>fill</code>, or on the next write.</li>
+  <li>A dead owner's copies die with it. With the core's
+  <code>failover_to_successor</code> and replication's remote copies, its
+  blobs are served by the successor from the persistent chain.</li>
+</ul>
+
+<h2>Monitoring</h2>
+<p>The Monitor query <code>stats</code> returns the same msgpack map as the
+write-back cache, with <code>policy</code> set to
+<code>"write-through"</code>; its dirty and flush counters stay at zero.
+<code>dirty_count</code> returns 0. Other queries are forwarded to the
+persistent chain.</p>
+
+<h2>Behaviors worth knowing</h2>
+<ul class="checks">
+  <li>Every put pays the persistent chain's latency, plus one extra copy of
+  the payload into the volatile core.</li>
+  <li>Writes allocate: a written blob gets a volatile copy whatever
+  <code>fill</code> says, so a write-once stream can push hot data out of
+  the volatile core.</li>
+  <li>A partial write to a cold blob reads the whole blob from the persistent
+  chain to build the copy.</li>
+  <li>Batched writes to blobs the container owns drop their copies instead of
+  refreshing them.</li>
+</ul>
+
+<h2>Limits</h2>
+<ul>
+  <li><code>evict: lfu</code> is accepted but behaves like
+  <code>lru</code>.</li>
+  <li>The copy is kept only on the blob's owner; a read from another node
+  crosses the network to it.</li>
+  <li>Writes that bypass the module leave existing copies stale.</li>
+</ul>
+
+<h2>Write-through or write-back</h2>
+<p>Choose write-through when an acknowledged write must already be on the
+persistent chain and visible from every node without an fsync: for example,
+applications that share files across nodes without calling fsync, or
+deployments where losing buffered writes on a crash is not acceptable. The
+cost is the persistent chain's latency on every write. Choose the <a
+href="/modules/write-back.html">write-back cache</a>, the default, when
+applications mark durability and cross-node visibility points with fsync and
+should otherwise write at RAM speed.</p>
+
+<h2>How it is tested</h2>
+<ul>
+  <li><code>context-transfer-engine/test/unit/test_policy_cache.cc</code>
+  (ctest <code>cte_policy_cache</code>) creates a write-through cache at
+  566.0 over a persistent file core and a volatile RAM core. "Write-through:
+  persistent first, copy kept current" checks that a full write and a partial
+  overwrite reach both cores immediately. "A blob read twice is filled into
+  the volatile core" checks <code>on_hit_count:2</code> admission and that a
+  partial read fills the whole blob.</li>
+  <li><code>context-transfer-engine/test/integration/clio_fs_suite</code>:
+  <code>suite.py --cache write_thru</code> runs the multi-node filesystem
+  suite with this module at 567.0. Its agents then skip the fsync on close
+  they use under write-back, so the suite checks that writes are visible
+  across nodes at once.</li>
+</ul>

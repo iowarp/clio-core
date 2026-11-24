@@ -38,16 +38,14 @@ name: CI Adapters
 
 on:
   push:
-    branches: [main, dev]
+    branches: [main]
+  # Push to dev does NOT trigger this directly: dev-full-ci.yml dispatches
+  # the full matrix once dev has been quiet for 30 minutes, so a burst of
+  # merges gets one full run instead of one per merge.
+  # PRs run only the Linux adapter job (single node, inside deps-cpu); the
+  # macOS/Windows adapter jobs run in the full dev sweep and on push to main.
   pull_request:
     branches: [main, dev]
-  # Merge queue (issue #1013): the full matrix -- macFUSE, WinFsp, the boost
-  # backend, the wide macOS sweep -- is gated on `event_name != pull_request`,
-  # so it never ran on a PR and only spoke up AFTER the merge, on dev, where a
-  # single bad commit turns every later push red. A merge_group run is that
-  # same full matrix executed on the PROSPECTIVE merge commit, before it lands.
-  # Cost is unchanged for PRs; dev stops being where breakage is discovered.
-  merge_group:
   workflow_dispatch:
 
 concurrency:
@@ -65,6 +63,8 @@ jobs:
   # add libfuse3-dev for the FUSE backend. --device /dev/fuse + SYS_ADMIN let
   # the live mount smoke test actually mount.
   linux-adapters:
+    # Skipped on dev -> main PRs: dev-to-main-gate.yml checks dev's full CI on the same commit instead.
+    if: ${{ !(github.event_name == 'pull_request' && github.head_ref == 'dev' && github.base_ref == 'main') }}
     name: adapters (linux, all 5)
     runs-on: ubuntu-24.04
     timeout-minutes: 120
@@ -97,146 +97,9 @@ jobs:
   # Recovery-Mode user approval (impossible on runners), so the mount smoke
   # below uses the FSKit backend (macFUSE 5.1+, macOS 15.4+, mountpoint under
   # /Volumes) and is NON-BLOCKING until proven on runner images.
-  macos-adapters:
-    name: adapters (macos, hdf5_vol + macfuse)
-    # Push-only (#921): the linux job above covers all five adapters on
-    # every PR; these two re-verify the platform-specific mount layers
-    # (macfuse / winfsp) at the merge point.
-    if: github.event_name != 'pull_request'
-    runs-on: macos-15
-    timeout-minutes: 120
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v5
-        with:
-          submodules: recursive
-      - name: Install dependencies (conda HDF5 provides >= 1.14)
-        run: |
-          chmod +x CI/ci-deps.sh
-          ./CI/ci-deps.sh --only-deps release
-      # macFUSE 5 ships libfuse3 (headers + dylib + pkg-config) under
-      # /usr/local; installing the cask needs no kext approval — only
-      # mounting through the kext backend would.
-      - name: Install macFUSE (libfuse3 for the adapter build)
-        run: bash CI/retry.sh brew install --cask macfuse
-      - name: Configure and build (hdf5_vol + macfuse)
-        run: |
-          set -x
-          if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
-            source "$HOME/miniconda3/etc/profile.d/conda.sh"
-          elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
-            source "$HOME/anaconda3/etc/profile.d/conda.sh"
-          elif command -v conda >/dev/null 2>&1; then
-            eval "$(conda shell.bash hook)"
-          fi
-          conda activate iowarp
-          export CMAKE_PREFIX_PATH="${CONDA_PREFIX}${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
-          export PKG_CONFIG_PATH="${CONDA_PREFIX}/lib/pkgconfig:${CONDA_PREFIX}/share/pkgconfig:/usr/local/lib/pkgconfig:/opt/homebrew/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
-          cmake -B build-adapters \
-            -DCMAKE_BUILD_TYPE=Debug \
-            -DPython3_EXECUTABLE="${CONDA_PREFIX}/bin/python3" \
-            -DSITE="macos-15" \
-            -DBUILDNAME="adapters/cnd/d" \
-            -DCLIO_CORE_ENABLE_RUNTIME=ON \
-            -DCLIO_CORE_ENABLE_CTE=ON \
-            -DCLIO_CORE_ENABLE_CAE=OFF \
-            -DCLIO_CORE_ENABLE_CEE=OFF \
-            -DCLIO_CORE_ENABLE_TESTS=ON \
-            -DCLIO_CORE_ENABLE_BENCHMARKS=OFF \
-            -DCLIO_CORE_ENABLE_PYTHON=OFF \
-            -DCLIO_CORE_ENABLE_CONDA=ON \
-            -DCLIO_CORE_ENABLE_ELF=OFF \
-            -DCLIO_CTE_ENABLE_HDF5_VOL=ON \
-            -DCLIO_CTE_ENABLE_FUSE_ADAPTER=ON \
-            -DCLIO_CTE_ENABLE_ADIOS2_ADAPTER=OFF \
-            -DCLIO_CTE_ENABLE_COMPRESS=OFF \
-            -DCLIO_CORE_ENABLE_GRAY_SCOTT=OFF \
-            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
-            -DCLIO_CTP_LOG_LEVEL=0
-          cmake --build build-adapters -- -j"$(sysctl -n hw.ncpu)"
-      - name: Verify the macFUSE adapter binary was built
-        run: |
-          if [ ! -x build-adapters/bin/clio_cte_fuse ]; then
-            echo "::error::clio_cte_fuse was not built — macFUSE/libfuse3 was not detected at configure time (check fuse3 pkg-config visibility under /usr/local/lib/pkgconfig)."
-            exit 1
-          fi
-          echo "OK: clio_cte_fuse present (macFUSE libfuse3 path compiled and linked)"
-      - name: Run adapter tests
-        run: |
-          if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
-            source "$HOME/miniconda3/etc/profile.d/conda.sh"
-          elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
-            source "$HOME/anaconda3/etc/profile.d/conda.sh"
-          elif command -v conda >/dev/null 2>&1; then
-            eval "$(conda shell.bash hook)"
-          fi
-          conda activate iowarp
-          # h5py for the VOL compat suite, source-built against the conda HDF5
-          # the VOL links (a wheel's bundled libhdf5 can't load the connector).
-          HDF5_DIR="$CONDA_PREFIX" "${CONDA_PREFIX}/bin/python3" -m pip install \
-            --no-binary=h5py h5py numpy
-          ctest --test-dir build-adapters --output-on-failure \
-            --timeout 180 --repeat until-pass:2 \
-            -R "hdf5_vol|fuse" -E "copy_workspace" -LE "docker|ollama|flaky"
-      # fuse_ops has crashed with a bare `***Exception: SegFault` on every
-      # macOS adapters run since at least 2026-08-21, always inside the
-      # "hard link" case. ctest reports the signal and throws the stack away,
-      # so there has never been anything to diagnose from. Re-run just that
-      # binary under lldb on failure to capture one.
-      #
-      # if: failure() so it costs nothing on a green run, and it cannot change
-      # the gate -- the ctest step above has already decided the job.
-      - name: Backtrace fuse_ops on crash (diagnostic only)
-        if: failure()
-        continue-on-error: true
-        run: |
-          exe=$(find build-adapters -name 'test_fuse_ops*' -type f -perm -u+x | head -1)
-          echo "fuse_ops binary: ${exe:-<not found>}"
-          if [ -z "$exe" ]; then exit 0; fi
-          # First pass produced only frame #0 (lldb could not unwind), so ask
-          # for every thread's stack explicitly and dump the faulting pointer.
-          # MallocScribble/MallocPreScribble make a use-after-free show up as
-          # 0x55.. / 0xaa.. instead of random garbage, which distinguishes
-          # "freed object" from "wrong address computed" -- the two candidates
-          # for a wild mutex pointer.
-          # -o commands after `run` are ABANDONED once the target crashes in
-          # --batch mode, which is why the first two attempts printed only the
-          # stop line. -k / --one-line-on-crash is the hook that actually fires
-          # on the crash.
-          #
-          # Scribble stays on, but note it has already told us something: the
-          # fault address differs every run (0x61de.., 0xb731..) and matches
-          # NEITHER 0x55.. nor 0xaa.., so this is not a freed-heap read. That
-          # points at an uninitialised/wild pointer or memory libmalloc never
-          # owned (e.g. shared-memory backed), not a classic use-after-free.
-          export MallocScribble=1 MallocPreScribble=1
-          lldb --batch                -k 'thread backtrace all'                -k 'register read x0 lr pc sp fp'                -k 'image lookup --address $lr'                -k 'memory read --size 8 --format x --count 4 $sp'                -k quit                -o run                -o quit                -- "$exe" 2>&1 | tail -200
-      # Real mount attempt via the FSKit backend (kext-free; macFUSE 5.1+,
-      # macOS 15.4+, mountpoint must live under /Volumes). NON-BLOCKING: FSKit
-      # extension approval semantics on runner images are unproven — promote
-      # to a hard gate once this step is observed green. See #903.
-      # timeout + continue-on-error: the first probe HUNG for 50+ minutes
-      # (fuse daemon stuck in an uninterruptible mount, the script's cleanup
-      # wait blocked behind it) — `|| echo` inside the script only survives
-      # failures, not hangs, so the non-blocking contract needs both a step
-      # bound and continue-on-error to hold.
-      - name: FUSE mount smoke (FSKit backend, non-blocking probe)
-        timeout-minutes: 10
-        continue-on-error: true
-        run: |
-          if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
-            source "$HOME/miniconda3/etc/profile.d/conda.sh"
-          elif command -v conda >/dev/null 2>&1; then
-            eval "$(conda shell.bash hook)"
-          fi
-          conda activate iowarp || true
-          sudo mkdir -p /Volumes/cte_fuse_smoke
-          sudo chown "$(whoami)" /Volumes/cte_fuse_smoke
-          chmod +x CI/fuse_mount_smoke.sh
-          CLIO_SMOKE_MOUNT_POINT=/Volumes/cte_fuse_smoke \
-          CLIO_SMOKE_FUSE_OPTS="-o backend=fskit" \
-            CI/fuse_mount_smoke.sh build-adapters \
-            || echo "::warning::macOS FSKit mount smoke failed — non-blocking probe (kext needs Recovery-Mode approval on runners; FSKit backend unproven there). Unit + ops suites above are the enforced macOS signal. See #903."
+  # macOS adapters (HDF5 VOL + macFUSE) moved into ci-macos.yml
+  # build-test (macos-15): the same image and nearly the same build, so a
+  # second macOS runner per sweep bought nothing but queue time.
 
   # ---- Windows: hdf5_vol + libfuse via WinFsp (build + unit + ops + mount) ---
   # This is the job that verifies the _WIN32 WinFsp FUSE path (issue #474):

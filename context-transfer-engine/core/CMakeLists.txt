@@ -54,7 +54,6 @@ add_clio_module_client(
     src/content_transfer_engine.cc
     src/tag.cc
     src/record_log.cc
-    src/shm_read_stats.cc
 )
 
 # Tell clio_cte/api.h to emit dllexport (instead of the default dllimport

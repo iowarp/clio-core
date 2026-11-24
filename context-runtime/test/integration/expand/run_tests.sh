@@ -12,6 +12,14 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../../../" && pwd)"
 
+# Bounded waits + diagnostics (CI/compose_wait.sh): readiness is `clio_run
+# status` on every node, every docker exec runs against ONE deadline below the
+# workflow step's timeout-minutes (15), and a timeout or failure dumps every
+# node's logs, processes and thread state.
+# shellcheck source=../../../../CI/compose_wait.sh
+source "$REPO_ROOT/CI/compose_wait.sh"
+SUITE_NODES=(iowarp-expand-node1 iowarp-expand-node2 iowarp-expand-node3)
+
 # Export workspace path for docker-compose
 if [ -n "${HOST_WORKSPACE:-}" ]; then
     export IOWARP_CORE_ROOT="${HOST_WORKSPACE}"
@@ -21,7 +29,7 @@ fi
 
 # Configuration
 POLL_INTERVAL=2
-MAX_WAIT=60
+MAX_WAIT=120
 
 # Colors for output
 RED='\033[0;31m'
@@ -80,10 +88,16 @@ start_docker_cluster() {
     fi
     log_info "Docker image: $IOWARP_DOCKER_IMAGE"
 
+    cw_reset_sync "$REPO_ROOT/build/cluster_sync/expand"
     docker compose up -d
 
-    log_info "Waiting for containers to initialize..."
-    sleep 5
+    # Node 3 starts its --induct runtime only once the initial cluster answers
+    # `clio_run status` (it waits for this marker instead of `sleep 15`).
+    if ! cw_wait_runtimes iowarp-expand-node1 iowarp-expand-node2; then
+        docker compose down 2>/dev/null || true
+        exit 1
+    fi
+    touch "$REPO_ROOT/build/cluster_sync/expand/initial_ready"
 
     docker compose ps
 
@@ -116,9 +130,7 @@ verify_induction() {
     done
 
     if [ $elapsed -ge $MAX_WAIT ]; then
-        log_error "Timed out waiting for node 3 induction"
-        log_error "Node 3 logs:"
-        docker logs iowarp-expand-node3 2>&1 | tail -30
+        cw_fail "Timed out waiting for node 3 induction" || true
         return 1
     fi
 
@@ -197,6 +209,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 COMMAND=${COMMAND:-all}
+
+cw_init "${EXPAND_BUDGET_SEC:-720}" "${SUITE_NODES[@]}"
 
 # Main execution
 log_info "IOWarp Expand/Induction Test Runner"

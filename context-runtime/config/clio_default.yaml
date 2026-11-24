@@ -42,6 +42,50 @@ networking:
   #                                    # port equals its own networking.port.
   wait_for_restart: 30                 # Seconds to wait for peer nodes on startup
   wait_for_restart_poll_period: 1      # Seconds between connection retries
+  # Peer (node-to-node) transport knobs (environment only):
+  #   CLIO_PEER_TRANSPORT      default zmq -- zmq (ZeroMQ over TCP), socket
+  #                            (plain TCP), or thallium (Mercury RPC + bulk
+  #                            transfer on the fabric below; needs a build with
+  #                            CLIO_CORE_ENABLE_THALLIUM=ON / Spack +mochi, else
+  #                            the runtime logs an error and uses zmq). All
+  #                            nodes must use the same value.
+  #   With thallium each listener keeps its TCP port (port, and the size-tier
+  #   ports), which then only answers peers asking for this node's Mercury
+  #   address; task traffic uses the fabric.
+  #   CLIO_LBM_THALLIUM_PROTOCOL  default "ofi+tcp;ofi_rxm" -- Mercury protocol.
+  #                            "ofi+cxi" = HPE Slingshot, "ofi+verbs;ofi_rxm" =
+  #                            InfiniBand/RoCE, "na+sm" = one node only.
+  #   CLIO_LBM_THALLIUM_LISTEN default unset -- device/interface after "://" in
+  #                            the listen address: "cxi0" (Slingshot NIC),
+  #                            "hsn0" or an IP (IP protocols). Unset: IP
+  #                            protocols use this node's hostfile address,
+  #                            others whichever device the provider lists
+  #                            first (set cxi0 on multi-NIC Slingshot nodes).
+  #   CLIO_LBM_THALLIUM_AUTH_KEY  default unset -- Mercury NA authorization key
+  #                            (Slingshot: "svc_id:vni") when the job's default
+  #                            credentials are not the ones to use.
+  #   CLIO_LBM_THALLIUM_BULK_THRESHOLD  default 64k -- payload segments of at
+  #                            least this size are pulled by Mercury bulk
+  #                            transfer (RDMA read); smaller ones travel inside
+  #                            the RPC message.
+  #   CLIO_LBM_THALLIUM_RPC_THREADS  default 4 -- Argobots execution streams
+  #                            running RPC handlers (each pulls one message's
+  #                            payload at a time).
+  #   CLIO_LBM_THALLIUM_PROGRESS_THREADS  default 1 -- 1 = dedicated Mercury
+  #                            progress thread; 0 = progress loop and handlers
+  #                            share one thread (RPC_THREADS ignored). Margo
+  #                            runs one progress loop, so more is not possible.
+  #   CLIO_LBM_THALLIUM_TIMEOUT_MS  default 10000 -- a send whose peer has not
+  #                            answered for this long fails (peer treated as
+  #                            down, send retried); 0 waits forever.
+  #   CLIO_LBM_THALLIUM_RECV_QUEUE_MSGS  default 1024, and
+  #   CLIO_LBM_THALLIUM_RECV_QUEUE_BYTES default 1g -- bound on received
+  #                            messages waiting for the runtime, per listener.
+  #   CLIO_LBM_THALLIUM_RECV_QUEUE_WAIT_MS  default 1000 -- how long a sender
+  #                            is held when that queue is full before its send
+  #                            is refused for a later retry.
+  #   CLIO_LBM_THALLIUM_RESOLVE_TIMEOUT_MS  default 5000 -- wait for a peer's
+  #                            reply to the address request.
 
 # -- Logging ------------------------------------------------------------------
 # Logging is controlled by environment variables, not this file.
@@ -82,6 +126,20 @@ runtime:
                                        # as the memfd links). Learned task-stat models are
                                        # saved under <conf_dir>/models; a directory shared
                                        # between users cannot be written by the second one.
+  # Shared-memory segment sizes. Each takes a byte count or a size string
+  # ("256m", "1g"). Segments are sparse: untouched pages cost no RAM, but a
+  # scanner that reads every mapped page (e.g. Windows Defender) makes them
+  # resident, so desktop embeddings may want them smaller.
+  # main_segment_size: 0               # default: 0 = auto (RAM, capped at 1 GiB off
+                                       # Linux). Env CLIO_MAIN_SEGMENT_SIZE overrides.
+  # metadata_segment_size: 0           # default: 0 = auto (RAM, capped at 1 GiB off
+                                       # Linux).
+  # client_data_segment_size: 512m     # default: 512m -- each client's first data
+                                       # segment (clio_<pid>_0, plus 32 MB of
+                                       # allocator metadata). More segments are
+                                       # added when it fills; 0 restores the
+                                       # default. Env CLIO_CLIENT_DATA_SEGMENT_SIZE
+                                       # overrides.
   # ipc_namespace: ""                  # Extra suffix for shared-memory segment
                                        # names, which already carry the user
                                        # and port. Set it to run two runtimes
@@ -179,7 +237,7 @@ compose:
     pool_name: "ram::chi_default_bdev"
     pool_query: local
     pool_id: "301.0"
-    bdev_type: ram                       # Options: file, ram, hbm, pinned, noop
+    bdev_type: ram                       # Options: file, ram, hbm, pinned, noop, s3, gcs, daos
     capacity: "0g"                       # 0/0g = default to 80% of total system DRAM
 
   # === Block Device (File) ===
@@ -199,6 +257,85 @@ compose:
   #   # "<pool_name>.fail" exists, every read, write and sync of this device
   #   # fails with an I/O error, as a dead disk would; delete the file and it
   #   # works again. Checked at most every 100 ms; off unless the file exists.
+
+  # === Block Device (Amazon S3 / Google Cloud Storage bucket) ===
+  # Needs a build with -DCLIO_ENABLE_AMAZON_DRIVE=ON / -DCLIO_ENABLE_GOOGLE_CLOUD=ON
+  # (on in the pip wheel; Spack: iowarp +s3_bdev / +gcs_bdev). Each block is
+  # one object [prefix/]block_<offset>. Settings go in a block named after the
+  # bdev type; every key falls back to the environment variable after it.
+  # The same s3: / gcs: block works on a clio_cte_core storage tier entry.
+  # Keys in this file are also kept in the pool log under conf_dir.
+  # - mod_name: clio_bdev
+  #   pool_name: "s3://my-bucket/clio"   # or gcs://my-bucket/clio
+  #   pool_query: local
+  #   pool_id: "320.0"
+  #   bdev_type: s3                      # or gcs
+  #   capacity: "1TB"
+  #   s3:
+  #     access_key_id: "..."             # AWS_ACCESS_KEY_ID (required)
+  #     secret_access_key: "..."         # AWS_SECRET_ACCESS_KEY (required)
+  #     session_token: "..."             # AWS_SESSION_TOKEN (optional)
+  #     region: us-east-1                # AWS_DEFAULT_REGION (default us-east-1)
+  #     endpoint: "http://127.0.0.1:9000" # S3_ENDPOINT; set => path-style (MinIO, R2)
+  #     allow_bucket_create: false       # S3_ALLOW_BUCKET_CREATE=1
+  #   gcs:
+  #     access_token: "..."              # GCS_ACCESS_TOKEN (required; ~1 hour)
+  #     endpoint: "https://storage.googleapis.com"  # GCS_ENDPOINT
+  #     project_id: my-project           # GCS_PROJECT_ID (only to create the bucket)
+
+  # === Block Device (native DAOS) ===
+  # Needs a build with -DCLIO_ENABLE_DAOS=ON (Spack: iowarp +daos); without
+  # it the pool is refused with an error naming the option.
+  # The device is one file of a DAOS POSIX container, read and written through
+  # the DAOS client library (libdfs) -- no dfuse mount in the data path. The
+  # pool_name says where it lives:
+  #   daos://<pool>/<container>/<file path>[?<option>=<value>[&...]]
+  # <pool> and <container> are DAOS labels (or UUIDs); the container must
+  # already exist and be of type POSIX (daos cont create --type POSIX).
+  # Missing directories of <file path> are created. Options (all optional):
+  #   chunk_size=<size>  DFS chunk size of the file, e.g. 1m, 4m (default 1m;
+  #                      applies when the file is created)
+  #   oclass=<name>      DAOS object class of the file, e.g. SX, EC_16P2GX
+  #                      (default: the container's; applies at creation)
+  #   alloc_log=<path>   LOCAL path of the allocator log (same as the
+  #                      alloc_log key below, for places that only take a path)
+  #   prezero=<0|1>      1 (default): zero the destination before each read,
+  #                      so never-written blocks read as zeros even if the
+  #                      DAOS client leaves holes untouched. 0 skips that
+  #                      extra pass over the buffer; only for a DAOS version
+  #                      known to return zeros for holes.
+  #   chunk_align=<0|1>  1 (default): blocks of at least chunk_size bytes
+  #                      start on a chunk boundary, so a 1 MiB block is one
+  #                      whole DAOS chunk (one erasure-coding stripe) instead
+  #                      of two partial ones (3.4x slower writes measured).
+  #                      0: pack blocks back to back.
+  #   io_threads=<n>     dedicated DAOS I/O threads of the process, 1-64
+  #                      (default: env CLIO_DAOS_IO_THREADS, else 4). All
+  #                      DAOS I/O is issued and reaped by these threads, each
+  #                      with its own DAOS event queue (network context);
+  #                      runtime workers only queue requests and wait. The
+  #                      threads are shared by every DAOS device of the
+  #                      process: the first device opened decides the count.
+  # Environment (read when the first DAOS device of a process is opened):
+  #   CLIO_DAOS_IO_THREADS=<n>  I/O thread count when io_threads is not given
+  #   CLIO_DAOS_POLL_US=<us>    how long an I/O thread waits in one event-queue
+  #                             poll while it has I/O in flight (default 200;
+  #                             0 = non-blocking polls, the thread spins while
+  #                             I/O is in flight). Idle threads always sleep.
+  # capacity is required and is a cap: DAOS allocates space as data is
+  # written. The process needs the usual DAOS client environment (agent
+  # socket, e.g. DAOS_AGENT_DRPC_DIR) and must be able to reach the servers.
+  # - mod_name: clio_bdev
+  #   pool_name: "daos://mypool/mycont/clio/chi_bdev.dat"
+  #   pool_query: local
+  #   pool_id: "303.0"
+  #   bdev_type: daos
+  #   capacity: "100GB"
+  #   # No allocator log by default (there is no local file to put it next
+  #   # to). Give a LOCAL path to keep one; it is then replayed on every
+  #   # start, exactly like a file bdev's explicit alloc_log. Without it a
+  #   # restart that keeps metadata may hand out blocks still in use.
+  #   # alloc_log: "/var/lib/clio/chi_bdev_daos.alloc_log"
 
   # === Safe Block Device (erasure-coded array over member bdevs) ===
   # One logical device over several member bdevs (disks): data members plus
@@ -269,7 +406,7 @@ compose:
   # To enable, uncomment this block AND point the CAE core's next_pool_id
   # (CAE entry below) at "401.0" so the data path runs through it. It must
   # be composed after the pool it forwards to exists and before the CAE
-  # entry: move it next to the CAE entry, after the cache.
+  # entry: move it next to the CAE entry, after the chain.
   #
   # Inference is synchronous on the handling worker, so scope tag_re/blob_re
   # tightly: a rule matching a hot write path serializes it behind the model.
@@ -278,7 +415,7 @@ compose:
   #   pool_name: clio_cae_summarizer
   #   pool_query: local
   #   pool_id: "401.0"
-  #   next_pool_id: "563.0"             # chain top (cache), as CAE uses
+  #   next_pool_id: "564.0"             # chain top (indexer), as CAE uses
   #   label_endpoint: "http://127.0.0.1:11434"   # inference server base URL
   #   label_api: ollama                 # ollama (default): POST
   #                                     #   {label_endpoint}/api/generate
@@ -329,36 +466,46 @@ compose:
   #       num_predict: 256
 
   # === Context Transfer Engine (CTE) ===
-  # High-performance data buffering and transfer engine. Sits at the
-  # canonical CTE entrypoint 512.0 (clio::cte::core::kCtePoolId) so every
-  # CTE client / FUSE adapter resolves to it directly. Remove this (and
-  # the CAE entry below) if you do not need CTE.
+  # Two DISCONNECTED cores: each core
+  # is either volatile or persistent, and moving data between them is the
+  # job of the write-back cache further down.
+  #
+  # durability: "persistent" | "volatile". Optional. When omitted it is
+  #   inferred at Create: persistent if every storage device has
+  #   persistence_level "temporary" or "long_term", else volatile (a device
+  #   without persistence_level is volatile). Devices are checked as they
+  #   register: a volatile device in a persistent core is refused; a
+  #   persistent device in a volatile core is accepted with a warning.
+  #   A volatile core writes no WAL (metadata_log_path is unused while
+  #   volatile) and starts empty; a persistent core logs metadata to
+  #   metadata_log_path when set and restores it on restart. The class can
+  #   be changed at runtime with Client::AsyncSetDurability until the next
+  #   restart.
+  #
+  # The PERSISTENT core sits at the canonical CTE entrypoint 512.0
+  # (clio::cte::core::kCtePoolId): a client that addresses the core directly
+  # reaches the durable store. Remove the CTE entries (and the CAE entry
+  # below) if you do not need CTE.
   - mod_name: clio_cte_core
     pool_name: cte_main
     pool_query: local
     pool_id: "512.0"
+    durability: persistent
 
     # Storage tiers ---------------------------------------------------------
     # Each entry creates a block device for CTE to buffer data onto.
     # score: 0.0 = slowest/cheapest, 1.0 = fastest/most expensive
     #        -1.0 = automatic scoring
     # persistence_level: "volatile" (default), "temporary", or "long_term".
-    #        Placement filters (Context::min_persistence_level_) and replica
-    #        durability (REPLICA_PERSISTENT, issue #886) key off this — a
-    #        tier left at "volatile" can never satisfy a persistence request.
+    #        Every device of a persistent core must be "temporary" or
+    #        "long_term" (both survive a process restart).
+    # growth_unit (file tiers, optional, default "1GB"): how far the file
+    #   grows -- and reserves -- at a time. The first unit is reserved when
+    #   the tier is created, so on a RAM-backed filesystem (tmpfs) each
+    #   file tier costs one unit of memory up front; use e.g. "64MB" there.
+    # Bdev pool ids are <core major + device index>.<1 + node>, so two cores
+    # on one runtime never share a device; give each device its own path.
     storage:
-      - path: "ram::cte_ram_tier1"       # "ram::<name>" for DRAM, filesystem path for disk
-        bdev_type: "ram"                 # Options: file, ram, hbm, pinned, noop
-        capacity_limit: "0g"             # 0/0g = default to 80% of total system DRAM
-        score: 1.0                       # DRAM = highest-performance tier
-
-      # Persistent disk tier: where the replication chimod (below) keeps the
-      # durable copies of DRAM-cached data. Grows lazily, so the
-      # capacity_limit is a cap, not an upfront allocation.
-      # growth_unit (file tiers, optional, default "1GB"): how far the file
-      #   grows -- and reserves -- at a time. The first unit is reserved when
-      #   the tier is created, so on a RAM-backed filesystem (tmpfs) each
-      #   file tier costs one unit of memory up front; use e.g. "64MB" there.
       - path: "${CLIO_STORAGE_ROOT}/cte_disk_tier.dat"
         bdev_type: "file"
         capacity_limit: "10GB"
@@ -366,10 +513,26 @@ compose:
         score: 0.2
         persistence_level: "temporary"
 
+      # Native DAOS tier (needs -DCLIO_ENABLE_DAOS=ON). One file of a DAOS
+      # POSIX container per node, driven through libdfs instead of a dfuse
+      # mount; see "Block Device (native DAOS)" above for the path format
+      # and its options. CTE names each node's target "<path>_node<N>", so
+      # the file on node 3 below is /clio/cte_tier.dat_node3. Give every
+      # node a distinct file if several runtimes share the container.
+      # capacity_limit is a cap (nothing is preallocated); growth_unit is
+      # ignored. The tier keeps no allocator log unless the path carries
+      # alloc_log=<local path>.
+      # - path: "daos://mypool/mycont/clio/cte_tier.dat"
+      #   bdev_type: "daos"
+      #   capacity_limit: "500GB"
+      #   score: 0.6
+      #   persistence_level: "temporary"
+
     # Metadata durability ---------------------------------------------------
     # Write-ahead log + periodic snapshots for tag/blob metadata. Required
     # for data to survive a runtime reboot: without it the disk tier's bytes
-    # persist but nothing remembers which blob they belong to.
+    # persist but nothing remembers which blob they belong to. Ignored (with
+    # a warning) on a volatile core, which never has a WAL.
     performance:
       metadata_log_path: "${CLIO_STORAGE_ROOT}/cte_metadata_log"
       transaction_log_capacity: "32MB"
@@ -426,46 +589,63 @@ compose:
     #                                    # transaction_log_capacity, or at most
     #                                    # once a minute to persist blob score
     #                                    # changes the WAL does not record.
-    #   flush_data_period_ms: 10000      # Data flush interval (ms)
-    #   flush_data_min_persistence: 1    # Min persistence level (1=temp-nonvolatile)
     #   fsync_mode: "durable"            # fsync(2) on clio-fs. "durable": returns
-    #                                    # once the file's bytes are on a tier at
-    #                                    # flush_data_min_persistence or above and
-    #                                    # synced to the device, along with the WAL
-    #                                    # and namespace log. "deferred": returns
-    #                                    # at once; the periodic flushes make the
-    #                                    # data durable (a crash can lose up to
-    #                                    # flush_data_period_ms of fsync'd data).
-    #                                    # A graceful `clio_run stop` also moves
-    #                                    # RAM-tier data to disk before exiting
-    #                                    # (bounded by --grace-period).
+    #                                    # once the write-back cache has flushed
+    #                                    # the file's dirty copies and the devices
+    #                                    # holding its bytes are synced, along with
+    #                                    # the WAL and namespace log. "deferred":
+    #                                    # returns at once; the cache's periodic
+    #                                    # flush makes the data durable (a crash
+    #                                    # can lose up to its flush_period_ms).
+    # The core no longer flushes data itself: flush_data_period_ms and
+    # flush_data_min_persistence are ignored (with a warning). Use the
+    # write-back cache's flush_period_ms.
     #   transaction_log_capacity: "32MB" # Write-ahead log capacity
+
+  # === Volatile CTE core ==================================================
+  # DRAM (and optionally hbm, or NVMe scratch files marked "volatile").
+  # Runs without a WAL and is empty after every start; it may refuse a put
+  # when full, which the write-back cache handles (evict, then fall back to
+  # persistent). Clients should not address it directly.
+  - mod_name: clio_cte_core
+    pool_name: cte_volatile
+    pool_query: local
+    pool_id: "540.0"
+    durability: volatile
+    storage:
+      - path: "ram::cte_ram_tier1"       # "ram::<name>" for DRAM
+        bdev_type: "ram"                 # ram, hbm, pinned, or a volatile file
+        capacity_limit: "0g"             # 0/0g = default to 80% of total system DRAM
+        score: 1.0
+    dpe:
+      dpe_type: "max_bw"
+    targets:
+      neighborhood: 1
 
   # === The interposition chain (issue #886) ==============================
   # The chimods below all speak the CTE core's own Put/Get task interface
   # and stack via next_pool_id, separating RELIABILITY (replication) from
   # LOCALITY (cache) from ENCODING (compression). The canonical full chain:
   #
-  #   cache(563.0) -> indexer(564.0) -> [compressor(562.0) ->]
-  #     replication(561.0) -> core(512.0)
+  #   indexer(564.0) -> shm cache(568.0) -> [compressor(562.0) ->]
+  #     core_persist_write_back(567.0)
+  #     -> volatile core(540.0)
+  #     -> replication(561.0) -> persistent core(512.0)
   #
   # Point any clio::cte::core::Client (or the filesystem chimod below) at
-  # the TOP pool and the whole chain is transparent: a put writes through
-  # the chain (compressed, then replicated, then stored — the AUTHORITATIVE
-  # copy lands before the ack) and updates the raw node-local cache copy
-  # with it; a read serves from the raw cache copy — which also keeps the
-  # zero-IPC SHM fast path live even for compressed blobs — and falls
-  # through the chain on a miss (fetching from the blob's owner node and
-  # re-populating the local copy, coherently: the owner's next write
-  # invalidates it). Order in this file matters: each entry must come AFTER
-  # the entry its next_pool_id names.
+  # the TOP pool and the whole chain is transparent: the indexer notes the
+  # write, the optional compressor encodes it, and the write-back cache
+  # lands it in the volatile core and acks; the cache later flushes it
+  # through replication to the persistent core. A read is served from the
+  # volatile copy when there is one, else from persistent. Order in this
+  # file matters: each entry must come AFTER every pool it names.
 
   # === Replication (durable copies, issue #886) ===
   # Reliability layer. replication_factor is the total number of durable
   # copies of every blob:
   #   1 (default): the blob's own copy only, made durable by fsync and the
-  #     periodic data flush -- the ext4 contract and a single-copy disk
-  #     footprint. A node's blobs are unavailable while it is down.
+  #     write-back cache's periodic flush -- the ext4 contract and a
+  #     single-copy disk footprint. A node's blobs are unavailable while it is down.
   #   N > 1: plus N-1 copies on the next nodes by hash, written before a put
   #     is acknowledged; with the core's failover_to_successor a blob stays
   #     readable and writable while its owner is down, and changes made
@@ -500,16 +680,89 @@ compose:
     # owner returns. Default: "" (kept in memory only).
     # handoff_log_path: "/var/lib/clio/cte_handoff_log"
 
+  # === Write-back cache ===
+  # Sits over the two disconnected cores and owns every durability
+  # decision: a put lands in the volatile core and is acked; dirty copies
+  # are flushed to the persistent chain periodically, on fsync (SyncTag) and
+  # FlushData, before they are evicted, and at `clio_run stop` (bounded by
+  # --grace-period). A read miss is served from persistent and, per `fill`,
+  # copied into the volatile core. Eviction is a DelBlob on the volatile
+  # core.
+  #
+  # Unplugging the cache (`clio_run pool stop <pool>`) is a synchronous flush:
+  # new buffered puts stop, every dirty copy is written to the persistent
+  # chain before the stop returns (up to 8 flush rounds), and tasks addressed
+  # to this pool are then redirected to that chain (GetUnplugSuccessor), so
+  # the data stays reachable. If dirty data cannot be made durable the stop
+  # fails and the pool keeps running. `pool stop <pool> --force` discards the
+  # dirty copies instead (counted as discarded_blobs). `clio_run pool rm <pool>`
+  # flushes the same way and also drops every volatile copy; `rm --force`
+  # drops everything without flushing.
+  #
+  # Monitor query `stats` (the dashboard's Pools tab) returns a msgpack map:
+  # policy ("write-back" or "write-through"), draining, dirty_blobs,
+  # dirty_bytes, cached_blobs, flush_rounds, blobs_flushed, bytes_flushed,
+  # flush_failures, unplug_flushes, unplug_blobs_flushed, unplug_bytes_flushed
+  # and discarded_blobs. Counters are cumulative since the container started;
+  # unplug_* count only what a stop or rm flushed or discarded.
+  #
+  # Every write lands in the volatile copy, including partial writes (the
+  # rest of the blob is fetched from persistent first) and the FUSE
+  # adapter's batched writes. Each blob's copy lives on ONE node, the
+  # blob's owner: puts and gets sent to another node are forwarded there,
+  # so two nodes never hold diverging dirty copies. A flush writes only the
+  # byte ranges that changed. Appends, replaces and conditional puts write
+  # the copy out and run on persistent, since they depend on the blob's
+  # current state.
+  #
+  # clio_cte_core_persist_write_thru takes the same keys (flush_period_ms and
+  # fallback_to_persistent are ignored there) and acks only after the
+  # persistent write: no dirty data, but every write pays the persistent
+  # chain's latency (measured slower than write-back on every workload of
+  # the Ares tier suite).
+  - mod_name: clio_cte_core_persist_write_back
+    pool_name: clio_cte_core_persist_write_back
+    pool_query: local
+    pool_id: "567.0"
+    next_volatile: "540.0"              # volatile core (required)
+    next_persistent: "561.0"            # replication -> persistent core;
+                                        #   omit for a volatile-only cache
+    fill: on_hit_count:2                # on_hit_count:N | on_read_miss | none
+    evict: lru                          # lru | lfu
+    flush_period_ms: 10000              # dirty-copy flush period; 0 = off
+    # Also flush as soon as the volatile core is this full (percent of its
+    # capacity) and holds unflushed data, without waiting for the period:
+    # flushed copies are clean, and clean copies are what a full cache can
+    # drop to keep absorbing writes. 0 = timer only.
+    flush_fill_pct: 80
+    # Continuous flushing: start a flush whenever this many MiB of new dirty
+    # data were written since the last one started, so flushing keeps pace
+    # with the writes and an fsync finds little left to do. 0 = off.
+    flush_dirty_mb: 256
+    # Write-back buffers a write on the node that makes it; a flush sends
+    # each range of another node's blob to that blob's owner, landing it
+    # through this pool there (the shm cache above, which then invalidates
+    # the nodes caching its metadata -- once per flushed range, not per
+    # write). Unset: this cache's own pool (no metadata invalidation).
+    flush_pool: "568.0"
+    # When the volatile core cannot hold a put even after eviction: true
+    # writes it straight to persistent (default); false fails the put with
+    # ENOSPC (kPutNoSpaceRc) so a deployment never silently drops to disk
+    # speed.
+    fallback_to_persistent: true
+
   # === Compression (optional, issue #886) ===
   # Encoding layer: transparently compresses on the way down and
   # decompresses on the way out. Requires a build with
-  # CLIO_CTE_ENABLE_COMPRESS=ON; uncomment this entry AND re-point the
-  # indexer entry below at 562.0 to enable it.
+  # CLIO_CTE_ENABLE_COMPRESS=ON. It sits between the shm cache and the
+  # write-back cache (indexer 564 -> shm cache 568 -> compressor 562 ->
+  # write-back 567): uncomment this entry AND set the shm cache entry's
+  # next_pool_id below to 562.0 to enable it.
   # - mod_name: clio_cte_compressor
   #   pool_name: clio_cte_compressor
   #   pool_query: local
   #   pool_id: "562.0"
-  #   next_pool_id: "561.0"             # replication pool — see entry above
+  #   next_pool_id: "567.0"             # write-back cache — see entry above
   #   # Steer each tag's compressed copy toward the node that last read it
   #   # (consumer tracking). false = always place by hash of the tag id.
   #   tracking_enabled: true            # default: true
@@ -543,45 +796,88 @@ compose:
   # (uncompressed) bytes. The module persists its own snapshot + WAL: a
   # restart restores the index and never rescans storage; pre-existing data
   # enters via a tag's first-insertion backfill or the kReindexScan verb.
+  # === Shared-memory cache (core_shm_cache_writethru/DESIGN.md) ===
+  # Sits BELOW the indexer (which reads and writes through it) and ABOVE the
+  # data transformations and data caches. It owns one shared-memory segment
+  # per node that client processes map, and caches tag and blob metadata
+  # there (and, unless md_only, blob bytes): a hit completes in the client
+  # with no task; a miss fetches from the owner and caches the answer. Each
+  # entry's home tracks which nodes cache it and invalidates them when it
+  # changes. md_only: true here because the write-back cache below already
+  # holds the bytes. The CTE core's Create returns this cache's segment keys
+  # (pid, pool, root offset, entry pool) for the core at the bottom of its
+  # chain; CLIO_CTE_CLIENT_INIT then binds the process to entry_pool_id (the
+  # indexer) and maps the segment. A process that cannot map it (TCP client,
+  # remote node) stays on the task path.
+  - mod_name: clio_cte_core_shm_cache_writethru
+    pool_name: clio_cte_core_shm_cache_writethru
+    pool_query: local
+    pool_id: "568.0"
+    next_pool_id: "567.0"               # write-back cache (562.0 with compressor)
+    entry_pool_id: "564.0"              # clients bind to the indexer above
+    md_only: true                       # bytes are cached by the write-back cache
+    # Writes send no invalidation of their own: the write-back cache below
+    # lands each flushed range through this pool on the blob's home, which
+    # invalidates its sharers then. Only with a write-back cache below whose
+    # flush_pool is this pool; false (default) invalidates on every write.
+    invalidate_on_flush: true
+    capacity: "256M"                    # segment bytes: buffers + tables + log
+    # Extent mode (only with md_only: false): keep blob bytes in a node-local
+    # RAM bdev instead of this cache's own segment. The cache leases
+    # data_capacity bytes of data_pool and stores each blob as up to 8 runs
+    # of 4 KiB granules there (no power-of-two rounding, growth appends).
+    # A minor of 0 means this node's own device of that core ("540.0": the
+    # first storage device of core 540 on this node). Unset = off.
+    # data_pool: "540.0"
+    # data_capacity: "1G"
+    log_depth: 0                        # dirty-range log entries (0: 1 per KiB)
+    flush_batch_bytes: "16M"            # max payload per MultiPutBlob batch
+    flush_period_us: 50                 # flusher cadence (it drains fully)
+    flush_retries: 3                    # per-record retries before an error sticks
+    flush_shards: 8                     # parallel MultiPutBlob tasks for this node's own blobs
+    flush_depth: 4                      # flush batches in flight (staging overlaps landing)
+    max_tags: 4096                      # tags tracked (new-tag completeness)
+    max_blobs: 65536                    # blob entries (metadata + buffers)
+    max_fill: "16M"                     # larger blobs are read, not cached
+    evict_sample: 16                    # clean entries sampled per eviction
+    half_life_ms: 10000                 # frecency decay half-life
+    max_sharer_entries: 65536           # blobs homed here that nodes cache
+    # A put refused for room waits up to this long (ms) for the ranges
+    # buffered before it to flush (flushed buffers are clean and evictable),
+    # then writes around the cache. Larger trades put latency on a slow
+    # flusher for fewer write-arounds.
+    nospace_wait_ms: 250
+
   - mod_name: clio_cte_indexer
     pool_name: clio_cte_indexer
     pool_query: local
     pool_id: "564.0"
-    next_pool_id: "561.0"               # replication (562.0 with compressor)
+    next_pool_id: "568.0"               # shm cache below the indexer (see entry above)
     index_log_path: "${CLIO_STORAGE_ROOT}/cte_indexer_index"
     # index_sweep_period_ms: 100        # async drain cadence (0 = lazy)
     # index_wal_compact_bytes: "8MB"    # WAL size that triggers compaction
     # tag_re: ".*"                      # index scope: only matching tags...
     # blob_re: ".*"                     # ...and blob names are tokenized
 
-  # === Cache (node-local raw copies, issue #886) ===
-  # Locality layer and the TOP of the chain, with ASYNCHRONOUS WRITE-THROUGH
-  # semantics: a put lands below (authoritative) before the ack — the layers
-  # underneath keep their own async machinery — and the raw local copy in
-  # the core's REPLICA_CACHE slot is updated with it. Reads serve the raw
-  # copy — including via the zero-IPC SHM fast path, which a compressed
-  # primary alone would refuse — and min_score is the floor below which the
-  # organizer will not rescore a cache copy (only genuine tier pressure
-  # evicts one).
-  - mod_name: clio_cte_cache
-    pool_name: clio_cte_cache
-    pool_query: local
-    pool_id: "563.0"
-    next_pool_id: "564.0"               # indexer — see entry above
-    min_score: 0.5                      # cache copies' score floor
-
   # === Context Assimilation Engine (CAE) ===
   # Assimilation / discovery entrypoint at its own pool 400.0
   # (clio::cae::core::kCaePoolId). CEE calls ParseOmni here; CAE forwards
   # the data-path tasks it owns to next_pool_id. It points at the top of the
-  # operator chain (the cache, 563.0), not the bare core, so imported data
+  # operator chain (the indexer, 564.0), not a bare core, so imported data
   # passes through the indexer and is keyword-searchable (#1242); it is
   # composed here, after the chain it forwards to exists.
   - mod_name: clio_cae_core
     pool_name: cae_main
     pool_query: local
     pool_id: "400.0"
-    next_pool_id: "563.0"               # chain top (cache) — see entry above
+    next_pool_id: "564.0"               # chain top (indexer) — see entry above
+    # Local paths CAE may read (file:: and hdf5:: sources) and write
+    # (ExportData). Clients choose these paths and the runtime does not
+    # authenticate clients, so list the data directories here. Unset: any
+    # path except credential and system locations (.ssh, .aws, .config,
+    # .clio, /proc, ...), and no writes to hidden files or system directories.
+    # Those locations stay refused inside listed roots too.
+    # allowed_roots: ["~/data", "/scratch/$USER"]
 
   # === Stream (byte-stream layer over CTE tags) ===
   # Owns what makes a tag a byte stream: its page layout (1 MiB page blobs
@@ -597,7 +893,7 @@ compose:
     pool_name: clio_cte_stream
     pool_query: local
     pool_id: "565.0"
-    next_pool_id: "563.0"               # data path: the chain top (cache)
+    next_pool_id: "564.0"               # data path: the chain top (indexer)
     # Where staged (not yet merged) appends are written. They are written
     # once and read at most once, after a restart, so skip the cache.
     # Default: next_pool_id.
@@ -611,17 +907,53 @@ compose:
   # POSIX-style filesystem chimod that the libfuse / POSIX adapters drive. It
   # sits at the canonical filesystem pool 560.0 (clio::cte::filesystem::
   # kCfsPoolId) over the interposition chain at next_pool_id: paths map to CTE
-  # tags and offsets to 1 MiB page-blobs, and every page ride the full chain
-  # (cache -> [compressor ->] replication -> core). Composing it here means a
-  # filesystem pool exists out of the box; the adapters create-or-bind it
-  # idempotently, so this is safe whether or not an adapter is also used. Must
-  # come AFTER the chain entries above. Remove it if you do not need the
+  # tags and offsets to 1 MiB page-blobs, and every page rides the full chain
+  # (indexer -> shm cache -> [compressor ->] write-back -> cores). The
+  # adapters (FUSE, LD_PRELOAD) only look this pool up by pool_name and fail
+  # if it is not composed; they never create it. Must come AFTER the chain
+  # entries above. Remove it if you do not need the
   # filesystem layer; point next_pool_id at 512.0 to bypass the chain.
+  #
+  # The FUSE adapter's caching is set by environment variables on the
+  # clio_cte_fuse process, not here (seconds; 0 disables):
+  #   CLIO_FUSE_ATTR_CACHE_S      kernel attribute cache. Default 1 on a
+  #                               single-node mount, 0 on a multi-node mount.
+  #   CLIO_FUSE_ENTRY_CACHE_S     kernel name cache. Default 1.
+  #   CLIO_FUSE_DIR_ATTR_CACHE_S  the adapter's cache of DIRECTORY attributes.
+  #                               Default: the attribute TTL on a single-node
+  #                               mount, 0 (off) on a multi-node mount. Opt in
+  #                               on multi-node (for example 1) to stop paying
+  #                               one getattr per path component per syscall;
+  #                               a directory changed through another node can
+  #                               then read stale for up to that long.
+  # Concurrency:
+  #   CLIO_FUSE_MAX_THREADS       FUSE requests the mount serves at once (its
+  #                               worker threads). Default: 64. libfuse 3.12+
+  #                               otherwise caps the pool at 10, below the
+  #                               writing ranks of a busy node. 0 = libfuse
+  #                               default. Ignored with libfuse < 3.12.
+  # Read path (not seconds):
+  #   CLIO_FUSE_MAX_BACKGROUND    read-ahead requests the kernel may have in
+  #                               flight on the mount. Default: unset (the
+  #                               libfuse default, 12). 256 suits parallel
+  #                               sequential reads.
+  #   CLIO_FUSE_READAHEAD_PAGES   pages (1 MiB) the adapter keeps fetched ahead
+  #                               of each sequentially read open handle.
+  #                               Default: unset / 0 (off); capped at 64.
+  #                               Needs CLIO_FUSE_ATTR_CACHE_S > 0: a fetched
+  #                               page is served for at most that long, so a
+  #                               write through another node can read stale
+  #                               for up to it (writes through this mount
+  #                               never do). Costs up to N+1 MiB per open
+  #                               handle being read sequentially.
   - mod_name: clio_cte_filesystem
     pool_name: clio_cte_filesystem
     pool_query: local
     pool_id: "560.0"
-    next_pool_id: "563.0"               # chain top (cache) — see entries above
+    # REQUIRED: the pool its pages go through (no default). Clients find
+    # this filesystem by pool_name (CLIO_CFS_POOL overrides) and learn this
+    # chain and the stream pool from it.
+    next_pool_id: "564.0"               # chain top (indexer) — see entries above
     # No metadata server. Names live in the inode table: each directory's
     # rows (name -> inode) are split into table blocks, each block has one
     # home container that holds it in memory, and every node caches what it
@@ -640,10 +972,51 @@ compose:
     metadata_log_path: "${CLIO_STORAGE_ROOT}/cfs_namespace_log"
     # Rows a table block holds before it splits (default 1024).
     # dir_split_entries: 1024
+    # Bytes of appended changes a table block's CTE blob may hold past its last
+    # full image (a size, default 256KB). A commit appends its delta to the
+    # blob and rewrites the blob whole once the log would pass this. 0 rewrites
+    # the whole block on every commit (the earlier behaviour).
+    # dir_log_compact_bytes: 256KB
     # Compare names case-insensitively, keeping their spelling, as NTFS does
     # (default false): Foo.TXT and foo.txt are one file. Fixed when the volume
     # is created; a runtime configured the other way refuses the volume.
     # case_insensitive: false
+    # Placement score for file DATA pages (float, default -1.0 = off: file
+    # data is placed with the same default score as metadata, so bulk data
+    # fills the fastest tier first and later directory blocks and small files
+    # land on a slower one). A value in (0, 1] places file data pages with
+    # that score; directory blocks, xattrs and the first
+    # data_score_head_pages pages of every file keep the default (1.0 for a
+    # new blob) and so stay on the highest-scored tier. Any other value is
+    # ignored. Clients that write pages themselves (the FUSE adapter) fetch
+    # the setting from this pool at mount.
+    # data_score_head_pages: leading 1 MiB pages of each file that keep the
+    # default score (unsigned, default 1; 0 = every page uses data_score).
+    # Only read when data_score is set.
+    # Example -- a small DRAM target reserved for metadata and file heads,
+    # bulk data in a second DRAM target, a slow tier below both. In the
+    # clio_cte_core storage list:
+    #   - path: "ram::cte_ram_meta"      # metadata + first MiB of each file
+    #     bdev_type: "ram"
+    #     capacity_limit: "2GB"
+    #     score: 1.0
+    #   - path: "ram::cte_ram_data"      # bulk file data
+    #     bdev_type: "ram"
+    #     capacity_limit: "32GB"
+    #     score: 0.9
+    #   - path: "${CLIO_STORAGE_ROOT}/cte_slow_tier.dat"
+    #     bdev_type: "file"
+    #     capacity_limit: "500GB"
+    #     score: 0.6
+    # and here:
+    #   data_score: 0.9
+    #   data_score_head_pages: 1
+    # When the small target fills, metadata and file heads spill to the next
+    # tier down, as all data does without this setting.
+    # data_score: -1.0
+    # data_score_head_pages: 1
     # Stream pool holding every file's logical size and merging deferred
-    # O_APPEND writes (see the clio_cte_stream entry). Default: "565.0".
-    # stream_pool_id: "565.0"
+    # O_APPEND writes (see the clio_cte_stream entry). clio-fs assumes no
+    # pool id: unset, the filesystem creates its own stream pool, named
+    # "<pool_name>_stream", one minor above its own pool id.
+    stream_pool_id: "565.0"

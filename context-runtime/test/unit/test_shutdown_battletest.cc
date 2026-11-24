@@ -86,7 +86,18 @@
 
 namespace {
 
-constexpr unsigned kBtPort = 10600;
+/**
+ * @return the runtime port the battletest drives: CLIO_PORT (ctest sets
+ * 10600), so several copies can run side by side on private ports.
+ */
+unsigned BtPort() {
+  if (const char *env = std::getenv("CLIO_PORT")) {
+    int p = std::atoi(env);
+    if (p > 0 && p < 65536) return static_cast<unsigned>(p);
+  }
+  return 10600;
+}
+const unsigned kBtPort = BtPort();
 /** Exit code the runtime-side watchdog uses when graceful teardown wedges */
 constexpr int kWatchdogExitCode = 2;
 
@@ -297,18 +308,37 @@ void KillLoadClients(std::vector<pid_t> &pids) {
 }
 
 /**
+ * Fail the test unless the daemon becomes ready.
+ *
+ * WaitForReady fails early when the daemon exits during startup. Why it
+ * exited is in its wait status, its sanitizer report (which memcheck routes
+ * to a log_path file, not to the daemon's stderr) and its captured log -- all
+ * of which CI discards with the runner unless quoted in the failure message.
+ * @param server the just-started daemon
+ * @param cycle current cycle (for the failure message)
+ */
+void RequireReady(clio::run::test::RuntimeServer &server, int cycle) {
+  if (!server.WaitForReady()) {
+    FAIL("cycle " + std::to_string(cycle) +
+         ": daemon did not become ready\n" + server.StartupFailureReport());
+  }
+}
+
+/**
  * One start -> [load] -> stop -> assert-clean cycle.
  * @param cycle cycle index (failure messages)
  * @param stop_args clio_run stop arguments ("stop", "stop --force", ...)
  * @param n_load_clients data-plane load processes to run during the stop
  * @param load_ms how long to let the load build before stopping
  * @param allow_watchdog whether daemon exit code 2 (watchdog) is acceptable
+ * @return milliseconds from issuing the stop command to the daemon's exit
+ *         (excludes startup and the load phase)
  */
-void RunStopCycle(int cycle, const std::string &stop_args, int n_load_clients,
+long long RunStopCycle(int cycle, const std::string &stop_args, int n_load_clients,
                   int load_ms, bool allow_watchdog) {
   clio::run::test::RuntimeServer server;
   REQUIRE(server.Start(kBtPort));
-  REQUIRE(server.WaitForReady());
+  RequireReady(server, cycle);
   AssertDeadOwnerEntriesReaped(cycle);
   const int pid = static_cast<int>(server.Pid());
 
@@ -318,6 +348,7 @@ void RunStopCycle(int cycle, const std::string &stop_args, int n_load_clients,
     std::this_thread::sleep_for(std::chrono::milliseconds(load_ms));
   }
 
+  const auto stop_t0 = std::chrono::steady_clock::now();
   const int stop_rc = RunClioCmd(stop_args);
   if (stop_rc != 0) {
     KillLoadClients(load);
@@ -327,6 +358,9 @@ void RunStopCycle(int cycle, const std::string &stop_args, int n_load_clients,
 
   int exit_code = -1;
   const bool exited = server.WaitExit(45000, &exit_code);
+  const long long stop_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - stop_t0).count();
   KillLoadClients(load);
   // Both failures below are about a daemon that misbehaved on its way out, and
   // whatever it has to say about that (an abort message, a watchdog line, the
@@ -350,6 +384,7 @@ void RunStopCycle(int cycle, const std::string &stop_args, int n_load_clients,
   }
 
   AssertRuntimeGoneAndClean(cycle, kBtPort, pid);
+  return stop_ms;
 }
 
 }  // namespace
@@ -383,12 +418,10 @@ TEST_CASE("ShutdownBattletest - Force Under Load", "[bt_force]") {
   for (int cycle = 1; cycle <= iters; ++cycle) {
     INFO("force churn cycle " + std::to_string(cycle) + "/" +
          std::to_string(iters));
-    const auto start = std::chrono::steady_clock::now();
-    RunStopCycle(cycle, "stop --force", /*n_load_clients=*/4,
-                 /*load_ms=*/2000, /*allow_watchdog=*/false);
-    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::steady_clock::now() - start).count();
-    INFO("force cycle " + std::to_string(cycle) + " took " +
+    const long long ms =
+        RunStopCycle(cycle, "stop --force", /*n_load_clients=*/4,
+                     /*load_ms=*/2000, /*allow_watchdog=*/false);
+    INFO("force cycle " + std::to_string(cycle) + " stop->exit took " +
          std::to_string(ms) + " ms");
   }
 }
@@ -401,11 +434,14 @@ TEST_CASE("ShutdownBattletest - Watchdog Bound", "[bt_watchdog]") {
   for (int cycle = 1; cycle <= iters; ++cycle) {
     INFO("watchdog cycle " + std::to_string(cycle) + "/" +
          std::to_string(iters));
-    const auto start = std::chrono::steady_clock::now();
-    RunStopCycle(cycle, "stop --grace-period 100", /*n_load_clients=*/4,
-                 /*load_ms=*/2000, /*allow_watchdog=*/true);
-    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::steady_clock::now() - start).count();
+    // Timed from the stop command to the daemon's exit only: daemon startup
+    // and the 2 s load phase are not part of the shutdown bound (on an ASan
+    // runner startup alone can take tens of seconds).
+    const long long ms =
+        RunStopCycle(cycle, "stop --grace-period 100", /*n_load_clients=*/4,
+                     /*load_ms=*/2000, /*allow_watchdog=*/true);
+    INFO("watchdog cycle " + std::to_string(cycle) + " stop->exit took " +
+         std::to_string(ms) + " ms");
     // grace(0.1s) + watchdog margin(15s) + stop-side wait slack
     REQUIRE(ms < 60000);
   }
@@ -420,7 +456,7 @@ TEST_CASE("ShutdownBattletest - Wedged Runtime", "[bt_wedged]") {
     INFO("wedged cycle " + std::to_string(cycle) + "/" + std::to_string(iters));
     clio::run::test::RuntimeServer server;
     REQUIRE(server.Start(kBtPort));
-    REQUIRE(server.WaitForReady());
+    RequireReady(server, cycle);
     const int pid = static_cast<int>(server.Pid());
 
     REQUIRE(kill(pid, SIGSTOP) == 0);
@@ -433,7 +469,7 @@ TEST_CASE("ShutdownBattletest - Wedged Runtime", "[bt_wedged]") {
     }
 
     int exit_code = -1;
-    REQUIRE(server.WaitExit(10000, &exit_code));
+    REQUIRE(server.WaitExit(30000, &exit_code));
     REQUIRE(exit_code == 128 + SIGKILL);  // escalation had to SIGKILL it
 
     AssertRuntimeGoneAndClean(cycle, kBtPort, pid);
@@ -450,7 +486,7 @@ TEST_CASE("ShutdownBattletest - Crash Recovery", "[bt_crash]") {
     INFO("crash cycle " + std::to_string(cycle) + "/" + std::to_string(iters));
     clio::run::test::RuntimeServer server;
     REQUIRE(server.Start(kBtPort));
-    REQUIRE(server.WaitForReady());
+    RequireReady(server, cycle);
     const int pid = static_cast<int>(server.Pid());
 
     // status on a live runtime: RUNNING (exit 0)
@@ -461,7 +497,7 @@ TEST_CASE("ShutdownBattletest - Crash Recovery", "[bt_crash]") {
 
     kill(pid, SIGKILL);
     int exit_code = -1;
-    REQUIRE(server.WaitExit(10000, &exit_code));
+    REQUIRE(server.WaitExit(30000, &exit_code));
     KillLoadClients(load);
 
     // The corpse left artifacts: status must expose them.

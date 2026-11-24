@@ -5,21 +5,9 @@ on:
   push:
     branches: main
     tags: ['v*']
-  # Validate packaging changes BEFORE they reach main (#953). Without this the
-  # workflow only ran post-merge, so a packaging break was discovered on main
-  # -- which is exactly how the wheels shipped for days with the FUSE adapter
-  # silently disabled, and how a Linux+FUSE combination that had never once
-  # been compiled in CI got enabled. Paths-filtered so ordinary source PRs do
-  # not pay for a full multi-arch wheel matrix; anything that can change what
-  # lands in a wheel is listed here.
-  pull_request:
-    paths:
-      - 'pyproject.toml'
-      - 'installers/pip/**'
-      - '.github/workflows/build-pip.yml'
-      - 'CMakeLists.txt'
-      - 'context-transfer-engine/adapter/libfuse/**'
-      - 'context-transfer-engine/wrapper/python/**'
+  # Not run on pull requests: PRs only check that the tree builds on
+  # Linux/macOS/Windows and passes Linux unit tests. This runs in the full
+  # dev sweep (dev-full-ci.yml) and on push to main.
 
 permissions:
   contents: write
@@ -71,6 +59,19 @@ jobs:
   # without a matching bump in installers/pip/repair_wheel.sh (which stamps
   # the platform tag) and a reason to drop RHEL8.
   #------------------------------------------------------------
+  #------------------------------------------------------------
+  # Wheel breadth by ref. dev's debounced full CI (dev-full-ci.yml) builds
+  # only the wheels the test jobs below install -- every tested wheel is
+  # still built and tested -- plus one GPU wheel per variant. main, tags and
+  # manual runs on any other ref build every Python version, so nothing is
+  # published that was not built in full first. A wheel bug is a packaging
+  # bug (RPATH, bundled libs, glibc floor, missing files): it shows up on the
+  # tested versions, not only on the untested ones.
+  #   Linux x86_64 tests: 22.04=3.10, debian12=3.11, 24.04/fedora40/rocky8=3.12,
+  #                       fedora43=3.14
+  #   Linux aarch64 tests: 22.04=3.10, 24.04/rocky8=3.12
+  #   macOS / Windows tests: 3.12, 3.15
+  #------------------------------------------------------------
   build-wheels:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
@@ -81,6 +82,7 @@ jobs:
           - runner: ubuntu-latest
             arch: x86_64
             cibw_build: "cp310-manylinux_x86_64 cp311-manylinux_x86_64 cp312-manylinux_x86_64 cp313-manylinux_x86_64 cp314-manylinux_x86_64 cp315-manylinux_x86_64"
+            cibw_build_dev: "cp310-manylinux_x86_64 cp311-manylinux_x86_64 cp312-manylinux_x86_64 cp314-manylinux_x86_64"
             cibw_image: manylinux_2_28
             cibw_environment: >-
               CMAKE_PREFIX_PATH=/usr/local
@@ -90,6 +92,7 @@ jobs:
           - runner: ubuntu-24.04-arm
             arch: aarch64
             cibw_build: "cp310-manylinux_aarch64 cp311-manylinux_aarch64 cp312-manylinux_aarch64 cp313-manylinux_aarch64 cp314-manylinux_aarch64 cp315-manylinux_aarch64"
+            cibw_build_dev: "cp310-manylinux_aarch64 cp312-manylinux_aarch64"
             cibw_image: manylinux_2_28
             cibw_environment: >-
               CMAKE_PREFIX_PATH=/usr/local
@@ -112,7 +115,7 @@ jobs:
 
     - name: Build wheels
       env:
-        CIBW_BUILD: ${{ matrix.cibw_build }}
+        CIBW_BUILD: ${{ github.ref == 'refs/heads/dev' && matrix.cibw_build_dev || matrix.cibw_build }}
         CIBW_MANYLINUX_X86_64_IMAGE: ${{ matrix.cibw_image }}
         CIBW_MANYLINUX_AARCH64_IMAGE: ${{ matrix.cibw_image }}
         # fuse3-devel: Linux wheels build the FUSE adapter by default
@@ -121,7 +124,7 @@ jobs:
         # does not bundle libfuse3.so.3 — end users get it from their
         # distro's fuse3 packages.
         CIBW_BEFORE_ALL: >
-          yum install -y curl patchelf fuse3-devel openssl-devel &&
+          yum clean all && bash {project}/CI/retry.sh yum install -y --refresh curl patchelf fuse3-devel openssl-devel &&
           bash {project}/installers/pip/build_deps_manylinux.sh
         CIBW_ENVIRONMENT: ${{ matrix.cibw_environment }}
         CIBW_REPAIR_WHEEL_COMMAND_LINUX: >
@@ -169,7 +172,8 @@ jobs:
       fail-fast: false
       matrix:
         variant: [cuda12, rocm6, sycl]
-        py: [cp310, cp311, cp312, cp313, cp314, cp315]
+        # dev: one Python per variant (see "Wheel breadth by ref" above).
+        py: ${{ fromJSON(github.ref == 'refs/heads/dev' && '["cp312"]' || '["cp310","cp311","cp312","cp313","cp314","cp315"]') }}
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
@@ -199,7 +203,7 @@ jobs:
         CIBW_BUILD: ${{ matrix.py }}-manylinux_x86_64
         CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
         CIBW_BEFORE_ALL: >
-          yum install -y curl patchelf fuse3-devel openssl-devel &&
+          yum clean all && bash {project}/CI/retry.sh yum install -y --refresh curl patchelf fuse3-devel openssl-devel &&
           bash {project}/installers/pip/install_gpu_toolchain.sh ${{ matrix.variant }} &&
           bash {project}/installers/pip/build_deps_manylinux.sh
         # The icx/icpx and nvcc paths need oneAPI's environment and CUDA on
@@ -248,7 +252,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        abi: [cp310, cp311, cp312, cp313, cp314, cp315]
+        # dev: the two ABIs test-wheels-windows installs (see "Wheel breadth
+        # by ref" above).
+        abi: ${{ fromJSON(github.ref == 'refs/heads/dev' && '["cp312","cp315"]' || '["cp310","cp311","cp312","cp313","cp314","cp315"]') }}
 
     steps:
     - name: Checkout repository
@@ -305,8 +311,15 @@ jobs:
     # test job, far from the cause (#1004).
     - name: Install WinFsp (FUSE adapter SDK)
       run: |
-        pwsh CI/Retry.ps1 -Attempts 3 -DelaySeconds 30 choco install winfsp -y --no-progress
-        if (-not (Test-Path "${env:ProgramFiles(x86)}\WinFsp\inc\fuse3\fuse.h")) {
+        # choco can exit 0 having installed nothing when its feed answers 503
+        # ("installed 0/0 packages"), which Retry.ps1 cannot see; retry until
+        # the SDK header is actually there.
+        $hdr = "${env:ProgramFiles(x86)}\WinFsp\inc\fuse3\fuse.h"
+        for ($i = 1; $i -le 4 -and -not (Test-Path $hdr); $i++) {
+          pwsh CI/Retry.ps1 -Attempts 3 -DelaySeconds 30 choco install winfsp -y --no-progress
+          if (-not (Test-Path $hdr)) { Start-Sleep -Seconds (30 * $i) }
+        }
+        if (-not (Test-Path $hdr)) {
           throw "WinFsp SDK missing after the install succeeded -- failing HERE instead of shipping a wheel without the FUSE adapter (#1004)"
         }
 
@@ -371,6 +384,7 @@ jobs:
           - runner: macos-15
             arch: arm64
             cibw_build: "cp310-macosx_arm64 cp311-macosx_arm64 cp312-macosx_arm64 cp313-macosx_arm64 cp314-macosx_arm64 cp315-macosx_arm64"
+            cibw_build_dev: "cp312-macosx_arm64 cp315-macosx_arm64"
             brew_prefix: /opt/homebrew
             macosx_deployment_target: '15.0'
 
@@ -427,7 +441,7 @@ jobs:
 
     - name: Build macOS wheels
       env:
-        CIBW_BUILD: ${{ matrix.cibw_build }}
+        CIBW_BUILD: ${{ github.ref == 'refs/heads/dev' && matrix.cibw_build_dev || matrix.cibw_build }}
         # MACOSX_DEPLOYMENT_TARGET must match (or exceed) the minimum
         # macOS target of every dylib bundled by delocate. Homebrew
         # bottles on the macos-15 runner are built for macOS 15.0, so
@@ -625,6 +639,7 @@ jobs:
 
             echo "=== CLI test ==="
             clio_run --help
+            clio-run --version
 
             echo "=== Benchmark binaries: --help smoke test ==="
             # NOTE: This entire docker invocation is wrapped in bash -c
@@ -686,6 +701,9 @@ jobs:
 
             echo "=== Web dashboard compiled in and its pages shipped ==="
             python /ci/check_wheel_dashboard.py
+
+            echo "=== S3 and GCS storage tiers compiled in ==="
+            python /ci/check_wheel_cloud_tiers.py
 
             echo "=== Symbol resolution check ==="
             LIB_DIR=$(python -c "import iowarp_core; print(iowarp_core.get_lib_dir())")
@@ -768,21 +786,16 @@ jobs:
   test-wheels-macos:
     needs: build-wheels-macos
     name: Test macOS wheels
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # Same runner as the build so the wheel's macosx_15_0_arm64
-          # platform tag is satisfied (the wheel is also installable on
-          # later macOS, but pinning here keeps test infra deterministic).
-          - runner: macos-15
-            arch: arm64
-            python: '3.12'
-          - runner: macos-15
-            arch: arm64
-            python: '3.15'
+    # One runner for both Python versions: each gets its own clean venv, so
+    # this checks exactly what two jobs did, on one macOS machine instead of
+    # two (macOS runners are the scarcest in the org). Same runner image as
+    # the build so the wheel's macosx_15_0_arm64 platform tag is satisfied,
+    # but a different machine, so the build's Homebrew libraries cannot hide
+    # a dylib the wheel forgot to bundle.
+    runs-on: macos-15
+    timeout-minutes: 40
+    env:
+      ARCH: arm64
 
     steps:
     - name: Check out wheel checks and capacity regression
@@ -792,86 +805,114 @@ jobs:
           installers/pip
           context-transfer-engine/wrapper/python
 
-    - name: Set up Python
+    - name: Set up Python 3.12 and 3.15
       uses: actions/setup-python@v5
       with:
-        python-version: ${{ matrix.python }}
+        python-version: |
+          3.12
+          3.15
 
     - name: Download macOS wheels
       uses: actions/download-artifact@v4
       with:
-        name: wheels-macos-${{ matrix.arch }}
+        name: wheels-macos-arm64
         path: wheels/
 
-    - name: Test wheel in clean venv
+    - name: Test wheel in clean venvs (3.12, 3.15)
       run: |
-        set -e
-        python -m venv /tmp/test-venv
-        source /tmp/test-venv/bin/activate
+        # Every version runs even if an earlier one fails; the step fails if
+        # any did.
+        test_one() (
+          set -e
+          PY="$1"
+          "python$PY" -m venv "/tmp/test-venv-$PY"
+          source "/tmp/test-venv-$PY/bin/activate"
+          echo "######## Python $PY ########"
+          python --version
 
-        # Install the built wheel by file path (not by name) so pip uses this
-        # wheel's metadata rather than a same-version release already on PyPI.
-        PYTAG=cp$(python -c "import sys; print(str(sys.version_info[0]) + str(sys.version_info[1]))")
-        WHEEL=$(ls wheels/iowarp_core-*-${PYTAG}-*.whl | head -1)
-        echo "Installing built wheel: $WHEEL"
-        pip install --quiet --find-links wheels --no-cache-dir "$WHEEL"
-        pip install --quiet --no-cache-dir psutil
+          # Install the built wheel by file path (not by name) so pip uses this
+          # wheel's metadata rather than a same-version release already on PyPI.
+          PYTAG=cp$(python -c "import sys; print(str(sys.version_info[0]) + str(sys.version_info[1]))")
+          WHEEL=$(ls wheels/iowarp_core-*-${PYTAG}-*.whl | head -1)
+          echo "Installing built wheel: $WHEEL"
+          pip install --quiet --find-links wheels --no-cache-dir "$WHEEL"
+          pip install --quiet --no-cache-dir psutil
 
-        echo "=== Import test ==="
-        python -c "import iowarp_core; print('Version:', iowarp_core.get_version())"
-        python -c "import iowarp_core; print('Lib dir:', iowarp_core.get_lib_dir())"
-        python -c "import iowarp_core; print('CTE available:', iowarp_core.cte_available())"
+          echo "=== Import test ==="
+          python -c "import iowarp_core; print('Version:', iowarp_core.get_version())"
+          python -c "import iowarp_core; print('Lib dir:', iowarp_core.get_lib_dir())"
+          python -c "import iowarp_core; print('CTE available:', iowarp_core.cte_available())"
 
-        echo "=== CLI test ==="
-        clio_run --help
+          echo "=== CLI test ==="
+          clio_run --help
+          clio-run --version
 
-        echo "=== Benchmark binaries: --help smoke test ==="
-        # Catch SIGSEGV / abort at load time. Bench --help exit codes
-        # are allowed to be non-zero; only signal-level deaths fail us.
-        for bench in clio_cte_bench clio_run_thrpt_bench; do
-          echo "--- $bench --help ---"
-          "$bench" --help || rc=$?
-          rc=${rc:-0}
-          if [ "$rc" -ge 128 ]; then
-            echo "FAIL: $bench --help died with signal (exit $rc)"
+          echo "=== Benchmark binaries: --help smoke test ==="
+          # Catch SIGSEGV / abort at load time. Bench --help exit codes
+          # are allowed to be non-zero; only signal-level deaths fail us.
+          for bench in clio_cte_bench clio_run_thrpt_bench; do
+            echo "--- $bench --help ---"
+            "$bench" --help || rc=$?
+            rc=${rc:-0}
+            if [ "$rc" -ge 128 ]; then
+              echo "FAIL: $bench --help died with signal (exit $rc)"
+              exit 1
+            fi
+            unset rc
+          done
+
+          echo "=== Web dashboard compiled in and its pages shipped ==="
+          python installers/pip/check_wheel_dashboard.py
+
+          echo "=== S3 and GCS storage tiers compiled in ==="
+          python installers/pip/check_wheel_cloud_tiers.py
+
+          echo "=== Symbol resolution check (otool -L) ==="
+          LIB_DIR=$(python -c "import iowarp_core; print(iowarp_core.get_lib_dir())")
+          MISSING=0
+          for dylib in "$LIB_DIR"/*.dylib; do
+            [ -f "$dylib" ] || continue
+            # Any line with "(compatibility ..." that resolves to a path
+            # starting with @rpath/ without a corresponding @loader_path
+            # would be suspect, but the more direct check is to actually
+            # dlopen the lib. We use otool just to surface the deps.
+            otool -L "$dylib" >/dev/null || MISSING=1
+          done
+          if [ "$MISSING" = "1" ]; then
+            echo "ERROR: otool failed on a bundled dylib"
             exit 1
           fi
-          unset rc
-        done
+          echo "All bundled dylibs are well-formed"
 
-        echo "=== Web dashboard compiled in and its pages shipped ==="
-        python installers/pip/check_wheel_dashboard.py
+          MODULE_DIR=$(python -c "import iowarp_core; print(iowarp_core.get_ext_dir())")
+          BIN_DIR=$(python -c "import iowarp_core; print(iowarp_core.get_bin_dir())")
+          python context-transfer-engine/wrapper/python/test_cte_capacity.py \
+            --module-dir "$MODULE_DIR" --bin-dir "$BIN_DIR" \
+            --output-dir "build/capacity-results/$PY"
 
-        echo "=== Symbol resolution check (otool -L) ==="
-        LIB_DIR=$(python -c "import iowarp_core; print(iowarp_core.get_lib_dir())")
-        MISSING=0
-        for dylib in "$LIB_DIR"/*.dylib; do
-          [ -f "$dylib" ] || continue
-          # Any line with "(compatibility ..." that resolves to a path
-          # starting with @rpath/ without a corresponding @loader_path
-          # would be suspect, but the more direct check is to actually
-          # dlopen the lib. We use otool just to surface the deps.
-          otool -L "$dylib" >/dev/null || MISSING=1
+          echo "=== All tests passed ==="
+        )
+        # Call test_one as a plain command, not `test_one || ...`: bash ignores
+        # `set -e` inside anything run on the left of || or &&, which would
+        # let a failed check fall through. set +e only for this loop so one
+        # version's failure does not skip the next.
+        failed=""
+        set +e
+        for v in 3.12 3.15; do
+          test_one "$v"
+          [ $? -eq 0 ] || failed="$failed $v"
         done
-        if [ "$MISSING" = "1" ]; then
-          echo "ERROR: otool failed on a bundled dylib"
+        set -e
+        if [ -n "$failed" ]; then
+          echo "::error::macOS wheel test failed for Python:$failed"
           exit 1
         fi
-        echo "All bundled dylibs are well-formed"
-
-        MODULE_DIR=$(python -c "import iowarp_core; print(iowarp_core.get_ext_dir())")
-        BIN_DIR=$(python -c "import iowarp_core; print(iowarp_core.get_bin_dir())")
-        python context-transfer-engine/wrapper/python/test_cte_capacity.py \
-          --module-dir "$MODULE_DIR" --bin-dir "$BIN_DIR" \
-          --output-dir build/capacity-results
-
-        echo "=== All tests passed ==="
 
     - name: Preserve capacity regression evidence
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: capacity-macos-${{ matrix.arch }}-${{ matrix.python }}
+        name: capacity-macos-arm64
         path: build/capacity-results/
         if-no-files-found: warn
 
@@ -966,6 +1007,8 @@ jobs:
         if ($LASTEXITCODE -lt 0 -or $LASTEXITCODE -gt 100) {
           throw "clio_run --help died with exit code $LASTEXITCODE (likely missing DLL or binary)"
         }
+        clio-run --version
+        if ($LASTEXITCODE -ne 0) { throw "clio-run --version failed ($LASTEXITCODE)" }
 
         Write-Host "=== Benchmark binaries: --help smoke test ==="
         foreach ($bench in @('clio_cte_bench', 'clio_run_thrpt_bench')) {
@@ -999,6 +1042,10 @@ jobs:
         Write-Host "=== Web dashboard compiled in and its pages shipped ==="
         python installers/pip/check_wheel_dashboard.py
         if ($LASTEXITCODE -ne 0) { throw "wheel has no web dashboard" }
+
+        Write-Host "=== S3 and GCS storage tiers compiled in ==="
+        python installers/pip/check_wheel_cloud_tiers.py
+        if ($LASTEXITCODE -ne 0) { throw "wheel has no S3/GCS storage tiers" }
 
         $moduleDir = python -c "import iowarp_core; print(iowarp_core.get_ext_dir())"
         if ($LASTEXITCODE -ne 0) { throw "get_ext_dir failed" }

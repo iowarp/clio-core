@@ -15,6 +15,7 @@ target_include_directories(test_fuse_adapter PRIVATE
 )
 
 target_link_libraries(test_fuse_adapter
+    clio_cte_filesystem_client  # fuse_cte.h reaches CTE via CLIO_CFS_CLIENT
     clio_cte_core_runtime
     clio_cte_core_client
     clio::run::admin_runtime
@@ -83,6 +84,7 @@ target_include_directories(test_fuse_copy_workspace PRIVATE
 )
 
 target_link_libraries(test_fuse_copy_workspace
+    clio_cte_filesystem_client  # fuse_cte.h reaches CTE via CLIO_CFS_CLIENT
     clio_cte_core_runtime
     clio_cte_core_client
     clio::run::admin_runtime
@@ -175,3 +177,20 @@ if(TARGET clio_cte_fuse)
 endif()
 
 message(STATUS "FUSE adapter tests configured successfully")
+
+# ------------------------------------------------------------------------------
+# Sequential read-ahead (CLIO_FUSE_READAHEAD_PAGES): the pure logic in
+# adapter/libfuse/fuse_readahead.h -- sequential detector, window and page
+# arithmetic. No runtime, no mount, no libfuse.
+# ------------------------------------------------------------------------------
+add_executable(test_fuse_readahead test_fuse_readahead.cc)
+target_include_directories(test_fuse_readahead PRIVATE
+    ${CMAKE_SOURCE_DIR}/context-runtime/test)
+target_link_libraries(test_fuse_readahead
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT})
+add_test(NAME fuse_readahead COMMAND test_fuse_readahead)
+set_tests_properties(fuse_readahead PROPERTIES
+    TIMEOUT 120
+    LABELS "unit;adapter;fuse"
+    ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}")

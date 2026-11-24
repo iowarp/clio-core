@@ -1,35 +1,14 @@
 name: GPU Tests (CUDA)
 
 on:
-  # Push to main/dev runs UNCONDITIONALLY -- no path filter. A merge is the
-  # gate that decides what lands, so it must exercise everything; a path
-  # filter here meant a merge touching only, say, CI or docs skipped the CUDA
-  # compile entirely, and the next unrelated merge inherited the breakage.
-  # PRs keep the path filter (below): breadth on every PR commit costs queue
-  # time for little signal, and the merge sweep still gates the branch.
   push:
-    branches: [main, dev]
-  # Also run on PRs touching the same paths. Previously this workflow fired
-  # ONLY on push to main/dev, so a change that broke the CUDA device compile
-  # was invisible in PR review and only surfaced after merge, on dev — which
-  # is exactly how the shm_metadata_cache.h device-pass break (#812, from
-  # #788) landed. Running the same compile-only build on PRs catches these
-  # before merge. Same path filter, so PRs that don't touch buildable source
-  # still skip it.
-  pull_request:
-    branches: [main, dev]
-    paths:
-      - 'context-runtime/**'
-      - 'context-transfer-engine/**'
-      - 'context-transport-primitives/**'
-      - 'CMakeLists.txt'
-      - 'CMakePresets.json'
-      - 'installers/conda/**'
-      - '.github/workflows/gpu-tests.yml'
-      - 'context-transfer-engine/adapter/gpu_vector/test/distributed*/**'
-  # Merge queue (issue #1013): same full-matrix-before-merge rationale as the
-  # other gates -- see ci-adapters.yml.
-  merge_group:
+    branches: [main]
+  # Push to dev does NOT trigger this directly: dev-full-ci.yml dispatches
+  # the full matrix once dev has been quiet for 30 minutes, so a burst of
+  # merges gets one full run instead of one per merge.
+  # Not run on pull requests: PRs only check that the tree builds on
+  # Linux/macOS/Windows and passes Linux unit tests. This runs in the full
+  # dev sweep (dev-full-ci.yml) and on push to main.
   workflow_dispatch:
 
 # One in-flight run per ref; a new push to a PR branch cancels the previous
@@ -132,6 +111,9 @@ jobs:
           wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 22
         fi
         clang++-22 --version | head -1
+        # clio-coroc (the CO_AWAIT transpiler the *_paged_newcoro benchmarks
+        # are built with) links against LLVM/Clang's development libraries.
+        bash CI/retry.sh sudo apt-get install -y -qq llvm-22-dev libclang-22-dev
 
     - name: Compile GPU tests (compile-only, no device)
       shell: bash -el {0}
@@ -156,13 +138,24 @@ jobs:
           -DCLIO_CTE_ENABLE_COMPRESS=ON \
           -DCLIO_CORE_ENABLE_CUDA=ON \
           -DCLIO_GPU_CLANG=ON \
-          -DCMAKE_CUDA_ARCHITECTURES=89-real
+          -DCMAKE_CUDA_ARCHITECTURES=89-real \
+          -DCLIO_RUN_ENABLE_COROC=ON \
+          -DLLVM_DIR=/usr/lib/llvm-22/lib/cmake/llvm \
+          -DClang_DIR=/usr/lib/llvm-22/lib/cmake/clang \
+          -DCLIO_CORO_REGCAP=OFF
+        # CLIO_CORO_REGCAP=OFF: installing llvm-22-dev (for clio-coroc) also
+        # puts llvm-config on PATH, which switches on the register-cap pass
+        # plugin -- and loading it crashes clang 22's frontend on the
+        # lammps_md probe build. Before llvm-22-dev was installed here the
+        # plugin was never built, so OFF keeps this job's configuration as it
+        # was. The crash itself is a separate bug.
+        # gpu_vector_all, not a hand-written --target list: that list only
+        # named what someone remembered to add, so four paged benchmark
+        # drivers stopped compiling and nothing noticed. gpu_vector_all is
+        # every target under adapter/gpu_vector, including ones added later,
+        # minus an explicit, printed GV_ALL_KNOWN_BROKEN list.
         cmake --build build-gpu-compile -j "$(nproc)" \
-          --target test_yieldable test_yield_stack \
-                   test_gpu_vector_smoke test_gpu_vector_semantics \
-                   test_gpu_vector_workloads test_gpu_vector_compress \
-                   test_gpu_vector_race test_gpu_vector_hbm_nvcomp \
-                   clio_weights_paged_bench
+          --target gpu_vector_all test_yieldable test_yield_stack -- -k
 
     # NOTE: GPU tests are disabled until self-hosted GPU runners are available.
     # To re-enable, change runs-on to [self-hosted, gpu], add nvidia-smi

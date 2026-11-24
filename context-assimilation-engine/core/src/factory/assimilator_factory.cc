@@ -33,6 +33,7 @@
 
 #include <clio_cae/core/factory/assimilator_factory.h>
 #include <clio_cae/core/factory/binary_file_assimilator.h>
+#include <clio_cae/core/factory/path_policy.h>
 #ifdef CAE_ENABLE_HTTP
 #include <clio_cae/core/factory/http_file_assimilator.h>
 #endif
@@ -82,6 +83,20 @@ std::unique_ptr<BaseAssimilator> AssimilatorFactory::Get(
 
   std::string protocol = GetUrlProtocol(src);
   HLOG(kDebug, "AssimilatorFactory: Extracted protocol='{}'", protocol);
+
+  // Local-file sources name a path on the runtime's host, chosen by whoever
+  // sent the task. Check it against the runtime's path policy before any
+  // assimilator opens it (the assimilators read the same "<proto>::<path>").
+  if (protocol == "file" || protocol == "hdf5") {
+    size_t sep = src.find("::");
+    std::string path = sep == std::string::npos ? "" : src.substr(sep + 2);
+    std::string reason;
+    if (!PathPolicy::Get().Allows(path, /*write=*/false, reason)) {
+      HLOG(kError, "AssimilatorFactory: refusing source '{}': {}", src,
+           reason);
+      return nullptr;
+    }
+  }
 
   if (protocol == "file") {
     HLOG(kDebug,

@@ -1,0 +1,99 @@
+<!--
+title: HDF5 VFD
+heading: The CLIO <em>HDF5 file driver.</em>
+description: How to use the CLIO Core HDF5 virtual file driver clio_vfd: build libclio_vfd.so, select it with HDF5_DRIVER or H5Pset_fapl_clio, configure it with HDF5_DRIVER_CONFIG (cache, fsync, sieve), enable the experimental read tier, and its durability and naming rules.
+eyebrow: Docs · I/O adapters
+lede: <code>clio_vfd</code> is an HDF5 virtual file driver: a drop-in replacement for HDF5's default <code>sec2</code> driver that writes every byte through to the native file and can also keep a copy of byte ranges in the CLIO tier. It works below the HDF5 library, so it sees every datatype and all of HDF5's metadata I/O, but only as byte ranges.
+facts: Driver | clio_vfd (value 3200) ; Library | libclio_vfd.so ; Build | CLIO_CTE_ENABLE_VFD=ON, HDF5 1.14+ ; Select | HDF5_DRIVER=clio_vfd ; Install | Source builds: Spack (+vfd) or CMake
+-->
+<h2>What it does</h2>
+<p>HDF5 turns every dataset and metadata operation into reads and writes of byte ranges at file offsets, and hands them to a file driver. <code>clio_vfd</code> performs each one on an ordinary file, synchronously, exactly where <code>sec2</code> would: after a successful <code>H5Fclose</code> the file is a complete native HDF5 file, and <code>h5dump</code>, <code>h5ls</code> or <code>h5repack</code> read it with or without CLIO. The driver adds no driver-info message to the file.</p>
+<p>On top of that it has an optional <strong>read tier</strong> in the CTE, off by default and experimental. With it on, written and read ranges are copied into the tier, and later reads of those ranges can be served from it. Without it, the driver is a write-through <code>sec2</code> replacement: writes do not populate the tier at all, because nothing could ever read them back.</p>
+<p>Choose the VFD over the <a href="/docs/io-adapters/hdf5-vol.html">VOL connector</a> when the VOL cannot help: datatypes it passes through (compound, variable-length) or workloads dominated by HDF5's own metadata I/O.</p>
+
+<h2>1. Build it</h2>
+<pre data-label="shell">
+$ cmake -S . -B build -DCLIO_CTE_ENABLE_VFD=ON \
+    -DHDF5_ROOT=/path/to/the/hdf5/your/application/uses
+$ cmake --build build -j"$(nproc)"
+$ ls build/bin/libclio_vfd.so
+</pre>
+<p>HDF5 1.14 or newer is required; configure fails without it. The driver does not need ELF support. Link the same <code>libhdf5</code> as the application (<code>ldd build/bin/libclio_vfd.so | grep hdf5</code>). It is only available from a source build, with Spack (<code>+vfd</code>, on by default) or CMake; see <a href="/docs/io-adapters/install.html">Install</a>.</p>
+
+<h2>2. Select the driver</h2>
+<h3>By environment, with no source changes</h3>
+<pre data-label="shell">
+$ export HDF5_PLUGIN_PATH=$PWD/build/bin
+$ export HDF5_DRIVER=clio_vfd
+$ ./my_hdf5_app
+</pre>
+<p>Configure it with <code>HDF5_DRIVER_CONFIG</code>, using the same <code>key=value;key=value</code> grammar as the VOL connector. An unknown key or a value that does not parse fails the open rather than being ignored.</p>
+<pre data-label="shell">
+$ export HDF5_DRIVER_CONFIG="cache=0;fsync=1;sieve=131072"
+</pre>
+<dl class="notes">
+<div><dt><code>cache=0|1</code></dt><dd>Default on. <code>0</code> makes the driver native-only: no CTE traffic and no runtime needed.</dd></div>
+<div><dt><code>fsync=0|1</code></dt><dd>Default off. <code>1</code> makes <code>H5Fflush</code> and <code>H5Fclose</code> <code>fsync</code> the native file and fail if that fails.</dd></div>
+<div><dt><code>sieve=&lt;bytes&gt;</code></dt><dd>Default 65536, accepted from 0 to 1 GiB. The window in which consecutive vector-I/O elements are coalesced into one I/O; <code>0</code> handles them one at a time. It only matters with <code>CLIO_VFD_VECTOR_IO=1</code>, because the driver does not advertise vector I/O by default (doing so switches HDF5 to selection I/O and defeats its own sieve buffer).</dd></div>
+</dl>
+
+<h3>In code</h3>
+<p>Include <code>H5FDclio.h</code> (installed to <code>include/adapter/vfd/</code>), link <code>libclio_vfd.so</code>, and set the driver on a file-access property list:</p>
+<pre data-label="c">
+#include <hdf5.h>
+#include "H5FDclio.h"
+
+hid_t fapl = H5Pcreate(H5P_FILE_ACCESS);
+H5Pset_fapl_clio(fapl, /*cache_enabled=*/1);
+hid_t file = H5Fcreate("/scratch/run1/data.h5", H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
+</pre>
+<p><code>H5Pget_fapl_clio(fapl, &amp;cache_enabled)</code> reads the setting back. <code>CLIO_VFD_CACHE=0</code> in the environment can switch the cache off over an explicit <code>H5Pset_fapl_clio(fapl, 1)</code>, but never on over an explicit <code>0</code>.</p>
+
+<h2>3. Use plain file names</h2>
+<p>Pass ordinary filesystem paths such as <code>/scratch/run1/data.h5</code>. A name containing <code>clio::</code> is <strong>refused</strong> with an error: the driver is selected by <code>HDF5_DRIVER</code> or <code>H5Pset_fapl_clio</code>, never by the file name, so an application gains CLIO without having any of its paths rewritten.</p>
+
+<h2>4. Turn on the read tier (experimental)</h2>
+<p>The read tier needs a running runtime and is kept in the CLIO filesystem module, so use a configuration that composes both a CTE pool named <code>clio_cte_core</code> and a <code>clio_cte_filesystem</code> pool. Then:</p>
+<pre data-label="shell">
+$ export CLIO_SERVER_CONF=$HOME/clio-hdf5.yaml
+$ build/bin/clio-run start &
+$ export HDF5_PLUGIN_PATH=$PWD/build/bin HDF5_DRIVER=clio_vfd
+$ export CLIO_VFD_READ_TIER=1 CLIO_REQUIRE_RUNTIME=1
+$ ./my_hdf5_app
+</pre>
+<p>With the read tier on, each cached copy is guarded by a coherence stamp, as in the VOL connector: a file changed between sessions no longer matches its stamp, and its cached copy is dropped. <code>CLIO_STAMP_GRANULARITY_NS</code> and <code>CLIO_STAMP_SETTLE_MAX_NS</code> apply to the VFD too; see the <a href="/docs/io-adapters/configuration.html">configuration reference</a>.</p>
+
+<h2>Runtime behavior</h2>
+<ul>
+  <li><strong>One attach per process.</strong> The driver attaches to the runtime on the first open that wants the cache and remembers the result. With <code>cache=0</code> it never attaches.</li>
+  <li><strong>Runtime absent.</strong> The open succeeds native-only with a warning, after the client's attach timeout. Set <code>CLIO_VFD_CACHE=0</code> (or <code>CLIO_WAIT_SERVER=0</code>) when you expect no runtime, or <code>CLIO_REQUIRE_RUNTIME=1</code> to make it an error instead.</li>
+  <li><strong>Runtime misconfigured.</strong> A <code>CLIO_SERVER_CONF</code> that names a missing or unparseable file aborts the process inside the runtime client. A missing runtime is survivable; a broken configuration is not.</li>
+  <li><strong>Late runtime.</strong> A runtime started after the first open is not picked up for the life of the process.</li>
+</ul>
+
+<h2>Durability</h2>
+<ul>
+  <li>Writes are committed to the native file before the call returns, and a failing <code>close</code> fails <code>H5Fclose</code>. Any driver failure either falls back to the native path or returns a real HDF5 error.</li>
+  <li>By default, like <code>sec2</code>, neither <code>H5Fflush</code> nor <code>H5Fclose</code> waits for stable storage. <code>fsync=1</code> in <code>HDF5_DRIVER_CONFIG</code>, or <code>CLIO_VFD_FSYNC=1</code> for every file in the process, turns both into durability barriers, at the cost of an <code>fsync</code> per file.</li>
+</ul>
+
+<h2>Diagnostics</h2>
+<dl class="notes">
+<div><dt><code>CLIO_VFD_TRACE=&lt;dir&gt;</code></dt><dd>Access telemetry at byte level: a <code>.access.jsonl</code> file per HDF5 file and a <code>.access.json</code> summary at close, with the request-size histogram, repeated ranges, metadata versus raw-data split, read/write mix and access locality.</dd></div>
+<div><dt><code>CLIO_VFD_DEBUG=1</code></dt><dd>Print every read and write (address and size) to stderr.</dd></div>
+<div><dt><code>CLIO_VFD_MAX_IO_BYTES</code></dt><dd>Largest single <code>pread</code>/<code>pwrite</code>, default 1 GiB; larger transfers are split.</dd></div>
+</dl>
+
+<h2>Limits</h2>
+<ul>
+  <li>The driver is serial: it advertises no MPI support. Parallel HDF5 codes should use the <a href="/docs/io-adapters/hdf5-vol.html">VOL connector</a>.</li>
+  <li>It cannot tell hot data from metadata, and HDF5's tiny metadata writes become many requests when the read tier is on.</li>
+  <li>The read tier is experimental and off by default.</li>
+</ul>
+
+<h2>Where to go next</h2>
+<ul>
+  <li><a href="/docs/io-adapters/hdf5-vol.html">HDF5 VOL connector</a>: dataset-level caching, on by default.</li>
+  <li><a href="/docs/io-adapters/configuration.html">Configuration reference</a>.</li>
+  <li><a href="/design/adapters.html#hdf5">HDF5 connector design</a>.</li>
+</ul>

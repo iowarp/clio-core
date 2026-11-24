@@ -41,6 +41,16 @@
 #include <thread>
 #include <vector>
 
+#include "lbm_test_deadline.h"
+
+// These checks use assert(). CI also runs this test in Release builds,
+// where NDEBUG would compile every check to nothing and the test could
+// only fail by crashing. Re-including <cassert> without NDEBUG (after
+// every other header, so no library code changes) keeps assert() live.
+#undef NDEBUG
+#include <cassert>  // NOLINT(build/include_order)
+
+
 using namespace ctp::lbm;
 
 class TestMeta : public LbmMeta<> {
@@ -57,14 +67,15 @@ class TestMeta : public LbmMeta<> {
 
 // Helper: recv with retry loop
 template <typename MetaT>
-ClientInfo RecvWithRetry(Transport* server, MetaT& meta, int max_ms = 5000) {
-  int attempts = 0;
+ClientInfo RecvWithRetry(Transport* server, MetaT& meta,
+                         int max_ms = lbm_test::kRecvDeadlineMs) {
+  lbm_test::Deadline deadline(max_ms);
   while (true) {
     auto info = server->Recv(meta);
     if (info.rc == 0) return info;
     if (info.rc != EAGAIN) return info;
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    if (++attempts > max_ms) {
+    if (deadline.Expired()) {
       std::cerr << "RecvWithRetry timed out\n";
       return info;
     }
@@ -518,8 +529,8 @@ void TestMultiClientWithEM() {
 
   // Server receives using EventManager-driven loop
   int received_count = 0;
-  int max_attempts = 100;
-  while (received_count < 2 && max_attempts-- > 0) {
+  lbm_test::Deadline deadline;
+  while (received_count < 2 && !deadline.Expired()) {
     int nfds = em.Wait(100000);  // 100ms
     if (nfds <= 0) continue;
 
@@ -633,7 +644,7 @@ void TestAcceptNewClient() {
 
   // First Recv triggers accept internally
   TestMeta recv_meta;
-  int attempts = 0;
+  lbm_test::Deadline deadline;
   ClientInfo info;
   while (true) {
     info = server->Recv(recv_meta);
@@ -643,8 +654,9 @@ void TestAcceptNewClient() {
       break;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    if (++attempts > 5000) {
-      std::cerr << "Recv timed out after 5000 attempts\n";
+    if (deadline.Expired()) {
+      std::cerr << "Recv timed out after " << lbm_test::kRecvDeadlineMs
+                << " ms\n";
       break;
     }
   }

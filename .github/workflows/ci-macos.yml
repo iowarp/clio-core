@@ -9,20 +9,31 @@ name: CI macOS
 
 on:
   push:
-    branches: [main, dev]
+    branches: [main]
+  # Push to dev does NOT trigger this directly: dev-full-ci.yml dispatches
+  # the full matrix once dev has been quiet for 30 minutes, so a burst of
+  # merges gets one full run instead of one per merge.
   pull_request:
     branches: [main, dev]
-  # Merge queue (issue #1013): the full matrix -- macFUSE, WinFsp, the boost
-  # backend, the wide macOS sweep -- is gated on `event_name != pull_request`,
-  # so it never ran on a PR and only spoke up AFTER the merge, on dev, where a
-  # single bad commit turns every later push red. A merge_group run is that
-  # same full matrix executed on the PROSPECTIVE merge commit, before it lands.
-  # Cost is unchanged for PRs; dev stops being where breakage is discovered.
-  merge_group:
   workflow_dispatch:
+  # nightly-full-sweep.yml calls this for macos-15-intel against dev. A called
+  # workflow runs inside the caller's run, so it is never mistaken for dev's
+  # full-CI ci-macos run by dev-to-main-gate.yml.
+  workflow_call:
+    inputs:
+      os:
+        description: 'JSON list of macOS runner images (overrides the tier)'
+        type: string
+        required: true
+      ref:
+        description: 'Ref to check out'
+        type: string
+        required: true
 
 concurrency:
-  group: ci-macos-${{ github.ref }}
+  # inputs.* are empty except when called, so a nightly call never shares (and
+  # never displaces a pending run in) the push/dispatch group.
+  group: ci-macos-${{ github.ref }}${{ inputs.ref && format('-call-{0}', inputs.ref) || '' }}
   # Cancel superseded runs on PR branches only. On a SHARED branch (main/dev)
   # github.ref is identical for every merge, so `true` here made each merge
   # cancel the PREVIOUS merge's validation mid-flight -- which is exactly the
@@ -32,16 +43,24 @@ concurrency:
 
 jobs:
   # ---- Matrix tier selection (issue #921) -----------------------------------
-  # A pull request builds ONE representative macOS runner; the full arm64 +
-  # Intel, macOS 14 -> 26 sweep runs on push to main/dev. Breadth on every PR
-  # commit bought little: the five runners fail together on real breakage, so
-  # what the extra four mostly added was more chances to hit a flake, more
-  # queue time, and more reruns. The sweep still gates what lands, just at the
-  # merge point instead of on every push to a branch.
+  # A pull request builds ONE representative macOS runner (build only); the
+  # full sweep runs in dev's debounced full CI and on push to main. Breadth on
+  # every PR commit bought little: the runners fail together on real breakage,
+  # so the extras mostly added flake exposure, queue time, and reruns.
+  #
+  # The full sweep is two runners: macos-15 (arm64, oldest supported; also
+  # builds and tests the HDF5 VOL + macFUSE adapters) and xcode-27 (newest
+  # toolchain). macos-26 sat between those ends and duplicated them. Intel
+  # (macos-15-intel) runs nightly against dev from nightly-full-sweep.yml: no
+  # Intel macOS wheel ships, x86_64 code is covered on Linux and Windows, and
+  # macOS code on arm64. macOS runners are the scarcest in the org and set
+  # the dev->main gate's length.
   #
   # macos-15 (arm64) is the PR runner: current-generation Apple silicon, the
   # default arch for contributors, and where cr_cli_cfs_rename surfaced.
   matrix-tier:
+    # Skipped on dev -> main PRs: dev-to-main-gate.yml checks dev's full CI on the same commit instead.
+    if: ${{ !(github.event_name == 'pull_request' && github.head_ref == 'dev' && github.base_ref == 'main') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -49,15 +68,21 @@ jobs:
     steps:
       - id: pick
         shell: bash
+        env:
+          CALLER_OS: ${{ inputs.os }}
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
+          if [ -n "$CALLER_OS" ]; then
+            echo "os=$CALLER_OS" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
             echo 'os=["macos-15"]' >> "$GITHUB_OUTPUT"
           else
-            echo 'os=["macos-15","macos-15-intel","macos-26","macos-26-intel"]' >> "$GITHUB_OUTPUT"
+            echo 'os=["macos-15","xcode-27"]' >> "$GITHUB_OUTPUT"
           fi
 
-  # ---- Standard build + ctest (arm64 + Intel, macOS 14 -> 26) ---------------
+  # ---- Standard build + ctest (macos-15 + adapters, xcode-27; Intel nightly) -
   build-test:
+    # Skipped on dev -> main PRs: dev-to-main-gate.yml checks dev's full CI on the same commit instead.
+    if: ${{ !(github.event_name == 'pull_request' && github.head_ref == 'dev' && github.base_ref == 'main') }}
     name: build-test (${{ matrix.os }})
     needs: matrix-tier
     runs-on: ${{ matrix.os }}
@@ -66,18 +91,33 @@ jobs:
       fail-fast: false
       matrix:
         os: ${{ fromJSON(needs.matrix-tier.outputs.os) }}
+    env:
+      # The macOS adapters (HDF5 VOL + macFUSE) build and test inside the
+      # macos-15 job instead of a separate runner (formerly ci-adapters.yml
+      # macos-adapters, a second, smaller build of the same tree on the same
+      # image). Off on PRs, which only build, as before.
+      ADAPTERS: ${{ (matrix.os == 'macos-15' && github.event_name != 'pull_request') && 'ON' || 'OFF' }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
         with:
           submodules: recursive
+          ref: ${{ inputs.ref }}
 
       - name: Install dependencies (conda)
         run: |
           chmod +x CI/ci-deps.sh
           ./CI/ci-deps.sh --only-deps release
 
+      # macFUSE 5 ships libfuse3 (headers + dylib + pkg-config) under
+      # /usr/local; installing the cask needs no kext approval -- only
+      # mounting through the kext backend would.
+      - name: Install macFUSE (adapters)
+        if: env.ADAPTERS == 'ON'
+        run: bash CI/retry.sh brew install --cask macfuse
+
       - name: Configure and build
+        id: build
         run: |
           set -x
           # Re-activate the conda env created by CI/ci-deps.sh (env vars do
@@ -93,6 +133,10 @@ jobs:
 
           export CMAKE_PREFIX_PATH="${CONDA_PREFIX}${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
           export PKG_CONFIG_PATH="${CONDA_PREFIX}/lib/pkgconfig:${CONDA_PREFIX}/share/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+          if [ "$ADAPTERS" = ON ]; then
+            # macFUSE's fuse3.pc lives under /usr/local (Homebrew cask).
+            export PKG_CONFIG_PATH="${PKG_CONFIG_PATH}:/usr/local/lib/pkgconfig:/opt/homebrew/lib/pkgconfig"
+          fi
 
           # Pin ar/ranlib to the Xcode toolchain, not conda's llvm-tools
           # (issue #797 has the full rationale). Short version: CMake otherwise
@@ -117,11 +161,23 @@ jobs:
             -DCLIO_CORE_ENABLE_DOCKER_CI=OFF \
             -DCLIO_CTE_ENABLE_ADIOS2_ADAPTER=OFF \
             -DCLIO_CTE_ENABLE_COMPRESS=OFF \
-            -DCLIO_CORE_ENABLE_GRAY_SCOTT=OFF
+            -DCLIO_CORE_ENABLE_GRAY_SCOTT=OFF \
+            -DCLIO_CTE_ENABLE_HDF5_VOL="${ADAPTERS}" \
+            -DCLIO_CTE_ENABLE_FUSE_ADAPTER="${ADAPTERS}"
 
           cmake --build build -- -j"$(sysctl -n hw.ncpu)"
 
+      - name: Verify the macFUSE adapter binary was built
+        if: env.ADAPTERS == 'ON'
+        run: |
+          if [ ! -x build/bin/clio_cte_fuse ]; then
+            echo "::error::clio_cte_fuse was not built -- macFUSE/libfuse3 was not detected at configure time (check fuse3 pkg-config visibility under /usr/local/lib/pkgconfig)."
+            exit 1
+          fi
+          echo "OK: clio_cte_fuse present (macFUSE libfuse3 path compiled and linked)"
+
       - name: Run ctest
+        if: github.event_name != 'pull_request'
         run: |
           if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
             source "$HOME/miniconda3/etc/profile.d/conda.sh"
@@ -140,10 +196,83 @@ jobs:
           # (#1174). Excluding them now would silently drop that coverage.
           ctest -T Test --output-on-failure --timeout 120 --repeat until-pass:3 \
             -LE "integration|restart|functional|stress|docker|flaky" \
-            -E "cr_bdev_|cr_mpi_|cr_per_process_shm_stress|cte_tag_large|cte_tiered_storage_all|cte_tiered_dram_default_all|cte_reorganize_all"
+            -E "cr_bdev_|cr_mpi_|cr_per_process_shm_stress|cte_tag_large|cte_tiered_storage_all|cte_tiered_dram_default_all|cte_reorganize_all|hdf5_vol|fuse"
+
+      # Adapter tests, exactly as the former macos-adapters job ran them. They
+      # run even if the main suite failed, so one job reports both verdicts.
+      - name: Run adapter tests (HDF5 VOL + macFUSE)
+        if: always() && env.ADAPTERS == 'ON' && steps.build.outcome == 'success'
+        run: |
+          if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
+            source "$HOME/miniconda3/etc/profile.d/conda.sh"
+          elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
+            source "$HOME/anaconda3/etc/profile.d/conda.sh"
+          elif command -v conda >/dev/null 2>&1; then
+            eval "$(conda shell.bash hook)"
+          fi
+          conda activate iowarp
+          # h5py for the VOL compat suite, source-built against the conda HDF5
+          # the VOL links (a wheel's bundled libhdf5 can't load the connector).
+          HDF5_DIR="$CONDA_PREFIX" "${CONDA_PREFIX}/bin/python3" -m pip install \
+            --no-binary=h5py h5py numpy
+          # Same build dir, so this ctest would overwrite the main suite's
+          # LastTest.log, which the summary / flaky-report / upload steps below
+          # read. Keep the adapters' log under its own name and put the main
+          # one back, whatever the outcome.
+          T=build/Testing/Temporary
+          [ -f "$T/LastTest.log" ] && cp "$T/LastTest.log" "$T/LastTest-main.log"
+          rc=0
+          ctest --test-dir build --output-on-failure \
+            --timeout 180 --repeat until-pass:2 \
+            -R "hdf5_vol|fuse" -E "copy_workspace" -LE "docker|ollama|flaky" || rc=$?
+          [ -f "$T/LastTest.log" ] && cp "$T/LastTest.log" "$T/LastTest-adapters.log"
+          [ -f "$T/LastTest-main.log" ] && mv -f "$T/LastTest-main.log" "$T/LastTest.log"
+          bash CI/report_flaky_tests.sh "$T/LastTest-adapters.log" "macos adapters" || true
+          exit "$rc"
+
+      # fuse_ops has crashed with a bare `***Exception: SegFault` inside the
+      # "hard link" case on macOS (since 2026-08-21); ctest throws the stack
+      # away. Re-run just that binary under lldb on failure to capture one.
+      # Diagnostic only: the steps above already decided the job.
+      - name: Backtrace fuse_ops on crash (diagnostic only)
+        if: failure() && env.ADAPTERS == 'ON'
+        continue-on-error: true
+        run: |
+          exe=$(find build -name 'test_fuse_ops*' -type f -perm -u+x | head -1)
+          echo "fuse_ops binary: ${exe:-<not found>}"
+          if [ -z "$exe" ]; then exit 0; fi
+          # MallocScribble/PreScribble make a use-after-free read 0x55../0xaa..;
+          # -k (one-line-on-crash) is the lldb hook that fires in --batch mode.
+          export MallocScribble=1 MallocPreScribble=1
+          lldb --batch -k 'thread backtrace all' -k 'register read x0 lr pc sp fp' \
+               -k 'image lookup --address $lr' \
+               -k 'memory read --size 8 --format x --count 4 $sp' -k quit \
+               -o run -o quit -- "$exe" 2>&1 | tail -200
+
+      # Real mount via the FSKit backend (kext-free; macFUSE 5.1+, macOS 15.4+,
+      # mountpoint under /Volumes). NON-BLOCKING until observed green (#903);
+      # step timeout + continue-on-error because a stuck mount once hung 50 min.
+      - name: FUSE mount smoke (FSKit backend, non-blocking probe)
+        if: always() && env.ADAPTERS == 'ON' && steps.build.outcome == 'success'
+        timeout-minutes: 10
+        continue-on-error: true
+        run: |
+          if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
+            source "$HOME/miniconda3/etc/profile.d/conda.sh"
+          elif command -v conda >/dev/null 2>&1; then
+            eval "$(conda shell.bash hook)"
+          fi
+          conda activate iowarp || true
+          sudo mkdir -p /Volumes/cte_fuse_smoke
+          sudo chown "$(whoami)" /Volumes/cte_fuse_smoke
+          chmod +x CI/fuse_mount_smoke.sh
+          CLIO_SMOKE_MOUNT_POINT=/Volumes/cte_fuse_smoke \
+          CLIO_SMOKE_FUSE_OPTS="-o backend=fskit" \
+            CI/fuse_mount_smoke.sh build \
+            || echo "::warning::macOS FSKit mount smoke failed -- non-blocking probe (see #903)."
 
       - name: Submit results to CDash
-        if: always()
+        if: always() && github.event_name != 'pull_request'
         continue-on-error: true
         run: |
           if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
@@ -158,7 +287,7 @@ jobs:
           ctest -T Submit || true
 
       - name: Summarize failed tests
-        if: always()
+        if: always() && github.event_name != 'pull_request'
         run: |
           LOG="build/Testing/Temporary/LastTest.log"
           echo "## macOS test summary (${{ matrix.os }})" >> "$GITHUB_STEP_SUMMARY"
@@ -172,14 +301,14 @@ jobs:
             echo "(LastTest.log not found)" >> "$GITHUB_STEP_SUMMARY"
           fi
       - name: Report retried-but-passed tests
-        if: always()
+        if: always() && github.event_name != 'pull_request'
         shell: bash
         # A green check must not mean "some test failed and we retried until it
         # did not" (#921). Reports only -- never fails the job.
         run: bash CI/report_flaky_tests.sh build/Testing/Temporary/LastTest.log "macos ${{ matrix.os }}"
 
       - name: Upload test logs
-        if: always()
+        if: always() && github.event_name != 'pull_request'
         # Never let the artifact service sink an otherwise-green job (#921).
         # These logs are diagnostics; the verdict already came from "Run tests".
         # Seen on PR #920: build-test (windows-11-arm) passed every one of its
@@ -190,55 +319,12 @@ jobs:
           name: mac-test-logs-${{ matrix.os }}
           path: |
             build/Testing/Temporary/LastTest.log
+            build/Testing/Temporary/LastTest-adapters.log
             build/Testing/Temporary/CTestCostData.txt
           if-no-files-found: warn
 
-  # ---- Boost.Context stackful coroutine backend (#620) ----------------------
-  boost:
-    name: boost (${{ matrix.os }})
-    # Push-only (#921): the Boost.Context coroutine backend is a build variant,
-    # not an arch. It gates main/dev rather than every PR commit.
-    if: github.event_name != 'pull_request'
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 120
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-15]
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v5
-        with:
-          submodules: recursive
-      - name: Install dependencies (conda env, incl. Boost.Context)
-        run: |
-          chmod +x CI/ci-deps.sh
-          ./CI/ci-deps.sh --only-deps release
-      - name: Build with Boost backend + run ctest
-        run: |
-          if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
-            source "$HOME/miniconda3/etc/profile.d/conda.sh"
-          elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
-            source "$HOME/anaconda3/etc/profile.d/conda.sh"
-          elif command -v conda &>/dev/null; then
-            eval "$(conda shell.bash hook)"
-          fi
-          conda activate iowarp
-          # Pin ar/ranlib to Xcode's, not conda's llvm-tools — see the
-          # "Configure and build" step above and #797.
-          AR_BIN="$(xcrun -f ar 2>/dev/null || echo /usr/bin/ar)"
-          RANLIB_BIN="$(xcrun -f ranlib 2>/dev/null || echo /usr/bin/ranlib)"
-          cmake --preset boost \
-            -DCMAKE_AR="${AR_BIN}" \
-            -DCMAKE_RANLIB="${RANLIB_BIN}"
-          cmake --build build-boost -j"$(sysctl -n hw.ncpu)"
-          # #619's fallback-runtime punting has no macOS support yet (#634);
-          # those cases are excluded until it lands.
-          ctest --test-dir build-boost --output-on-failure --timeout 180 --repeat until-pass:3 \
-            -LE "ollama|flaky" -E "cr_cli_cte_fallback|cr_cli_fallback_runtime|cte_tag_large|cte_tiered_storage_all|cte_tiered_dram_default_all|cte_reorganize_all"
-      - name: Report retried-but-passed tests
-        if: always()
-        shell: bash
-        # A green check must not mean "some test failed and we retried until it
-        # did not" (#919/#921). Reports only -- never fails the job.
-        run: bash CI/report_flaky_tests.sh build-boost/Testing/Temporary/LastTest.log "macos boost ${{ matrix.os }}"
+  # ---- Boost.Context stackful coroutine backend (#620): Linux only ---------
+  # The Boost backend is opt-in (CLIO_CORE_ENABLE_BOOST_COROUTINES=OFF by
+  # default) and only forced on for NVHPC, which is Linux. Nothing shipped on
+  # this platform uses it, so it is tested on Linux (ci-linux.yml: boost-docker,
+  # boost-native on x86_64 and arm64) and not here.

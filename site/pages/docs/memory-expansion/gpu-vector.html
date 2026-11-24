@@ -1,0 +1,203 @@
+<!--
+title: gpu_vector
+heading: An array larger than <em>GPU memory.</em>
+description: How to use gpu_vector, step by step: create the vector and launch the kernel on the CPU side, fetch, hold, flush and unpin pages inside a CUDA kernel on the GPU side, and build it with clang, which is required because the device verbs are C++20 coroutines.
+eyebrow: Docs · Memory expansion
+lede: <code>gpu_vector</code> gives a CUDA kernel an array that can be far larger than the GPU's memory. The CPU side creates the vector and launches the kernel; the kernel itself pulls pages into a cache in GPU memory, works on them and writes them back. The device code uses C++20 coroutines, so it must be compiled with <strong>clang</strong>, not nvcc.
+facts: Header | clio_cte/gpu_vector/gpu_vector.h ; Namespace | clio::cte::gpu_vector ; Compiler | clang++ as the CUDA compiler (CLIO_GPU_CLANG=ON) ; CPU-only alternative | <a href="/docs/memory-expansion/cpu-vector.html">cpu_vector</a>
+-->
+<h2>The idea in four steps</h2>
+<p>A <code>gpu_vector</code> is split into fixed-size pages. Every page is stored in the <a href="/docs/cte/index.html">Context Transfer Engine</a>, which puts it in RAM, on NVMe or on disk depending on the tiers you configured. The GPU only keeps the pages a kernel is working on right now. Inside the kernel, each page goes through the same four steps:</p>
+<ol class="steps">
+  <li><h3>Fetch</h3><p>Ask for a range of elements. The page that holds them is copied into the GPU cache and pinned so it cannot be evicted.</p></li>
+  <li><h3>Hold</h3><p>Get a pointer into the cached page and read or write it like an ordinary array.</p></li>
+  <li><h3>Flush</h3><p>Write the elements you changed back to the CTE. Nothing is written back automatically.</p></li>
+  <li><h3>Unpin</h3><p>Release the page so its slot in the cache can be reused for the next one.</p></li>
+</ol>
+<p>The program has two halves. The <strong>CPU side</strong> starts the runtime, creates the vector, fills it, launches the kernel and reads the result. The <strong>GPU side</strong> is the kernel, which does the four steps above. The example below doubles every element of a 256 MiB vector of floats through a 64 MiB cache on the GPU.</p>
+
+<h2 id="gpu-side">GPU side: the kernel</h2>
+<p>The work is written as a device coroutine (<code>YCoroMain</code>). Each <code>co_await</code> is a point where the block may pause while the CPU completes a transfer; the GPU runs other blocks in the meantime. Each block walks its own share of the pages, one page at a time.</p>
+<pre data-label="cpp · scale_example.cc (GPU side)">
+#include <clio_runtime/clio_runtime.h>
+#include <clio_runtime/gpu/gpu_ipc_manager.h>
+#include <clio_runtime/gpu/yield_stack.h>
+#include <clio_runtime/gpu/yieldable.h>
+#include <clio_cte/core/core_client.h>
+#include <clio_cte/gpu_vector/gpu_vector.h>
+#include <vector>
+
+namespace gv = clio::cte::gpu_vector;
+namespace gy = clio::run::gpu;
+using clio::run::u32;
+using clio::run::u64;
+
+// Block `block` of `nblocks` doubles pages block, block + nblocks, ...
+__device__ gy::YCoroMain DoublePages(gv::DeviceVector<float> v,
+                                     u32 block, u32 nblocks) {
+  const u64 epp = v.ElemsPerPage();                 // elements per page
+  for (u64 pg = block; pg < v.NumPages(); pg += nblocks) {
+    const u64 off = pg * epp;                       // first element of the page
+    const u64 count = (v.size() - off < epp) ? v.size() - off : epp;
+
+    co_await v.Fetch(0, off, count);                // 1. bring the page in, pin it
+    {
+      auto h = co_await v.HoldPage(off, count, /*write=*/true);  // 2. hold it
+      for (u64 i = off + threadIdx.x; i < off + h.run(); i += blockDim.x) {
+        h[i] = 2.0f * h[i];                         // h is indexed by absolute offset
+      }
+    }
+    co_await v.Flush(0, off, count);                // 3. write the page back
+    v.UnpinRange(off, count);                       // 4. let the cache reuse the slot
+  }
+}
+
+// The kernel entry point. The four lines before CLIO_YCORO_RUN are the same
+// in every gpu_vector kernel.
+__global__ void DoubleKernel(clio::run::IpcManagerGpuInfo info,
+                             gv::DeviceVector<float> v, u32 nblocks,
+                             gy::YieldableView<> yv, gy::YieldStackView ys) {
+  CLIO_GPU_INIT(info, nullptr);                 // connect the kernel to the runtime
+  v.Init(yv.Block());                           // yv.Block() is this block's id
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());  // where the coroutine saves its state
+  __syncthreads();
+  CLIO_YCORO_RUN(DoublePages(v, yv.Block(), nblocks));
+}
+</pre>
+<dl class="notes">
+<div><dt>Ranges are in elements</dt><dd><code>Fetch(0, off, count)</code> means elements <code>[off, off + count)</code>. The leading <code>0</code> is the generation; 0 is an ordinary transfer. One call can name up to eight <code>(off, count)</code> pairs.</dd></div>
+<div><dt>A hold is a page-sized window</dt><dd><code>h.run()</code> is how many of the requested elements lie on this page, and <code>h[i]</code> takes the absolute element offset, the same number you passed to <code>Fetch</code>.</dd></div>
+<div><dt>The whole block calls together</dt><dd>Every <code>DeviceVector</code> call is block-collective. All threads run the loop and split the elements between them with <code>threadIdx.x</code>; never wrap a <code>co_await</code> in <code>if (threadIdx.x == 0)</code>.</dd></div>
+<div><dt>Use <code>yv.Block()</code>, not <code>blockIdx.x</code></dt><dd>A block that pauses is relaunched later, possibly as a different CUDA block. <code>yv.Block()</code> stays the same across relaunches.</dd></div>
+</dl>
+
+<h2 id="cpu-side">CPU side: create, fill, launch, read back</h2>
+<p>The host never touches pages directly while the kernel runs. It creates the <code>Vector</code>, which allocates the GPU cache, hands the kernel a <code>DeviceVector</code> by value with <code>GetDevice(0)</code>, and runs the kernel through the yield driver. The driver relaunches paused blocks until every block has finished.</p>
+<pre data-label="cpp · scale_example.cc (CPU side, same file)">
+#if !CTP_IS_DEVICE_PASS   // host-only code: skipped when clang compiles for the GPU
+int main() {
+  // 1. Start a runtime in this process (or attach to one) and the CTE client.
+  if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true)) return 1;
+  if (!clio::cte::core::CLIO_CTE_CLIENT_INIT()) return 1;
+  auto gpu_info = CLIO_CPU_IPC->GetGpuIpcManager()->GetGpuInfo(/*gpu=*/0);
+
+  // 2. Create the vector: 64M floats (256 MiB) in 1 MiB pages, on GPU 0.
+  //    The cache has nblocks sets of set_size pages: 8 x 8 = 64 MiB.
+  const u64 n = 64ull << 20;
+  const u64 page_bytes = 1ull << 20;
+  const u32 nblocks = 8, nthreads = 32;
+  gv::Vector<float> vec("doubled", /*gpu_ids=*/{0}, page_bytes,
+                        nblocks, /*set_size=*/8, n);
+
+  // 3. Fill it from the host. This writes straight to the CTE.
+  std::vector<float> data(n, 1.5f);
+  vec.Preload(data.data(), n);
+
+  // 4. Launch the kernel and run it until every block is done.
+  gy::Yieldable<> driver(nblocks, nthreads);
+  gy::YieldStack stack(nblocks, nthreads, /*bytes_per_lane=*/8192);
+  driver.RunToCompletion(
+      [&](dim3 grid, dim3 block, gy::YieldableView<> yv) {
+        DoubleKernel<<<grid, block, CLIO_YIELD_SMEM_BYTES>>>(
+            gpu_info, vec.GetDevice(0), nblocks, yv, stack.View());
+      },
+      [] {}, /*max_rounds=*/200000, gv::ResumeWhenComplete);
+  ctp::GpuApi::Synchronize();
+
+  // 5. Read the result back. Every page was flushed by the kernel.
+  vec.Download(data.data(), n);
+  bool ok = (data[0] == 3.0f && data[n - 1] == 3.0f);
+
+  clio::run::CLIO_RUNTIME_FINALIZE();
+  return ok ? 0 : 2;
+}
+#endif
+</pre>
+<dl class="notes">
+<div><dt><code>Vector(tag, gpu_ids, page_bytes, nblocks, set_size, n)</code></dt><dd>The tag names the vector in the CTE; open the same tag again and you get the same data. <code>nblocks</code> must match the number of blocks you launch, because each block gets its own transfer slots. The cache holds <code>nblocks * set_size</code> pages by default.</dd></div>
+<div><dt><code>Preload</code> and <code>Download</code></dt><dd>Move data between a host array and the CTE, bypassing the GPU cache. For data that never fits in host memory either, <code>PreloadPages</code> and <code>DownloadPages</code> take a callback per page.</dd></div>
+<div><dt>The yield driver</dt><dd><code>Yieldable</code> launches the grid, and after the kernel returns it relaunches only the blocks that paused on a transfer. <code>gv::ResumeWhenComplete</code> holds a paused block back until its transfer has actually finished. <code>YieldStack</code> is where paused coroutines keep their state; 8192 bytes per thread is what the adapter's tests use.</dd></div>
+</dl>
+
+<h2 id="clang">Compile with clang</h2>
+<p>The <code>co_await</code> calls in the kernel are C++20 coroutines running on the GPU. nvcc cannot compile coroutines in device code, so <code>gpu_vector</code> needs clang as the CUDA compiler. clang compiles the same source file twice, once for the CPU and once for the GPU. That is why the host code above sits inside <code>#if !CTP_IS_DEVICE_PASS</code>: the GPU pass skips it.</p>
+<div class="callout warn"><span class="callout-title">nvcc builds have no gpu_vector</span><p>Without <code>CLIO_GPU_CLANG=ON</code> the configure step prints that <code>gpu_vector</code> is disabled and builds nothing for it. The CUDA pip wheel is compiled with nvcc, so it does not include <code>gpu_vector</code> either. Build from source.</p></div>
+<p>Configure CLIO Core with CUDA and clang. CMake finds the newest <code>clang++</code> on the path (clang++-22 is what the tree is tested with), or you can name one:</p>
+<pre data-label="shell">
+$ cmake -S . -B build-gv -G Ninja -DCMAKE_BUILD_TYPE=Release \
+    -DCLIO_CORE_ENABLE_CUDA=ON -DCLIO_GPU_CLANG=ON \
+    -DCMAKE_CUDA_COMPILER=clang++-22          # optional; found automatically
+$ cmake --build build-gv -j"$(nproc)"
+</pre>
+<p>In that build tree, add your program the way the adapter's own tests are added. <code>add_cuda_executable</code> marks the source as CUDA, so it goes to clang with the C++ standard and GPU architecture CLIO Core was configured with:</p>
+<pre data-label="cmake">
+add_cuda_executable(scale_example FALSE
+    scale_example.cc
+    INCLUDE_DIRS
+        ${CMAKE_SOURCE_DIR}/context-runtime/include
+        ${CMAKE_SOURCE_DIR}/context-runtime/modules/admin/include
+        ${CMAKE_SOURCE_DIR}/context-runtime/modules/bdev/include
+        ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
+        ${CMAKE_SOURCE_DIR}/context-transfer-engine/adapter/gpu_vector/include
+    LINK_LIBS
+        clio_run_cxx clio_run_cxx_gpu
+        clio_admin_client clio_bdev_client
+        clio_cte_core_client clio_cte_core_runtime
+        clio::cte::gpu_vector ctp::cuda_cxx
+        ${CMAKE_THREAD_LIBS_INIT})
+</pre>
+<p>On Intel GPUs the oneAPI compiler is already clang-based: configure with <code>-DCLIO_CORE_ENABLE_SYCL=ON</code> and <code>icpx</code>, and the same <code>DeviceVector</code> calls work from a SYCL kernel lambda. The SYCL tests in <code>context-transfer-engine/adapter/gpu_vector/test/sycl</code> show the launch code. The <a href="/docs/memory-expansion/install.html">install page</a> covers every toolchain.</p>
+
+<h2 id="run">Run it</h2>
+<p>The runtime needs a CTE pool with at least one storage tier big enough for the vector. Save this as <code>clio.yaml</code> and point <code>CLIO_SERVER_CONF</code> at it:</p>
+<pre data-label="yaml · clio.yaml">
+gpu:
+  queue_depth: 64            # more than the number of blocks you launch
+compose:
+  - mod_name: clio_cte_core
+    pool_name: clio_cte
+    pool_query: local
+    pool_id: 512.0
+    storage:
+      - path: "ram::vector_dram"
+        bdev_type: "ram"
+        capacity_limit: "1GB"
+        score: 1.0
+    dpe:
+      dpe_type: "max_bw"
+</pre>
+<pre data-label="shell">
+$ CLIO_SERVER_CONF=$PWD/clio.yaml ./build-gv/bin/scale_example; echo "exit $?"
+exit 0
+</pre>
+<p>If a kernel stops with a trap, call <code>gv::FatalReport()</code> on the host. It returns the reason, such as a hold over a page that was never fetched or a cache set with every slot pinned.</p>
+
+<h2 id="rules">Rules that keep a kernel working</h2>
+<ul class="checks">
+  <li><strong>Flush before you unpin.</strong> There is no dirty bit. A page evicted before it was flushed loses its writes.</li>
+  <li><strong>Unpin everything you fetch.</strong> A pinned page can never be evicted; a set full of pinned pages stops the next fetch.</li>
+  <li><strong>Hold only what you fetched.</strong> <code>HoldPage</code> never fetches. Holding elements that no fetch named stops the kernel.</li>
+  <li><strong>Size the cache for your blocks.</strong> Give each set at least as many slots as blocks that may hold a page of it at once, and set <code>gpu.queue_depth</code> above the block count.</li>
+  <li><strong>Several blocks may share a page.</strong> Each flushes only the elements it wrote, so they do not overwrite each other.</li>
+</ul>
+
+<h2 id="overlap">Overlap transfers with compute</h2>
+<p><code>Fetch</code> and <code>Flush</code> each have a split form. Start the next page's fetch, work on the current page, then wait:</p>
+<pre data-label="cpp">
+co_await v.BeginFetch(0, next_off, next_count);   // submitted; returns at once
+/* ... compute on the page you already hold ... */
+co_await v.AwaitFetch();                          // now the next page is in
+
+co_await v.BeginFlush(0, off, count);             // start writing this page back
+/* ... compute ... */
+co_await v.EndFlush();                            // wait for the write
+</pre>
+<p>For moving pages between storage tiers ahead of the kernel, see prefetch hints on the <a href="/docs/memory-expansion/usage.html#hints">usage page</a>.</p>
+
+<h2>Where to go next</h2>
+<ul>
+  <li><a href="/docs/memory-expansion/cpu-vector.html">cpu_vector</a>: the same model from ordinary CPU threads, with no GPU or clang.</li>
+  <li><a href="/docs/memory-expansion/usage.html">Usage</a>: lazy copies, checkpoints and tier placement hints for both vectors.</li>
+  <li><a href="/docs/memory-expansion/api.html#gpu">API reference</a>: every constructor argument and method of <code>Vector</code> and <code>DeviceVector</code>.</li>
+  <li><a href="/docs/memory-expansion/design.html">Design</a>: how the GPU cache and the fetch path work.</li>
+</ul>

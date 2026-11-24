@@ -18,7 +18,9 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
 #include <string>
+#include <thread>
 #include <vector>
 
 using ctp::SystemInfo;
@@ -82,6 +84,74 @@ TEST_CASE("SystemInfoMemfdDir") {
   // Default (user-derived) directory.
   std::string default_dir = SystemInfo::GetMemfdDir();
   REQUIRE(!default_dir.empty());
+}
+
+#ifndef _WIN32
+TEST_CASE("SystemInfoMemfdDirMustBePrivate") {
+  using State = SystemInfo::MemfdDirState;
+  const std::string base =
+      "/tmp/ctp_memfd_private_test_" + std::to_string(getpid());
+  const std::string dir = base + "_dir";
+  const std::string link = base + "_link";
+  SystemInfo::Setenv("CLIO_MEMFD_DIR", dir, 1);
+
+  // Missing, then created by EnsureMemfdDir with mode 0700.
+  rmdir(dir.c_str());
+  REQUIRE(SystemInfo::CheckMemfdDir() == State::kMissing);
+  REQUIRE(SystemInfo::EnsureMemfdDir());
+  struct stat st;
+  REQUIRE(lstat(dir.c_str(), &st) == 0);
+  REQUIRE((st.st_mode & 0777) == 0700);
+  REQUIRE(SystemInfo::CheckMemfdDir() == State::kPrivate);
+
+  // Readable by others is fine; writable by others is not.
+  chmod(dir.c_str(), 0755);
+  REQUIRE(SystemInfo::EnsureMemfdDir());
+  chmod(dir.c_str(), 0777);
+  REQUIRE(SystemInfo::CheckMemfdDir() == State::kUnsafe);
+  REQUIRE_FALSE(SystemInfo::EnsureMemfdDir());
+  chmod(dir.c_str(), 0770);
+  REQUIRE_FALSE(SystemInfo::EnsureMemfdDir());
+  chmod(dir.c_str(), 0700);
+
+  // A link is refused even when it points at a private directory.
+  unlink(link.c_str());
+  REQUIRE(symlink(dir.c_str(), link.c_str()) == 0);
+  SystemInfo::Setenv("CLIO_MEMFD_DIR", link, 1);
+  REQUIRE(SystemInfo::CheckMemfdDir() == State::kUnsafe);
+  REQUIRE_FALSE(SystemInfo::EnsureMemfdDir());
+
+  // No segment is created in, or opened from, a refused directory.
+  ctp::File fd;
+  REQUIRE_FALSE(SystemInfo::CreateNewSharedMemory(fd, "/memfd_private_seg", 4096));
+  REQUIRE_FALSE(SystemInfo::SharedMemoryExists("/memfd_private_seg"));
+
+  unlink(link.c_str());
+  rmdir(dir.c_str());
+  SystemInfo::Unsetenv("CLIO_MEMFD_DIR");
+}
+#endif
+
+TEST_CASE("SystemInfoNormalizePath") {
+  // Ordinary paths are untouched on every platform.
+  REQUIRE(SystemInfo::NormalizePath("/tmp/clio_x") == "/tmp/clio_x");
+  REQUIRE(SystemInfo::NormalizePath("C:\\Users\\u") == "C:\\Users\\u");
+  REQUIRE(SystemInfo::NormalizePath("").empty());
+#ifdef _WIN32
+  // Win32 verbatim paths lose their prefix (#1356).
+  REQUIRE(SystemInfo::NormalizePath("\\\\?\\C:\\Users\\u\\data") ==
+          "C:\\Users\\u\\data");
+  REQUIRE(SystemInfo::NormalizePath("//?/C:/Users/u") == "C:/Users/u");
+  REQUIRE(SystemInfo::NormalizePath("\\\\?\\UNC\\srv\\share\\d") ==
+          "\\\\srv\\share\\d");
+  // A verbatim CLIO_MEMFD_DIR yields usable segment paths.
+  SystemInfo::Setenv("CLIO_MEMFD_DIR", "\\\\?\\C:\\clio_test_dir", 1);
+  REQUIRE(SystemInfo::GetMemfdDir() == "C:\\clio_test_dir");
+  SystemInfo::Unsetenv("CLIO_MEMFD_DIR");
+#else
+  // On POSIX a "\\?\" prefix is just part of a file name.
+  REQUIRE(SystemInfo::NormalizePath("\\\\?\\C:\\x") == "\\\\?\\C:\\x");
+#endif
 }
 
 TEST_CASE("SystemInfoHostnameResolution") {
@@ -314,4 +384,50 @@ TEST_CASE("SystemInfoShmLargerThan4GiB") {
   REQUIRE(SystemInfo::CreateNewSharedMemory(fd3, name, kPage));
   SystemInfo::CloseSharedMemory(fd3);
   SystemInfo::DestroySharedMemory(name);
+}
+
+/**
+ * Write 1 MiB blocks across a fresh region while another thread runs
+ * TouchPages over it, as a RAM bdev populates the rest of a unit while
+ * workers already write blocks inside it.
+ * @param bytes region size
+ * @return bytes that do not hold what was written (lost to the touch)
+ */
+static size_t LostBytesUnderTouch(size_t bytes) {
+  char *base = static_cast<char *>(SystemInfo::MapPrivateMemory(bytes));
+  REQUIRE(base != nullptr);
+  std::atomic<bool> go{false};
+  std::thread toucher([&] {
+    while (!go.load()) {
+    }
+    SystemInfo::TouchPages(base, bytes);
+  });
+  go.store(true);
+  constexpr size_t kBlock = 1u << 20;
+  for (size_t off = 0; off < bytes; off += kBlock) {
+    std::memset(base + off, 0x5a, kBlock);
+  }
+  toucher.join();
+  size_t lost = 0;
+  for (size_t i = 0; i < bytes; ++i) {
+    lost += base[i] != 0x5a;
+  }
+  SystemInfo::UnmapMemory(base, bytes);
+  return lost;
+}
+
+TEST_CASE("SystemInfoTouchPagesKeepsConcurrentWrites") {
+  // A plain `p[i] = p[i]` touch lost ~2000 bytes per 64 MiB round here
+  // (the write lands between its load and store); the atomic touch none.
+  size_t lost = 0;
+  for (int round = 0; round < 8; ++round) {
+    lost += LostBytesUnderTouch(size_t(64) << 20);
+  }
+  INFO("bytes lost to a concurrent TouchPages: " << lost);
+  REQUIRE(lost == 0);
+  // BulkFault keeps contents too (it may take the same touch path).
+  std::vector<char> v(size_t(1) << 20, 'q');
+  REQUIRE(SystemInfo::BulkFault(v.data(), v.size()));
+  REQUIRE(v[0] == 'q');
+  REQUIRE(v[v.size() - 1] == 'q');
 }

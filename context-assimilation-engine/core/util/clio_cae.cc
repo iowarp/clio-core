@@ -32,13 +32,13 @@
  */
 
 /**
- * clio_cae - Ingest an OMNI YAML file for CAE processing.
+ * clio-cae - Ingest an OMNI YAML file for CAE processing.
  *
  * Reads the OMNI file and calls ParseOmni to schedule assimilation tasks.
- * Usage: clio_cae <omni_file_path>
+ * Usage: clio-cae <omni_file_path> | --version | --help
  *
- * Installed as `clio_cae`; the legacy name `clio_cae_omni` is preserved
- * as an install-time symlink for backward compat.
+ * Installed as `clio-cae`; the legacy names `clio_cae` and `clio_cae_omni`
+ * are preserved as install-time aliases for backward compat.
  *
  * The parsing itself lives in core/src/omni_loader.cc so it can be unit
  * tested without a live runtime; what remains here is the part that cannot
@@ -54,17 +54,46 @@
 #include <clio_cae/core/omni_loader.h>
 #include <clio_cae/core/omni_run.h>
 
+#include <cstring>
+#include <iostream>
 #include <string>
 #include <vector>
+
+// Injected by CMake (clio_core_version interface target).
+#ifndef CLIO_CORE_VERSION_STRING
+#define CLIO_CORE_VERSION_STRING "unknown"
+#endif
+
+/** @return basename of argv[0], so the alias in use names itself. */
+static const char* ProgName(const char* argv0) {
+  if (argv0 == nullptr || argv0[0] == '\0') {
+    return "clio-cae";
+  }
+  const char* base = std::strrchr(argv0, '/');
+  return base ? base + 1 : argv0;
+}
 
 void PrintUsage(const char* program_name) {
   HIPRINT("Usage: {} <omni_file_path>", program_name);
   HIPRINT("  omni_file_path - Path to the OMNI YAML file to ingest");
+  HIPRINT("  -V, --version  - Print the version and exit");
+  HIPRINT("  -h, --help     - Print this help and exit");
 }
 
 int main(int argc, char* argv[]) {
+  const char* prog = ProgName(argc > 0 ? argv[0] : nullptr);
+  if (argc == 2 && (std::strcmp(argv[1], "--version") == 0 ||
+                    std::strcmp(argv[1], "-V") == 0)) {
+    std::cout << prog << " " << CLIO_CORE_VERSION_STRING << "\n";
+    return 0;
+  }
+  if (argc == 2 && (std::strcmp(argv[1], "--help") == 0 ||
+                    std::strcmp(argv[1], "-h") == 0)) {
+    PrintUsage(prog);
+    return 0;
+  }
   if (argc != 2) {
-    PrintUsage(argv[0]);
+    PrintUsage(prog);
     return 1;
   }
 
@@ -147,7 +176,8 @@ int main(int argc, char* argv[]) {
            contexts.size());
       HLOG(kError,
            "  Likely causes: include_patterns matched no dataset, or the CTE "
-           "tier is full (look for 'PutBlob failed' in the runtime log).");
+           "tier is full (look for 'PutBlob failed' in the runtime log). "
+           "Set CLIO_CAE_TELEMETRY=<path> for per-phase counts and timings.");
       return 1;
     }
 

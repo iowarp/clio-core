@@ -8,16 +8,12 @@ name: CI Windows
 
 on:
   push:
-    branches: [main, dev]
+    branches: [main]
+  # Push to dev does NOT trigger this directly: dev-full-ci.yml dispatches
+  # the full matrix once dev has been quiet for 30 minutes, so a burst of
+  # merges gets one full run instead of one per merge.
   pull_request:
     branches: [main, dev]
-  # Merge queue (issue #1013): the full matrix -- macFUSE, WinFsp, the boost
-  # backend, the wide macOS sweep -- is gated on `event_name != pull_request`,
-  # so it never ran on a PR and only spoke up AFTER the merge, on dev, where a
-  # single bad commit turns every later push red. A merge_group run is that
-  # same full matrix executed on the PROSPECTIVE merge commit, before it lands.
-  # Cost is unchanged for PRs; dev stops being where breakage is discovered.
-  merge_group:
   workflow_dispatch:
 
 concurrency:
@@ -32,8 +28,10 @@ concurrency:
 jobs:
   # ---- Matrix tier selection (issue #921) -----------------------------------
   # A pull request builds ONE MSVC runner and ONE icx runner; the full sweep
-  # (2022 / 2025 / 11-arm for MSVC, 2022 / 2025 / 2025-vs2026 for icx, plus the
-  # Boost.Context variant) runs on push to main/dev. Seven Windows jobs on every
+  # (2022 / 2025 / 11-arm for MSVC, 2025 for icx) runs in dev's debounced full
+  # CI and on push to main. icx is a second compiler, not an arch: one image
+  # catches what it catches, and the other two duplicated it. The Boost.Context
+  # variant is Linux-only (see the end of this file). Seven Windows jobs on every
   # PR commit was the single largest block of CI, and the arches fail together
   # on real breakage -- the extra six mostly added flake exposure and queue
   # time. The sweep still gates what lands, at the merge point.
@@ -41,6 +39,8 @@ jobs:
   # windows-2025 x64 is the PR runner for both toolchains: the current image,
   # and the one both cte_bdev_fragmentation (icx) and cr_detached_spawn hit.
   matrix-tier:
+    # Skipped on dev -> main PRs: dev-to-main-gate.yml checks dev's full CI on the same commit instead.
+    if: ${{ !(github.event_name == 'pull_request' && github.head_ref == 'dev' && github.base_ref == 'main') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -55,11 +55,13 @@ jobs:
             echo 'icx=["windows-2025"]' >> "$GITHUB_OUTPUT"
           else
             echo 'msvc={"include":[{"os":"windows-2022","triplet":"x64-windows","arch":"x64"},{"os":"windows-2025","triplet":"x64-windows","arch":"x64"},{"os":"windows-11-arm","triplet":"arm64-windows","arch":"ARM64"}]}' >> "$GITHUB_OUTPUT"
-            echo 'icx=["windows-2022","windows-2025","windows-2025-vs2026"]' >> "$GITHUB_OUTPUT"
+            echo 'icx=["windows-2025"]' >> "$GITHUB_OUTPUT"
           fi
 
   # ---- MSVC build + ctest (Visual Studio generator) -------------------------
   build-test:
+    # Skipped on dev -> main PRs: dev-to-main-gate.yml checks dev's full CI on the same commit instead.
+    if: ${{ !(github.event_name == 'pull_request' && github.head_ref == 'dev' && github.base_ref == 'main') }}
     name: build-test (${{ matrix.os }})
     needs: matrix-tier
     runs-on: ${{ matrix.os }}
@@ -127,8 +129,8 @@ jobs:
             # a sparse file under %TEMP%/clio_$USERNAME (SystemInfo::
             # GetMemfdDir) and recreates that file on every shm_init. This is
             # outside the workspace, so the exclusion above does not cover it.
-            # CDash has caught intermittent cte_shm_metadata_cache_all
-            # failures there (Win32 error 1224, ERROR_USER_MAPPED_FILE) that
+            # CDash has caught intermittent shared-memory test failures
+            # there (first in the since-removed cte_shm_metadata_cache_all) (Win32 error 1224, ERROR_USER_MAPPED_FILE) that
             # look like the same real-time-scan-holds-the-file-open flake as
             # the link.exe case above, just on this directory instead.
             Add-MpPreference -ExclusionPath "$env:TEMP\clio_$env:USERNAME" -ErrorAction SilentlyContinue
@@ -250,6 +252,7 @@ jobs:
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
       - name: Run tests
+        if: github.event_name != 'pull_request'
         # VCPKG_APPLOCAL_DEPS=OFF above (see #848: the z-applocal DLL copy
         # intermittently dies with ERROR_SHARING_VIOLATION) means dependency
         # DLLs were never copied next to the exes -- resolve them from the
@@ -258,11 +261,11 @@ jobs:
           $env:PATH = "${{ github.workspace }}\build\vcpkg_installed\${{ matrix.triplet }}\debug\bin;${{ github.workspace }}\build\vcpkg_installed\${{ matrix.triplet }}\bin;$env:PATH"
           ctest --test-dir build -T Test --build-config Debug --output-on-failure --timeout 120 --repeat until-pass:3 -LE "ollama|flaky"
       - name: Submit results to CDash
-        if: always()
+        if: always() && github.event_name != 'pull_request'
         continue-on-error: true
         run: ctest --test-dir build -T Submit --build-config Debug
       - name: Summarize failed tests
-        if: always()
+        if: always() && github.event_name != 'pull_request'
         shell: bash
         run: |
           LOG="build/Testing/Temporary/LastTest.log"
@@ -277,13 +280,13 @@ jobs:
             echo "(LastTest.log not found)" >> "$GITHUB_STEP_SUMMARY"
           fi
       - name: Report retried-but-passed tests
-        if: always()
+        if: always() && github.event_name != 'pull_request'
         shell: bash
         # A green check must not mean "some test failed and we retried until it
         # did not" (#921). Reports only -- never fails the job.
         run: bash CI/report_flaky_tests.sh build/Testing/Temporary/LastTest.log "windows ${{ matrix.os }}"
       - name: Upload test logs
-        if: always()
+        if: always() && github.event_name != 'pull_request'
         # Never let the artifact service sink an otherwise-green job (#921).
         # These logs are diagnostics; the verdict already came from "Run tests".
         # Seen on PR #920: build-test (windows-11-arm) passed every one of its
@@ -300,6 +303,7 @@ jobs:
   # ---- Intel oneAPI (icx-cl) compiler variant (#555) ------------------------
   icx:
     name: icx (${{ matrix.os }})
+    if: github.event_name != 'pull_request'
     needs: matrix-tier
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
@@ -371,8 +375,8 @@ jobs:
             # a sparse file under %TEMP%/clio_$USERNAME (SystemInfo::
             # GetMemfdDir) and recreates that file on every shm_init. This is
             # outside the workspace, so the exclusion above does not cover it.
-            # CDash has caught intermittent cte_shm_metadata_cache_all
-            # failures there (Win32 error 1224, ERROR_USER_MAPPED_FILE) that
+            # CDash has caught intermittent shared-memory test failures
+            # there (first in the since-removed cte_shm_metadata_cache_all) (Win32 error 1224, ERROR_USER_MAPPED_FILE) that
             # look like the same real-time-scan-holds-the-file-open flake as
             # the link.exe case above, just on this directory instead.
             Add-MpPreference -ExclusionPath "$env:TEMP\clio_$env:USERNAME" -ErrorAction SilentlyContinue
@@ -452,6 +456,11 @@ jobs:
           echo Using Visual Studio at: %VSINSTALL%
           call "%VSINSTALL%\VC\Auxiliary\Build\vcvarsall.bat" x64 || exit /b 1
           call "%ProgramFiles(x86)%\Intel\oneAPI\setvars.bat" || exit /b 1
+          rem The newest Visual Studio on the image (VS 18, MSVC 14.52) ships an
+          rem STL whose yvals_core.h rejects any Clang older than 22 with
+          rem STL1000; icx 2025.3 is Clang 21. Microsoft's documented override
+          rem lets the pair build until Intel ships a Clang 22 based icx.
+          set "CXXFLAGS=/D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
           cmake -B build -G Ninja ^
             -DCMAKE_C_COMPILER=icx-cl ^
             -DCMAKE_CXX_COMPILER=icx-cl ^
@@ -547,168 +556,8 @@ jobs:
             build/Testing/Temporary/CTestCostData.txt
           if-no-files-found: warn
 
-  # ---- Boost.Context stackful coroutine backend (#620) ----------------------
-  boost:
-    name: boost (${{ matrix.os }})
-    # Push-only (issue #921): the Boost.Context coroutine backend is a build
-    # variant, not an arch, and it has never been the first job to catch a
-    # regression MSVC did not. It gates main/dev, not every PR commit.
-    if: github.event_name != 'pull_request'
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 120
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-2025
-            triplet: x64-windows
-            arch: x64
-    env:
-      VCPKG_DEFAULT_TRIPLET: ${{ matrix.triplet }}
-      CAE_LABEL_TEST_SKIP: "1"
-    steps:
-      # actions/checkout has no retry, and Windows runners intermittently fail
-      # the fetch with a transient schannel SEC_E_UNTRUSTED_ROOT (#1043). Let
-      # the first attempt fail, pause, and check out once more.
-      - name: Checkout repository
-        id: checkout
-        continue-on-error: true
-        uses: actions/checkout@v6
-        with:
-          submodules: recursive
-      - name: Wait before retrying checkout
-        if: steps.checkout.outcome == 'failure'
-        shell: pwsh
-        run: Start-Sleep -Seconds 15
-      - name: Checkout repository (retry)
-        if: steps.checkout.outcome == 'failure'
-        uses: actions/checkout@v6
-        with:
-          submodules: recursive
-      # Windows link steps intermittently fail with "Access is denied" or
-      # "The process cannot access the file because it is being used by another
-      # process" while cmake replaces a freshly written .exe. The holder is
-      # Defender's real-time scanner opening the new binary the instant it
-      # lands. Observed on 3 of the last 5 dev CI Windows runs, hitting a
-      # different random target each time (test_blob_block_reuse,
-      # test_ring_buffer_ext, ...), which is why it reads as a flake.
-      #
-      # Excluding the workspace and the toolchain processes removes the
-      # scanner from the link path. Best-effort: if Defender is absent or the
-      # runner refuses the call, the build proceeds exactly as before.
-      #
-      # vcpkg.exe/MSBuild.exe and the vcpkg root are excluded too, after a
-      # "Access is denied" failure in the `vcpkg z-applocal` DLL-deployment
-      # step (MSB3075) whose source DLLs live under VCPKG_INSTALLATION_ROOT,
-      # which the workspace exclusion does not cover.
-      #
-      # Caveat: that applocal failure has been seen once, and Defender is not
-      # the only candidate. MSBuild builds many test executables in parallel
-      # and each runs applocal deployment, so two projects copying the same
-      # DLL into build/bin concurrently would also produce a sharing
-      # violation reported as "Access is denied" -- and exclusions would not
-      # help that. If MSB3075 recurs with these exclusions in place, the
-      # parallel-copy explanation is the one to pursue.
-      - name: Exclude workspace from Defender (link-flake mitigation)
-        shell: pwsh
-        continue-on-error: true
-        run: |
-          try {
-            Add-MpPreference -ExclusionPath "${{ github.workspace }}" -ErrorAction Stop
-            Add-MpPreference -ExclusionProcess "link.exe","lld-link.exe","cl.exe","icx.exe","mspdbsrv.exe","ninja.exe","vcpkg.exe","MSBuild.exe" -ErrorAction Stop
-            if ($env:VCPKG_INSTALLATION_ROOT) {
-              Add-MpPreference -ExclusionPath "$env:VCPKG_INSTALLATION_ROOT" -ErrorAction SilentlyContinue
-            }
-            # PosixShmMmap backs each named Windows shared-memory segment with
-            # a sparse file under %TEMP%/clio_$USERNAME (SystemInfo::
-            # GetMemfdDir) and recreates that file on every shm_init. This is
-            # outside the workspace, so the exclusion above does not cover it.
-            # CDash has caught intermittent cte_shm_metadata_cache_all
-            # failures there (Win32 error 1224, ERROR_USER_MAPPED_FILE) that
-            # look like the same real-time-scan-holds-the-file-open flake as
-            # the link.exe case above, just on this directory instead.
-            Add-MpPreference -ExclusionPath "$env:TEMP\clio_$env:USERNAME" -ErrorAction SilentlyContinue
-            Write-Host "Defender exclusions added for ${{ github.workspace }}"
-          } catch {
-            Write-Host "Could not add Defender exclusions (continuing): $_"
-          }
-      - name: Bootstrap vcpkg
-        shell: pwsh
-        run: |
-          cd $env:VCPKG_INSTALLATION_ROOT
-          # bootstrap-vcpkg downloads vcpkg.exe from the vcpkg-tool GitHub
-          # release, and that download intermittently dies with a WinHttp
-          # connection error -- seen on dev as
-          #   WinHttpReceiveResponse got error 0x00002EFE
-          #   Downloading vcpkg.exe failed. Please check your internet connection
-          # which failed a whole push build on windows-2022 with nothing wrong
-          # in the tree. Retry with a backoff; `git pull` is a network call
-          # too, so it retries alongside.
-          $ok = $false
-          for ($i = 1; $i -le 5; $i++) {
-            git pull
-            .\bootstrap-vcpkg.bat
-            if ($LASTEXITCODE -eq 0) { $ok = $true; break }
-            $delay = $i * 15
-            Write-Host "bootstrap-vcpkg attempt $i failed (exit $LASTEXITCODE); retry in ${delay}s"
-            Start-Sleep -Seconds $delay
-          }
-          if (-not $ok) {
-            Write-Error "bootstrap-vcpkg failed after 5 attempts"
-            exit 1
-          }
-      - name: Configure CMake (Boost backend, vcpkg boost-context feature)
-        run: |
-          cmake -B build-boost -A ${{ matrix.arch }} `
-            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
-            -DVCPKG_TARGET_TRIPLET="${{ matrix.triplet }}" `
-            -DVCPKG_MANIFEST_DIR="${{ github.workspace }}/installers/vcpkg" `
-            -DVCPKG_MANIFEST_FEATURES="boost-coroutines" `
-            -DVCPKG_OVERLAY_PORTS="${{ github.workspace }}/installers/vcpkg/overlay-ports" `
-            -DVCPKG_APPLOCAL_DEPS=OFF `
-            -DCMAKE_BUILD_TYPE=Release `
-            -DCLIO_CORE_ENABLE_BOOST_COROUTINES=ON `
-            -DCLIO_CORE_ENABLE_RUNTIME=ON `
-            -DCLIO_CORE_ENABLE_CTE=ON `
-            -DCLIO_CORE_ENABLE_CAE=ON `
-            -DCLIO_CORE_ENABLE_CEE=OFF `
-            -DCLIO_CTE_ENABLE_FILESYSTEM=ON `
-            -DCLIO_CORE_ENABLE_TESTS=ON `
-            -DCLIO_CORE_ENABLE_PYTHON=OFF `
-            -DCLIO_CORE_ENABLE_ZMQ=ON `
-            -DCLIO_CORE_ENABLE_CEREAL=ON `
-            -DCLIO_CORE_ENABLE_CONDA=OFF `
-            -DCLIO_CORE_ENABLE_ELF=OFF `
-            -DCLIO_CORE_ENABLE_RPATH=OFF `
-            -DCLIO_CTE_ENABLE_VFD=OFF `
-            -DCLIO_CTE_ENABLE_HDF5_VOL=OFF `
-            -DCLIO_CORE_ENABLE_BENCHMARKS=OFF `
-            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON `
-            -DCLIO_CTP_LOG_LEVEL=0
-      # Retry once on a transient Windows link lock — see the build-test Build
-      # step and issue #800.
-      - name: Build
-        shell: pwsh
-        run: |
-          # See the build-test Build step: pwsh 'Stop' + native-command error
-          # preference would abort before the retry could run.
-          $ErrorActionPreference = 'Continue'
-          $PSNativeCommandUseErrorActionPreference = $false
-          cmake --build build-boost --config Release -j $env:NUMBER_OF_PROCESSORS
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "::warning::BUILD-RETRY: first boost build attempt failed (exit $LASTEXITCODE); retrying once — see issue #800"
-            Start-Sleep -Seconds 5
-            cmake --build build-boost --config Release -j $env:NUMBER_OF_PROCESSORS
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          }
-      - name: Run tests
-        # VCPKG_APPLOCAL_DEPS=OFF (#848): DLLs resolve from the vcpkg tree
-        run: |
-          $env:PATH = "${{ github.workspace }}\build-boost\vcpkg_installed\${{ matrix.triplet }}\bin;${{ github.workspace }}\build-boost\vcpkg_installed\${{ matrix.triplet }}\debug\bin;$env:PATH"
-          ctest --test-dir build-boost --build-config Release --output-on-failure --timeout 180 --repeat until-pass:3 -LE "ollama|flaky"
-      - name: Report retried-but-passed tests
-        if: always()
-        shell: bash
-        # A green check must not mean "some test failed and we retried until it
-        # did not" (#919/#921). Reports only -- never fails the job.
-        run: bash CI/report_flaky_tests.sh build-boost/Testing/Temporary/LastTest.log "windows boost"
+  # ---- Boost.Context stackful coroutine backend (#620): Linux only ---------
+  # The Boost backend is opt-in (CLIO_CORE_ENABLE_BOOST_COROUTINES=OFF by
+  # default) and only forced on for NVHPC, which is Linux. Nothing shipped on
+  # this platform uses it, so it is tested on Linux (ci-linux.yml: boost-docker,
+  # boost-native on x86_64 and arm64) and not here.

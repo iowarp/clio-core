@@ -1,0 +1,123 @@
+<!--
+title: Compose using an agent
+heading: Compose the stack <em>with an agent.</em>
+description: Install CLIO Kit's CLIO Core skills into Claude Code, Codex, Cursor or another agent, have it write a compose section for your hardware and durability needs, review what it wrote, and test the guarantee it claims.
+eyebrow: Tutorial · Compose
+lede: CLIO Kit packages what an agent needs to know to compose CLIO Core: every shipped module, what each one guarantees, and complete recipes. Install it once, describe your hardware and the failures your data must survive, and review the YAML the agent hands back.
+facts: Time | 15 minutes ; You need | A working install, uv, and Claude Code, Codex, Cursor or another agent that reads skills ; Result | A reviewed <code>clio.yaml</code> and a crash test of its durability claim
+-->
+<h2>1. What CLIO Kit gives your agent</h2>
+<p><a href="https://github.com/iowarp/clio-kit">CLIO Kit</a> is IOWarp's marketplace of agent skills, MCP servers and plugins for scientific computing. Its <code>clio-core</code> bundle holds a skill for composing a storage system, one skill per shipped module, and skills for writing new modules and GPU kernels. A skill is a folder of instructions that the agent loads when your request matches it. Each module skill lists every configuration key with its default, the module's client API, and what it loses to each kind of failure, so the agent does not need the CLIO Core source. These skills call no MCP server.</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Skill</th><th>The agent uses it to</th></tr></thead>
+  <tbody>
+    <tr><td><code>storage-compose</code></td><td>Choose and order modules, write the <code>compose</code> list, and state what is durable, consistent and available after each kind of failure</td></tr>
+    <tr><td><code>clio-runtime-config</code></td><td>The config file outside <code>compose</code>, environment variables, the <code>clio-run</code> commands, multi-node and Docker</td></tr>
+    <tr><td><code>clio-bdev</code></td><td>Block devices and storage tiers, and the erasure-coded <code>safe_bdev</code> array</td></tr>
+    <tr><td><code>clio-cte-core</code></td><td>The CTE core's keys, and the C++ and Python blob API</td></tr>
+    <tr><td><code>clio-cte-caches</code></td><td>The write-back, write-thru, shared-memory and node-copy caches</td></tr>
+    <tr><td><code>clio-replication</code></td><td>Copies on other nodes, failover and hand-back</td></tr>
+    <tr><td><code>clio-compressor</code></td><td>Transparent compression and its codecs</td></tr>
+    <tr><td><code>clio-indexer</code></td><td>Keyword search over stored data</td></tr>
+    <tr><td><code>clio-fs</code></td><td>The filesystem and stream modules, and mounting with FUSE</td></tr>
+    <tr><td><code>clio-cae</code></td><td>Importing data with OMNI files and <code>clio-cae</code>, and the summarizer</td></tr>
+    <tr><td><code>chimod-dev</code></td><td>Write, build and load a new ChiMod or data-path operator outside the CLIO Core repository</td></tr>
+    <tr><td><code>gpu-vector</code></td><td>Write and tune GPU kernels over the paged out-of-core vector</td></tr>
+  </tbody>
+</table></div>
+<p>This tutorial uses <code>storage-compose</code>, which loads the module skills as it writes each entry.</p>
+
+<h2>2. Install the launcher</h2>
+<p>The <code>clio-kit</code> command installs skills into an agent's skill directory.</p>
+<div class="tabs" data-label="Where CLIO Kit comes from">
+  <section class="tab-panel" data-tab="Release"><p class="tab-title">Release</p>
+<pre data-label="shell">
+$ uv tool install clio-kit
+$ clio-kit skill list --bundle clio-core
+</pre>
+<p>If the list is empty, your release predates the <code>clio-core</code> bundle. Use the checkout route.</p></section>
+  <section class="tab-panel" data-tab="Checkout"><p class="tab-title">Checkout</p>
+<pre data-label="shell">
+$ git clone https://github.com/iowarp/clio-kit.git
+$ cd clio-kit
+$ uv tool install --force --reinstall --editable .
+$ clio-kit skill list --bundle clio-core
+</pre>
+<p>Keep the checkout: an editable install reads the skills from it.</p></section>
+</div>
+<p>The list names the twelve skills in the table above. If <code>clio-kit</code> is not found, run <code>uv tool update-shell</code> and open a new shell.</p>
+
+<h2>3. Install the skills into your agent</h2>
+<p>Run these from the project directory where you will work with the agent.</p>
+<div class="tabs" data-label="Your agent">
+  <section class="tab-panel" data-tab="Claude Code"><p class="tab-title">Claude Code</p>
+<p>Claude Code installs the bundle as a plugin from the CLIO Kit marketplace:</p>
+<pre data-label="shell">
+$ claude plugin marketplace add iowarp/clio-kit
+$ claude plugin install clio-core-skills@clio-kit
+</pre>
+<p>From a checkout, pass its path to <code>marketplace add</code> instead of <code>iowarp/clio-kit</code>. To copy the skill folders into the project instead, use <code>clio-kit skill install --bundle clio-core --target .claude/skills</code>.</p></section>
+  <section class="tab-panel" data-tab="Codex"><p class="tab-title">Codex</p>
+<pre data-label="shell">
+$ clio-kit skill install --bundle clio-core --target .agents/skills
+</pre>
+<p>Use <code>~/.agents/skills</code> to make them available in every project.</p></section>
+  <section class="tab-panel" data-tab="Cursor"><p class="tab-title">Cursor</p>
+<pre data-label="shell">
+$ clio-kit skill install --bundle clio-core --target .cursor/skills
+</pre></section>
+  <section class="tab-panel" data-tab="Other agents"><p class="tab-title">Other agents</p>
+<p>Give <code>--target</code> the directory your agent reads skills from. VS Code, Cursor and Antigravity also read <code>.agents/skills</code>.</p>
+<pre data-label="shell">
+$ clio-kit skill install --bundle clio-core --target &lt;skill directory&gt;
+</pre></section>
+</div>
+<p>Start a new agent session so it picks up the skills.</p>
+
+<h2>4. Describe the system you need</h2>
+<p>Name the hardware, and the failures your data must survive with how much loss you accept. The skill turns those into module choices; adjectives such as "durable" or "fast" leave the agent guessing.</p>
+<pre data-label="prompt">
+Write a clio.yaml compose section for one node with 64 GB of DRAM and a
+2 TB NVMe drive mounted at /mnt/nvme. Data the application has fsynced
+must survive a runtime crash; losing a few seconds of unsynced writes is
+fine. State what an acknowledged put means, and what a kill -9 loses.
+</pre>
+<p>A good answer has:</p>
+<ul>
+  <li>Two CTE cores: a persistent one at 512.0 on the NVMe file tier and a volatile one at 540.0 on DRAM.</li>
+  <li>The replication module, and the write-back cache over both cores.</li>
+  <li><code>persistence_level</code> set on the NVMe tier and <code>performance.metadata_log_path</code> set on the persistent core.</li>
+  <li>A statement that a put is acknowledged once it is in DRAM, that fsync is the durability point, and that a crash loses writes not yet flushed (up to <code>flush_period_ms</code>).</li>
+</ul>
+<p>Add what your setup really needs: more nodes and a node that may fail, a drive that may fail, a POSIX mount, search, or compression. The agent adds replication, an erasure-coded array, the filesystem and stream modules, the indexer or the compressor to match.</p>
+
+<h2>5. Review what it wrote</h2>
+<p>Check these before you run it. Each one is a mistake that starts cleanly and fails later.</p>
+<ul>
+  <li><strong>Order.</strong> Every entry comes after each pool it names in <code>next_pool_id</code>, <code>next_volatile</code>, <code>next_persistent</code>, <code>flush_pool</code> or <code>existing_pool_id</code>.</li>
+  <li><strong>Unique pool ids.</strong> A second pool with a taken id is reported as created and is never made.</li>
+  <li><strong>Durable tiers say so.</strong> A tier without <code>persistence_level</code> is volatile, even a file on NVMe.</li>
+  <li><strong>Metadata is logged.</strong> Without <code>metadata_log_path</code>, the bytes survive a restart but nothing records which blob they belong to.</li>
+  <li><strong>No volatile and persistent devices in one core.</strong> Two cores joined by the write-back cache, not one mixed core.</li>
+  <li><strong>Search and labeling are scoped.</strong> The indexer's <code>tag_re</code> and the summarizer's rules match only the data you need searched or labeled.</li>
+</ul>
+<p>Every key is described in the module skills, in the commented default config (<code>~/.clio/clio.yaml</code> after a pip install), and on the <a href="/modules/index.html">module pages</a>.</p>
+
+<h2>6. Start it and test the claim</h2>
+<pre data-label="shell">
+$ CLIO_SERVER_CONF=$PWD/clio.yaml clio-run start &
+</pre>
+<p>Open the dashboard's <strong>Pools</strong> page (<a href="/tutorials/dashboard.html">Navigate the dashboard</a>) and check that every pool in the file is listed. Then ask the agent to prove the durability statement it made:</p>
+<pre data-label="prompt">
+Write and run a crash test for this deployment: write data, fsync it,
+kill -9 the runtime, start it again without --fresh, and read the data
+back. Repeat without the fsync and report what was lost.
+</pre>
+<p>The fsynced data must come back. What the run without fsync loses must match the window the agent stated in step 4. If it does not, the configuration or the statement is wrong: show the agent the result and have it fix one or the other.</p>
+
+<h2>Next</h2>
+<ul>
+  <li><a href="/tutorials/compose.html">Compose local tiers</a> explains each tier key by hand.</li>
+  <li><a href="/tutorials/operators.html">Compose data operators</a> covers erasure coding, replication and compression.</li>
+  <li><a href="/develop/index.html">Custom data operators</a> pairs with the <code>chimod-dev</code> skill.</li>
+</ul>

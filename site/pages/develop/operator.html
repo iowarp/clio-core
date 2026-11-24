@@ -3,7 +3,7 @@ title: Write a chain operator
 heading: Write a <em>chain operator.</em>
 description: Build a CLIO Core data operator outside the source tree, insert it into the storage chain, and read its statistics from the dashboard API and Python.
 eyebrow: Develop · Guide
-lede: This guide builds <code>bytecount</code>, an operator that sits between the filesystem and the cache, passes every call through unchanged, and counts the bytes written to each file. It is small, but it has everything a real operator needs.
+lede: This guide builds <code>bytecount</code>, an operator that sits between the filesystem and the indexer at the top of the chain, passes every call through unchanged, and counts the bytes written to each file. It is small, but it has everything a real operator needs.
 facts: Time | 30 minutes ; You need | CLIO Core built from source, on Linux ; Result | A module loaded from your own build directory
 -->
 <h2>1. Install CLIO Core into a prefix</h2>
@@ -13,7 +13,7 @@ $ cmake --install build --prefix $HOME/clio-inst
 $ export PATH=$HOME/clio-inst/bin:$PATH
 $ export PYTHONPATH=$HOME/clio-inst/ext
 </pre>
-<p>Use the installed <code>clio_run</code> and <code>clio_cte_fuse</code> from now on, so the runtime and your module load the same CLIO Core libraries.</p>
+<p>Use the installed <code>clio-run</code> and <code>clio_cte_fuse</code> from now on, so the runtime and your module load the same CLIO Core libraries.</p>
 
 <h2>2. Lay out the module</h2>
 <pre data-label="files">
@@ -564,22 +564,23 @@ $ cmake --build bytecount/build
 <p>If CMake reports that the target <code>yaml-cpp::yaml-cpp</code> was not found, keep the <code>find_package(yaml-cpp REQUIRED)</code> line above <code>find_package(clio-core)</code>.</p>
 
 <h2>8. Put it in the chain</h2>
-<p>Copy your configuration and add the operator right after the <code>clio_cte_cache</code> entry, since it forwards to the cache:</p>
+<p>Copy your configuration and add the operator right after the <code>clio_cte_indexer</code> entry, since it forwards to the indexer, the top of the default chain:</p>
 <pre data-label="yaml · clio.yaml">
-  # The bytecount operator: counts bytes written, then forwards to the cache.
+  # The bytecount operator: counts bytes written, then forwards to the indexer.
   - mod_name: clio_demo_bytecount
     pool_name: bytecount
     pool_query: local
     pool_id: "600.0"
-    next_pool_id: "563.0"
+    next_pool_id: "564.0"
 </pre>
-<p>Then send the filesystem through it: in the <code>clio_cte_filesystem</code> entry, change <code>next_pool_id</code> from <code>"563.0"</code> to <code>"600.0"</code>.</p>
+<p>Then send the filesystem through it: in the <code>clio_cte_filesystem</code> entry, change <code>next_pool_id</code> from <code>"564.0"</code> to <code>"600.0"</code>. The chain is now filesystem 560.0, bytecount 600.0, indexer 564.0, shm cache 568.0, write-back 567.0.</p>
+<p>Why above the indexer and not lower down? A client bound to 600.0 does not use the shm cache's no-task write path (that path is only taken by a client bound to the shm cache or its entry pool, 564.0). So every page write reaches the operator as a <code>PutBlob</code> task. Below the shm cache, the operator would see only the cache's flush batches (<code>MultiPutBlob</code>), some time after each write. That works too, by setting the shm cache's <code>next_pool_id</code> to 600.0 and the operator's to 567.0, but the counts then lag the writes.</p>
 
 <h2>9. Run it</h2>
 <pre data-label="shell">
 $ export CLIO_REPO_PATH=$HOME/bytecount/build     # where the runtime finds the module
 $ export CLIO_SERVER_CONF=$HOME/clio-bytecount.yaml
-$ clio_run start &
+$ clio-run start &
 $ CLIO_WITH_RUNTIME=0 clio_cte_fuse ~/clio-mnt -f &
 </pre>
 <p>The runtime log shows <code>Loaded ChiMod: clio_demo_bytecount</code>, and the FUSE daemon prints <code>data pool 600.0 (filesystem chain)</code>. Write some files:</p>

@@ -253,6 +253,6 @@ To integrate these tests in CI/CD:
 
 ## Documentation References
 
-- [CTE Core API Documentation](../../docs/cte/cte.md)
+- [CTE Core API Documentation](https://core.iowarp.ai/docs/cte/api.html)
 - [Python Bindings Implementation](core_bindings.cc)
-- [Module Development Guide](../../../docs/docs/sdk/context-runtime/2.module_dev_guide.md)
+- [Module Development Guide](https://core.iowarp.ai/develop/)

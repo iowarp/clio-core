@@ -70,6 +70,8 @@ def main():
   ap.add_argument('--baseline', default='')
   ap.add_argument('--threshold', type=float, default=0.20)
   ap.add_argument('--out', default='')
+  ap.add_argument('--title', default='Ares',
+                  help='system name in the report heading')
   a = ap.parse_args()
 
   cur = load(a.run)
@@ -102,7 +104,7 @@ def main():
       elif d and change * d > a.threshold:
         perf_better.append((leg, name, mk, m0[mk], v, change))
 
-  lines = [f'# Ares run report: `{a.run}`', '',
+  lines = [f'# {a.title} run report: `{a.run}`', '',
            f'baseline: `{a.baseline or "(none)"}`, '
            f'perf threshold {int(a.threshold * 100)}%', '']
   counts = {}

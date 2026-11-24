@@ -20,19 +20,17 @@ install(TARGETS clio_cte_bench
   RUNTIME DESTINATION bin
 )
 
-# Zero-IPC read path under sustained write load (issue #787): how often
-# GetBlobSize/GetBlob readers retry or fall back to RPC while one blob is
-# rewritten in place. Run against cte_config_shm_read.yaml.
-add_executable(clio_cte_shm_read_bench
-  clio_cte_shm_read_bench.cc
+# clio_cte_shm_wtc_bench: task path vs shm write-through cache path per op
+# (run against a runtime composed with cte_config_shm_wtc.yaml).
+add_executable(clio_cte_shm_wtc_bench
+  clio_cte_shm_wtc_bench.cc
 )
-target_link_libraries(clio_cte_shm_read_bench
+target_link_libraries(clio_cte_shm_wtc_bench
   clio::cte::core_client
   clio::run::cxx
   ${CMAKE_THREAD_LIBS_INIT}
 )
-target_compile_features(clio_cte_shm_read_bench PRIVATE cxx_std_17)
-install(TARGETS clio_cte_shm_read_bench
+install(TARGETS clio_cte_shm_wtc_bench
   RUNTIME DESTINATION bin
 )
 

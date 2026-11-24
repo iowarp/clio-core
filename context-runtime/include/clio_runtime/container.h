@@ -49,10 +49,23 @@
 #include "clio_runtime/pool_query.h"
 #include "clio_runtime/task.h"
 #include "clio_runtime/task_archives.h"
+#include "clio_runtime/task_cost.h"
 #include "clio_runtime/local_task_archives.h"
 #include "clio_runtime/task_stat_model.h"
 #include "clio_runtime/types.h"
 #include "clio_runtime/viz/viz_server.h"
+
+// ABI fingerprint of the headers this TU is compiled against (generated at
+// build time; see cmake/ClioAbiFingerprint.cmake). Exported by every ChiMod
+// through get_chimod_abi() so ModuleManager can refuse a stale module. The
+// fallback only matters for TUs outside the clio_run_cxx include set, which
+// never define a ChiMod; a ChiMod built with it is refused at load time.
+#if __has_include("clio_runtime/abi_fingerprint_generated.h")
+#include "clio_runtime/abi_fingerprint_generated.h"
+#endif
+#ifndef CLIO_RUNTIME_ABI_FINGERPRINT
+#define CLIO_RUNTIME_ABI_FINGERPRINT ""
+#endif
 
 // Forward declarations to avoid circular dependencies
 namespace clio::run {
@@ -631,6 +644,38 @@ class Container {
   virtual void PostGpuContainerCreate() {}
 
   /**
+   * The pool this container forwards requests to when it sits in a module
+   * chain (an interposer's next pool). Lets the runtime walk a chain from
+   * its top to the pool at its bottom without knowing any module's config.
+   * @return the next pool, or a null PoolId when this container does not
+   *         forward (the bottom of a chain, or a standalone module)
+   */
+  virtual PoolId GetNextPool() const { return PoolId::GetNull(); }
+
+  /**
+   * The pool that takes this pool's traffic once it is unplugged (stopped or
+   * removed). When non-null, destroying this pool leaves a redirect behind:
+   * tasks still addressed to it -- from pools stacked above it that were
+   * never reconfigured -- are routed to the successor instead of failing.
+   * Opt-in, unlike GetNextPool: only a module whose next pool speaks its
+   * full interface and holds a superset of its data may name one (a cache
+   * over its backing store; not a compressor, whose next pool holds
+   * transformed bytes).
+   * @return the successor pool, or a null PoolId for no redirect
+   */
+  virtual PoolId GetUnplugSuccessor() const { return PoolId::GetNull(); }
+
+  /**
+   * Fill the OUT fields of a create task that found this pool already
+   * existing. Get-or-create on an existing pool never runs the module's
+   * Create, so without this hook a later caller would receive only the
+   * params it sent. Called on the node that answered the create, only when
+   * the task names this pool's ChiMod.
+   * @param create_task the create task (an admin::CreatePoolFields)
+   */
+  virtual void FillExistingCreate(Task *create_task) { (void)create_task; }
+
+  /**
    * Serialize task parameters for network transfer (unified method)
    * Must be implemented by derived classes
    * Uses switch-case structure based on method ID to dispatch to appropriate serialization
@@ -906,6 +951,7 @@ typedef clio::run::Container* (*new_chimod_t)(const clio::run::PoolId* pool_id,
                                         const char* pool_name);
 typedef const char* (*get_chimod_name_t)(void);
 typedef void (*destroy_chimod_t)(clio::run::Container* container);
+typedef const char* (*get_chimod_abi_t)(void);
 }
 
 /**
@@ -933,6 +979,8 @@ typedef void (*destroy_chimod_t)(clio::run::Container* container);
   void destroy_chimod(clio::run::Container* container) {                   \
     delete reinterpret_cast<CONTAINER_CLASS*>(container);            \
   }                                                                  \
+                                                                     \
+  const char* get_chimod_abi() { return CLIO_RUNTIME_ABI_FINGERPRINT; } \
                                                                      \
   static bool is_clio_chimod_ = true;                            \
   }
@@ -967,6 +1015,8 @@ typedef void (*destroy_chimod_t)(clio::run::Container* container);
   void destroy_chimod(clio::run::Container* container) {                   \
     delete reinterpret_cast<CONTAINER_CLASS*>(container);            \
   }                                                                  \
+                                                                     \
+  const char* get_chimod_abi() { return CLIO_RUNTIME_ABI_FINGERPRINT; } \
                                                                      \
   static bool is_clio_chimod_ = true;                            \
   }

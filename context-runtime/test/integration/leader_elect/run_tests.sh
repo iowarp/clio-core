@@ -11,6 +11,14 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../../../" && pwd)"
 
+# Bounded waits + diagnostics (CI/compose_wait.sh): readiness is `clio_run
+# status` on every node, every docker exec runs against ONE deadline below the
+# workflow step's timeout-minutes (15), and a timeout or failure dumps every
+# node's logs, processes and thread state.
+# shellcheck source=../../../../CI/compose_wait.sh
+source "$REPO_ROOT/CI/compose_wait.sh"
+SUITE_NODES=(iowarp-leader-elect-node1 iowarp-leader-elect-node2 iowarp-leader-elect-node3 iowarp-leader-elect-node4)
+
 # Export workspace path for docker-compose
 if [ -n "${HOST_WORKSPACE:-}" ]; then
     export IOWARP_CORE_ROOT="${HOST_WORKSPACE}"
@@ -80,8 +88,11 @@ start_docker_cluster() {
 
     docker compose up -d
 
-    log_info "Waiting for containers to initialize..."
-    sleep 10
+    log_info "Waiting for runtimes to report RUNNING..."
+    if ! cw_wait_runtimes; then
+        docker compose down 2>/dev/null || true
+        exit 1
+    fi
 
     docker compose ps
 
@@ -99,7 +110,7 @@ stop_docker_cluster() {
 # Run a single test phase inside the Docker cluster
 run_single_test() {
     local filter="$1"
-    docker exec iowarp-leader-elect-node1 bash -c "
+    cw_exec_or_dump iowarp-leader-elect-node1 bash -c "
         export CLIO_WITH_RUNTIME=0
         clio_run_leader_elect_tests '$filter'
     "
@@ -117,7 +128,7 @@ check_cluster_status() {
         running=$(docker inspect -f '{{.State.Running}}' "$cname" 2>/dev/null || echo "gone")
         if [ "$running" = "true" ]; then
             local procs
-            procs=$(docker exec "$cname" pgrep -a clio_run 2>/dev/null || echo "(none)")
+            procs=$(timeout 20 docker exec "$cname" pgrep -a clio_run 2>/dev/null || echo "(none)")
             log_info "  $cname: UP  runtime=$procs"
         else
             log_warning "  $cname: DOWN ($running)"
@@ -136,7 +147,7 @@ run_test_docker_direct() {
 
     # Wait for all runtimes to be ready
     log_info "Waiting for runtimes to initialize across all nodes..."
-    sleep 5
+    cw_wait_runtimes || return 1
     check_cluster_status "after init"
 
     # Phase 1: Leader shutdown and failover
@@ -154,10 +165,12 @@ run_test_docker_direct() {
     docker exec -d iowarp-leader-elect-node1 \
         /workspace/build/bin/clio_run runtime start
 
-    # Wait for the restarted runtime to initialize and rejoin the cluster
-    log_info "Waiting 10s for restarted runtime to initialize..."
+    # Wait for the restarted runtime to answer `clio_run status`, then give
+    # SWIM the old 10 s to re-admit it (no observable rejoin signal yet).
+    log_info "Waiting for the restarted runtime to report RUNNING..."
+    cw_wait_runtimes iowarp-leader-elect-node1 || return 1
     sleep 10
-    check_cluster_status "after restart + 10s"
+    check_cluster_status "after restart (RUNNING + 10s rejoin)"
 
     # Phase 2: Verify system health after leader restart
     log_info "Phase 2: Running post-restart health check..."
@@ -224,6 +237,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 COMMAND=${COMMAND:-all}
+
+cw_init "${LEADER_ELECT_BUDGET_SEC:-720}" "${SUITE_NODES[@]}"
 
 # Main execution
 log_info "IOWarp Leader Election Test Runner"

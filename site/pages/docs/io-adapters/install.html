@@ -1,0 +1,89 @@
+<!--
+title: Install
+heading: Install the <em>I/O adapters.</em>
+description: How to build the CLIO Core I/O adapters from source: the CMake option for each adapter, the ELF, MPI, HDF5 and ADIOS2 dependencies, the libraries each build produces and where they are installed. The adapters are not in pip, conda, Spack or the prebuilt packages.
+eyebrow: Docs · I/O adapters
+lede: Each adapter is a CMake option of a source build, and all of them except POSIX are off by default. The interceptors also need ELF support, which is off by default too, so a default build contains no adapter at all.
+facts: Install method | Spack or a CMake source build ; Interceptors | Linux, CLIO_CORE_ENABLE_ELF=ON ; HDF5 | 1.14 or newer ; Output | build/bin, installed to lib/
+-->
+<div class="callout warn">
+  <span class="callout-title">Spack or a source build</span>
+  <p>The interceptors (POSIX, STDIO, MPI-IO), the HDF5 VFD and the GPUDirect Storage adapter are not in <code>pip install iowarp-core</code>, the conda packages, the Docker image, or the .deb, .rpm, AppImage and Windows packages. The Docker image, <code>iowarp/deploy-cpu</code>, does include the HDF5 VOL connector and the ADIOS2 engine. Spack builds the interceptors and both HDF5 connectors by default (<code>+posix +stdio +mpiio +vol +vfd</code>) and adds <code>+adios2</code> and <code>+gds</code> on request. For a source build, use the options on this page: <a href="https://github.com/iowarp/clio-core/blob/main/INSTALL.md"><code>INSTALL.md</code></a> lists the platform prerequisites, and the <a href="/index.html#install">install matrix</a> on the home page writes the configure command.</p>
+</div>
+
+<h2>Options at a glance</h2>
+<table>
+  <tr><th>Adapter</th><th>CMake options</th><th>Default</th><th>Also needs</th><th>Library (build tree)</th></tr>
+  <tr><td>POSIX</td><td><code>CLIO_CTE_ENABLE_POSIX_ADAPTER=ON</code> and <code>CLIO_CORE_ENABLE_ELF=ON</code></td><td>ON, but inert while ELF is OFF</td><td>libelf (pkg-config <code>libelf</code>), Linux</td><td><code>build/bin/libclio_cte_posix.so</code></td></tr>
+  <tr><td>STDIO</td><td><code>CLIO_CTE_ENABLE_STDIO_ADAPTER=ON</code> and <code>CLIO_CORE_ENABLE_ELF=ON</code></td><td>OFF</td><td>libelf, Linux</td><td><code>build/bin/libclio_cte_stdio.so</code></td></tr>
+  <tr><td>MPI-IO</td><td><code>CLIO_CTE_ENABLE_MPIIO_ADAPTER=ON</code> and <code>CLIO_CORE_ENABLE_ELF=ON</code></td><td>OFF</td><td>libelf, Linux, an MPI (OpenMPI or MPICH)</td><td><code>build/bin/libclio_cte_mpiio.so</code></td></tr>
+  <tr><td>HDF5 VOL</td><td><code>CLIO_CTE_ENABLE_HDF5_VOL=ON</code></td><td>OFF</td><td>HDF5 1.14 or newer</td><td><code>build/bin/libclio_hdf5_vol.so</code></td></tr>
+  <tr><td>HDF5 VFD</td><td><code>CLIO_CTE_ENABLE_VFD=ON</code></td><td>OFF</td><td>HDF5 1.14 or newer</td><td><code>build/bin/libclio_vfd.so</code></td></tr>
+  <tr><td>ADIOS2</td><td><code>CLIO_CTE_ENABLE_ADIOS2_ADAPTER=ON</code></td><td>OFF</td><td>ADIOS2; MPI optional</td><td><code>build/bin/libiowarp_engine.so</code></td></tr>
+</table>
+<p>All adapter libraries are written to the build tree's <code>bin/</code> directory and installed to <code>&lt;prefix&gt;/lib</code> by <code>cmake --install</code>. The options are defined in the top-level <code>CMakeLists.txt</code>; which subdirectory each one builds is decided in <code>context-transfer-engine/adapter/CMakeLists.txt</code>.</p>
+
+<h2>Build everything</h2>
+<p>One configure line for all six adapters on Linux, with MPI and the tests:</p>
+<pre data-label="shell">
+$ git clone --recurse-submodules https://github.com/iowarp/clio-core.git
+$ cd clio-core
+$ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+    -DCLIO_CORE_ENABLE_ELF=ON \
+    -DCLIO_CTE_ENABLE_POSIX_ADAPTER=ON \
+    -DCLIO_CTE_ENABLE_STDIO_ADAPTER=ON \
+    -DCLIO_CTE_ENABLE_MPIIO_ADAPTER=ON -DCLIO_CORE_ENABLE_MPI=ON \
+    -DCLIO_CTE_ENABLE_HDF5_VOL=ON \
+    -DCLIO_CTE_ENABLE_VFD=ON \
+    -DCLIO_CTE_ENABLE_ADIOS2_ADAPTER=ON \
+    -DHDF5_ROOT=/path/to/the/hdf5/your/application/uses \
+    -DCLIO_CORE_ENABLE_TESTS=ON
+$ cmake --build build -j"$(nproc)"
+$ ls build/bin/lib{clio_cte_posix,clio_cte_stdio,clio_cte_mpiio,clio_hdf5_vol,clio_vfd,iowarp_engine}.so
+$ cmake --install build --prefix "$HOME/clio"      # optional: copies them to $HOME/clio/lib
+</pre>
+<p>Leave out the options for adapters you do not need; each one only adds its own dependency. Two presets in <code>CMakePresets.json</code> cover common subsets:</p>
+<ul>
+  <li><code>vfd</code>: a Debug build into <code>build-vfd</code> with ELF, the POSIX and STDIO interceptors and the HDF5 VFD, and tests on. <code>cmake --preset vfd &amp;&amp; cmake --build build-vfd -j</code>.</li>
+  <li><code>release-adapter</code>: a Release build with the HDF5 VOL connector, the ADIOS2 engine and the FUSE daemon, MPI on and ELF off, so no interceptors.</li>
+</ul>
+
+<h2>Per-adapter notes</h2>
+
+<h3>POSIX, STDIO and MPI-IO interceptors</h3>
+<ul>
+  <li><strong>ELF is required.</strong> The interceptors find the real C library and MPI functions by walking the loaded ELF objects, so they are only built when <code>CLIO_CORE_ENABLE_ELF=ON</code>. That option needs libelf, found through pkg-config (<code>sudo apt install libelf-dev pkg-config</code> on Debian and Ubuntu). Without it, configure prints <code>CTE Adapters: DISABLED (ELF support not enabled)</code> and builds none of the three. They are Linux only.</li>
+  <li><strong>The filesystem module comes with them.</strong> Enabling any interceptor (or the VFD or FUSE) forces <code>CLIO_CTE_ENABLE_FILESYSTEM=ON</code>, the <code>clio_cte_filesystem</code> module the interceptors write through. It in turn needs the stream module, <code>CLIO_CTE_ENABLE_STREAM</code>, which is on by default; do not turn it off.</li>
+  <li><strong>MPI-IO detects the MPI flavor.</strong> The MPI-IO interceptor reads implementation-specific <code>MPI_Status</code> fields, so configure asks <code>mpicc</code> whether it is OpenMPI or MPICH and stops with an error if it cannot tell. Force the answer with <code>-DCLIO_CTE_OPENMPI=ON</code> or <code>-DCLIO_CTE_MPICH=ON</code>. Its unit test is only registered when <code>CLIO_CORE_ENABLE_MPI=ON</code>.</li>
+</ul>
+
+<h3>HDF5 VOL connector and VFD</h3>
+<ul>
+  <li><strong>HDF5 1.14 or newer, and the same one as the application.</strong> HDF5 loads the connectors with <code>dlopen</code>, so they must link the same <code>libhdf5</code> as the program that loads them. Point CMake at it with <code>-DHDF5_ROOT=&lt;prefix&gt;</code> (or <code>CMAKE_PREFIX_PATH</code>) and check afterwards with <code>ldd build/bin/libclio_hdf5_vol.so | grep hdf5</code>. A mismatch shows up later as an <code>H5Fopen</code> that fails without naming the library it could not load.</li>
+  <li><strong>The two fail differently when HDF5 is missing.</strong> The VFD requires HDF5 and configure stops with an error if it is absent or older than 1.14. The VOL connector only prints a warning (<code>HDF5 not found. HDF5 VOL adapter will not be built.</code>) and the build continues without it, so check that <code>libclio_hdf5_vol.so</code> exists before you rely on it.</li>
+  <li><strong>No ELF needed.</strong> Both connectors are HDF5 plugins rather than interceptors, so they do not depend on <code>CLIO_CORE_ENABLE_ELF</code> and are not limited to Linux.</li>
+  <li><strong>CAE HDF5 is a different option.</strong> <code>CLIO_CORE_ENABLE_HDF5=ON</code> enables HDF5 support in the Context Assimilation Engine only. It does not build either connector.</li>
+  <li>The VFD's public header <code>H5FDclio.h</code> is installed to <code>include/adapter/vfd/</code> for applications that select the driver in code.</li>
+</ul>
+
+<h3>ADIOS2 engine</h3>
+<ul>
+  <li><strong>ADIOS2 is required once the option is on.</strong> The top-level CMake calls <code>find_package(ADIOS2 REQUIRED)</code>, so configure fails if ADIOS2 cannot be found. Add its prefix to <code>CMAKE_PREFIX_PATH</code>.</li>
+  <li><strong>MPI is optional.</strong> When an MPI C++ compiler is found, the engine links it and configure prints <code>ADIOS2 adapter: MPI support enabled</code>.</li>
+  <li>The engine is compiled as C++17, because some ADIOS2 headers do not parse as C++20 with GCC 11.</li>
+</ul>
+
+<h2>Check the build</h2>
+<p>With <code>CLIO_CORE_ENABLE_TESTS=ON</code>, each adapter registers its own tests. They start a runtime in-process with a test configuration, so no <code>clio-run</code> needs to be running:</p>
+<pre data-label="shell">
+$ ctest --test-dir build -R 'clio_cte_(posix|stdio|mpiio)_unit_tests' --output-on-failure
+$ ctest --test-dir build -R 'clio_cte_vfd_unit_tests|cte_hdf5_vol' --output-on-failure
+$ ctest --test-dir build -L adios2 --output-on-failure
+</pre>
+<p><code>cte_hdf5_vol_compat_suite</code> and <code>cte_hdf5_vfd_compat_suite</code> run the HDF5 differential compatibility suite against native HDF5. They need Python, h5py and the HDF5 command-line tools (<code>h5diff</code>, <code>h5dump</code> and others), and report "Not Run" when those are missing. For the HDF5 connectors, <code>scripts/clio-hdf5-doctor --bin build/bin</code> checks an environment and prints the fix for each problem it finds; add <code>--smoke</code> to round-trip a file through the VOL connector.</p>
+
+<h2>Where to go next</h2>
+<ul>
+  <li>Set up the adapter you built: <a href="/docs/io-adapters/posix.html">POSIX</a>, <a href="/docs/io-adapters/stdio.html">STDIO</a>, <a href="/docs/io-adapters/mpiio.html">MPI-IO</a>, <a href="/docs/io-adapters/hdf5-vol.html">HDF5 VOL</a>, <a href="/docs/io-adapters/hdf5-vfd.html">HDF5 VFD</a>, <a href="/docs/io-adapters/adios2.html">ADIOS2</a>.</li>
+  <li><a href="/docs/io-adapters/configuration.html">Configuration reference</a>: the runtime pools and environment variables the adapters read.</li>
+</ul>

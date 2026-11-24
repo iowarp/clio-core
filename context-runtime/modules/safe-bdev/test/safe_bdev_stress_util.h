@@ -160,6 +160,32 @@ class Array {
         safe_(clio::run::PoolId(base, 0)) {}
 
   /**
+   * Destroy the array pool and every disk pool this object created, and
+   * delete their backing files, so one case leaves no pools or files behind
+   * for the next. This does not close the disks' file descriptors: a file
+   * bdev opens its backing file once per runtime worker, and DestroyPool only
+   * drops the pool's container handles (PoolManager::UnregisterAllContainers)
+   * without destroying the containers, so those descriptors stay open for
+   * the life of the runtime. What keeps a long suite under the open-file
+   * limit is RaiseFdLimit in the runtime (manager.cc), not this cleanup.
+   * Single-node arrays only: a distributed array's disks live on other nodes.
+   */
+  ~Array() {
+    if (distributed_) return;
+    if (created_) DestroyPoolId(safe_.pool_id_);
+    for (const Disk &d : disks_) ReleaseDisk(d);
+    disks_.clear();
+    std::error_code ec;
+    if (!log_.empty()) {
+      std::filesystem::remove(log_, ec);
+      std::filesystem::remove(log_ + ".members", ec);
+      std::filesystem::remove(log_ + ".journal", ec);
+    }
+  }
+  Array(const Array &) = delete;
+  Array &operator=(const Array &) = delete;
+
+  /**
    * Create a fresh file bdev (a new disk).
    * @param d receives the disk
    * @return true on success
@@ -176,7 +202,9 @@ class Array {
     auto t = c.AsyncCreate(clio::run::PoolQuery::Dynamic(), d->path, d->id,
                            bd::BdevType::kFile, kMemberSize);
     t.Wait();
-    return t->GetReturnCode() == 0;
+    if (t->GetReturnCode() != 0) return false;
+    disks_.push_back(*d);
+    return true;
   }
 
   /**
@@ -203,6 +231,7 @@ class Array {
                                distributed);
     t.Wait();
     safe_.pool_id_ = t->new_pool_id_;
+    created_ = t->GetReturnCode() == 0;
     return t->GetReturnCode();
   }
 
@@ -245,13 +274,31 @@ class Array {
     return t->GetReturnCode();
   }
 
-  /** Rebuild an unplugged disk's contents onto a replacement. @return rc. */
+  /**
+   * Rebuild an unplugged disk's contents onto a replacement. On success the
+   * replaced disk is out of the array for good, so its pool is destroyed and
+   * its file deleted (single-node arrays; never the disk Restart() re-creates
+   * the array on). Its descriptors stay open; see ~Array.
+   * @param old_disk the unplugged member
+   * @param fresh the replacement disk
+   * @return RecoverBdev rc
+   */
   clio::run::u32 Recover(const Disk &old_disk, const Disk &fresh) {
     auto t = safe_.AsyncRecoverBdev(clio::run::PoolQuery::Dynamic(),
                                     old_disk.id, fresh.path, fresh.node,
                                     fresh.id);
     t.Wait();
-    return t->GetReturnCode();
+    const clio::run::u32 rc = t->GetReturnCode();
+    if (rc == 0 && !distributed_ && old_disk.id != first_.id) {
+      for (size_t i = 0; i < disks_.size(); ++i) {
+        if (disks_[i].id == old_disk.id) {
+          ReleaseDisk(disks_[i]);
+          disks_.erase(disks_.begin() + static_cast<std::ptrdiff_t>(i));
+          break;
+        }
+      }
+    }
+    return rc;
   }
 
   /** Bring every stripe's parity up to date. @return rc. */
@@ -300,6 +347,29 @@ class Array {
   /** @return true if the blocks read back as the seed's pattern. */
   bool ReadMatches(const Stored &s);
 
+  /**
+   * Destroy one pool (best effort: cleanup must not fail a test).
+   * @param id the pool to destroy
+   */
+  static void DestroyPoolId(const clio::run::PoolId &id) {
+    clio::run::admin::Client admin(clio::run::kAdminPoolId);
+    auto t = admin.AsyncDestroyPool(clio::run::PoolQuery::Dynamic(), id);
+    t.Wait();
+  }
+
+  /**
+   * Destroy a disk's bdev pool and delete its backing file and sidecars.
+   * The pool's per-worker descriptors are not closed (see ~Array), so on
+   * Linux the unlinked file's space is freed only when the runtime exits.
+   * @param d a disk this object created with NewDisk
+   */
+  static void ReleaseDisk(const Disk &d) {
+    DestroyPoolId(d.id);
+    std::error_code ec;
+    std::filesystem::remove(d.path, ec);
+    std::filesystem::remove(d.path + ".alloc_log", ec);
+  }
+
   std::string tag_;
   clio::run::u32 base_;
   clio::run::u32 next_disk_ = 0;
@@ -308,6 +378,8 @@ class Array {
   clio::run::u32 max_failures_ = 1;
   bool distributed_ = false;
   sb::Client safe_;
+  bool created_ = false;     // Create succeeded: the array pool exists
+  std::vector<Disk> disks_;  // disks NewDisk made and not yet released
   std::mutex mu_;
   std::vector<Stored> stored_;
 };

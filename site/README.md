@@ -1,6 +1,9 @@
 # CLIO Core website
 
-The public website for CLIO Core: **Overview**, **Docs** (installation, basic
+The public website for CLIO Core, a composable I/O stack for data-intensive
+pipelines: **Overview** (with the install feature matrix), **Technologies** (the composable stack and its
+products: Context FS, key-value store, memory expansion, machine learning,
+each with measured results against alternative systems), **Docs** (basic
 usage, concepts, CLI, Python API), **Tutorials** (composing the context
 filesystem from RAM/NVMe/SSD/disk and S3/GCS, FUSE on Linux/macOS/Windows, the
 dashboard, Python semantic query, AI agents over MCP) and **Design** (how the
@@ -10,12 +13,11 @@ It follows the editorial style of the sibling Clio sites
 ([clio-coder](https://github.com/iowarp/clio-coder) and
 [clio-agent](https://github.com/iowarp/clio-agent)): black and warm ivory,
 cyan accent, copper secondary, Newsreader headings, IBM Plex text and code,
-dark by default with a light theme. It is separate from, and narrower than,
-the Docusaurus documentation in the [`docs/`](../docs) submodule.
+dark by default with a light theme. It is the documentation for CLIO Core.
 
 ## Build and preview
 
-No dependencies beyond Python 3.8+:
+No dependencies beyond Python 3.12+ (build.py uses 3.12 f-string syntax):
 
 ```bash
 python3 site/build.py            # writes site/_site and checks every internal link
@@ -55,7 +57,8 @@ site/
   build.py              Wraps pages in the shared layout, writes _site/, checks links
   pages/                Page sources (one HTML fragment per page)
     index.html          Overview (landing layout)
-    docs/               Introduction, installation, basic usage, concepts, CLI, Python API
+    technologies/       The stack, Context FS, key-value store, memory expansion, machine learning
+    docs/               Introduction, basic usage, concepts, CLI, Python API
     tutorials/          Compose, cloud storage, FUSE x3, dashboard, Python query, AI agents
     design/             Runtime, CTE, placement, durability, chain, filesystem, adapters
   assets/
@@ -85,7 +88,10 @@ $ sudo apt install fuse3
 ```
 
 - Add the page to `NAV` in `build.py` so it appears in the sidebar and in the
-  previous/next links.
+  previous/next links. Sections listed in `DROPDOWNS` (Technologies) also get
+  a header dropdown built from their `NAV` entries.
+- Every performance figure on a Technologies page must come from a benchmark
+  document in the repository; state its hardware and caveats next to it.
 - Write internal links root-relative (`href="/docs/cli.html"`). The build
   rewrites them relative to each page.
 - `<pre data-label="...">` blocks hold raw text. The build escapes them, adds

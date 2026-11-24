@@ -59,6 +59,8 @@ class Client : public clio::run::ContainerClient {
    * unique identifier
    * @param custom_pool_id Explicit pool ID for the pool being created
    * @param perf_metrics Optional user-defined performance characteristics (uses defaults if not provided)
+   * @param ext_yaml YAML text of the bdev type's own settings block (the
+   *        `s3:` / `gcs:` keys, credentials included); empty for none
    */
   clio::run::Future<clio::run::bdev::CreateTask> AsyncCreate(
       const clio::run::PoolQuery& pool_query,
@@ -68,7 +70,7 @@ class Client : public clio::run::ContainerClient {
       const PerfMetrics* perf_metrics = nullptr,
       const std::string& alloc_log_path = "",
       clio::run::u64 growth_unit = clio::run::u64(1) << 30,
-      int persistence_level = -1) {
+      int persistence_level = -1, const std::string& ext_yaml = "") {
     auto* ipc_manager = CLIO_CPU_IPC;
 
     // CreateTask should always use admin pool, never the client's pool_id_
@@ -89,7 +91,7 @@ class Client : public clio::run::ContainerClient {
         this,             // Client pointer for PostWait
         // CreateParams arguments (perf_metrics is optional, defaults used if nullptr):
         bdev_type, total_size, io_depth, safe_alignment, perf_metrics,
-        alloc_log_path, growth_unit, persistence_level);
+        alloc_log_path, growth_unit, persistence_level, ext_yaml);
 
     // Submit to runtime
     return ipc_manager->Send(task);

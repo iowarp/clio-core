@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
@@ -15,15 +16,18 @@ namespace {
 namespace fs = std::filesystem;
 
 void PrintComposeUsage() {
-  HIPRINT("Usage: clio_run compose <start|stop|rm|list> [options]");
+  HIPRINT("Usage: clio-run compose <start|stop|rm|list> [options]");
   HIPRINT("  start <config.yaml>    Create the pools in the compose file.");
   HIPRINT("                         Pools with 'restart: true' are recorded in");
   HIPRINT("                         each node's pool log (<conf_dir>/wal) and");
   HIPRINT("                         re-created by the next `clio_run start`.");
-  HIPRINT("  stop  <config.yaml>    Destroy the pools listed in the compose file.");
+  HIPRINT("  stop  <config.yaml> [--force]");
+  HIPRINT("                         Flush and stop the pools in the compose file.");
   HIPRINT("                         Keeps them in the pool log (still restartable).");
-  HIPRINT("  rm    <config.yaml>    Stop the pools AND drop them from the pool");
-  HIPRINT("                         log. Does NOT delete the compose file.");
+  HIPRINT("                         --force skips the flush.");
+  HIPRINT("  rm    <config.yaml> [--force]");
+  HIPRINT("                         Flush and stop the pools AND drop them from the");
+  HIPRINT("                         pool log. Does NOT delete the compose file.");
   HIPRINT("  list  [--restartable]  List active containers in the local daemon.");
   HIPRINT("                         --restartable: list the pool-log entries.");
 }
@@ -122,13 +126,16 @@ int ComposeStart(const std::string& path) {
 }
 
 /**
- * Destroy every pool listed in a compose file. Used by both stop and rm.
+ * Unplug every pool listed in a compose file. Used by both stop and rm. Each
+ * pool is flushed (module Destroy) before it is removed, unless force is set.
  * @param path compose file
  * @param keep_restartable true (stop) to keep the pools in the nodes' pool
  *        logs so the next start re-creates them; false (rm) to forget them
+ * @param force true to skip the flush (kDestroyPoolNoFlush)
  * @return 0 on success, 1 if the file or admin client is unavailable
  */
-int DestroyComposePools(const std::string& path, bool keep_restartable) {
+int DestroyComposePools(const std::string& path, bool keep_restartable,
+                        bool force) {
   clio::run::ComposeConfig compose;
   if (!LoadComposeFile(path, &compose)) {
     return 1;
@@ -138,39 +145,46 @@ int DestroyComposePools(const std::string& path, bool keep_restartable) {
     HLOG(kError, "Failed to get admin client");
     return 1;
   }
+  clio::run::u32 flags = 0;
+  if (keep_restartable) {
+    flags |= clio::run::admin::kDestroyPoolKeepRestartable;
+  }
+  if (force) {
+    flags |= clio::run::admin::kDestroyPoolNoFlush;
+  }
   for (const auto& pool_config : compose.pools_) {
     HLOG(kInfo, "Stopping pool {} (module: {})", pool_config.pool_name_,
          pool_config.mod_name_);
-    auto task =
-        admin->AsyncDestroyPool(
-            clio::run::PoolQuery::Dynamic(), pool_config.pool_id_,
-            keep_restartable ? clio::run::admin::kDestroyPoolKeepRestartable
-                             : 0u);
-    task.Wait();
-    if (task->GetReturnCode() != 0) {
-      HLOG(kWarning, "Failed to stop pool {}, return code: {}",
-           pool_config.pool_name_, task->GetReturnCode());
+    std::string err;
+    clio::run::u64 blobs = 0;
+    clio::run::u64 bytes = 0;
+    const clio::run::u32 rc = admin->UnplugPool(pool_config.pool_id_, flags,
+                                                &err, &blobs, &bytes);
+    if (rc != 0) {
+      HLOG(kWarning, "Failed to stop pool {}, return code: {}: {}",
+           pool_config.pool_name_, rc, err);
     } else {
-      HLOG(kSuccess, "Stopped pool {}", pool_config.pool_name_);
+      HLOG(kSuccess, "Stopped pool {}: flushed {} blobs, {} bytes",
+           pool_config.pool_name_, blobs, bytes);
     }
   }
   return 0;
 }
 
-int ComposeStop(const std::string& path) {
+int ComposeStop(const std::string& path, bool force) {
   if (!InitClient()) {
     return 1;
   }
   ClientFinalizeGuard guard;
-  return DestroyComposePools(path, /*keep_restartable=*/true);
+  return DestroyComposePools(path, /*keep_restartable=*/true, force);
 }
 
-int ComposeRm(const std::string& path) {
+int ComposeRm(const std::string& path, bool force) {
   if (!InitClient()) {
     return 1;
   }
   ClientFinalizeGuard guard;
-  int rc = DestroyComposePools(path, /*keep_restartable=*/false);
+  int rc = DestroyComposePools(path, /*keep_restartable=*/false, force);
 
   // DestroyPool removes each pool from the nodes' pool logs; the compose
   // file itself is kept.
@@ -248,18 +262,27 @@ int Compose(int argc, char** argv) {
   }
 
   if (sub == "start" || sub == "stop" || sub == "rm") {
-    if (rest.empty()) {
+    const bool force =
+        std::find(rest.begin(), rest.end(), std::string("--force")) != rest.end();
+    std::string path;
+    for (const auto& a : rest) {
+      if (a != "--force") {
+        path = a;
+        break;
+      }
+    }
+    if (path.empty()) {
       HLOG(kError, "compose {} requires a config file path", sub);
       PrintComposeUsage();
       return 1;
     }
     if (sub == "start") {
-      return ComposeStart(rest[0]);
+      return ComposeStart(path);
     }
     if (sub == "stop") {
-      return ComposeStop(rest[0]);
+      return ComposeStop(path, force);
     }
-    return ComposeRm(rest[0]);
+    return ComposeRm(path, force);
   }
 
   if (sub == "list") {
@@ -293,5 +316,5 @@ int Compose(int argc, char** argv) {
   }
   HLOG(kWarning,
        "`clio_run compose <file>` is deprecated; use `clio_run compose start`");
-  return unregister ? ComposeRm(path) : ComposeStart(path);
+  return unregister ? ComposeRm(path, /*force=*/false) : ComposeStart(path);
 }

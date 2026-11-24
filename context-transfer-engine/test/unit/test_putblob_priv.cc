@@ -149,9 +149,6 @@ class Fixture {
     std::this_thread::sleep_for(200ms);
 
     if (!RegisterRamTarget()) return false;
-    // Best-effort: attach the SHM metadata cache so the zero-IPC read-back
-    // path can run where available.
-    (void)CLIO_CTE_CLIENT->AttachShmCache();
     return true;
   }
 
@@ -206,7 +203,6 @@ class Fixture {
     if (!RegisterRamTarget()) {
       return false;
     }
-    (void)CLIO_CTE_CLIENT->AttachShmCache();
     return true;
   }
 };
@@ -385,7 +381,7 @@ TEST_CASE("Private PutBlob rejects degenerate requests", "[cte][830]") {
   p_zero.Wait();
 
   // Neither name may exist: a rejected request must not reach the runtime.
-  auto listed = cte->AsyncGetContainedBlobs(tag_id);
+  auto listed = cte->AsyncGetContainedBlobs(tag_id, clio::run::PoolQuery::Broadcast());
   listed.Wait();
   REQUIRE(listed->GetReturnCode() == 0);
   for (const std::string &name : listed->blob_names_) {

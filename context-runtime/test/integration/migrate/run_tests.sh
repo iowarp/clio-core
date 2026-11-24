@@ -16,6 +16,14 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../../../" && pwd)"
 
+# Bounded waits + diagnostics (CI/compose_wait.sh): readiness is `clio_run
+# status` on every node, every docker exec runs against ONE deadline below the
+# workflow step's timeout-minutes (15), and a timeout or failure dumps every
+# node's logs, processes and thread state.
+# shellcheck source=../../../../CI/compose_wait.sh
+source "$REPO_ROOT/CI/compose_wait.sh"
+SUITE_NODES=(iowarp-migrate-node1 iowarp-migrate-node2 iowarp-migrate-node3 iowarp-migrate-node4)
+
 # Export workspace path for docker-compose
 if [ -n "${HOST_WORKSPACE:-}" ]; then
     export IOWARP_CORE_ROOT="${HOST_WORKSPACE}"
@@ -80,7 +88,10 @@ start_docker_cluster() {
     docker compose up -d
 
     log_info "Waiting for containers to initialize..."
-    sleep 10
+    if ! cw_wait_runtimes; then
+        docker compose down 2>/dev/null || true
+        exit 1
+    fi
 
     docker compose ps
 
@@ -98,7 +109,7 @@ stop_docker_cluster() {
 # Run a single test case inside the Docker cluster
 run_single_test() {
     local filter="$1"
-    docker exec iowarp-migrate-node1 bash -c "
+    cw_exec_or_dump iowarp-migrate-node1 bash -c "
         export CLIO_WITH_RUNTIME=0
         clio_run_migrate_tests '$filter'
     "
@@ -111,7 +122,7 @@ run_test_docker_direct() {
 
     # Wait for all runtimes to be ready
     log_info "Waiting for runtimes to initialize across all nodes..."
-    sleep 5
+    cw_wait_runtimes || return 1
 
     log_info "Running $TEST_FILTER..."
     run_single_test "$TEST_FILTER"
@@ -173,6 +184,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 COMMAND=${COMMAND:-all}
+
+cw_init "${MIGRATE_BUDGET_SEC:-720}" "${SUITE_NODES[@]}"
 
 # Main execution
 log_info "IOWarp Migrate Test Runner"

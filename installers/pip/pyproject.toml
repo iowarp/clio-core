@@ -25,6 +25,9 @@ dependencies = [
 
 
 [project.scripts]
+# clio-run is canonical; clio_run is the legacy alias. A wheel cannot hold a
+# symlink, so both are entry points that exec the single bundled bin/clio-run.
+clio-run = "iowarp_core._cli:clio_run_main"
 clio_run = "iowarp_core._cli:clio_run_main"
 clio_cte_bench = "iowarp_core._cli:cte_bench_main"
 clio_run_thrpt_bench = "iowarp_core._cli:run_thrpt_main"
@@ -80,6 +83,12 @@ CLIO_CORE_ENABLE_CUDA = "OFF"
 CLIO_CORE_ENABLE_ROCM = "OFF"
 CLIO_CORE_ENABLE_OPENMP = "OFF"
 CTP_LOG_LEVEL = "1"
+# S3 and GCS storage tiers (bdev_type s3 / gcs). Both speak HTTPS through
+# Poco::NetSSL, which every wheel already builds for the dashboard; on Linux
+# OpenSSL is linked statically (installers/pip/build_deps_manylinux.sh).
+# CMake turns them off with a warning if Poco is missing.
+CLIO_ENABLE_AMAZON_DRIVE = "ON"
+CLIO_ENABLE_GOOGLE_CLOUD = "ON"
 
 [tool.scikit-build.metadata.version]
 provider = "scikit_build_core.metadata.regex"
@@ -108,6 +117,9 @@ regex = 'project\(iowarp-core VERSION (?P<value>[\d.]+)'
 if.platform-system = "linux"
 inherit.cmake.define = "append"
 cmake.define.CLIO_CTE_ENABLE_FUSE_ADAPTER = "ON"
+# The static OpenSSL 3 from build_deps_manylinux.sh, not the image's 1.1.
+cmake.define.OPENSSL_ROOT_DIR = "/usr/local"
+cmake.define.OPENSSL_USE_STATIC_LIBS = "ON"
 
 [[tool.scikit-build.overrides]]
 if.platform-system = "win32"

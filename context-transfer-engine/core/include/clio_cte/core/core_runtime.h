@@ -81,6 +81,17 @@ bool IsTargetEligibleForBlob(const TargetInfo &target,
                              int min_persistence_level);
 
 /**
+ * One lazy copy registered on a source tag (copy-on-write, see
+ * Runtime::CowAddLink). Held per container, keyed by the source tag.
+ */
+struct CowCopyLink {
+  TagId copy_tag_;                        // the lazy copy
+  clio::run::PoolId fault_pool_id_;       // pool that materialises the copy
+  std::string fault_pool_name_;           // its name (kCowFaultPoolName)
+  std::string fault_params_;              // the source tag NAME
+};
+
+/**
  * CTE Core Runtime Container
  * Implements target management and tag/blob operations
  */
@@ -221,48 +232,6 @@ public:
    * slot's metadata (flags, min_score) survives so the next cache write
    * refills it. freed_bytes reports the physical footprint returned.
    */
-  /** MoveBlobToPersistent outcomes. */
-  static constexpr clio::run::u32 kMoveDone = 0;         ///< moved, or nothing to move
-  static constexpr clio::run::u32 kMoveNoRoom = 1;       ///< persistent budget too small
-  static constexpr clio::run::u32 kMovePlaceFailed = 2;  ///< placement/write failed
-  static constexpr clio::run::u32 kMoveSkipped = 3;      ///< could not read the blob
-
-  /**
-   * Move one blob whose blocks sit below `target_level` onto tiers at or above
-   * it, atomically under its write token (the FlushData / SyncTag move).
-   * @param composite_key "major.minor.name" key of the blob
-   * @param tag_id the blob's tag
-   * @param blob_name the blob's name
-   * @param score placement score for the new layout
-   * @param target_level minimum persistence level to move to
-   * @param budget free bytes on qualifying tiers; debited by the move
-   * @param size OUT bytes moved (kMoveDone) or needed (kMoveNoRoom)
-   * @param rc OUT one of the kMove* outcomes
-   * @param replicas_current the caller vouches that the blob's durable
-   *        replicas are up to date (kSyncReplicasCurrent): one of the
-   *        blob's full size at target_level makes the move unnecessary
-   */
-  clio::run::TaskResume MoveBlobToPersistent(const std::string &composite_key,
-                                             const TagId &tag_id,
-                                             const std::string &blob_name,
-                                             float score, int target_level,
-                                             clio::run::u64 &budget,
-                                             clio::run::u64 &size,
-                                             clio::run::u32 &rc,
-                                             bool replicas_current = false);
-
-  /**
-   * Whether a blob has a durable (non-cache) replica holding all of its
-   * bytes on tiers at or above a persistence level. The caller holds the
-   * blob's write token.
-   * @param blob_info the blob
-   * @param size the blob's current size
-   * @param level the persistence level the replica must reach
-   * @return true when such a replica exists
-   */
-  bool HasDurableReplica(const BlobInfo &blob_info, clio::run::u64 size,
-                         int level);
-
   /** Blobs FlushMetadata serializes between yields to its worker. */
   static constexpr size_t kSnapshotYieldEvery = 256;
 
@@ -324,71 +293,19 @@ public:
   clio::run::u64 NoteReorgNoRoom(float score);
 
   /**
-   * Place `total_size` bytes of `data` on tiers at or above `target_level`
-   * and swap them in as the blob's layout (caller holds the write token and
-   * the reader drain), then free the old layout and WAL the new one.
-   * @param blob_info blob being moved
-   * @param composite_key its "major.minor.name" key (SHM mirror)
-   * @param tag_id its tag
-   * @param blob_name its name
-   * @param score placement score
-   * @param data buffer holding the blob's current bytes
-   * @param total_size bytes in `data`
-   * @param target_level minimum persistence level
-   * @param rc OUT kMoveDone or kMovePlaceFailed
-   */
-  clio::run::TaskResume RelocateBlob(BlobInfo &blob_info,
-                                     const std::string &composite_key,
-                                     const TagId &tag_id,
-                                     const std::string &blob_name, float score,
-                                     ctp::ipc::ShmPtr<> data,
-                                     clio::run::u64 total_size,
-                                     int target_level, clio::run::u32 &rc);
-
-  /**
    * Append a full-replacement kExtendBlob WAL record of the blob's layout.
    * @param tag_id the blob's tag
    * @param blob_name the blob's name
    * @param blob_info the blob (its blocks_ are recorded)
    */
-  /**
-   * The least durable persistence level among a blob's blocks: a move or
-   * re-placement must not put the blob below it.
-   * @param blocks the blob's current layout
-   * @return the minimum PersistenceLevel (as int); 0 for an empty layout
-   */
-  int DurabilityFloor(const clio::run::priv::vector<BlobBlock> &blocks);
-
   void LogBlobLayout(const TagId &tag_id, const std::string &blob_name,
                      const BlobInfo &blob_info);
 
   /**
-   * Whether any block sits on a target below persistence `level`. Caller
-   * holds target_lock_ (read).
-   * @param blocks blocks to check
-   * @param level persistence level
-   * @return true if at least one block is below `level`
-   */
-  bool HasBlocksBelowLevelLocked(const clio::run::priv::vector<BlobBlock> &blocks,
-                                 int level);
-
-  /**
-   * Whether any registered target is at or above a persistence level.
-   * @param level persistence level
-   * @return true if such a tier exists (full or not)
-   */
-  bool HasTierAtLevel(int level);
-
-  /**
-   * Free bytes on every target at or above persistence `level`.
-   * @param level persistence level
-   * @return summed remaining space
-   */
-  clio::run::u64 PersistentBudget(int level);
-
-  /**
-   * fsync(2) for one tag on this container (Method::kSyncTag): move the
-   * tag's blobs to a persistent tier, sync their devices, then the WAL.
+   * fsync(2) for one tag on this container (Method::kSyncTag): sync the
+   * devices holding the tag's blocks, then the WAL. A core is uniform in
+   * durability, so there is nothing to move first; dirty volatile copies
+   * are the write-back cache's to flush before it forwards this verb.
    * @param task sync task (see SyncTagTask)
    */
   clio::run::TaskResume SyncTag(clio::run::shared_ptr<SyncTagTask> &task);
@@ -427,9 +344,10 @@ public:
   /** Reorganize single blob (Method::kReorganizeBlob) - update score. */
   clio::run::TaskResume ReorganizeBlob(clio::run::shared_ptr<ReorganizeBlobTask> &task);
   /** Evict lowest-score blobs off a tier until a byte budget is reclaimed
-   *  (Method::kEvict). Broadcast; each shard reports its share. */
+   *  (Method::kEvict). Dynamic resolves Local; each container reports its own share.
+   *  A cluster-wide sweep passes Broadcast explicitly. */
   clio::run::TaskResume Evict(clio::run::shared_ptr<EvictTask> &task);
-  /** Store the organizer phase hint (Method::kReorganizeHint). Broadcast;
+  /** Store the organizer phase hint (Method::kReorganizeHint). Dynamic resolves Local;
    *  the value itself is opaque here and interpreted by the organizer. */
   clio::run::TaskResume ReorganizeHint(
       clio::run::shared_ptr<ReorganizeHintTask> &task);
@@ -557,21 +475,26 @@ public:
   clio::run::TaskResume TruncateBlob(clio::run::shared_ptr<TruncateBlobTask> &task);
 
   /**
-   * Rename tag (Method::kRenameTag) - change a tag's name in place, keeping
-   * its TagId (and all blobs). Broadcast op; shares no data movement.
+   * Rename tag (Method::kRenameTag) - change one of a tag's names, keeping
+   * its TagId (and all blobs). Runs on the old name's owner; the batched
+   * form is UpdateTagNames kRename.
    */
   clio::run::TaskResume RenameTag(clio::run::shared_ptr<RenameTagTask> &task);
 
   /**
    * GetOrCreateTagAlias (Method::kGetOrCreateTagAlias) - bind an extra name to
-   * an existing tag's id (hard link at the tag level). Broadcast op.
+   * an existing tag's id (hard link at the tag level). If the alias is
+   * already bound, returns the tag it names. Batched form: UpdateTagNames
+   * kAddName.
    */
   clio::run::TaskResume GetOrCreateTagAlias(
       clio::run::shared_ptr<GetOrCreateTagAliasTask> &task);
 
   /**
-   * Delete tag operation - removes all blobs from tag and removes tag
-   * Returns TaskResume for coroutine-based async operations
+   * Delete a tag, by name (on the name's owner) or by id (on its home). A
+   * name that is not the tag's last (an alias, or with posix_unlink_ any
+   * name while another is left) is only unbound. Otherwise every name is
+   * unbound and every container drops its share (MultiDelTag broadcast).
    */
   clio::run::TaskResume DelTag(clio::run::shared_ptr<DelTagTask> &task);
 
@@ -586,52 +509,140 @@ public:
    */
   void LogTagIdentity(const TagId &tag_id, const TagInfo &info);
 
-  // ---- published tag names (UpdateTagNames) ----
-  /** Serializes every name operation (no suspension inside). */
+  // ---- flat tag names (UpdateTagNames; see TagNameOp) ----
+  /** Serializes this container's name steps (no suspension inside). */
   std::mutex tag_names_mu_;
-  /** Last-writer-wins stamp per stored name (kept for removed names too). */
-  std::unordered_map<std::string, clio::run::u64> name_seq_;
-  /** Names that cannot resolve yet, keyed by the ancestor they wait for. */
-  std::unordered_map<TagId, std::vector<std::pair<TagId, std::string>>>
-      parked_names_;
-  /** Tags renamed under a parent not known yet, with the absolute path the
-   *  index still keys their subtree by: it moves when the name resolves. */
-  std::unordered_map<TagId, std::string> pending_rekey_;
   /**
-   * Apply one decoded name operation unless a newer one for the same name
-   * was already applied. Caller holds tag_names_mu_.
-   * @return true if applied
+   * Apply one per-container name step (kBind ... kHomeNames) to this
+   * container's binding table / tag name lists. Caller holds tag_names_mu_.
+   * @param r the step
+   * @return its result record (op_ = TagNameResult)
    */
-  bool ApplyTagNameOp(const TagNameOpRec &r);
-  /** Bind `name` to `id` (canonical if it has none, else alias). */
-  void TnAddName(const TagId &id, const std::string &name);
-  /** Unbind `name` from `id`; drops a name-less, data-less tag. */
-  void TnRemoveName(const TagId &id, const std::string &name);
-  /** Rebind `id`'s name `from` to `to`, re-keying its indexed subtree. */
-  void TnRename(const TagId &id, const std::string &from, const std::string &to);
+  TagNameOpRec ApplyNameStep(const TagNameOpRec &r);
   /**
-   * Resolve a stored name to an absolute path, failing (instead of guessing)
-   * when an ancestor is unknown or name-less.
-   * @param stored stored name ("/", "$tagid{P}/leaf", or flat)
-   * @param abs receives the absolute path
-   * @param blocker receives the first ancestor that could not be resolved
-   * @return true if fully resolved
+   * Send per-container steps to the containers that hold their state: the
+   * local group is applied inline, each remote group goes as one task.
+   * @param steps steps, in the order each container must apply its own
+   * @param results receives one result per step, in input order
    */
-  bool ResolveNameStrict(const std::string &stored, std::string *abs,
-                         TagId *blocker);
-  /** Index `id` under `name`'s absolute path, or park it until resolvable. */
-  void IndexOrParkName(const TagId &id, const std::string &name);
-  /** Retry names parked on `parent` (it just gained a name). */
-  void UnparkNames(const TagId &parent);
-  /** Move every search-index key at or under old_abs to new_abs. */
-  void RekeyIndexSubtree(const std::string &old_abs, const std::string &new_abs);
+  clio::run::TaskResume SendNameSteps(std::vector<TagNameOpRec> steps,
+                                      std::vector<TagNameOpRec> *results);
+  /**
+   * Run a batch of name ops: caller ops (kAddName/kRemoveName/kRename) are
+   * expanded into their steps, steps are sent as they are. One round trip to
+   * each container, plus a second only to undo a step that lost a race.
+   * @param ops the batch
+   * @param results receives one result per op, in input order
+   */
+  clio::run::TaskResume RunNameOps(std::vector<TagNameOpRec> ops,
+                                   std::vector<TagNameOpRec> *results);
+  /** Restored name lists not yet checked against owners/homes. */
+  bool names_migration_pending_ = false;
+  /**
+   * After a restore: bind every flat name of the restored name lists that
+   * no binding names yet (a metadata log from before names had their own
+   * records binds nothing), so existing tags keep their ids from the first
+   * request on. Names this container does not own are dropped later by
+   * MigrateRestoredNames. No WAL records; sets names_migration_pending_.
+   */
+  void BindRestoredNames();
+  /**
+   * Once every container is up (first StatTargets tick, retried until it
+   * succeeds): make each restored name list agree with the flat layout --
+   * drop old hierarchical "$tagid{..}" and "/" names, bind every name on
+   * its owner, keep local bindings only for names owned here, and move a
+   * list whose home is another container to that home.
+   */
+  clio::run::TaskResume MigrateRestoredNames();
+  /** True when DirectHash(h) lands on this container. */
+  bool OwnsHash(clio::run::u32 h);
+  /** Bind name -> id here (owner side): table, search index, WAL. */
+  void BindNameLocal(const std::string &name, const TagId &id);
+  /** Drop name's binding here if it names id (owner side). */
+  bool UnbindNameLocal(const std::string &name, const TagId &id);
+  /**
+   * Delete this container's share of a tag: its blobs, TagInfo and xattrs
+   * (MultiDelTag; DelTag broadcasts it). Names are not touched.
+   * @param tag_id the tag
+   * @param found set true when this container held anything of it
+   */
+  clio::run::TaskResume DelTagShare(TagId tag_id, bool *found);
+
+  /**
+   * True when any copy-on-write link exists on this container. One relaxed
+   * atomic load: the only cost a write pays when no lazy copy exists.
+   * @return true if at least one source->copy link is registered here
+   */
+  bool CowActive() const {
+    return cow_link_count_.load(std::memory_order_acquire) != 0;
+  }
+  /**
+   * Snapshot of the lazy copies registered on `source` here.
+   * @param source the source tag
+   * @return the copies (empty when none); a copy, so no lock is held after
+   */
+  std::vector<CowCopyLink> CowCopiesOf(const TagId &source);
+  /**
+   * Record a lazy copy on `source`, or replace the entry for the same copy
+   * tag (a re-registered copy is one link, not two).
+   * @param source the source tag
+   * @param link   the copy and how to materialise it
+   */
+  void CowAddLink(const TagId &source, const CowCopyLink &link);
+  /**
+   * Forget every link involving `tag`: links FROM it (it is a source being
+   * deleted) and links TO it (it is a copy being deleted). Local only.
+   * @param tag the tag being deleted here
+   */
+  void CowForgetTag(const TagId &tag);
+  /**
+   * Before a write or delete mutates `blob_name` of `source`, make every
+   * registered copy that lacks the blob hold its PRE-WRITE bytes. Must run
+   * under the blob's write token; a copy that holds the blob is untouched.
+   * @param source    the source tag whose blob is about to change
+   * @param blob_name the blob
+   * @param rc        set to 0, or the first materialisation error (the
+   *                  mutation must then not proceed)
+   */
+  clio::run::TaskResume CowMaterializeBlob(const TagId &source,
+                                           const std::string &blob_name,
+                                           clio::run::u32 *rc);
+  /**
+   * Materialise one blob into one lazy copy if the copy lacks it: probe the
+   * copy, then dispatch a materialise-only fault to the copy's fault pool.
+   * @param link      the copy and its fault handler
+   * @param blob_name the blob
+   * @param rc        set to 0 on success, else the failing code
+   */
+  clio::run::TaskResume CowMaterializeCopy(const CowCopyLink &link,
+                                           const std::string &blob_name,
+                                           clio::run::u32 *rc);
+  /**
+   * Name owner side of a copy registration: resolve the source tag and
+   * broadcast the link (CowLinkTask) to every container of this pool.
+   * @param copy_tag       the lazy copy's id
+   * @param fault_pool_id  the copy's fault pool
+   * @param fault_pool_name its name
+   * @param fault_params   the source tag NAME
+   * @param rc             set to 0 once every container has the link
+   */
+  clio::run::TaskResume CowRegisterCopy(const TagId &copy_tag,
+                                        const clio::run::PoolId &fault_pool_id,
+                                        const std::string &fault_pool_name,
+                                        const std::string &fault_params,
+                                        clio::run::u32 *rc);
+  /**
+   * kCowLink handler: apply one link locally (copy-on-write entry and the
+   * copy's fault registration). Never re-broadcasts.
+   * @param task the broadcast link task
+   */
+  clio::run::TaskResume CowLink(clio::run::shared_ptr<CowLinkTask> &task);
   /** Replace `id`'s TagInfo with a copy edited by `edit` (readers stay safe). */
   void EditTagInfo(const TagId &id, const std::function<void(TagInfo &)> &edit);
 
   /**
-   * GetTagName (Method::kGetTagName) - resolve a TagId to its full, absolute
-   * tag name by walking the stored relative "$tagid{parent}/leaf" references.
-   * Broadcast op; the container owning the tag's metadata answers.
+   * GetTagName (Method::kGetTagName) - a tag's canonical name, answered by
+   * the tag's home (which holds its name list).
    */
   clio::run::TaskResume GetTagName(clio::run::shared_ptr<GetTagNameTask> &task);
 
@@ -641,6 +652,17 @@ public:
    * @param task the TagXattrTask; return_code_ 0 or a kTagXattr*Rc
    */
   clio::run::TaskResume TagXattr(clio::run::shared_ptr<TagXattrTask> &task);
+
+  /**
+   * SetDurability (Method::kSetDurability) - switch this core between
+   * volatile and persistent. To persistent: refused with
+   * kCteVolatileTargetRc while a volatile target is registered; else the
+   * WAL shards open and a full metadata snapshot is written so the state
+   * built while volatile is durable. To volatile: the WAL shards close.
+   * @param task the SetDurabilityTask; previous_ receives the old class
+   */
+  clio::run::TaskResume SetDurability(
+      clio::run::shared_ptr<SetDurabilityTask> &task);
 
   /**
    * Get tag size operation - returns total size of all blobs in tag
@@ -656,22 +678,25 @@ public:
   /**
    * GetNumAliases (Method::kGetNumAliases) - number of extra names (tag-level
    * hard links) bound to a tag, by name or id. Excludes the canonical name, so
-   * the POSIX link count is num_aliases_ + 1. Broadcast op; the container that
-   * owns the tag answers.
+   * the POSIX link count is num_aliases_ + 1. Answered from the tag's home.
    */
   clio::run::TaskResume GetNumAliases(clio::run::shared_ptr<GetNumAliasesTask> &task);
 
   /**
-   * UpdateTagNames (Method::kUpdateTagNames) - apply a batch of tag-name
-   * operations (add / remove / rename / set root) to this container's name
-   * table and search index. Broadcast by the publisher, so every container
-   * holds every name.
+   * UpdateTagNames (Method::kUpdateTagNames) - the batched name verb: runs
+   * caller ops across the containers that hold their state (RunNameOps) and
+   * applies per-container steps sent here by another container.
    */
   clio::run::TaskResume UpdateTagNames(
       clio::run::shared_ptr<UpdateTagNamesTask> &task);
 
   /**
    * Schedule a task by resolving Dynamic pool queries.
+   *
+   * A Dynamic query is resolved by HASHING the task key to its owner container,
+   * or LOCALLY for per-container scans and answers. It is never resolved to
+   * Broadcast. A caller that wants the cluster-wide view passes Broadcast()
+   * explicitly.
    */
   clio::run::PoolQuery ScheduleTask(const clio::run::shared_ptr<clio::run::Task> &task) override;
 
@@ -689,7 +714,10 @@ public:
    * payload size (size_) for routing. Otherwise the scheduler buckets
    * every blob op as "metadata" and lands them on the scheduler worker,
    * making large blob transfers compete with latency-sensitive admin
-   * traffic instead of going to dedicated I/O workers.
+   * traffic instead of going to dedicated I/O workers. Every other core
+   * method returns an explicit estimate too (core_task_stats.h).
+   * @param task the task to estimate
+   * @return the task's cost features
    */
   clio::run::TaskStat GetTaskStats(const clio::run::Task *task) const override;
 
@@ -765,6 +793,17 @@ private:
   ctp::priv::unordered_map_ll<std::string, TagId>
       tag_name_to_id_;                                   // tag_name -> tag_id
   ctp::priv::unordered_map_ll<TagId, std::shared_ptr<TagInfo>> tag_id_to_info_; // tag_id -> TagInfo
+
+  // Copy-on-write links (lazy checkpoints): source tag -> an IMMUTABLE snapshot
+  // of the copies that must hold a blob's pre-write bytes before a write or
+  // delete lands on it here. Readers take a handle; writers serialise on
+  // cow_mutex_ (never held across a co_await) and replace the snapshot.
+  // cow_link_count_ is the total number of links: a write checks it with one
+  // atomic load, so a container with no links takes no lock at all.
+  std::mutex cow_mutex_;
+  ctp::priv::unordered_map_ll<TagId, std::shared_ptr<const std::vector<CowCopyLink>>>
+      cow_links_;
+  std::atomic<clio::run::u32> cow_link_count_{0};
   ctp::priv::unordered_map_ll<std::string, std::shared_ptr<BlobInfo>>
       tag_blob_name_to_info_; // "tag_id.blob_name" -> BlobInfo
 
@@ -817,31 +856,14 @@ private:
   // RenameTag, rebuilt after WAL/metadata restore).
   ctp::search::RegexSearchEngine<TagId> tag_search_;
 
-  // issue #783: shared-memory mirror of the tag/blob metadata, for zero-IPC
-  // client reads. DERIVED STATE ONLY -- the maps above stay authoritative.
-  // Every mirror call is best-effort and silently no-ops when the metadata
-  // segment is unavailable, so a metadata write is never rejected because the
-  // cache could not be updated.
-  ShmMetadataCache shm_cache_;
-
-  /** Project a BlobInfo into its cacheable form. Returns false when the blob
-   *  cannot be represented (too many blocks), in which case it is not
-   *  cached and clients keep using the RPC path for it. */
-  void MirrorTagShm(const TagId &tag_id, const TagInfo &info);
-  bool BuildShmBlobRecord(const BlobInfo &info, ShmBlobRecord *out);
-
-  /** Mirror one blob into the SHM cache. No-op when caching is off. */
-  void MirrorBlobToShm(const std::string &composite_key, const BlobInfo &info);
   /**
-   * Withdraw a blob's zero-IPC mirror record. Called before extents the
-   * record names are freed (#1131): a client copying from the mirror pins
-   * nothing and validates only against the mirror's generation, so a record
-   * left in place across the free lets it return another blob's reused bytes
-   * with rc 0. A miss sends it to the RPC path instead.
-   * @param tag_id the blob's tag
-   * @param blob_name the blob's name
+   * Project a BlobInfo into a ShmBlobRecord (GetResidency's direct-readable
+   * test).
+   * @param info the blob
+   * @param out receives the record
+   * @return false when the blob cannot be represented
    */
-  void WithdrawBlobMirror(const TagId &tag_id, const std::string &blob_name);
+  bool BuildShmBlobRecord(const BlobInfo &info, ShmBlobRecord *out);
 
   /**
    * Log a read served from a non-primary copy (CLIO_TRACE_COPY_READS=1):
@@ -894,6 +916,86 @@ private:
 
   // CTE configuration (replaces ConfigManager singleton)
   Config config_;
+
+  // Durability class: resolved from config_ in Create (ApplyDurability),
+  // changed at runtime by SetDurability. Atomic: every worker reads it.
+  std::atomic<CoreDurability> durability_class_{CoreDurability::kVolatile};
+
+ public:
+  /** Whether this core is volatile (no WAL, empty after every start). */
+  bool IsVolatileCore() const {
+    return durability_class_.load(std::memory_order_acquire) ==
+           CoreDurability::kVolatile;
+  }
+
+ private:
+  /**
+   * Resolve the durability class from config_ (Config::ResolveDurability)
+   * and apply what it implies. A volatile core keeps its WAL shards closed
+   * (records are dropped) and treats a restart as a fresh start.
+   * @return true on success; false (logged) for an unknown durability value
+   */
+  bool ApplyDurability();
+
+ public:
+  /**
+   * Fill the OUT params of a get-or-create that found this pool already
+   * existing (Container::FillExistingCreate): the shm cache keys, so every
+   * client of an existing pool can connect, not only the one that created it.
+   * @param create_task the CTE CreateTask
+   */
+  void FillExistingCreate(clio::run::Task *create_task) override;
+
+ private:
+  /**
+   * Serialize this pool's OUT CreateParams (config and shm cache keys) into
+   * a create task's chimod_params_, where the client's Wait() reads them.
+   * @param create_task the create task
+   */
+  void WriteCreateOut(clio::run::admin::CreatePoolFields *create_task);
+
+  /**
+   * Keys of the shm cache module that fronts this pool on this node: the
+   * cache whose chain of next pools (Container::GetNextPool) ends at this
+   * pool. Found through the metadata directory where every cache publishes
+   * its wtc::Locator; a destroyed cache clears its Locator's ready flag. When
+   * several live caches front this pool, the newest registration wins.
+   * @return the keys, all zero when no cache fronts this pool
+   */
+  ShmCacheKeys FindFrontCache() const;
+
+  /**
+   * Durability label of a target being registered: the task's
+   * persistence_level_ when given (>= 0), else the core's storage config
+   * entry for the target, else volatile.
+   * @param task the RegisterTargetTask
+   * @return the bdev's persistence level
+   */
+  clio::run::bdev::PersistenceLevel RegisteringTargetLevel(
+      RegisterTargetTask &task);
+
+  /**
+   * Apply the durability rule to one bdev registration: a volatile bdev in
+   * a persistent core is refused; a persistent bdev in a volatile core is
+   * accepted with a warning.
+   * @param target_name the target being registered
+   * @param level its durability label
+   * @return 0 to proceed, or kCteVolatileTargetRc
+   */
+  clio::run::u32 CheckTargetDurability(const std::string &target_name,
+                                       clio::run::bdev::PersistenceLevel level);
+
+  /**
+   * @return true when any registered target is volatile. The caller holds
+   *         target_lock_ (SetDurability holds it for writing).
+   */
+  bool HasVolatileTarget();
+
+  /** Open every WAL shard (the core is becoming persistent). */
+  void ActivateWal();
+
+  /** Close every WAL shard; later records are dropped (now volatile). */
+  void DeactivateWal();
 
   // Cached Data Placement Engine — built once from config_ in Create() so
   // ExtendBlob does not allocate a fresh DPE on every PutBlob.
@@ -950,6 +1052,8 @@ private:
   std::mutex tag_xattr_mu_;
   /** FlushMetadata snapshot entry type of one tag's xattr section. */
   static constexpr uint8_t kSnapTagXattrEntry = 7;
+  /** Snapshot entry: one name binding this container holds, [name][TagId]. */
+  static constexpr uint8_t kSnapNameBindEntry = 8;
   /**
    * The container a Dynamic TagXattrTask goes to: the hash of its tag id.
    * @param tag_id the tag
@@ -1054,6 +1158,15 @@ private:
    *  (PersistenceLevel), or -1 when the target has no configured level. */
   int ConfiguredPersistenceLevel(const std::string &target_name);
 
+  /**
+   * The bdev-type settings block (StorageDeviceConfig::bdev_ext_yaml_) of the
+   * configured storage device a target name belongs to, matched the same way
+   * as ConfiguredPersistenceLevel.
+   * @param target_name the target being registered
+   * @return the block's YAML text, or empty for an unconfigured target
+   */
+  std::string ConfiguredBdevExt(const std::string &target_name);
+
   clio::run::bdev::PersistenceLevel GetPersistenceLevelForTarget(
       const std::string &target_name);
 
@@ -1065,38 +1178,8 @@ private:
                          bool *created = nullptr);
 
   /**
-   * Get-or-create the chain of tags for an absolute path, returning the id of
-   * the deepest tag. "/a/b/c" creates "/", "/a", "/a/b", "/a/b/c" (each child
-   * stored relative to its parent as "$tagid{parent}/leaf") and returns the id
-   * of "/a/b/c". Non-absolute names are created as a single flat tag.
-   * preferred_id (if set) is applied to the deepest tag only.
-   * @param created if non-null, set to true iff THIS call inserted the
-   *        deepest tag (exactly one of several racing creators sees true)
-   */
-  TagId GetOrCreateTagChain(const std::string &name,
-                            const TagId &preferred_id = TagId::GetNull(),
-                            bool *created = nullptr);
-
-  /**
-   * Resolve an absolute path to an existing tag id by walking the hierarchy
-   * (no creation). Returns TagId::GetNull() if any component is missing.
-   * Must be called while holding tag_map_lock_.
-   */
-  TagId ResolvePathToIdLocked(const std::string &path);
-
-  /**
-   * Expand a stored (possibly relative "$tagid{parent}/leaf") tag name into its
-   * full absolute name by recursively resolving parent references against
-   * tag_id_to_info_. Flat names and the root "/" resolve to themselves. Lock
-   * free: callers iterate the tag maps with the same discipline used elsewhere.
-   * `depth` guards against pathological/cyclic references.
-   */
-  std::string ResolveTagName(const std::string &stored_name, int depth = 0);
-
-  /**
-   * Rebuild tag_search_ from scratch out of tag_id_to_info_. Order-independent
-   * (every tag's parents are present), so it is the safe way to repopulate the
-   * index after WAL/metadata restore. Caller must hold tag_map_lock_ (write).
+   * Rebuild tag_search_ from scratch out of the name bindings this container
+   * holds (after WAL/metadata restore).
    */
   void RebuildTagSearchIndexLocked();
 
@@ -1140,6 +1223,70 @@ private:
    * Returns TaskResume for coroutine-based async operations
    */
   clio::run::TaskResume FreeAllBlobBlocks(BlobInfo &blob_info, clio::run::u32 &error_code);
+
+  /** Blocks to free, grouped by bdev pool (with the pool's target query). */
+  using PoolBlocks = std::unordered_map<
+      clio::run::PoolId,
+      std::pair<clio::run::PoolQuery, std::vector<clio::run::bdev::Block>>>;
+
+  /**
+   * Add every block of a blob to a per-pool free plan.
+   * @param blob_info blob whose blocks_ are collected
+   * @param plan      out: blocks grouped by pool
+   */
+  void CollectBlobBlocks(const BlobInfo &blob_info, PoolBlocks *plan);
+
+  /**
+   * Free a per-pool plan: ONE FreeBlocks task per pool, crediting each
+   * target's remaining space.
+   * @param plan blocks grouped by pool
+   */
+  clio::run::TaskResume FreeBlocksByPool(const PoolBlocks &plan);
+
+  /**
+   * After a blob's blocks are freed: tag size, maps, mirror, telemetry and
+   * the WAL record -- the tail DelBlob and planned tag deletion share.
+   * @param tag_id    the blob's tag
+   * @param blob_name the blob's name
+   * @param blob_info the blob (still alive through the caller's shared_ptr)
+   * @param blob_size its logical size, captured before its blocks moved
+   */
+  void FinishBlobDelete(const TagId &tag_id, const std::string &blob_name,
+                        const BlobInfo &blob_info, clio::run::u64 blob_size);
+
+  /**
+   * Delete many blobs of this container as one plan (DelTag): lock and
+   * invalidate every blob, collect all their blocks, free them with one
+   * FreeBlocks per pool, then finish each blob. Replaces one DelBlob task
+   * per blob.
+   * @param blobs (tag, blob name) pairs held by this container
+   */
+  /**
+   * Delete a set of blobs as one plan. A blob whose copy-on-write
+   * materialisation fails is KEPT (not freed, index untouched) and reported.
+   * @param blobs   (tag, name) pairs; resolved and locked per owner
+   * @param deleted set to the number actually deleted (may be null)
+   * @param kept    receives the (tag, name) pairs kept because a lazy copy
+   *                could not take its snapshot first (may be null)
+   */
+  clio::run::TaskResume DeleteBlobsPlanned(
+      std::vector<std::pair<TagId, std::string>> blobs,
+      clio::run::u32 *deleted = nullptr,
+      std::vector<std::pair<TagId, std::string>> *kept = nullptr);
+
+  /**
+   * Delete a set of blobs in one task: this container's blobs as one plan,
+   * every other owner's subset as one MultiDelBlob, all concurrently.
+   */
+  clio::run::TaskResume MultiDelBlob(
+      clio::run::shared_ptr<MultiDelBlobTask> &task);
+
+  /**
+   * Delete a set of tags (by id) in one task: this container's share of
+   * each, through DelTag's own logic on this fiber (no task per tag).
+   */
+  clio::run::TaskResume MultiDelTag(
+      clio::run::shared_ptr<MultiDelTagTask> &task);
 
   /**
    * Check if blob exists and return pointer to BlobInfo if found
@@ -1460,6 +1607,8 @@ private:
    *  canonical name + alias list (rename / hard link / unlink survival). */
   void ApplyWalSetTagIdentity(const std::vector<char> &payload,
                              clio::run::u32 &tags_replayed);
+  /** Apply one replayed kBindName (bind) or kUnbindName (unbind) record. */
+  void ApplyWalBindName(const std::vector<char> &payload, bool unbind);
   /**
    * Apply one replayed kSetTagXattr (upsert) or kDelTagXattr record.
    * @param payload the record payload
@@ -1507,13 +1656,19 @@ private:
   void ReserveRestoredBlockSpace();
 
   /**
-   * Register the graceful-stop hook that moves RAM-tier data to a persistent
-   * tier (FlushData) before the runtime exits. Removed again by Destroy.
+   * Register the graceful-stop hook that marks this core as stopping
+   * (stopping_), so the organizer starts no new tier moves while the stop
+   * drain finishes the ones in flight. Removed again by Destroy. The core
+   * moves no data at stop: flushing dirty volatile data is the write-back
+   * cache's stop hook.
    */
-  void RegisterStopFlush();
+  void RegisterStopHook();
 
   /** fsync, close and drop every WAL shard (teardown). */
   void SyncAndCloseLogs();
+
+  /** fsync every WAL shard, leaving them open (a per-pool destroy). */
+  void SyncLogs();
 
   /** RuntimeManager stop-hook id (0 = none registered). */
   clio::run::u64 stop_hook_id_ = 0;
@@ -1640,7 +1795,10 @@ private:
   clio::run::TaskResume FlushMetadata(clio::run::shared_ptr<FlushMetadataTask> &task);
 
   /**
-   * Flush data from volatile to non-volatile targets (Method::kFlushData)
+   * Make everything this core accepted durable (Method::kFlushData): sync
+   * every non-volatile device and the WAL. A no-op on a volatile core. The
+   * core never moves data between durability classes; the write-back cache
+   * interposes this verb to flush its dirty copies first.
    */
   clio::run::TaskResume FlushData(clio::run::shared_ptr<FlushDataTask> &task);
 

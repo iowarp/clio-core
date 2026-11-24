@@ -47,7 +47,7 @@ jobs:
   # Previously ran inside `iowarp/clio-core-devcontainer:latest`, which is
   # not pulled into a public registry the GHA runner can access (Docker
   # pull failed with "access denied" at v1.9.0). Run natively on
-  # ubuntu-latest and `apt-get install` deps inline — same shape the RPM
+  # ubuntu-24.04 (pinned, see the matrix) and `apt-get install` deps inline -- same shape the RPM
   # job already uses for Fedora.
   #-----------------------------------------------------------------------
   build-deb:
@@ -60,8 +60,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Pinned, not ubuntu-latest: ubuntu-latest moved to 26.04, whose
+          # libfuse3 is soname 4, so the .deb/AppImage linked libfuse3.so.4
+          # and failed to load on 24.04 (Test DEB/AppImage, v2.4.1-v2.5.0).
+          # The packages target noble, so build on noble.
           - arch: x86_64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
           - arch: arm64
             runner: ubuntu-24.04-arm
     steps:
@@ -196,7 +200,7 @@ jobs:
       matrix:
         include:
           - arch: x86_64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
           # AppImageKit's continuous release ships appimagetool-aarch64.AppImage;
           # build_appimage.sh.in autodetects host arch and downloads the matching
           # binary, so the same script works on either runner.
@@ -268,7 +272,7 @@ jobs:
       matrix:
         include:
           - arch: x86_64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
           - arch: arm64
             runner: ubuntu-24.04-arm
     steps:
@@ -294,6 +298,10 @@ jobs:
           echo "FAIL: clio_run --help died with exit code $rc"
           exit 1
         fi
+        echo "=== clio-run --version (canonical name; clio_run is its alias) ==="
+        clio-run --version || { echo "FAIL: clio-run --version"; exit 1; }
+        clio-cae --version || { echo "FAIL: clio-cae --version"; exit 1; }
+        clio_cae --version || { echo "FAIL: clio_cae alias"; exit 1; }
         echo "=== clio_cte_fuse (FUSE adapter, #899) ==="
         # The .deb now declares libfuse3-dev + fuse3, so the apt install
         # above must have pulled libfuse3.so.3 — a load failure here means
@@ -348,6 +356,10 @@ jobs:
           echo "FAIL: clio_run --help died with exit code $rc"
           exit 1
         fi
+        echo "=== clio-run --version (canonical name; clio_run is its alias) ==="
+        clio-run --version || { echo "FAIL: clio-run --version"; exit 1; }
+        clio-cae --version || { echo "FAIL: clio-cae --version"; exit 1; }
+        clio_cae --version || { echo "FAIL: clio_cae alias"; exit 1; }
         echo "=== clio_cte_fuse (FUSE adapter, #899) ==="
         # The .rpm now requires fuse3-devel + fuse3, so dnf must have
         # pulled libfuse3.so.3 — a load failure here means the dependency
@@ -379,7 +391,7 @@ jobs:
       matrix:
         include:
           - arch: x86_64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
           - arch: arm64
             runner: ubuntu-24.04-arm
     steps:
@@ -586,6 +598,9 @@ jobs:
         if ($LASTEXITCODE -lt 0 -or $LASTEXITCODE -gt 100) {
           throw "clio_run --help died with exit code $LASTEXITCODE (likely missing DLL)"
         }
+        Write-Host "=== clio-run.exe --version (canonical name) ==="
+        & "$bin\clio-run.exe" --version
+        if ($LASTEXITCODE -ne 0) { throw "clio-run --version failed ($LASTEXITCODE)" }
 
         Write-Host "=== clio_cte_fuse.exe (FUSE adapter, #899) ==="
         if (-not (Test-Path "$bin\clio_cte_fuse.exe")) { throw "clio_cte_fuse.exe missing from package" }
@@ -656,7 +671,7 @@ jobs:
       run: ls -lh packages/
 
     - name: Attach packages to GitHub Release
-      uses: softprops/action-gh-release@v1
+      uses: softprops/action-gh-release@v2
       with:
         files: packages/*
         fail_on_unmatched_files: true

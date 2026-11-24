@@ -89,7 +89,8 @@ enum class BdevType : clio::run::u32 {
   kPinned = 3,  // Pinned host memory via cudaMallocHost
   kNoop = 4,    // No-op backend for latency testing (no actual I/O)
   kS3 = 5,      // Amazon S3 object store backend
-  kGcs = 6      // Google Cloud Storage object store backend
+  kGcs = 6,     // Google Cloud Storage object store backend
+  kDaos = 7     // Native DAOS backend (a DFS file driven through libdfs)
 };
 
 /**
@@ -223,6 +224,14 @@ struct CreateParams {
   // one unit. YAML key: populate_unit (size string).
   clio::run::u64 populate_unit_ = clio::run::u64(64) << 20;  // 64 MiB default
 
+  // Settings that only one bdev type understands, as the YAML text of the
+  // block named after that type in the pool's compose entry (an `s3:` block
+  // for bdev_type s3, `gcs:` for gcs). The transport parses it at Init; see
+  // S3BdevTransport / GcsBdevTransport for the keys. Empty => none given, and
+  // the transport falls back to its environment variables. Holds credentials,
+  // so it is never logged.
+  std::string ext_yaml_;
+
   // Required: chimod library name for module manager
   static constexpr const char *chimod_lib_name = "clio_bdev";
 
@@ -272,13 +281,15 @@ struct CreateParams {
                clio::run::u32 alignment, const PerfMetrics *perf_metrics = nullptr,
                const std::string &alloc_log_path = "",
                clio::run::u64 growth_unit = clio::run::u64(1) << 30,
-               int persistence_level = -1)
+               int persistence_level = -1,
+               const std::string &ext_yaml = "")
       : bdev_type_(bdev_type),
         total_size_(total_size),
         io_depth_(io_depth),
         alignment_(alignment),
         alloc_log_path_(alloc_log_path),
-        growth_unit_(growth_unit) {
+        growth_unit_(growth_unit),
+        ext_yaml_(ext_yaml) {
     // persistence_level < 0: not specified (keep the default, not explicit).
     if (persistence_level >= 0) {
       persistence_level_ = static_cast<PersistenceLevel>(persistence_level);
@@ -315,7 +326,7 @@ struct CreateParams {
   void serialize(Archive &ar) {
     ar(bdev_type_, total_size_, io_depth_, alignment_, perf_metrics_,
        persistence_level_, alloc_policy_, alloc_log_path_, growth_unit_,
-       populate_unit_, persistence_explicit_);
+       populate_unit_, persistence_explicit_, ext_yaml_);
   }
 
   /**
@@ -360,7 +371,8 @@ struct CreateParams {
         perf_metrics_.write_latency_us_ = 10.0;
         perf_metrics_.iops_ = 500000.0;
         break;
-      default:  // kFile / kS3 / kGcs / kNoop keep the conservative estimates
+      default:  // kFile / kS3 / kGcs / kDaos / kNoop keep the conservative
+                // estimates
         break;
     }
   }
@@ -395,6 +407,13 @@ struct CreateParams {
         bdev_type_ = BdevType::kS3;
       } else if (type_str == "gcs") {
         bdev_type_ = BdevType::kGcs;
+      } else if (type_str == "daos") {
+        bdev_type_ = BdevType::kDaos;
+      }
+      // The type's own settings block, e.g. `s3: {region: ..., access_key_id:
+      // ...}` for bdev_type s3. Kept as YAML text for the transport to read.
+      if (config[type_str] && config[type_str].IsMap()) {
+        ext_yaml_ = YAML::Dump(config[type_str]);
       }
       // The type now implies its speed. Before this, EVERY bdev type kept the
       // conservative file defaults (100/80 MB/s), so a kHbm tier and a kRam
@@ -787,7 +806,13 @@ struct ReadTask : public clio::run::Task {
   template <typename Archive>
   CTP_CROSS_FUN void SerializeOut(Archive &ar) {
     Task::SerializeOut(ar);
-    ar(length_, bytes_read_, io_error_);
+    // length_ is INOUT: a response may shorten it (a short read) but never
+    // grow it past the buffer the caller exposed, because the bulk below is
+    // copied into that buffer using it. When saving, `length` is just
+    // length_; when loading, a larger value from the wire is ignored.
+    size_t length = length_;
+    ar(length, bytes_read_, io_error_);
+    if (length < length_) length_ = length;
     // Use BULK_XFER to actually transfer the read data back
     ar.bulk(data_, length_, BULK_XFER);
   }

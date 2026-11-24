@@ -1,0 +1,128 @@
+<!--
+title: ADIOS2 engine
+heading: An ADIOS2 engine <em>backed by the CTE.</em>
+description: How to use the CLIO Core ADIOS2 plugin engine: build libiowarp_engine.so, select it with engine type Plugin and PluginLibrary iowarp_engine in code or in an ADIOS2 XML file, how variables, steps and ranks map to CTE blobs, and the rules readers must follow.
+eyebrow: Docs · I/O adapters
+lede: The ADIOS2 adapter is a plugin engine. An ADIOS2 program switches its IO to it in code or in its XML configuration, and every <code>Put</code> becomes a blob in the Context Transfer Engine, one per variable, step and rank. There is no file on disk.
+facts: Library | libiowarp_engine.so ; Build | CLIO_CTE_ENABLE_ADIOS2_ADAPTER=ON ; Select | engine type Plugin, PluginLibrary=iowarp_engine ; Find | ADIOS2_PLUGIN_PATH ; Install | Spack (+adios2), CMake, or the Docker image
+-->
+<h2>How it maps ADIOS2 to the CTE</h2>
+<ul>
+  <li><strong>One tag per opened engine.</strong> The name passed to <code>io.Open(name, mode)</code> becomes the name of a CTE tag.</li>
+  <li><strong>One blob per variable, step and rank.</strong> A <code>Put</code> of variable <code>u</code> during step 3 on rank 0 writes the blob <code>u_step_3_rank_0</code> in that tag. The step counter starts at 0 and each <code>BeginStep</code> adds one, so the first step's blobs are named <code>_step_1_</code>. The blob size is the product of the variable's count (or its shape, if no count is set) times the element size.</li>
+  <li><strong>Synchronous and deferred puts.</strong> <code>Put(var, data, adios2::Mode::Sync)</code> writes the blob before returning. A deferred <code>Put</code> (ADIOS2's default) copies the data into a shared-memory buffer, submits the write and returns; <code>EndStep</code> waits for all of the step's deferred writes.</li>
+  <li><strong>Gets are synchronous.</strong> Both sync and deferred <code>Get</code> read the blob immediately.</li>
+</ul>
+
+<h2>1. Build it</h2>
+<pre data-label="shell">
+$ cmake -S . -B build -DCLIO_CTE_ENABLE_ADIOS2_ADAPTER=ON \
+    -DCMAKE_PREFIX_PATH=/path/to/adios2
+$ cmake --build build -j"$(nproc)"
+$ ls build/bin/libiowarp_engine.so
+</pre>
+<p>Configure fails if ADIOS2 cannot be found. MPI is optional; when it is found the engine links it. The engine is in Spack (<code>+adios2</code>) and the Docker image, not in the pip wheel or conda; see <a href="/docs/io-adapters/install.html">Install</a>.</p>
+
+<h2>2. Start a runtime</h2>
+<pre data-label="shell">
+$ build/bin/clio-run start &
+</pre>
+<p>The engine attaches to the runtime on the local node when it is constructed. Its configuration must compose a CTE core pool; as for the HDF5 connectors, name it <code>clio_cte_core</code>, the name clients look up, or set <code>CLIO_CTE_POOL</code> to its id. If no runtime answers, the engine retries (60 attempts about 3 s apart by default) and then throws <code>IowarpEngine: CLIO_CTE_CLIENT_INIT failed after 60 attempts - is Clio runtime running?</code>.</p>
+
+<h2>3. Select the engine</h2>
+<p>Point ADIOS2 at the directory that holds the library:</p>
+<pre data-label="shell">
+$ export ADIOS2_PLUGIN_PATH=$PWD/build/bin      # or <prefix>/lib after an install
+</pre>
+<p>Then choose the engine for an IO, either in the ADIOS2 XML file the application already reads, with no code change:</p>
+<pre data-label="xml · adios2.xml">
+<?xml version="1.0"?>
+<adios-config>
+  <io name="SimulationOutput">
+    <engine type="Plugin">
+      <parameter key="PluginName" value="iowarp" />
+      <parameter key="PluginLibrary" value="iowarp_engine" />
+    </engine>
+  </io>
+</adios-config>
+</pre>
+<p>or in code:</p>
+<pre data-label="cpp">
+adios2::IO io = adios.DeclareIO("SimulationOutput");
+io.SetEngine("Plugin");
+io.SetParameters({{"PluginName", "iowarp"}, {"PluginLibrary", "iowarp_engine"}});
+</pre>
+<p><code>PluginLibrary</code> must be <code>iowarp_engine</code>; ADIOS2 loads <code>libiowarp_engine.so</code> from <code>ADIOS2_PLUGIN_PATH</code>. <code>PluginName</code> is a label of your choice.</p>
+
+<h2>4. A complete writer</h2>
+<pre data-label="cpp · writer.cc">
+#include <adios2.h>
+#include <mpi.h>
+#include <vector>
+
+int main(int argc, char **argv) {
+  MPI_Init(&argc, &argv);
+  int rank, nranks;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  MPI_Comm_size(MPI_COMM_WORLD, &nranks);
+
+  adios2::ADIOS adios(MPI_COMM_WORLD);
+  adios2::IO io = adios.DeclareIO("SimulationOutput");
+  io.SetEngine("Plugin");
+  io.SetParameters({{"PluginName", "iowarp"}, {"PluginLibrary", "iowarp_engine"}});
+
+  const size_t n = 1024;
+  std::vector<double> u(n);
+  auto var = io.DefineVariable<double>("u", {nranks * n}, {rank * n}, {n});
+
+  adios2::Engine w = io.Open("gs_output", adios2::Mode::Write);
+  for (int step = 0; step < 3; ++step) {
+    for (size_t i = 0; i < n; ++i) u[i] = step + rank;
+    w.BeginStep();
+    w.Put(var, u.data());          // deferred: completes at EndStep
+    w.EndStep();
+  }
+  w.Close();
+  MPI_Finalize();
+  return 0;
+}
+</pre>
+<p>The writer links only ADIOS2 and MPI, never CLIO; ADIOS2 loads the engine at run time.</p>
+<pre data-label="cmake · CMakeLists.txt">
+cmake_minimum_required(VERSION 3.16)
+project(writer CXX)
+find_package(MPI REQUIRED)
+find_package(ADIOS2 REQUIRED)
+add_executable(writer writer.cc)
+target_link_libraries(writer adios2::cxx11_mpi MPI::MPI_CXX)
+</pre>
+<pre data-label="shell">
+$ cmake -S . -B build-writer && cmake --build build-writer
+$ mpirun -np 2 env ADIOS2_PLUGIN_PATH=$CLIO_SRC/build/bin ./build-writer/writer
+</pre>
+<p><code>$CLIO_SRC</code> is your CLIO Core source tree. The run leaves six blobs in the tag <code>gs_output</code>: <code>u_step_1_rank_0</code> through <code>u_step_3_rank_1</code>, 8 KiB each. At the info log level, rank 0 logs each step's I/O time in milliseconds and a timing summary when the engine is destroyed.</p>
+
+<h2>Reading data back</h2>
+<p>The engine stores only the blobs, no variable metadata (shape, offsets, type) and no step index. A reader must therefore:</p>
+<ul>
+  <li>open the same name with the plugin engine, and define each variable itself with the writer's count, because <code>InquireVariable</code> has no stored metadata to find;</li>
+  <li>run with the same number of ranks as the writer, since each rank reads the blobs carrying its own rank number;</li>
+  <li>call <code>BeginStep</code> the same number of times as the writer to reach a given step. <code>BeginStep</code> always returns <code>adios2::StepStatus::OK</code>, so a loop that waits for <code>EndOfStream</code> never ends; loop over a known step count.</li>
+</ul>
+
+<h2>Large runs</h2>
+<p>At start-up every rank connects to its node's runtime. To keep thousands of ranks from connecting at once, ranks on a node are staggered: local rank <i>r</i> (the rank modulo <code>IOWARP_PPN</code>, default 12) waits <i>r</i> × <code>CLIO_INIT_STAGGER_MS</code> (default 250 ms) before connecting. Set <code>IOWARP_PPN</code> to your ranks per node. Connection retries are tuned with <code>CLIO_INIT_ATTEMPTS</code> (default 60) and <code>CLIO_INIT_SLEEP_MS</code> (mean pause between attempts, default 3000 ms, jittered).</p>
+
+<h2>Limits</h2>
+<ul>
+  <li>No variable metadata, no step discovery, and readers bound to the writer's rank layout, as above.</li>
+  <li>Data lives only in the CTE; its durability is decided by the tiers the runtime composes. Use a second IO with a file engine such as BP5 for output that must exist as files.</li>
+  <li>Blobs are written with placement score 1.0; see <a href="/design/placement.html">placement</a> for how scores pick tiers.</li>
+</ul>
+
+<h2>Where to go next</h2>
+<ul>
+  <li><a href="/docs/cte/index.html">Context Transfer Engine docs</a>: reading the blobs of tag <code>gs_output</code> from C++ or Python.</li>
+  <li><a href="/docs/io-adapters/configuration.html">Configuration reference</a>.</li>
+  <li><a href="/design/adapters.html#adios2">ADIOS2 engine design</a>.</li>
+</ul>

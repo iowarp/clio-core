@@ -164,8 +164,14 @@ inline int Transport::PollRecv(int timeout_ms) {
     case TransportType::kZeroMq:
       return static_cast<ZeroMqTransport*>(this)->PollRecv(timeout_ms);
 #endif
+    case TransportType::kSocket:
+      return static_cast<SocketTransport*>(this)->PollRecv(timeout_ms);
+#if CTP_ENABLE_THALLIUM
+    case TransportType::kThallium:
+      return static_cast<ThalliumTransport*>(this)->PollRecv(timeout_ms);
+#endif
     default:
-      // Non-ZMQ transports block via their EventManager registration instead.
+      // Other transports block via their EventManager registration instead.
       return 0;
   }
 }

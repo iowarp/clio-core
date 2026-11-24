@@ -55,6 +55,12 @@ set(TASK_STAT_MODEL_TEST_SOURCES
   test_task_stat_model.cc
 )
 
+# LoadTaskArchive::bulk size bounds
+set(TASK_ARCHIVE_BULK_TEST_TARGET clio_run_task_archive_bulk_tests)
+set(TASK_ARCHIVE_BULK_TEST_SOURCES
+  test_task_archive_bulk.cc
+)
+
 # Web dashboard test executable (issue #990). Needs Poco: the dashboard's HTTP
 # transport is Poco::Net, and the test drives it with Poco's HTTP client.
 set(VIZ_TEST_TARGET clio_run_viz_tests)
@@ -311,6 +317,75 @@ set_target_properties(${TASK_STAT_MODEL_TEST_TARGET} PROPERTIES
 set_target_properties(${TASK_STAT_MODEL_TEST_TARGET} PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
+
+# Create LoadTaskArchive bulk bounds test executable
+add_executable(${TASK_ARCHIVE_BULK_TEST_TARGET} ${TASK_ARCHIVE_BULK_TEST_SOURCES})
+
+target_include_directories(${TASK_ARCHIVE_BULK_TEST_TARGET} PRIVATE
+  ${CLIO_RUN_ROOT}/include
+  ${CLIO_RUN_ROOT}/test  # For simple_test.h
+  ${CLIO_RUN_ROOT}/modules/admin/include
+)
+
+target_link_libraries(${TASK_ARCHIVE_BULK_TEST_TARGET}
+  clio_admin_runtime
+  clio_admin_client
+  ctp::cxx
+  ${CMAKE_THREAD_LIBS_INIT}
+)
+
+set_target_properties(${TASK_ARCHIVE_BULK_TEST_TARGET} PROPERTIES
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
+# ChiMod ABI-fingerprint check. Three stand-in ChiMods from one source, built
+# into their own directory (NOT bin/, which ScanForChiMods walks): one with
+# the runtime's fingerprint, one with a different one, one with none.
+set(CHIMOD_ABI_TEST_TARGET clio_run_chimod_abi_check_tests)
+set(_abi_fake_dir ${CMAKE_BINARY_DIR}/test_chimod_abi)
+set(_abi_fake_defs "")
+foreach(_mode_name IN ITEMS 0:match 1:stale 2:none 3:bare)
+  string(REPLACE ":" ";" _pair ${_mode_name})
+  list(GET _pair 0 _mode)
+  list(GET _pair 1 _name)
+  set(_tgt clio_run_abi_fake_${_name})
+  add_library(${_tgt} MODULE test_chimod_abi_fake.cc)
+  target_compile_definitions(${_tgt} PRIVATE FAKE_ABI_MODE=${_mode})
+  # Link admin like every real module runtime does: its get_chimod_abi() is
+  # then reachable through dlsym on the "none" library's handle, which the
+  # check must not mistake for the library's own. "bare" links no module, so
+  # no get_chimod_abi() is reachable from it at all.
+  if(_name STREQUAL "bare")
+    target_link_libraries(${_tgt} PRIVATE clio_run_cxx)
+  else()
+    target_link_libraries(${_tgt} PRIVATE clio_run_cxx clio_admin_runtime)
+    if(NOT APPLE AND NOT WIN32)
+      target_link_options(${_tgt} PRIVATE -Wl,--no-as-needed)
+    endif()
+  endif()
+  set_target_properties(${_tgt} PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    WINDOWS_EXPORT_ALL_SYMBOLS ON  # as add_clio_module_runtime does
+    LIBRARY_OUTPUT_DIRECTORY ${_abi_fake_dir})
+  string(TOUPPER ${_name} _upper)
+  list(APPEND _abi_fake_defs
+    "ABI_FAKE_${_upper}_LIB=\"$<TARGET_FILE:${_tgt}>\"")
+  list(APPEND _abi_fake_targets ${_tgt})
+endforeach()
+add_executable(${CHIMOD_ABI_TEST_TARGET} test_chimod_abi_check.cc)
+target_include_directories(${CHIMOD_ABI_TEST_TARGET} PRIVATE
+  ${CLIO_RUN_ROOT}/test)  # For simple_test.h
+target_compile_definitions(${CHIMOD_ABI_TEST_TARGET} PRIVATE ${_abi_fake_defs})
+target_link_libraries(${CHIMOD_ABI_TEST_TARGET} clio_run_cxx ctp::cxx
+  ${CMAKE_THREAD_LIBS_INIT})
+add_dependencies(${CHIMOD_ABI_TEST_TARGET} ${_abi_fake_targets})
+set_target_properties(${CHIMOD_ABI_TEST_TARGET} PROPERTIES
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 # Create web dashboard test executable (issue #990). Skipped entirely when Poco
 # is absent: without it the build has no HTTP transport to test.
@@ -963,6 +1038,27 @@ if(CLIO_CORE_ENABLE_TESTS)
     ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;CLIO_TEST_MODE=1;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
     TIMEOUT 300
   )
+
+  # LoadTaskArchive::bulk size bounds. Own process: in-process runtime.
+  add_test(
+    NAME cr_task_archive_bulk_tests
+    COMMAND ${TASK_ARCHIVE_BULK_TEST_TARGET}
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_task_archive_bulk_tests PROPERTIES
+    ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;CLIO_TEST_MODE=1;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
+    TIMEOUT 300
+    RESOURCE_LOCK "clio_runtime_port"
+  )
+
+  # ChiMod ABI-fingerprint check: no runtime, just ModuleManager::LoadChiMod
+  # on the stand-in libraries.
+  add_test(
+    NAME cr_chimod_abi_check
+    COMMAND ${CHIMOD_ABI_TEST_TARGET}
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_chimod_abi_check PROPERTIES TIMEOUT 60)
 
   # Web dashboard (issue #990). Own ctest entry => own process: it brings up an
   # in-process runtime, and CLIO_INIT is once-per-process. The dashboard binds an
@@ -1627,6 +1723,7 @@ set(_install_test_targets
   ${SAVE_LOAD_TASK_TEST_TARGET}
   ${LOCAL_TASK_ARCHIVE_TEST_TARGET}
   ${TASK_STAT_MODEL_TEST_TARGET}
+  ${TASK_ARCHIVE_BULK_TEST_TARGET}
   ${STREAMING_TEST_TARGET}
   ${RUNTIME_CLEANUP_TEST_TARGET}
   ${IPC_ERRORS_TEST_TARGET}

@@ -46,9 +46,19 @@ kPodReorganizeBlob: 45  # POD variant of ReorganizeBlob
 # device-to-device copy it exists to perform. Data movement is about 5% of a
 # read; the round trip is the other 95%. Batching amortizes that trip over
 # many pages, which is the only lever that touches the dominant term.
-kPodMultiPutBlob: 50    # Many POD puts in one task (page flush)
-kPodMultiGetBlob: 51    # Many POD gets in one task (page fault)
-kPodMultiScore: 52      # Many POD score updates in one task (reorganize hints)
+kPodMultiPutBlob: 51    # Many POD puts in one task (page flush)
+kPodMultiGetBlob: 52    # Many POD gets in one task (page fault)
+kPodMultiScore: 53      # Many POD score updates in one task (reorganize hints)
+kTemporalSearch: 36    # Temporal search over blob access times
+kTruncateBlob: 37      # Truncate (resize) one blob
+kRenameTag: 38         # Rename a tag
+kGetOrCreateTagAlias: 39  # Create a tag-level hard link alias
+kGetTagName: 40        # Canonical name of a tag
+kGetCapacity: 41       # Capacity of the storage tiers
+kGetNumAliases: 42     # Number of aliases bound to a tag
+kMultiPutBlob: 48      # Batched multi-blob put
+kRegisterReplicaContainer: 49  # Register a replicated copy holder for a blob
+kGetResidency: 50      # Residency of a byte range in the tier
 kGetBlobScore: 22       # Get the score of a blob
 kGetBlobSize: 23        # Get the size of a blob
 kGetBlobInfo: 25        # Get comprehensive blob metadata (score, size, blocks, targets)
@@ -67,3 +77,7 @@ kUpdateTagNames: 55     # Batched broadcast tag-name add/remove/rename (filesyst
 kSyncTag: 56            # fsync for one tag: blobs to a persistent tier, sync devices + WAL (broadcast)
 kListLocalBlobs: 57     # list blobs (tag id + name) matching a name pattern on the queried containers
 kTagXattr: 58           # set / get / delete / list one key of a tag's xattr section
+kSetDurability: 59      # switch the core between volatile and persistent at runtime
+kMultiDelBlob: 60       # delete a set of blobs in one task (split by owner, one plan each)
+kMultiDelTag: 61        # delete a set of tags (by id) in one task (each container its share)
+kCowLink: 62           # Broadcast: register a copy-on-write link (source tag -> copy tag) on this container

@@ -459,7 +459,20 @@ class ConfigManager : public ctp::BaseConfig {
   void SetVizPort(u32 port) { viz_port_ = port; }
 
   /** Override the dashboard bind address (CLI `--viz-bind`). */
-  void SetVizBindAddr(const std::string &addr) { viz_bind_addr_ = addr; }
+  void SetVizBindAddr(const std::string &addr) {
+    viz_bind_addr_ = configured_viz_bind_addr_ = addr;
+  }
+
+  /** @return the bind address the runtime's own configuration chose (YAML,
+   *  environment or the daemon's `--viz-bind`), as opposed to one a
+   *  `viz_start` query picked for this run. */
+  std::string GetConfiguredVizBindAddr() const {
+    return configured_viz_bind_addr_;
+  }
+
+  /** Bind the dashboard to `addr` for this run only (a `viz_start` query),
+   *  leaving the configured address as it was. */
+  void UseVizBindAddr(const std::string &addr) { viz_bind_addr_ = addr; }
 
  private:
   /**
@@ -508,7 +521,12 @@ class ConfigManager : public ctp::BaseConfig {
   // CLIO_MAIN_SEGMENT_SIZE; LoadDefault() also installs 0, this initializer
   // just matches it.
   size_t main_segment_size_ = 0;
-  size_t client_data_segment_size_ = ctp::Unit<size_t>::Megabytes(256);
+  /** Default size of each client's first data segment (clio_<pid>_0). */
+  static constexpr size_t kDefaultClientDataSegmentSize =
+      static_cast<size_t>(512) * 1024 * 1024;
+  // issue #1359: settable via yaml `runtime: client_data_segment_size` or
+  // CLIO_CLIENT_DATA_SEGMENT_SIZE (both used to be silently ignored).
+  size_t client_data_segment_size_ = kDefaultClientDataSegmentSize;
   // issue #783: metadata segment. Deliberately huge and never pre-faulted --
   // shm_open + ftruncate + mmap is lazily populated, so the reservation
   // (default: the machine's RAM capacity, so metadata scales with the host)
@@ -604,6 +622,7 @@ class ConfigManager : public ctp::BaseConfig {
   bool viz_enabled_explicit_ = false;
   u32 viz_port_ = 8080;
   std::string viz_bind_addr_ = "127.0.0.1";
+  std::string configured_viz_bind_addr_ = "127.0.0.1";
   u32 viz_max_threads_ = 16;
 
   // Compose configuration

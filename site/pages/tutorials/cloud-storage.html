@@ -4,11 +4,11 @@ heading: Bring in <em>S3 and Google Cloud.</em>
 description: Import objects from Amazon S3 and Google Cloud Storage into CLIO Core, or use a bucket as a cold storage tier.
 eyebrow: Tutorial · Compose
 lede: Object stores connect to CLIO Core in two ways. The assimilation engine imports <code>s3://</code> and <code>gs://</code> objects. A build with the cloud options can also use a bucket as a storage tier.
-facts: Time | 20 minutes ; You need | A source build with cloud options, and bucket credentials ; Status | Not yet verified end to end
+facts: Time | 20 minutes ; You need | An AWS account; <code>pip install iowarp-core</code> for an S3 tier, a source build to import ; Status | S3 tier verified; import and GCS not yet
 -->
 <div class="callout warn">
-  <span class="callout-title">Not yet verified</span>
-  <p>The commands on this page have not been run end to end against Amazon S3 or Google Cloud Storage. The other tutorials were checked on a live system; this one was checked only against the source code. Expect to adjust details, and please report what you find.</p>
+  <span class="callout-title">Partly verified</span>
+  <p><a href="#try-an-s3-tier-from-pip">An S3 bucket as a tier</a> was run end to end against Amazon S3 with <code>iowarp-core</code> 2.5.1 from pip, exactly as written below. Importing objects and everything on Google Cloud Storage were checked only against the source code. For those, expect to adjust details, and please report what you find.</p>
 </div>
 
 <h2>Which one do you need?</h2>
@@ -18,10 +18,11 @@ facts: Time | 20 minutes ; You need | A source build with cloud options, and buc
     <tr><td>What it does</td><td>Copies objects into CLIO Core once</td><td>Stores tiered data in a bucket</td></tr>
     <tr><td>Data ends up</td><td>On your local tiers, searchable from Python</td><td>In the bucket</td></tr>
     <tr><td>Build options</td><td><code>CAE_ENABLE_S3</code>, <code>CAE_ENABLE_GCS</code></td><td><code>CLIO_ENABLE_AMAZON_DRIVE</code>, <code>CLIO_ENABLE_GOOGLE_CLOUD</code></td></tr>
-    <tr><td>Status</td><td class="good">Supported, with unit tests</td><td class="cost">Config parsing tested; no end-to-end test yet</td></tr>
+    <tr><td>In the pip wheel</td><td class="cost">No</td><td class="good">Yes (2.5.1 and later)</td></tr>
+    <tr><td>Status</td><td class="good">Supported, with unit tests</td><td class="good">S3 run end to end; GCS config parsing tested</td></tr>
   </tbody>
 </table></div>
-<p>The pip wheel includes neither. Build from source with the options you need, or use Spack (<code>spack install iowarp +s3 +gcs</code>).</p>
+<p>The pip wheel includes the bucket tiers; it does not include the importers. For the importers, build from source with the options you need, or use Spack (<code>spack install iowarp +s3_cae +gcs</code> for import, <code>+s3_bdev +gcs_bdev</code> for the tiers).</p>
 <pre data-label="shell">
 $ cmake --preset release-fuse \
     -DCAE_ENABLE_S3=ON -DCAE_ENABLE_GCS=ON \
@@ -29,6 +30,161 @@ $ cmake --preset release-fuse \
 $ cmake --build build -j"$(nproc)" && sudo cmake --install build
 </pre>
 <p>S3 support needs the AWS SDK for C++ (<code>aws-cpp-sdk-s3</code>). The GCS importer needs <code>google-cloud-cpp</code>, and the GCS block device needs Poco (Net, NetSSL, Crypto, JSON). If one is missing, the build turns that option off with a warning.</p>
+
+<h2>Try an S3 tier from pip</h2>
+<p>This is the shortest path to data in a bucket, and the one that was run end to end: install from pip, sign in with the AWS CLI, create a bucket, then write and read blobs through a CTE tier stored in it. No source build is needed.</p>
+<p>Every node that runs the runtime needs outbound HTTPS to <code>s3.&lt;region&gt;.amazonaws.com</code>. On a cluster, check from a compute node, not the login node. Any HTTP status (for example <code>307</code>) means it is reachable:</p>
+<pre data-label="shell">
+$ curl -s -o /dev/null -w "HTTP %{http_code}\n" https://s3.us-east-2.amazonaws.com/
+HTTP 307
+</pre>
+
+<h3>1. Install CLIO Core</h3>
+<pre data-label="shell">
+$ python3 -m venv ~/venv-iowarp
+$ ~/venv-iowarp/bin/pip install --upgrade pip
+$ ~/venv-iowarp/bin/pip install iowarp-core
+$ source ~/venv-iowarp/bin/activate      # puts clio_run and clio_cte_bench on PATH
+</pre>
+
+<h3>2. Install the AWS CLI</h3>
+<p>The AWS CLI v2 installs without root. This puts it in <code>~/aws-cli</code>, with the <code>aws</code> command in <code>~/bin</code>:</p>
+<pre data-label="shell">
+$ mkdir -p ~/awscli-dl && cd ~/awscli-dl
+$ curl -sSLo awscliv2.zip https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip
+$ unzip -q awscliv2.zip
+$ ./aws/install -i ~/aws-cli -b ~/bin
+$ cd ~ && rm -rf ~/awscli-dl
+$ aws --version                          # add ~/bin to PATH if not found
+</pre>
+<p>On ARM64, download <code>awscli-exe-linux-aarch64.zip</code> instead.</p>
+
+<h3>3. Sign in to AWS</h3>
+<div class="tabs" data-label="Sign-in">
+  <section class="tab-panel" data-tab="Browser sign-in"><p class="tab-title">Browser sign-in (recommended)</p>
+<pre data-label="shell">
+$ aws login
+</pre>
+  <p>Prints a link to open in any browser, so it works over SSH. Needs AWS CLI 2.32 or newer.</p></section>
+  <section class="tab-panel" data-tab="SSO portal"><p class="tab-title">Organization SSO portal</p>
+<pre data-label="shell">
+$ aws configure sso
+</pre>
+  <p>For accounts reached through a <code>*.awsapps.com/start</code> portal.</p></section>
+  <section class="tab-panel" data-tab="Access key"><p class="tab-title">An access key from the console</p>
+<pre data-label="shell">
+$ aws configure          # key ID, secret, region, output format
+</pre>
+  <p>To create a key, open the account menu (top right of the console) → <strong>Security credentials</strong> → <strong>Access keys</strong> → <strong>Create access key</strong> → <strong>Command Line Interface (CLI)</strong>. The secret is shown once. Do not create keys for the root user (an email sign-in); make an IAM user first, as in <a href="#least-privilege-keys">least-privilege keys</a>.</p></section>
+</div>
+<p>Check who you are signed in as, and the default region:</p>
+<pre data-label="shell">
+$ aws sts get-caller-identity
+$ aws configure get region
+</pre>
+
+<h3>4. Create a bucket</h3>
+<p>Bucket names are global across AWS, so add a random suffix:</p>
+<pre data-label="shell">
+$ BUCKET="clio-s3-test-$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+$ REGION=us-east-2
+$ aws s3 mb "s3://$BUCKET" --region "$REGION"
+make_bucket: clio-s3-test-d806c972
+$ aws s3api head-bucket --bucket "$BUCKET" --region "$REGION"
+</pre>
+<p>The runtime does not create buckets unless <code>allow_bucket_create</code> is set, so a typo in the name fails loudly instead of creating a new bucket.</p>
+
+<h3>5. Hand the credentials to the runtime</h3>
+<p>The tier reads only its <code>s3:</code> block and the <code>AWS_*</code> environment variables. <code>aws login</code> and SSO keep their credentials in a cache, not in <code>~/.aws/credentials</code>, so export them into the shell that starts the runtime:</p>
+<pre data-label="shell">
+$ eval "$(aws configure export-credentials --format env)"
+$ export AWS_DEFAULT_REGION=$REGION
+</pre>
+<p>This sets <code>AWS_ACCESS_KEY_ID</code>, <code>AWS_SECRET_ACCESS_KEY</code> and <code>AWS_SESSION_TOKEN</code>. The keys are temporary, typically a few hours. When they expire, run <code>aws login</code> and the export again, then restart the runtime.</p>
+
+<h3>6. Write the config</h3>
+<p>Save this as <code>clio_s3.yaml</code>. It has the required DRAM block device and one CTE tier in the bucket:</p>
+<pre data-label="yaml · clio_s3.yaml">
+networking:
+  port: 9413
+
+compose:
+  - mod_name: clio_bdev
+    pool_name: "ram::chi_default_bdev"
+    pool_query: local
+    pool_id: "301.0"
+    bdev_type: ram
+    capacity: "2g"
+
+  - mod_name: clio_cte_core
+    pool_name: cte_main
+    pool_query: local
+    pool_id: "512.0"
+    storage:
+      - path: "s3://${S3_TEST_BUCKET}/clio-s3-test"
+        bdev_type: "s3"
+        capacity_limit: "10GB"
+        score: 0.5
+        persistence_level: "long_term"
+        # region and keys come from AWS_DEFAULT_REGION and AWS_*
+</pre>
+<div class="callout warn">
+  <span class="callout-title"><code>${VAR}</code> is not expanded inside <code>s3:</code></span>
+  <p>Variables are expanded in <code>path</code>, but not inside an <code>s3:</code> block. <code>region: "${AWS_DEFAULT_REGION}"</code> reaches the runtime as literal text and fails with <code>Host not found: &lt;bucket&gt;.s3.${aws_default_region}.amazonaws.com</code>. Inside <code>s3:</code>, write literal values, or leave the key out and set the variable.</p>
+</div>
+
+<h3>7. Write and read through the bucket</h3>
+<pre data-label="shell">
+$ export S3_TEST_BUCKET=$BUCKET
+$ export CLIO_SERVER_CONF=$PWD/clio_s3.yaml
+$ clio_run --local start --fresh > runtime.log 2>&1 &
+$ until clio_run --local status 2>/dev/null | grep -q running; do sleep 1; done
+$ grep "S3 bdev ready" runtime.log
+INFO Init S3 bdev ready: bucket='clio-s3-test-d806c972' prefix='clio-s3-test_node0' region='us-east-2' endpoint='' capacity=...
+$ clio_cte_bench --op PutGet --threads 1 --depth 1 --io-size 1m --io-count 16
+</pre>
+<p>The benchmark should end with <code>Total ops: 16</code> and no <code>PutBlob</code> or <code>GetBlob</code> errors. Then look in the bucket. CTE appends <code>_node&lt;N&gt;</code> to each node's tier, so node 0 writes under <code>clio-s3-test_node0/</code>, one object per block:</p>
+<pre data-label="shell">
+$ aws s3 ls "s3://$BUCKET" --recursive --summarize | tail -2
+Total Objects: 16
+   Total Size: 16777216
+</pre>
+<p>The benchmark checks return codes, not the bytes it reads back. Each thread fills its buffer with its thread number, so with one thread every object is 1 MiB of zeros; <code>aws s3 cp "s3://$BUCKET/clio-s3-test_node0/block_0" - | od -An -tx1 | sort -u</code> shows it. Expect about 2 MB/s at one thread and depth 1, because every 1 MiB put and get is its own HTTPS round trip. Raise <code>--threads</code> and <code>--depth</code> to measure throughput.</p>
+
+<h3>8. Stop and clean up</h3>
+<pre data-label="shell">
+$ clio_run --local stop
+$ aws s3 rb "s3://$BUCKET" --force      # deletes every object, then the bucket
+</pre>
+
+<h3>If it fails</h3>
+<div class="table-wrap"><table>
+  <thead><tr><th>Runtime log says</th><th>Cause and fix</th></tr></thead>
+  <tbody>
+    <tr><td><code>Host not found: …s3.${aws_default_region}…</code></td><td>A <code>${VAR}</code> inside the <code>s3:</code> block. Use a literal, or drop the key and set the variable.</td></tr>
+    <tr><td><code>S3 bdev: no credentials</code></td><td>The shell that started the runtime has no keys. Run the export in step 5 in that shell and restart.</td></tr>
+    <tr><td><code>RegisterTarget Failed to create bdev container s3://…</code>, then <code>PutBlob rc=11</code></td><td>The S3 tier did not start, so CTE has nowhere to write. The real error is a few lines above it.</td></tr>
+    <tr><td><code>ExpiredToken</code> or 403 after a few hours</td><td>Temporary keys expired. <code>aws login</code>, export again, restart.</td></tr>
+    <tr><td>404, bucket not found</td><td>Wrong name or region. Check with <code>aws s3api head-bucket --bucket &lt;name&gt;</code>.</td></tr>
+    <tr><td>Timeouts on compute nodes only</td><td>No outbound internet from those nodes. Use the <code>curl</code> check at the top of this section.</td></tr>
+  </tbody>
+</table></div>
+
+<h3>Least-privilege keys</h3>
+<p>Your own sign-in is fine for a test. For a long-lived deployment, give the runtime a key that can only use one bucket: in the console, <strong>IAM → Users → Create user</strong> (no console access), attach this policy with your bucket name, then <strong>Security credentials → Create access key → Application running outside AWS</strong>. These keys do not expire; delete them when you are done.</p>
+<pre data-label="json">
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": "arn:aws:s3:::YOUR-BUCKET" },
+    { "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+      "Resource": "arn:aws:s3:::YOUR-BUCKET/*" }
+  ]
+}
+</pre>
 
 <h2>Import objects</h2>
 <h3>1. Provide credentials</h3>
@@ -40,7 +196,7 @@ $ export AWS_SECRET_ACCESS_KEY=...
 $ export AWS_DEFAULT_REGION=us-east-1
 $ export S3_ENDPOINT=https://s3.us-east-1.amazonaws.com   # or MinIO, Ceph, ...
 </pre>
-  <p><code>AWS_SESSION_TOKEN</code> is read for temporary credentials. <code>AWS_ENDPOINT_URL</code> works in place of <code>S3_ENDPOINT</code>. Set these in the environment of <code>clio_run start</code>, because downloads run inside the runtime.</p></section>
+  <p><code>AWS_SESSION_TOKEN</code> is read for temporary credentials. <code>AWS_ENDPOINT_URL</code> works in place of <code>S3_ENDPOINT</code>. Set these in the environment of <code>clio-run start</code>, because downloads run inside the runtime.</p></section>
   <section class="tab-panel" data-tab="Google Cloud Storage"><p class="tab-title">Google Cloud Storage</p>
 <pre data-label="shell">
 $ gcloud auth application-default login
@@ -90,13 +246,14 @@ transfers:
 <p>A build with <code>CLIO_ENABLE_AMAZON_DRIVE</code> or <code>CLIO_ENABLE_GOOGLE_CLOUD</code> can use a bucket as a storage tier. Give the tier <code>bdev_type: "s3"</code> or <code>"gcs"</code> and a path of the form <code>s3://bucket/prefix</code> or <code>gcs://bucket/prefix</code>. The prefix is required: CLIO Core appends <code>_node&lt;N&gt;</code> to the path for each node, and without a prefix that would change the bucket name.</p>
 
 <h3>1. Credentials for a bucket tier</h3>
+<p>Give credentials either in the tier's entry, as an <code>s3:</code> or <code>gcs:</code> block (step 2), or as environment variables of the process that starts the runtime. A key in the block wins over its variable. The <a href="/modules/bdev.html#s3">bdev reference</a> lists every key.</p>
 <div class="tabs" data-label="Provider">
   <section class="tab-panel" data-tab="Amazon S3"><p class="tab-title">Amazon S3</p>
 <pre data-label="shell">
 $ export AWS_DEFAULT_REGION=us-east-1
 $ export AWS_ACCESS_KEY_ID=...  AWS_SECRET_ACCESS_KEY=...
 </pre>
-  <p>Credentials come from the AWS SDK's usual sources: environment variables, <code>~/.aws/credentials</code>, or an instance role.</p></section>
+  <p>Only these variables and the <code>s3:</code> block are read: <code>~/.aws/credentials</code> and instance roles are not. After <code>aws login</code> or SSO, <code>eval "$(aws configure export-credentials --format env)"</code> sets all three, including <code>AWS_SESSION_TOKEN</code> (see <a href="#5-hand-the-credentials-to-the-runtime">step 5 above</a>).</p></section>
   <section class="tab-panel" data-tab="Google Cloud Storage"><p class="tab-title">Google Cloud Storage</p>
 <pre data-label="shell">
 $ export GCS_ACCESS_TOKEN=$(gcloud auth print-access-token)
@@ -123,6 +280,13 @@ $ export GCS_PROJECT_ID=my-project        # used only when creating the bucket
         capacity_limit: "1TB"
         score: 0.05
         persistence_level: "long_term"
+        s3:                                  # optional; else the environment
+          region: us-east-2
+          access_key_id: AKIA...
+          secret_access_key: ...
+        # gcs:
+        #   access_token: ya29....
 </pre>
+<p>Keys in the file end up in the runtime's pool log under <code>conf_dir</code> too, so keep the file and that directory private, or use the environment variables instead.</p>
 <p>Give the bucket the lowest score, so only data the organizer demotes reaches it (see <a href="/tutorials/operators.html#tiering-where-data-moves-later">tiering</a>). The CTE roster in the <a href="/tutorials/dashboard.html">dashboard</a> lists it as a tier.</p>
 <p>If the runtime logs <code>CLIO_ENABLE_AMAZON_DRIVE is not defined. Cannot use S3 bdev.</code>, the build lacks the S3 option. Reconfigure with <code>-DCLIO_ENABLE_AMAZON_DRIVE=ON</code>.</p>

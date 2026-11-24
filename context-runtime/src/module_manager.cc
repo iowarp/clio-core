@@ -37,10 +37,15 @@
 
 #include "clio_runtime/module_manager.h"
 
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 
 #include "clio_runtime/container.h"
+
+static_assert(sizeof(CLIO_RUNTIME_ABI_FINGERPRINT) > 1,
+              "clio_run_cxx must be compiled with the generated ABI "
+              "fingerprint header (clio_runtime/abi_fingerprint_generated.h)");
 
 // Global pointer variable definition for Module manager singleton
 CLIO_RUN_DEFINE_GLOBAL_PTR_VAR_CC(clio::run::ModuleManager, g_module_manager);
@@ -102,6 +107,12 @@ bool ModuleManager::LoadChiMod(const std::string &lib_path) {
     HLOG(kDebug,
          "Skipping library {} (invalid ChiMod - missing required symbols)",
          lib_path);
+    return false;
+  }
+
+  // Refuse a module built against different runtime headers before any of
+  // its code (alloc_chimod, get_chimod_name) runs.
+  if (!IsAbiCompatible(chimod_info->lib, lib_path)) {
     return false;
   }
 
@@ -172,7 +183,7 @@ ChiModInfo *ModuleManager::GetChiMod(const std::string &chimod_name) {
   // name here so older YAML configs (compose entries, persistent pool
   // metadata in the WAL) keep loading the module under the old `mod_name`.
   // The table is checked only on cache miss, so the rename does not slow
-  // down the hot path. See docs/deprecation-notes.md for the public list.
+  // down the hot path.
   static const std::pair<const char *, const char *> kAliases[] = {
       {"clio_bdev", "clio_bdev"},   // renamed 2026
       {"clio_admin", "clio_admin"}, // renamed 2026
@@ -347,6 +358,52 @@ bool ModuleManager::ValidateChiMod(ctp::SharedLibrary &lib) const {
 
   return (alloc_func != nullptr && new_func != nullptr &&
           name_func != nullptr && destroy_func != nullptr);
+}
+
+bool ModuleManager::IsAbiCompatible(ctp::SharedLibrary &lib,
+                                    const std::string &lib_path) const {
+  const char *check = std::getenv("CLIO_CHIMOD_ABI_CHECK");
+  if (check != nullptr && std::strcmp(check, "0") == 0) {
+    return true;
+  }
+  auto abi_func =
+      reinterpret_cast<get_chimod_abi_t>(lib.GetSymbol("get_chimod_abi"));
+  if (abi_func == nullptr) {
+    HLOG(kWarning,
+         "Skipping ChiMod {}: it has no ABI fingerprint, so it was built "
+         "against an older runtime. Rebuild it or remove it "
+         "(CLIO_CHIMOD_ABI_CHECK=0 loads it anyway).",
+         lib_path);
+    return false;
+  }
+  // dlsym on a library handle also searches the library's dependencies, and
+  // every non-admin module runtime links libclio_admin_runtime, which has its
+  // own get_chimod_abi(). Accept only a symbol defined in this very file.
+  // Compare by file identity, not by string: Windows may spell the same
+  // path with other separators or letter case.
+  std::string abi_path =
+      ctp::SystemInfo::GetModulePathFor(reinterpret_cast<void *>(abi_func));
+  std::error_code ec;
+  if (abi_path.empty() ||
+      !std::filesystem::equivalent(abi_path, lib_path, ec)) {
+    HLOG(kWarning,
+         "Skipping ChiMod {}: it has no ABI fingerprint of its own (the one "
+         "found is in {}), so it was built against an older runtime. "
+         "Rebuild it or remove it (CLIO_CHIMOD_ABI_CHECK=0 loads it anyway).",
+         lib_path, abi_path);
+    return false;
+  }
+  const char *mod_abi = abi_func();
+  if (mod_abi == nullptr ||
+      std::strcmp(mod_abi, CLIO_RUNTIME_ABI_FINGERPRINT) != 0) {
+    HLOG(kWarning,
+         "Skipping ChiMod {}: ABI fingerprint '{}' does not match the "
+         "runtime's '{}' (stale build?). Rebuild it or remove it "
+         "(CLIO_CHIMOD_ABI_CHECK=0 loads it anyway).",
+         lib_path, mod_abi ? mod_abi : "", CLIO_RUNTIME_ABI_FINGERPRINT);
+    return false;
+  }
+  return true;
 }
 
 }  // namespace clio::run

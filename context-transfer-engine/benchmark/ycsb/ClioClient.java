@@ -41,39 +41,29 @@ import java.util.Vector;
 public class ClioClient extends DB {
 
   private static native int nativeInit();
+  private static native int nativeSync();
   private static native int nativePut(String key, byte[] value);
-  private static native int nativePutAsync(String key, byte[] value);
-  private static native int nativeDrain();
   private static native byte[] nativeGet(String key);
   private static native String[] nativeScanKeys(String startKey, int count);
-  private static native int nativePutDirect(String key, java.nio.ByteBuffer buf, int len);
+  private static native int nativePutDirect(String key, java.nio.ByteBuffer buf, int len,
+      boolean newKey);
   private static native int nativeGetDirect(String key, java.nio.ByteBuffer buf);
-  private static native java.nio.ByteBuffer nativeGetView(String key, long[] genOut);
-  private static native boolean nativeValidateGen(String key, long gen);
 
   static {
     System.loadLibrary("clio_ycsb_jni");
   }
 
-  // ---- copy-reduction plumbing (items 1-3) --------------------------------
-  // Writes: a per-thread ring of direct ByteBuffers, sized comfortably above
-  // the shim's async window (default 64) so a slot's put is guaranteed reaped
-  // (the window is a global FIFO) before its buffer is reused. Serialization
-  // writes ONCE into the direct buffer; the native put uses its address as
-  // the source (runtime mode reads it directly; client mode stages at
-  // submit). Reads: one per-thread direct buffer for copying reads, and a
-  // zero-copy view path over the blob's RAM extent, gen-validated after the
-  // row is built (fall back to the copying read on mismatch).
-  // AsyncPutBlobDefer owns a copy of the bytes at submit, so one reusable
-  // per-thread direct buffer is all the write path needs — no ring, no
-  // lifetime coupling, no knobs.
+  // ---- copy-reduction plumbing --------------------------------------------
+  // Writes: serialization writes ONCE into a per-thread direct buffer whose
+  // address is the native put's source. The native put is synchronous (a
+  // copy into the CTE shm cache segment when one is connected, else a task
+  // that is waited on), so the buffer is reusable as soon as it returns.
+  // Reads: one per-thread direct buffer for copying reads.
   private static final int BUF_CAP = 64 * 1024;
   private static final ThreadLocal<java.nio.ByteBuffer> WRITE_BUF =
       ThreadLocal.withInitial(() -> java.nio.ByteBuffer.allocateDirect(BUF_CAP));
   private static final ThreadLocal<java.nio.ByteBuffer> READ_BUF =
       ThreadLocal.withInitial(() -> java.nio.ByteBuffer.allocateDirect(1024 * 1024));
-  private static final ThreadLocal<long[]> GEN_OUT =
-      ThreadLocal.withInitial(() -> new long[1]);
 
   /** Zero-copy ByteIterator over a slice of a (shared) ByteBuffer; absolute
    *  reads so many iterators can share one buffer without position races. */
@@ -140,22 +130,30 @@ public class ClioClient extends DB {
     }
   }
 
+  /**
+   * Standalone entry point for the benchmark driver: {@code drain} waits
+   * until every put buffered by the shm cache reached the CTE core.
+   * Exits 0 on success.
+   */
+  public static void main(String[] args) {
+    if (args.length != 1 || !"drain".equals(args[0])) {
+      System.err.println("usage: ClioClient drain");
+      System.exit(2);
+    }
+    int rc = nativeInit();
+    if (rc == 0) {
+      rc = nativeSync();
+    }
+    System.out.println("clio drain rc=" + rc);
+    System.exit(rc == 0 ? 0 : 1);
+  }
+
   @Override
   public void init() throws DBException {
     int rc = nativeInit();
     if (rc != 0) {
       throw new DBException("Clio native init failed rc=" + rc
           + " (is the clio_run daemon running?)");
-    }
-  }
-
-  @Override
-  public void cleanup() throws DBException {
-    // Drain the async write window (shared across threads; idempotent) so no
-    // put escapes this phase and completion errors fail the phase loudly.
-    int errs = nativeDrain();
-    if (errs != 0) {
-      throw new DBException("Clio async writes failed: " + errs);
     }
   }
 
@@ -197,24 +195,7 @@ public class ClioClient extends DB {
   public Status read(String table, String key, Set<String> fields,
       Map<String, ByteIterator> result) {
     String name = blobName(table, key);
-    // Item 3: zero-copy view over the blob's RAM extent, validated by
-    // placement generation AFTER the row is built (torn/moved -> retry via
-    // the copying path). The field views point into the store; YCSB consumes
-    // them within this operation.
-    long[] gen = GEN_OUT.get();
-    java.nio.ByteBuffer view = nativeGetView(name, gen);
-    if (view != null) {
-      try {
-        deserializeBB(view, view.capacity(), fields, result);
-        if (nativeValidateGen(name, gen[0])) {
-          return Status.OK;
-        }
-        result.clear();  // placement moved mid-read: fall through and copy
-      } catch (IOException e) {
-        result.clear();
-      }
-    }
-    // Item 2: one-copy read into the per-thread direct buffer.
+    // One-copy read into the per-thread direct buffer.
     java.nio.ByteBuffer buf = READ_BUF.get();
     int n = nativeGetDirect(name, buf);
     if (n == 0) {
@@ -234,10 +215,20 @@ public class ClioClient extends DB {
   @Override
   public Status insert(String table, String key,
       Map<String, ByteIterator> values) {
+    return put(table, key, values, true);
+  }
+
+  /**
+   * Serialize a record into the per-thread direct buffer and put it.
+   * newKey adds the key to the scan index; an update of an existing key
+   * skips it, so updates never touch the index's lock.
+   */
+  private Status put(String table, String key,
+      Map<String, ByteIterator> values, boolean newKey) {
     try {
       java.nio.ByteBuffer wb = (java.nio.ByteBuffer) WRITE_BUF.get().clear();
       int len = serializeInto(wb, values);
-      int rc = nativePutDirect(blobName(table, key), wb, len);
+      int rc = nativePutDirect(blobName(table, key), wb, len, newKey);
       return rc == 0 ? Status.OK : Status.ERROR;
     } catch (IOException e) {
       return Status.ERROR;
@@ -260,7 +251,8 @@ public class ClioClient extends DB {
       }
     }
     merged.putAll(values);
-    return insert(table, key, merged);
+    // An update of a missing key creates it, so it must enter the index.
+    return put(table, key, merged, existing == null);
   }
 
   @Override

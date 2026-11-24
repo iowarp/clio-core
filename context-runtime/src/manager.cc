@@ -36,9 +36,11 @@
  */
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
@@ -46,6 +48,10 @@
 
 #ifndef _WIN32
 #include <sys/resource.h>  // RaiseFdLimit
+#if defined(__APPLE__)
+#include <sys/syslimits.h>  // OPEN_MAX (RaiseFdLimit)
+#include <sys/sysctl.h>     // kern.maxfilesperproc (RaiseFdLimit)
+#endif
 #if defined(__linux__)
 #include <sys/prctl.h>  // MaybeAllowPtrace
 #endif
@@ -251,8 +257,9 @@ namespace {
  * Restart replay of this node's pool log -- the one restart registry: every
  * durable pool (compose `restart: true`, or API-created by a client with
  * SetPersistent) is re-created here, in creation order, taking the
- * Restart() path. A fresh start forgets them instead: it begins a new
- * cluster lifetime, and test pools must never come back.
+ * Restart() path. A fresh start forgets them instead (ServerInit clears the
+ * log before the server compose): it begins a new cluster lifetime, and test
+ * pools must never come back.
  * @param is_restart true for a recovering `clio_run start`, false for
  *        `clio_run start --fresh`
  */
@@ -260,8 +267,7 @@ void ReplayPoolLog(bool is_restart) {
   auto *pool_manager = CLIO_POOL_MANAGER;
   auto *admin = CLIO_ADMIN;
   if (!is_restart) {
-    pool_manager->ClearPoolLog();
-    return;
+    return;  // a fresh start cleared the log before its compose (ServerInit)
   }
   const auto pools = pool_manager->LoadPoolLog();
   if (pools.empty() || admin == nullptr) return;
@@ -286,22 +292,57 @@ void ReplayPoolLog(bool is_restart) {
        pools.size(), pool_manager->PoolLogPath());
 }
 
+#ifndef _WIN32
 /**
- * Raise this process's open-file soft limit to its hard limit. Every file
- * bdev opens its backing file once per worker, so an array of several disks
- * on 16 workers runs past the usual 1024 soft limit, and the next member's
+ * The highest open-file soft limit setrlimit will accept on this platform.
+ * macOS reports an unlimited hard limit (RLIM_INFINITY) but rejects a soft
+ * limit above kern.maxfilesperproc with EINVAL, so asking for the hard limit
+ * there fails and leaves the process at the default 256.
+ * @param hard the RLIMIT_NOFILE hard limit
+ * @return the target soft limit
+ */
+rlim_t FdLimitTarget(rlim_t hard) {
+#if defined(__APPLE__)
+  rlim_t cap = OPEN_MAX;
+  int per_proc = 0;
+  size_t len = sizeof(per_proc);
+  if (sysctlbyname("kern.maxfilesperproc", &per_proc, &len, nullptr, 0) ==
+          0 &&
+      per_proc > 0) {
+    cap = static_cast<rlim_t>(per_proc);
+  }
+  return hard < cap ? hard : cap;
+#else
+  return hard;
+#endif
+}
+#endif
+
+/**
+ * Raise this process's open-file soft limit to its hard limit (clamped to
+ * what the platform accepts, see FdLimitTarget). Every file bdev opens its
+ * backing file once per worker, so an array of several disks on 16 workers
+ * runs past the usual 1024 soft limit (256 on macOS), and the next member's
  * workers then fail to open it. Storage daemons raise the limit themselves.
  */
 void RaiseFdLimit() {
 #ifndef _WIN32
   struct rlimit rl;
-  if (getrlimit(RLIMIT_NOFILE, &rl) != 0 || rl.rlim_cur >= rl.rlim_max) {
+  if (getrlimit(RLIMIT_NOFILE, &rl) != 0) {
+    return;
+  }
+  const rlim_t target = FdLimitTarget(rl.rlim_max);
+  if (rl.rlim_cur >= target) {
     return;
   }
   const rlim_t old = rl.rlim_cur;
-  rl.rlim_cur = rl.rlim_max;
+  rl.rlim_cur = target;
   if (setrlimit(RLIMIT_NOFILE, &rl) == 0) {
     HLOG(kDebug, "Raised open-file limit from {} to {}", old, rl.rlim_cur);
+  } else {
+    HLOG(kWarning, "Could not raise the open-file limit from {} to {} ({}); "
+         "file bdevs may fail to open once it is reached", old, target,
+         std::strerror(errno));
   }
 #endif
 }
@@ -359,6 +400,20 @@ bool RuntimeManager::ServerInit() {
     return false;
   }
 
+  // Start the control channel only now that every ChiMod is loaded. Its
+  // thread opens its own ZMQ context, which spawns ZMQ's I/O and reaper
+  // threads; started earlier, those pthread_create calls ran while this
+  // thread dlopen()ed the ChiMods. Under ASan that is a crash: libasan
+  // (GCC 14) allocates a new thread's context and the globals list of a
+  // dlopen()ed library from the same LowLevelAllocator under two different
+  // mutexes, so the two allocations can overlap, and the daemon died with
+  // "CHECK failed: sanitizer_thread_registry.cpp:161 ((tctx->status)) ==
+  // ((ThreadStatusInvalid))" in ControlChannelLoop -> zmq_socket while the
+  // main thread was loading a module (the shutdown-battletest flake).
+  // Nothing before this point needs the control channel: it carries only
+  // inter-node liveness pings.
+  ipc_manager->StartControlChannel();
+
   // Initialize work orchestrator before pool manager
   auto *work_orchestrator = CLIO_WORK_ORCHESTRATOR;
   if (!work_orchestrator->Init()) {
@@ -394,6 +449,14 @@ bool RuntimeManager::ServerInit() {
   // composed explicitly (e.g. a spawned per-app runtime backed by a main
   // runtime via the fallback).
   const auto &compose_config = config_manager->GetComposeConfig();
+  // A fresh start forgets the previous lifetime's durable pools BEFORE the
+  // server compose runs: clearing after it (in ReplayPoolLog) also erased the
+  // entries the compose had just recorded for its own `restart: true` pools,
+  // so `clio_run pool start` and `compose list --restartable` could not see
+  // them until the next recovering start.
+  if (!is_restart_ && !config_manager->IsEphemeral()) {
+    pool_manager->ClearPoolLog();
+  }
   if (config_manager->IsEphemeral() && !compose_config.pools_.empty()) {
     HLOG(kInfo,
          "Ephemeral runtime: skipping default compose ({} pools in config)",

@@ -18,7 +18,7 @@ level until a flush moves it to a persistent tier.</p>
 
 <h2 id="state">What is persisted, and where</h2>
 <p>Persistent state lives under a single storage root
-(<code>CLIO_STORAGE_ROOT</code> or <code>clio_run start --disk</code>,
+(<code>CLIO_STORAGE_ROOT</code> or <code>clio-run start --disk</code>,
 default <code>~/.clio</code>):</p>
 <table>
   <tr><th>Artifact</th><th>Owner</th><th>Contents</th><th>Sync policy</th></tr>
@@ -81,7 +81,7 @@ when one of these holds:</p>
 </div>
 
 <h2 id="restart">What a restart does</h2>
-<p><code>clio_run start</code> always recovers existing state.
+<p><code>clio-run start</code> always recovers existing state.
 <code>--fresh</code> is the only way to discard it.</p>
 <ol>
   <li><strong>Pools come back.</strong> The runtime replays its per-node
@@ -156,25 +156,26 @@ when one of these holds:</p>
 <p>Through the FUSE filesystem, <code>fsync</code> on a file does the
 following, in order:</p>
 <ol>
-  <li>Drains the client's write-behind pages.</li>
+  <li>Runs any queued close publish for the file. Writes are synchronous,
+  so there are no pending pages to drain.</li>
   <li>Publishes the file's size.</li>
-  <li>Waits for any pending asynchronous replication of the file.</li>
-  <li>Syncs the file's tag: data is moved to a persistent tier and its
-  devices are fsynced, then the metadata log is fsynced.</li>
+  <li>Syncs the file's tag: the write-back cache flushes its dirty copies
+  to the persistent core, replication brings pending replicas up to date,
+  the devices are fsynced, then the metadata log is fsynced.</li>
   <li>Fsyncs the stream size log.</li>
-  <li>Syncs the parent directory's tag, so the name is durable too.</li>
+  <li>Syncs the parent directory's tag and the directory journal, so the
+  name is durable too.</li>
 </ol>
 <p>If a node that may have held this file's unsynced writes died since the
 last sync, <code>fsync</code> returns an I/O error rather than claiming
 durability it cannot vouch for. Measured cost: syncing to the device adds
 roughly 23–35% to fsync-heavy workloads such as sqlite, tar and appends.</p>
 <div class="callout warn">
-  <p><strong>Front ends differ.</strong> The <code>LD_PRELOAD</code>
-  interceptors (POSIX, STDIO) implement <code>fsync</code> as "drain the
-  deferred writes and report any latched error". That makes the write
-  visible and surfaces errors, but it does not sync the tag to a device.
-  MPI-IO's sync is a no-op. Applications that need power-loss durability
-  through these paths depend on the periodic flush. See
+  <p><strong>Front ends agree.</strong> The <code>LD_PRELOAD</code>
+  interceptors write synchronously, so a failed write is reported by that
+  write. Their sync calls (POSIX <code>fsync</code>, STDIO
+  <code>fflush</code> and <code>MPI_File_sync</code>) run the same durable
+  sync as the FUSE mount: file tag, size, then the parent directory. See
   <a href="adapters.html">I/O adapters</a>.</p>
 </div>
 
@@ -187,7 +188,10 @@ roughly 23–35% to fsync-heavy workloads such as sqlite, tar and appends.</p>
   <li><strong>Remote copies.</strong> With factor <em>N</em>, the owner
   writes <em>N−1</em> copies to the next nodes in ring order before
   acknowledging. A dead successor is skipped: the write succeeds with one
-  copy fewer, and nothing re-replicates it later.</li>
+  copy fewer, and the owner notes the missed copy in an in-memory list.
+  The replication module's handoff sweep (every 500 ms) re-copies it from
+  the owner's primary once the successor is alive again. The list is not
+  persisted, so a restart of the owner forgets it.</li>
   <li><strong>Failover.</strong> With <code>failover_to_successor</code>,
   requests for a dead owner's blobs go to its first live successor, which
   serves its shadow copy and records every change. When the owner

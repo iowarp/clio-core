@@ -15,6 +15,14 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../../../" && pwd)"
 
+# Bounded waits + diagnostics (CI/compose_wait.sh): readiness is `clio_run
+# status` on every node, every docker exec runs against ONE deadline below the
+# workflow step's timeout-minutes (20), and a timeout or failure dumps every
+# node's logs, processes and thread state.
+# shellcheck source=../../../../CI/compose_wait.sh
+source "$REPO_ROOT/CI/compose_wait.sh"
+SUITE_NODES=(iowarp-distributed-node1 iowarp-distributed-node2 iowarp-distributed-node3 iowarp-distributed-node4)
+
 # Export workspace path for docker-compose
 # Priority: HOST_WORKSPACE > existing IOWARP_CORE_ROOT > computed REPO_ROOT
 if [ -n "${HOST_WORKSPACE:-}" ]; then
@@ -89,7 +97,10 @@ start_docker_cluster() {
 
     # Wait for containers to be ready
     log_info "Waiting for containers to initialize..."
-    sleep 10
+    if ! cw_wait_runtimes; then
+        docker compose down 2>/dev/null || true
+        exit 1
+    fi
 
     # Check container status
     docker compose ps
@@ -129,7 +140,7 @@ matches_filter() {
 run_single_test() {
     local filter="$1"
     local ipc_mode="${2:-}"
-    if ! docker exec iowarp-distributed-node1 bash -c "
+    if ! cw_exec_or_dump iowarp-distributed-node1 bash -c "
         export CLIO_WITH_RUNTIME=0
         ${ipc_mode:+export CLIO_IPC_MODE=$ipc_mode}
         clio_run_bdev_chimod_tests '$filter'
@@ -148,7 +159,7 @@ run_test_docker_direct() {
 
     # Wait for all runtimes to be ready (give them time to initialize)
     log_info "Waiting for runtimes to initialize across all nodes..."
-    sleep 5
+    cw_wait_runtimes || return 1
 
     # Execute each IPC mode variant as a separate process invocation
     local any_failed=0
@@ -241,6 +252,8 @@ done
 
 # Default command
 COMMAND=${COMMAND:-all}
+
+cw_init "${DISTRIBUTED_BUDGET_SEC:-1020}" "${SUITE_NODES[@]}"
 
 # Main execution
 log_info "IOWarp Distributed Test Runner"

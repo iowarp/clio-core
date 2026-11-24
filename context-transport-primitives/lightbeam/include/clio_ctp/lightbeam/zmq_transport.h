@@ -681,6 +681,25 @@ class ZeroMqTransport : public Transport {
     }
   }
 
+  // Abandon a message whose bulk frame did not match its declared size:
+  // release the zero-copy handles already adopted for bulks [0, count), so
+  // the caller never sees a half-filled recv vector, and discard the rest
+  // of the multipart message so the next Recv() starts on a boundary.
+  template <typename MetaT>
+  void RejectBulks(MetaT& meta, size_t count) {
+    for (size_t j = 0; j < count && j < meta.recv.size(); ++j) {
+      Bulk& bulk = meta.recv[j];
+      if (bulk.desc) {
+        zmq_msg_t* msg = static_cast<zmq_msg_t*>(bulk.desc);
+        zmq_msg_close(msg);
+        delete msg;
+        bulk.desc = nullptr;
+        bulk.data = ctp::ipc::FullPtr<char>::GetNull();
+      }
+    }
+    DrainToMessageBoundary();
+  }
+
   template <typename MetaT>
   int RecvMetadata(MetaT& meta, const LbmContext& ctx = LbmContext()) {
     (void)ctx;
@@ -759,6 +778,16 @@ class ZeroMqTransport : public Transport {
                                   static_cast<char*>(zmq_msg_data(&msg)) + msg_size);
       ctp::ipc::GlobalDeserialize<std::vector<char>> ar(meta_buf);
       ar(meta);
+      // A short or foreign message does not throw; it fails the archive.
+      // Skip the rest of the multipart message and drop it (#1353).
+      if (ar.Failed()) {
+        HLOG(kError,
+             "ZeroMQ RecvMetadata: malformed message dropped (msg_size={})",
+             msg_size);
+        zmq_msg_close(&msg);
+        DrainToMessageBoundary();
+        return -1;
+      }
     } catch (const std::exception& e) {
       HLOG(kFatal,
            "ZeroMQ RecvMetadata: Deserialization failed - {} (msg_size={})",
@@ -794,6 +823,17 @@ class ZeroMqTransport : public Transport {
           zmq_msg_close(&zmq_msg);
           return err;
         }
+        // The frame must carry exactly the bytes the receiver exposed:
+        // a shorter frame would make the copy read past libzmq's buffer.
+        if (zmq_msg_size(&zmq_msg) != meta.recv[i].size) {
+          HLOG(kError,
+               "ZeroMQ RecvBulks: bulk {} is {} bytes, expected {}; "
+               "dropping the message",
+               i, zmq_msg_size(&zmq_msg), meta.recv[i].size);
+          zmq_msg_close(&zmq_msg);
+          RejectBulks(meta, i);
+          return EPROTO;
+        }
         memcpy(meta.recv[i].data.ptr_,
                zmq_msg_data(&zmq_msg), meta.recv[i].size);
         zmq_msg_close(&zmq_msg);
@@ -806,6 +846,18 @@ class ZeroMqTransport : public Transport {
           zmq_msg_close(zmq_msg);
           delete zmq_msg;
           return err;
+        }
+        // The size every later reader trusts is the one the sender declared
+        // in the metadata; refuse a frame that does not carry that many bytes.
+        if (zmq_msg_size(zmq_msg) != meta.recv[i].size) {
+          HLOG(kError,
+               "ZeroMQ RecvBulks: bulk {} is {} bytes, declared {}; "
+               "dropping the message",
+               i, zmq_msg_size(zmq_msg), meta.recv[i].size);
+          zmq_msg_close(zmq_msg);
+          delete zmq_msg;
+          RejectBulks(meta, i);
+          return EPROTO;
         }
         char *zmq_data = static_cast<char*>(zmq_msg_data(zmq_msg));
         meta.recv[i].data.ptr_ = zmq_data;

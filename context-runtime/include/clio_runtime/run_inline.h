@@ -88,8 +88,8 @@ inline clio::run::Future<TaskT> RunInlineOrSend(
         CLIO_POOL_MANAGER->GetRealOrStaticContainer(task->pool_id_);
     clio::run::ContainerHold c = dc.get();
     if (c != nullptr) {
-      // Same synthesized-completed-future shape as the batch-merged sink and
-      // the TryShmGet fast path: give the task a RunContext + future, run the
+      // Same synthesized-completed-future shape as the batch-merged sink:
+      // give the task a RunContext + future, run the
       // handler as a nested call on THIS fiber (its awaits suspend the
       // enclosing fiber, per the Boost backend contract), then mark complete.
       task->BeginRunContext();

@@ -188,6 +188,16 @@ void PoolManager::DestroyAllContainers() {
     info.static_container_ = DynamicContainer();
     info.local_container_ = DynamicContainer();
   }
+  // Containers of pools destroyed earlier (see UnregisterAllContainers). Each
+  // was retired once, when its pool's handles were dropped, so none is also in
+  // a live pool's maps above.
+  for (auto &r : retired_containers_) {
+    if (ContainerHold c = r.second.get()) {
+      c.Destroy(r.first);
+      ++destroyed;
+    }
+  }
+  retired_containers_.clear();
   if (destroyed > 0) {
     HLOG(kInfo, "PoolManager: Destroyed {} container(s) on shutdown", destroyed);
   }
@@ -419,10 +429,81 @@ void PoolManager::UnregisterAllContainers(PoolId pool_id) {
     return;
   }
 
+  // Retire the pool's containers instead of just dropping the handles: nothing
+  // else owns them, so dropping them leaked every destroyed pool's real and
+  // static containers (the intermittent cte_cli_cache_unplug LSan failure --
+  // intermittent only because a stale handle copy sometimes kept them
+  // reachable). They cannot be deleted here, since other workers may still
+  // hold cached handles; DestroyAllContainers() deletes them after the
+  // workers stop. local_container_ is one of containers_, so it is not added.
   PoolInfo &info = it->second;
+  for (auto &cpair : info.containers_) {
+    if (cpair.second.IsValid()) {
+      retired_containers_.emplace_back(info.chimod_name_, cpair.second);
+    }
+  }
+  if (info.static_container_.IsValid()) {
+    retired_containers_.emplace_back(info.chimod_name_, info.static_container_);
+  }
   info.containers_.clear();
   info.static_container_ = DynamicContainer();
   info.local_container_ = DynamicContainer();
+}
+
+template <typename Pick>
+DynamicContainer PoolManager::PickFromServingPool(PoolId pool_id,
+                                                  Pick pick) const {
+  {
+    PoolMetaReadLock lock(pool_metadata_mutex_);
+    auto it = pool_metadata_.find(pool_id);
+    if (it != pool_metadata_.end()) {
+      return pick(it->second);
+    }
+  }
+  // Pool has no metadata here: it may have been unplugged. Serve from its
+  // successor so tasks still addressed to it resolve (see RedirectOf).
+  PoolId successor = RedirectOf(pool_id);
+  if (successor.IsNull()) {
+    return DynamicContainer();
+  }
+  PoolMetaReadLock lock(pool_metadata_mutex_);
+  auto it = pool_metadata_.find(successor);
+  return it != pool_metadata_.end() ? pick(it->second) : DynamicContainer();
+}
+
+PoolId PoolManager::RedirectOf(PoolId pool_id) const {
+  if (!has_redirects_.load(std::memory_order_relaxed)) {
+    return PoolId::GetNull();
+  }
+  std::shared_lock<std::shared_mutex> lk(redirects_mu_);
+  PoolId result = PoolId::GetNull();
+  PoolId current = pool_id;
+  for (size_t hop = 0; hop < kMaxRedirectHops; ++hop) {
+    auto it = redirects_.find(current);
+    if (it == redirects_.end()) {
+      break;
+    }
+    result = it->second;
+    current = result;
+  }
+  return result;
+}
+
+void PoolManager::InstallRedirect(PoolId from, PoolId to) {
+  if (from == to) {
+    return;
+  }
+  std::unique_lock<std::shared_mutex> lk(redirects_mu_);
+  redirects_[from] = to;
+  has_redirects_.store(true, std::memory_order_release);
+}
+
+void PoolManager::ClearRedirect(PoolId pool_id) {
+  std::unique_lock<std::shared_mutex> lk(redirects_mu_);
+  redirects_.erase(pool_id);
+  if (redirects_.empty()) {
+    has_redirects_.store(false, std::memory_order_release);
+  }
 }
 
 DynamicContainer PoolManager::GetContainer(PoolId pool_id,
@@ -430,21 +511,15 @@ DynamicContainer PoolManager::GetContainer(PoolId pool_id,
   if (!is_initialized_) {
     return DynamicContainer();
   }
-
-  PoolMetaReadLock lock(pool_metadata_mutex_);
-  auto it = pool_metadata_.find(pool_id);
-  if (it == pool_metadata_.end()) {
-    return DynamicContainer();
-  }
-
-  const PoolInfo &info = it->second;
-  if (container_id != kInvalidContainerId) {
-    auto cit = info.containers_.find(container_id);
-    if (cit != info.containers_.end()) {
-      return cit->second;  // copy the handle (shared_ptr refcount bump)
+  return PickFromServingPool(pool_id, [container_id](const PoolInfo &info) {
+    if (container_id != kInvalidContainerId) {
+      auto cit = info.containers_.find(container_id);
+      if (cit != info.containers_.end()) {
+        return cit->second;  // copy the handle (shared_ptr refcount bump)
+      }
     }
-  }
-  return info.local_container_;  // copy (may be invalid)
+    return info.local_container_;  // copy (may be invalid)
+  });
 }
 
 DynamicContainer PoolManager::GetContainerRaw(PoolId pool_id,
@@ -468,32 +543,33 @@ DynamicContainer PoolManager::GetStaticContainer(PoolId pool_id) const {
   if (!is_initialized_) {
     return DynamicContainer();
   }
-
-  PoolMetaReadLock lock(pool_metadata_mutex_);
-  auto it = pool_metadata_.find(pool_id);
-  if (it == pool_metadata_.end()) {
-    return DynamicContainer();
-  }
-
-  return it->second.static_container_;
+  return PickFromServingPool(pool_id, [](const PoolInfo &info) {
+    return info.static_container_;
+  });
 }
 
 DynamicContainer PoolManager::GetRealOrStaticContainer(PoolId pool_id) const {
   if (!is_initialized_) {
     return DynamicContainer();
   }
+  // Prefer the real (local) container if this node hosts one; fall back to the
+  // static container otherwise.
+  return PickFromServingPool(pool_id, [](const PoolInfo &info) {
+    return info.local_container_.IsValid() ? info.local_container_
+                                           : info.static_container_;
+  });
+}
 
+DynamicContainer PoolManager::GetLocalContainer(PoolId pool_id) const {
+  if (!is_initialized_) {
+    return DynamicContainer();
+  }
   PoolMetaReadLock lock(pool_metadata_mutex_);
   auto it = pool_metadata_.find(pool_id);
   if (it == pool_metadata_.end()) {
     return DynamicContainer();
   }
-
-  // Prefer the real (local) container if this node hosts one; fall back to the
-  // static container otherwise.
-  const PoolInfo &info = it->second;
-  return info.local_container_.IsValid() ? info.local_container_
-                                         : info.static_container_;
+  return it->second.local_container_;
 }
 
 void PoolManager::PlugContainer(PoolId pool_id, ContainerId container_id) {
@@ -834,6 +910,30 @@ class CreateInProgressGuard {
 };
 }  // namespace
 
+/**
+ * Let an existing pool's local container fill the OUT fields of a
+ * get-or-create that found it (Container::FillExistingCreate). Skipped when
+ * this node hosts no container of the pool, or when the task names a
+ * different ChiMod than the pool runs: the OUT params are typed by the
+ * requesting ChiMod, so another module's params would not deserialize.
+ * @param pm this node's pool manager
+ * @param task the create task
+ * @param pool_id the existing pool
+ * @param chimod_name the ChiMod the task asked for
+ */
+static void FillExistingCreateOut(PoolManager *pm, Task *task, PoolId pool_id,
+                                  const std::string &chimod_name) {
+  const PoolInfo *info = pm->GetPoolInfo(pool_id);
+  if (info == nullptr || info->chimod_name_ != chimod_name) {
+    return;
+  }
+  DynamicContainer container = pm->GetLocalContainer(pool_id);
+  if (!container) {
+    return;
+  }
+  container.get()->FillExistingCreate(task);
+}
+
 TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
   CLIO_TASK_BODY_BEGIN
   if (!is_initialized_) {
@@ -902,6 +1002,7 @@ TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
   if (!existing_pool_id.IsNull()) {
     // Pool with this name already exists, update task with existing pool ID
     create_task->new_pool_id_ = existing_pool_id;
+    FillExistingCreateOut(this, task.get(), existing_pool_id, chimod_name);
     was_created = false;
     HLOG(kInfo,
          "PoolManager: Pool with name '{}' for ChiMod '{}' already exists "
@@ -926,6 +1027,7 @@ TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
   // generation, but safety check)
   if (HasPool(target_pool_id)) {
     // Pool already exists by ID, task already has correct new_pool_id_
+    FillExistingCreateOut(this, task.get(), target_pool_id, chimod_name);
     was_created = false;
     HLOG(kInfo,
          "PoolManager: Pool {} already exists by ID, returning existing pool",
@@ -948,6 +1050,8 @@ TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
     std::lock_guard<std::mutex> lk(destroyed_pools_mu_);
     destroyed_pools_.erase(target_pool_id);
   }
+  // A live pool no longer forwards to its former successor.
+  ClearRedirect(target_pool_id);
 
   // Initialize address map for the pool (ContainerId -> NodeId)
   InitAddressMap(target_pool_id, num_containers);
@@ -1099,7 +1203,8 @@ TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
   CLIO_TASK_BODY_END
 }
 
-TaskResume PoolManager::DestroyPool(PoolId pool_id, bool keep_in_pool_log) {
+TaskResume PoolManager::DestroyPool(PoolId pool_id, bool keep_in_pool_log,
+                                    PoolId successor) {
   CLIO_TASK_BODY_BEGIN
   if (!is_initialized_) {
     HLOG(kError, "PoolManager: Not initialized for pool destruction");
@@ -1120,6 +1225,12 @@ TaskResume PoolManager::DestroyPool(PoolId pool_id, bool keep_in_pool_log) {
     CLIO_CO_RETURN;
   }
 
+  // Leave the redirect before the metadata goes, so no lookup sees a gap.
+  if (!successor.IsNull()) {
+    InstallRedirect(pool_id, successor);
+    HLOG(kInfo, "PoolManager: pool {} unplugged; redirecting to {}", pool_id,
+         successor);
+  }
   // Remove pool metadata
   ErasePoolMetadata(pool_id);
   if (!keep_in_pool_log) {
@@ -1417,7 +1528,15 @@ void PoolManager::WriteAddressTableWAL(PoolId pool_id,
 
   // Create WAL directory
   std::string wal_dir = config_manager->GetConfDir() + "/wal";
-  std::filesystem::create_directories(wal_dir);
+  // With an error_code: an unusable conf_dir must fail this write, not throw
+  // a filesystem_error that terminates the process from a worker (#1356).
+  std::error_code wal_ec;
+  std::filesystem::create_directories(wal_dir, wal_ec);
+  if (wal_ec) {
+    HLOG(kError, "PoolManager: cannot create WAL directory {}: {}", wal_dir,
+         wal_ec.message());
+    return;
+  }
 
   // Determine this node's ID for the WAL filename
   auto *ipc_manager = CLIO_IPC;

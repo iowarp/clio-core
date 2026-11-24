@@ -57,14 +57,13 @@ static constexpr clio::run::u32 kShmFileNoOverride = 0xFFFFFFFFu;
 /**
  * Cached per-path filesystem metadata (issue #817).
  *
- * WHY THIS EXISTS SEPARATELY FROM ShmTagRecord: the filesystem chimod owns a
- * LOGICAL size (FileInfo::size_) that is not the tag's physical size. They
+ * WHY THIS EXISTS: the filesystem chimod owns a LOGICAL size (FileInfo::size_) that is not the tag's physical size. They
  * diverge after ftruncate-grow, sparse writes and staged appends, and POSIX
  * read semantics -- short read at EOF, zeros inside a hole -- depend on the
  * logical one. A client that clamped against the physical size would return
  * the wrong bytes, so the fs number has to be published in its own right.
  *
- * POD ONLY, for the same reason as ShmBlobRecord: the map's reader copies the
+ * POD ONLY: the map's reader copies the
  * whole record out between two reads of the slot generation, so an
  * allocator-owned member here would defeat the seqlock. The PATH is the map
  * key and is therefore not duplicated in the record.
@@ -77,9 +76,9 @@ struct ShmFileRecord {
    * utimens OVERRIDES, not timestamps (0 = unset, defer to the tag).
    *
    * Only the overrides live here because only they are the chimod's to own --
-   * the natural atime/mtime/ctime belong to the CTE tag and are already
-   * mirrored in ShmTagRecord. Duplicating them here would invent a second,
-   * drifting copy of a number this module does not maintain.
+   * the natural atime/mtime/ctime belong to the CTE tag. Duplicating them
+   * here would invent a second, drifting copy of a number this module does
+   * not maintain.
    */
   clio::run::u64 ov_atime_ns_;
   clio::run::u64 ov_mtime_ns_;
@@ -124,11 +123,10 @@ using ShmFsFileMap =
 /**
  * Root of the filesystem chimod's shared-memory cache (issue #817).
  *
- * Same ownership contract as ShmMetadataCacheRoot: written only by the
- * runtime, attached read-mostly by clients, never authoritative, droppable at
- * any moment. Registered in the process-wide MetadataDirectory under the
- * FILESYSTEM pool id, so it coexists with the CTE core pool's cache root
- * rather than competing for one slot.
+ * Written only by the runtime, attached read-mostly by clients, never
+ * authoritative, droppable at any moment. Registered in the process-wide
+ * MetadataDirectory under the FILESYSTEM pool id, so it coexists with other
+ * modules' roots rather than competing for one slot.
  */
 struct ShmFsCacheRoot {
   static constexpr clio::run::u32 kLayoutVersion = 4;
@@ -167,7 +165,7 @@ struct ShmFsCacheRoot {
 /**
  * Runtime-side owner of the filesystem cache.
  *
- * Entirely best-effort, exactly like ShmMetadataCache: every method is a no-op
+ * Entirely best-effort: every method is a no-op
  * when disabled and every failure is swallowed, because a filesystem operation
  * must never fail on account of a cache mirror.
  */

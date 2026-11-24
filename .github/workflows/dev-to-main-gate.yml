@@ -1,0 +1,106 @@
+# Merge gate for PRs into main.
+#
+# A dev -> main PR does not re-run CI. Its head commit IS the dev tip, which
+# dev's debounced full CI (dev-full-ci.yml) already runs. The PR-tier
+# workflows skip every job on a dev -> main PR, and this job instead waits for
+# the full-CI runs on that exact commit (the list in
+# .github/dev-full-ci-workflows.txt) and passes only if all of them passed.
+#
+#   * all succeeded              -> pass
+#   * any failed or cancelled    -> fail (fix on dev; the next dev push re-runs)
+#   * still running / debouncing -> keep waiting
+#   * never started for this SHA -> dispatch dev-full-ci with no quiet period,
+#                                    then wait
+#
+# PRs into main from any other branch (release/hotfix) pass this job
+# immediately and get the normal PR-tier checks.
+#
+# Make the job "dev full CI passed" a required status check on main.
+name: Dev -> main gate
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: dev-to-main-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  gate:
+    name: dev full CI passed
+    runs-on: ubuntu-latest
+    # Hosted jobs cap at 6 h. dev's full sweep takes ~3 h plus the 5 min quiet
+    # period; if this ever times out, re-run the job once the sweep is done.
+    timeout-minutes: 350
+    steps:
+      - name: Not a dev -> main PR
+        if: github.head_ref != 'dev'
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+        run: echo "Head is '$HEAD_REF', not dev; the regular PR checks apply."
+
+      - uses: actions/checkout@v5
+        if: github.head_ref == 'dev'
+        with:
+          sparse-checkout: .github
+
+      - name: Wait for dev's full CI on this commit
+        if: github.head_ref == 'dev'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -u
+          mapfile -t WFS < <(grep -v '^#' .github/dev-full-ci-workflows.txt | grep .)
+          echo "Gating on ${#WFS[@]} workflows for dev @ ${SHA:0:9}"
+          deadline=$((SECONDS + 340 * 60))
+          dispatched_at=-1
+          while :; do
+            pending=(); missing=(); failed=()
+            for wf in "${WFS[@]}"; do
+              r=$(gh run list --workflow "$wf" --commit "$SHA" --event workflow_dispatch \
+                    --limit 1 --json status,conclusion,url \
+                    -q '.[0] | if . == null then "missing" else "\(.status) \(.conclusion) \(.url)" end')
+              case "$r" in
+                missing)            missing+=("$wf") ;;
+                "completed success"*) ;;
+                completed*)         failed+=("$wf: $r") ;;
+                *)                  pending+=("$wf") ;;
+              esac
+            done
+            if (( ${#failed[@]} )); then
+              printf '::error::dev full CI failed for %s\n' "${failed[@]}"
+              { echo "## dev full CI FAILED @ ${SHA:0:9}"; printf -- '- %s\n' "${failed[@]}"; } >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+            if (( ${#pending[@]} == 0 && ${#missing[@]} == 0 )); then
+              echo "## dev full CI passed @ ${SHA:0:9} (${#WFS[@]} workflows)" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            if (( ${#missing[@]} )); then
+              debouncing=$(gh run list --workflow dev-full-ci.yml --commit "$SHA" \
+                             --json status -q '[.[] | select(.status != "completed")] | length')
+              if (( debouncing == 0 )); then
+                if (( dispatched_at < 0 )); then
+                  echo "No full-CI run for ${SHA:0:9} and none pending: dispatching dev-full-ci now."
+                  gh workflow run dev-full-ci.yml --ref dev -f quiet_minutes=0
+                  dispatched_at=$SECONDS
+                elif (( SECONDS - dispatched_at > 20 * 60 )); then
+                  printf '::error::full-CI run never started for %s\n' "${missing[@]}"
+                  exit 1
+                fi
+              fi
+            fi
+            if (( SECONDS > deadline )); then
+              echo "::error::timed out waiting for dev full CI; re-run this job"; exit 1
+            fi
+            echo "$(date -u +%H:%M) waiting: ${#pending[@]} running, ${#missing[@]} not started"
+            sleep 120
+          done

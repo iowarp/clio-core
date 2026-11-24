@@ -158,11 +158,32 @@ cmake -S cppzmq-4.10.0 -B cppzmq-build \
 cmake --install cppzmq-build
 rm -rf /tmp/cppzmq-*
 
-# Poco 1.14.1 (static only) -- the runtime's web dashboard HTTP server.
-# Without it CMake prints "Web dashboard (viz): DISABLED" and the wheel ships
-# a clio_run with no dashboard. The root CMakeLists asks for Net, NetSSL,
-# Crypto and JSON together (NetSSL/Crypto need openssl-devel, installed in
-# CIBW_BEFORE_ALL); the runtime itself links only Net + Foundation.
+# OpenSSL 3.0 LTS (static only) -- the TLS stack behind Poco::NetSSL, which
+# the S3 and GCS storage tiers use (CLIO_ENABLE_AMAZON_DRIVE /
+# CLIO_ENABLE_GOOGLE_CLOUD, on in the wheel). Static because the image's
+# openssl-devel is OpenSSL 1.1, whose libssl.so.1.1 is gone from current
+# distributions, and repair_wheel.sh does not bundle third-party .so files.
+# The bdev module links it with --exclude-libs so its symbols stay private.
+# The default certificate path compiled in here (/etc/pki/tls) is RHEL's; the
+# tiers name the CA bundle explicitly (tls_ca.h), so Debian-family systems
+# work too.
+echo "--- OpenSSL 3.0.15 ---"
+cd /tmp
+bash "$(dirname "$0")/../../CI/retry.sh" yum install -y perl-core >/dev/null
+download_tar https://github.com/openssl/openssl/releases/download/openssl-3.0.15/openssl-3.0.15.tar.gz openssl.tar.gz
+tar xzf openssl.tar.gz && rm openssl.tar.gz
+(cd openssl-3.0.15 && \
+  ./Configure no-shared no-tests no-module -fPIC \
+      --prefix=$PREFIX --libdir=lib --openssldir=/etc/pki/tls && \
+  make -j$NPROC build_libs && make install_dev)
+rm -rf /tmp/openssl-3.0.15
+
+# Poco 1.14.1 (static only) -- the runtime's web dashboard HTTP server and the
+# HTTPS client of the S3 and GCS storage tiers. Without it CMake prints "Web
+# dashboard (viz): DISABLED" and the wheel ships a clio_run with no dashboard
+# and no cloud tiers. The root CMakeLists asks for Net, NetSSL, Crypto and
+# JSON together, built here against the static OpenSSL above; the runtime
+# itself links only Net + Foundation, the bdev module adds NetSSL + Crypto.
 #
 # Static, because repair_wheel.sh only fixes RPATHs and does not bundle
 # third-party .so files. Two of our libraries link Poco (clio_ctp_host and
@@ -189,6 +210,8 @@ cmake -S poco-poco-1.14.1-release -B poco-build \
     -DENABLE_UTIL=ON \
     -DENABLE_CRYPTO=ON \
     -DENABLE_NETSSL=ON \
+    -DOPENSSL_ROOT_DIR=$PREFIX \
+    -DOPENSSL_USE_STATIC_LIBS=ON \
     -DENABLE_TESTS=OFF \
     -DENABLE_SAMPLES=OFF
 cmake --build poco-build -j$NPROC

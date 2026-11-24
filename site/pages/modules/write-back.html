@@ -1,0 +1,446 @@
+<!--
+title: Write-back cache module
+heading: Write-back: <em>ack in RAM, flush later.</em>
+description: The CTE write-back cache: acknowledges puts once they are in the volatile RAM core, tracks dirty byte ranges and flushes them through the persistent chain on a timer, under pressure, on fsync and at stop. Consistency model, routing, flush mechanics, eviction, unplugging, configuration and limits.
+eyebrow: Modules · Transfer engine
+lede: The write-back cache joins the two disconnected CTE cores. A put is acknowledged as soon as it is in the volatile core on the node that made it; its dirty byte ranges are flushed through the persistent chain later. It is the cache in the default configuration, and the only layer that decides when data becomes durable.
+facts: Library | clio_cte_core_persist_write_back ; Default pool | 567.0 ; Build option | CLIO_CTE_ENABLE_POLICY_CACHES (ON) ; Source | context-transfer-engine/core_persist_write_back
+-->
+<h2>What it does</h2>
+<p>The default stack runs two CTE cores that never move data between each
+other: a volatile core (540.0) on DRAM, which has no write-ahead log and is
+empty after every start, and a persistent core (512.0) on files, reached
+through the replication module (561.0). The write-back cache sits above both
+and owns every durability decision. Writes land in the volatile core and are
+acknowledged. The cache records which byte ranges are newer than the
+persistent copy and writes only those ranges down later.</p>
+<p>The module is a thin shell. All logic lives in the shared policy-cache
+base, <code>context-transfer-engine/cache_base</code>
+(<code>CacheBase</code>, derived from the core's
+<code>DualTargetInterposer</code>); this module only fixes the policy to
+write-back. The <a href="/modules/write-through.html">write-through
+module</a> is the same code with the other policy.</p>
+
+<h2>Consistency model</h2>
+<p>Write-back is <strong>eventually consistent</strong>. Measured at this
+module's interface:</p>
+<ul>
+  <li>A put returns once its bytes are in the volatile core of the node that
+  made it. Nothing has reached the persistent chain yet.</li>
+  <li>A read is always answered by the blob's owner (the container chosen by
+  hashing tag and blob name). If the writing node owns the blob, the read sees
+  the write at once, on every node. If it does not, the write sits in the writing node's
+  buffer and no reader, including readers on the writing node, sees it until
+  a flush has landed it on the owner.</li>
+  <li>A flush is what makes a write visible across nodes and durable. Flushes
+  happen on a timer, under pressure, on fsync (SyncTag), before eviction,
+  before certain verbs and at stop, as described below.</li>
+  <li>Overlapping writes to the same bytes from two nodes are applied on the
+  owner in the order their flushes land, not the order the writes were
+  made. Applications that share a blob across nodes order their accesses
+  with fsync.</li>
+  <li>A crash loses whatever was not flushed. A graceful stop flushes first,
+  bounded by the stop grace period.</li>
+</ul>
+<p>Tag metadata and some puts are exempt from buffering and are applied on
+the owner at once; see <a href="#write-path">the write path</a>.</p>
+
+<h2>Where it sits</h2>
+<p>From <code>context-runtime/config/clio_default.yaml</code>, the canonical
+chain is:</p>
+<pre data-label="text">
+indexer(564.0) -> shm cache(568.0) -> [compressor(562.0) ->]
+  core_persist_write_back(567.0)
+  -> volatile core(540.0)
+  -> replication(561.0) -> persistent core(512.0)
+</pre>
+<p>The persistent chain (<code>next_persistent</code>) is the interposer's
+single next pool: every core verb the module does not handle is forwarded
+there, and owner routing follows the core's rules. The volatile core
+(<code>next_volatile</code>) is reached only through an ordinary core client
+with local queries, so the two cores stay disconnected.</p>
+<ul>
+  <li><strong>Interposed core verbs</strong>, with the core's own method ids:
+  PutBlob (15), GetBlob (16), DelBlob (18), DelTag (19), GetBlobSize (23),
+  FlushData (34), TruncateBlob (37), MultiPutBlob (48) and SyncTag
+  (56), plus Create, Destroy and Monitor.</li>
+  <li><strong>Own verb</strong>: DropTagCopies (100) flushes and/or drops
+  one container's copies of a tag. The cache sends it to its own containers;
+  it is not a client API. <code>clio_mod.yaml</code> also lists ids 101 and
+  102, which the dispatch table does not implement.</li>
+  <li><strong>Every other core verb</strong> is forwarded to the persistent
+  chain after making it coherent (see <a href="#reads">reads</a>).</li>
+</ul>
+<p>Clients never address this pool directly in the default stack; they bind
+to the indexer at the top. The module's client class,
+<code>clio::cte::core_persist_write_back::Client</code>, is a core client
+plus <code>AsyncCreateCache</code> for creating the pool from code.</p>
+
+<h2>Composing it</h2>
+<p>The entry shipped in the default configuration. It must come after the
+volatile core, the replication module and the persistent core it names, and
+before the shm cache that names it.</p>
+<pre data-label="yaml">
+compose:
+  - mod_name: clio_cte_core_persist_write_back
+    pool_name: clio_cte_core_persist_write_back
+    pool_query: local
+    pool_id: "567.0"
+    next_volatile: "540.0"              # volatile core (required)
+    next_persistent: "561.0"            # replication -> persistent core;
+                                        #   omit for a volatile-only cache
+    fill: on_hit_count:2                # on_hit_count:N | on_read_miss | none
+    evict: lru                          # lru | lfu
+    flush_period_ms: 10000              # dirty-copy flush period; 0 = off
+    flush_fill_pct: 80
+    flush_dirty_mb: 256
+    flush_pool: "568.0"
+    fallback_to_persistent: true
+</pre>
+<p>Create fails with return code 1 when <code>next_volatile</code> is
+missing. Without <code>next_persistent</code> the module runs volatile-only:
+every verb is forwarded to the volatile core, and no flusher or stop hook is
+started.</p>
+
+<h2>Configuration</h2>
+<p>Keys are parsed from the compose entry by
+<code>PolicyCacheParams::LoadConfig</code>
+(<code>cache_base/include/clio_cte/cache_base/cache_config.h</code>). A
+malformed value is logged and leaves that key at its default.</p>
+<dl class="notes">
+  <dt><code>next_volatile</code></dt>
+  <dd>The volatile core, as <code>"major.minor"</code>. Required.</dd>
+  <dt><code>next_persistent</code></dt>
+  <dd>The persistent chain: normally replication (561.0), or a persistent
+  core directly. Unset: volatile-only, as above.</dd>
+  <dt><code>fill</code></dt>
+  <dd>When a read miss copies the blob into the volatile core.
+  <code>on_hit_count:N</code> fills on a blob's Nth miss (default
+  <code>on_hit_count:2</code>, so one pass over data larger than the cache does
+  not displace the working set; N of 0 is treated as 1).
+  <code>on_read_miss</code> fills on every miss; <code>none</code> never fills,
+  so the volatile core holds only written data. Miss counts are kept for up to
+  2<sup>20</sup> blobs, then reset.</dd>
+  <dt><code>evict</code></dt>
+  <dd><code>lru</code> (default) or <code>lfu</code>. The value is parsed and
+  stored, but the eviction code orders victims by last access time only, so
+  both settings currently evict least-recently-used copies.</dd>
+  <dt><code>flush_period_ms</code></dt>
+  <dd>Period of the background flush of every dirty copy on the container.
+  Default 10000. 0 turns the periodic flush off.</dd>
+  <dt><code>flush_fill_pct</code></dt>
+  <dd>Start a flush as soon as the volatile core is at least this full
+  (percent of its capacity) and holds unflushed data, without waiting for the
+  period. Flushed copies are clean, and clean copies are what a full cache can
+  drop. Default 80; 0 disables it; values above 100 are clamped to 100. The
+  fill level is asked for at most once every 10 ms.</dd>
+  <dt><code>flush_dirty_mb</code></dt>
+  <dd>Continuous flushing: start a flush whenever this many MiB of new dirty
+  data were written since the last one started, so flushing keeps pace with
+  the writes and an fsync finds little left to do. Default 256; 0 disables
+  it.</dd>
+  <dt><code>flush_pool</code></dt>
+  <dd>The pool a flushed range of another node's blob is sent to on that
+  blob's owner. The default configuration sets the <a href="/modules/shm-cache.html">shm cache</a> (568.0), which
+  lands the range and invalidates the nodes caching its metadata once per
+  flushed range instead of once per write. Unset: this cache's own pool.</dd>
+  <dt><code>fallback_to_persistent</code></dt>
+  <dd>What happens when the volatile core cannot hold a put even after
+  eviction. <code>true</code> (default) writes it straight to the persistent
+  chain. <code>false</code> fails the put with <code>kPutNoSpaceRc</code>
+  (13), so a deployment never silently drops to disk speed. It also changes
+  eviction; see <a href="#eviction-and-capacity">eviction</a>.</dd>
+</dl>
+<p>There is no size setting: the cache uses the volatile core's tiers,
+bounded by their <code>capacity_limit</code>.</p>
+
+<h2>Routing</h2>
+<p>The module overrides the scheduler's routing decision:</p>
+<ul>
+  <li><strong>PutBlob, MultiPutBlob, DelBlob and TruncateBlob</strong> run
+  on the submitting node (a local query) whenever a persistent chain is
+  configured. Writes are buffered where they are made; deletes and
+  truncates run there first so that no later flush of that node's buffer
+  undoes them.</li>
+  <li><strong>FlushData and DropTagCopies</strong> stay on the container
+  they were sent to: they act on that container's copies.</li>
+  <li><strong>Everything else</strong>, including GetBlob and GetBlobSize,
+  is routed exactly as the core routes it: blob verbs to the blob's
+  owner.</li>
+</ul>
+<p>The owner is computed from the blob hash over the pool's containers, with
+the core's failover applied, so when <code>failover_to_successor</code> is
+on, a dead owner's blobs go to its successor. A put, get, size probe, delete
+or truncate forwarded to an owner that dies in flight is resent up to ten
+times, one second apart, to whichever container failover then names. Appends
+are not resent, since a lost one may have landed.</p>
+
+<h2>Write path</h2>
+<ol class="steps">
+  <li><strong>Exempt puts go to the owner.</strong> Appends, replaces and
+  conditional puts (put-if-absent, put-if-version) depend on the blob's
+  current state, which only the persistent copy decides. Puts flagged
+  <code>kMetaBlob</code> (clio-fs directory and inode blocks) are read on
+  every node and must be current. On a node that does not own the blob,
+  these first flush and drop any bytes of the blob buffered locally, then go
+  to the owner. On the owner, a special put flushes and drops the cached copy,
+  then goes to the persistent chain and leaves no copy behind; a
+  metadata put is buffered there like any other.</li>
+  <li><strong>The blob is locked.</strong> Every operation on one blob is
+  serialized by a per-blob lock that yields while another task holds it.</li>
+  <li><strong>Make room.</strong> With fallback on, if the volatile core
+  refused a put at least this large within the last 100 ms and holds no copy
+  of this blob, up to 64 clean copies are dropped ahead of time. If there are
+  no clean copies, the put bypasses the volatile core and is written
+  through.</li>
+  <li><strong>Make the copy whole.</strong> On the owner, a partial write
+  to a blob that only the persistent chain holds first copies the whole blob
+  into the volatile core, so the owner's copy is always the entire blob. On
+  another node, only the written ranges are buffered; that buffer is never
+  read locally.</li>
+  <li><strong>Write volatile and log the range dirty.</strong> If the
+  volatile core refuses for lack of room, up to four least-recently-used
+  copies are evicted and the put is retried once.</li>
+  <li><strong>Fall back.</strong> If the copy still cannot be written, or the
+  persistent chain could not supply the blob's other bytes, the blob's
+  buffered bytes are flushed, its copy dropped, and the put written through,
+  unless <code>fallback_to_persistent</code> is false and the failure was lack
+  of room, in which case the put fails whole with return code 13.</li>
+  <li><strong>Acknowledge</strong>, then check the flush triggers
+  (<code>flush_dirty_mb</code>, <code>flush_fill_pct</code>). A triggered
+  flush is sent asynchronously and the put does not wait for it.</li>
+</ol>
+<h3>Batched writes</h3>
+<p>MultiPutBlob, used by the FUSE adapter for batched writes, takes a fast
+path when every record is plain: all records are locked in key order, all
+sizes the batch needs are asked for at once, and every record is written to
+the volatile core at once and logged dirty. Anything else (a special record,
+a known-full volatile core, a partial write that needs persistent bytes, a
+failed volatile put) falls back to record-by-record absorption with the same
+rules as a single put. A batch carrying <code>kMetaBlob</code> context, or
+any batch while the cache is draining, is sent to the owners instead.</p>
+
+<h2>Flushing</h2>
+<h3>Dirty tracking</h3>
+<p>Each copy keeps a sorted list of disjoint dirty byte ranges; overlapping
+or touching writes merge. A per-tag index of dirty copies lets a sync of one
+tag find its blobs without scanning every copy. A flush writes only the dirty
+ranges, never whole blobs.</p>
+<h3>Triggers</h3>
+<ul>
+  <li><strong>Periodic</strong>: every <code>flush_period_ms</code>, a
+  FlushData task on each container flushes all its dirty copies.</li>
+  <li><strong>Continuous</strong>: after <code>flush_dirty_mb</code> MiB of
+  new dirty data.</li>
+  <li><strong>Fill level</strong>: when the volatile core is
+  <code>flush_fill_pct</code> percent full and something is unflushed. At most
+  one continuous or fill-level flush is pending at a time.</li>
+  <li><strong>fsync</strong>: SyncTag, below.</li>
+  <li><strong>Eviction</strong>: a dirty copy is flushed before it is
+  dropped (only when fallback is off; see eviction).</li>
+  <li><strong>Before verbs that must see persistent state</strong>: exempt
+  puts, truncates, tag-level reads and Pod verbs (see <a
+  href="#reads">reads</a>), and a volatile read that fails.</li>
+  <li><strong>Stop and unplug</strong>: see <a
+  href="#stop-unplug-and-restart">below</a>.</li>
+</ul>
+<p>The periodic, fill-level, continuous and stop flushes and Destroy share
+rounds: a caller that arrives while a round is running waits for the next
+round, which starts after it arrived and so covers everything it needs.</p>
+<h3>Mechanics</h3>
+<p>A flush runs in two passes, so that a lock on a blob this container owns
+is never held while waiting on another container:</p>
+<ol class="steps">
+  <li><strong>Blobs other containers own.</strong> Their dirty ranges are
+  read out of the volatile core into one buffer per owner and sent as
+  MultiPutBlob batches of up to 8 MiB, at most 256 MiB in flight, to
+  <code>flush_pool</code> on the owner. There the batch is written through:
+  the owner flushes and drops its own copy of each blob, then the persistent
+  chain takes the batch. Once a range has landed, the writing node drops its
+  buffer unless the blob was written again meanwhile.</li>
+  <li><strong>Blobs this container owns.</strong> Up to 64 ranges are in
+  flight at once (and at most 256 MiB of I/O buffers): each is read from the
+  volatile core and put to the persistent chain locally.</li>
+</ol>
+<p>A blob is marked clean only when all of its ranges have landed. A failed
+range leaves the blob dirty for the next flush, and the failure is counted
+in <code>flush_failures</code>.</p>
+<h3>fsync (SyncTag)</h3>
+<ul>
+  <li>Concurrent syncs of the same tag with the same arguments share one
+  round; the others take its result.</li>
+  <li>The leader flushes that tag's dirty copies on this container. Unless
+  the sync arrived as a broadcast (the client's <code>kSyncFannedOut</code>
+  flag, under which every container flushes its own), it then tells every
+  live container to flush its copies of the tag, waiting for all of them.</li>
+  <li>Only then is SyncTag forwarded to the persistent chain, which syncs its
+  devices. A failed flush returns <code>kSyncNoSpaceRc</code> (28) for a
+  no-space failure, else <code>kSyncIoRc</code> (5), and the devices are not
+  synced.</li>
+</ul>
+<p>With the persistent core's <code>fsync_mode: "deferred"</code>, the
+filesystem layer stops waiting on fsync after the first reply and leaves
+durability to this module's periodic flush, so a crash can lose up to
+<code>flush_period_ms</code> of writes. See the <a
+href="/modules/cte-core.html">CTE core</a> page.</p>
+
+<h2>Reads</h2>
+<ul>
+  <li><strong>GetBlob</strong> runs on the owner. A present copy serves the
+  read from the volatile core and refreshes its LRU time. A copy that fails
+  to serve is flushed and dropped, and the read goes to the persistent
+  chain.</li>
+  <li><strong>Miss</strong>: the read goes to the persistent chain. If it
+  succeeds and <code>fill</code> admits the blob, the whole blob is then
+  copied into the volatile core. With fallback on, no fill happens while the
+  volatile core is known to be full of dirty copies.</li>
+  <li><strong>GetBlobSize</strong> runs on the owner and answers from the
+  copy when there is one (the copy is the whole blob), else from the
+  persistent chain.</li>
+  <li><strong>Tag-level and Pod verbs</strong>: before GetTagSize,
+  GetContainedBlobs, GetBlobInfo, GetBlobScore, PodGetBlob or
+  PodMultiGetBlob, every live container flushes its dirty copies of the tag.
+  Before BlobQuery, ListLocalBlobs, SemanticSearch or TemporalSearch, every
+  dirty copy is flushed. PodPutBlob and PodMultiPutBlob write behind the
+  cache, so the tag's copies are flushed and dropped before the write and
+  dropped again after it.</li>
+</ul>
+
+<h2>Deletes and truncates</h2>
+<ul>
+  <li><strong>DelBlob</strong> discards the local buffer of the blob without
+  flushing it, then deletes on the owner, which drops its copy and deletes on
+  the persistent chain. A blob that was never flushed reports success, since
+  it existed only in a buffer.</li>
+  <li><strong>TruncateBlob</strong> on another node first flushes and drops
+  the local buffer, then truncates on the owner. The owner flushes and drops
+  its copy before truncating the persistent blob.</li>
+  <li><strong>DelTag</strong> is forwarded to the persistent chain, then
+  broadcast as a tag delete on the persistent chain and as DropTagCopies in
+  discard mode to every container of this pool, so dirty bytes of the tag die
+  with it.</li>
+</ul>
+
+<h2>Eviction and capacity</h2>
+<ul>
+  <li>Eviction is a DelBlob of the copy on the volatile core. Victims are
+  chosen from up to 256 least-recently-used unlocked copies.</li>
+  <li><strong>With fallback on</strong> (default), eviction drops clean
+  copies only. A put that finds no room is written through rather than
+  flushing other blobs' dirty bytes inline, so a full cache does not pay a
+  synchronous flush per put. The flush triggers are what turn dirty copies
+  clean again.</li>
+  <li><strong>With fallback off</strong>, eviction flushes a dirty copy
+  before dropping it, except a buffer of a blob another container owns,
+  which is left to the flusher so a writer never waits on a remote owner
+  while holding a lock.</li>
+  <li>A refusal by the volatile core is remembered for 100 ms; after that
+  the next put probes the volatile core again.</li>
+</ul>
+
+<h2>Stop, unplug and restart</h2>
+<ul>
+  <li><strong><code>clio_run stop</code></strong>: a stop hook flushes every
+  dirty copy, waiting up to the stop grace period
+  (<code>--grace-period &lt;ms&gt;</code>). If the flush does not finish in
+  time, a warning says the unflushed data is lost.</li>
+  <li><strong><code>clio_run pool stop &lt;pool&gt;</code></strong> unplugs
+  the cache. New puts stop buffering and take the ordered write-through path,
+  in-flight buffered puts are waited for, and every dirty copy is flushed in
+  up to 8 rounds. Tasks addressed to the pool are then redirected to the
+  persistent chain. If dirty data cannot be made durable, the stop fails and
+  the pool keeps running. <code>--force</code> discards the dirty copies
+  instead and counts them as <code>discarded_blobs</code>.</li>
+  <li><strong><code>clio_run pool rm &lt;pool&gt;</code></strong> flushes the
+  same way and also drops every volatile copy; <code>rm --force</code> drops
+  everything without flushing.</li>
+  <li><strong>Restart</strong>: the cache's dirty-range bookkeeping lives in
+  memory, and the volatile core starts empty. After a crash, writes that were
+  never flushed are gone. Everything that was flushed is read from the
+  persistent chain and refilled into the volatile core per
+  <code>fill</code>.</li>
+  <li><strong>Node loss</strong>: a dead node's buffers die with it, and
+  flush fan-outs skip dead containers rather than fail. Buffers on surviving
+  nodes for blobs the dead node owned land at its failover successor when one
+  is configured; otherwise those ranges stay dirty and are retried by later
+  flushes.</li>
+</ul>
+
+<h2>Monitoring</h2>
+<p>The Monitor query <code>stats</code> returns a msgpack map per container:
+<code>policy</code>, <code>draining</code>, <code>dirty_blobs</code>,
+<code>dirty_bytes</code>, <code>cached_blobs</code>,
+<code>flush_rounds</code>, <code>blobs_flushed</code>,
+<code>bytes_flushed</code>, <code>flush_failures</code>,
+<code>unplug_flushes</code>, <code>unplug_blobs_flushed</code>,
+<code>unplug_bytes_flushed</code> and <code>discarded_blobs</code>. Counters
+are cumulative since the container started. The query
+<code>dirty_count</code> returns the number of dirty blobs. Other queries are
+forwarded to the persistent chain.</p>
+
+<h2>Behaviors worth knowing</h2>
+<ul class="checks">
+  <li>A write to a blob owned by another node is invisible to every reader,
+  including the writer, until it is flushed. Call fsync (SyncTag) before
+  reading data written elsewhere.</li>
+  <li>The owner's copy is always the whole blob, so a partial write to a cold
+  blob costs a read of the whole blob from the persistent chain first.</li>
+  <li>A delete discards only the deleting node's buffer and the owner's copy.
+  Another node's unflushed buffer of the same blob is not discarded and lands
+  at that node's next flush.</li>
+  <li>With fallback on, a full volatile core turns into write-through at
+  persistent speed for blobs it holds no copy of, until flushes make clean
+  copies available to evict.</li>
+  <li>Durability equals what the persistent chain provides once a range lands:
+  replication factor, persistent tiers and fsync of its devices. See <a
+  href="/modules/replication.html">replication</a> and <a
+  href="/design/durability.html">durability</a>.</li>
+</ul>
+
+<h2>Limits</h2>
+<ul>
+  <li>Unflushed writes are lost on a crash or power failure, up to whatever
+  the flush triggers had not yet written.</li>
+  <li><code>evict: lfu</code> is accepted but behaves like
+  <code>lru</code>.</li>
+  <li>Cross-node writers of the same bytes have no ordering beyond their
+  flush order.</li>
+  <li>Destroy gives up after 8 flush rounds; a round that flushes nothing also
+  stops it.</li>
+</ul>
+
+<h2>Write-back or write-through</h2>
+<p>Choose write-back, the default, when write latency matters and the
+application already uses fsync to mark the points where data must be durable
+and visible on other nodes. Choose <a href="/modules/write-through.html">write-through</a>
+when every acknowledged write must already be on the persistent chain and
+readable from any node without an fsync, and the application can pay the
+persistent chain's latency on every write.</p>
+
+<h2>How it is tested</h2>
+<ul>
+  <li><code>context-transfer-engine/test/unit/test_policy_cache.cc</code>
+  (ctest <code>cte_policy_cache</code>): one runtime with a persistent file
+  core and a small volatile RAM core. Puts ack from volatile and a flush makes
+  them durable, partial writes and appends, batched partial writes,
+  concurrent partial writes under eviction, SyncTag, deleting a never-flushed
+  blob, eviction through an 8 MiB volatile core, and fallback on versus
+  off.</li>
+  <li><code>test_cache_unplug.cc</code> (<code>cte_cache_unplug</code>):
+  unplug flushes every dirty blob, leaves a redirect to the persistent chain,
+  <code>--force</code> discards, <code>rm</code> drops copies, and an unplug
+  racing concurrent writers loses no acknowledged write.</li>
+  <li><code>test_cli_cache_unplug.cc</code>
+  (<code>cte_cli_cache_unplug</code>): <code>clio_run pool
+  stop|start|rm</code> against a real daemon, with the data verified from the
+  persistent core after a restart.</li>
+  <li><code>test_cfs_fsync_durable.cc</code>
+  (<code>cfs_fsync_durable</code>): fsync through the POSIX descriptor layer
+  makes the cache flush a file's pages to the persistent tier.</li>
+  <li><code>test_concurrent_same_blob.cc</code> with
+  <code>SAME_BLOB_FLUSH=1</code> (<code>cte_concurrent_same_blob_flush</code>):
+  same-blob writes racing the periodic flush lose no region.</li>
+  <li><code>context-transfer-engine/test/integration/clio_fs_suite</code>:
+  multi-node filesystem suite, which composes this module at 567.0 by default
+  and has its agents fsync every file before closing it.</li>
+</ul>

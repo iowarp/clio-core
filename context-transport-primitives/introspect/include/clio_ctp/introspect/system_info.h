@@ -272,8 +272,8 @@ class SystemInfo {
    *  - Windows: PrefetchVirtualMemory to bring the range resident in bulk.
    *  - macOS:   write-touch loop (no populate API); still batches the
    *             faults at a controlled point instead of inside the copy.
-   * The fallback write-touch loop performs a volatile read-modify-write of
-   * one byte per page, preserving existing contents.
+   * The fallback is TouchPages (an atomic same-value compare-exchange per
+   * page), which preserves contents even while other threads write the range.
    *
    * @param addr Start of the range (any alignment; internally page-aligned).
    * @param size Bytes to populate.
@@ -281,6 +281,17 @@ class SystemInfo {
    *         false only for a null/empty range.
    */
   CTP_DLL static bool BulkFault(void *addr, size_t size);
+
+  /**
+   * Fault every page of [addr, addr+size) for writing by an atomic
+   * compare-exchange of one byte per page with its own value: BulkFault's
+   * portable fallback (the macOS path). Safe on a range other threads are writing concurrently -- unlike
+   * a plain `p[i] = p[i]`, whose load and store a concurrent write can fall
+   * between, losing that write.
+   * @param addr Start of the range (any alignment; internally page-aligned).
+   * @param size Bytes to fault.
+   */
+  CTP_DLL static void TouchPages(void *addr, size_t size);
 
   CTP_DLL static void *AlignedAlloc(size_t alignment, size_t size);
 
@@ -303,14 +314,50 @@ class SystemInfo {
 
   CTP_DLL static void Unsetenv(const char *name);
 
+  /**
+   * Convert a Win32 verbatim path to its ordinary form.
+   *
+   * A verbatim path ("\\?\C:\dir", "\\?\UNC\server\share") reaches the kernel
+   * unparsed, so a '/' that the runtime appends when it builds a file name
+   * becomes an invalid character and every open on it fails (#1356). Such a
+   * path is rewritten as "C:\dir" or "\\server\share". Other paths, and every
+   * path on non-Windows platforms, are returned unchanged.
+   *
+   * @param path path as given by a user, an environment variable or a config
+   * @return the path without a verbatim prefix
+   */
+  CTP_DLL static std::string NormalizePath(const std::string &path);
+
   /** Get the per-user clio tmp directory path (/tmp/clio_$USER) */
   CTP_DLL static std::string GetMemfdDir();
 
   /** Get the full path for a named file in the memfd directory */
   CTP_DLL static std::string GetMemfdPath(const std::string &name);
 
-  /** Ensure the per-user memfd directory exists */
-  CTP_DLL static void EnsureMemfdDir();
+  /** State of the per-user memfd directory, see CheckMemfdDir(). */
+  enum class MemfdDirState {
+    kPrivate,  ///< a real directory owned by this user, writable by no one else
+    kMissing,  ///< does not exist yet
+    kUnsafe,   ///< exists, but is a link, another user's, or writable by others
+  };
+
+  /**
+   * Whether the per-user memfd directory can be used.
+   *
+   * The directory holds the segment links, the IPC socket and the runtime pid
+   * record. Under /tmp its name is predictable, so another account can create
+   * it first. A directory that is a symbolic link, belongs to another user, or
+   * that a group or other users can write is reported as kUnsafe; another
+   * account could replace the entries in it.
+   */
+  CTP_DLL static MemfdDirState CheckMemfdDir();
+
+  /**
+   * Create the per-user memfd directory if needed (mode 0700) and check it.
+   * @return true when the directory is kPrivate; false otherwise, after
+   * logging which directory and why to stderr
+   */
+  CTP_DLL static bool EnsureMemfdDir();
 
   CTP_DLL static bool IsProcessAlive(int pid);
 
@@ -447,6 +494,14 @@ class SystemInfo {
 
   /** Directory of the shared library containing the given symbol. */
   CTP_DLL static std::string GetModuleDirectoryFor(void *symbol);
+
+  /**
+   * Resolved path of the shared library (or executable) that contains the
+   * given symbol.
+   * @param symbol Address of a function or object
+   * @return The canonical file path, or "" if it cannot be determined
+   */
+  CTP_DLL static std::string GetModulePathFor(void *symbol);
 
   /// @brief Retrieves storage device hardware health statistics.
   CTP_DLL static std::string GetDeviceHealthStats(const std::string &path);

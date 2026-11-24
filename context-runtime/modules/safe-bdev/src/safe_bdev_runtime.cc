@@ -58,49 +58,71 @@ namespace clio::run::safe_bdev {
 // Helpers
 //===========================================================================
 
+/**
+ * Per-task cost estimate for the scheduler (see Container::GetTaskStats).
+ *
+ * Write/Read scale with their 4 KiB-aligned length. A safe-bdev write stages
+ * a per-block copy before forwarding to each member, so it carries roughly
+ * twice the CPU per byte of a plain bdev write (5 KB per CPU microsecond);
+ * wall time keeps the ~500 MB/s storage scale of the member bdevs. Every
+ * other method is an explicit constant so none is predicted as a zero.
+ * @param task the task to estimate
+ * @return the task's cost features
+ */
 clio::run::TaskStat Runtime::GetTaskStats(const clio::run::Task *task) const {
+  namespace cost = clio::run::cost;
+  constexpr float kSafeCopyBytesPerCpuUs = cost::kCopyBytesPerCpuUs / 2.0F;
+  constexpr size_t kSafeBaseComputeUs = 3;
   if (task == nullptr) {
     return clio::run::TaskStat();
   }
   switch (task->method_) {
-    case Method::kWrite: {
-      const auto *wt = static_cast<const WriteTask *>(task);
-      clio::run::TaskStat stat;
-      stat.io_size_ = wt->length_;
-      const size_t aligned = ((stat.io_size_ + 4095) / 4096) * 4096;
-      // compute_ feeds InferCpuTime; a safe-bdev write additionally stages a
-      // per-block copy before forwarding to each member, so it carries roughly
-      // twice the CPU per byte of a plain bdev write.
-      stat.compute_ = static_cast<size_t>(aligned / 5000.0F) + 3;
-      stat.wall_time_ = static_cast<float>(aligned) / 500.0F;
-      return stat;
-    }
+    case Method::kWrite:
     case Method::kRead: {
-      const auto *rt = static_cast<const ReadTask *>(task);
-      clio::run::TaskStat stat;
-      stat.io_size_ = rt->length_;
-      const size_t aligned = ((stat.io_size_ + 4095) / 4096) * 4096;
-      stat.compute_ = static_cast<size_t>(aligned / 5000.0F) + 3;
-      stat.wall_time_ = static_cast<float>(aligned) / 500.0F;
+      const size_t length =
+          task->method_ == Method::kWrite
+              ? static_cast<const WriteTask *>(task)->length_
+              : static_cast<const ReadTask *>(task)->length_;
+      const size_t aligned = ((length + 4095) / 4096) * 4096;
+      clio::run::TaskStat stat =
+          cost::Data(aligned, kSafeCopyBytesPerCpuUs,
+                     cost::kStorageBytesPerWallUs, kSafeBaseComputeUs);
+      stat.io_size_ = length;
       return stat;
     }
     case Method::kAllocateBlocks:
-    case Method::kFreeBlocks: {
+    case Method::kFreeBlocks:
       // Slot bookkeeping under alloc_mu_ — small and bounded.
-      clio::run::TaskStat stat;
-      stat.compute_ = 6;
-      stat.wall_time_ = 10.0F;
-      return stat;
-    }
-    case Method::kBuildParity: {
-      // Reed-Solomon encode over a dirty stripe: the CPU-heaviest verb here.
-      clio::run::TaskStat stat;
-      stat.compute_ = 500;
-      stat.wall_time_ = 600.0F;
-      return stat;
-    }
+      return cost::Fixed(6, 10.0F);
+    case Method::kBuildParity:
+      // Reed-Solomon encode over dirty stripes: the CPU-heaviest periodic.
+      return cost::Fixed(500, 600.0F);
+    case Method::kSync:
+      // Encodes any still-dirty stripes, then syncs every member (each
+      // member's fsync is offloaded by the member bdev).
+      return cost::Fixed(100, 500.0F);
+    case Method::kAddBdev:
+    case Method::kRemoveBdev:
+      // Membership change: member-manifest append + capacity recompute.
+      return cost::Fixed(100, 1000.0F);
+    case Method::kRecoverBdev:
+      // Rebuilds a whole member from parity: decode every live stripe. The
+      // largest single job this module runs; PredictHold caps the booking.
+      return cost::Fixed(5000, 50000.0F);
+    case Method::kGetStats:
+      // Array capacity sum over the members.
+      return cost::Fixed(5, 10.0F);
+    case Method::kFlushAllocLog:
+      // Periodic alloc-log fsync, offloaded like bdev's.
+      return cost::DeviceSync();
+    case Method::kMonitor:
+      return cost::Fixed(10, 15.0F);
+    case Method::kCreate:
+      return cost::ContainerCreate();
+    case Method::kDestroy:
+      return cost::ContainerDestroy();
     default:
-      return clio::run::TaskStat();
+      return cost::Metadata();
   }
 }
 

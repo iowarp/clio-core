@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(iowarp-core VERSION 2.4.0 LANGUAGES C CXX)
+project(iowarp-core VERSION 2.5.1 LANGUAGES C CXX)
 
 #------------------------------------------------------------------------------
 # MSVC-like front end detection
@@ -53,6 +53,7 @@ option(CLIO_CORE_ENABLE_COVERAGE "Enable code coverage instrumentation for all c
 option(CLIO_CORE_ENABLE_LEAK_CHECK "Enable allocator allocation-size tracking (CTP_ALLOC_TRACK_SIZE) so tests can assert no runtime memory is leaked. Adds a small per-allocation atomic; keep OFF in production." OFF)
 option(CLIO_CORE_ENABLE_DOXYGEN "Check how well the code is documented" OFF)
 option(CLIO_CORE_ENABLE_RPATH "Enable RPATH configuration with relative ($ORIGIN) paths" ON)
+option(CLIO_CORE_SEED_USER_CONFIG "On install, copy clio_default.yaml to ~/.clio/clio.yaml if absent (package builds turn this off)" ON)
 option(CLIO_CORE_ENABLE_CPACK "Enable CPack for package generation" OFF)
 option(CLIO_CORE_ENABLE_DEB_PACKAGE "Build Debian .deb package via CPack" OFF)
 option(CLIO_CORE_ENABLE_RPM_PACKAGE "Build RPM .rpm package via CPack" OFF)
@@ -162,6 +163,7 @@ option(CLIO_CORE_ENABLE_SYCL "Enable Intel GPU support via SYCL/oneAPI (icpx -fs
 option(CLIO_CORE_ENABLE_JARVIS "Enable Jarvis CI infrastructure installation" OFF)
 option(CLIO_ENABLE_AMAZON_DRIVE "Enable Amazon S3 intermediate storage" OFF)
 option(CLIO_ENABLE_GOOGLE_CLOUD "Enable Google Cloud Storage intermediate storage" OFF)
+option(CLIO_ENABLE_DAOS "Enable the native DAOS bdev transport (bdev_type: daos; needs libdaos + libdfs + libgurt)" OFF)
 
 #------------------------------------------------------------------------------
 # ClioCtp (context-transport-primitives) Options
@@ -313,6 +315,9 @@ if(CLIO_GPU_CLANG)
 endif()
 
 include(ClioCoreCommon)
+# clio_core_version (--version stamping) + clio_add_cli_alias (clio_run ->
+# clio-run style legacy names).
+include(ClioCliAlias)
 # Measured per-kernel register ceilings for device-coroutine kernels; a no-op
 # unless CLIO_GPU_CLANG is on.
 include(ClioCoroRegCap)
@@ -392,6 +397,12 @@ find_package(cereal REQUIRED)
 if(cereal_FOUND)
     message(STATUS "found cereal at ${cereal_DIR}")
 endif()
+# Some cereal installs (Spack's package, for one) export the target as plain
+# `cereal` rather than `cereal::cereal`, which ctp::serialize links.
+if(TARGET cereal AND NOT TARGET cereal::cereal)
+    add_library(cereal::cereal INTERFACE IMPORTED)
+    set_target_properties(cereal::cereal PROPERTIES INTERFACE_LINK_LIBRARIES cereal)
+endif()
 
 # MessagePack C library (pure C, no Boost dependency)
 # Prefer static linkage so pip wheels don't need libmsgpack-c.so at runtime.
@@ -423,6 +434,13 @@ if(CLIO_CORE_ENABLE_MPI)
     find_package(MPI REQUIRED COMPONENTS C CXX)
     set(MPI_LIBS MPI::MPI_CXX)
     message(STATUS "found mpi.h at ${MPI_CXX_INCLUDE_DIRS}")
+endif()
+# The deprecated MPI C++ bindings are never used, but mpi.h pulls them in
+# (Intel MPI's mpicxx.h, OpenMPI's and MPICH's equivalents) and some of them
+# fail to compile under newer compilers, e.g. clang in CUDA mode. Skip them
+# everywhere, since clio_ctp.h includes mpi.h for every target when MPI is on.
+if(CLIO_CORE_ENABLE_MPI)
+    add_compile_definitions(OMPI_SKIP_MPICXX MPICH_SKIP_MPICXX)
 endif()
 
 # ROCm (conditional). Only require the HIP CMake package when HIP-AMD is
@@ -505,9 +523,40 @@ endif()
 
 # Thallium (conditional)
 if(CLIO_CORE_ENABLE_THALLIUM)
+    # thallium's package config resolves margo -> mercury through pkg-config.
+    # Some Mercury packages (e.g. the mercury-devel RPM shipped with DAOS on
+    # Cray systems) install mercury.pc next to libmercury.so instead of in a
+    # pkgconfig/ directory, where pkg-config never looks. When pkg-config
+    # cannot see mercury, locate the library through the normal CMake search
+    # and add the directory holding its .pc file to PKG_CONFIG_PATH.
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(CLIO_MERCURY_PC QUIET mercury)
+    if(NOT CLIO_MERCURY_PC_FOUND)
+        find_library(CLIO_MERCURY_LIBRARY NAMES mercury)
+        if(CLIO_MERCURY_LIBRARY)
+            get_filename_component(CLIO_MERCURY_LIBDIR "${CLIO_MERCURY_LIBRARY}" DIRECTORY)
+            foreach(_clio_pc_dir "${CLIO_MERCURY_LIBDIR}/pkgconfig" "${CLIO_MERCURY_LIBDIR}")
+                if(EXISTS "${_clio_pc_dir}/mercury.pc")
+                    set(ENV{PKG_CONFIG_PATH} "${_clio_pc_dir}:$ENV{PKG_CONFIG_PATH}")
+                    message(STATUS "mercury.pc found at ${_clio_pc_dir} (added to PKG_CONFIG_PATH)")
+                    break()
+                endif()
+            endforeach()
+        endif()
+    endif()
     find_package(thallium CONFIG REQUIRED)
     if(thallium_FOUND)
         message(STATUS "found thallium at ${thallium_DIR}")
+    endif()
+    # A Mercury built with its system-Boost option (HG_HAS_BOOST in
+    # mercury_config.h) includes <boost/preprocessor.hpp> from mercury_macros.h,
+    # which margo.h and so thallium.hpp pull in, but neither mercury.pc nor the
+    # thallium package config exports the Boost include directory. Attach the
+    # Boost headers to the imported thallium target so every consumer sees them.
+    find_package(Boost QUIET)
+    if(Boost_FOUND AND TARGET Boost::headers)
+        target_link_libraries(thallium INTERFACE Boost::headers)
+        message(STATUS "thallium: using Boost headers ${Boost_INCLUDE_DIRS} for mercury_macros.h")
     endif()
     set(SERIALIZATION_LIBS thallium ${SERIALIZATION_LIBS})
     set(CLIO_CORE_ENABLE_CEREAL ON)
@@ -1122,6 +1171,27 @@ if(CLIO_ENABLE_AMAZON_DRIVE)
   message(STATUS "Amazon S3 bdev support: ENABLED (Poco found)")
 endif()
 
+# The DAOS adapter (kDaos bdev transport) talks to a DAOS pool through the
+# client library itself (libdfs files + libdaos event queues) instead of going
+# through a dfuse mount. Same auto-disable treatment as the cloud adapters
+# above: a build that asks for it without the DAOS development files warns and
+# continues without the transport (bdev_type "daos" is then rejected at pool
+# creation with an error naming this option).
+if(CLIO_ENABLE_DAOS)
+  find_package(DAOS QUIET)
+  if(NOT DAOS_FOUND)
+    message(WARNING "CLIO_ENABLE_DAOS is ON but the DAOS client development "
+                    "files (daos_fs.h, libdfs, libdaos, libgurt) were not "
+                    "found. DAOS bdev support will be disabled. Install "
+                    "daos-devel or point DAOS_ROOT / CMAKE_PREFIX_PATH at a "
+                    "DAOS install to enable it.")
+    set(CLIO_ENABLE_DAOS OFF)
+  endif()
+endif()
+if(CLIO_ENABLE_DAOS)
+  message(STATUS "DAOS bdev support: ENABLED (${DAOS_DFS_LIBRARY})")
+endif()
+
 # AWS SDK for C++ (optional - for the CAE S3 assimilator, s3://). Reuses the
 # same dependency the bdev S3 transport links (aws-cpp-sdk-s3/-core). If the
 # option is requested but the SDK isn't found, warn and disable rather than
@@ -1364,7 +1434,11 @@ endif()
 # Use CLIO_CORE_MSVC_LIKE (not just MSVC) so clang-cl / icx.exe on Windows take
 # the MSVC-style flag path; GNU flags break icx's /Fo handling (see issue #555).
 if(NOT CLIO_CORE_MSVC_LIKE)
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC")
+    # -fPIC has no meaning on Windows (PE/COFF) and GNU-style clang++ targeting
+    # x86_64-pc-windows-msvc rejects it outright.
+    if(NOT WIN32)
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC")
+    endif()
     if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "NVHPC")
         # Add compiler flags following Google C++ style guide
         set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -pedantic")
@@ -1766,7 +1840,7 @@ if(CLIO_CORE_ENABLE_TESTS)
     # reading the GENERATED command with `ctest -N -V`.
     set(_clio_proc_kill
         "ps -eo pid,comm 2>/dev/null \
-           | awk -v self=$$ '($2 == \"clio_run\" || $2 == \"clio_daemon\") && $1 != self {print $1}' \
+           | awk -v self=$$ '($2 == \"clio-run\" || $2 == \"clio_run\" || $2 == \"clio_daemon\") && $1 != self {print $1}' \
            | while read -r _pid; do kill -9 \"$_pid\" 2>/dev/null; done; \
          true")
     set(_clio_cleanup_cmd
@@ -2421,6 +2495,20 @@ endif()
 if(TARGET clio_cte_replication_client)
   list(APPEND PIP_LIB_TARGETS clio_cte_replication_client clio_cte_replication_runtime)
 endif()
+# Policy caches over a volatile and a persistent core: the default config
+# composes the write-back cache (567.0), so a wheel without it fails to
+# create that pool. cache_base is compiled into each module.
+if(TARGET clio_cte_core_persist_write_back_client)
+  list(APPEND PIP_LIB_TARGETS clio_cte_core_persist_write_back_client clio_cte_core_persist_write_back_runtime)
+endif()
+if(TARGET clio_cte_core_persist_write_thru_client)
+  list(APPEND PIP_LIB_TARGETS clio_cte_core_persist_write_thru_client clio_cte_core_persist_write_thru_runtime)
+endif()
+# The shm cache: the default config composes it (568.0, metadata only) under
+# the indexer, so a wheel without it fails to create that pool.
+if(TARGET clio_cte_core_shm_cache_writethru_client)
+  list(APPEND PIP_LIB_TARGETS clio_cte_core_shm_cache_writethru_client clio_cte_core_shm_cache_writethru_runtime)
+endif()
 # Indexer chimod (#905): the default config composes it into the filesystem
 # chain (cache -> indexer -> replication), so without it the wheel's
 # `clio_run start` fails to create pool 564.0 and the runtime exits (#1240).
@@ -2531,10 +2619,9 @@ endif()
 if(TARGET clio_run_thrpt_bench)
   install(TARGETS clio_run_thrpt_bench RUNTIME DESTINATION bin)
 endif()
-# `clio_run` is created as a symlink to `clio_run` by an install(CODE)
-# in context-runtime/util/CMakeLists.txt — that runs after this point
-# during cmake --install, so the symlink lands in the default
-# component too. No extra rule needed here.
+# The legacy `clio_run` alias of `clio-run` is created by
+# clio_add_cli_alias() in context-runtime/util/CMakeLists.txt, in the
+# default component. No extra rule needed here.
 
 # Python extensions -> iowarp_core/ext/
 if(CLIO_CORE_ENABLE_PYTHON)

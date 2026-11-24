@@ -181,7 +181,7 @@ TEST_CASE("on_fault: nothing is ingested until a blob faults",
   REQUIRE(AssimilateRef(g_file.string(), "ref_nocopy") == 0);
   const auto tag = TagOf("ref_nocopy");
   auto size_of = [&]() {
-    auto sz = CLIO_CTE_CLIENT->AsyncGetTagSize(tag);
+    auto sz = CLIO_CTE_CLIENT->AsyncGetTagSize(tag, clio::run::PoolQuery::Broadcast(0.0f));
     sz.Wait();
     REQUIRE(sz->GetReturnCode() == 0);
     return sz->tag_size_;
@@ -272,7 +272,7 @@ TEST_CASE("reference: a partial write keeps the source bytes around it",
     REQUIRE(r.data[i] == want);
   }
   // Exactly the written page became resident -- one page, not the file.
-  auto sz = CLIO_CTE_CLIENT->AsyncGetTagSize(tag);
+  auto sz = CLIO_CTE_CLIENT->AsyncGetTagSize(tag, clio::run::PoolQuery::Broadcast(0.0f));
   sz.Wait();
   REQUIRE(sz->tag_size_ == kPage);
 }
@@ -335,7 +335,7 @@ TEST_CASE("on_fault: ingestion never takes the tier's last space",
     REQUIRE(r.data[0] == Pattern(pg * kChunk));
     REQUIRE(r.data[kChunk - 1] == Pattern(pg * kChunk + kChunk - 1));
   }
-  auto sz = CLIO_CTE_CLIENT->AsyncGetTagSize(tag);
+  auto sz = CLIO_CTE_CLIENT->AsyncGetTagSize(tag, clio::run::PoolQuery::Broadcast(0.0f));
   sz.Wait();
   REQUIRE(sz->tag_size_ > 0);              // it did ingest ...
   REQUIRE(sz->tag_size_ <= (24ull << 20));  // ... but kept the 8 MB reserve

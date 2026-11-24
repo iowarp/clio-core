@@ -36,6 +36,7 @@
 
 #include <clio_runtime/clio_runtime.h>
 #include <clio_cae/core/core_tasks.h>
+#include <clio_cte/core/core_task_stats.h>
 #include <clio_cae/core/factory/pagify.h>
 #include <clio_cae/core/factory/assimilation_ctx.h>
 #include <clio_cae/core/factory/base_assimilator.h>
@@ -85,8 +86,13 @@ class Runtime : public clio::run::Container {
 #ifdef CLIO_ENABLE_S3_REST
     // sockets==1 & requests>>1 is reuse. No-ops when no S3 I/O happened.
     s3_conn_pool_.LogTally();
+#ifdef CAE_ENABLE_S3
     // Where each object's latency actually went. Same placement, same reason.
+    // Defined with the S3 assimilator, which only CAE_ENABLE_S3 builds:
+    // CLIO_ENABLE_S3_REST alone also comes from the S3 storage tier
+    // (CLIO_ENABLE_AMAZON_DRIVE), which does not.
     S3AssimLogPhaseTally();
+#endif
 #endif
   }
 
@@ -97,57 +103,50 @@ class Runtime : public clio::run::Container {
    * per-method coefficient by. CAE had no override at all, so every one of its
    * tasks reported all-zero stats and the CPU model degenerated to a single
    * constant per method — a 4 KiB PutBlob and a 1 MiB PutBlob were
-   * indistinguishable to the scheduler. wall_time_ seeds InferWallClockTime
-   * at the ~500 MB/s convention shared with CTE and bdev; both coefficients
-   * are learned from real completions afterwards.
+   * indistinguishable to the scheduler. PutBlob/GetBlob (CTE's task types)
+   * scale with their payload at the shared rates in clio_runtime/task_cost.h;
+   * every other method is an explicit constant. Both coefficients are learned
+   * from real completions afterwards.
+   * @param task the task to estimate
+   * @return the task's cost features
    */
   clio::run::TaskStat GetTaskStats(
       const clio::run::Task *task) const override {
-    clio::run::TaskStat stat;
+    namespace cost = clio::run::cost;
     if (task == nullptr) {
-      return stat;
+      return clio::run::TaskStat();
     }
-    constexpr float kBytesPerComputeUs = 10000.0f;
-    constexpr float kBytesPerWallUs = 500.0f;
     switch (task->method_) {
-      case Method::kPutBlob: {
+      case Method::kPutBlob:
         // CAE reuses CTE's blob task types (core_tasks.h aliases them).
-        const auto *t = static_cast<const PutBlobTask *>(task);
-        stat.io_size_ = t->size_;
-        stat.compute_ = static_cast<size_t>(t->size_ / kBytesPerComputeUs) + 2;
-        stat.wall_time_ = static_cast<float>(t->size_) / kBytesPerWallUs;
-        return stat;
-      }
-      case Method::kGetBlob: {
-        const auto *t = static_cast<const GetBlobTask *>(task);
-        stat.io_size_ = t->size_;
-        stat.compute_ = static_cast<size_t>(t->size_ / kBytesPerComputeUs) + 2;
-        stat.wall_time_ = static_cast<float>(t->size_) / kBytesPerWallUs;
-        return stat;
-      }
+        return cost::Data(clio::cte::core::CoreBlobBytes(
+            static_cast<const PutBlobTask *>(task)));
+      case Method::kGetBlob:
+        return cost::Data(clio::cte::core::CoreBlobBytes(
+            static_cast<const GetBlobTask *>(task)));
       case Method::kParseOmni:
         // Parsing an OMNI record is CPU-bound text work whose size is not
         // known from the task alone; seed it as clearly non-trivial.
-        stat.compute_ = 300;
-        stat.wall_time_ = 400.0f;
-        return stat;
+        return cost::Fixed(300, 400.0f);
       case Method::kExportData:
-        // Writes a dataset out to a file — dominated by the write, not CPU.
-        stat.compute_ = 50;
-        stat.wall_time_ = 5000.0f;
-        return stat;
+      case Method::kImportData:
+        // Moves a whole dataset between a file and CTE — dominated by the
+        // file I/O, whose size is only known once the tag/file is opened.
+        return cost::Fixed(50, 5000.0f);
       case Method::kSemanticSearch:
         // Embedding comparison across the indexed set: the most CPU-hungry
         // verb this chimod serves.
-        stat.compute_ = 1000;
-        stat.wall_time_ = 1200.0f;
-        return stat;
+        return cost::Fixed(1000, 1200.0f);
       case Method::kGetOrCreateTag:
-        stat.compute_ = 10;
-        stat.wall_time_ = 15.0f;
-        return stat;
+        return cost::Metadata();
+      case Method::kCreate:
+        return cost::ContainerCreate();
+      case Method::kDestroy:
+        return cost::ContainerDestroy();
+      case Method::kMonitor:
+        return cost::Fixed(5, 10.0f);
       default:
-        return stat;
+        return cost::Metadata();
     }
   }
 

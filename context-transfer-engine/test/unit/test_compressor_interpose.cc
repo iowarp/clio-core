@@ -305,7 +305,7 @@ TEST_CASE("CompressorInterpose - transparent compress/decompress + parity",
 
   // F. Metadata verbs forward untouched.
   {
-    auto sz = comp_io.AsyncGetTagSize(tag_id);
+    auto sz = comp_io.AsyncGetTagSize(tag_id, clio::run::PoolQuery::Broadcast(0.0f));
     sz.Wait();
     REQUIRE(sz->GetReturnCode() == 0);
   }

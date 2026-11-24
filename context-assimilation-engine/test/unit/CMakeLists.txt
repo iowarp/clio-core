@@ -375,6 +375,16 @@ if(HDF5_ENABLED)
 
   # Set test labels
   set_tests_properties(cae_hdf5_assim PROPERTIES LABELS "format;cae;hdf5;msan_skip")
+
+  # dataset_filter round trip on a generated file: one transfer per glob
+  # feature of MatchGlobPattern (fnmatch on POSIX, the portable matcher on
+  # Windows), each verified byte-for-byte through CTE.
+  add_cae_unit_test(cae_hdf5_dataset_filter
+    ${CMAKE_CURRENT_SOURCE_DIR}/hdf5_filter/test_hdf5_dataset_filter.cc
+    EXTRA_LIBS ${HDF5_LIBRARIES}
+    EXTRA_INCLUDES ${HDF5_INCLUDE_DIRS}
+  )
+  set_tests_properties(cae_hdf5_dataset_filter PROPERTIES LABELS "format;cae;hdf5;msan_skip")
 endif()
 
 #------------------------------------------------------------------------------
@@ -404,6 +414,16 @@ if(CAE_ENABLE_GLOBUS)
   target_compile_definitions(cae_cloud_factory_guard PRIVATE CAE_ENABLE_GLOBUS)
 endif()
 set_tests_properties(cae_cloud_factory_guard PROPERTIES LABELS "cloud;cae;factory;msan_skip")
+
+#------------------------------------------------------------------------------
+# Local path policy (path_policy.h): which paths file::/hdf5:: sources may read
+# and ExportData may write. No runtime; scratch files under the temp directory.
+#------------------------------------------------------------------------------
+add_cae_unit_test(cae_path_policy
+  ${CMAKE_CURRENT_SOURCE_DIR}/path_policy/test_path_policy.cc
+  EXTRA_LIBS clio_cae_core_runtime
+)
+set_tests_properties(cae_path_policy PROPERTIES LABELS "cae;unit")
 
 #------------------------------------------------------------------------------
 # http(s) sources: config-file rules (http_auth.h) and the offline parts of the

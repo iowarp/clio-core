@@ -488,16 +488,19 @@ std::string WgetConfig(const HttpAuth &auth, std::string *err) {
 
 HttpProbe ParseProbeHeaders(const std::string &dump) {
   HttpProbe p;
-  std::istringstream in(dump);
-  std::string line;
   int64_t clen = -1;
   std::string crange;
-  while (std::getline(in, line)) {
-    line = detail::Trim(line);  // wget -S indents; also drops the '\r'
+  // No std::istringstream here: see detail::SplitLines (MSan).
+  for (const std::string &raw : detail::SplitLines(dump)) {
+    // wget -S indents; Trim also drops the '\r'
+    const std::string line = detail::Trim(raw);
     if (line.compare(0, 5, "HTTP/") == 0) {  // a new response (redirects)
-      std::istringstream sl(line);
-      std::string ver;
-      sl >> ver >> p.status;
+      // "HTTP/1.1 206 Partial Content": the status follows the first space.
+      size_t sp = line.find(' ');
+      p.status = sp == std::string::npos
+                     ? 0
+                     : static_cast<int>(
+                           std::strtol(line.c_str() + sp + 1, nullptr, 10));
       p.content_type.clear();
       clen = -1;
       crange.clear();

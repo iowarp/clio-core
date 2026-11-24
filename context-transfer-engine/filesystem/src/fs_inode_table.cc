@@ -65,8 +65,11 @@
 
 #include <clio_cte/core/blob_placement.h>
 #include <clio_cte/filesystem/filesystem_runtime.h>
+#include <clio_runtime/evlat.h>
 
 namespace clio::cte::filesystem {
+
+namespace ev = clio::run::evlat;
 
 namespace {
 
@@ -77,6 +80,13 @@ inline clio::run::u64 NowNs() { return clio::cte::core::GetWallTimeNs(); }
 constexpr double kCommitPollUs = 10.0;
 /** Wait between checks while another task loads the same block (us). */
 constexpr double kLoadPollUs = 20.0;
+/**
+ * Most directory entries one block-loading subtask covers when a directory
+ * scan fans out. A level of the split tree whose blocks could hold more than
+ * this many entries is loaded by concurrent subtasks, each covering at most
+ * this many (see Runtime::ScanBlocksPerTask).
+ */
+constexpr clio::run::u64 kScanTaskEntries = 8192;
 /** Version jump when a home loads a block from its blob: more changes
  *  than one incarnation of a home can make to one block. */
 constexpr clio::run::u64 kIncarnationStride = 1ull << 32;
@@ -134,7 +144,7 @@ clio::run::u32 Runtime::BlockHome(clio::run::u64 dir, clio::run::u32 k) {
 
 clio::run::TaskResume Runtime::ReadBlockBlob(clio::run::u64 dir,
                                              clio::run::u32 k, InodeTableBlock *out,
-                                             int &rc) {
+                                             int &rc, BlockLogInfo *log) {
   CLIO_TASK_BODY_BEGIN
   rc = 0;
   // Before the journal is replayed, "not in the journal" means nothing.
@@ -183,7 +193,7 @@ clio::run::TaskResume Runtime::ReadBlockBlob(clio::run::u64 dir,
     rc = 0;
     CLIO_CO_RETURN;
   }
-  CLIO_CO_AWAIT(ReadBlockCte(dir, k, out, rc));
+  CLIO_CO_AWAIT(ReadBlockCte(dir, k, out, rc, log));
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
@@ -250,7 +260,7 @@ clio::run::TaskResume Runtime::ReadBlockStandIn(clio::run::u64 dir,
                                bytes.data(), q);
     CLIO_CO_AWAIT(g);
     if (g->GetReturnCode() != 0) CLIO_CO_RETURN;
-    if (!DecodeTableBlock(bytes.data(), bytes.size(), out) ||
+    if (!DecodeBlockLog(bytes.data(), bytes.size(), out, nullptr) ||
         out->dir_ != dir || out->index_ != k) {
       CLIO_CO_RETURN;
     }
@@ -262,7 +272,8 @@ clio::run::TaskResume Runtime::ReadBlockStandIn(clio::run::u64 dir,
 
 clio::run::TaskResume Runtime::ReadBlockCte(clio::run::u64 dir,
                                             clio::run::u32 k,
-                                            InodeTableBlock *out, int &rc) {
+                                            InodeTableBlock *out, int &rc,
+                                            BlockLogInfo *log) {
   CLIO_TASK_BODY_BEGIN
   rc = 0;
   bool ready = false;
@@ -300,11 +311,12 @@ clio::run::TaskResume Runtime::ReadBlockCte(clio::run::u64 dir,
       CLIO_CO_RETURN;
     }
   }
-  // A block that shrank leaves stale bytes past its end; the codec stops at
-  // the encoded length.
+  // The blob is an image frame, possibly followed by delta frames (see
+  // fs_block_log.h); a bare image from an earlier clio-fs is read as before.
+  BlockLogInfo scan;
   if (g->GetReturnCode() != 0 ||
-      !DecodeTableBlock(bytes.data(), bytes.size(), out) || out->dir_ != dir ||
-      out->index_ != k) {
+      !DecodeBlockLog(bytes.data(), bytes.size(), out, &scan) ||
+      out->dir_ != dir || out->index_ != k) {
     if (g->GetReturnCode() == 0 && IsOldDirBlock(bytes.data(), bytes.size())) {
       HLOG(kError, "filesystem: directory {} was written by an older clio-fs "
            "(directory format CDB1); this volume must be recreated", dir);
@@ -312,6 +324,8 @@ clio::run::TaskResume Runtime::ReadBlockCte(clio::run::u64 dir,
       HLOG(kError, "filesystem: inode-table block {}/{} unreadable", dir, k);
     }
     rc = EIO;
+  } else if (log != nullptr) {
+    *log = scan;
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -319,29 +333,20 @@ clio::run::TaskResume Runtime::ReadBlockCte(clio::run::u64 dir,
 
 clio::run::TaskResume Runtime::WriteBlockBlob(clio::run::u64 dir,
                                               clio::run::u32 k,
-                                              const std::string &image,
-                                              int &rc) {
+                                              BlockBlobWrite &blob, int &rc) {
   CLIO_TASK_BODY_BEGIN
   rc = 0;
   while (!dir_ready_.load(std::memory_order_acquire)) {
     CLIO_CO_AWAIT(clio::run::yield(1000.0));
   }
-  if (dir_journal_) {
-    rc = JournalAppend(FsLogRec::kBlockImage, image);
-    if (rc != 0) CLIO_CO_RETURN;
-  }
-  // With the journal on, the CTE blob is the replicated mirror a stand-in
-  // reads while this node is down (#1263); the change is acknowledged only
-  // once both are written.
-  CLIO_CO_AWAIT(PutBlockCte(dir, k, image, rc));
+  CLIO_CO_AWAIT(PutBlockCte(dir, k, blob, rc));
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
 
 clio::run::TaskResume Runtime::PutBlockCte(clio::run::u64 dir,
                                            clio::run::u32 k,
-                                           const std::string &image,
-                                           int &rc) {
+                                           BlockBlobWrite &blob, int &rc) {
   CLIO_TASK_BODY_BEGIN
   rc = 0;
   bool ready = false;
@@ -351,24 +356,30 @@ clio::run::TaskResume Runtime::PutBlockCte(clio::run::u64 dir,
     CLIO_CO_RETURN;
   }
   const clio::cte::core::TagId tag = FsUnpack(dir);
-  // Pad to a power of two (>= 4 KiB). Every create grows the image a little;
-  // a blob rewritten at a slightly larger size each time gains one more small
-  // extent per write, and every rewrite then touches all of them (creates
-  // slowed linearly with directory size). Padded, the blob only changes size
-  // a few times and stays a few extents. The codec ignores the padding.
-  size_t cap = 4096;
-  while (cap < image.size()) cap <<= 1;
-  std::string padded = image;
-  padded.resize(cap, '\0');
-  auto p = cte_.AsyncPutBlob(tag, TableBlockName(k), 0, padded.size(),
-                             padded.data(), -1.0f,
-                             MetaCtx(inode_volatile_only_), 0u,
+  // An image replaces the blob, so a log that shrank leaves no stale bytes.
+  // A frame is appended at the blob's current end, which must be where this
+  // home left the log (checked below). Images used to be padded to a power of
+  // two (>= 4 KiB) so a blob rewritten slightly larger each commit did not
+  // gain a small extent per write. That padding is gone: frames must be
+  // contiguous, and the compaction threshold (dir_log_compact_bytes) now
+  // bounds how many extents a log accumulates between images.
+  const clio::run::u32 flags = blob.append_ ? clio::cte::core::kCtePutAppend
+                                            : clio::cte::core::kCtePutReplace;
+  // The level THIS put asked for decides whether it retries. Reading
+  // inode_volatile_only_ again after the await let another task's
+  // successful fallback (which sets it) cancel this task's retry: its
+  // refused non-volatile put then surfaced as a failed mkdir/create (rc 12;
+  // IO500 mdtest at 64 and 256 nodes).
+  const bool asked_volatile = inode_volatile_only_;
+  auto p = cte_.AsyncPutBlob(tag, TableBlockName(k), 0, blob.bytes_.size(),
+                             blob.bytes_.data(), -1.0f,
+                             MetaCtx(asked_volatile), flags,
                              clio::run::PoolQuery::Dynamic());
   CLIO_CO_AWAIT(p);
-  if (p->GetReturnCode() != 0 && !inode_volatile_only_) {
+  if (p->GetReturnCode() != 0 && !asked_volatile) {
     // No non-volatile tier accepts it: keep it in RAM (lost on restart).
-    p = cte_.AsyncPutBlob(tag, TableBlockName(k), 0, padded.size(),
-                          padded.data(), -1.0f, MetaCtx(true), 0u,
+    p = cte_.AsyncPutBlob(tag, TableBlockName(k), 0, blob.bytes_.size(),
+                          blob.bytes_.data(), -1.0f, MetaCtx(true), flags,
                           clio::run::PoolQuery::Dynamic());
     CLIO_CO_AWAIT(p);
     if (p->GetReturnCode() == 0) {
@@ -376,6 +387,15 @@ clio::run::TaskResume Runtime::PutBlockCte(clio::run::u64 dir,
            "directories do not survive a restart");
       inode_volatile_only_ = true;
     }
+  }
+  if (p->GetReturnCode() == 0 && blob.append_ &&
+      p->offset_ != blob.expect_end_) {
+    // Someone else wrote to the blob since this home last did: the frame is
+    // at the wrong place, so the commit fails and the next one writes an image.
+    HLOG(kError, "filesystem: inode-table block {}/{} log append landed at {} "
+         "but this home left it at {}", dir, k, p->offset_, blob.expect_end_);
+    rc = EIO;
+    CLIO_CO_RETURN;
   }
   if (p->GetReturnCode() != 0) {
     HLOG(kError, "filesystem: writing inode-table block {}/{} failed (rc {})",
@@ -572,7 +592,7 @@ void Runtime::DropHomeBlocksAfterFailover() {
         continue;
       }
       if (s.committing_ || s.splitting_ || s.persist_dirty_ ||
-          !s.unpushed_.empty()) {
+          s.blob_image_due_ || !s.unpushed_.empty()) {
         ++kept;
         ++it;
         continue;
@@ -666,7 +686,8 @@ clio::run::TaskResume Runtime::LoadHomeBlock(clio::run::u64 dir,
   lrc = 0;
   const TableBlockKey key{dir, k};
   SetLoadStage(key, "home load: reading the block blob (GetBlobSize/GetBlob)");
-  CLIO_CO_AWAIT(ReadBlockBlob(dir, k, &slot->blk_, lrc));
+  BlockLogInfo log;
+  CLIO_CO_AWAIT(ReadBlockBlob(dir, k, &slot->blk_, lrc, &log));
   if (TraceDirBlock()) {
     HLOG(kWarning, "[DIRBLOCK] home load {}/{} on container {}: rc {} "
          "version {} rows {}", dir, k, container_id_, lrc,
@@ -674,6 +695,13 @@ clio::run::TaskResume Runtime::LoadHomeBlock(clio::run::u64 dir,
   }
   // Loaded from the journal: its deltas build on the image there.
   slot->journal_image_ = lrc != 0;
+  // The first commit writes a full image instead of a frame when the blob
+  // cannot simply be extended: the journal is authoritative and the blob may
+  // lag it, the load failed, or the blob holds more than one frame or an old
+  // bare image. That commit compacts it; the load itself writes nothing.
+  slot->blob_image_due_ = dir_journal_ || lrc != 0 || log.NeedsImage();
+  slot->blob_log_bytes_ = log.DeltaBytes();
+  slot->blob_end_ = log.valid_bytes_;
   if (lrc == ENOENT && dir == FsPack(FsRootId()) && k == 0) {
     // "/" exists by definition: its home materializes its table on first
     // use (its inode record is materialized by its own home, EnsureInode).
@@ -698,12 +726,14 @@ clio::run::TaskResume Runtime::LoadHomeBlock(clio::run::u64 dir,
     slot->blk_.version_ += kIncarnationStride;
     int wrc = 0;
     SetLoadStage(key, "home load: persisting the incarnation jump (PutBlob)");
-    CLIO_CO_AWAIT(WriteBlockBlob(dir, k, EncodeTableBlock(slot->blk_, true),
-                                 wrc));
-    if (wrc != 0) {
-      slot->persist_dirty_ = true;  // the next commit retries
-      slot->journal_image_ = true;
+    BlockBlobWrite image = MakeImageWrite(slot->blk_);
+    if (dir_journal_) {
+      wrc = JournalAppend(FsLogRec::kBlockImage,
+                          EncodeTableBlock(slot->blk_, true));
     }
+    if (wrc == 0) CLIO_CO_AWAIT(WriteBlockBlob(dir, k, image, wrc));
+    // The jump is an image, so it also compacts whatever log the blob held.
+    SettleBlobWriteLocked(*slot, image, wrc, false);
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -728,6 +758,7 @@ clio::run::TaskResume Runtime::FetchBlock(clio::run::u64 dir,
     lrc = EIO;
   }
   slot->home_id_ = home;
+  slot->reg_ = resp.reg_;
   // The lease runs from when we asked: the home granted it later.
   slot->lease_until_ms_ = asked_ms + kCacheLeaseMs;
   CLIO_CO_RETURN;
@@ -764,6 +795,7 @@ clio::run::TaskResume Runtime::RevalidateBlock(
   if (changed && nb.version_ > slot->blk_.version_) {
     slot->blk_ = std::move(nb);
   }
+  slot->reg_ = resp.reg_;  // the home registered this copy anew
   slot->lease_until_ms_ = asked_ms + kCacheLeaseMs;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -786,9 +818,12 @@ clio::run::TaskResume Runtime::ServeBlockFetch(const FsReq &req,
   std::lock_guard<std::mutex> g(ns_mu_);
   const clio::run::u32 holder = static_cast<clio::run::u32>(req.a_);
   if (holder != container_id_) {
-    slot->holders_[holder] = reg_seq_++;
+    resp.reg_ = slot->holders_[holder] = reg_seq_++;
     slot->holder_lease_ms_[holder] =
         SteadyMs() + kCacheLeaseMs + kCacheLeaseSlackMs;
+    // What it is given here (or already has, if unchanged) is the block as
+    // it stands, every change it was owed included.
+    slot->owed_.erase(holder);
   }
   resp.rc_ = 0;
   if (req.b_ != 0 && req.b_ == slot->blk_.version_) {
@@ -904,6 +939,8 @@ clio::run::u64 Runtime::RecordChangeLocked(TableBlockSlot &slot, TableDelta delt
   delta.depth_ = b.depth_;
   delta.mtime_ = b.mtime_;
   delta.sealed_ = b.sealed_;
+  slot.batch_from_ = MergeBatchSource(slot.unpushed_.empty(),
+                                      slot.batch_from_, slot.mutator_);
   slot.unpushed_.push_back(std::move(delta));
   if (persisted) slot.persist_dirty_ = true;
   return b.version_;
@@ -913,7 +950,8 @@ clio::run::TaskResume Runtime::PushToHolders(
     clio::run::u32 op, const FsReq &req,
     const std::vector<clio::run::u32> &holders,
     const std::vector<clio::run::u64> &leases,
-    std::vector<clio::run::u32> *gone) {
+    std::vector<clio::run::u32> *gone,
+    const std::map<clio::run::u32, std::string> *own) {
   CLIO_TASK_BODY_BEGIN
   // (holder, lease end) still owed this push
   std::vector<std::pair<clio::run::u32, clio::run::u64>> todo;
@@ -934,6 +972,10 @@ clio::run::TaskResume Runtime::PushToHolders(
       } else if (!clio::cte::core::ContainerNodeAlive(pool_id_,
                                                       todo[i].first)) {
         wait.push_back(todo[i]);  // may only be cut off: wait out the lease
+      } else if (own != nullptr && own->count(todo[i].first) != 0) {
+        FsReq mine = req;  // this holder's own payload
+        mine.str_ = own->at(todo[i].first);
+        fs.emplace_back(i, SendShard(todo[i].first, op, mine));
       } else {
         fs.emplace_back(i, SendShard(todo[i].first, op, req));
       }
@@ -950,10 +992,20 @@ clio::run::TaskResume Runtime::PushToHolders(
       // Backoff starts at 25 us: a flat 20 ms poll put a 20 ms floor under
       // every commit (atime updates included), and a 28,800-file tree walk
       // went from ~5 ms to ~30 ms a file (dirs_crash_restart timed out).
-      double poll_us = 25.0;
+      //
+      // The interval is an eighth of the time this holder has been waited
+      // for, clamped to [25 us, 20 ms]. Doubling it on every poll overshot a
+      // reply by up to its own latency: with replies arriving after ~0.5 ms
+      // a push to 4 holders took 2.2 ms of a 2.6 ms create (8 nodes, mdtest;
+      // CLIO_EVLAT fs_row_push). A proportional interval notices the reply
+      // within 1/8 of its latency and still reaches 20 ms for a holder that
+      // is not answering.
+      const auto poll_t0 = std::chrono::steady_clock::now();
       while (!xf.second.IsComplete() && SteadyMs() < h.second) {
-        CLIO_CO_AWAIT(clio::run::yield(poll_us));
-        poll_us = std::min(poll_us * 2.0, 20000.0);
+        const double waited_us = std::chrono::duration<double, std::micro>(
+            std::chrono::steady_clock::now() - poll_t0).count();
+        CLIO_CO_AWAIT(clio::run::yield(
+            std::clamp(waited_us / 8.0, 25.0, 20000.0)));
       }
       if (!xf.second.IsComplete()) {
         gone->push_back(h.first);
@@ -1022,17 +1074,186 @@ void Runtime::PushTargetsLocked(const TableBlockSlot &slot, bool resync,
   }
 }
 
+namespace {
+/**
+ * Log a block commit that took longer than kSlowBlockOpS.
+ * @param dir packed directory id
+ * @param k block index
+ * @param t0 when the commit's writes started
+ * @param holders number of containers the commit pushed to
+ * @param resync true if the commit pushed a snapshot to every container
+ */
+void WarnIfSlowCommit(clio::run::u64 dir, clio::run::u32 k,
+                      std::chrono::steady_clock::time_point t0, size_t holders,
+                      bool resync) {
+  const double took = std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - t0).count();
+  if (took > kSlowBlockOpS) {
+    HLOG(kWarning, "filesystem: committing inode-table block {}/{} took "
+         "{} ms ({} holders{})", dir, k,
+         static_cast<clio::run::u64>(took * 1000.0), holders,
+         resync ? ", resync" : "");
+  }
+}
+}  // namespace
+
+clio::run::TaskResume Runtime::WriteCommitRecords(
+    clio::run::u64 dir, clio::run::u32 k, BlockBlobWrite &blob, FsLogRec jtype,
+    const std::string &jrec, int &wrc, bool &mirror_failed, bool ev_timed) {
+  CLIO_TASK_BODY_BEGIN
+  wrc = 0;
+  mirror_failed = false;
+  if (!dir_journal_) {
+    // The blob is the only persistence.
+    if (!blob.bytes_.empty()) {
+      const unsigned long long ev_b0 = ev_timed ? ev::Now() : 0;
+      CLIO_CO_AWAIT(WriteBlockBlob(dir, k, blob, wrc));
+      ev::Span(ev::kFsRowBlob, ev_b0, ev::Now());
+    }
+    CLIO_CO_RETURN;
+  }
+  // With the journal, the record is journaled first and the blob is the
+  // replicated mirror a stand-in reads while this node is down (#1263); the
+  // change is acknowledged only once both are written.
+  if (!jrec.empty()) {
+    const unsigned long long ev_j0 = ev_timed ? ev::Now() : 0;
+    wrc = JournalAppend(jtype, jrec);
+    ev::Span(ev::kFsRowJournal, ev_j0, ev::Now());
+  }
+  if (wrc == 0 && !blob.bytes_.empty()) {
+    int mrc = 0;
+    const unsigned long long ev_b0 = ev_timed ? ev::Now() : 0;
+    CLIO_CO_AWAIT(WriteBlockBlob(dir, k, blob, mrc));
+    ev::Span(ev::kFsRowBlob, ev_b0, ev::Now());
+    if (mrc == ENOSPC) {
+      // The change is durable in this node's journal; only the replicated
+      // mirror a stand-in would read is behind. Failing the operation for
+      // that made unlink/rmdir on a full store fail ENOSPC -- the one way
+      // to free space. Succeed, and write the mirror at the next commit
+      // (a full image, see SettleBlobWriteLocked). The cost: a stand-in
+      // serving this block before that sees it without this change.
+      mirror_failed = true;
+      HLOG(kWarning, "filesystem: inode-table block {}/{} change is "
+           "journaled but its replicated mirror could not be written "
+           "(store full); retried at the next commit", dir, k);
+    } else {
+      wrc = mrc;
+    }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+void Runtime::PlanCommitPushLocked(TableBlockSlot &slot, bool resync,
+                                   const std::vector<TableDelta> &deltas,
+                                   CommitPush *push) {
+  const clio::run::u32 from = slot.batch_from_;
+  slot.batch_from_ = kBatchLocal;
+  PushTargetsLocked(slot, resync, &push->holders_, &push->leases_);
+  if (resync) {
+    slot.owed_.clear();  // the snapshot is the whole block
+    return;
+  }
+  if (deltas.empty()) return;  // nothing is pushed: owed changes stay owed
+  const clio::run::u64 now = SteadyMs();
+  for (size_t i = 0; i < push->holders_.size();) {
+    const clio::run::u32 h = push->holders_[i];
+    // Every change of this commit is its own, and its lease is running: it
+    // gets them in its replies (RowMutation). Past the lease it is pushed,
+    // which deregisters it, as ever.
+    if (from != kBatchLocal && from != kBatchMixed && h + 1 == from &&
+        now < push->leases_[i]) {
+      std::vector<TableDelta> &owed = slot.owed_[h];
+      owed.insert(owed.end(), deltas.begin(), deltas.end());
+      push->holders_.erase(push->holders_.begin() +
+                           static_cast<std::ptrdiff_t>(i));
+      push->leases_.erase(push->leases_.begin() +
+                          static_cast<std::ptrdiff_t>(i));
+      continue;
+    }
+    auto ot = slot.owed_.find(h);
+    if (ot != slot.owed_.end() && !ot->second.empty()) {
+      push->own_[h] = EncodeTableDeltas(WithOwedDeltas(ot->second, deltas));
+    }
+    ++i;
+  }
+}
+
+void Runtime::SettleOwedLocked(TableBlockSlot &slot, const CommitPush &push,
+                               bool pushed) {
+  if (pushed) {
+    // The push carried what each was owed; one that did not take it is
+    // deregistered below or has fetched the block again since.
+    for (clio::run::u32 h : push.holders_) slot.owed_.erase(h);
+  }
+  for (auto it = slot.owed_.begin(); it != slot.owed_.end();) {
+    it = slot.holders_.count(it->first) == 0 ? slot.owed_.erase(it) : ++it;
+  }
+}
+
+clio::run::u32 Runtime::MutationSourceLocked(TableBlockSlot &slot,
+                                             const FsReq &req) {
+  if (req.from_ == 0 || req.from_ == kBatchMixed || req.reg_ == 0) {
+    return kBatchLocal;
+  }
+  const clio::run::u32 who = req.from_ - 1;
+  if (who == container_id_) return kBatchLocal;
+  // Only the copy this home has registered: one fetched again since the
+  // request was sent (it gave up on an earlier reply, or renewed its lease)
+  // is pushed like any other holder.
+  auto ht = slot.holders_.find(who);
+  if (ht == slot.holders_.end() || ht->second != req.reg_) return kBatchLocal;
+  auto ot = slot.owed_.find(who);
+  if (ot != slot.owed_.end()) {
+    TrimOwedDeltas(&ot->second, req.have_);
+    if (ot->second.empty()) slot.owed_.erase(ot);
+  }
+  return req.from_;
+}
+
+void Runtime::AttachOwedLocked(const TableBlockSlot &slot, const FsReq &req,
+                               FsResp &resp) {
+  if (req.from_ == 0 || req.reg_ == 0) return;
+  const clio::run::u32 who = req.from_ - 1;
+  auto ht = slot.holders_.find(who);
+  if (ht == slot.holders_.end() || ht->second != req.reg_) return;
+  auto ot = slot.owed_.find(who);
+  if (ot == slot.owed_.end() || ot->second.empty()) return;
+  resp.deltas_ = EncodeTableDeltas(ot->second);
+}
+
+void Runtime::SettleMutationReply(const FsReq &req, FsResp &resp, bool lost) {
+  if (req.from_ == 0) return;
+  // No reply (or one that says the home could not finish): this copy may
+  // lack its own change, and nothing will push it.
+  bool drop = lost || resp.rc_ == EIO;
+  if (!resp.deltas_.empty()) {
+    FsReq pr;
+    pr.str_.swap(resp.deltas_);
+    // ENOENT (the copy is gone meanwhile) is as for a push to a non-holder.
+    if (ApplyTablePush(pr) == EINVAL) drop = true;
+  }
+  if (!drop) return;
+  std::lock_guard<std::mutex> g(ns_mu_);
+  auto it = blocks_.find(TableBlockKey{req.dir_id_, req.block_});
+  if (it != blocks_.end() && !it->second->home_) blocks_.erase(it);
+}
+
 clio::run::TaskResume Runtime::CommitBlock(std::shared_ptr<TableBlockSlot> slot,
-                                           clio::run::u64 version, int &rc) {
+                                           clio::run::u64 version, int &rc,
+                                           RowEvlat *ev) {
   CLIO_TASK_BODY_BEGIN
   rc = 0;
+  // fs_row_wait: from here until this task's own commit starts, or until it
+  // finds its version made durable by another task's commit (group commit).
+  const unsigned long long ev_w0 = ev != nullptr ? clio::run::CycleNow() : 0;
+  bool ev_waiting = ev != nullptr;
   for (;;) {
     std::vector<TableDelta> deltas;
-    std::string image, jrec;
+    BlockBlobWrite blob;  // what the blob gets: an image or an appended frame
+    std::string jrec;
     FsLogRec jtype = FsLogRec::kBlockDeltas;
-    std::string mirror;  // full image for the CTE copy of a journaled delta
-    std::vector<clio::run::u32> holders;
-    std::vector<clio::run::u64> leases;  // parallel to holders
+    CommitPush push;  // who is pushed, and what
     std::map<clio::run::u32, clio::run::u64> reg;  // registrations pushed to
     clio::run::u64 v = 0, dir = 0;
     clio::run::u32 k = 0;
@@ -1052,65 +1273,52 @@ clio::run::TaskResume Runtime::CommitBlock(std::shared_ptr<TableBlockSlot> slot,
                slot->home_);
         }
         deltas.swap(slot->unpushed_);
-        TakePersistLocked(*slot, deltas, &image, &jtype, &jrec);
-        // A journaled delta lives only in this node's journal: mirror the
-        // block's whole current image to its replicated CTE blob too, so a
-        // stand-in can serve it while this node is down (#1263).
-        if (dir_journal_ && image.empty() && !jrec.empty()) {
-          mirror = EncodeTableBlock(slot->blk_, true);
-        }
+        TakePersistLocked(*slot, deltas, &blob, &jtype, &jrec);
         reg = slot->holders_;
         if (slot->holders_unknown_) {
           resync = true;
           slot->holders_unknown_ = false;
           deltas.assign(1, SnapshotDelta(slot->blk_));
         }
-        PushTargetsLocked(*slot, resync, &holders, &leases);
+        PlanCommitPushLocked(*slot, resync, deltas, &push);
       }
     }
     if (!go) {
       CLIO_CO_AWAIT(clio::run::yield(kCommitPollUs));
       continue;
     }
+    if (ev_waiting) {
+      ev->wait_cyc_ += clio::run::CycleNow() - ev_w0;
+      ev_waiting = false;
+    }
     int wrc = 0;
-    const auto commit_t0 = std::chrono::steady_clock::now();
-    if (!image.empty()) CLIO_CO_AWAIT(WriteBlockBlob(dir, k, image, wrc));
-    if (wrc == 0 && !jrec.empty()) wrc = JournalAppend(jtype, jrec);
     bool mirror_failed = false;
-    if (wrc == 0 && !mirror.empty()) {
-      int mrc = 0;
-      CLIO_CO_AWAIT(PutBlockCte(dir, k, mirror, mrc));
-      if (mrc == ENOSPC) {
-        // The change is durable in this node's journal; only the replicated
-        // mirror a stand-in would read is behind. Failing the operation for
-        // that made unlink/rmdir on a full store fail ENOSPC -- the one way
-        // to free space. Succeed, and rewrite the mirror at the next commit
-        // (persist_dirty_). The cost: a stand-in serving this block before
-        // that sees it without this change.
-        mirror_failed = true;
-        HLOG(kWarning, "filesystem: inode-table block {}/{} change is "
-             "journaled but its replicated mirror could not be written "
-             "(store full); retried at the next commit", dir, k);
-      } else {
-        wrc = mrc;
-      }
+    const auto commit_t0 = std::chrono::steady_clock::now();
+    CLIO_CO_AWAIT(WriteCommitRecords(dir, k, blob, jtype, jrec, wrc,
+                                     mirror_failed, ev != nullptr));
+    if (TraceDirBlock()) {
+      HLOG(kWarning, "[DIRBLOCK] commit {}/{} wrote {} of {} bytes (rc {})",
+           dir, k,
+           blob.bytes_.empty() ? "no blob"
+                               : (blob.append_ ? "a delta frame (appended)"
+                                               : "an image (replaced blob)"),
+           blob.bytes_.size(), wrc);
     }
     std::vector<clio::run::u32> gone;
-    if (!deltas.empty() && !holders.empty()) {
+    const bool pushed = !deltas.empty() && !push.holders_.empty();
+    if (pushed) {
       FsReq pr;
       pr.str_ = EncodeTableDeltas(deltas);
-      CLIO_CO_AWAIT(PushToHolders(kTablePush, pr, holders, leases, &gone));
+      const unsigned long long ev_p0 = ev != nullptr ? ev::Now() : 0;
+      CLIO_CO_AWAIT(PushToHolders(kTablePush, pr, push.holders_, push.leases_,
+                                  &gone, &push.own_));
+      ev::Span(ev::kFsRowPush, ev_p0, ev::Now());
     }
-    {
-      const double took = std::chrono::duration<double>(
-          std::chrono::steady_clock::now() - commit_t0).count();
-      if (took > kSlowBlockOpS) {
-        HLOG(kWarning, "filesystem: committing inode-table block {}/{} took "
-             "{} ms ({} holders{})", dir, k,
-             static_cast<clio::run::u64>(took * 1000.0), holders.size(),
-             resync ? ", resync" : "");
-      }
+    // Fan-out of this commit: 0 when nothing was pushed.
+    if (ev != nullptr) {
+      ev::Count(ev::kFsRowHolders, pushed ? push.holders_.size() : 0);
     }
+    WarnIfSlowCommit(dir, k, commit_t0, push.holders_.size(), resync);
     {
       std::lock_guard<std::mutex> g(ns_mu_);
       if (resync) {
@@ -1119,21 +1327,17 @@ clio::run::TaskResume Runtime::CommitBlock(std::shared_ptr<TableBlockSlot> slot,
         // restart may be trusted until that horizon). Without one they
         // counted as expired: the next change skipped them while they still
         // served their copy without asking.
-        for (size_t i = 0; i < holders.size(); ++i) {
-          const clio::run::u32 h = holders[i];
+        for (size_t i = 0; i < push.holders_.size(); ++i) {
+          const clio::run::u32 h = push.holders_[i];
           if (std::find(gone.begin(), gone.end(), h) != gone.end()) continue;
           if (slot->holders_.count(h) == 0) slot->holders_[h] = reg_seq_++;
           clio::run::u64 &lease = slot->holder_lease_ms_[h];
-          lease = std::max(lease, leases[i]);
+          lease = std::max(lease, push.leases_[i]);
         }
       }
       DropGoneHolders(gone, reg, &slot->holders_, &slot->holder_lease_ms_);
-      if (wrc != 0) {
-        slot->persist_dirty_ = true;  // the next commit retries
-        slot->journal_image_ = true;  // these deltas never reached it
-      } else if (mirror_failed) {
-        slot->persist_dirty_ = true;  // rewrite the mirror next time
-      }
+      SettleOwedLocked(*slot, push, pushed);
+      SettleBlobWriteLocked(*slot, blob, wrc, mirror_failed);
       slot->durable_version_ = v;
       slot->committing_ = false;
     }
@@ -1142,6 +1346,7 @@ clio::run::TaskResume Runtime::CommitBlock(std::shared_ptr<TableBlockSlot> slot,
       break;
     }
   }
+  if (ev_waiting) ev->wait_cyc_ += clio::run::CycleNow() - ev_w0;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
@@ -1156,9 +1361,8 @@ int Runtime::InsertRowLocked(TableBlockSlot &slot, const FsReq &req,
   InodeTableBlock &b = slot.blk_;
   if (b.sealed_) return ENOENT;  // an rmdir is removing the directory
   if (req.id_ == 0) return EINVAL;  // the caller names the inode
-  const clio::cte::core::TagId dir_tag = FsUnpack(b.dir_);
   const std::string key = KeyOf(req.leaf_);
-  const std::string tn = clio::cte::core::MakeTagRefName(dir_tag, req.leaf_);
+  const std::string tn = FsTagName(req.leaf_, req.id_);
   auto it = b.rows_.find(key);
   TableDelta dl;
   if ((f & kInsCommit) != 0) {
@@ -1185,8 +1389,7 @@ int Runtime::InsertRowLocked(TableBlockSlot &slot, const FsReq &req,
     dl.ops_.push_back({key, true, it->second});
     RecordChangeLocked(slot, dl, true);
     PublishName(clio::cte::core::TagNameOp::kAddName, FsUnpack(req.id_),
-                clio::cte::core::MakeTagRefName(dir_tag,
-                                                RowName(key, it->second)));
+                FsTagName(RowName(key, it->second), req.id_));
     return 0;
   }
   if (it != b.rows_.end()) {
@@ -1215,7 +1418,7 @@ int Runtime::InsertRowLocked(TableBlockSlot &slot, const FsReq &req,
     RecordChangeLocked(slot, dl, true);
     if ((f & kInsNoTagName) == 0) {
       PublishName(clio::cte::core::TagNameOp::kRemoveName, FsUnpack(victim),
-                  clio::cte::core::MakeTagRefName(dir_tag, resp.str_));
+                  FsTagName(resp.str_, victim));
       PublishName(clio::cte::core::TagNameOp::kAddName, FsUnpack(e.id_), tn);
     }
     resp.id_ = req.id_;
@@ -1293,7 +1496,7 @@ int Runtime::RemoveRowLocked(TableBlockSlot &slot, const FsReq &req,
   RecordChangeLocked(slot, dl, true);
   if ((f & kRmNoTagName) == 0) {
     PublishName(clio::cte::core::TagNameOp::kRemoveName, FsUnpack(gone),
-                clio::cte::core::MakeTagRefName(FsUnpack(b.dir_), resp.str_));
+                FsTagName(resp.str_, gone));
   }
   return 0;
 }
@@ -1320,10 +1523,8 @@ int Runtime::RespellRowLocked(TableBlockSlot &slot, const FsReq &req,
   TableDelta dl;
   dl.ops_.push_back({key, true, e});
   RecordChangeLocked(slot, dl, true);
-  const clio::cte::core::TagId dir_tag = FsUnpack(b.dir_);
   PublishName(clio::cte::core::TagNameOp::kRename, FsUnpack(e.id_),
-              clio::cte::core::MakeTagRefName(dir_tag, resp.str_),
-              clio::cte::core::MakeTagRefName(dir_tag, req.leaf_));
+              FsTagName(resp.str_, e.id_), FsTagName(req.leaf_, e.id_));
   return 0;
 }
 
@@ -1334,9 +1535,16 @@ clio::run::TaskResume Runtime::RowMutation(clio::run::u32 op,
     resp.rc_ = kFsRedirect;
     CLIO_CO_RETURN;
   }
+  // CLIO_EVLAT: this container is the block's home. fs_row_exec is the whole
+  // mutation from here; row_ev collects its waits (fs_row_wait).
+  ev::ScopedSpan ev_exec(ev::kFsRowExec);
+  RowEvlat row_ev;
+  RowEvlat *const evp = ev::On() ? &row_ev : nullptr;
   std::shared_ptr<TableBlockSlot> slot;
   int rc = 0;
+  const unsigned long long ev_l0 = ev::Now();
   CLIO_CO_AWAIT(LoadBlock(req.dir_id_, req.block_, slot, rc));
+  ev::Span(ev::kFsRowLoad, ev_l0, ev::Now());
   if (rc != 0) {
     resp.rc_ = static_cast<clio::run::u32>(rc);
     CLIO_CO_RETURN;
@@ -1351,25 +1559,47 @@ clio::run::TaskResume Runtime::RowMutation(clio::run::u32 op,
         rc = kFsRedirect;  // it split: the caller re-walks
       } else if (slot->splitting_) {
         rc = kFsRetry;
-      } else if (op == kTableInsert) {
-        rc = InsertRowLocked(*slot, req, resp);
-      } else if (op == kTableRemove) {
-        rc = RemoveRowLocked(*slot, req, resp);
       } else {
-        rc = RespellRowLocked(*slot, req, resp);
+        // A requester that caches this block takes its change in the reply.
+        slot->mutator_ = MutationSourceLocked(*slot, req);
+        if (op == kTableInsert) {
+          rc = InsertRowLocked(*slot, req, resp);
+        } else if (op == kTableRemove) {
+          rc = RemoveRowLocked(*slot, req, resp);
+        } else {
+          rc = RespellRowLocked(*slot, req, resp);
+        }
+        slot->mutator_ = kBatchLocal;
       }
       after = slot->blk_.version_;
     }
     if (rc != kFsRetry) break;
+    const unsigned long long ev_y0 = ev::Now();
     CLIO_CO_AWAIT(clio::run::yield(50));
+    if (ev_y0 != 0) row_ev.wait_cyc_ += clio::run::CycleNow() - ev_y0;
   }
   if (after != before) {
     int crc = 0;
-    CLIO_CO_AWAIT(CommitBlock(slot, after, crc));
+    CLIO_CO_AWAIT(CommitBlock(slot, after, crc, evp));
     if (crc != 0 && rc == 0) rc = crc;
   }
+  // One sample per mutation that reached its block, 0 included.
+  ev::Add(ev::kFsRowWait, row_ev.wait_cyc_);
   resp.rc_ = static_cast<clio::run::u32>(rc);
-  if (rc == 0 && op == kTableInsert) CLIO_CO_AWAIT(SplitBlock(slot));
+  // The row's CTE tag name changes before the operation returns, so a later
+  // operation on the inode always follows it.
+  CLIO_CO_AWAIT(FlushNames());
+  if (rc == 0 && op == kTableInsert) {
+    const unsigned long long ev_s0 = ev::Now();
+    CLIO_CO_AWAIT(SplitBlock(slot));
+    ev::Span(ev::kFsRowSplit, ev_s0, ev::Now());
+  }
+  {
+    // Whatever the requester's copy was not pushed -- this change, and any
+    // earlier one whose reply may not have arrived -- goes back with this.
+    std::lock_guard<std::mutex> g(ns_mu_);
+    AttachOwedLocked(*slot, req, resp);
+  }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
@@ -1426,6 +1656,7 @@ clio::run::TaskResume Runtime::SplitBlock(std::shared_ptr<TableBlockSlot> slot) 
         dl.ops_.push_back({leaf, false, InodeRow()});
       }
       b.depth_ = d + 1;
+      slot->blob_image_due_ = true;  // a split rewrites the block whole
       v = RecordChangeLocked(*slot, dl, true);
     }
     slot->splitting_ = false;
@@ -1455,6 +1686,7 @@ clio::run::TaskResume Runtime::InstallBlock(const FsReq &req, FsResp &resp) {
   }
   slot->home_ = true;
   slot->persist_dirty_ = true;
+  slot->blob_image_due_ = true;
   {
     std::lock_guard<std::mutex> g(ns_mu_);
     // A leftover from an earlier failed split of the same block is replaced.
@@ -1495,6 +1727,7 @@ clio::run::TaskResume Runtime::CreateTable(const FsReq &req, FsResp &resp) {
   b.mtime_ = NowNs();
   slot->home_ = true;
   slot->persist_dirty_ = true;
+  slot->blob_image_due_ = true;
   {
     std::lock_guard<std::mutex> g(ns_mu_);
     blocks_[TableBlockKey{b.dir_, 0}] = slot;
@@ -1550,6 +1783,7 @@ clio::run::TaskResume Runtime::SealBlock(const FsReq &req, FsResp &resp) {
       }
     } else if (b.sealed_ != seal) {
       b.sealed_ = seal;
+      slot->blob_image_due_ = true;  // seal/unseal rewrites the block whole
       v = RecordChangeLocked(*slot, TableDelta(), false);
     }
   }
@@ -1707,6 +1941,101 @@ clio::run::TaskResume Runtime::TableBlocks(clio::run::u64 dir,
   CLIO_TASK_BODY_END
 }
 
+size_t Runtime::ScanBlocksPerTask(clio::run::u32 split_entries) {
+  const size_t split = std::max<clio::run::u32>(split_entries, 1);
+  return std::max<size_t>(1, static_cast<size_t>(kScanTaskEntries) / split);
+}
+
+clio::run::TaskResume Runtime::CollectBlocks(
+    clio::run::u64 dir, std::vector<clio::run::u32> *out, int &rc) {
+  CLIO_TASK_BODY_BEGIN
+  rc = 0;
+  out->clear();
+  // A block's children are known only once it is loaded, so the tree is
+  // walked one level at a time. A level's blocks hold at most
+  // split_entries_ rows each: a level that could exceed kScanTaskEntries is
+  // loaded by subtasks first, and the walk below then finds every block cached.
+  std::vector<clio::run::u32> level{0};
+  std::unordered_set<clio::run::u32> seen;
+  std::string shape;  // index:born-depth of every block, for the error below
+  while (!level.empty()) {
+    if (static_cast<clio::run::u64>(level.size()) * split_entries_ >
+        kScanTaskEntries) {
+      CLIO_CO_AWAIT(LoadBlocksConcurrently(dir, level, rc));
+      if (rc != 0) CLIO_CO_RETURN;
+    }
+    std::vector<clio::run::u32> next;
+    for (clio::run::u32 k : level) {
+      if (!seen.insert(k).second) {
+        // Each block has exactly one parent in the split tree; reaching one
+        // twice means two blocks disagree about who owns which names.
+        HLOG(kError, "filesystem: directory {} has a corrupt split tree "
+             "(block {} reached twice): {}", dir, k, shape);
+        rc = EIO;
+        CLIO_CO_RETURN;
+      }
+      std::shared_ptr<TableBlockSlot> slot;
+      CLIO_CO_AWAIT(LoadBlock(dir, k, slot, rc));
+      if (rc != 0) CLIO_CO_RETURN;
+      out->push_back(k);
+      {
+        std::lock_guard<std::mutex> g(ns_mu_);
+        const InodeTableBlock &b = slot->blk_;
+        shape += std::to_string(b.index_) + ":" + std::to_string(b.born_) +
+                 "-" + std::to_string(b.depth_) + " ";
+        for (clio::run::u32 c : ChildBlocks(b)) next.push_back(c);
+      }
+      if (out->size() % 64 == 0) CLIO_CO_AWAIT(clio::run::yield(1.0));
+    }
+    level = std::move(next);
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::LoadBlocksConcurrently(
+    clio::run::u64 dir, const std::vector<clio::run::u32> &blocks, int &rc) {
+  CLIO_TASK_BODY_BEGIN
+  rc = 0;
+  const size_t per_task = ScanBlocksPerTask(split_entries_);
+  // Every subtask is sent before any reply is awaited, so they run on
+  // whichever workers are free.
+  std::vector<clio::run::Future<ShardOpTask>> inflight;
+  for (size_t i = 0; i < blocks.size(); i += per_task) {
+    const size_t end = std::min(blocks.size(), i + per_task);
+    FsReq req;
+    req.dir_id_ = dir;
+    req.str_ = EncIndices(std::vector<clio::run::u32>(
+        blocks.begin() + static_cast<std::ptrdiff_t>(i),
+        blocks.begin() + static_cast<std::ptrdiff_t>(end)));
+    inflight.push_back(SendShard(container_id_, kTableLoadBlocks, req));
+  }
+  for (auto &f : inflight) {
+    CLIO_CO_AWAIT(f);
+    FsResp resp;
+    const bool ok = ReadShardResp(f, &resp);
+    if (rc == 0) rc = ok ? static_cast<int>(resp.rc_) : EIO;
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::LoadBlockGroup(const FsReq &req, FsResp &resp) {
+  CLIO_TASK_BODY_BEGIN
+  resp.rc_ = 0;
+  for (clio::run::u32 k : DecIndices(req.str_)) {
+    std::shared_ptr<TableBlockSlot> slot;
+    int rc = 0;
+    CLIO_CO_AWAIT(LoadBlock(req.dir_id_, k, slot, rc));
+    if (rc != 0) {
+      resp.rc_ = static_cast<clio::run::u32>(rc);
+      break;
+    }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 clio::run::TaskResume Runtime::CollectDir(
     clio::run::u64 dir, std::vector<std::pair<std::string, InodeRow>> *out,
     clio::run::u64 *newest, int &rc) {
@@ -1722,7 +2051,7 @@ clio::run::TaskResume Runtime::CollectDir(
     out->clear();
     *newest = 0;
     std::vector<clio::run::u32> blocks;
-    CLIO_CO_AWAIT(TableBlocks(dir, &blocks, rc));
+    CLIO_CO_AWAIT(CollectBlocks(dir, &blocks, rc));
     if (rc != 0) CLIO_CO_RETURN;
     std::vector<std::shared_ptr<TableBlockSlot>> slots;
     for (clio::run::u32 k : blocks) {
@@ -1779,6 +2108,87 @@ bool Runtime::SnapshotDir(
     out->emplace_back(RowName(kv.first, kv.second), kv.second);
   }
   return true;
+}
+
+clio::run::TaskResume Runtime::CollectDirRange(
+    clio::run::u64 dir, clio::run::u64 start_off, clio::run::u32 max_entries,
+    std::vector<DirRangeEntry> *out, clio::run::u64 *next_off, int &rc) {
+  CLIO_TASK_BODY_BEGIN
+  out->clear();
+  *next_off = kDirOffEnd;
+  // Small or large is read off the root block: it has split root.depth_
+  // times, so with an even hash the directory has about 2^depth_ blocks of at
+  // most split_entries_ rows. Up to one scan task's worth of entries is
+  // listed whole; a lopsided tree only makes that one reply larger.
+  std::shared_ptr<TableBlockSlot> root;
+  CLIO_CO_AWAIT(LoadBlock(dir, 0, root, rc));
+  if (rc != 0) CLIO_CO_RETURN;
+  clio::run::u32 root_depth = 0;
+  {
+    std::lock_guard<std::mutex> g(ns_mu_);
+    root_depth = root->blk_.depth_;
+  }
+  const bool small = (1ULL << root_depth) * split_entries_ <= kScanTaskEntries;
+  if (!small) {
+    CLIO_CO_AWAIT(
+        ScanDirRange(dir, start_off, max_entries, out, next_off, rc));
+    CLIO_CO_RETURN;
+  }
+  // One snapshot of the whole directory, exactly what Readdir lists (a
+  // rename in progress shows once), returned from start_off to the end.
+  std::vector<std::pair<std::string, InodeRow>> listing;
+  clio::run::u64 newest = 0;
+  CLIO_CO_AWAIT(CollectDir(dir, &listing, &newest, rc));
+  if (rc != 0) CLIO_CO_RETURN;
+  out->reserve(listing.size());
+  for (auto &kv : listing) {
+    // The offset is the key's: every spelling of a name has one.
+    const clio::run::u64 off = DirEntryOff(KeyOf(kv.first));
+    if (off < start_off) continue;
+    out->push_back(DirRangeEntry{off, std::move(kv.first), kv.second.id_,
+                                 kv.second.type_});
+  }
+  SortDirRange(out);
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::ScanDirRange(
+    clio::run::u64 dir, clio::run::u64 start_off, clio::run::u32 max_entries,
+    std::vector<DirRangeEntry> *out, clio::run::u64 *next_off, int &rc) {
+  CLIO_TASK_BODY_BEGIN
+  rc = 0;
+  // Whole blocks in offset order, each read under ns_mu_ on its own: unlike
+  // CollectDir this is not one snapshot of the directory, so a rename caught
+  // mid-way is not de-duplicated across blocks (see DirRangeScan).
+  DirRangeScan scan(start_off, std::max<clio::run::u32>(max_entries, 1));
+  TableSubtree sub;
+  size_t loaded = 0;
+  while (scan.Next(&sub)) {
+    std::shared_ptr<TableBlockSlot> slot;
+    CLIO_CO_AWAIT(LoadBlock(dir, sub.index_, slot, rc));
+    if (rc != 0) CLIO_CO_RETURN;
+    bool ok = false;
+    {
+      std::lock_guard<std::mutex> g(ns_mu_);
+      ok = scan.Take(sub, slot->blk_);
+    }
+    if (!ok) {
+      HLOG(kError, "filesystem: directory {} has a corrupt split tree "
+           "(block {} is not the one born at depth {})", dir, sub.index_,
+           sub.born_);
+      rc = EIO;
+      CLIO_CO_RETURN;
+    }
+    // Cached blocks load without suspending: let a long scan share the
+    // worker.
+    if (++loaded % 64 == 0) CLIO_CO_AWAIT(clio::run::yield(1.0));
+  }
+  scan.Finish();
+  *out = std::move(scan.entries());
+  *next_off = scan.next_off();
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
 }
 
 clio::run::TaskResume Runtime::StatDir(clio::run::u64 dir, FsResp &resp) {
@@ -1909,9 +2319,21 @@ clio::run::TaskResume Runtime::TableOp(clio::run::u32 op, FsReq req,
       std::lock_guard<std::mutex> g(ns_mu_);
       req.block_ = slot->blk_.index_;
     }
+    const clio::run::u32 home = BlockHome(req.dir_id_, req.block_);
+    {
+      // We cache a copy registered with that home: ask for the change in
+      // the reply instead of a push we would have to wait for as well.
+      std::lock_guard<std::mutex> g(ns_mu_);
+      const bool copy = !slot->home_ && home != container_id_ &&
+                        slot->home_id_ == home && slot->reg_ != 0;
+      req.from_ = copy ? container_id_ + 1 : 0;
+      req.have_ = copy ? slot->blk_.version_ : 0;
+      req.reg_ = copy ? slot->reg_ : 0;
+    }
     bool lost = false;
-    CLIO_CO_AWAIT(CallShard(BlockHome(req.dir_id_, req.block_), op, req, resp,
-                            &lost));
+    CLIO_CO_AWAIT(CallShard(home, op, req, resp, &lost));
+    // Our own change is in our copy before our caller hears of it.
+    SettleMutationReply(req, resp, lost);
     // The block's home died with the call in flight: once it is declared
     // dead BlockHome names its stand-in, which serves the block from its
     // replicated CTE copy (#1263). Walk again rather than fail the lookup
@@ -1974,9 +2396,8 @@ clio::run::TaskResume Runtime::CheckMoveTarget(clio::run::u64 moving,
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::EncodeHomeNames(std::string *out) {
+clio::run::TaskResume Runtime::RepublishHomeNames() {
   CLIO_TASK_BODY_BEGIN
-  out->clear();
   std::vector<TableBlockKey> keys;
   if (dir_journal_) {
     JournaledHomeKeys(&keys);
@@ -1991,24 +2412,34 @@ clio::run::TaskResume Runtime::EncodeHomeNames(std::string *out) {
               std::strtoul(list->blob_names_[i].c_str() + 2, nullptr, 10))});
     }
   }
-  const clio::run::u64 now = NowNs();
+  constexpr size_t kBatchRows = 4096;
+  size_t queued = 0, total = 0;
   for (const TableBlockKey &key : keys) {
-    const clio::run::u64 dir = key.dir_;
-    const clio::run::u32 k = key.index_;
-    if (BlockHome(dir, k) != container_id_) continue;
+    if (BlockHome(key.dir_, key.index_) != container_id_) continue;
     std::shared_ptr<TableBlockSlot> slot;
     int rc = 0;
-    CLIO_CO_AWAIT(LoadBlock(dir, k, slot, rc));
+    CLIO_CO_AWAIT(LoadBlock(key.dir_, key.index_, slot, rc));
     if (rc != 0) continue;
-    std::lock_guard<std::mutex> g(ns_mu_);
-    for (const auto &kv : slot->blk_.rows_) {
-      if (kv.second.state_ == kRowPending) continue;
-      clio::cte::core::EncodeTagNameOp(
-          out, clio::cte::core::TagNameOp::kAddName, FsUnpack(kv.second.id_),
-          now, clio::cte::core::MakeTagRefName(FsUnpack(dir),
-                                               RowName(kv.first, kv.second)));
+    {
+      std::lock_guard<std::mutex> g(ns_mu_);
+      for (const auto &kv : slot->blk_.rows_) {
+        if (kv.second.state_ == kRowPending) continue;
+        PublishName(clio::cte::core::TagNameOp::kAddName,
+                    FsUnpack(kv.second.id_),
+                    FsTagName(RowName(kv.first, kv.second), kv.second.id_));
+        ++queued;
+      }
+    }
+    if (queued >= kBatchRows) {
+      total += queued;
+      queued = 0;
+      CLIO_CO_AWAIT(FlushNames());
     }
   }
+  total += queued;
+  CLIO_CO_AWAIT(FlushNames());
+  HLOG(kInfo, "filesystem: re-named {} link(s) of {} homed block(s) in the "
+       "CTE", total, keys.size());
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }

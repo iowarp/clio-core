@@ -88,6 +88,7 @@ std::string Runtime::MakePerfStatsPath(const std::string &pool_name) {
     }
     dir += "/bdev_perf";
   }
+  dir = ctp::SystemInfo::NormalizePath(dir);  // no "\\?\" prefix (#1356)
   // Sanitize the pool name (it may be a filesystem path or "ram::name")
   // into a flat file name.
   std::string name = pool_name;
@@ -229,39 +230,97 @@ void Runtime::SavePerfStats(bool force) {
   SavePerfStatsFile(perf_stats_path_, perf_metrics_, wall_read, wall_write);
 }
 
+namespace {
+
+/**
+ * True for the tiers whose bytes live in memory (no device underneath).
+ * @param type the bdev's backend type
+ * @return true for kRam, kHbm and kPinned
+ */
+bool IsMemoryClass(BdevType type) {
+  return type == BdevType::kRam || type == BdevType::kHbm ||
+         type == BdevType::kPinned;
+}
+
+/**
+ * Wall-time feature for one bdev Read/Write of `aligned` bytes.
+ *
+ * Memory-class tiers move bytes at memcpy speed (~5 GB/s), so they use
+ * cost::kMemoryBytesPerWallUs; they never restore a persisted profile
+ * (LoadPerfStats), so nothing learned against another scale is invalidated.
+ * Disk-class and object-store tiers (file, DAOS, S3, GCS) keep the ~500 MB/s
+ * house scale: LoadPerfStats seeds their wall coefficient from a profile
+ * learned against exactly that feature, and a different scale here would
+ * mis-scale every restored profile. kNoop does no I/O at all.
+ * @param type the bdev's backend type
+ * @param aligned 4 KiB-aligned transfer size in bytes
+ * @return the wall_time_ feature in microseconds
+ */
+float BdevWallFeature(BdevType type, size_t aligned) {
+  if (type == BdevType::kNoop) {
+    return 1.0f;
+  }
+  const float rate = IsMemoryClass(type) ? clio::run::cost::kMemoryBytesPerWallUs
+                                         : clio::run::cost::kStorageBytesPerWallUs;
+  return static_cast<float>(aligned) / rate;
+}
+
+}  // namespace
+
+/**
+ * Per-task cost estimate for the scheduler (see Container::GetTaskStats).
+ *
+ * Read/Write scale with their 4 KiB-aligned length: compute_ is the staging
+ * copy (~10 KB per CPU microsecond), wall_time_ the device rate for this
+ * bdev's type (BdevWallFeature). Every other method is an explicit constant
+ * so none is predicted as a silent zero.
+ * @param task the task to estimate
+ * @return the task's cost features
+ */
 clio::run::TaskStat Runtime::GetTaskStats(const clio::run::Task *task) const {
+  namespace cost = clio::run::cost;
   if (!task) return clio::run::TaskStat();
   switch (task->method_) {
-    case Method::kWrite: {
-      auto *wt = static_cast<const WriteTask *>(task);
-      clio::run::TaskStat stat;
-      stat.io_size_ = wt->length_;
-      size_t aligned = ((stat.io_size_ + 4095) / 4096) * 4096;
-      // compute_ is the feature InferCpuTime scales — without it the CPU model
-      // is one constant per method and cannot tell 4 KiB from 1 MiB. The CPU
-      // half of a device write is the staging copy, ~10 KB per microsecond.
-      stat.compute_ = static_cast<size_t>(aligned / 10000.0f) + 2;
-      stat.wall_time_ = static_cast<float>(aligned) / 500.0f;
-      return stat;
-    }
+    case Method::kWrite:
     case Method::kRead: {
-      auto *rt = static_cast<const ReadTask *>(task);
-      clio::run::TaskStat stat;
-      stat.io_size_ = rt->length_;
-      size_t aligned = ((stat.io_size_ + 4095) / 4096) * 4096;
-      stat.compute_ = static_cast<size_t>(aligned / 10000.0f) + 2;
-      stat.wall_time_ = static_cast<float>(aligned) / 500.0f;
+      const size_t length =
+          task->method_ == Method::kWrite
+              ? static_cast<const WriteTask *>(task)->length_
+              : static_cast<const ReadTask *>(task)->length_;
+      const size_t aligned = ((length + 4095) / 4096) * 4096;
+      clio::run::TaskStat stat = cost::Data(aligned);
+      stat.io_size_ = length;
+      stat.wall_time_ = BdevWallFeature(bdev_type_, aligned);
       return stat;
     }
     case Method::kAllocateBlocks:
-    case Method::kFreeBlocks: {
+    case Method::kFreeBlocks:
       // Pure allocator bookkeeping: no payload, a handful of microseconds.
-      clio::run::TaskStat stat;
-      stat.compute_ = 5;
-      stat.wall_time_ = 8.0f;
-      return stat;
-    }
-    default: return clio::run::TaskStat();
+      return cost::Fixed(5, 8.0f);
+    case Method::kGetStats:
+      // Reads cached metrics and two model inferences.
+      return cost::Fixed(3, 5.0f);
+    case Method::kUpdate:
+    case Method::kSetLifespan:
+      // Swap a buffer pointer / a lifespan field.
+      return cost::Fixed(3, 5.0f);
+    case Method::kSync:
+      // fdatasync of the tier file on disk-class bdevs (offloaded; the task
+      // polls it); a no-op for memory tiers.
+      return IsMemoryClass(bdev_type_) ? cost::Trivial() : cost::DeviceSync();
+    case Method::kFlushAllocLog:
+      // Periodic: append + fsync of the allocator log, offloaded like Sync.
+      return cost::DeviceSync();
+    case Method::kMonitor:
+      // "stats" query: serialize metrics into a msgpack buffer.
+      return cost::Fixed(10, 15.0f);
+    case Method::kCreate:
+      return cost::ContainerCreate();
+    case Method::kDestroy:
+      // Final unthrottled perf-stats save to disk.
+      return cost::ContainerDestroy();
+    default:
+      return cost::Metadata();
   }
 }
 

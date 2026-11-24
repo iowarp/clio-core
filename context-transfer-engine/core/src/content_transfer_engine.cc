@@ -45,6 +45,33 @@ CTP_DEFINE_GLOBAL_PTR_VAR_CC(clio::cte::core::ContentTransferEngine,
 
 namespace clio::cte::core {
 
+/**
+ * Bind a client to the shm cache that fronts its CTE stack and connect to
+ * the cache's segment. The client sends its tasks to the cache's entry pool
+ * (or the cache pool itself), so every task-path request passes the cache.
+ * Leaves the client bound to its current pool when there is no cache or the
+ * segment cannot be mapped from this process (TCP client, remote node).
+ * @param cte_client the client, bound to the CTE core pool
+ * @param keys the cache keys the core's Create returned
+ */
+static void BindToCache(Client *cte_client, const ShmCacheKeys &keys) {
+  if (!keys.Valid()) {
+    return;
+  }
+  const clio::run::PoolId core_pool = cte_client->pool_id_;
+  cte_client->pool_id_ = clio::run::PoolId::FromU64(keys.FrontPool());
+  if (!cte_client->ConnectCache(keys)) {
+    cte_client->pool_id_ = core_pool;
+    HLOG(kInfo, "CTE ClientInit: shm cache present but not mappable from "
+         "this process; using the task path to {}.{}", core_pool.major_,
+         core_pool.minor_);
+    return;
+  }
+  HLOG(kInfo, "CTE ClientInit: bound to {}.{} over shm cache {}",
+       cte_client->pool_id_.major_, cte_client->pool_id_.minor_,
+       clio::run::PoolId::FromU64(keys.cache_pool_).ToString());
+}
+
 bool ContentTransferEngine::ClientInit(const clio::run::PoolQuery &pool_query) {
   // Check for race conditions - if already initialized or initializing
   if (is_initialized_) {
@@ -67,60 +94,41 @@ bool ContentTransferEngine::ClientInit(const clio::run::PoolQuery &pool_query) {
     return false;
   }
 
-  // Initialize CTE core client
   auto *cte_client = CLIO_CTE_CLIENT;
 
   // CLIO_CTE_POOL=major.minor (issue #886): bind this process's CTE client
-  // singleton to an INTERPOSING pool — e.g. the replication chimod at 561.0,
-  // which speaks the core task interface and forwards every method it does
-  // not override. Pure configuration: no caller changes, no create (the
-  // interposer is composed, and creating it needs its own params anyway).
-  // Deliberately ONLY here, never in Client::Init/ctor — runtime-internal
-  // module clients construct Client(next_pool_id) to reach the core, and
-  // redirecting those would make an interposer forward to itself.
-  {
-    const char *pool_env = std::getenv("CLIO_CTE_POOL");
-    if (pool_env != nullptr && *pool_env != '\0') {
-      unsigned major = 0, minor = 0;
-      if (std::sscanf(pool_env, "%u.%u", &major, &minor) == 2) {
-        cte_client->Init(clio::run::PoolId(major, minor));
-        // Zero-IPC reads through an interposer: the interposer pool
-        // publishes no mirror of its own, so fall back to the CANONICAL
-        // core pool's mirror — the pool every shipped interposer sits over.
-        // Correct because interposed writes update the primary
-        // synchronously and drops re-mirror empty (see AttachShmCacheOf).
-        if (cte_client->AttachShmCache()) {
-          HLOG(kInfo, "CTE ClientInit: SHM fast path via pool {}.{}'s mirror",
-               major, minor);
-        } else if (cte_client->AttachShmCacheOf(clio::cte::core::kCtePoolId)) {
-          HLOG(kInfo,
-               "CTE ClientInit: SHM fast path via the core pool's mirror");
-        } else {
-          HLOG(kDebug,
-               "CTE ClientInit: SHM metadata cache unavailable; using RPC");
-        }
-        HLOG(kInfo, "CTE ClientInit: CLIO_CTE_POOL bound client to pool {}.{}",
-             major, minor);
-        is_initialized_ = true;
-        is_initializing_ = false;
-        return true;
-      }
-      HLOG(kError, "CTE ClientInit: ignoring malformed CLIO_CTE_POOL '{}'",
-           pool_env);
+  // singleton to a composed pool -- e.g. the replication chimod at 561.0 or
+  // the shm cache's entry pool -- which speaks the core task interface.
+  // The named pool is not created. The shm cache keys come from the
+  // get-or-create of the canonical CTE pool (Client::ConnectCache()), and the
+  // client connects only when the named pool fronts that cache. Deliberately ONLY
+  // here, never in Client::Init/ctor -- runtime-internal module clients
+  // construct Client(next_pool_id) and must stay on the task path.
+  if (const char *pool_env = std::getenv("CLIO_CTE_POOL");
+      pool_env != nullptr && *pool_env != '\0') {
+    unsigned major = 0, minor = 0;
+    if (std::sscanf(pool_env, "%u.%u", &major, &minor) == 2) {
+      cte_client->Init(clio::run::PoolId(major, minor));
+      const bool connected = cte_client->ConnectCache();
+      HLOG(kInfo, "CTE ClientInit: CLIO_CTE_POOL bound client to pool {}.{} "
+           "(shm cache {})", major, minor,
+           connected ? "connected" : "not connected");
+      is_initialized_ = true;
+      is_initializing_ = false;
+      return true;
     }
+    HLOG(kError, "CTE ClientInit: ignoring malformed CLIO_CTE_POOL '{}'",
+         pool_env);
   }
 
-  // Create CreateParams without config - configuration is now provided via clio compose
-  CreateParams params;
-
-  // Create CTE Core container using constants from core_tasks.h and specified pool_query
+  // Get-or-create the CTE Core pool. Its OUT params carry the keys of the
+  // shm cache module fronting it on this node, for a new and an existing
+  // pool alike.
   auto create_task = cte_client->AsyncCreate(pool_query,
                                               clio::cte::core::kCtePoolName,
                                               clio::cte::core::kCtePoolId,
-                                              params);
+                                              CreateParams());
   create_task.Wait();
-
-  // Check if Create operation succeeded
   clio::run::u32 return_code = create_task->GetReturnCode();
   if (return_code != 0) {
     HLOG(kError, "CTE ClientInit: Failed to create CTE pool '{}' with return code: {}",
@@ -128,28 +136,13 @@ bool ContentTransferEngine::ClientInit(const clio::run::PoolQuery &pool_query) {
     is_initializing_ = false;
     return false;
   }
-
-  // Update client pool_id_ with the actual pool ID from the task
   cte_client->pool_id_ = create_task->new_pool_id_;
-
-  // Attach the shared-memory metadata cache (issue #783, wired up in #817).
-  // Until this call existed the cache was only ever attached by its own unit
-  // tests, so `Tag::GetBlob`'s zero-IPC fast path was dead in every real
-  // process. Must run AFTER pool_id_ is set: directory lookup is keyed by pool,
-  // and a shared slot would attach whichever CTE pool cached last.
-  //
-  // The DIRECTORY overload, not the CreateTask one: the task carries a non-zero
-  // root offset only for the process that actually caused pool creation, and
-  // under `clio compose` the pool already exists by the time any real client
-  // runs. (Reading the task's params here would also drag the config parser
-  // into the client library, which does not link it.)
-  //
-  // Failure is not an error -- a TCP client, a remote node, or a runtime built
-  // without the cache all legitimately report false, and every caller of the
-  // fast path falls back to RPC.
-  if (!cte_client->AttachShmCache()) {
-    HLOG(kDebug, "CTE ClientInit: SHM metadata cache unavailable; using RPC");
-  }
+  // Deserialized directly (not GetParams()): GetParams' compose branch would
+  // pull the runtime-only config parser into the client library.
+  const ShmCacheKeys keys =
+      clio::run::Task::Deserialize<CreateParams>(create_task->chimod_params_)
+          .cache_keys_;
+  BindToCache(cte_client, keys);
 
   // Mark as successfully initialized
   is_initialized_ = true;

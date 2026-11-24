@@ -18,46 +18,59 @@ flags and fault handlers. Each layer supplies the <em>policy</em>: what to
 copy, where, and when.</p>
 
 <figure class="diagram">
-  <svg viewBox="0 0 860 400" role="img" aria-label="Default interposition chain">
+  <svg viewBox="0 0 860 420" role="img" aria-label="Default interposition chain">
     <defs><marker id="ah4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10 z"/></marker></defs>
     <rect class="box alt" x="20" y="20" width="200" height="56" rx="8"/><text class="title" x="36" y="44">Filesystem (clio-fs)</text><text class="muted" x="36" y="62">namespace, inodes</text>
     <rect class="box alt" x="20" y="100" width="200" height="56" rx="8"/><text class="title" x="36" y="124">Stream</text><text class="muted" x="36" y="142">file sizes, ordered appends</text>
     <rect class="box alt" x="20" y="180" width="200" height="56" rx="8"/><text class="title" x="36" y="204">Applications / adapters</text><text class="muted" x="36" y="222">core client API</text>
-    <rect class="box hl" x="330" y="20" width="240" height="56" rx="8"/><text class="title" x="346" y="44">Cache</text><text class="muted" x="346" y="62">node-local raw copy, coherence</text>
-    <rect class="box hl" x="330" y="100" width="240" height="56" rx="8"/><text class="title" x="346" y="124">Indexer</text><text class="muted" x="346" y="142">BM25 semantic search</text>
-    <rect class="box" x="330" y="180" width="240" height="56" rx="8" stroke-dasharray="5 4"/><text class="title" x="346" y="204">Compressor (optional)</text><text class="muted" x="346" y="222">encode down, decode up</text>
-    <rect class="box hl" x="330" y="260" width="240" height="56" rx="8"/><text class="title" x="346" y="284">Replication</text><text class="muted" x="346" y="302">replicas, remote copies, failover</text>
-    <rect class="box hl" x="330" y="340" width="240" height="50" rx="8"/><text class="title" x="346" y="370">CTE core</text>
+    <rect class="box hl" x="330" y="20" width="240" height="56" rx="8"/><text class="title" x="346" y="44">Indexer (564)</text><text class="muted" x="346" y="62">BM25 semantic search; chain top</text>
+    <rect class="box hl" x="330" y="100" width="240" height="56" rx="8"/><text class="title" x="346" y="124">Shm cache (568)</text><text class="muted" x="346" y="142">metadata in shared memory</text>
+    <rect class="box" x="330" y="180" width="240" height="56" rx="8" stroke-dasharray="5 4"/><text class="title" x="346" y="204">Compressor (562, optional)</text><text class="muted" x="346" y="222">encode down, decode up</text>
+    <rect class="box hl" x="330" y="260" width="240" height="56" rx="8"/><text class="title" x="346" y="284">Write-back cache (567)</text><text class="muted" x="346" y="302">ack in RAM, flush later</text>
+    <rect class="box hl" x="330" y="340" width="240" height="50" rx="8"/><text class="title" x="346" y="370">Volatile CTE core (540)</text>
+    <rect class="box hl" x="640" y="180" width="200" height="56" rx="8"/><text class="title" x="656" y="204">Replication (561)</text><text class="muted" x="656" y="222">remote copies, failover</text>
+    <rect class="box hl" x="640" y="260" width="200" height="56" rx="8"/><text class="title" x="656" y="284">Persistent CTE core</text><text class="muted" x="656" y="302">512, with the metadata log</text>
     <path class="edge hl" d="M450,76 L450,98" marker-end="url(#ah4)"/>
     <path class="edge hl" d="M450,156 L450,178" marker-end="url(#ah4)"/>
     <path class="edge hl" d="M450,236 L450,258" marker-end="url(#ah4)"/>
     <path class="edge hl" d="M450,316 L450,338" marker-end="url(#ah4)"/>
+    <path class="edge hl" d="M570,288 L605,288 L605,208 L638,208" marker-end="url(#ah4)"/>
+    <text class="muted" x="578" y="250">flush</text>
+    <path class="edge hl" d="M740,236 L740,258" marker-end="url(#ah4)"/>
     <path class="edge" d="M220,48 L328,48" marker-end="url(#ah4)"/>
     <path class="edge" d="M220,128 L270,128 L270,56 L328,56" marker-end="url(#ah4)"/>
     <path class="edge" d="M220,208 L290,208 L290,64 L328,64" marker-end="url(#ah4)"/>
-    <path class="edge" d="M20,140 L8,140 L8,290 L328,290" marker-end="url(#ah4)"/>
-    <text class="muted" x="128" y="282">stream: staged appends</text>
+    <path class="edge" d="M20,140 L8,140 L8,404 L620,404 L620,226 L638,226" marker-end="url(#ah4)"/>
+    <text class="muted" x="128" y="398">stream: staged appends</text>
     <rect class="box" x="640" y="20" width="200" height="56" rx="8" stroke-dasharray="5 4"/><text class="title" x="656" y="44">Checkpoint</text><text class="muted" x="656" y="62">fault handler, on demand</text>
-    <path class="edge" d="M740,76 L740,365 L572,365" marker-end="url(#ah4)"/>
-    <text class="muted" x="620" y="350">lazy-copy reads</text>
+    <path class="edge" d="M840,48 L852,48 L852,288 L842,288" marker-end="url(#ah4)"/>
+    <text class="muted" x="740" y="140">lazy-copy reads</text>
   </svg>
-  <figcaption>The default composition. The cache sits on top, so every
-  reader gets locality. The indexer sits above the compressor, so it sees
-  logical bytes. Replication sits directly on the core, so every copy it
-  makes is of the final stored form. The compressor entry is shipped
-  commented out, and checkpoint pools are created on demand.</figcaption>
+  <figcaption>The default composition. The indexer sits on top and above
+  the compressor, so it sees logical bytes. The shm cache answers metadata
+  from shared memory in the client's process. The write-back cache
+  acknowledges a write once it is in the volatile core, and flushes it
+  through replication to the persistent core. The compressor entry is
+  shipped commented out, and checkpoint pools are created on demand. The
+  cache module described below (563.0) is optional and not composed by
+  default.</figcaption>
 </figure>
 
 <h3>Why this order</h3>
 <ul>
-  <li><strong>Cache on top.</strong> The cache keeps an untransformed copy
-  on the reader's node. Blobs compressed further down can still be served
-  by zero-copy shared-memory reads, which refuse transformed data.</li>
-  <li><strong>Indexer above the compressor.</strong> The indexer re-reads
-  blobs to tokenize them, and needs the logical, uncompressed bytes.</li>
-  <li><strong>Replication directly above the core.</strong> Replicas are
-  copies of exactly what is stored, compressed or not, so every copy has
-  the same format.</li>
+  <li><strong>Indexer on top.</strong> Every writer (the filesystem, the
+  stream module, the CAE) forwards to 564.0, so everything written is
+  indexed. The indexer re-reads blobs to tokenize them, and needs the
+  logical, uncompressed bytes, so it sits above the compressor.</li>
+  <li><strong>Shm cache below the indexer.</strong> Client processes map
+  its segment and answer metadata lookups with no task. It is
+  <code>md_only</code> because the write-back cache holds the bytes.</li>
+  <li><strong>Write-back cache at the bottom.</strong> It owns every
+  durability decision: puts are acknowledged in the volatile core, and
+  dirty copies are flushed periodically, on fsync and before eviction.</li>
+  <li><strong>Replication directly above the persistent core.</strong>
+  Replicas are copies of exactly what is stored, compressed or not, so
+  every copy has the same format.</li>
 </ul>
 
 <h2 id="replication">Replication: the reliability layer</h2>
@@ -67,7 +80,7 @@ copy, where, and when.</p>
   <tr><td>Protects against</td><td>Node loss</td><td>Device loss, and data loss on a volatile primary</td></tr>
   <tr><td>Where</td><td>The next <em>k</em> nodes in ring order after the blob's owner</td><td>Durable tiers on the owner's own node</td></tr>
   <tr><td>When written</td><td>Synchronously, before the put is acknowledged, one copy after another</td><td>Asynchronously by default: a sweep every 50 ms copies the current primary, so repeated overwrites are coalesced. Synchronous if the period is set to 0.</td></tr>
-  <tr><td>On failure</td><td>The dead or failing copy is skipped with a warning, and the put still succeeds</td><td>The blob stays dirty and the next sweep retries it</td></tr>
+  <tr><td>On failure</td><td>The dead or failing copy is skipped with a warning, and the put still succeeds. The handoff sweep (every 500 ms) re-copies it once the node is back</td><td>The blob stays dirty and the next sweep retries it</td></tr>
   <tr><td>Configured by</td><td><code>replication_factor</code> (default 1, so no remote copies) or <code>remote_copies</code></td><td><code>num_replicas</code> (default 0)</td></tr>
 </table>
 
@@ -133,8 +146,9 @@ forwarded to an owner that dies mid-flight are retried.</p>
   copies</em>, plus any cache copy.</p>
 </div>
 
-<h2 id="cache">Cache: the locality layer</h2>
-<p>The cache keeps a <strong>node-local, untransformed copy</strong> of
+<h2 id="cache">Cache: the optional locality layer</h2>
+<p>The cache module (<code>clio_cte_cache</code>, 563.0) is built but not
+composed in the default chain. The cache keeps a <strong>node-local, untransformed copy</strong> of
 each blob a node uses but does not own. Requests to the cache are routed to
 the <em>submitter's</em> node, so a process touching its own data stays
 local, and only the authoritative hop crosses the network.</p>
@@ -244,8 +258,9 @@ shipped configuration.</p>
 </ul>
 <p><strong>Reads.</strong> A read of a compressed blob fetches the whole
 stored blob, decompresses it once, and copies out the requested ranges.
-Small random reads of compressed data therefore pay for a full decode. The
-cache layer above offsets this by keeping a raw copy near the reader.</p>
+Small random reads of compressed data therefore pay for a full decode.
+The optional cache module, composed above it, offsets this by keeping a
+raw copy near the reader.</p>
 <p><strong>Dynamic codec selection.</strong> A feature-based predictor
 scores a few candidate codecs on samples of the data (entropy, deviation,
 smoothness) and picks either the best ratio or the fastest end-to-end
@@ -337,7 +352,7 @@ component.</p>
   <tr><th>Decision</th><th>Buys</th><th>Costs</th></tr>
   <tr><td>Features as stackable interposers</td><td class="good">Pay only for what you compose. Each layer can be tested in isolation, and clients need no changes.</td><td class="cost">Each layer adds a forwarding hop, and the stack's order is part of its correctness.</td></tr>
   <tr><td>Write-through cache with owner invalidation</td><td class="good">No dirty data outside the authoritative path. Readers never see stale copies.</td><td class="cost">Extra local writes, and coherence messages to the owner.</td></tr>
-  <tr><td>Synchronous remote copies that tolerate failures</td><td class="good">Durable on ack in the common case, and available while degraded.</td><td class="cost">No quorum: degraded writes keep fewer copies and are not re-replicated.</td></tr>
+  <tr><td>Synchronous remote copies that tolerate failures</td><td class="good">Durable on ack in the common case, and available while degraded.</td><td class="cost">No quorum: degraded writes keep fewer copies until the handoff sweep re-makes the missed copy.</td></tr>
   <tr><td>Asynchronous indexing</td><td class="good">Puts run near native speed.</td><td class="cost">A search pays the backlog drain, and the index is memory-resident.</td></tr>
   <tr><td>Whole-blob compression</td><td class="good">Simple and codec-agnostic, with a strong ratio.</td><td class="cost">Partial reads decode the whole blob, and partial writes are stored raw.</td></tr>
   <tr><td>Stage-then-merge appends</td><td class="good">Crash-safe appends from any node, in a deterministic order.</td><td class="cost">Bytes are written twice, and merging is serialized per stream.</td></tr>

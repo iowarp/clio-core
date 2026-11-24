@@ -7,9 +7,9 @@ lede: Every write in CLIO Core passes through a chain of data operators, and you
 facts: Language | C++20 ; Builds against | An installed CLIO Core ; Loaded | At runtime start, from a shared library
 -->
 <h2>What a data operator is</h2>
-<p>The runtime hosts <strong>modules</strong>, each in its own <strong>pool</strong>. Some modules are data operators: they receive the storage engine's calls, act on them, and pass them on. The built-in ones are the cache, the indexer, the compressor and replication (see <a href="/tutorials/operators.html">Compose data operators</a>). A module of your own works the same way:</p>
+<p>The runtime hosts <strong>modules</strong>, each in its own <strong>pool</strong>. Some modules are data operators: they receive the storage engine's calls, act on them, and pass them on. The built-in ones are the indexer, the shm cache, the compressor, the write-back cache and replication (see <a href="/tutorials/operators.html">Compose data operators</a>). A module of your own works the same way:</p>
 <pre data-label="data path">
-filesystem 560.0 → your operator 600.0 → cache 563.0 → indexer 564.0 → replication 561.0 → core 512.0
+filesystem 560.0 → your operator 600.0 → indexer 564.0 → shm cache 568.0 → write-back 567.0 → cores 540.0 / 512.0
 </pre>
 <p>Because the operator speaks the storage engine's interface, everything above it works unchanged: the FUSE mount, the Python API and other operators. It sees every call that passes through, and handles only the ones it cares about. The rest go down the chain untouched.</p>
 
@@ -39,18 +39,18 @@ filesystem 560.0 → your operator 600.0 → cache 563.0 → indexer 564.0 → r
 <p>The build produces <code>lib&lt;namespace&gt;_&lt;module&gt;_runtime.so</code> and a client library. In <code>clio.yaml</code>, <code>mod_name</code> is the name the module reports, its <code>chimod_lib_name</code>.</p>
 <div class="callout">
   <span class="callout-title">Write the dispatch file by hand</span>
-  <p><code>clio_run refresh</code> can generate dispatch files, but it currently writes include paths that do not match namespaced modules. Copy the dispatch file from an existing operator instead, as the guide does.</p>
+  <p><code>clio-run refresh</code> can generate dispatch files, but it currently writes include paths that do not match namespaced modules. Copy the dispatch file from an existing operator instead, as the guide does.</p>
 </div>
 
 <h2>How the runtime finds your module</h2>
-<p>When <code>clio_run start</code> runs, the runtime scans for shared libraries whose names end in <code>_runtime.so</code> and that export the module entry points. It looks in this order:</p>
+<p>When <code>clio-run start</code> runs, the runtime scans for shared libraries whose names end in <code>_runtime.so</code> and that export the module entry points. It looks in this order:</p>
 <ol>
   <li>The directory that holds <code>libclio_run_cxx</code></li>
   <li>Each directory in <code>CLIO_REPO_PATH</code> (separated by <code>:</code>, or <code>;</code> on Windows)</li>
   <li>Each directory in <code>LD_LIBRARY_PATH</code></li>
   <li><code>./lib</code>, <code>../lib</code> and <code>/usr/local/lib</code></li>
 </ol>
-<p>Scanning happens once, at startup. Set <code>CLIO_REPO_PATH</code> before you start the runtime; after that, <code>clio_run compose start</code> can create pools of your module. The log confirms each module it loads:</p>
+<p>Scanning happens once, at startup. Set <code>CLIO_REPO_PATH</code> before you start the runtime; after that, <code>clio-run compose start</code> can create pools of your module. The log confirms each module it loads:</p>
 <pre data-label="output">
 LoadChiMod Loaded ChiMod: clio_demo_bytecount from /home/me/bytecount/build/libclio_demo_bytecount_runtime.so
 </pre>

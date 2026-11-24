@@ -399,9 +399,43 @@ class LocalDeserialize {
   const DataT &data_;
   size_t cur_off_ = 0;
   bool warp_converged_ = false;
+  /** Set by the first read past the end of the data; sticky. */
+  bool failed_ = false;
 
  public:
   CTP_CROSS_FUN LocalDeserialize(const DataT &data) : data_(data), cur_off_(0), warp_converged_(false) {}
+
+  /**
+   * Whether any read ran past the end of the data.
+   *
+   * A failed archive is a truncated or corrupt message: every later read is
+   * ignored, and the receiver must drop the message.
+   *
+   * @return true once a read has overrun the data
+   */
+  CTP_INLINE_CROSS_FUN bool Failed() const { return failed_; }
+
+  /** Mark the archive failed, e.g. when a decoded count cannot fit. */
+  CTP_INLINE_CROSS_FUN void MarkFailed() {
+#if CTP_IS_HOST
+    if (!failed_) {
+      HLOG(kError,
+           "LocalDeserialize: malformed data (offset {} of {} bytes); the "
+           "rest of this message is ignored",
+           cur_off_, data_.size());
+    }
+#endif
+    failed_ = true;
+  }
+
+  /**
+   * Bytes not yet consumed.
+   *
+   * @return number of unread bytes, 0 once the archive has failed
+   */
+  CTP_INLINE_CROSS_FUN size_t Remaining() const {
+    return failed_ ? 0 : data_.size() - cur_off_;
+  }
 
   /** right shift operator */
   template <typename T>
@@ -503,12 +537,10 @@ class LocalDeserialize {
     } else
 #endif
     {
-      if (cur_off_ + size > data_.size()) {
-#if CTP_IS_HOST
-        HLOG(kError,
-             "LocalDeserialize::read_binary: Attempted to read beyond end of "
-             "data");
-#endif
+      // Bytes-left comparison (no wrap on a garbage size); one overrun fails
+      // the archive for good and logs once (#1353).
+      if (failed_ || size > data_.size() - cur_off_) {
+        MarkFailed();
         return *this;
       }
       if (size > 0) {

@@ -36,6 +36,7 @@
 
 #include <clio_ctp/util/env_compat.h>
 #include "clio_ctp/introspect/system_info.h"
+#include "clio_ctp/types/atomic.h"
 
 #include <atomic>
 #include <cerrno>
@@ -52,6 +53,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <string>
 
@@ -521,6 +523,22 @@ void *SystemInfo::GetTls(const ThreadLocalKey &key) {
 #endif
 }
 
+std::string SystemInfo::NormalizePath(const std::string &path) {
+#if CTP_ENABLE_WINDOWS_SYSINFO
+  // "\\?\" and its slash spelling "//?/" both mark a verbatim path.
+  auto starts_with = [&path](const char *prefix) {
+    return path.compare(0, std::strlen(prefix), prefix) == 0;
+  };
+  if (starts_with("\\\\?\\UNC\\") || starts_with("//?/UNC/")) {
+    return "\\\\" + path.substr(8);  // \\?\UNC\server\share -> \\server\share
+  }
+  if (starts_with("\\\\?\\") || starts_with("//?/")) {
+    return path.substr(4);  // \\?\C:\dir -> C:\dir
+  }
+#endif
+  return path;
+}
+
 std::string SystemInfo::GetMemfdDir() {
   // Default is /tmp/clio_$USER, but some sites have a tiny /
   // partition where /tmp fills up (ares compute nodes are a known
@@ -531,7 +549,7 @@ std::string SystemInfo::GetMemfdDir() {
   // bookkeeping at an NFS-backed location (e.g. $HOME).
   const char *override_dir = ctp::env::GetCompat("MEMFD_DIR");
   if (override_dir && *override_dir) {
-    return std::string(override_dir);
+    return NormalizePath(override_dir);
   }
 #if CTP_ENABLE_WINDOWS_SYSINFO
   // Windows has no /tmp and uses USERNAME (not USER). Anchor the per-user
@@ -558,18 +576,59 @@ std::string SystemInfo::GetMemfdPath(const std::string &name) {
   return GetMemfdDir() + "/" + base;
 }
 
-void SystemInfo::EnsureMemfdDir() {
+SystemInfo::MemfdDirState SystemInfo::CheckMemfdDir() {
+#if CTP_ENABLE_PROCFS_SYSINFO
+  // lstat, not stat: a link is refused even when it points at a directory of
+  // this user's, because whoever owns the link chooses where it points.
+  struct stat st;
+  if (lstat(GetMemfdDir().c_str(), &st) != 0) {
+    return errno == ENOENT ? MemfdDirState::kMissing : MemfdDirState::kUnsafe;
+  }
+  if (!S_ISDIR(st.st_mode) || st.st_uid != geteuid() ||
+      (st.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
+    return MemfdDirState::kUnsafe;
+  }
+  return MemfdDirState::kPrivate;
+#else
+  // Windows: the directory is under the user's own %TEMP%.
+  std::error_code ec;
+  return std::filesystem::is_directory(GetMemfdDir(), ec)
+             ? MemfdDirState::kPrivate
+             : MemfdDirState::kMissing;
+#endif
+}
+
+bool SystemInfo::EnsureMemfdDir() {
   std::string dir = GetMemfdDir();
 #if CTP_ENABLE_PROCFS_SYSINFO
   // All POSIX platforms (Linux, macOS, BSD) need this per-user dir to exist:
   // it holds the file-backed shared-memory segments and the IPC Unix-domain
   // socket. It was previously Linux-only, so on macOS the IPC socket bind
   // failed ("failed to bind Unix socket") because the parent dir was absent.
+  // mkdir fails with EEXIST when the directory is already there, which is the
+  // usual case; CheckMemfdDir then decides whether it is ours.
   mkdir(dir.c_str(), 0700);
 #elif CTP_ENABLE_WINDOWS_SYSINFO
   std::error_code ec;
   std::filesystem::create_directories(dir, ec);
 #endif
+  switch (CheckMemfdDir()) {
+    case MemfdDirState::kPrivate:
+      return true;
+    case MemfdDirState::kMissing:
+      fprintf(stderr, "clio: could not create the directory %s\n",
+              dir.c_str());
+      return false;
+    case MemfdDirState::kUnsafe:
+      break;
+  }
+  fprintf(stderr,
+          "clio: %s must be a directory owned by this user that no other user "
+          "can write. Remove it, or set CLIO_MEMFD_DIR to a directory of your "
+          "own.\n",
+          dir.c_str());
+  errno = EACCES;  // reported by GetLastSharedMemoryError
+  return false;
 }
 
 bool SystemInfo::CreateNewSharedMemory(File &fd, const std::string &name,
@@ -585,7 +644,10 @@ bool SystemInfo::CreateNewSharedMemory(File &fd, const std::string &name,
     close(fd.posix_fd_);
     return false;
   }
-  EnsureMemfdDir();
+  if (!EnsureMemfdDir()) {
+    close(fd.posix_fd_);
+    return false;
+  }
   std::string memfd_path = GetMemfdPath(name);
   unlink(memfd_path.c_str());
   std::string proc_path =
@@ -605,7 +667,9 @@ bool SystemInfo::CreateNewSharedMemory(File &fd, const std::string &name,
   // with "Address already in use". Back the segment with a regular file in
   // the memfd dir instead: arbitrary-length names, an openable path for
   // cross-process attach, and MAP_SHARED gives identical semantics.
-  EnsureMemfdDir();
+  if (!EnsureMemfdDir()) {
+    return false;
+  }
   std::string shm_path = GetMemfdPath(name);
   fd.posix_fd_ = open(shm_path.c_str(), O_CREAT | O_RDWR, 0600);
   if (fd.posix_fd_ < 0) {
@@ -721,6 +785,11 @@ bool SystemInfo::CreateNewSharedMemory(File &fd, const std::string &name,
 
 bool SystemInfo::OpenSharedMemory(File &fd, const std::string &name) {
 #if CTP_ENABLE_PROCFS_SYSINFO
+  // A segment found in a directory another user controls could be theirs.
+  if (CheckMemfdDir() != MemfdDirState::kPrivate) {
+    errno = EACCES;
+    return false;
+  }
 #if __linux__
   std::string memfd_path = GetMemfdPath(name);
   fd.posix_fd_ = open(memfd_path.c_str(), O_RDWR);
@@ -982,15 +1051,42 @@ bool SystemInfo::BulkFault(void *addr, size_t size) {
   // Fall through to the touch loop (e.g. pre-Win8, or an unmapped subrange).
 #endif
 
-  // Universal fallback (and the macOS primary path): write-touch one byte
-  // per page. A volatile read-modify-write faults the page for writing while
-  // preserving its contents. Same per-page cost as demand faulting, but paid
-  // here, at a controlled point, instead of scattered through a bulk memcpy.
-  volatile char *p = reinterpret_cast<volatile char *>(begin);
-  for (uintptr_t off = 0; off < end - begin; off += page) {
-    p[off] = p[off];
-  }
+  // Universal fallback (and the macOS primary path).
+  TouchPages(reinterpret_cast<void *>(begin), end - begin);
   return true;
+}
+
+void SystemInfo::TouchPages(void *addr, size_t size) {
+  if (addr == nullptr || size == 0) {
+    return;
+  }
+  const size_t page = static_cast<size_t>(GetPageSize());
+  uintptr_t begin = reinterpret_cast<uintptr_t>(addr);
+  const uintptr_t end = begin + size;
+  begin &= ~(static_cast<uintptr_t>(page) - 1);
+  // An atomic compare-exchange of the byte with itself, never `p = p`: the
+  // range is usually live (a RAM bdev populates the rest of a unit while
+  // other workers already write blocks inside it). A plain load + store is
+  // two accesses, and a write landing between them is overwritten with the
+  // stale byte -- one lost byte per page, which corrupted RAM bdev blocks on
+  // macOS (where this loop is the only populate path). The CAS stores only
+  // if the byte still holds what was loaded, so it faults the page for
+  // writing and never changes it; if a concurrent write won, that write
+  // already faulted the page. (Not fetch_add(0): clang folds an idempotent
+  // RMW whose result is unused into a bare fence, touching nothing.)
+  // Host only: ctp::ipc::atomic_ref exists only on the host pass, and the
+  // GPU builds also compile this file for the device, which never runs it.
+#if CTP_IS_HOST
+  for (uintptr_t a = begin; a < end; a += page) {
+    ctp::ipc::atomic_ref<char> ref(*reinterpret_cast<char *>(a));
+    char seen = ref.load(std::memory_order_relaxed);
+    ref.compare_exchange_strong(seen, seen, std::memory_order_relaxed);
+  }
+#else
+  (void)begin;
+  (void)end;
+  (void)page;
+#endif
 }
 
 void *SystemInfo::AlignedAlloc(size_t alignment, size_t size) {
@@ -1440,9 +1536,9 @@ std::string SystemInfo::GetHomeDir() {
   // Fall back to HOMEDRIVE+HOMEPATH or HOME if a user explicitly set them.
   char buf[MAX_PATH];
   DWORD len = ::GetEnvironmentVariableA("USERPROFILE", buf, sizeof(buf));
-  if (len > 0 && len < sizeof(buf)) return std::string(buf, len);
+  if (len > 0 && len < sizeof(buf)) return NormalizePath(std::string(buf, len));
   len = ::GetEnvironmentVariableA("HOME", buf, sizeof(buf));
-  if (len > 0 && len < sizeof(buf)) return std::string(buf, len);
+  if (len > 0 && len < sizeof(buf)) return NormalizePath(std::string(buf, len));
   return std::string();
 #endif
 }
@@ -1458,17 +1554,16 @@ std::string SystemInfo::GetHostname() {
   return std::string(buf);
 }
 
-std::string SystemInfo::GetModuleDirectoryFor(void *symbol) {
+std::string SystemInfo::GetModulePathFor(void *symbol) {
   if (!symbol) return "";
 #if CTP_ENABLE_PROCFS_SYSINFO
   Dl_info dl_info;
-  if (dladdr(symbol, &dl_info) == 0) return "";
+  if (dladdr(symbol, &dl_info) == 0 || dl_info.dli_fname == nullptr) {
+    return "";
+  }
   char resolved[PATH_MAX];
   if (realpath(dl_info.dli_fname, resolved) == nullptr) return "";
-  std::string resolved_str(resolved);
-  auto pos = resolved_str.rfind('/');
-  return (pos != std::string::npos) ? resolved_str.substr(0, pos)
-                                    : std::string();
+  return std::string(resolved);
 #elif CTP_ENABLE_WINDOWS_SYSINFO
   HMODULE hModule = nullptr;
   if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
@@ -1478,11 +1573,20 @@ std::string SystemInfo::GetModuleDirectoryFor(void *symbol) {
   }
   char path[MAX_PATH];
   if (GetModuleFileNameA(hModule, path, MAX_PATH) == 0) return "";
-  std::string path_str(path);
-  auto pos2 = path_str.rfind('\\');
-  if (pos2 == std::string::npos) pos2 = path_str.rfind('/');
-  return (pos2 != std::string::npos) ? path_str.substr(0, pos2) : std::string();
+  return std::string(path);
+#else
+  return "";
 #endif
+}
+
+std::string SystemInfo::GetModuleDirectoryFor(void *symbol) {
+  std::string path = GetModulePathFor(symbol);
+#if CTP_ENABLE_WINDOWS_SYSINFO
+  auto pos = path.find_last_of("/\\");
+#else
+  auto pos = path.rfind('/');
+#endif
+  return (pos != std::string::npos) ? path.substr(0, pos) : std::string();
 }
 
 std::vector<std::string> SystemInfo::GetLocalInterfaceIps() {

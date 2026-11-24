@@ -1,6 +1,6 @@
 {
   "name": "iowarp-core",
-  "version-string": "0.0.0",
+  "version": "2.5.1",
   "description": "IOWarp Context Management Platform - AI-accelerated scientific workflow orchestration",
   "homepage": "https://www.iowarp.ai",
   "license": "BSD-3-Clause",
@@ -22,11 +22,16 @@
   ],
   "features": {
     "viz": {
-      "description": "Poco HTTP transport for the runtime web dashboard (and the GCS bdev / CAE Globus)",
+      "description": "Poco HTTP(S) for the runtime web dashboard and the S3 / GCS storage tiers",
       "dependencies": [
         {
           "name": "poco",
-          "features": ["net", "netssl", "crypto", "json"]
+          "features": [
+            "net",
+            "netssl",
+            "crypto",
+            "json"
+          ]
         }
       ]
     },
@@ -35,6 +40,9 @@
       "dependencies": [
         "boost-context"
       ]
+    },
+    "hdf5": {
+      "description": "HDF5 import in the CAE plus the HDF5 VOL connector and VFD (hdf5 is already a base dependency)"
     }
   }
 }

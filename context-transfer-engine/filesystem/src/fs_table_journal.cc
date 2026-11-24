@@ -98,12 +98,7 @@ size_t Runtime::ReplayBlockDeltas(const std::string &p, TableBlockState *state) 
       ++bad;  // no image to build on (a dropped block's late commit)
       continue;
     }
-    // Not newer: a compaction's image already holds it.
-    if (x.kind_ != TableDeltaKind::kOps ||
-        x.new_version_ <= it->second.version_) {
-      continue;
-    }
-    if (!ApplyTableOps(&it->second, x)) ++bad;
+    if (ReplayTableDelta(&it->second, x) == ReplayStep::kMismatch) ++bad;
   }
   return bad;
 }
@@ -250,25 +245,68 @@ int Runtime::TakeJournaledBlock(clio::run::u64 dir, clio::run::u32 k,
 
 void Runtime::TakePersistLocked(TableBlockSlot &slot,
                                 const std::vector<TableDelta> &deltas,
-                                std::string *image, FsLogRec *jtype,
+                                BlockBlobWrite *blob, FsLogRec *jtype,
                                 std::string *jrec) {
-  if (!dir_journal_) {
-    if (slot.persist_dirty_) {
-      *image = EncodeTableBlock(slot.blk_, true);
-      slot.persist_dirty_ = false;
+  // A full image is due for the blob when it has no log to append to, and,
+  // with the journal, when the journal has no image to build on: the blob
+  // mirrors the journal then, so it takes the same image.
+  const bool image_due = slot.blob_image_due_ ||
+                         (dir_journal_ && slot.journal_image_);
+  slot.persist_dirty_ = false;
+  if (dir_journal_) {
+    // Every change is journaled, durable or not: each delta builds on the
+    // one before it, and replay drops what a crash aborts (pending, leaving).
+    if (slot.journal_image_) {
+      *jtype = FsLogRec::kBlockImage;
+      *jrec = EncodeTableBlock(slot.blk_, true);
+      slot.journal_image_ = false;
+    } else if (!deltas.empty()) {
+      *jtype = FsLogRec::kBlockDeltas;
+      *jrec = EncodeTableDeltas(deltas);
     }
+  }
+  // Every commit with changes writes them to the blob (not only durable
+  // ones): a non-durable change (a reservation, a leaving mark) is part of
+  // the version chain the next frame builds on.
+  if (image_due || !deltas.empty()) {
+    PlanBlobWriteLocked(slot, deltas, image_due, blob);
+  }
+}
+
+void Runtime::PlanBlobWriteLocked(TableBlockSlot &slot,
+                                  const std::vector<TableDelta> &deltas,
+                                  bool image_due, BlockBlobWrite *blob) {
+  if (!image_due && dir_log_compact_bytes_ > 0) {
+    BlockBlobWrite w = MakeDeltaWrite(deltas);
+    if (slot.blob_log_bytes_ + w.bytes_.size() <= dir_log_compact_bytes_) {
+      w.expect_end_ = slot.blob_end_;
+      *blob = std::move(w);
+      return;
+    }
+  }
+  // Compaction: one image replaces the log (and the old frames with it).
+  *blob = MakeImageWrite(slot.blk_);
+}
+
+void Runtime::SettleBlobWriteLocked(TableBlockSlot &slot,
+                                    const BlockBlobWrite &blob, int wrc,
+                                    bool mirror_failed) {
+  if (wrc != 0 || mirror_failed) {
+    // The blob may lack this commit's changes (or hold a partial frame): the
+    // next commit writes a full image, which covers them.
+    slot.blob_image_due_ = true;
+    slot.persist_dirty_ = true;  // the next commit retries
+    if (wrc != 0) slot.journal_image_ = true;  // these deltas never reached it
     return;
   }
-  // Every change is journaled, durable or not: each delta builds on the one
-  // before it, and replay drops what a crash aborts (pending, leaving).
-  slot.persist_dirty_ = false;
-  if (slot.journal_image_) {
-    *jtype = FsLogRec::kBlockImage;
-    *jrec = EncodeTableBlock(slot.blk_, true);
-    slot.journal_image_ = false;
-  } else if (!deltas.empty()) {
-    *jtype = FsLogRec::kBlockDeltas;
-    *jrec = EncodeTableDeltas(deltas);
+  if (blob.bytes_.empty()) return;  // nothing was planned
+  slot.blob_image_due_ = false;
+  if (blob.append_) {
+    slot.blob_log_bytes_ += blob.bytes_.size();
+    slot.blob_end_ += blob.bytes_.size();
+  } else {
+    slot.blob_log_bytes_ = 0;
+    slot.blob_end_ = blob.bytes_.size();
   }
 }
 

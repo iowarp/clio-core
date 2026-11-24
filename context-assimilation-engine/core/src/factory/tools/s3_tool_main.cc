@@ -68,6 +68,7 @@
 #include <aws/core/Aws.h>
 #include <aws/core/auth/AWSAuthSigner.h>
 #include <aws/core/client/ClientConfiguration.h>
+#include <aws/core/VersionConfig.h>
 #include <aws/core/utils/memory/stl/AWSStringStream.h>
 #include <aws/s3/S3Client.h>
 #include <aws/s3/model/CreateBucketRequest.h>
@@ -108,7 +109,14 @@ namespace {
  */
 Aws::S3::S3Client MakeS3Client() {
   Aws::Client::ClientConfiguration cfg;
+  // allowSystemProxy appeared in aws-sdk-cpp 1.11.169; older SDKs (Spack's
+  // 1.11.144, for one) build without it and ignore the proxy variables.
+#if AWS_SDK_VERSION_MAJOR > 1 ||                                    \
+    (AWS_SDK_VERSION_MAJOR == 1 && (AWS_SDK_VERSION_MINOR > 11 ||    \
+                                    (AWS_SDK_VERSION_MINOR == 11 &&  \
+                                     AWS_SDK_VERSION_PATCH >= 169)))
   cfg.allowSystemProxy = true;
+#endif
   const char* region_env = std::getenv("AWS_DEFAULT_REGION");
   cfg.region = (region_env && *region_env) ? region_env : "us-east-1";
 

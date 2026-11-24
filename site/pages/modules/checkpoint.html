@@ -1,0 +1,312 @@
+<!--
+title: Checkpoint module
+heading: Checkpoint: <em>lazy copies.</em>
+description: The CTE checkpoint module: the fault handler behind vector Copy, which materializes a copy tag's blobs from its source on first touch and, with the core's copy-on-write hook, keeps a lazy copy a point-in-time snapshot.
+eyebrow: Modules · Transfer engine
+lede: The checkpoint module turns a tag into a lazy copy of another tag. Taking the copy duplicates no bytes; the CTE core calls this module the first time a blob of the copy is read or written, and the module copies that blob from the source. Together with the core's copy-on-write hook, a lazy copy holds the source exactly as it was when the copy was taken.
+facts: Library | clio_cte_checkpoint ; Default pool | 566.0 ; Build option | CLIO_CTE_ENABLE_CHECKPOINT (ON) ; Source | context-transfer-engine/checkpoint
+-->
+<h2>What it does</h2>
+<p>The CTE core lets a tag register a <strong>fault handler</strong>: a pool
+that is asked to produce a blob whenever a get or put finds the blob missing
+under that tag. The checkpoint module is the handler used for copies. A copy
+tag registers pool 566.0 as its handler and the source tag as the handler's
+parameter. When the core faults a blob of the copy, the module reads the
+whole blob from the source, writes it into the copy, and then lets the
+original operation proceed against the copy's own blob.</p>
+<p>It exists for <code>Copy</code> on the CPU and GPU paged vectors, the
+checkpoint primitive of <a href="/docs/memory-expansion/usage.html">memory
+expansion</a>. An untouched copy occupies no storage, so taking a checkpoint
+costs a flush and two metadata operations, and bytes move only for pages
+that are later read back, overwritten in the source, or materialized
+explicitly.</p>
+
+<h2>Where it sits</h2>
+<p>The runtime class derives from the core's interposer base, so it speaks
+the core's task interface and forwards every core verb it does not handle
+to <code>next_pool_id</code>. It is not part of any client's data path,
+though: no client binds to it, and it is not in the default chain in
+<code>context-runtime/config/clio_default.yaml</code>. The
+<a href="/modules/cte-core.html">CTE core</a> is its only regular
+caller.</p>
+<ul>
+  <li><strong>Called by</strong>: the core, on a miss in a fault-handled
+  tag and from the copy-on-write hook, always with a local pool query, so
+  the fault runs on the node that holds the blob's container. Vectors also
+  call it directly from <code>MaterializeAll</code>.</li>
+  <li><strong>Calls</strong>: <code>next_pool_id</code> (the core, or the top
+  of the chain in front of it) for the source lookup, the size probe, the
+  whole-blob read and the materializing put. Unset, it uses the core pool
+  512.0.</li>
+  <li><strong>Interposed verb</strong>: GetBlob only. Create, Destroy and
+  Monitor are its own lifecycle methods; everything else is forwarded.</li>
+</ul>
+
+<h2>Composing it</h2>
+<p>Usually nothing needs composing. <code>Copy</code> creates the pool
+itself, idempotently, before registering the copy tag:</p>
+<pre data-label="cpp">
+clio::cte::checkpoint::Client ckpt(
+    clio::cte::checkpoint::kCheckpointPoolId, storage_pool_id_);
+clio::cte::checkpoint::CheckpointConfig params;
+params.next_pool_id_ = storage_pool_id_;
+auto cf = ckpt.AsyncCreateCheckpoint(
+    clio::run::PoolQuery::Dynamic(),
+    clio::cte::checkpoint::kCheckpointPoolName,   // "clio_cte_checkpoint"
+    clio::cte::checkpoint::kCheckpointPoolId,     // 566.0
+    params);
+cf.Wait();
+</pre>
+<p>The dynamic query matters. The core dispatches a fault to the handler on
+the node where the faulting blob lives, which need not be the node that
+took the copy, so the pool has to exist on every node.</p>
+<p>The module's config parser also reads a compose entry, so a deployment
+can create the pool at startup. No shipped configuration does this; the
+entry below is an example:</p>
+<pre data-label="yaml">
+compose:
+  # ... the CTE core (512.0) and any chain above it, first
+  - mod_name: clio_cte_checkpoint
+    pool_name: clio_cte_checkpoint
+    pool_query: local
+    pool_id: "566.0"
+    next_pool_id: "512.0"
+</pre>
+<p>Keep the pool name <code>clio_cte_checkpoint</code>. The core turns on
+copy-on-write only for a fault registration that names that pool
+(<code>kCowFaultPoolName</code> in <code>core_tasks.h</code>), and the
+module's <code>kCheckpointPoolName</code> is defined from it.</p>
+
+<h2>Operations</h2>
+<p>From <code>checkpoint/clio_mod.yaml</code>:</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Method</th><th>Id</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td><code>kCreate</code></td><td>0</td><td>Creates the container. The parameters are a <code>CheckpointConfig</code> holding <code>next_pool_id_</code>.</td></tr>
+    <tr><td><code>kDestroy</code></td><td>1</td><td>Destroys the container. It holds no state to clean up.</td></tr>
+    <tr><td><code>kMonitor</code></td><td>9</td><td>Standard monitor. Returns success and does nothing else.</td></tr>
+    <tr><td><code>kGetBlob</code></td><td>16</td><td>The fault entry point. It carries the core's own GetBlob id, and the task is the core's <code>GetBlobTask</code>: the copy tag, the missing blob's name, the requested range and buffer, and the source in <code>Context::fault_params_</code>.</td></tr>
+  </tbody>
+</table></div>
+<p>A GetBlob with size 0 and a null buffer is a <strong>materialize-only</strong>
+fault: copy the blob into the copy tag and serve nothing. The core issues
+that form before a put into a missing blob and from the copy-on-write hook;
+<code>MaterializeAll</code> issues it once per page. The client class only
+creates the pool (<code>AsyncCreateCheckpoint</code>); it inherits the core
+client, but callers never address the pool for data.</p>
+
+<h2>Taking a copy</h2>
+<p>Both vectors' <code>Copy(new_name, sync = false)</code> follow the same
+steps (<code>adapter/cpu_vector/include/clio_cte/cpu_vector/cpu_vector.h</code>,
+<code>adapter/gpu_vector/include/clio_cte/gpu_vector/gpu_vector.h</code>):</p>
+<ol class="steps">
+  <li><strong>Check the source name.</strong> It must be shorter than 64
+  bytes, the size of <code>Context::fault_params_</code>. A longer name
+  throws, since the core would silently truncate it and resolve a
+  different tag.</li>
+  <li><strong>Flush.</strong> Every resident page goes to the CTE, so the
+  copy snapshots what the vector holds now rather than what happened to be
+  flushed.</li>
+  <li><strong>Create the pool</strong> at 566.0 with a dynamic query, as
+  above.</li>
+  <li><strong>Register the copy tag.</strong>
+  <code>AsyncGetOrCreateTag(new_name, 566.0, "clio_cte_checkpoint",
+  source_name)</code> on the core. The container that owns the name stores
+  the handler. Because the pool name is the copy-on-write name, it then
+  looks the source up (a lookup that never creates; a missing source fails
+  the call) and broadcasts <code>CowLink</code> (core method 62) to every
+  core container. Each container records the link from source to copy and
+  installs the copy's handler locally, with the source named by id as
+  <code>#major.minor</code>, so the copy still resolves after the source's
+  name is gone. The call returns after every container has the link.</li>
+  <li><strong>Optionally materialize.</strong> With <code>sync = true</code>,
+  <code>MaterializeAll</code> sends a materialize-only fault for every page,
+  32 in flight by default, and <code>Copy</code> throws unless every page
+  succeeds.</li>
+</ol>
+<p>The same registration is available to any core client: pass the pool
+id, pool name and source tag name to the four-argument
+<code>AsyncGetOrCreateTag</code>, as <code>test_checkpoint_fault.cc</code>
+does.</p>
+
+<h2>Resolving a fault</h2>
+<p>When a get or put on the copy finds no blob and the request does not
+carry <code>kNoFault</code>, the core sends a GetBlobTask to the handler
+with a local query. A get forwards its range and buffer and returns the
+handler's result. A put sends a materialize-only fault, then probes again
+and writes against whatever now exists, so a partial put into a page lands
+on top of the source's bytes rather than zeros. The handler
+(<code>checkpoint/src/checkpoint_runtime.cc</code>) then:</p>
+<ol class="steps">
+  <li><strong>Rejects an empty parameter.</strong> A fault with no source is
+  a registration bug and fails with return code 1.</li>
+  <li><strong>Keeps an existing copy.</strong> For a materialize-only fault
+  it first probes the copy. If the blob is already there, even as an empty
+  tombstone, nothing happens: rematerializing would replace the copy's
+  bytes with the source's current ones.</li>
+  <li><strong>Resolves the source.</strong> An id-form parameter is used
+  directly; a plain name goes through GetOrCreateTag. A failed lookup
+  returns 1.</li>
+  <li><strong>Sizes the source blob.</strong> If the source has no bytes for
+  it, a materialize-only fault writes an empty tombstone into the copy, so
+  the copy records the blob as absent and never faults on it again. Any
+  other fault is forwarded to the copy unchanged with
+  <code>kNoFault</code>, so create-on-get and not-found behave exactly as
+  on a tag without a handler.</li>
+  <li><strong>Copies the whole blob.</strong> The handler reads the entire
+  source blob into a staging buffer the size of the blob (return code 2 if
+  it cannot be allocated) and puts it into the copy at offset 0. It copies
+  the whole blob even for a range read: the fault is triggered by the blob
+  being missing, so a partial copy would leave holes that no later access
+  could detect.</li>
+  <li><strong>Serves the request.</strong> For a get, the original range is
+  re-issued against the copy with <code>kNoFault</code>. It is not a memcpy
+  from the staging buffer because the caller's buffer can be device memory
+  (a GPU vector page fault), which only the core's serve path knows how to
+  fill.</li>
+</ol>
+<p>Every core operation the handler issues carries <code>kNoFault</code>, so
+it cannot fault again. The materializing put also carries
+<code>kNoCow</code> and clears <code>create_on_get</code>: it writes the
+copy's own bytes, not a change to a source.</p>
+
+<h2>Copy-on-write</h2>
+<p>Faulting alone would copy a blob from the source as it is at the first
+touch, so a source overwritten in between would leak later bytes into the
+copy. The copy-on-write hook in <code>core/src/core_runtime.cc</code> closes
+that window. Before the owner container changes a source blob, each copy
+registered on that source receives the blob's current bytes:</p>
+<ul>
+  <li><strong>PutBlob</strong>, including each record of a batched put.
+  Replica and shadow writes, emulated writes, and the handler's own
+  <code>kNoCow</code> puts skip the hook.</li>
+  <li><strong>DelBlob</strong> and <strong>DelTag</strong>, before blocks
+  are freed.</li>
+  <li><strong>TruncateBlob</strong>, only when it shrinks the blob.</li>
+</ul>
+<p>The hook runs under the blob's write token, so two writers to one blob
+materialize it once. For each copy it probes the copy; a copy that already
+holds the blob costs only that probe. Otherwise it sends a materialize-only
+fault to the checkpoint pool on the same node. If the pool is absent there,
+the mutation fails with return code 2 (<code>kCowErrFaultPoolMissing</code>)
+rather than dispatching a task the router would retry forever.</p>
+<p>The consequences, all exercised by <code>test_checkpoint_cow.cc</code>:</p>
+<ul class="checks">
+  <li>An overwrite of a source blob leaves the copy with the old bytes and
+  the source with the new ones.</li>
+  <li>A blob the source gains after the copy was taken is recorded in the
+  copy as a tombstone by its first put, so it stays absent from the
+  snapshot.</li>
+  <li>Two copies taken at different times each keep their own
+  version.</li>
+  <li>Deleting a source blob that a copy has not materialized saves it into
+  the copy first.</li>
+  <li>Deleting a copy removes its links, and writes to the source then
+  proceed without the hook.</li>
+  <li>A tag with no copies of its own is unaffected.</li>
+</ul>
+<p>When a snapshot cannot be saved, the source change does not happen. A put,
+delete or shrinking truncate returns the hook's error. A tag delete keeps
+each blob it could not save, together with the tag's metadata and links,
+and logs an error. A source tag deleted completely drops all its links,
+since its copies then hold every blob.</p>
+
+<h2>Configuration</h2>
+<dl class="notes">
+  <dt><code>next_pool_id</code></dt>
+  <dd>The pool the handler resolves sources through and materializes copies
+  into, as <code>"major.minor"</code>. <code>Copy</code> sets it to the
+  vector's storage pool. Unset falls back to the core pool 512.0. It is the
+  only key; parsing is best effort, and a malformed value leaves it
+  unset.</dd>
+</dl>
+<p>The pool id and name are fixed constants in
+<code>checkpoint_tasks.h</code>: <code>kCheckpointPoolId</code> is 566.0 and
+<code>kCheckpointPoolName</code> is <code>clio_cte_checkpoint</code>. The id
+is 566 rather than 565 because the stream module owns 565.0; a shared id
+made <code>Copy</code> resolve its handler to the stream pool (issue #1186).
+The module has no entry in <code>clio_default.yaml</code>.</p>
+<p><strong>Collision with the write-through cache.</strong> The
+<a href="/modules/write-through.html">write-through cache</a> also defaults
+to 566.0 (<code>kWriteThruCachePoolId</code>). If you compose the
+write-through cache, give it a different <code>pool_id</code>: the checkpoint
+id is fixed in code, the write-through cache's is set by its compose
+entry.</p>
+
+<h2>Who uses it</h2>
+<ul>
+  <li><strong>CPU and GPU paged vectors.</strong> <code>Copy</code> and
+  <code>MaterializeAll</code>; both adapter targets link
+  <code>clio_cte_checkpoint_client</code>. See the
+  <a href="/docs/memory-expansion/api.html">memory expansion API</a>.</li>
+  <li><strong>GPU vector benchmarks.</strong> The grayscott, gmx,
+  lammps_md and lbann paged benchmarks take an end-of-run checkpoint with
+  <code>Copy</code> through <code>benchmark/bench_ckpt.h</code>, lazy by
+  default and synchronous with <code>--ckpt-sync</code>. Their CMake files
+  add a build dependency on the runtime library, since the runtime loads the
+  module rather than linking it and <code>Copy</code> otherwise throws
+  "checkpoint pool create failed".
+  <code>clio_gpu_vector_copy_sync_bench</code> compares the cost of lazy and
+  synchronous copies.</li>
+  <li><strong>CTE vector stress benchmark.</strong>
+  <code>context-transfer-engine/benchmark/clio_cte_vector_stress.cc</code>
+  takes a copy every <code>--ckpt-every</code> steps and materializes the
+  node's own pages.</li>
+</ul>
+<p>The <a href="/modules/cae-core.html">CAE</a> uses the same core
+fault-handler mechanism to ingest data on first access, with its own pool
+as the handler. It does not go through this module.</p>
+
+<h2>Behaviors worth knowing</h2>
+<ul class="checks">
+  <li>A lazy copy is a snapshot from the moment <code>Copy</code> returns.
+  <code>sync = true</code> or <code>MaterializeAll</code> makes it real bytes
+  immediately; neither is needed for snapshot correctness.</li>
+  <li><code>MaterializeAll</code> runs entirely inside the runtime: each page
+  is a whole-blob read and write between tags, and no bytes cross to the
+  client.</li>
+  <li>A copy is independent once materialized. Writes to the copy do not
+  reach the source, and later source writes do not reach the copy.</li>
+  <li>A copy returned by the GPU vector's <code>Copy</code> builds no device
+  views. A kernel that must read it opens its own vector on the copy's
+  tag.</li>
+  <li>A tag has one fault handler. Registering again overwrites it;
+  GetOrCreateTag without fault arguments leaves an existing registration
+  alone.</li>
+</ul>
+
+<h2>Limits</h2>
+<ul>
+  <li>The source tag name must fit in 64 bytes including the terminator.</li>
+  <li>A fault stages the entire source blob in one buffer, whatever range
+  was requested.</li>
+  <li>Fault registrations and copy-on-write links live in memory. The
+  core's transaction log records a tag's name and id, not its handler, so
+  materialize a copy that has to survive a runtime restart.</li>
+  <li>The checkpoint pool must exist on every node that holds blobs of a
+  copy or its source. <code>Copy</code> ensures this; code that registers
+  copy tags itself must too.</li>
+  <li>The core does not check the return code of a put-side fault. If
+  materialization fails, the put proceeds on a new, empty blob.</li>
+</ul>
+
+<h2>How it is tested</h2>
+<ul>
+  <li><code>context-transfer-engine/test/unit/test_checkpoint_fault.cc</code>
+  (ctest <code>cte_checkpoint_fault</code>): get faults, copy and source
+  independence, put-side materialize-then-merge, whole-blob faulting on
+  range reads, and the source-absent fallback.</li>
+  <li><code>context-transfer-engine/test/unit/test_checkpoint_cow.cc</code>
+  (ctest <code>cte_checkpoint_cow</code>): the copy-on-write cases listed
+  above, on one node.</li>
+  <li><code>context-transfer-engine/adapter/gpu_vector/test/test_gpu_vector_copy_gpu.cc</code>
+  (ctest <code>cte_gpu_vector_copy</code>, CUDA builds): host and device
+  reads of a copy materialize from the source.</li>
+  <li><code>context-transfer-engine/test/unit/test_well_known_pool_ids.cc</code>
+  (ctest <code>cte_well_known_pool_ids</code>): compile-time check that
+  566.0 does not collide with the CTE module ids it lists. The write-through
+  cache's default, also 566.0, is not in that list.</li>
+</ul>
+<p>The two checkpoint unit tests are built only when the
+<code>clio_cte_checkpoint_client</code> target exists, that is, with
+<code>CLIO_CTE_ENABLE_CHECKPOINT=ON</code>.</p>

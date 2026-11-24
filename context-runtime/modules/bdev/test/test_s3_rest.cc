@@ -53,6 +53,22 @@ std::string Env(const char *name) {
 /** True when s3_stub_server.py is driving us. */
 bool StubAvailable() { return !Env("S3_ENDPOINT").empty(); }
 
+/**
+ * True when the endpoint is the bundled s3_stub_server.py. Tests that read the
+ * stub's /__stats__ counters or rely on its "/public/" anonymous-read rule only
+ * mean something there; CI sets S3_REAL_SERVER=1 when it runs this binary
+ * against a real S3 implementation (VersityGW) and those tests skip.
+ */
+bool StubOnly() { return StubAvailable() && Env("S3_REAL_SERVER") != "1"; }
+
+/** True when S3_ENDPOINT names a loopback host (127.0.0.1, ::1, localhost). */
+bool LoopbackEndpoint() {
+  const std::string ep = Env("S3_ENDPOINT");
+  return ep.find("//127.") != std::string::npos ||
+         ep.find("//localhost") != std::string::npos ||
+         ep.find("//[::1]") != std::string::npos;
+}
+
 /** A client pointed at the stub bucket with the given key prefix. */
 s3::S3RestClient MakeClient(const std::string &prefix) {
   return s3::S3RestClient(
@@ -340,8 +356,8 @@ TEST_CASE("s3_rest_ensure_bucket_refuses_to_create_by_default", "[s3_rest]") {
 }
 
 TEST_CASE("s3_rest_reuses_one_connection", "[s3_rest]") {
-  if (!StubAvailable()) {
-    INFO("S3_ENDPOINT unset; run via s3_stub_server.py. Skipping.");
+  if (!StubOnly()) {
+    INFO("Needs s3_stub_server.py (stub counters / public-key rule). Skipping.");
     return;
   }
   // The whole point of the S3Connection handle: a worker reuses one socket for
@@ -485,8 +501,8 @@ TEST_CASE("s3_rest_streaming_ranged_get_returns_the_slice", "[s3_rest]") {
 }
 
 TEST_CASE("s3_rest_streaming_reuses_one_connection", "[s3_rest]") {
-  if (!StubAvailable()) {
-    INFO("S3_ENDPOINT unset; run via s3_stub_server.py. Skipping.");
+  if (!StubOnly()) {
+    INFO("Needs s3_stub_server.py (stub counters / public-key rule). Skipping.");
     return;
   }
   // Several whole-object streamed reads (each many ReadBody calls, and under
@@ -526,8 +542,8 @@ TEST_CASE("s3_rest_streaming_out_of_range_is_an_error", "[s3_rest]") {
 }
 
 TEST_CASE("s3_rest_anonymous_reads_a_public_object", "[s3_rest]") {
-  if (!StubAvailable()) {
-    INFO("S3_ENDPOINT unset; run via s3_stub_server.py. Skipping.");
+  if (!StubOnly()) {
+    INFO("Needs s3_stub_server.py (stub counters / public-key rule). Skipping.");
     return;
   }
   // Seed with a signed client, then read back unsigned. The stub lets an
@@ -600,7 +616,7 @@ TEST_CASE("s3_rest_requests_go_through_http_proxy", "[s3_rest][proxy]") {
 }
 
 TEST_CASE("s3_rest_loopback_endpoint_ignores_the_proxy", "[s3_rest][proxy]") {
-  if (!StubAvailable()) {
+  if (!StubAvailable() || !LoopbackEndpoint()) {
     INFO("S3_ENDPOINT unset; run via s3_stub_server.py. Skipping.");
     return;
   }

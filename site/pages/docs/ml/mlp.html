@@ -1,0 +1,63 @@
+<!--
+title: mlp
+heading: <em>mlp:</em> multilayer perceptron classifier.
+description: API reference for clio-ml's multilayer perceptron classifier (one sigmoid hidden layer, softmax output, full-batch Adam): Python fit_mlp and predict, C++ FitMlp and MlpPredict, MlpOptions.
+eyebrow: Docs · Machine learning
+lede: A one-hidden-layer perceptron classifier, the equivalent of Spark MLlib's MultilayerPerceptronClassifier: features to <code>hidden</code> sigmoid units to <code>num_classes</code> softmax outputs, cross-entropy loss, full-batch Adam. Each step is one paged pass with forward and backward per row in the kernel.
+facts: Module | ml_mlp ; Header | clio_ml/mlp.h ; Rows | features, then class label ; Limits | hidden at most 32, num_classes at most 8
+-->
+<h2>What it does</h2>
+<p>Every parameter's gradient is summed in fixed row order and Adam runs on the host, so the trained network is bit-identical across paging, block counts and cluster nodes. For deeper networks or custom architectures see the torch module.</p>
+
+<h2>Rows</h2>
+<p><code>n_features</code> feature columns followed by the class label. <code>clio_ml.COLUMNS["mlp"]</code> is 1.</p>
+
+<h2>Python</h2>
+<pre data-label="python">
+import numpy as np, clio_ml as cm
+rng = np.random.default_rng(1)
+X = rng.normal(size=(4096, 7)).astype(np.float32)
+y = (X[:, 0] + X[:, 1] > 0).astype(np.float32)
+data = np.column_stack([X, y]).astype(np.float32)
+
+r = cm.fit_mlp(data, hidden=16, num_classes=2, iters=20, learning_rate=0.05)
+print(r.loss_history[0], "->", r.loss_history[-1])
+print(cm.predict("mlp", r, data[0, :7]))     # predicted class
+</pre>
+<ul>
+  <li><code>fit_mlp(X, **options)</code>.</li>
+  <li>Options (<code>MlpOptions</code>): <code>hidden</code> (16), <code>num_classes</code> (2), <code>iters</code> (200), <code>learning_rate</code> (0.05, Adam), <code>seed</code> (1), <code>threads</code> (256).</li>
+  <li>Result <code>MlpResult</code>: <code>model</code> (<code>MlpModel</code> with <code>nf</code>, <code>H</code>, <code>C</code> and <code>params</code> laid out as <code>[W1 | b1 | W2 | b2]</code>), <code>loss_history</code> (mean cross-entropy before each step), <code>stats</code>.</li>
+  <li><code>predict("mlp", r, x)</code> returns the class index.</li>
+</ul>
+
+<h2>C++</h2>
+<pre data-label="cpp">
+struct MlpOptions {
+  u32 hidden = 16;       // <= 32
+  u32 num_classes = 2;   // <= 8
+  u32 iters = 200;
+  float learning_rate = 0.05f;  // Adam
+  u32 seed = 1;
+  u32 threads = 256;
+  ClusterExchange cluster;
+};
+struct MlpModel {
+  u32 nf = 0, H = 0, C = 0;
+  std::vector<float> params;  // [W1 | b1 | W2 | b2]
+  std::vector<float> Flatten() const;
+};
+struct MlpResult {
+  MlpModel model;
+  std::vector<double> loss_history;
+  VecStats stats;
+};
+MlpResult FitMlp(Dataset &ds, const MlpOptions &opt);
+MlpResult FitMlpPlain(const float *data, u64 n_rows, u32 nf, u64 elems_per_page,
+                      u32 nblocks, const MlpOptions &opt);
+MlpResult FitMlpReference(/* same arguments */);
+u32 MlpPredict(const MlpModel &m, const float *x);
+</pre>
+<p>The ChiMod is module <code>ml_mlp</code>.</p>
+
+<p>Related: 1-D CNN, LSTM, GNN, torch.</p>

@@ -498,6 +498,25 @@ TEST_CASE("CliDispatch - command help and argument errors", "[cli][dispatch]") {
   REQUIRE(RunCli("compose --help") == 0);
   REQUIRE(RunCli("compose -h") == 0);
   REQUIRE(RunCli("compose --unregister") == 1);   // missing config path
+
+  SECTION("--version under every spelling");
+  REQUIRE(RunCli("--version") == 0);
+  REQUIRE(RunCli("-V") == 0);
+  REQUIRE(RunCli("version") == 0);
+
+  SECTION("viz argument errors never reach the runtime");
+  REQUIRE(RunCli("viz") == 1);                    // no action
+  REQUIRE(RunCli("viz --help") == 0);
+  REQUIRE(RunCli("viz -h") == 0);
+  REQUIRE(RunCli("viz status --help") == 0);
+  REQUIRE(RunCli("viz bogus") == 1);              // unknown action
+  REQUIRE(RunCli("viz status --port 1") == 1);    // options are start-only
+  REQUIRE(RunCli("viz start --bogus") == 1);
+  REQUIRE(RunCli("viz start --port") == 1);       // missing value
+  REQUIRE(RunCli("viz start --port 70000") == 1); // out of range
+  REQUIRE(RunCli("viz start --port 12ab") == 1);  // not a number
+  REQUIRE(RunCli("viz start --bind \"\"") == 1);  // empty
+  REQUIRE(RunCli("viz start --bind 'a&b'") == 1); // would split the query
 }
 
 //==============================================================================
@@ -533,6 +552,11 @@ TEST_CASE("CliClientError - commands fail fast without a runtime",
   REQUIRE(RunCli("compose " + (tmp.path / "compose.yaml").string()) == 1);
   REQUIRE(RunCli("compose --unregister " +
                  (tmp.path / "compose.yaml").string()) == 1);
+
+  SECTION("viz reports the runtime as unreachable (exit 2)");
+  REQUIRE(RunCli("viz status") == 2);
+  REQUIRE(RunCli("viz start --port 0") == 2);
+  REQUIRE(RunCli("viz stop") == 2);
 }
 
 //==============================================================================
@@ -599,6 +623,29 @@ TEST_CASE("CliRuntime - client commands against a live runtime",
   int migrate_rc = RunCliTimed({"migrate", "--pool-id", "320.0",
                                 "--container-id", "0", "--node-id", "1"}, 60);
   REQUIRE((migrate_rc == 0 || migrate_rc == 1));
+
+  SECTION("viz stop/status/start/status round trip");
+  // Whatever the daemon's configured dashboard state, stop converges it.
+  REQUIRE(RunCliTimed({"viz", "stop"}, 60) == 0);
+  REQUIRE(RunCliTimed({"viz", "stop"}, 60) == 0);   // idempotent
+  REQUIRE(RunCliTimed({"viz", "status"}, 60) == 1);  // not running
+#if CLIO_RUN_HAS_POCO
+  // A query may not move the dashboard off loopback unless the runtime's
+  // configuration names that address (here it names the default, loopback).
+  REQUIRE(RunCliTimed({"viz", "start", "--port", "0", "--bind", "0.0.0.0"},
+                      60) == 1);
+  REQUIRE(RunCliTimed({"viz", "status"}, 60) == 1);
+  // Ephemeral port: CI runs many daemons at once.
+  REQUIRE(RunCliTimed({"viz", "start", "--port", "0", "--bind", "127.0.0.1"},
+                      60) == 0);
+  REQUIRE(RunCliTimed({"viz", "status"}, 60) == 0);
+  REQUIRE(RunCliTimed({"viz", "start"}, 60) == 0);   // already running
+  REQUIRE(RunCliTimed({"viz", "stop"}, 60) == 0);
+  REQUIRE(RunCliTimed({"viz", "status"}, 60) == 1);
+#else
+  // Built without Poco: the dashboard cannot start, and says so.
+  REQUIRE(RunCliTimed({"viz", "start", "--port", "0"}, 60) == 1);
+#endif
 
   SECTION("stop shuts the runtime down cleanly");
   REQUIRE(RunCliTimed({"stop", "--grace-period", "2000"}, 90) == 0);

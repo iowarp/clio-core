@@ -19,11 +19,45 @@ namespace clio::cte::filesystem {
 CLIO_CTE_FS_DEFINE_GLOBAL_PTR_VAR_CC(clio::cte::filesystem::Client, g_fs_client);
 
 /**
- * Create-or-bind the default filesystem pool over the default CTE core pool
- * and publish the process-wide client. Mirrors
- * clio::cte::core::CLIO_CTE_CLIENT_INIT / ContentTransferEngine::ClientInit:
- * GetOrCreatePool is idempotent, so this both creates the pool on first call
- * and binds to the existing one if a launcher already composed it.
+ * Find the filesystem pool this process should use, by name or id.
+ * @param fs_client client to bind (pool_id_ is set on success)
+ * @param pool_query routing of the lookup
+ * @return true when the pool exists
+ */
+static bool ResolveFsPool(Client *fs_client,
+                          const clio::run::PoolQuery &pool_query) {
+  std::string target = kCfsPoolName;
+  if (const char *env = std::getenv("CLIO_CFS_POOL")) {
+    if (*env != '\0') target = env;
+  }
+  unsigned major = 0, minor = 0;
+  char tail = 0;
+  if (std::sscanf(target.c_str(), "%u.%u%c", &major, &minor, &tail) == 2) {
+    fs_client->Init(clio::run::PoolId(major, minor));
+    return true;
+  }
+  // A get-or-create with no pool id is a lookup by name: it returns the
+  // existing pool's id and creates nothing (the admin waits for compose to
+  // create a pool its config names, so a client racing startup still binds).
+  auto lookup = fs_client->AsyncCreate(pool_query, target,
+                                       clio::run::PoolId::GetNull(),
+                                       FilesystemConfig());
+  lookup.Wait();
+  if (lookup->GetReturnCode() != 0 || lookup->new_pool_id_.IsNull()) {
+    HLOG(kError,
+         "CFS ClientInit: no filesystem pool named '{}' (rc={}); compose a "
+         "clio_cte_filesystem pool with that pool_name, or set CLIO_CFS_POOL",
+         target, lookup->GetReturnCode());
+    return false;
+  }
+  fs_client->Init(lookup->new_pool_id_);
+  return true;
+}
+
+/**
+ * Bind the process-wide filesystem client to the composed filesystem pool
+ * and to the pools that pool is configured with. Creates no pool: the
+ * deployment's compose owns every pool and its id.
  */
 bool CLIO_CFS_CLIENT_INIT(const std::string &config_path,
                           const clio::run::PoolQuery &pool_query) {
@@ -32,32 +66,23 @@ bool CLIO_CFS_CLIENT_INIT(const std::string &config_path,
     return true;
   }
   (void)config_path;  // configuration now flows through clio compose
-
-  // The filesystem chimod sits over the default CTE core pool, so make sure
-  // that exists first (also brings up the runtime client / IPC).
-  if (!clio::cte::core::CLIO_CTE_CLIENT_INIT()) {
-    HLOG(kError, "CFS ClientInit: failed to initialize the CTE core pool");
+  if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, false)) {
+    HLOG(kError, "CFS ClientInit: runtime client init failed");
     return false;
   }
 
   // CLIO_CFS_CLIENT lazily allocates the global Client on first access.
   auto *fs_client = CLIO_CFS_CLIENT;
-  if (fs_client == nullptr) {
+  if (fs_client == nullptr || !ResolveFsPool(fs_client, pool_query)) {
     return false;
   }
-  fs_client->Init(kCfsPoolId);
-
-  FilesystemConfig params;
-  params.next_pool_id_ = clio::cte::core::kCtePoolId;
-  auto create_task =
-      fs_client->AsyncCreate(pool_query, kCfsPoolName, kCfsPoolId, params);
-  create_task.Wait();
-  if (create_task->GetReturnCode() != 0) {
-    HLOG(kError, "CFS ClientInit: failed to create filesystem pool '{}' (rc={})",
-         kCfsPoolName, create_task->GetReturnCode());
+  if (!fs_client->BindPools()) {
+    HLOG(kError,
+         "CFS ClientInit: filesystem pool {}.{} did not report its data and "
+         "stream pools", fs_client->pool_id_.major_,
+         fs_client->pool_id_.minor_);
     return false;
   }
-  fs_client->pool_id_ = create_task->new_pool_id_;
 
   // issue #817: attach the filesystem attribute cache. Must run AFTER pool_id_
   // is set -- the directory is keyed by pool. Failure is not an error: it just
@@ -261,15 +286,10 @@ int Client::SyncFd(int fd) {
   if (!LookupFd(fd, &of)) {
     return -1;
   }
-  // Wait for every deferred write on this file and report a latched failure
-  // exactly once — fsync and close are the only two places a deferred write's
-  // failure can reach the application.
-  if (Flush(of.path) != 0) {
-    return -1;
-  }
-  // Then put the bytes on a persistent device. Draining alone left them on
-  // whatever tier took them (RAM) until the periodic flush, while the same
-  // file fsynced through the FUSE mount was durable (#1188).
+  // Writes are synchronous, so every write(2) already landed; put the bytes
+  // on a persistent device. Otherwise they stay on whatever tier took them
+  // (RAM) until the periodic flush, while the same file fsynced through the
+  // FUSE mount was durable (#1188).
   int rc = SyncDurable(TagOfPath(of.path, /*want_dir=*/false),
                        FsParentDir(of.path));
   if (rc != 0) {
@@ -294,8 +314,10 @@ int Client::SyncTagDurable(const clio::cte::core::TagId &tag, bool *lost_node,
   if (lost_node != nullptr) *lost_node = false;
   if (liveness_change_ns != nullptr) *liveness_change_ns = 0;
   if (FsyncDeferred()) return 0;
-  auto *cte_c = CLIO_CTE_CLIENT;
-  if (cte_c == nullptr || tag.IsNull()) return 0;
+  // Through the filesystem's own chain: a cache above the cores flushes
+  // its dirty copies of the tag before the cores sync.
+  auto *cte_c = CLIO_CFS_CLIENT->Cte();
+  if (cte_c->pool_id_.IsNull() || tag.IsNull()) return 0;
   auto fut = cte_c->AsyncSyncTag(tag);
   fut.Wait();
   const bool deferred = fut->deferred_ != 0;
@@ -332,9 +354,8 @@ int Client::SyncFileSize(const clio::cte::core::TagId &tag) {
   if (tag.IsNull()) return 0;
   const clio::run::u64 packed = FsPack(tag);
   if (!FsIdHasHome(packed)) return 0;
-  clio::cte::stream::Client stream;
-  auto f = stream.AsyncSizeOp(tag, FsIdHome(packed),
-                              clio::cte::stream::StreamSizeOp::kSync);
+  auto f = CLIO_CFS_CLIENT->Stream()->AsyncSizeOp(
+      tag, FsIdHome(packed), clio::cte::stream::StreamSizeOp::kSync);
   f.Wait();
   const clio::run::u32 rc = f->GetReturnCode();
   if (rc == 0) return 0;
@@ -399,9 +420,6 @@ int Client::TruncatePath(const std::string &raw_path, FsOff length) {
     return -1;
   }
   std::string path = StripClioPrefix(raw_path);
-  // Order matters: a deferred write that landed AFTER the truncate would undo
-  // it, so drain before resizing (issue #817).
-  Flush(path);
   auto t = AsyncTruncate(path, static_cast<clio::run::u64>(length));
   t.Wait();
   if (t->GetReturnCode() != 0) {
@@ -417,9 +435,6 @@ int Client::RemovePath(const std::string &raw_path) {
     return -1;
   }
   std::string path = StripClioPrefix(raw_path);
-  // Drain first: a write still deferred against a deleted path would
-  // resurrect the tag.
-  Flush(path);
   auto t = AsyncUnlink(path);
   t.Wait();
   if (t->GetReturnCode() != 0) {
@@ -436,11 +451,6 @@ int Client::RenamePath(const std::string &raw_src, const std::string &raw_dst) {
   }
   std::string src = StripClioPrefix(raw_src);
   std::string dst = StripClioPrefix(raw_dst);
-  // Both sides drain: a deferred write to either path must land before the
-  // namespace moves, or it would be applied to a name that no longer means
-  // the same file.
-  Flush(src);
-  Flush(dst);
   auto t = AsyncRename(src, dst);
   t.Wait();
   if (t->GetReturnCode() != 0) {
@@ -475,7 +485,6 @@ int Client::ReaddirPath(const std::string &raw_path, std::vector<std::string> *o
 
 int Client::CloseFd(int fd) {
   clio::run::u64 handle;
-  std::string path;
   {
     std::lock_guard<std::mutex> g(fd_mu_);
     auto it = fds_.find(fd);
@@ -484,20 +493,11 @@ int Client::CloseFd(int fd) {
       return -1;
     }
     handle = it->second.handle;
-    path = it->second.path;
     fds_.erase(it);
   }
-  // Drain BEFORE releasing the chimod handle: a deferred write names that
-  // handle, and the runtime answers EBADF once it is gone (issue #817).
-  // close(2) is also the last chance to report a latched write failure, which
-  // is why its return code is not simply the Close task's.
-  int werr = Flush(path);
+  // Writes are synchronous, so nothing is pending against the handle.
   auto t = AsyncClose(handle);
   t.Wait();
-  if (werr != 0) {
-    errno = EIO;
-    return -1;
-  }
   return (t->GetReturnCode() == 0) ? 0 : -1;
 }
 

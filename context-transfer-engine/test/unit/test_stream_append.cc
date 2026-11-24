@@ -153,6 +153,9 @@ std::string ReadStream(const TagId &tag, clio::run::u64 size) {
 }
 
 /** Stream size at the home. */
+/** The stream pool this test composes (no stream pool id is assumed). */
+const clio::run::PoolId kTestStreamPool(565, 0);
+
 clio::run::u64 SizeOf(clio::cte::stream::Client &s, const TagId &tag) {
   auto f = s.AsyncSizeOp(tag, kHome, StreamSizeOp::kGet);
   f.Wait();
@@ -182,7 +185,7 @@ std::string Record(int writer, int seq) {
 
 TEST_CASE("Stream sizes", "[stream]") {
   StreamFixture fx;
-  clio::cte::stream::Client s;
+  clio::cte::stream::Client s(kTestStreamPool);
   TagId tag = MakeTag("stream_sizes");
   auto op = [&](StreamSizeOp o, clio::run::u64 v, clio::run::u64 *old_sz) {
     auto f = s.AsyncSizeOp(tag, kHome, o, v);
@@ -206,7 +209,7 @@ TEST_CASE("Stream sizes", "[stream]") {
 TEST_CASE("Stream concurrent appends merge exactly once, in writer order",
           "[stream]") {
   StreamFixture fx;
-  clio::cte::stream::Client s;
+  clio::cte::stream::Client s(kTestStreamPool);
   TagId tag = MakeTag("stream_writers");
   std::vector<std::thread> ts;
   std::vector<int> failures(kWriters, 0);
@@ -236,7 +239,7 @@ TEST_CASE("Stream concurrent appends merge exactly once, in writer order",
 
 TEST_CASE("Stream appends spanning page boundaries", "[stream]") {
   StreamFixture fx;
-  clio::cte::stream::Client s;
+  clio::cte::stream::Client s(kTestStreamPool);
   TagId tag = MakeTag("stream_pages");
   constexpr int kChunks = 5;
   constexpr size_t kChunk = 700 * 1024;
@@ -255,7 +258,7 @@ TEST_CASE("Stream appends spanning page boundaries", "[stream]") {
 
 TEST_CASE("Stream append after truncate lands at the new end", "[stream]") {
   StreamFixture fx;
-  clio::cte::stream::Client s;
+  clio::cte::stream::Client s(kTestStreamPool);
   TagId tag = MakeTag("stream_trunc");
   const std::string a(1000, 'A');
   const std::string b(20, 'B');
@@ -271,7 +274,7 @@ TEST_CASE("Stream append after truncate lands at the new end", "[stream]") {
 
 TEST_CASE("Stream appends to a dropped stream are discarded", "[stream]") {
   StreamFixture fx;
-  clio::cte::stream::Client s;
+  clio::cte::stream::Client s(kTestStreamPool);
   auto *cte = CLIO_CTE_CLIENT;
   TagId tag = MakeTag("stream_dropped");
   auto d = s.AsyncSizeOp(tag, kHome, StreamSizeOp::kDrop);
@@ -290,10 +293,13 @@ TEST_CASE("Stream appends to a dropped stream are discarded", "[stream]") {
   st.Wait();
   char prefix[64];
   std::snprintf(prefix, sizeof(prefix), "sa.%x.%x.", tag.major_, tag.minor_);
-  // Discarded staged bytes are reaped in the background: wait for it.
+  // Discarded staged bytes are reaped in the background: wait for it, under
+  // a long deadline (a reap that never happens still fails).
   bool clean = false;
-  for (int attempt = 0; attempt < 100 && !clean; ++attempt) {
-    auto blobs = cte->AsyncGetContainedBlobs(st->tag_id_);
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(60);
+  while (!clean && std::chrono::steady_clock::now() < deadline) {
+    auto blobs = cte->AsyncGetContainedBlobs(st->tag_id_, clio::run::PoolQuery::Broadcast());
     blobs.Wait();
     clean = true;
     for (const auto &n : blobs->blob_names_) {

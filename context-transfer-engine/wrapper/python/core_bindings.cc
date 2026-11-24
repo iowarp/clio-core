@@ -743,65 +743,66 @@ NB_MODULE(clio_cte_core_ext, m) {
          "tag_id"_a, "blob_name"_a, "data_size"_a, "off"_a = 0,
          "Asynchronously get blob data into a private buffer (issue #823). "
          "Returns a Future; .result() -> bytes.")
-     .def("AsyncPutBlobDefer",
+     .def("PutBlob",
          [](clio::cte::core::Client &self, const clio::cte::core::TagId &tag_id,
-            const std::string &blob_name, nb::bytes data, size_t off,
-            clio::run::u64 max_inflight_bytes) {
-           // The client stages its own SHM copy at submit -- `data` is free
-           // the moment this returns, in every mode. Submission may await
-           // older puts when shared memory is full, so release the GIL.
+            const std::string &blob_name, nb::bytes data, size_t off) {
+           // Synchronous: `data` is free the moment this returns. With the
+           // shm cache connected this is a copy into its segment (no task);
+           // otherwise a task the call waits on, so release the GIL.
            const char *ptr = data.c_str();
            size_t len = data.size();
-           int rc;
-           {
-             nb::gil_scoped_release release;
-             rc = self.AsyncPutBlobDefer(
-                 tag_id, blob_name, off, len, ptr, -1.0f,
-                 clio::cte::core::Context(), 0,
-                 clio::run::PoolQuery::Dynamic(), max_inflight_bytes);
-           }
-           return rc;
+           nb::gil_scoped_release release;
+           return self.PutBlob(tag_id, blob_name, off, len, ptr);
          },
          "tag_id"_a, "blob_name"_a, "data"_a, "off"_a = 0,
-         "max_inflight_bytes"_a = 0,
-         "Deferred async put (issue #862): stages an SHM copy and registers "
-         "the put in the client's pending registry; grows until shared memory "
-         "is exhausted, then awaits oldest puts (max_inflight_bytes adds an "
-         "optional pacing wall; 0 = none). 0 = submitted; poll "
-         "DeferErrorCount() for completion failures.")
-     .def("AsyncGetBlobDefer",
+         "Synchronous put from a private buffer: the shm cache path when "
+         "connected, else the task path. Returns the return code "
+         "(0 = success).")
+     .def("GetBlob",
          [](clio::cte::core::Client &self, const clio::cte::core::TagId &tag_id,
-            const std::string &blob_name, size_t data_size, size_t off) {
-           auto buf = std::make_shared<std::string>(data_size, '\0');
-           using TaskT = clio::cte::core::GetBlobTask;
-           clio::run::Future<TaskT> fut;
+            const std::string &blob_name, size_t data_size,
+            size_t off) -> nb::object {
+           std::string buf(data_size, '\0');
+           clio::run::u32 rc;
            {
              nb::gil_scoped_release release;
-             fut = self.AsyncGetBlobDefer(tag_id, blob_name, off, data_size,
-                                          buf->data());
+             rc = self.GetBlob(tag_id, blob_name, off, data_size, buf.data());
            }
-           return MakePyFuture<TaskT>(std::move(fut), [buf](TaskT *) {
-             return nb::bytes(buf->data(), buf->size());
-           });
+           if (rc != 0) {
+             return nb::none();
+           }
+           return nb::bytes(buf.data(), buf.size());
          },
          "tag_id"_a, "blob_name"_a, "data_size"_a, "off"_a = 0,
-         "Read-after-write-consistent async get: completes any pending "
-         "deferred put(s) for this blob first, then reads. Returns a Future; "
-         ".result() -> bytes.")
-     .def("AwaitPutsUntilSpace",
-         [](clio::cte::core::Client &, clio::run::u64 max_inflight_bytes) {
+         "Synchronous get: the shm cache path when connected and the range is "
+         "cached, else the task path. Returns bytes, or None on failure.")
+     .def("GetBlobSize",
+         [](clio::cte::core::Client &self, const clio::cte::core::TagId &tag_id,
+            const std::string &blob_name) -> nb::object {
+           clio::run::u64 size = 0;
+           clio::run::u32 rc;
+           {
+             nb::gil_scoped_release release;
+             rc = self.GetBlobSize(tag_id, blob_name, &size);
+           }
+           if (rc != 0) {
+             return nb::none();
+           }
+           return nb::int_(size);
+         },
+         "tag_id"_a, "blob_name"_a,
+         "Blob size: from the shm cache when it knows it, else a task. "
+         "Returns the size, or None when the blob does not exist.")
+     .def("ConnectCache",
+         [](clio::cte::core::Client &self) {
            nb::gil_scoped_release release;
-           return clio::cte::core::Client::AwaitPutsUntilSpace(
-               max_inflight_bytes);
+           return self.ConnectCache();
          },
-         "max_inflight_bytes"_a,
-         "Await oldest deferred puts until at most max_inflight_bytes of "
-         "payload remain in flight (0 = drain all). Returns in-flight bytes.")
-     .def("DeferErrorCount",
-         [](clio::cte::core::Client &) {
-           return clio::cte::core::Client::DeferErrorCount();
-         },
-         "Deferred puts that completed with a nonzero return code (sticky).")
+         "Connect this client (bound to the shm cache pool or its entry "
+         "pool) to the shm cache, with the keys the CTE Create returns. "
+         "Returns True when connected.")
+     .def("HasCache", &clio::cte::core::Client::HasCache,
+         "True when this client is connected to a shm cache segment.")
      .def("AsyncDelBlob",
          [](clio::cte::core::Client &self, const clio::cte::core::TagId &tag_id,
             const std::string &blob_name) {
@@ -834,7 +835,7 @@ NB_MODULE(clio_cte_core_ext, m) {
             const clio::run::PoolQuery &target_query,
             const clio::run::PoolId &bdev_id,
             const clio::run::PoolQuery &pool_query, uint32_t attach_existing,
-            uint64_t growth_unit) {
+            uint64_t growth_unit, int32_t persistence_level) {
            using TaskT = clio::cte::core::RegisterTargetTask;
            clio::run::Future<TaskT> fut;
            {
@@ -842,7 +843,7 @@ NB_MODULE(clio_cte_core_ext, m) {
              fut = self.AsyncRegisterTarget(target_name, bdev_type,
                                             total_size, target_query, bdev_id,
                                             pool_query, attach_existing,
-                                            growth_unit);
+                                            growth_unit, persistence_level);
            }
            return MakePyFuture<TaskT>(std::move(fut));
          },
@@ -852,7 +853,11 @@ NB_MODULE(clio_cte_core_ext, m) {
          "pool_query"_a = clio::run::PoolQuery::Dynamic(),
          "attach_existing"_a = uint32_t{0},
          "growth_unit"_a = uint64_t{1} << 30,
+         "persistence_level"_a = int32_t{-1},
          "Asynchronously register a storage target. .wait() -> rc. "
+         "persistence_level labels the bdev (0 volatile, 1 temporary, 2 "
+         "long_term; -1 = from the core's config, else volatile): a "
+         "persistent core refuses a volatile bdev (rc 16). "
          "The original three-argument call retains native defaults. Supply "
          "an explicit stable bdev_id when creating a managed target; null "
          "does not allocate a new pool ID. Registration does not resize an "

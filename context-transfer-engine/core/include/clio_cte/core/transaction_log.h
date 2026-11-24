@@ -128,6 +128,13 @@ enum class TxnType : uint8_t {
    * key is empty.
    */
   kDelTagXattr = 11,
+  /**
+   * A name was bound to a tag on the container that holds the name's
+   * binding (TxnCreateTag payload). Replay rebinds; a later record wins.
+   */
+  kBindName = 12,
+  /** A name's binding was dropped (TxnCreateTag payload: name, its tag). */
+  kUnbindName = 13,
 };
 
 /** A single block entry within TxnExtendBlob */
@@ -281,9 +288,51 @@ class TransactionLog {
    *  left exactly as it is -- appending must never rewrite bytes a
    *  not-yet-replayed reader may still need. */
   void Open(const std::string &file_path, clio::run::u64 capacity_bytes) {
+    Configure(file_path, capacity_bytes);
+    OpenFile();
+  }
+
+  /**
+   * Set the shard's file and capacity without opening it. Records logged
+   * while the shard is not open are dropped (WriteRecord), which is how a
+   * volatile core keeps its shards without writing a WAL.
+   * @param file_path path of this shard's file
+   * @param capacity_bytes compaction threshold for this shard
+   */
+  void Configure(const std::string &file_path, clio::run::u64 capacity_bytes) {
     file_path_ = file_path;
     capacity_bytes_ = capacity_bytes;
     buffer_.reserve(4096);
+  }
+
+  /**
+   * Start logging to the configured file (the core became persistent).
+   * Serialized with Log() by the shard mutex, so a concurrent record is
+   * either dropped or fully written.
+   */
+  void Activate() {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!ofs_.is_open()) OpenFile();
+  }
+
+  /**
+   * Stop logging (the core became volatile): flush and close the file.
+   * Later records are dropped until Activate().
+   */
+  void Deactivate() {
+    std::lock_guard<std::mutex> lk(mu_);
+    Close();
+  }
+
+  /** @return true while records are being written to the file */
+  bool IsActive() {
+    std::lock_guard<std::mutex> lk(mu_);
+    return ofs_.is_open();
+  }
+
+ private:
+  /** Open file_path_ for append; a new or empty file gets the magic. */
+  void OpenFile() {
     namespace fs = std::filesystem;
     // error_code overload: the file can vanish between a check and the stat
     // (a test or a compaction removing it); never throw out of a coroutine.
@@ -295,6 +344,8 @@ class TransactionLog {
       WriteMagic();
     }
   }
+
+ public:
 
   /**
    * Global sequence-number source for records this log writes (issue: WAL
@@ -608,6 +659,7 @@ class TransactionLog {
    */
   void TruncateThrough(clio::run::u64 seq) {
     std::lock_guard<std::mutex> lk(mu_);
+    const bool was_open = ofs_.is_open();
     if (ofs_.is_open()) {
       ofs_.flush();
       ofs_.close();
@@ -629,7 +681,8 @@ class TransactionLog {
       HLOG(kError, "TransactionLog: could not rewrite {}; keeping it whole",
            file_path_);
     }
-    ofs_.open(file_path_, std::ios::binary | std::ios::app);
+    // A deactivated shard (volatile core) stays closed.
+    if (was_open) ofs_.open(file_path_, std::ios::binary | std::ios::app);
   }
 
   /** Sync then close the file handle */

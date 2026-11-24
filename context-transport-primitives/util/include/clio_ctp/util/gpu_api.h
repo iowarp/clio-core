@@ -51,8 +51,10 @@
 #endif
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <thread>
+#include <cstdlib>
 #include <chrono>
 #include <atomic>
 #include <string>
@@ -78,6 +80,7 @@
 #if !defined(_WIN32)
 extern "C" void clio_evlat_add(int which, unsigned long long cycles)
     __attribute__((weak));
+extern "C" double clio_evlat_cycles_per_us() __attribute__((weak));
 #endif
 
 extern "C" void ctp_copy_kernel_launch(char *dst, const char *src, size_t n,
@@ -98,6 +101,15 @@ inline void EvlatAdd(int which, unsigned long long cycles) {
   (void)which;
   (void)cycles;
 #endif
+}
+
+/** TSC cycles per microsecond the runtime's latency report divides by
+ *  (measured at startup), or 2995 when no runtime is linked / on Windows. */
+inline double EvlatCyclesPerUs() {
+#if !defined(_WIN32)
+  if (clio_evlat_cycles_per_us != nullptr) return clio_evlat_cycles_per_us();
+#endif
+  return 2995.0;
 }
 
 /** @return true when the latency-report hook is linked in. */
@@ -183,7 +195,7 @@ class GpuApi {
 #elif CTP_ENABLE_SYCL
     auto platforms = sycl::platform::get_platforms();
     for (auto &p : platforms) {
-      auto devs = p.get_devices(sycl::info::device_type::gpu);
+      auto devs = p.get_devices(SyclDeviceType());
       ngpu += static_cast<int>(devs.size());
     }
 #endif
@@ -258,7 +270,7 @@ class GpuApi {
     stream = s;
 #endif
 #if CTP_ENABLE_SYCL
-    stream = new sycl::queue(sycl::gpu_selector_v,
+    stream = new sycl::queue(&GpuApi::SyclSelect,
                              sycl::property::queue::in_order{});
 #endif
     return stream;
@@ -441,34 +453,71 @@ class GpuApi {
     return dev;
   }
 
-  /** Free streams per device. Function-local so the header stays standalone. */
-  static std::unordered_map<int, std::vector<void *>> &StreamPool() {
-    static std::unordered_map<int, std::vector<void *>> pool;
-    return pool;
+  /**
+   * ALL stream-pool state, ONE PER PROCESS.
+   *
+   * This used to be function-local statics in these inline methods. On ELF
+   * that is one copy per process (the dynamic linker merges them). On
+   * WINDOWS EVERY DLL GETS ITS OWN COPY: the runtime warmed its pool,
+   * clio_bdev_runtime.dll saw an un-warmed one, bootstrapped a single stream
+   * and then spun on nullptr -- a gpu_vector fault livelock ("bdev write has
+   * waited ~10s for a stream (outstanding=1)", then ROUND CAP HIT). On
+   * Windows the first module to ask publishes the state's address in the
+   * process environment (shared by every DLL under the dynamic UCRT, /MD)
+   * and every other module adopts it. No <windows.h>: its macros collide
+   * with names across this tree.
+   */
+  struct StreamPoolState {
+    std::unordered_map<int, std::vector<void *>> pool;
+    std::mutex mtx;
+    std::atomic<long> borrows{0}, returns{0}, warmed{0};
+    std::unordered_map<int, bool> pool_warmed;
+    std::vector<void *> reserved;
+    std::atomic<int> reserved_next{0};
+  };
+  static StreamPoolState &PoolState() {
+#if defined(_WIN32)
+    static StreamPoolState *state = [] {
+      constexpr const char *kVar = "CTP_GPU_STREAM_POOL_ADDR";
+      auto adopt = [&]() -> StreamPoolState * {
+        const char *v = std::getenv(kVar);
+        if (v == nullptr || *v == '\0') return nullptr;
+        return reinterpret_cast<StreamPoolState *>(
+            static_cast<uintptr_t>(std::strtoull(v, nullptr, 16)));
+      };
+      if (StreamPoolState *s = adopt()) return s;
+      auto *mine = new StreamPoolState();  // process lifetime, never freed
+      char buf[32];
+      std::snprintf(buf, sizeof(buf), "%llx",
+                    static_cast<unsigned long long>(
+                        reinterpret_cast<uintptr_t>(mine)));
+      if (std::getenv(kVar) == nullptr) _putenv_s(kVar, buf);
+      // Re-read: if another module won a concurrent first call, use its.
+      StreamPoolState *s = adopt();
+      return s != nullptr ? s : mine;
+    }();
+    return *state;
+#else
+    static StreamPoolState state;
+    return state;
+#endif
   }
 
-  static std::mutex &StreamPoolMutex() {
-    static std::mutex mtx;
-    return mtx;
+  /** Free streams per device. */
+  static std::unordered_map<int, std::vector<void *>> &StreamPool() {
+    return PoolState().pool;
   }
+
+  static std::mutex &StreamPoolMutex() { return PoolState().mtx; }
 
   /** Borrow/return accounting. Exhaustion with (borrows - returns) far below
    *  the warmed count means streams are LEAKING; equal to it means they are
    *  legitimately all in flight. Those need opposite fixes, and the stacks
    *  alone could not tell them apart. */
-  static std::atomic<long> &StreamBorrows() {
-    static std::atomic<long> n{0};
-    return n;
-  }
-  static std::atomic<long> &StreamReturns() {
-    static std::atomic<long> n{0};
-    return n;
-  }
+  static std::atomic<long> &StreamBorrows() { return PoolState().borrows; }
+  static std::atomic<long> &StreamReturns() { return PoolState().returns; }
   /** Streams handed out by WarmStreamPool, for comparison against the above. */
-  static std::atomic<long> &StreamWarmed() {
-    static std::atomic<long> n{0};
-    return n;
-  }
+  static std::atomic<long> &StreamWarmed() { return PoolState().warmed; }
 
   /**
    * Per-device free-list sizes, e.g. "dev0=0 dev1=64".
@@ -493,8 +542,7 @@ class GpuApi {
 
   /** Whether a device's pool has been pre-created. */
   static std::unordered_map<int, bool> &PoolWarmed() {
-    static std::unordered_map<int, bool> warmed;
-    return warmed;
+    return PoolState().pool_warmed;
   }
 
   /**
@@ -541,14 +589,8 @@ class GpuApi {
    * never yields, so a thread cannot re-enter it and cannot overlap two uses
    * of its own stream.
    */
-  static std::vector<void *> &ReservedStreams() {
-    static std::vector<void *> v;
-    return v;
-  }
-  static std::atomic<int> &ReservedNext() {
-    static std::atomic<int> n{0};
-    return n;
-  }
+  static std::vector<void *> &ReservedStreams() { return PoolState().reserved; }
+  static std::atomic<int> &ReservedNext() { return PoolState().reserved_next; }
 
   /**
    * This thread's reserved stream, or nullptr when the reserve is used up
@@ -1186,16 +1228,50 @@ class GpuApi {
 
 #if CTP_ENABLE_SYCL
   /**
-   * True if at least one SYCL GPU device is visible. Cached on first use:
-   * enumerating platforms on every per-op IsDevicePointer call would be far too
-   * slow. This is the guard that keeps a GPU-enabled build running on a host
-   * with no GPU — see SyclQueue()/IsDevicePointer() for why constructing a queue
-   * unconditionally is fatal there.
+   * The SYCL device type every queue and device query here uses.
+   *
+   * GPU by default. CTP_SYCL_DEVICE_TYPE=cpu selects a CPU device instead, so
+   * the same SYCL kernels run on a host with no GPU (CI, through an OpenCL CPU
+   * runtime). Read once and cached.
+   *
+   * @return sycl::info::device_type::cpu if CTP_SYCL_DEVICE_TYPE is "cpu",
+   *         otherwise sycl::info::device_type::gpu
+   */
+  static sycl::info::device_type SyclDeviceType() {
+    static const sycl::info::device_type type = [] {
+      const char *e = std::getenv("CTP_SYCL_DEVICE_TYPE");
+      return (e != nullptr && std::string(e) == "cpu")
+                 ? sycl::info::device_type::cpu
+                 : sycl::info::device_type::gpu;
+    }();
+    return type;
+  }
+
+  /**
+   * SYCL device selector for SyclDeviceType(): exactly sycl::gpu_selector_v
+   * on the default path (so device choice on real GPUs is unchanged), and
+   * sycl::cpu_selector_v under CTP_SYCL_DEVICE_TYPE=cpu.
+   *
+   * @param dev candidate device
+   * @return the selector score for dev (negative rejects it)
+   */
+  static int SyclSelect(const sycl::device &dev) {
+    return SyclDeviceType() == sycl::info::device_type::cpu
+               ? sycl::cpu_selector_v(dev)
+               : sycl::gpu_selector_v(dev);
+  }
+
+  /**
+   * True if at least one SYCL device of SyclDeviceType() is visible. Cached on
+   * first use: enumerating platforms on every per-op IsDevicePointer call
+   * would be far too slow. This is the guard that keeps a GPU-enabled build
+   * running on a host with no such device — see SyclQueue()/IsDevicePointer()
+   * for why constructing a queue unconditionally is fatal there.
    */
   static bool HasSyclGpuDevice() {
     static const bool has = [] {
       try {
-        return !sycl::device::get_devices(sycl::info::device_type::gpu).empty();
+        return !sycl::device::get_devices(SyclDeviceType()).empty();
       } catch (const sycl::exception &) {
         return false;
       }
@@ -1206,13 +1282,12 @@ class GpuApi {
   /**
    * Shared SYCL queue backing the GPU host-side helpers (Memcpy, Free,
    * Synchronize) and the device-pointer probe. Only ever call this when
-   * HasSyclGpuDevice() is true: sycl::gpu_selector_v (and even the default
-   * selector on this environment) throws "No device of requested type
-   * available" when no SYCL device is present, and an unhandled throw inside a
-   * coroutine task aborts the whole runtime server.
+   * HasSyclGpuDevice() is true: the selector throws "No device of requested
+   * type available" when no such SYCL device is present, and an unhandled
+   * throw inside a coroutine task aborts the whole runtime server.
    */
   static sycl::queue &SyclQueue() {
-    static sycl::queue q{sycl::gpu_selector_v};
+    static sycl::queue q{&GpuApi::SyclSelect};
     return q;
   }
 
@@ -1289,9 +1364,13 @@ class GpuApi {
             ev.get_profiling_info<sycl::info::event_profiling::command_start>();
         const auto t_end =
             ev.get_profiling_info<sycl::info::event_profiling::command_end>();
-        // The report divides by 2995 cycles per us; these are ns.
-        if (t_start >= t_sub) EvlatAdd(17, (t_start - t_sub) * 2995ull / 1000ull);
-        if (t_end >= t_start) EvlatAdd(18, (t_end - t_start) * 2995ull / 1000ull);
+        // The report divides by the runtime's measured TSC rate; these are
+        // ns, so scale by that same rate (2995 if no runtime is linked).
+        const double cyc_per_ns = EvlatCyclesPerUs() / 1000.0;
+        if (t_start >= t_sub)
+          EvlatAdd(17, static_cast<unsigned long long>((t_start - t_sub) * cyc_per_ns));
+        if (t_end >= t_start)
+          EvlatAdd(18, static_cast<unsigned long long>((t_end - t_start) * cyc_per_ns));
       } catch (const sycl::exception &) {
       }
     }

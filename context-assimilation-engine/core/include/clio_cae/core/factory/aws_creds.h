@@ -37,6 +37,7 @@
 #include <map>
 #include <sstream>
 #include <string>
+#include <vector>
 
 namespace clio::cae::core {
 
@@ -80,6 +81,26 @@ inline std::string Trim(const std::string &s) {
 }
 
 /**
+ * Split text into lines on '\n', as a std::getline loop would: the last line
+ * needs no '\n', and a final '\n' does not add an empty line. '\r' is kept.
+ *
+ * Plain string scanning on purpose: std::istringstream keeps its state in
+ * members written by the prebuilt libstdc++.so, which MSan cannot see, so every
+ * `while (std::getline(in, line))` test reads as uninitialized under MSan.
+ */
+inline std::vector<std::string> SplitLines(const std::string &text) {
+  std::vector<std::string> lines;
+  size_t pos = 0;
+  while (pos < text.size()) {
+    size_t nl = text.find('\n', pos);
+    if (nl == std::string::npos) nl = text.size();
+    lines.emplace_back(text, pos, nl - pos);
+    pos = nl + 1;
+  }
+  return lines;
+}
+
+/**
  * Parse an AWS-style INI file: [section] headers and `key = value` lines, with
  * `#`/`;` comments. Only top-level (non-indented) keys are captured -- nested
  * sub-settings (e.g. an `s3 =` block) are ignored, which is all this resolver
@@ -88,10 +109,8 @@ inline std::string Trim(const std::string &s) {
 using IniSections = std::map<std::string, std::map<std::string, std::string>>;
 inline IniSections ParseIni(const std::string &text) {
   IniSections out;
-  std::istringstream in(text);
-  std::string line;
   std::string section;
-  while (std::getline(in, line)) {
+  for (const std::string &line : SplitLines(text)) {
     // Strip inline comments only when they start the trimmed line; values may
     // legitimately contain '#'/';' so we do not split mid-value.
     std::string t = Trim(line);

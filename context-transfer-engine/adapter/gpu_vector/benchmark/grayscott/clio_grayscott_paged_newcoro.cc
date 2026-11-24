@@ -167,6 +167,44 @@ CTP_GPU_FUN CLIO_COROC_INLINE void SeedCoro(gv::DeviceVector<float> vec, u64 pla
   CO_AWAIT(vec.CoEndFlush());
 }
 
+/** --load-tag: bring plane z of u and v in from the storage tiers and leave
+ *  both resident (unpinned). Out of line for the same reason as
+ *  ResolvePlane: a suspending loop body inline has crashed IGC (AURORA.md 4).
+ *  @param vec    the vector
+ *  @param plane  elements per plane (= per page)
+ *  @param z      the plane
+ *  @param ubase  first element of u
+ *  @param vbase  first element of v */
+CTP_GPU_FUN __attribute__((noinline)) void LoadPlane(
+    gv::DeviceVector<float> vec, u64 plane, u64 z, u64 ubase, u64 vbase) {
+  gv::PageRef<float> h;
+  CO_AWAIT(vec.CoFetch(0, ubase + z * plane, plane, vbase + z * plane, plane));
+  h = CO_AWAIT(vec.CoHoldPage(ubase + z * plane, plane, /*write=*/false));
+  h = CO_AWAIT(vec.CoHoldPage(vbase + z * plane, plane, /*write=*/false));
+  h = {};
+  vec.UnpinRange2(ubase + z * plane, plane, vbase + z * plane, plane);
+}
+
+/** --load-tag: the timed LOAD phase. Reads this block's planes of u and v
+ *  back from the storage tiers (staged there, GPU cache dropped), as many as
+ *  fit in the block's share of the cache; the steps fault in the rest.
+ *  @param vec        the vector
+ *  @param plane      elements per plane
+ *  @param z0, z1     this block's planes [z0, z1)
+ *  @param ubase      first element of u
+ *  @param vbase      first element of v
+ *  @param max_planes planes this block may load (two pages each) */
+CTP_GPU_FUN CLIO_COROC_INLINE void LoadCoro(gv::DeviceVector<float> vec,
+                                            u64 plane, u64 z0, u64 z1,
+                                            u64 ubase, u64 vbase,
+                                            u64 max_planes) {
+  u64 np = 0;
+  for (u64 z = z0; z < z1 && np < max_planes; ++z) {
+    CO_AWAIT(LoadPlane(vec, plane, z, ubase, vbase));
+    ++np;
+  }
+}
+
 // GLOBAL, SAID OUT LOUD (see the kmeans edition). The step body is a call the
 // kernel does not inline, so IGC cannot prove a held plane's pointer is
 // global and every stencil load became a generic-address check plus a
@@ -529,6 +567,19 @@ void LaunchSeed(dim3 grid, dim3 block, const GpuInfo &info, DevF32 vec,
   });
 }
 
+/** --load-tag: launch the load phase (LoadCoro); blocks own planes as in
+ *  LaunchSeed. */
+void LaunchLoad(dim3 grid, dim3 block, const GpuInfo &info, DevF32 vec,
+                u64 plane, u64 zper, u64 ubase, u64 vbase, u64 zbase,
+                u64 zend, u64 max_planes, View vw, StackView sv) {
+  (void)info;
+  SubmitYieldable(grid, block, vec, vw, sv, [=](clio::co::Ctx &_cy, DevF32 dev, u32 blk) {
+    const u64 z0 = zbase + static_cast<u64>(blk) * zper;
+    const u64 z1 = (z0 + zper < zend) ? (z0 + zper) : zend;
+    LoadCoro(_cy, dev, plane, z0, z1, ubase, vbase, max_planes);
+  });
+}
+
 void LaunchStep(dim3 grid, dim3 block, const GpuInfo &info, DevF32 vec,
                 u64 plane, u64 nx, u64 ny, u64 nz, u64 zper, u64 ubase,
                 u64 vbase, u64 unext, u64 vnext, float Du, float Dv, float F,
@@ -712,6 +763,19 @@ __global__ GV_LAUNCH_BOUNDS void SeedKernel(GpuInfo info, DevF32 vec, u64 plane,
   CLIO_COROC_RUN(yv, ys, SeedCoro(_cy, vec, plane, nx, ny, nz, z0, z1, ubase, vbase, zbase, zend, all));
 }
 
+__global__ GV_LAUNCH_BOUNDS void LoadKernel(GpuInfo info, DevF32 vec, u64 plane,
+                                            u64 zper, u64 ubase, u64 vbase,
+                                            u64 zbase, u64 zend,
+                                            u64 max_planes, View yv,
+                                            StackView ys) {
+  CLIO_GPU_INIT(info, nullptr);
+  vec.Init(yv.Block());
+  __syncthreads();
+  const u64 z0 = zbase + static_cast<u64>(yv.Block()) * zper;
+  const u64 z1 = (z0 + zper < zend) ? (z0 + zper) : zend;
+  CLIO_COROC_RUN(yv, ys, LoadCoro(_cy, vec, plane, z0, z1, ubase, vbase, max_planes));
+}
+
 __global__ GV_LAUNCH_BOUNDS void StepKernel(GpuInfo info, DevF32 vec, u64 plane, u64 nx, u64 ny,
                            u64 nz, u64 zper, u64 ubase, u64 vbase, u64 zbase,
                            u64 zend, u64 unext,
@@ -778,6 +842,13 @@ void LaunchSeed(dim3 grid, dim3 block, const GpuInfo &info, DevF32 vec,
   SeedKernel<<<grid, block, CLIO_YIELD_SMEM_BYTES>>>(
       info, vec, plane, nx, ny, nz, zper, ubase, vbase, zbase, zend, vw,
       sv, all);
+}
+
+void LaunchLoad(dim3 grid, dim3 block, const GpuInfo &info, DevF32 vec,
+                u64 plane, u64 zper, u64 ubase, u64 vbase, u64 zbase,
+                u64 zend, u64 max_planes, View vw, StackView sv) {
+  LoadKernel<<<grid, block, CLIO_YIELD_SMEM_BYTES>>>(
+      info, vec, plane, zper, ubase, vbase, zbase, zend, max_planes, vw, sv);
 }
 
 void LaunchStep(dim3 grid, dim3 block, const GpuInfo &info, DevF32 vec,
@@ -909,6 +980,23 @@ class YieldRunner {
 
 }  // namespace
 
+/**
+ * Bytes a checkpoint's copy tag holds in CTE right now. For a lazy copy this is
+ * the copy-on-write material: blobs the run's writes forced into the copy, plus
+ * any the copy's own faults materialised.
+ * @param tag_name the copy tag (gv_gs_ck<id>)
+ * @return the tag's blob bytes, or 0 if the tag is unknown
+ */
+static u64 CheckpointTagBytes(const std::string &tag_name) {
+  auto *core = CLIO_CTE_CLIENT;
+  auto tf = core->AsyncGetOrCreateTag(tag_name);
+  tf.Wait();
+  if (tf->GetReturnCode() != 0) return 0;
+  auto sz = core->AsyncGetTagSize(tf->tag_id_);
+  sz.Wait();
+  return static_cast<u64>(sz->tag_size_);
+}
+
 int main(int argc, char **argv) {
   u32 blocks = 64, threads = 256, slots = 12, steps = 4;
   // --set-size N: cache SETS of N ways, as many as it takes to hold
@@ -939,6 +1027,11 @@ int main(int argc, char **argv) {
   // plane evictable and refetchable; resident runs (E1) keep edge-only
   // publishing.
   bool ooc = false;
+  // --load-tag NAME: the initial grids are LOADED, not generated. An untimed
+  // staging step publishes the seeded u and v to the CTE tiers under tag
+  // NAME and drops the GPU cache; the timed run reads them back through the
+  // vector (load phase, then the steps fault the rest from storage).
+  std::string load_tag;
   // GS_NO_COMPUTE=1 (diagnostic): every page operation runs, the stencil
   // arithmetic does not, so step time minus this is the stencil's share.
   const bool no_compute = getenv("GS_NO_COMPUTE") != nullptr;
@@ -998,6 +1091,13 @@ int main(int argc, char **argv) {
   // materialised inside the Copy) instead of lazy copy-on-write. Implies
   // --ckpt-final.
   bool ckpt_sync = false;
+  // --ckpt-lazy-only: each periodic checkpoint is a LAZY Copy that is never
+  // materialised by the benchmark. Its blobs come into existence by
+  // copy-on-write: the first simulation write to a grid blob makes the copy
+  // take that blob's pre-write bytes. So the checkpoint costs I/O only for
+  // what the run actually overwrites. Per-checkpoint CoW bytes are reported
+  // at the end of the run. Incompatible with --ckpt-sync and --ckpt-drain.
+  bool ckpt_lazy_only = false;
   // OPT-IN, NOT OPT-OUT. The end-of-run checkpoint arrived enabled by
   // default, which silently changes what an already-queued job measures:
   // the E1 scaling rungs were submitted against binaries without it and
@@ -1026,6 +1126,7 @@ int main(int argc, char **argv) {
     else if (a == "--plane-order" && i + 1 < argc) plane_cyclic = (std::string(argv[++i]) == "cyclic");
     else if (a == "--two-phase") two_phase = true;
     else if (a == "--ooc") ooc = true;
+    else if (a == "--load-tag" && i + 1 < argc) load_tag = argv[++i];
     else if (a == "--threads") threads = static_cast<u32>(next());
     else if (a == "--slots") slots = static_cast<u32>(next());
     else if (a == "--steps") steps = static_cast<u32>(next());
@@ -1054,6 +1155,7 @@ int main(int argc, char **argv) {
     else if (a == "--ckpt-every") ckpt_every = next();
     else if (a == "--ckpt-drain") ckpt_drain = true;
     else if (a == "--ckpt-sync") ckpt_sync = ckpt_final = true;
+    else if (a == "--ckpt-lazy-only") ckpt_lazy_only = true;
     else if (a == "--no-ckpt") ckpt_final = false;   // kept: now a no-op
     else if (a == "--ckpt-final") ckpt_final = true;
     else if (a == "--organizer-hint") organizer_hint = true;
@@ -1073,7 +1175,8 @@ int main(int argc, char **argv) {
                   "       [--pf-hot f] [--pf-warm f] [--pf-cold f] "
                   "[--pf-no-demote] [--pf-stall-every N]\n"
                   "       [--nvme-mb N] [--nvme-path P] [--ram-mb N]\n"
-                  "       [--ckpt-every N] [--ckpt-drain] [--ckpt-sync] [--ckpt-cold f]\n"
+                  "       [--ckpt-every N] [--ckpt-drain] [--ckpt-sync] [--ckpt-lazy-only] [--ckpt-cold f]\n"
+                  "       [--load-tag NAME] (needs --two-phase --ooc)\n"
                   "       [--hbm-score f] [--ram-score f] [--nvme-score f]\n"
                   "         tier scores: a tier scored ABOVE the vector's put "
                   "score (0.5) is\n"
@@ -1374,7 +1477,14 @@ int main(int argc, char **argv) {
       set_size_arg != 0 ? set_size_arg : (slots < 24u ? 24u : slots);
   const u32 vec_nsets =
       set_size_arg != 0 ? (cap_pages + set_size_arg - 1) / set_size_arg : 0;
-  gv::Vector<float> vec("gv_grayscott", {0}, page_bytes, blocks,
+  const bool load = !load_tag.empty();
+  if (load && !(ooc && two_phase)) {
+    std::fprintf(stderr, "GRAYSCOTT ERROR: --load-tag needs --two-phase --ooc "
+                 "(every plane must be refetchable from the tiers)\n");
+    return 2;
+  }
+  gv::Vector<float> vec(load ? load_tag.c_str() : "gv_grayscott", {0},
+                        page_bytes, blocks,
                         vec_set_size, n, clio::run::PoolId::GetNull(), 0, 1,
                         vec_nsets, set_size_arg != 0 ? cap_pages : 0);
   if (set_size_arg != 0) {
@@ -1431,6 +1541,10 @@ int main(int argc, char **argv) {
   }
   if (vec.HasPrefetchers()) runner.BindPrefetch(vec);
 
+  // With --load-tag this is the untimed STAGING step: u and v are published
+  // to the tiers (every plane) and the GPU cache is dropped after the seed
+  // barrier, so the device holds none of the input when the clock starts.
+  const double t_stage0 = NowMs();
   runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw, gy::YieldStackView sv) {
     gs::LaunchSeed(g, b, gpu, dev, plane, nx, ny, nz, zper, ubase, vbase,
                    zbase, zend, vw, sv, ooc ? 1u : 0u);
@@ -1442,11 +1556,14 @@ int main(int argc, char **argv) {
   // (16000 faults at 32 GB/node) inside the timed region -- a setup cost the
   // baselines do not pay. Seeding them with the same generator makes them
   // resident; step 0 overwrites every value, so the result is unchanged.
-  runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw, gy::YieldStackView sv) {
-    gs::LaunchSeed(g, b, gpu, dev, plane, nx, ny, nz, zper, unext, vnext,
-                   zbase, zend, vw, sv, 0u);
-  });
-  ctp::GpuApi::Synchronize();
+  // Not when loading: the cache is dropped below, which would discard them.
+  if (!load) {
+    runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw, gy::YieldStackView sv) {
+      gs::LaunchSeed(g, b, gpu, dev, plane, nx, ny, nz, zper, unext, vnext,
+                     zbase, zend, vw, sv, 0u);
+    });
+    ctp::GpuApi::Synchronize();
+  }
   // SEED BARRIER (before the clock). Step 0's halo fetch demands a peer's
   // generation-1 publish, and the runtime bounds that wait (~10 s). At 64
   // nodes start-up and seeding skew exceeds it: a node reached step 0 before
@@ -1457,6 +1574,18 @@ int main(int argc, char **argv) {
                                 "gsseed", 600)) {
     std::fprintf(stderr, "GRAYSCOTT ERROR: seed barrier failed\n");
     return 1;
+  }
+  const double stage_ms = NowMs() - t_stage0;
+  // Planes each block may load: three quarters of its share of the cache,
+  // two pages (u and v) per plane.
+  const u64 load_planes_per_block = (static_cast<u64>(slots) * 3 / 4) / 2;
+  if (load) {
+    vec.ClearCache();
+    ctp::GpuApi::Synchronize();
+    std::fprintf(stderr, "GRAYSCOTT STAGE tag=%s stage_ms=%.1f planes=%llu "
+                 "(u and v published to the tiers; GPU cache dropped)\n",
+                 load_tag.c_str(), stage_ms,
+                 (unsigned long long)(zend - zbase));
   }
   // No seed-side flush/invalidate. SeedCoro publishes its own
   // planes AS generation 1 (BeginFlush(1) + EndFlush), and step 0's halo
@@ -1548,6 +1677,8 @@ int main(int argc, char **argv) {
   };
 
   double best_ms = 1e30, checksum = 0.0;
+  // E5 accounting: the repeat with the smallest load + compute.
+  double best_total = 1e30, best_load_ms = 0.0, best_compute_ms = 0.0;
   u64 ckpt_id = 0, ckpt_pages = 0;
   double ckpt_ms = 0.0;
   for (int r = 0; r < repeat; ++r) {
@@ -1562,6 +1693,22 @@ int main(int argc, char **argv) {
                        zbase, zend, vw, sv, ooc ? 1u : 0u);
       });
       ctp::GpuApi::Synchronize();
+    }
+    double load_ms = 0.0;
+    if (load) {
+      // Every repeat starts cold: the input is only in the tiers. The seed
+      // published every plane and the outputs are rewritten by step 0, so
+      // dropping the frames loses nothing.
+      vec.ClearCache();
+      ctp::GpuApi::Synchronize();
+      const double tl0 = NowMs();
+      runner.Run([&](dim3 g, dim3 b, gy::YieldableView<> vw,
+                     gy::YieldStackView sv) {
+        gs::LaunchLoad(g, b, gpu, dev, plane, zper, ubase, vbase, zbase, zend,
+                       load_planes_per_block, vw, sv);
+      });
+      ctp::GpuApi::Synchronize();
+      load_ms = NowMs() - tl0;
     }
     vec.ResetStats();
     vec.ResetPrefetchStats();
@@ -1696,16 +1843,23 @@ int main(int argc, char **argv) {
       // materialise-only fault), so the bytes never cross to the host -- this
       // is a checkpoint being made durable, not a read-back.
       if (ckpt_every != 0 && ((s + 1) % ckpt_every) == 0) {
+        if (ckpt_lazy_only && (ckpt_sync || ckpt_drain)) {
+          std::fprintf(stderr, "GRAYSCOTT ERROR: --ckpt-lazy-only is "
+                       "incompatible with --ckpt-sync and --ckpt-drain\n");
+          return 1;
+        }
         const double ck0 = NowMs();
         // --ckpt-sync materialises inside the Copy; otherwise do it here.
         auto snap = vec.Copy("gv_gs_ck" + std::to_string(ckpt_id), ckpt_sync);
-        const u64 mat = ckpt_sync ? snap->NumPages() : snap->MaterializeAll();
-        if (mat == 0) {
-          std::fprintf(stderr, "GRAYSCOTT ERROR: checkpoint %llu failed to "
-                       "materialize\n", (unsigned long long)ckpt_id);
-          return 1;
+        if (!ckpt_lazy_only) {
+          const u64 mat = ckpt_sync ? snap->NumPages() : snap->MaterializeAll();
+          if (mat == 0) {
+            std::fprintf(stderr, "GRAYSCOTT ERROR: checkpoint %llu failed to "
+                         "materialize\n", (unsigned long long)ckpt_id);
+            return 1;
+          }
+          ckpt_pages += mat;
         }
-        ckpt_pages += mat;
         // DRAIN IT. A materialised checkpoint is written at blob score 1.0
         // (the handler puts at -1.0, which PutBlobImpl resolves to 1.0 for a
         // new blob), so it outranks the LIVE grid on every tier and parks
@@ -1725,6 +1879,11 @@ int main(int argc, char **argv) {
     ctp::GpuApi::Synchronize();
     const double ms = NowMs() - t0;
     if (ms < best_ms) best_ms = ms;
+    if (load_ms + ms < best_total) {
+      best_total = load_ms + ms;
+      best_load_ms = load_ms;
+      best_compute_ms = ms;
+    }
     if (gs_step_ms > 0.0) {
       if (two_phase) {
         // Everything but the stencil is the paging kernels (resolve, release,
@@ -1951,9 +2110,39 @@ int main(int argc, char **argv) {
   // MaterializeAll: nothing writes the field after it, so the lazy copy
   // cannot be overtaken by a later step.
   std::unique_ptr<gv::Vector<float>> final_ck;
+  double ckpt_final_ms = 0.0;
   if (ckpt_final) {
+    const double tc0 = NowMs();
     final_ck = clio_bench_ckpt::FinalCheckpoint(vec, "gv_gs_ckpt_final", nodes,
                                                  ckpt_sync);
+    ckpt_final_ms = NowMs() - tc0;
+  }
+  // E5 line: load (from the tiers) + compute (the steps, as ms= on the
+  // GRAYSCOTT line; periodic --ckpt-every snapshots are inside it) + the
+  // final checkpoint. Staging is not part of total.
+  std::fprintf(stderr,
+               "GRAYSCOTT E5 load_ms=%.1f compute_ms=%.1f ckpt_ms=%.1f "
+               "total_ms=%.1f stage_ms=%.1f periodic_ckpt_ms=%.1f load=%d "
+               "ckpt=%d ckpt_sync=%d ckpt_flushed_pages=%llu "
+               "ckpt_flushed_bytes=%llu ckpt_materialized_bytes=%llu\n",
+               best_load_ms, best_compute_ms, ckpt_final_ms,
+               best_load_ms + best_compute_ms + ckpt_final_ms, stage_ms,
+               ckpt_ms, load ? 1 : 0, ckpt_final ? 1 : 0, ckpt_sync ? 1 : 0,
+               (unsigned long long)(final_ck ? vec.LastFlushPages() : 0),
+               (unsigned long long)(final_ck ? vec.LastFlushBytes() : 0),
+               (unsigned long long)(final_ck && ckpt_sync
+                                        ? final_ck->NumPages() * page_bytes
+                                        : 0));
+  if (ckpt_lazy_only) {
+    u64 cow_total = 0;
+    for (u64 id = 0; id < ckpt_id; ++id) {
+      const u64 bytes = CheckpointTagBytes("gv_gs_ck" + std::to_string(id));
+      cow_total += bytes;
+      std::printf("GRAYSCOTT CKPT_COW id=%llu materialized_bytes=%llu\n",
+                  (unsigned long long)id, (unsigned long long)bytes);
+    }
+    std::printf("GRAYSCOTT CKPT_COW checkpoints=%llu total_materialized_bytes=%llu\n",
+                (unsigned long long)ckpt_id, (unsigned long long)cow_total);
   }
   // EXIT BARRIER: each rank embeds its node's runtime, so a rank that exits
   // early takes that node's containers with it, and a slower rank whose

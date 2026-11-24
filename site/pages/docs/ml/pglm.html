@@ -1,0 +1,57 @@
+<!--
+title: pglm
+heading: <em>pglm:</em> Poisson generalized linear model.
+description: API reference for clio-ml's Poisson regression module (log link, Newton/IRLS): Python fit_pglm and predict, C++ FitPoissonGlm and PoissonGlmPredict, PoissonGlmOptions.
+eyebrow: Docs · Machine learning
+lede: Poisson regression with a log link fitted by Newton's method (iteratively reweighted least squares), the equivalent of Spark MLlib's GeneralizedLinearRegression with family poisson, link log and solver irls. Each iteration is one paged pass.
+facts: Module | ml_pglm ; Header | clio_ml/poisson_glm.h ; Rows | features, then count
+-->
+<h2>What it does</h2>
+<p>The pass accumulates the weighted Hessian <code>sum mu x x^T</code>, the score <code>sum (y - mu) x</code> and the log-likelihood; the host solves the Newton step by Cholesky in double precision. A small ridge term is added to the Hessian diagonal. Bit-reproducible.</p>
+
+<h2>Rows</h2>
+<p><code>n_features</code> feature columns followed by the count target. <code>clio_ml.COLUMNS["pglm"]</code> is 1.</p>
+
+<h2>Python</h2>
+<pre data-label="python">
+import numpy as np, clio_ml as cm
+rng = np.random.default_rng(1)
+X = rng.normal(scale=0.3, size=(4096, 7)).astype(np.float32)
+y = rng.poisson(np.exp(0.5 * X[:, 0] + 0.2))
+data = np.column_stack([X, y]).astype(np.float32)
+
+r = cm.fit_pglm(data, iters=8)
+print(r.coef[:7], "intercept", r.coef[7])
+print(r.loglik[0], "->", r.loglik[-1])
+print(cm.predict("pglm", r, data[0, :7]))    # predicted mean count
+</pre>
+<ul>
+  <li><code>fit_pglm(X, **options)</code>.</li>
+  <li>Options (<code>PoissonGlmOptions</code>): <code>iters</code> (8), <code>ridge</code> (1e-6, relative to N), <code>threads</code> (256).</li>
+  <li>Result <code>PoissonGlmResult</code>: <code>coef</code> (<code>n_features</code> coefficients, then the intercept), <code>loglik</code> (mean <code>y*eta - mu</code> before each step), <code>stats</code>.</li>
+  <li><code>predict("pglm", r, x)</code> returns the predicted mean, <code>exp(coef . x + intercept)</code>.</li>
+</ul>
+
+<h2>C++</h2>
+<pre data-label="cpp">
+struct PoissonGlmOptions {
+  u32 iters = 8;
+  float ridge = 1e-6f;
+  u32 threads = 256;
+  ClusterExchange cluster;
+};
+struct PoissonGlmResult {
+  std::vector<float> coef;      // n_features coefficients, then intercept
+  std::vector<double> loglik;
+  VecStats stats;
+};
+PoissonGlmResult FitPoissonGlm(Dataset &ds, const PoissonGlmOptions &opt);
+PoissonGlmResult FitPoissonGlmPlain(const float *data, u64 n_rows, u32 nf,
+                                    u64 elems_per_page, u32 nblocks,
+                                    const PoissonGlmOptions &opt);
+PoissonGlmResult FitPoissonGlmReference(/* same arguments */);
+float PoissonGlmPredict(const std::vector<float> &coef, const float *x);  // mean
+</pre>
+<p>The ChiMod is module <code>ml_pglm</code>.</p>
+
+<p>Related: <a href="/docs/ml/linreg.html">linear regression</a>, <a href="/docs/ml/aft.html">AFT survival regression</a>.</p>
