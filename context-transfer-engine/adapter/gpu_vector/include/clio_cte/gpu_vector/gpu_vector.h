@@ -40,6 +40,9 @@
 #include <cstdlib>
 #include <string>
 #include <vector>
+#include <unordered_map>
+#include <mutex>
+#include <list>
 
 namespace clio::cte::gpu_vector {
 
@@ -57,30 +60,53 @@ namespace clio::cte::gpu_vector {
  * implied by it).
  */
 
-/** A device-resident task region and its host snapshot (see
- *  ResumeWhenComplete). One per vector device table; host-only. */
+/** A device-resident task region (see ResumeWhenComplete). One per vector device table; host-only. */
 struct TaskRegion {
   char *base = nullptr;
+  size_t bytes = 0;
+};
+/** A thread's host snapshot of one task region. */
+struct TaskRegionSnap {
   std::vector<char> snap;
   clio::run::u32 last_block = 0;
   bool fresh = false;
 };
-inline std::vector<TaskRegion> &TaskRegions() {
-  static std::vector<TaskRegion> regions;
+/**
+ * The registry is shared by every thread that builds a vector or drives a
+ * paged kernel, so it is locked, and lookups return a COPY of the region's
+ * bounds. It was an unlocked std::vector handing out pointers into itself: a
+ * vector constructed on one thread (a ProcessGroup's) reallocated it while
+ * another thread's driver read through such a pointer -- a read at
+ * 0 + offset in ResumeWhenComplete, the FSDP / ProcessGroup crash. Regions
+ * are unregistered when their vector frees them (they used to accumulate).
+ */
+inline std::mutex &TaskRegionMutex() {
+  static std::mutex m;
+  return m;
+}
+inline std::list<TaskRegion> &TaskRegions() {
+  static std::list<TaskRegion> regions;
   return regions;
 }
 inline void RegisterTaskRegion(char *base, size_t bytes) {
-  TaskRegion r;
-  r.base = base;
-  r.snap.resize(bytes);
-  TaskRegions().push_back(std::move(r));
+  std::lock_guard<std::mutex> lk(TaskRegionMutex());
+  TaskRegions().push_back(TaskRegion{base, bytes});
 }
-inline TaskRegion *FindTaskRegion(clio::run::u64 tag) {
-  for (auto &r : TaskRegions()) {
+inline void UnregisterTaskRegion(char *base) {
+  std::lock_guard<std::mutex> lk(TaskRegionMutex());
+  TaskRegions().remove_if([base](const TaskRegion &r) { return r.base == base; });
+}
+/** The region holding the 4-byte word at `tag`, copied into *out; false if none. */
+inline bool FindTaskRegion(clio::run::u64 tag, TaskRegion *out) {
+  std::lock_guard<std::mutex> lk(TaskRegionMutex());
+  for (const auto &r : TaskRegions()) {
     const auto lo = reinterpret_cast<clio::run::u64>(r.base);
-    if (tag >= lo && tag + sizeof(unsigned int) <= lo + r.snap.size()) return &r;
+    if (tag >= lo && tag + sizeof(unsigned int) <= lo + r.bytes) {
+      *out = r;
+      return true;
+    }
   }
-  return nullptr;
+  return false;
 }
 
 /**
@@ -107,20 +133,29 @@ inline bool ResumeWhenComplete(clio::run::u32 block, clio::run::u64 tag) {
   // walks pending blocks in increasing order, so a block index that does not
   // increase marks a new spin) and every block's word is read from that.
   if (tag == 0) return true;
-  TaskRegion *r = FindTaskRegion(tag);
-  if (r == nullptr) {
+  TaskRegion r;
+  if (!FindTaskRegion(tag, &r)) {
     unsigned int done = 0;
     ctp::GpuApi::Memcpy(reinterpret_cast<char *>(&done),
                         reinterpret_cast<const char *>(tag), sizeof(done));
     return (done & 1u) != 0u;
   }
-  if (!r->fresh || block <= r->last_block) {
-    ctp::GpuApi::Memcpy(r->snap.data(), r->base, r->snap.size());
-    r->fresh = true;
+  // Each driver thread keeps its own snapshot: the spin detection below is per
+  // driver, and concurrent drivers (paging lanes on one vector) shared one
+  // snapshot and overwrote it under each other.
+  thread_local std::unordered_map<char *, TaskRegionSnap> snaps;
+  TaskRegionSnap &sn = snaps[r.base];
+  if (sn.snap.size() != r.bytes) {  // new, or a region re-registered at the same address
+    sn.snap.assign(r.bytes, 0);
+    sn.fresh = false;
   }
-  r->last_block = block;
+  if (!sn.fresh || block <= sn.last_block) {
+    ctp::GpuApi::Memcpy(sn.snap.data(), r.base, sn.snap.size());
+    sn.fresh = true;
+  }
+  sn.last_block = block;
   unsigned int done = 0;
-  std::memcpy(&done, r->snap.data() + (tag - reinterpret_cast<clio::run::u64>(r->base)),
+  std::memcpy(&done, sn.snap.data() + (tag - reinterpret_cast<clio::run::u64>(r.base)),
               sizeof(done));
   return (done & 1u) != 0u;
 #else
@@ -1592,7 +1627,10 @@ class Vector {
     if (ipc != nullptr) {
       if (!st.pages_alloc.IsNull()) ipc->FreeGpuBackend(gpu, st.pages_alloc);
       if (!st.table_alloc.IsNull()) ipc->FreeGpuBackend(gpu, st.table_alloc);
-      if (!st.tasks_alloc.IsNull()) ipc->FreeGpuBackend(gpu, st.tasks_alloc);
+      if (!st.tasks_alloc.IsNull()) {
+        UnregisterTaskRegion(st.tasks_base);
+        ipc->FreeGpuBackend(gpu, st.tasks_alloc);
+      }
       if (!st.btbl_alloc.IsNull()) ipc->FreeGpuBackend(gpu, st.btbl_alloc);
     }
     st.pages_alloc = ctp::ipc::AllocatorId::GetNull();

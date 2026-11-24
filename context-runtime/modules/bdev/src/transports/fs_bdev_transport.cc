@@ -743,6 +743,10 @@ void FsBdevTransport::Destroy() {
   if (has_alloc_log_) {
     alloc_log_.Close();
   }
+  std::lock_guard<std::mutex> lock(staging_mu_);
+  for (Staging &st : staging_pool_) FreeStaging(st);
+  staging_pool_.clear();
+  staging_pinned_ = 0;
 }
 
 bool FsBdevTransport::AllocateBlocks(size_t size, int worker_id, std::vector<Block>& blocks) {
@@ -1058,6 +1062,85 @@ void FsBdevTransport::GiveBounce(AlignedBuf buf, size_t size) {
   }
 }
 
+namespace {
+/** Synchronous ENGINE (DMA) copy between device memory and host staging.
+ *  Not DeviceAwareMemcpy: it sends a copy that touches device-mapped pinned
+ *  host memory through an SM copy kernel, which competed with every running
+ *  kernel and took ~900 ms per 64 MB here, against a few ms for the copy
+ *  engine. Same convention as the gpu2cpu path (c210b54fe): name the engine
+ *  at the call site, leave the global predicate alone.
+ *  @param dst destination (device or host)
+ *  @param src source (device or host)
+ *  @param n bytes */
+void EngineCopy(void *dst, const void *src, size_t n) {
+#if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM
+  void *ps = ctp::GpuApi::ThreadReservedStream();
+  const bool borrowed = ps == nullptr;
+  if (borrowed) ps = ctp::GpuApi::BorrowStream();
+  if (ps == nullptr) {  // stream pool exhausted: the general path
+    ctp::DeviceAwareMemcpy(dst, src, n);
+    return;
+  }
+  ctp::GpuApi::MemcpyAsync(static_cast<char *>(dst), static_cast<const char *>(src), n, ps);
+  ctp::GpuApi::PollSync(ps);
+  if (borrowed) ctp::GpuApi::ReturnStream(ps);
+#else
+  ctp::DeviceAwareMemcpy(dst, src, n);
+#endif
+}
+}  // namespace
+
+FsBdevTransport::Staging FsBdevTransport::TakeStaging(size_t size) {
+  Staging s;
+  s.size = size;
+  bool pin = false;
+  {
+    std::lock_guard<std::mutex> lock(staging_mu_);
+    for (size_t i = 0; i < staging_pool_.size(); ++i) {
+      if (staging_pool_[i].size == size) {
+        s = staging_pool_[i];
+        staging_pool_[i] = staging_pool_.back();
+        staging_pool_.pop_back();
+        return s;
+      }
+    }
+    if (staging_pinned_ + size <= kStagingPinnedBytes) {
+      staging_pinned_ += size;
+      pin = true;
+    }
+  }
+  if (pin) {
+    s.p = ctp::GpuApi::MallocHost<char>(size);  // page-aligned
+    s.pinned = s.p != nullptr;
+    if (!s.pinned) {
+      std::lock_guard<std::mutex> lock(staging_mu_);
+      staging_pinned_ -= size;  // no GPU runtime: plain aligned memory below
+    }
+  }
+  if (s.p == nullptr) {
+    s.p = static_cast<char *>(::operator new[](size, std::align_val_t(DirectAlign())));
+  }
+  return s;
+}
+
+void FsBdevTransport::GiveStaging(Staging s) {
+  if (!s.pinned) {
+    FreeStaging(s);
+    return;
+  }
+  std::lock_guard<std::mutex> lock(staging_mu_);
+  staging_pool_.push_back(s);
+}
+
+void FsBdevTransport::FreeStaging(Staging s) {
+  if (s.p == nullptr) return;
+  if (s.pinned) {
+    ctp::GpuApi::FreeHost(s.p);
+  } else {
+    ::operator delete[](s.p, std::align_val_t(DirectAlign()));
+  }
+}
+
 clio::run::TaskResume FsBdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask> task) {
   CLIO_TASK_BODY_BEGIN
   clio::run::Worker *worker = CLIO_CUR_WORKER;
@@ -1068,10 +1151,17 @@ clio::run::TaskResume FsBdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask> 
   ctp::ipc::FullPtr<char> data_ptr = ipc_mgr->ToFullPtr(task->data_).Cast<char>();
 
   bool data_on_device = ctp::IsDevicePointer(data_ptr.ptr_);
-  std::vector<char> staging;
+  // CLIO_FS_PROF=1 (diagnostic): where a write's time goes.
+  static const bool fs_prof = getenv("CLIO_FS_PROF") != nullptr;
+  const auto fp_t0 = std::chrono::steady_clock::now();
+  auto fp_t1 = fp_t0, fp_t2 = fp_t0;
+  StagingGuard staging;
   if (data_on_device) {
-    staging.resize(task->length_);
-    ctp::DeviceAwareMemcpy(staging.data(), data_ptr.ptr_, task->length_);
+    staging.t = this;
+    staging.s = TakeStaging(task->length_);
+    fp_t1 = std::chrono::steady_clock::now();
+    EngineCopy(staging.s.p, data_ptr.ptr_, task->length_);
+    fp_t2 = std::chrono::steady_clock::now();
   }
 
   clio::run::u64 total_bytes_written = 0;
@@ -1101,7 +1191,7 @@ clio::run::TaskResume FsBdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask> 
     clio::run::u64 block_write_size = std::min(remaining, block.size_);
 
     void *block_data = data_on_device
-                           ? static_cast<void *>(staging.data() + data_offset)
+                           ? static_cast<void *>(staging.s.p + data_offset)
                            : static_cast<void *>(data_ptr.ptr_ + data_offset);
 
     if (io_ctx == nullptr || !io_ctx->is_initialized_ || io_ctx->async_ios_.empty()) {
@@ -1159,6 +1249,16 @@ clio::run::TaskResume FsBdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask> 
     data_offset += seg_done;
   }
 
+  staging.Release();
+  if (fs_prof) {
+    auto us = [](auto a, auto b) {
+      return static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(b - a).count());
+    };
+    const auto fp_t3 = std::chrono::steady_clock::now();
+    fprintf(stderr, "[fsw] bytes=%llu dev=%d alloc_us=%lld d2h_us=%lld io_us=%lld\n",
+            static_cast<unsigned long long>(total_bytes_written), data_on_device ? 1 : 0, us(fp_t0, fp_t1),
+            us(fp_t1, fp_t2), us(data_on_device ? fp_t2 : fp_t0, fp_t3));
+  }
   task->return_code_ = 0;
   task->bytes_written_ = total_bytes_written;
   CLIO_CO_RETURN;
@@ -1175,9 +1275,10 @@ clio::run::TaskResume FsBdevTransport::ReadBlocks(ctp::ipc::FullPtr<ReadTask> ta
   ctp::ipc::FullPtr<char> data_ptr = ipc_mgr->ToFullPtr(task->data_).Cast<char>();
 
   bool data_on_device = ctp::IsDevicePointer(data_ptr.ptr_);
-  std::vector<char> staging;
+  StagingGuard staging;
   if (data_on_device) {
-    staging.resize(task->length_);
+    staging.t = this;
+    staging.s = TakeStaging(task->length_);
   }
 
   clio::run::u64 total_bytes_read = 0;
@@ -1199,7 +1300,7 @@ clio::run::TaskResume FsBdevTransport::ReadBlocks(ctp::ipc::FullPtr<ReadTask> ta
     clio::run::u64 block_read_size = std::min(remaining, block.size_);
 
     void *block_data = data_on_device
-                           ? static_cast<void *>(staging.data() + data_offset)
+                           ? static_cast<void *>(staging.s.p + data_offset)
                            : static_cast<void *>(data_ptr.ptr_ + data_offset);
 
     if (io_ctx == nullptr || !io_ctx->is_initialized_ || io_ctx->async_ios_.empty()) {
@@ -1257,8 +1358,9 @@ clio::run::TaskResume FsBdevTransport::ReadBlocks(ctp::ipc::FullPtr<ReadTask> ta
   }
 
   if (data_on_device && total_bytes_read > 0) {
-    ctp::DeviceAwareMemcpy(data_ptr.ptr_, staging.data(), total_bytes_read);
+    EngineCopy(data_ptr.ptr_, staging.s.p, total_bytes_read);
   }
+  staging.Release();
 
   task->return_code_ = 0;
   task->bytes_read_ = total_bytes_read;

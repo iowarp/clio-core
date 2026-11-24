@@ -443,6 +443,18 @@ bool RuntimeManager::ServerInit() {
     std::atomic<bool> &flag_;
     ~ComposeDoneGuard() { flag_.store(true, std::memory_order_release); }
   } compose_done_guard{compose_done_};
+  // A failure from here on leaves a RUNNING server: the workers are up and the
+  // pools so far exist. Mark it initialized so CLIO_RUNTIME_FINALIZE still stops
+  // it, while ServerInit reports the failure. Returning without this left the
+  // workers running and unreachable from finalize (ServerFinalize requires
+  // is_initialized_) all the way into process teardown, where they polled
+  // pinned queues CUDA was freeing: an access violation at every exit of a
+  // process whose compose failed (e.g. a ChiMod that is not built).
+  auto FailedRunning = [this]() {
+    is_initialized_ = true;
+    runtime_is_initializing_ = false;
+    return false;
+  };
 
   // Process compose section if present — unless this runtime is ephemeral
   // (--ephemeral / CLIO_EPHEMERAL), in which case it starts bare and is
@@ -470,7 +482,7 @@ bool RuntimeManager::ServerInit() {
     auto *admin_client = CLIO_ADMIN;
     if (!admin_client) {
       HLOG(kError, "Failed to get admin client for compose processing");
-      return false;
+      return FailedRunning();
     }
 
     // Iterate over each pool configuration and create asynchronously
@@ -494,7 +506,7 @@ bool RuntimeManager::ServerInit() {
         HLOG(kError,
              "Compose: Failed to create pool {} (module: {}), return code: {}",
              pool_config.pool_name_, pool_config.mod_name_, return_code);
-        return false;
+        return FailedRunning();
       }
 
       HLOG(kInfo, "Compose: Successfully created pool {} (module: {})",
@@ -531,7 +543,7 @@ bool RuntimeManager::ServerInit() {
       auto *admin_client = CLIO_ADMIN;
       if (!admin_client) {
         HLOG(kError, "Failed to get admin client for restart-log replay");
-        return false;
+        return FailedRunning();
       }
       HLOG(kInfo, "Restart log: replaying {} registered container(s) from {}",
            containers.size(), restart_log.path());

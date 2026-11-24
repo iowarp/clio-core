@@ -97,15 +97,20 @@ bool ModuleManager::LoadChiMod(const std::string &lib_path) {
   // Load the shared library
   chimod_info->lib.Load(lib_path);
   if (chimod_info->lib.IsNull()) {
-    HLOG(kDebug, "Skipping library {} (failed to load): {}", lib_path,
+    // A WARNING, not debug: only files named like a ChiMod (*_runtime.<ext>)
+    // get here, and a module that silently fails to load surfaces later as
+    // "ChiMod '<name>' not found" with no hint why (a missing dependency DLL,
+    // an architecture mismatch, ...). Release builds compile debug logs out.
+    HLOG(kWarning, "Skipping ChiMod candidate {} (failed to load): {}", lib_path,
          chimod_info->lib.GetError());
     return false;
   }
 
   // Validate ChiMod entry points
   if (!ValidateChiMod(chimod_info->lib)) {
-    HLOG(kDebug,
-         "Skipping library {} (invalid ChiMod - missing required symbols)",
+    HLOG(kWarning,
+         "Skipping ChiMod candidate {} (missing alloc_chimod / new_chimod / "
+         "get_chimod_name / destroy_chimod exports)",
          lib_path);
     return false;
   }
