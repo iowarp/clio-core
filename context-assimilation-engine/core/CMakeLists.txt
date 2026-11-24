@@ -110,6 +110,24 @@ if(NOT WIN32)
     src/factory/http_fetch.cc)
 endif()
 
+# dataverse:// sources (dataverse.h): the http engine above plus zlib, to
+# inflate the selected members of remote zip files.
+if(NOT WIN32)
+  find_package(ZLIB QUIET)
+endif()
+if(NOT WIN32 AND ZLIB_FOUND)
+  message(STATUS "CAE Dataverse support: ENABLED")
+  add_compile_definitions(CAE_ENABLE_DATAVERSE)
+  list(APPEND RUNTIME_SOURCES
+    src/factory/dataverse_fetch.cc
+    src/factory/dataverse_file_assimilator.cc)
+  list(APPEND RUNTIME_LINK_LIBRARIES ZLIB::ZLIB)
+  set(DATAVERSE_ENABLED TRUE)
+else()
+  message(STATUS "CAE Dataverse support: DISABLED (needs POSIX and zlib)")
+  set(DATAVERSE_ENABLED FALSE)
+endif()
+
 # Conditionally add Globus assimilator if enabled
 if(GLOBUS_ENABLED)
   list(APPEND RUNTIME_SOURCES src/factory/globus_file_assimilator.cc)
@@ -217,6 +235,19 @@ if(NOT WIN32)
   find_package(Threads REQUIRED)
   target_link_libraries(cae_http_tool PRIVATE Threads::Threads)
   install(TARGETS cae_http_tool DESTINATION bin)
+endif()
+
+# cae_dataverse_tool: list a Dataverse dataset, try dataset_filter patterns on
+# it and stage the selection, without a runtime.
+if(DATAVERSE_ENABLED)
+  add_executable(cae_dataverse_tool
+    src/factory/tools/dataverse_tool_main.cc
+    src/factory/dataverse_fetch.cc
+    src/factory/http_fetch.cc)
+  target_include_directories(cae_dataverse_tool PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(cae_dataverse_tool PRIVATE Threads::Threads ZLIB::ZLIB)
+  install(TARGETS cae_dataverse_tool DESTINATION bin)
 endif()
 
 # OMNI parsing, split out of the clio_cae binary so the unit tests can link it

@@ -37,6 +37,9 @@
 #ifdef CAE_ENABLE_HTTP
 #include <clio_cae/core/factory/http_file_assimilator.h>
 #endif
+#ifdef CAE_ENABLE_DATAVERSE
+#include <clio_cae/core/factory/dataverse_file_assimilator.h>
+#endif
 #include <clio_cae/core/factory/string_data_assimilator.h>
 #ifdef CLIO_CAE_ENABLE_HDF5
 #include <clio_cae/core/factory/hdf5_file_assimilator.h>
@@ -116,6 +119,18 @@ std::unique_ptr<BaseAssimilator> AssimilatorFactory::Get(
     HLOG(kError, "AssimilatorFactory: http(s) sources need a POSIX build");
     return nullptr;
 #endif
+  } else if (protocol == "dataverse") {
+#ifdef CAE_ENABLE_DATAVERSE
+    HLOG(kDebug,
+         "AssimilatorFactory: Creating DataverseFileAssimilator for '{}'", src);
+    // Files and zip members of a Dataverse dataset (dataverse.h), fetched by
+    // the http engine; file:: or iowarp:: destinations.
+    return std::make_unique<DataverseFileAssimilator>(cte_client_);
+#else
+    HLOG(kError,
+         "AssimilatorFactory: dataverse sources need a POSIX build with zlib");
+    return nullptr;
+#endif
   } else if (protocol == "string") {
     HLOG(kDebug,
          "AssimilatorFactory: Creating StringDataAssimilator for 'string' "
@@ -190,16 +205,17 @@ std::unique_ptr<BaseAssimilator> AssimilatorFactory::Get(
 }
 
 std::string AssimilatorFactory::GetUrlProtocol(const std::string& url) {
-  // Check for standard URI format first (e.g., "globus://")
-  size_t pos_standard = url.find("://");
+  // Standard URI format (e.g., "globus://") or custom format (e.g.,
+  // "file::"), whichever separator comes first: "dataverse::https://host/pid"
+  // is the dataverse protocol wrapping a URL, not protocol "dataverse::https".
+  const size_t pos_standard = url.find("://");
+  const size_t pos_custom = url.find("::");
+  if (pos_custom != std::string::npos &&
+      (pos_standard == std::string::npos || pos_custom < pos_standard)) {
+    return url.substr(0, pos_custom);
+  }
   if (pos_standard != std::string::npos) {
     return url.substr(0, pos_standard);
-  }
-
-  // Fall back to custom format (e.g., "file::")
-  size_t pos_custom = url.find("::");
-  if (pos_custom != std::string::npos) {
-    return url.substr(0, pos_custom);
   }
 
   return "";
