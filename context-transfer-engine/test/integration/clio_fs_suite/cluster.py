@@ -512,18 +512,23 @@ class Cluster:
       top_id = '563.0'
     # The shm cache (pool 568.0) sits on the chain top, below whatever
     # composes above it (clio-fs, stream), as in clio_default.yaml: every
-    # clio-fs tag and blob operation passes through it. md_only: the cache
-    # below (563 or the write-back cache) already holds the bytes, so it
-    # caches tag and blob metadata only. CLIO_FS_SUITE_SHM_CACHE=0 leaves it
-    # out (the chain then ends at top_id as before).
+    # clio-fs tag and blob operation passes through it. Data mode: it caches
+    # the bytes as well as the metadata, so a write completes as a copy into
+    # the segment (written through in the background) and a read of cached
+    # bytes needs no task. Sized to hold a whole Linux checkout and more:
+    # CLIO_FS_SUITE_SHM_CACHE_GB segment (default 8) and 1M entries.
+    # CLIO_FS_SUITE_SHM_CACHE=0 leaves it out (the chain then ends at
+    # top_id as before).
     if os.environ.get('CLIO_FS_SUITE_SHM_CACHE', '1') != '0':
       shm_cache = ('  - mod_name: clio_cte_core_shm_cache_writethru\n'
                    '    pool_name: clio_cte_core_shm_cache_writethru\n'
                    '    pool_query: local\n'
                    '    pool_id: "568.0"\n'
                    f'    next_pool_id: "{top_id}"\n'
-                   '    md_only: true\n'
-                   '    capacity: "256M"\n')
+                   '    md_only: false\n'
+                   '    capacity: "'
+                   f'{os.environ.get("CLIO_FS_SUITE_SHM_CACHE_GB", "8")}G"\n'
+                   '    max_blobs: 1048576\n')
       top_id = '568.0'
     else:
       shm_cache = ''
