@@ -45,6 +45,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -89,6 +91,13 @@ std::string CaeJsonEscape(const std::string& in) {
   for (char c : in) {
     if (c == '"' || c == '\\') { out += '\\'; out += c; }
     else if (c == '\n') { out += "\\n"; }
+    else if (c == '\t') { out += "\\t"; }
+    else if (c == '\r') { out += "\\r"; }
+    else if (static_cast<unsigned char>(c) < 0x20) {
+      char u[8];
+      std::snprintf(u, sizeof u, "\\u%04x", static_cast<unsigned>(c));
+      out += u;
+    }
     else { out += c; }
   }
   return out;
@@ -140,6 +149,90 @@ void CaeEmitTelemetry(const std::string& src, const std::string& dst,
     << ",\"total_ms\":" << total
     << ",\"error_code\":" << error_code
     << "}\n";
+}
+
+/** One attribute value as JSON: numbers (%.17g; non-finite as strings),
+ *  strings, or a flat list of them for an array attribute; null for types
+ *  this does not convert. */
+std::string Hdf5AttrValueJson(hid_t attr) {
+  hid_t ftype = H5Aget_type(attr);
+  hid_t space = H5Aget_space(attr);
+  const hssize_t n = space >= 0 ? H5Sget_simple_extent_npoints(space) : -1;
+  const bool scalar = space >= 0 && H5Sget_simple_extent_ndims(space) == 0;
+  const H5T_class_t cls = ftype >= 0 ? H5Tget_class(ftype) : H5T_NO_CLASS;
+  std::vector<std::string> vals;
+  bool ok = n >= 0 && n <= (1 << 20);
+  auto num = [](double v) {
+    if (!std::isfinite(v)) return std::string(std::isnan(v) ? "\"NaN\"" : (v > 0 ? "\"Infinity\"" : "\"-Infinity\""));
+    char b[40];
+    std::snprintf(b, sizeof b, "%.17g", v);
+    return std::string(b);
+  };
+  if (ok && cls == H5T_FLOAT) {
+    std::vector<double> v(static_cast<size_t>(n));
+    ok = n == 0 || H5Aread(attr, H5T_NATIVE_DOUBLE, v.data()) >= 0;
+    for (double x : v) vals.push_back(num(x));
+  } else if (ok && cls == H5T_INTEGER) {
+    const bool sign = H5Tget_sign(ftype) != H5T_SGN_NONE;
+    std::vector<int64_t> v(static_cast<size_t>(n));
+    ok = n == 0 || H5Aread(attr, sign ? H5T_NATIVE_INT64 : H5T_NATIVE_UINT64,
+                           v.data()) >= 0;
+    for (int64_t x : v)
+      vals.push_back(sign ? std::to_string(x)
+                          : std::to_string(static_cast<uint64_t>(x)));
+  } else if (ok && cls == H5T_STRING) {
+    if (H5Tis_variable_str(ftype) > 0) {
+      std::vector<char*> v(static_cast<size_t>(n), nullptr);
+      hid_t mt = H5Tcopy(H5T_C_S1);
+      H5Tset_size(mt, H5T_VARIABLE);
+      ok = n == 0 || H5Aread(attr, mt, v.data()) >= 0;
+      for (char* x : v) vals.push_back("\"" + CaeJsonEscape(x ? x : "") + "\"");
+      if (ok && n > 0) H5Dvlen_reclaim(mt, space, H5P_DEFAULT, v.data());
+      H5Tclose(mt);
+    } else {
+      const size_t len = H5Tget_size(ftype);
+      std::vector<char> buf(static_cast<size_t>(n) * len + 1, '\0');
+      hid_t mt = H5Tcopy(H5T_C_S1);
+      H5Tset_size(mt, len);
+      ok = n == 0 || H5Aread(attr, mt, buf.data()) >= 0;
+      H5Tclose(mt);
+      for (hssize_t i = 0; i < n; ++i) {
+        std::string x(buf.data() + i * len, len);
+        x.resize(std::strlen(x.c_str()));  // drop NUL padding
+        vals.push_back("\"" + CaeJsonEscape(x) + "\"");
+      }
+    }
+  } else {
+    ok = false;
+  }
+  if (space >= 0) H5Sclose(space);
+  if (ftype >= 0) H5Tclose(ftype);
+  if (!ok) return "null";
+  if (scalar && vals.size() == 1) return vals[0];
+  std::string out = "[";
+  for (size_t i = 0; i < vals.size(); ++i) out += (i ? "," : "") + vals[i];
+  return out + "]";
+}
+
+/** The attributes of an object (group or dataset) as one JSON object, or ""
+ *  when it has none. */
+std::string Hdf5AttributesJson(hid_t obj) {
+  struct Acc {
+    std::string json;
+  } acc;
+  H5Aiterate2(
+      obj, H5_INDEX_NAME, H5_ITER_INC, nullptr,
+      [](hid_t loc, const char* name, const H5A_info_t*, void* op) -> herr_t {
+        auto* a = static_cast<Acc*>(op);
+        hid_t attr = H5Aopen(loc, name, H5P_DEFAULT);
+        if (attr < 0) return 0;
+        a->json += (a->json.empty() ? "{" : ",");
+        a->json += "\"" + CaeJsonEscape(name) + "\":" + Hdf5AttrValueJson(attr);
+        H5Aclose(attr);
+        return 0;
+      },
+      &acc);
+  return acc.json.empty() ? "" : acc.json + "}";
 }
 
 }  // namespace
@@ -313,11 +406,38 @@ clio::run::TaskResume Hdf5FileAssimilator::Schedule(const AssimilationCtx& ctx,
     }
   }
 
+  // The root group's attributes go to the file's own tag (tag_prefix).
+  const std::string root_attrs = Hdf5AttributesJson(file_id);
+
   // Close file before distributing tasks (each task will open it independently)
   HLOG(kDebug,
        "Hdf5FileAssimilator: Closing HDF5 file before distributed "
        "processing...");
   CloseHdf5File(file_id);
+  if (!root_attrs.empty()) {
+    auto rtag = cte_client_->AsyncGetOrCreateTag(tag_prefix);
+    CLIO_CO_AWAIT(rtag);
+    const clio::cte::core::TagId rtag_id = rtag->tag_id_;
+    int rput_rc = -1;
+    if (!rtag_id.IsNull()) {
+      auto rbuf = CLIO_IPC->AllocateBuffer(root_attrs.size());
+      std::memcpy(rbuf.ptr_, root_attrs.data(), root_attrs.size());
+      auto rput = cte_client_->AsyncPutBlob(
+          rtag_id, "attributes", 0, root_attrs.size(),
+          rbuf.shm_.template Cast<void>(), 1.0f, clio::cte::core::Context(),
+          0);
+      CLIO_CO_AWAIT(rput);
+      rput_rc = static_cast<int>(rput->return_code_);
+    }
+    if (rput_rc != 0) {
+      HLOG(kError,
+           "Hdf5FileAssimilator: Failed to store the root attributes of '{}' "
+           "under '{}' ({})",
+           src_path, tag_prefix, rput_rc);
+      error_code = -7;
+      CLIO_CO_RETURN;
+    }
+  }
 
   // Distribute datasets across nodes using CTE task routing
   int total_errors = 0;
@@ -868,6 +988,30 @@ clio::run::TaskResume Hdf5FileAssimilator::ProcessDataset(
   HLOG(kDebug, "Hdf5FileAssimilator: Stored description for '{}': {}", tag_name,
        description);
 
+  // The dataset's attributes, as JSON in an "attributes" blob.
+  {
+    const std::string attrs = Hdf5AttributesJson(dataset_id);
+    if (!attrs.empty()) {
+      auto abuf = CLIO_IPC->AllocateBuffer(attrs.size());
+      std::memcpy(abuf.ptr_, attrs.data(), attrs.size());
+      auto atask = cte_client_->AsyncPutBlob(
+          tag_id, "attributes", 0, attrs.size(),
+          abuf.shm_.template Cast<void>(), 1.0f, clio::cte::core::Context(), 0);
+      CLIO_CO_AWAIT(atask);
+      if (atask->return_code_ != 0) {
+        HLOG(kError,
+             "Hdf5FileAssimilator: Failed to store attributes for dataset "
+             "'{}', return_code: {}",
+             dataset_path, atask->return_code_);
+        H5Tclose(datatype_id);
+        H5Sclose(dataspace_id);
+        H5Dclose(dataset_id);
+        error_code = -6;
+        CLIO_CO_RETURN;
+      }
+    }
+  }
+
   // Define chunking parameters
   // Note: kMaxChunkSize must be < 2MB due to MultiProcessAllocator
   // thread_unit_ limit (2MB). Using 1.5MB to leave room for allocator overhead.
@@ -1024,13 +1168,14 @@ std::string Hdf5FileAssimilator::GetTypeName(hid_t datatype) {
   size_t type_size = H5Tget_size(datatype);
 
   switch (type_class) {
-    case H5T_INTEGER:
-      if (type_size == 4) {
-        return "int32";
-      } else if (type_size == 8) {
-        return "int64";
+    case H5T_INTEGER: {
+      const bool sign = H5Tget_sign(datatype) != H5T_SGN_NONE;
+      if (type_size == 1 || type_size == 2 || type_size == 4 ||
+          type_size == 8) {
+        return (sign ? "int" : "uint") + std::to_string(8 * type_size);
       }
       return "unknown";
+    }
 
     case H5T_FLOAT:
       if (type_size == 4) {
@@ -1047,6 +1192,25 @@ std::string Hdf5FileAssimilator::GetTypeName(hid_t datatype) {
 
 std::string Hdf5FileAssimilator::FormatTensorDescription(
     hid_t datatype, const std::vector<hsize_t>& dims) {
+  // A table (compound type, e.g. a PyTables Table) is stored as its packed
+  // records: "compound<record bytes, dims...>{field:type@offset, ...}".
+  if (H5Tget_class(datatype) == H5T_COMPOUND) {
+    std::string d = "compound<" + std::to_string(H5Tget_size(datatype));
+    for (hsize_t dim : dims) d += ", " + std::to_string(dim);
+    d += ">{";
+    const int nm = H5Tget_nmembers(datatype);
+    for (int i = 0; i < nm; ++i) {
+      char* name = H5Tget_member_name(datatype, static_cast<unsigned>(i));
+      hid_t mt = H5Tget_member_type(datatype, static_cast<unsigned>(i));
+      d += (i ? ", " : "") + std::string(name ? name : "") + ":" +
+           GetTypeName(mt) + "@" +
+           std::to_string(
+               H5Tget_member_offset(datatype, static_cast<unsigned>(i)));
+      H5Tclose(mt);
+      H5free_memory(name);
+    }
+    return d + "}";
+  }
   std::string type_name = GetTypeName(datatype);
   std::string description = "tensor<" + type_name;
 

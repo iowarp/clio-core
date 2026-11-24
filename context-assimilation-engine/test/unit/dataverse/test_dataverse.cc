@@ -97,7 +97,10 @@ TEST_CASE("dataverse_url_forms", "[dataverse]") {
   REQUIRE(s.pid == "hdl:1902.1/1");
   REQUIRE(!cae::ParseDataverseUrl("dataverse://host", &s, &err));
   REQUIRE(!cae::ParseDataverseUrl("dataverse://host/LCCLLW", &s, &err));
-  REQUIRE(!cae::ParseDataverseUrl("https://host/doi:1/2", &s, &err));
+  REQUIRE(!cae::ParseDataverseUrl("ftp://host/doi:1/2", &s, &err));
+  // A plain web URL is a single web file, not a Dataverse dataset.
+  REQUIRE(cae::ParseDataverseUrl("https://host/doi:1/2", &s, &err));
+  REQUIRE(s.url == "https://host/doi:1/2");
 }
 
 TEST_CASE("dataverse_json_reader", "[dataverse]") {

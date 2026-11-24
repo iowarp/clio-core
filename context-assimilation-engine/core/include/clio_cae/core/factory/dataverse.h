@@ -64,15 +64,44 @@ namespace clio::cae::core {
 struct DataverseSource {
   std::string base;  ///< "https://dataverse.harvard.edu"
   std::string pid;   ///< "doi:10.7910/DVN/LCCLLW"
+  /** Set for a plain web file (an http(s) URL, no Dataverse API): the one
+   *  file of the "dataset", whose zip members can be selected the same way. */
+  std::string url;
 };
+
+/** The file name a plain web URL names: its last path segment. */
+inline std::string WebFileName(const std::string &url) {
+  std::string p = url.substr(0, url.find_first_of("?#"));
+  while (!p.empty() && p.back() == '/') p.pop_back();
+  size_t s = p.rfind('/');
+  return s == std::string::npos ? p : p.substr(s + 1);
+}
 
 /**
  * Parse "dataverse://<host>/<persistent id>" (https is implied) or
  * "dataverse::https://<host>/<persistent id>". The persistent id keeps its
  * slashes ("doi:10.7910/DVN/LCCLLW", "hdl:1902.1/12345").
+ *
+ * A plain "http(s)://<host>/<path>" is accepted too: a single web file (for
+ * example a data release's zip), staged like a one-file dataset. Its pid is
+ * "web:<host>/<path>", which names its cache directory.
  */
 inline bool ParseDataverseUrl(const std::string &src, DataverseSource *out,
                               std::string *err) {
+  for (const char *s : {"https://", "http://"}) {
+    const size_t n = std::strlen(s);
+    if (src.compare(0, n, s) != 0) continue;
+    const std::string rest = src.substr(n, src.find_first_of("?#") - n);
+    const size_t slash = rest.find('/');
+    if (slash == std::string::npos || slash == 0 || WebFileName(src).empty()) {
+      *err = "expected http(s)://<host>/<path to a file>, got " + src;
+      return false;
+    }
+    out->base = s + rest.substr(0, slash);
+    out->pid = "web:" + rest;
+    out->url = src;
+    return true;
+  }
   std::string rest;
   std::string scheme = "https://";
   if (src.compare(0, 12, "dataverse://") == 0) {
@@ -127,6 +156,7 @@ inline std::string DataverseDatasetApiUrl(const DataverseSource &s) {
 }
 
 inline std::string DataverseFileUrl(const DataverseSource &s, int64_t id) {
+  if (!s.url.empty()) return s.url;
   return s.base + "/api/access/datafile/" + std::to_string(id);
 }
 

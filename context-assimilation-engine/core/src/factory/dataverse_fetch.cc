@@ -115,7 +115,7 @@ struct Run {
     *a = r.auth;
     // The API key is for the Dataverse host only, never for the storage
     // (S3) host its download redirects point at.
-    if (!token.empty() && url.compare(0, src.base.size() + 1, src.base + "/") == 0)
+    if (!token.empty() && src.url.empty() && url.compare(0, src.base.size() + 1, src.base + "/") == 0)
       a->headers.push_back("X-Dataverse-key: " + token);
     return true;
   }
@@ -149,6 +149,10 @@ struct Run {
       }
     }
     const std::string api = DataverseFileUrl(src, id);
+    if (!src.url.empty()) {  // a plain web file: curl follows its redirects
+      *out = api;
+      return true;
+    }
     for (int attempt = 0;; ++attempt) {
       int code = 0;
       std::string loc;
@@ -544,16 +548,27 @@ DataverseStageResult DataverseStage(const std::string &src,
     return res;
   }
 
-  // 1. The dataset's files.
-  std::string body;
-  for (int attempt = 0;; ++attempt) {
-    if (run.Get(DataverseDatasetApiUrl(run.src), 0, 0, &body, &res.error)) break;
-    if (attempt >= run.cfg.part_retries) return res;
-    run.Say(res.error + "; retrying");
-    run.Backoff(attempt + 1);
-  }
+  // 1. The dataset's files (a plain web URL is a dataset of one file).
   std::vector<DataverseFile> files;
-  if (!ParseDataverseFiles(body, &files, &res.version, &res.error)) return res;
+  if (!run.src.url.empty()) {
+    DataverseFile f;
+    f.id = 0;
+    f.path = WebFileName(run.src.url);
+    f.size = -1;
+    files.push_back(f);
+    res.version = "web";
+  } else {
+    std::string body;
+    for (int attempt = 0;; ++attempt) {
+      if (run.Get(DataverseDatasetApiUrl(run.src), 0, 0, &body, &res.error))
+        break;
+      if (attempt >= run.cfg.part_retries) return res;
+      run.Say(res.error + "; retrying");
+      run.Backoff(attempt + 1);
+    }
+    if (!ParseDataverseFiles(body, &files, &res.version, &res.error))
+      return res;
+  }
   res.dataset_files = files.size();
   run.Say(run.src.pid + " (" + res.version + "): " +
           std::to_string(files.size()) + " files");

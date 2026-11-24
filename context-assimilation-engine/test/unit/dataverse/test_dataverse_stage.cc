@@ -94,6 +94,8 @@ std::string DatasetJson(const std::vector<DvFile> &fs,
  *                                   or the bytes themselves for `direct` ids
  *   GET /s3/<id>                    the bytes, honouring Range (except for
  *                                   `norange` ids)
+ *   GET /web/<id>/<name>            the bytes, honouring Range: a plain web
+ *                                   file (no Dataverse API)
  *
  * The storage redirect names "localhost" while the Dataverse base is
  * "127.0.0.1", so they are different hosts to the stager, as on S3.
@@ -123,6 +125,8 @@ class FakeDataverse {
     std::lock_guard<std::mutex> g(mu_);
     for (auto &t : conns_) t.join();
   }
+
+  int Port() const { return port_; }
 
   std::string Src(const std::string &pid) const {
     return "dataverse::http://127.0.0.1:" + std::to_string(port_) + "/" + pid;
@@ -314,6 +318,20 @@ class FakeDataverse {
               "<Error><Code>AccessDenied</Code></Error>");
       } else {
         ServeBytes(fd, body, range, norange.count(id) == 0, head);
+      }
+    } else if (path.compare(0, 5, "/web/") == 0) {
+      const int64_t id = std::atoll(path.c_str() + 5);
+      std::string body;
+      bool found;
+      {
+        std::lock_guard<std::mutex> g(mu_);
+        found = blobs_.count(id) > 0;
+        if (found) body = blobs_[id];
+      }
+      if (found) {
+        ServeBytes(fd, body, range, true, head);
+      } else {
+        Reply(fd, "404 Not Found", "", "");
       }
     } else {
       Reply(fd, "404 Not Found", "", "");
@@ -653,6 +671,78 @@ TEST_CASE("dataverse_stage_errors", "[dataverse][stage]") {
     REQUIRE(!r.ok);
     REQUIRE(r.error.find("share the path") != std::string::npos);
   }
+}
+
+TEST_CASE("dataverse_stage_web_zip", "[dataverse][stage]") {
+  // A plain http(s) URL is a dataset of one file: no Dataverse API request,
+  // a zip's members selected and range-read as for a Dataverse zip, and no
+  // Dataverse key sent to the web host.
+  auto &s = Server();
+  std::map<int64_t, std::string> b;
+  b[701] = MakeZip({{"posterior.h5", kHdf1, true},
+                    {"example.py", "print('hi')\n", false},
+                    {"__MACOSX/._posterior.h5", "junk", false},
+                    {"big.mp4", kVideo, false}},
+                   false);
+  b[702] = kReadme;
+  s.AddDataset("doi:10.5072/FK2/WEB", {}, b);
+  s.Reset();
+  const std::string base = "http://127.0.0.1:" + std::to_string(s.Port());
+  const std::string dir = TmpDir() + "/web";
+  auto r = cae::DataverseStage(base + "/web/701/release.zip?dl=1",
+                               {"*.zip/posterior.h5", "*.zip/*.py"}, {}, dir,
+                               "secret-key", false, nullptr);
+  INFO(r.error);
+  REQUIRE(r.ok);
+  REQUIRE(r.version == "web");
+  REQUIRE(r.dataset_files == 1);
+  REQUIRE(r.objects.size() == 2);
+  REQUIRE(r.objects[0].path == "release.zip/example.py");
+  REQUIRE(r.objects[1].path == "release.zip/posterior.h5");
+  REQUIRE(r.objects[1].member == "posterior.h5");
+  REQUIRE(Slurp(dir + "/release.zip/posterior.h5") == kHdf1);
+  REQUIRE(Slurp(dir + "/release.zip/example.py") == "print('hi')\n");
+  REQUIRE(!Exists(dir + "/release.zip/__MACOSX"));
+  REQUIRE(r.fetched < kVideo.size());
+  REQUIRE(s.resolves == 0);
+  REQUIRE(s.storage_with_key == 0);
+
+  // A web file that is not a zip, selected whole.
+  auto w = cae::DataverseStage(base + "/web/702/README.txt", {"README.txt"},
+                               {}, dir, "", false, nullptr);
+  INFO(w.error);
+  REQUIRE(w.ok);
+  REQUIRE(w.objects.size() == 1);
+  REQUIRE(Slurp(dir + "/README.txt") == kReadme);
+
+  // A missing web file.
+  auto m = cae::DataverseStage(base + "/web/799/gone.zip", {"*.zip/*"}, {},
+                               dir, "", false, nullptr);
+  REQUIRE(!m.ok);
+}
+
+TEST_CASE("dataverse_parse_web_url", "[dataverse]") {
+  cae::DataverseSource s;
+  std::string err;
+  REQUIRE(cae::ParseDataverseUrl("https://h.org/a/b/rel.zip?x=1#f", &s, &err));
+  REQUIRE(s.base == "https://h.org");
+  REQUIRE(s.pid == "web:h.org/a/b/rel.zip");
+  REQUIRE(s.url == "https://h.org/a/b/rel.zip?x=1#f");
+  REQUIRE(cae::DataverseFileUrl(s, 0) == s.url);
+  REQUIRE(cae::WebFileName(s.url) == "rel.zip");
+  REQUIRE(cae::WebFileName("http://h/d/") == "d");
+  ::setenv("CAE_DATAVERSE_CACHE", "/c", 1);
+  REQUIRE(cae::DataverseCacheDir(s) == "/c/web_h.org_a_b_rel.zip");
+  ::unsetenv("CAE_DATAVERSE_CACHE");
+  REQUIRE(cae::ParseDataverseUrl("http://h.org/f.zip", &s, &err));
+  REQUIRE(s.base == "http://h.org");
+  REQUIRE(!cae::ParseDataverseUrl("https://h.org", &s, &err));
+  REQUIRE(err.find("http(s)://<host>/<path") != std::string::npos);
+  REQUIRE(!cae::ParseDataverseUrl("https:///f.zip", &s, &err));
+  // A Dataverse source after a web one carries no web URL.
+  cae::DataverseSource d;
+  REQUIRE(cae::ParseDataverseUrl("dataverse://h.org/doi:10.1/X", &d, &err));
+  REQUIRE(d.url.empty());
 }
 
 TEST_CASE("dataverse_cache_dir", "[dataverse]") {

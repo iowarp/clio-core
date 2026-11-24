@@ -9,6 +9,9 @@
 #include <clio_cae/core/factory/http_auth.h>
 #include <clio_cae/core/factory/http_fetch.h>
 #include <clio_cae/core/factory/http_file_assimilator.h>
+#ifdef CAE_ENABLE_DATAVERSE
+#include <clio_cae/core/factory/dataverse_file_assimilator.h>
+#endif
 
 #include <string>
 
@@ -91,6 +94,17 @@ clio::run::TaskResume HttpFileAssimilator::Schedule(const AssimilationCtx& ctx,
   clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
 #endif
   CLIO_TASK_BODY_BEGIN
+#ifdef CAE_ENABLE_DATAVERSE
+  // To clio-core (iowarp::<tag>) the web file is staged like a one-file
+  // Dataverse dataset: a zip's members can be selected with dataset_filter
+  // and are range-read out of it, and HDF5 files go through the HDF5
+  // assimilator.
+  if (ctx.dst.compare(0, 8, "iowarp::") == 0) {
+    DataverseFileAssimilator dv(cte_client_);
+    CLIO_CO_AWAIT(dv.Schedule(ctx, error_code));
+    CLIO_CO_RETURN;
+  }
+#endif
   // Blocking, like the Globus file download: the transfer runs on curl
   // children and helper threads while this worker waits for it.
   error_code = Run(ctx);

@@ -177,6 +177,64 @@ bool GenerateTestHDF5File(const std::string& file_path) {
     HLOG(kInfo, "Created /group/nested_dataset: nested 1D array of 30 integers");
   }
 
+  // Dataset 5: /table - a compound (PyTables-style) table, with attributes of
+  // several types on it and on the root group
+  {
+    struct Rec {
+      int32_t id;
+      double x;
+      float y;
+    };
+    hid_t ct = H5Tcreate(H5T_COMPOUND, sizeof(Rec));
+    H5Tinsert(ct, "id", HOFFSET(Rec, id), H5T_NATIVE_INT32);
+    H5Tinsert(ct, "x", HOFFSET(Rec, x), H5T_NATIVE_DOUBLE);
+    H5Tinsert(ct, "y", HOFFSET(Rec, y), H5T_NATIVE_FLOAT);
+    hsize_t dims[1] = {20};
+    hid_t sp = H5Screate_simple(1, dims, NULL);
+    hid_t ds = H5Dcreate2(file_id, "/table", ct, sp, H5P_DEFAULT, H5P_DEFAULT,
+                          H5P_DEFAULT);
+    std::vector<Rec> recs(20);
+    for (int i = 0; i < 20; ++i) recs[i] = {i, i * 0.5, i * 0.25f};
+    H5Dwrite(ds, ct, H5S_ALL, H5S_ALL, H5P_DEFAULT, recs.data());
+
+    hid_t scalar = H5Screate(H5S_SCALAR);
+    auto put = [&](hid_t obj, const char* name, hid_t type, hid_t space,
+                   const void* v) {
+      hid_t a = H5Acreate2(obj, name, type, space, H5P_DEFAULT, H5P_DEFAULT);
+      H5Awrite(a, type, v);
+      H5Aclose(a);
+    };
+    const double ev = -96375.5;
+    put(ds, "log_evidence", H5T_NATIVE_DOUBLE, scalar, &ev);
+    const uint32_t cnt = 7;
+    put(ds, "count", H5T_NATIVE_UINT32, scalar, &cnt);
+    hsize_t three[1] = {3};
+    hid_t sp3 = H5Screate_simple(1, three, NULL);
+    const int64_t arr[3] = {-1, 0, 2};
+    put(ds, "ints", H5T_NATIVE_INT64, sp3, arr);
+    const double nan = std::nan("");
+    put(ds, "missing", H5T_NATIVE_DOUBLE, scalar, &nan);
+    hid_t fs = H5Tcopy(H5T_C_S1);
+    H5Tset_size(fs, 8);
+    put(ds, "CLASS", fs, scalar, "TABLE\0\0\0");
+    hid_t vs = H5Tcopy(H5T_C_S1);
+    H5Tset_size(vs, H5T_VARIABLE);
+    const char* quote = "say \"hi\"\tthere";
+    put(ds, "note", vs, scalar, &quote);
+    put(ds, "self", ct, scalar, &recs[0]);  // a type left out (null)
+    const double prior = 0.125;
+    put(file_id, "prior_n1", H5T_NATIVE_DOUBLE, scalar, &prior);
+    put(file_id, "units_n1", fs, scalar, "Unitless");
+    H5Tclose(vs);
+    H5Tclose(fs);
+    H5Sclose(sp3);
+    H5Sclose(scalar);
+    H5Dclose(ds);
+    H5Sclose(sp);
+    H5Tclose(ct);
+    HLOG(kInfo, "Created /table: compound table of 20 records with attributes");
+  }
+
   H5Fclose(file_id);
   HLOG(kSuccess, "Test HDF5 file generated successfully");
   return true;
@@ -715,6 +773,51 @@ int main(int argc, char* argv[]) {
       exit_code = 1;
     } else {
       HLOG(kSuccess, "All expected datasets found and verified in CTE");
+    }
+
+    // Step 7a: the compound table, its attributes, and the root attributes
+    HLOG(kInfo, "[STEP 7a] Verifying the compound table and attributes...");
+    {
+      auto tt = cte_client->AsyncGetOrCreateTag(kTestTagBase + "/table");
+      tt.Wait();
+      auto ft = cte_client->AsyncGetOrCreateTag(kTestTagBase);
+      ft.Wait();
+      const std::string desc = ReadBlob(cte_client, tt->tag_id_, "description");
+      const std::string attrs = ReadBlob(cte_client, tt->tag_id_, "attributes");
+      const std::string root = ReadBlob(cte_client, ft->tag_id_, "attributes");
+      const std::string want_desc =
+          "compound<24, 20>{id:int32@0, x:float64@8, y:float32@16}";
+      const std::string want_attrs =
+          "{\"CLASS\":\"TABLE\",\"count\":7,\"ints\":[-1,0,2],"
+          "\"log_evidence\":-96375.5,\"missing\":\"NaN\","
+          "\"note\":\"say \\\"hi\\\"\\tthere\",\"self\":null}";
+      const std::string want_root =
+          "{\"prior_n1\":0.125,\"units_n1\":\"Unitless\"}";
+      if (desc != want_desc) {
+        HLOG(kError, "table description '{}', want '{}'", desc, want_desc);
+        exit_code = 1;
+      }
+      if (attrs != want_attrs) {
+        HLOG(kError, "table attributes '{}', want '{}'", attrs, want_attrs);
+        exit_code = 1;
+      }
+      if (root != want_root) {
+        HLOG(kError, "root attributes '{}', want '{}'", root, want_root);
+        exit_code = 1;
+      }
+      if (!VerifyDatasetData(kTestFileName, "/table", kTestTagBase + "/table",
+                             cte_client)) {
+        HLOG(kError, "compound table data does not match");
+        exit_code = 1;
+      }
+      // Without attributes there is no "attributes" blob.
+      auto it = cte_client->AsyncGetOrCreateTag(kTestTagBase + "/int_dataset");
+      it.Wait();
+      if (!ReadBlob(cte_client, it->tag_id_, "attributes").empty()) {
+        HLOG(kError, "int_dataset has an attributes blob but no attributes");
+        exit_code = 1;
+      }
+      if (exit_code == 0) HLOG(kSuccess, "compound table and attributes OK");
     }
 
     // Step 7b: the same file, staged for the HDF5 VOL connector

@@ -23,7 +23,8 @@ External Source          CAE Module              CTE Module
 
 **Supported source schemes:** `file::`, `string::`, `hdf5::`, `globus://`,
 `s3://` (Amazon S3 / MinIO), `gs://` and `gcs://` (Google Cloud Storage),
-`dataverse://` (files and zip members of a Dataverse dataset)
+`dataverse://` (files and zip members of a Dataverse dataset), `http://` and
+`https://` (a web file; to `iowarp::`, also the members of a web zip)
 
 ## Building
 
@@ -130,7 +131,12 @@ transfers:
     format: hdf5_vol
 ```
 
-`hdf5` gives each dataset a tag of its own. `hdf5_vol` instead writes the file
+`hdf5` gives each dataset a tag of its own, with a `description` blob
+(`tensor<float64, 100, 3>`; a table of compound records, such as a PyTables
+`Table`, is `compound<record bytes, rows>{field:type@offset, ...}` over its
+packed records) and, when the dataset has HDF5 attributes, an `attributes`
+blob holding them as one JSON object. The root group's attributes go to an
+`attributes` blob on the destination tag itself. `hdf5_vol` instead writes the file
 in the cache layout of CTE's HDF5 VOL connector
 (`context-transfer-engine/adapter/hdf5_vol/clio_vol_layout.h`): the native-type
 image of every atomic dataset under the connector's tag for the file, then the
@@ -211,6 +217,27 @@ every file is taken whole.
   file below.
 - **Without a runtime:** `cae_dataverse_tool list|stage <src> [dir] -i <glob>
   -x <glob>` lists a selection or stages it.
+
+**Web files and zip archives (`http(s)://` to `iowarp::`):**
+
+```yaml
+transfers:
+  - src: https://example.org/releases/data_release.zip
+    dst: iowarp::release
+    format: hdf5
+    dataset_filter:
+      include_patterns:
+        - "*.zip/posterior.h5"       # members of the web zip
+        - "*.zip/*.py"
+```
+
+To clio-core, a web URL is staged like a Dataverse dataset of one file named
+after the URL's last path segment: zip members are selected with the same
+patterns and range-read out of the remote zip (the server must support range
+requests), HDF5 files go through the `hdf5` assimilator, and the result is
+listed in the `manifest` blob of the destination tag. The staging directory is
+`$CAE_DATAVERSE_CACHE/web_<host>_<path>`. To `file::<path>` the URL is still
+downloaded whole, as before.
 
 **Transforming a source first (`run:`):**
 
