@@ -477,9 +477,16 @@ clio::run::TaskResume Runtime::MultiPutBlob(
   {
     clio::cte::core::MultiPutBatchView batch;
     const bool attached = clio::cte::core::MultiPutBatchView::Attach(*task, &batch);
-    if (view_.Ready() && view_.MdOnly() && attached) {
-      // Metadata only: the batch goes down as one task, then every
-      // record's cached metadata is dropped here and at its home.
+    // A write-back cache's flush landing (cache_base, flush_pool = this
+    // pool) is acknowledged data on its way to persistent storage: pass it
+    // down unchanged and drop the copies it supersedes, exactly as in
+    // metadata-only mode. Absorbing it (data mode) would flush it back to
+    // the write-back cache as a new dirty write, around and around.
+    const bool landing =
+        task->route_blob_.str() == clio::cte::core::kCacheLandBlob;
+    if (view_.Ready() && (view_.MdOnly() || landing) && attached) {
+      // Metadata only (or a landing): the batch goes down as one task, then
+      // every record's cached metadata is dropped here and at its home.
       std::vector<BlobKey> keys;
       std::vector<TagId> tags;
       for (size_t i = 0; i < batch.size(); ++i) {

@@ -74,7 +74,7 @@ constexpr size_t kFlushInflightOps = 64;
 constexpr clio::run::u64 kLandBatchBytes = 8ull << 20;
 /** Routing name of a MultiPutBlob that lands another node's flushed range
  *  on the blob's owner (write-back): the owner writes it through. */
-constexpr const char kLandBlob[] = "\x01" "cache_base.land";
+constexpr const char *kLandBlob = core::kCacheLandBlob;
 constexpr clio::run::u64 kFlushInflightBytes = 256ull << 20;
 /** Least time between two fill-level queries of the volatile core (ns). */
 constexpr clio::run::u64 kFillCheckNs = 10ull * 1000 * 1000;
