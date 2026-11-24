@@ -99,8 +99,9 @@ bool ClioInitImpl(RuntimeMode mode, bool default_with_runtime,
         return false;
       }
       HLOG(kInfo,
-           "CLIO_WITH_RUNTIME=1: could not start a runtime (port already "
-           "bound); attaching to the existing one as a client");
+           "CLIO_WITH_RUNTIME=1: could not start a runtime (the port is "
+           "already bound, or its startup failed - see the errors above); "
+           "attaching as a client");
     }
   }
 
