@@ -61,6 +61,7 @@ class Runtime;
  */
 struct OrganizerBlobStat {
   TagId tag_id_;               // Owning tag
+  std::string tag_name_;       // Canonical tag name (empty if the tag is gone)
   std::string blob_name_;      // Blob name within the tag
   float score_;                // Current placement score (0-1)
   Timestamp last_modified_;    // Last write, steady-clock ns

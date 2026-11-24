@@ -39,7 +39,7 @@ services:
     command: >
       "
         echo 'Node 1: Starting runtime...' &&
-        /workspace/build/bin/clio_run runtime start &
+        /workspace/build/bin/clio_run runtime start --fresh &
         RUNTIME_PID=\$! &&
         echo 'Node 1: Runtime started (PID \$RUNTIME_PID). Waiting for test runner...' &&
         wait \$RUNTIME_PID
@@ -73,7 +73,7 @@ services:
     command: >
       "
         echo 'Node 2: Starting runtime...' &&
-        /workspace/build/bin/clio_run runtime start
+        /workspace/build/bin/clio_run runtime start --fresh
       "
 
   # Node 3
@@ -104,7 +104,7 @@ services:
     command: >
       "
         echo 'Node 3: Starting runtime...' &&
-        /workspace/build/bin/clio_run runtime start
+        /workspace/build/bin/clio_run runtime start --fresh
       "
 
   # Node 4
@@ -135,7 +135,7 @@ services:
     command: >
       "
         echo 'Node 4: Starting runtime...' &&
-        /workspace/build/bin/clio_run runtime start
+        /workspace/build/bin/clio_run runtime start --fresh
       "
 
 networks:

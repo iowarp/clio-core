@@ -5,6 +5,13 @@
 # scale comes from GS_BLOB_KB / GS_BLOBS / GS_OUTPUTS (exported by
 # run_tests.sh): the L=256 analog must complete; the L=512 analog is expected
 # to hit the throughput cliff (STALL, exit 42).
+#
+# Start/stop are barriers, not sleeps: a node runs its producer only after
+# BOTH runtimes answer `clio_run status` (CI/cluster_node.sh ready markers in
+# CN_SYNC, on the shared /workspace mount), and after its producer exits it
+# keeps its runtime up until both nodes wrote <node>.done (cap GS_DONE_CAP),
+# so the slower peer can still reach blobs this node owns. That replaces a
+# fixed `sleep 6` start and a `sleep GS_TEARDOWN_LINGER` (30 s) teardown.
 
 services:
   gs-node1:
@@ -15,18 +22,20 @@ services:
     hostname: iowarp-node1
     networks:
       gs-cluster:
-        ipv4_address: 172.30.0.10
+        ipv4_address: 172.31.3.10
     volumes:
       - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
     tmpfs:
       - /mnt:mode=1777
     environment:
       - NODE_ID=1
-      - NODE_IP=172.30.0.10
+      - NODE_IP=172.31.3.10
       - CLIO_SERVER_CONF=/workspace/context-transfer-engine/test/integration/grayscott_congestion/clio_config.yaml
       - CONTAINER_HOSTFILE=/workspace/context-transfer-engine/test/integration/grayscott_congestion/hostfile
       - CLIO_WITH_RUNTIME=0
       - GS_NODE_ID=1
+      - GS_WATCHDOG_SEC=${GS_WATCHDOG_SEC:-0}
+      - CN_SYNC=/workspace/build/cluster_sync/grayscott_congestion
       - GS_BLOB_KB=${GS_BLOB_KB:-512}
       - GS_BLOBS=${GS_BLOBS:-64}
       - GS_OUTPUTS=${GS_OUTPUTS:-3}
@@ -41,13 +50,16 @@ services:
       "
         set -x &&
         echo 'gs-node1: starting Clio runtime' &&
-        /workspace/build/bin/clio_run runtime start &
+        /workspace/build/bin/clio_run runtime start --fresh &
         RUNTIME_PID=$$! &&
-        sleep 6 &&
+        bash /workspace/CI/cluster_node.sh ready \"$$CN_SYNC\" node1 $$RUNTIME_PID &&
+        bash /workspace/CI/cluster_node.sh wait-ready \"$$CN_SYNC\" 2 &&
         echo 'gs-node1: running congestion producer' &&
-        /workspace/build/bin/test_grayscott_congestion
-        EXIT=$$? &&
-        echo \"gs-node1: producer exit $$EXIT\" &&
+        /workspace/build/bin/test_grayscott_congestion;
+        EXIT=$$?;
+        echo \"gs-node1: producer exit $$EXIT\";
+        bash /workspace/CI/cluster_node.sh done \"$$CN_SYNC\" node1 $$EXIT;
+        bash /workspace/CI/cluster_node.sh wait-done \"$$CN_SYNC\" 2 $${GS_DONE_CAP:-120};
         exit $$EXIT
       "
 
@@ -59,18 +71,20 @@ services:
     hostname: iowarp-node2
     networks:
       gs-cluster:
-        ipv4_address: 172.30.0.11
+        ipv4_address: 172.31.3.11
     volumes:
       - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
     tmpfs:
       - /mnt:mode=1777
     environment:
       - NODE_ID=2
-      - NODE_IP=172.30.0.11
+      - NODE_IP=172.31.3.11
       - CLIO_SERVER_CONF=/workspace/context-transfer-engine/test/integration/grayscott_congestion/clio_config.yaml
       - CONTAINER_HOSTFILE=/workspace/context-transfer-engine/test/integration/grayscott_congestion/hostfile
       - CLIO_WITH_RUNTIME=0
       - GS_NODE_ID=2
+      - GS_WATCHDOG_SEC=${GS_WATCHDOG_SEC:-0}
+      - CN_SYNC=/workspace/build/cluster_sync/grayscott_congestion
       - GS_BLOB_KB=${GS_BLOB_KB:-512}
       - GS_BLOBS=${GS_BLOBS:-64}
       - GS_OUTPUTS=${GS_OUTPUTS:-3}
@@ -85,13 +99,16 @@ services:
       "
         set -x &&
         echo 'gs-node2: starting Clio runtime' &&
-        /workspace/build/bin/clio_run runtime start &
+        /workspace/build/bin/clio_run runtime start --fresh &
         RUNTIME_PID=$$! &&
-        sleep 6 &&
+        bash /workspace/CI/cluster_node.sh ready \"$$CN_SYNC\" node2 $$RUNTIME_PID &&
+        bash /workspace/CI/cluster_node.sh wait-ready \"$$CN_SYNC\" 2 &&
         echo 'gs-node2: running congestion producer' &&
-        /workspace/build/bin/test_grayscott_congestion
-        EXIT=$$? &&
-        echo \"gs-node2: producer exit $$EXIT\" &&
+        /workspace/build/bin/test_grayscott_congestion;
+        EXIT=$$?;
+        echo \"gs-node2: producer exit $$EXIT\";
+        bash /workspace/CI/cluster_node.sh done \"$$CN_SYNC\" node2 $$EXIT;
+        bash /workspace/CI/cluster_node.sh wait-done \"$$CN_SYNC\" 2 $${GS_DONE_CAP:-120};
         exit $$EXIT
       "
 
@@ -100,4 +117,4 @@ networks:
     driver: bridge
     ipam:
       config:
-        - subnet: 172.30.0.0/24
+        - subnet: 172.31.3.0/24

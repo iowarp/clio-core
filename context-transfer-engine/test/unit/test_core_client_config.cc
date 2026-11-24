@@ -76,11 +76,15 @@ class CoreClientConfigFixture {
   CoreClientConfigFixture() {
     INFO("=== Initializing Core Client/Config Test Environment ===");
 
-    // Initialize test paths
-    std::string home_dir = ctp::SystemInfo::GetHomeDir();
-    REQUIRE(!home_dir.empty());
-    test_storage_path_ = home_dir + "/cte_client_test.dat";
-    test_config_path_ = home_dir + "/cte_test_config.yaml";
+    // Initialize test paths. The storage file grows to ~1 GB, so it goes in
+    // the temp directory (TMPDIR on POSIX, TMP/TEMP on Windows), not in a
+    // quota-limited home directory; home is only the fallback.
+    std::error_code tmp_ec;
+    std::string test_dir = fs::temp_directory_path(tmp_ec).string();
+    if (tmp_ec || test_dir.empty()) test_dir = ctp::SystemInfo::GetHomeDir();
+    REQUIRE(!test_dir.empty());
+    test_storage_path_ = (fs::path(test_dir) / "cte_client_test.dat").string();
+    test_config_path_ = (fs::path(test_dir) / "cte_test_config.yaml").string();
 
     // Clean up existing files. Non-throwing form: on Windows the previous
     // test case's bdev runtime still holds the storage file open (same
@@ -88,8 +92,13 @@ class CoreClientConfigFixture {
     // a sharing-violation. Best-effort removal is what we want — if the
     // file's open, leaving it in place is harmless because the runtime
     // already truncates/reuses it on the next pool create.
+    //
+    // The storage file is the bdev target's backing file, and that target
+    // lives for the whole process: remove a stale one only before the
+    // runtime exists. Deleting it under a live target makes the bdev refuse
+    // further I/O (#1210) -- it used to silently write to a new empty file.
     std::error_code _setup_ec;
-    fs::remove(test_storage_path_, _setup_ec);
+    if (!g_initialized) fs::remove(test_storage_path_, _setup_ec);
     fs::remove(test_config_path_, _setup_ec);
 
     // Initialize CLIO Runtime and CTE once
@@ -134,8 +143,9 @@ class CoreClientConfigFixture {
     // surfaces as 0xC0000409 / STATUS_STACK_BUFFER_OVERRUN). Best-effort
     // cleanup is correct here — leftover files are scrubbed by the
     // clio_test_cleanup_fixture between test binaries.
+    // The storage file stays: it backs a target that outlives this fixture
+    // (see the constructor).
     std::error_code ec;
-    fs::remove(test_storage_path_, ec);
     fs::remove(test_config_path_, ec);
   }
 
@@ -411,7 +421,7 @@ TEST_CASE("Client - AsyncGetTagSize", "[core][client][tag]") {
   REQUIRE(create_task->GetReturnCode() == 0);
 
   // Get tag size
-  auto size_task = client->AsyncGetTagSize(create_task->tag_id_);
+  auto size_task = client->AsyncGetTagSize(create_task->tag_id_, clio::run::PoolQuery::Broadcast(0.0f));
   size_task.Wait();
 
   REQUIRE(size_task->GetReturnCode() == 0);
@@ -650,7 +660,7 @@ TEST_CASE("Client - AsyncGetContainedBlobs Direct", "[core][client][blob]") {
   }
 
   // Get contained blobs
-  auto blobs_task = client->AsyncGetContainedBlobs(tag_task->tag_id_);
+  auto blobs_task = client->AsyncGetContainedBlobs(tag_task->tag_id_, clio::run::PoolQuery::Broadcast());
   blobs_task.Wait();
 
   REQUIRE(blobs_task->GetReturnCode() == 0);

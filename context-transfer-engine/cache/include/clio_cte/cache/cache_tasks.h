@@ -6,6 +6,7 @@
 #define CLIO_CTE_CACHE_CACHE_TASKS_H_
 
 #include <clio_runtime/clio_runtime.h>
+#include <clio_ctp/util/msan.h>
 #include <clio_runtime/task.h>
 #include <clio_runtime/admin/admin_tasks.h>
 #include <clio_cte/core/core_tasks.h>
@@ -42,11 +43,20 @@ struct CacheConfig {
   /// reclaims one. Modest default keeps hot raw bytes resident without
   /// starving primaries of the fast tier.
   float min_score_ = 0.5f;
+  /// Metadata-only mode (YAML key `md_only`). When true the cache keeps NO
+  /// node-local copies of blob DATA: no cache-replica writes, reads,
+  /// populates or size probes. Tag metadata write-through and task routing
+  /// are unchanged, and all blob data goes straight to / from the
+  /// authoritative owner chain. Use it when node-local copies crowd the fast
+  /// tiers more than they save on remote reads (e.g. write-heavy IO500-style
+  /// runs). Default off: the full read/write cache.
+  bool md_only_ = false;
 
   CacheConfig() : next_pool_id_(clio::run::PoolId::GetNull()) {}
   CacheConfig(const clio::run::PoolId &pool_id, const CacheConfig &other)
       : next_pool_id_(other.next_pool_id_),
-        min_score_(other.min_score_) {
+        min_score_(other.min_score_),
+        md_only_(other.md_only_) {
     (void)pool_id;
   }
 
@@ -55,7 +65,7 @@ struct CacheConfig {
     // EVERY field round-trips — the audit rule three silently-dropped-field
     // bugs on this branch bought us (replication copy-ctor, ReplicationConfig
     // period, CompressorConfig next_pool_id_).
-    ar(next_pool_id_, min_score_);
+    ar(next_pool_id_, min_score_, md_only_);
   }
 
   /** Load configuration from compose YAML. */
@@ -63,6 +73,11 @@ struct CacheConfig {
     if (!pool_config.config_.empty()) {
       try {
         YAML::Node node = YAML::Load(pool_config.config_);
+        // yaml-cpp is a prebuilt .so: the scalars its scanner just
+        // produced carry no MSan shadow, so every key lookup and
+        // .as<>() below reads memory it has no record of. One walk
+        // here covers the whole tree.
+        ctp::MsanUnpoisonYaml(node);
         if (node["next_pool_id"]) {
           std::string next_str = node["next_pool_id"].as<std::string>();
           auto dot = next_str.find('.');
@@ -74,6 +89,9 @@ struct CacheConfig {
         }
         if (node["min_score"]) {
           min_score_ = node["min_score"].as<float>();
+        }
+        if (node["md_only"]) {
+          md_only_ = node["md_only"].as<bool>();
         }
       } catch (...) {
         // Config parsing is best-effort

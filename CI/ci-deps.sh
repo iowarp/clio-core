@@ -8,9 +8,9 @@
 #   ./CI/ci-deps.sh release                  # Build with release preset
 #   ./CI/ci-deps.sh release-fuse             # Build with FUSE adapter enabled
 #   ./CI/ci-deps.sh debug                    # Build with debug preset
-#   ./CI/ci-deps.sh conda                    # Build with conda-optimized preset
-#   ./CI/ci-deps.sh cuda                     # Build with CUDA preset
-#   ./CI/ci-deps.sh rocm                     # Build with ROCm preset
+#   ./CI/ci-deps.sh cuda-release             # Build with CUDA preset
+#   ./CI/ci-deps.sh rocm-debug               # Build with ROCm preset
+#   (any configurePreset name from CMakePresets.json works)
 #   ./CI/ci-deps.sh --only-deps [preset]     # Install ONLY iowarp-core's deps
 #                                         # (build+host+run from the recipe),
 #                                         # skip conda-build of iowarp-core itself.
@@ -476,6 +476,16 @@ echo ""
 # family). Compile/test failures must still fail on the first attempt --
 # a blind retry of a 10-30 minute build would burn CI on every real
 # breakage -- so we match the crash signature before retrying.
+#
+# A second signature is retried for the same reason: the package built, but
+# conda-build could not SOLVE its test env against a dependency conda-forge
+# had published minutes earlier. On 2026-10-15 the msan job built against
+# libcurl 8.23.0 (published 2026-10-14 15:15 UTC) and then failed with
+#     nothing provides libcurl >=8.23.0,<9.0a0 needed by iowarp-core-...
+#     ERROR: Failed to get package records, max retries exceeded.
+# while asan/ubsan passed the identical step in the same run: the channel
+# index had not caught up everywhere yet. That retry clears the local index
+# cache first so it fetches fresh repodata instead of the stale copy.
 _build_log="$(mktemp -t iowarp-conda-build.XXXXXX)"
 BUILD_SUCCESS=false
 for _attempt in 1 2; do
@@ -494,12 +504,19 @@ for _attempt in 1 2; do
         BUILD_SUCCESS=true
         break
     fi
-    if [ "$_attempt" -ge 2 ] || \
-       ! grep -qE "ERROR REPORT|IndexError: list index out of range" "$_build_log"; then
+    if [ "$_attempt" -ge 2 ]; then
         break
     fi
-    echo -e "${YELLOW}conda-build crashed internally (not a build error); retrying once in 60s...${NC}"
-    sleep 60
+    if grep -qE "ERROR REPORT|IndexError: list index out of range" "$_build_log"; then
+        echo -e "${YELLOW}conda-build crashed internally (not a build error); retrying once in 60s...${NC}"
+        sleep 60
+    elif grep -q "Failed to get package records, max retries exceeded" "$_build_log"; then
+        echo -e "${YELLOW}conda-build could not solve the test env (stale channel index, not a build error); clearing the index cache and retrying once in 120s...${NC}"
+        "$CONDA_BIN" clean --index-cache -y || true
+        sleep 120
+    else
+        break
+    fi
 done
 rm -f "$_build_log"
 

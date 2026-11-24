@@ -61,11 +61,14 @@
 #define CLIO_RUNTIME_GPU_YIELDABLE_H_
 
 #include <cstdio>
+#include <cstdlib>
 #include <clio_ctp/util/gpu_api.h>
 #include <clio_runtime/types.h>
 
 #include <type_traits>
 #include <chrono>
+#include <functional>
+#include <utility>
 #include <vector>
 
 namespace clio::run::gpu {
@@ -103,10 +106,45 @@ struct YieldBlockState {
    * back to the caller's ResumeWhen. 0 means "no token, relaunch freely".
    */
   clio::run::u64 wait_tag_;
+  /**
+   * WHERE IN ITS OWN DATA this block currently is. Stamped by the kernel
+   * (YieldPublishCursor), copied to the host with the rest of this struct,
+   * and never interpreted by the driver.
+   *
+   * Neither of the other fields can answer that question. `resume_point_` is
+   * a SOURCE line, not a data offset, and under the coroutine mechanism it is
+   * permanently 0 -- the real resume point is an opaque frame address in
+   * YieldLaneHeader::coro_resume_, which no host code can decode. So a host
+   * observer that wants to know "which page will this block ask for next"
+   * has to be told by the only party that knows: the workload.
+   *
+   * It lives HERE, and not in the per-block user state, because this array is
+   * already copied D2H every round. Two more words ride for free; carrying
+   * them in StateT would add a second per-round copy to the driver's critical
+   * path to move the same sixteen bytes.
+   *
+   * A HINT, ALWAYS. A kernel that never stamps it leaves it 0, and every
+   * consumer must treat 0 -- and any value it cannot interpret -- as "no
+   * information". Nothing about correctness may depend on it.
+   */
+  clio::run::u64 cursor_;
+  clio::run::u64 cursor_aux_;
 };
 
 /** State type for kernels that need no state of their own. */
 struct YieldNoState {};
+
+/**
+ * A post-round observer; see Yieldable::SetYieldObserver.
+ *
+ * Declared at namespace scope, NOT as a member of Yieldable<StateT>, so that
+ * a consumer can hand one over without naming -- or being templated on -- the
+ * driver's state type. The whole point of the seam is that the two sides know
+ * nothing about each other.
+ */
+using YieldObserverFn = std::function<void(const YieldBlockState *states,
+                                           clio::run::u32 nblocks,
+                                           clio::run::u32 round)>;
 
 /**
  * Device-side handle passed to a yieldable kernel by value.
@@ -238,6 +276,11 @@ class Yieldable {
 
   clio::run::u32 NumBlocks() const { return nblocks_; }
   clio::run::u32 NumThreads() const { return nthreads_; }
+  /** Run this driver on its own (non-blocking) stream: the launch callback must launch on Stream(), and a round
+   *  then waits for and copies on that stream only. Null (the default) is the legacy default stream. Two drivers
+   *  on different streams run their rounds concurrently instead of queueing behind each other's kernels. */
+  void SetStream(void *stream) { stream_ = stream; }
+  void *Stream() const { return stream_; }
   /** Blocks that have not finished. */
   clio::run::u32 NumPending() const { return num_pending_; }
   /** Host copy of one block's state (as of the last completed round). */
@@ -250,22 +293,53 @@ class Yieldable {
   /** Device user state, for host-side setup before the first round. */
   StateT *DeviceState() const { return d_user_; }
 
+  /**
+   * Called after every round, once the block states are on the host.
+   *
+   * THE GAP AFTER A KERNEL RETURNS IS FREE HOST TIME, and it is the only
+   * moment with all three of: no grid resident, every block's reason for
+   * stopping already copied out, and the next launch not yet decided. Work
+   * issued here (a tier migration, a hint to another service) overlaps the
+   * NEXT round's kernel instead of competing with this one.
+   *
+   * The driver interprets nothing it hands over -- `states` is the whole
+   * per-block array including cursor_, indexed by LOGICAL block. Kept
+   * deliberately narrow: no reference to the observer's owner, no ordering
+   * guarantee beyond "after the copy, before the pending set is recomputed",
+   * and any exception is the observer's problem, not the driver's.
+   */
+  using YieldObserver = YieldObserverFn;
+  void SetYieldObserver(YieldObserver obs) { observer_ = std::move(obs); }
+  void ClearYieldObserver() { observer_ = nullptr; }
+  /** Rounds executed since the last Reset(); what the observer is passed. */
+  clio::run::u32 Round() const { return round_; }
+
   /** Rewind every block to its entry point and mark them all pending. */
   void Reset() {
     for (clio::run::u32 i = 0; i < nblocks_; ++i) {
       host_yield_[i].resume_point_ = 0;
       host_yield_[i].status_ = kYieldSuspended;
       host_yield_[i].wait_tag_ = 0;
+      // A STALE CURSOR IS WORSE THAN NO CURSOR. A reused driver whose blocks
+      // still carried the last run's positions would hand an observer a
+      // confident, wrong answer for the first round of the next run.
+      host_yield_[i].cursor_ = 0;
+      host_yield_[i].cursor_aux_ = 0;
       host_pending_[i] = i;
     }
     num_pending_ = nblocks_;
+    round_ = 0;
     // Restore the per-block user state too. The constructor zeroes d_user_ and
     // Reset did not, so a REUSED driver started its next run with whatever the
     // previous one left there -- Reset has to leave the object in the state
     // construction leaves it in, or it is not a reset.
 #if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
     if (d_user_ != nullptr) {
-      ctp::GpuApi::Memset(d_user_, 0, nblocks_ * sizeof(StateT));
+      if (stream_ != nullptr) {  // on its own stream: no implicit join with the legacy stream
+        ctp::GpuApi::MemsetAsync(d_user_, 0, nblocks_ * sizeof(StateT), stream_);
+      } else {
+        ctp::GpuApi::Memset(d_user_, 0, nblocks_ * sizeof(StateT));
+      }
     }
 #endif
     Upload();
@@ -364,10 +438,15 @@ class Yieldable {
     // The kernels launch on the legacy default stream, so that is what has to
     // be waited on. Clio's streams are created cudaStreamNonBlocking, so they
     // do not implicitly join it and are correctly excluded here.
-    ctp::GpuApi::Synchronize(/*stream=*/nullptr);
+    ctp::GpuApi::Synchronize(stream_);
     const auto _t1 = std::chrono::steady_clock::now();
-    ctp::GpuApi::Memcpy(host_yield_.data(), d_yield_,
-                        nblocks_ * sizeof(YieldBlockState));
+    if (stream_ != nullptr) {  // on its own stream: no implicit join with the legacy stream
+      ctp::GpuApi::MemcpyAsync(host_yield_.data(), d_yield_, nblocks_ * sizeof(YieldBlockState), stream_);
+      ctp::GpuApi::Synchronize(stream_);
+    } else {
+      ctp::GpuApi::Memcpy(host_yield_.data(), d_yield_,
+                          nblocks_ * sizeof(YieldBlockState));
+    }
     const auto _t2 = std::chrono::steady_clock::now();
     const double _rms =
         std::chrono::duration<double, std::milli>(_t1 - _t0).count();
@@ -375,6 +454,15 @@ class Yieldable {
     t_kernel_ms_ += _rms;
     t_copy_ms_ += std::chrono::duration<double, std::milli>(_t2 - _t1).count();
 #endif
+    // THE OBSERVER RUNS BEFORE THE PENDING SET IS RECOMPUTED, and that is
+    // deliberate: it sees every block's state, including the ones that just
+    // finished. A prefetcher wants the finish as much as the suspend -- a
+    // block leaving its slab is exactly when the pages behind it become
+    // demotable.
+    ++round_;
+    if (observer_) {
+      observer_(host_yield_.data(), nblocks_, round_);
+    }
     // Compact the still-suspended blocks. Order is preserved so that a block's
     // work stays as sequential as the caller wrote it.
     clio::run::u32 n = 0;
@@ -400,6 +488,38 @@ class Yieldable {
    * Returns the number of rounds executed.
    */
   /**
+   * Wall-clock bound on a RunToCompletion loop (CLIO_GV_WALL_CAP_MS; unset or
+   * 0 = none).
+   *
+   * The round cap counts relaunches, and 2,000,000 of them is minutes of a
+   * whole allocation parked behind one dead peer. A time bound reports the
+   * same livelock in seconds. Sets hit_round_cap_ so callers treat it as the
+   * same condition.
+   * @param wall_t0 when the loop started
+   * @param rounds rounds completed so far, for the message
+   * @return true when the bound is exceeded and the loop must stop
+   */
+  bool WallCapHit(std::chrono::steady_clock::time_point wall_t0,
+                  clio::run::u32 rounds) {
+    static const long long cap_ms = [] {
+      const char *e = std::getenv("CLIO_GV_WALL_CAP_MS");
+      return (e != nullptr && *e) ? std::atoll(e) : 0LL;
+    }();
+    if (cap_ms <= 0) return false;
+    const long long elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - wall_t0).count();
+    if (elapsed_ms < cap_ms) return false;
+    hit_round_cap_ = true;
+    std::fprintf(stderr,
+                 "[yieldable] WALL CAP HIT after %lld ms (%u rounds) with %u "
+                 "block(s) still suspended -- faults are not being satisfied.\n",
+                 elapsed_ms, rounds, num_pending_);
+    std::fflush(stderr);
+    return true;
+  }
+
+  /**
    * `service` may return void, or bool to ABORT: returning false stops the
    * loop immediately.
    *
@@ -415,8 +535,12 @@ class Yieldable {
   clio::run::u32 RunToCompletion(LaunchFn &&launch, ServiceFn &&service,
                                  clio::run::u32 max_rounds = 0) {
     clio::run::u32 rounds = 0;
+    const auto wall_t0 = std::chrono::steady_clock::now();
     while (Round(launch)) {
       ++rounds;
+      if (WallCapHit(wall_t0, rounds)) {
+        break;
+      }
       if (max_rounds != 0 && rounds >= max_rounds) {
         hit_round_cap_ = true;
         // LOUD ON PURPOSE. Hitting the cap means blocks kept parking and
@@ -487,8 +611,12 @@ class Yieldable {
                                  clio::run::u32 max_rounds,
                                  ResumeWhenFn &&resume_when) {
     clio::run::u32 rounds = 0;
+    const auto wall_t0 = std::chrono::steady_clock::now();
     while (Round(launch, resume_when)) {
       ++rounds;
+      if (WallCapHit(wall_t0, rounds)) {
+        break;
+      }
       if (max_rounds != 0 && rounds >= max_rounds) {
         hit_round_cap_ = true;   // see HitRoundCap(): never silent again
         std::fprintf(stderr,
@@ -543,8 +671,13 @@ class Yieldable {
 
   void Upload() {
 #if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
-    ctp::GpuApi::Memcpy(d_yield_, host_yield_.data(),
-                        nblocks_ * sizeof(YieldBlockState));
+    if (stream_ != nullptr) {
+      ctp::GpuApi::MemcpyAsync(d_yield_, host_yield_.data(), nblocks_ * sizeof(YieldBlockState), stream_);
+      ctp::GpuApi::Synchronize(stream_);  // host_yield_ may change before the copy would run
+    } else {
+      ctp::GpuApi::Memcpy(d_yield_, host_yield_.data(),
+                          nblocks_ * sizeof(YieldBlockState));
+    }
 #endif
     UploadPending();
   }
@@ -552,8 +685,13 @@ class Yieldable {
   void UploadPending() {
 #if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
     if (num_pending_ > 0) {
-      ctp::GpuApi::Memcpy(d_pending_, host_pending_.data(),
-                          num_pending_ * sizeof(clio::run::u32));
+      if (stream_ != nullptr) {
+        ctp::GpuApi::MemcpyAsync(d_pending_, host_pending_.data(), num_pending_ * sizeof(clio::run::u32), stream_);
+        ctp::GpuApi::Synchronize(stream_);  // host_pending_ is rewritten before the next upload
+      } else {
+        ctp::GpuApi::Memcpy(d_pending_, host_pending_.data(),
+                            num_pending_ * sizeof(clio::run::u32));
+      }
     }
 #endif
   }
@@ -561,10 +699,16 @@ class Yieldable {
   clio::run::u32 nblocks_ = 0;
   clio::run::u32 nthreads_ = 0;
   clio::run::u32 num_pending_ = 0;
+  /** The stream this driver's kernels run on (SetStream); null = the legacy default stream. */
+  void *stream_ = nullptr;
   /** Set when a service callback returned false; see RunToCompletion. */
   bool aborted_ = false;
   /** See HitRoundCap(). Sticky across Reset(). */
   bool hit_round_cap_ = false;
+  /** Rounds since Reset(). Passed to the observer so a consumer can tell one
+   *  round from the next without keeping its own count. */
+  clio::run::u32 round_ = 0;
+  YieldObserver observer_;
   YieldBlockState *d_yield_ = nullptr;
   StateT *d_user_ = nullptr;
   clio::run::u32 *d_pending_ = nullptr;

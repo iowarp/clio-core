@@ -43,6 +43,26 @@ def _locate_bin(name):
     return candidate, os.path.join(package_dir, "bin"), os.path.join(package_dir, "lib")
 
 
+
+def _gpu_runtime_dirs(lib_dir):
+    """Runtime library dirs for GPU wheel variants (empty for the CPU wheel).
+
+    The GPU libraries carry these in their RPATH (repair_wheel.sh), but an
+    executable's own dependencies resolve through its search path, not its
+    libraries' RPATH, so the launcher adds them too. Only dirs that exist are
+    returned, so this is a no-op where the runtime is absent.
+    """
+    site = os.path.dirname(os.path.dirname(lib_dir))
+    candidates = [
+        # iowarp-core-cuda12: nvidia-cuda-runtime-cu12 -> libcudart.so.12
+        os.path.join(site, "nvidia", "cuda_runtime", "lib"),
+        # iowarp-core-sycl: intel-sycl-rt installs libsycl into <prefix>/lib
+        os.path.join(sys.prefix, "lib"),
+        # iowarp-core-rocm6: system ROCm
+        os.environ.get("ROCM_PATH", "/opt/rocm") + "/lib",
+    ]
+    return [d for d in candidates if os.path.isdir(d)]
+
 def _exec_iowarp_bin(name):
     """Find ``iowarp_core/bin/<name>[.exe]``, set the platform's
     dynamic-loader search path, and run it.
@@ -76,25 +96,24 @@ def _exec_iowarp_bin(name):
     else:
         env_var = "LD_LIBRARY_PATH"
     existing = env.get(env_var, "")
-    env[env_var] = (
-        lib_dir + os.pathsep + existing if existing else lib_dir
-    )
+    search = [lib_dir] + _gpu_runtime_dirs(lib_dir)
+    if existing:
+        search.append(existing)
+    env[env_var] = os.pathsep.join(search)
     os.execve(bin_path, [bin_path] + sys.argv[1:], env)
 
 
 def clio_run_main():
-    """Entry point for the ``clio_run`` console script (canonical)."""
-    _exec_iowarp_bin("clio_run")
+    """Entry point for the ``clio-run`` console script and its legacy
+    ``clio_run`` alias. Both exec the one bundled ``bin/clio-run`` binary
+    (a wheel cannot carry the symlink native packages use for the alias).
+    """
+    _exec_iowarp_bin("clio-run")
 
 
 def main():
-    """Entry point for the deprecated ``clio_run`` console script.
-
-    Kept as a backward-compat shim. New code should call ``clio_run``;
-    this dispatches to the clio_run.exe alias so existing pipelines
-    keep working until the alias is removed in a future release.
-    """
-    _exec_iowarp_bin("clio_run")
+    """Backward-compat shim for callers of ``iowarp_core._cli.main``."""
+    _exec_iowarp_bin("clio-run")
 
 
 def cte_bench_main():

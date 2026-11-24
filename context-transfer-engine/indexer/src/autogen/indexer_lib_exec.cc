@@ -64,6 +64,7 @@ namespace clio::cte::indexer {
   X(kSemanticSearch, clio::cte::core::SemanticSearchTask, SemanticSearch) \
   X(kTruncateBlob, clio::cte::core::TruncateBlobTask, TruncateBlob)       \
   X(kRenameTag, clio::cte::core::RenameTagTask, RenameTag)                \
+  X(kUpdateTagNames, clio::cte::core::UpdateTagNamesTask, UpdateTagNames) \
   X(kMultiPutBlob, clio::cte::core::MultiPutBlobTask, MultiPutBlob)       \
   X(kIndexSweep, IndexSweepTask, IndexSweep)                              \
   X(kReindexScan, ReindexScanTask, ReindexScan)

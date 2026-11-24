@@ -1,35 +1,14 @@
 name: GPU Tests (CUDA)
 
 on:
-  # Push to main/dev runs UNCONDITIONALLY -- no path filter. A merge is the
-  # gate that decides what lands, so it must exercise everything; a path
-  # filter here meant a merge touching only, say, CI or docs skipped the CUDA
-  # compile entirely, and the next unrelated merge inherited the breakage.
-  # PRs keep the path filter (below): breadth on every PR commit costs queue
-  # time for little signal, and the merge sweep still gates the branch.
   push:
-    branches: [main, dev]
-  # Also run on PRs touching the same paths. Previously this workflow fired
-  # ONLY on push to main/dev, so a change that broke the CUDA device compile
-  # was invisible in PR review and only surfaced after merge, on dev — which
-  # is exactly how the shm_metadata_cache.h device-pass break (#812, from
-  # #788) landed. Running the same compile-only build on PRs catches these
-  # before merge. Same path filter, so PRs that don't touch buildable source
-  # still skip it.
-  pull_request:
-    branches: [main, dev]
-    paths:
-      - 'context-runtime/**'
-      - 'context-transfer-engine/**'
-      - 'context-transport-primitives/**'
-      - 'CMakeLists.txt'
-      - 'CMakePresets.json'
-      - 'installers/conda/**'
-      - '.github/workflows/gpu-tests.yml'
-      - 'context-transfer-engine/adapter/gpu_vector/test/distributed*/**'
-  # Merge queue (issue #1013): same full-matrix-before-merge rationale as the
-  # other gates -- see ci-adapters.yml.
-  merge_group:
+    branches: [main]
+  # Push to dev does NOT trigger this directly: dev-full-ci.yml dispatches
+  # the full matrix once dev has been quiet for 30 minutes, so a burst of
+  # merges gets one full run instead of one per merge.
+  # Not run on pull requests: PRs only check that the tree builds on
+  # Linux/macOS/Windows and passes Linux unit tests. This runs in the full
+  # dev sweep (dev-full-ci.yml) and on push to main.
   workflow_dispatch:
 
 # One in-flight run per ref; a new push to a PR branch cancels the previous
@@ -132,6 +111,9 @@ jobs:
           wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 22
         fi
         clang++-22 --version | head -1
+        # clio-coroc (the CO_AWAIT transpiler the *_paged_newcoro benchmarks
+        # are built with) links against LLVM/Clang's development libraries.
+        bash CI/retry.sh sudo apt-get install -y -qq llvm-22-dev libclang-22-dev
 
     - name: Compile GPU tests (compile-only, no device)
       shell: bash -el {0}
@@ -156,13 +138,24 @@ jobs:
           -DCLIO_CTE_ENABLE_COMPRESS=ON \
           -DCLIO_CORE_ENABLE_CUDA=ON \
           -DCLIO_GPU_CLANG=ON \
-          -DCMAKE_CUDA_ARCHITECTURES=89-real
+          -DCMAKE_CUDA_ARCHITECTURES=89-real \
+          -DCLIO_RUN_ENABLE_COROC=ON \
+          -DLLVM_DIR=/usr/lib/llvm-22/lib/cmake/llvm \
+          -DClang_DIR=/usr/lib/llvm-22/lib/cmake/clang \
+          -DCLIO_CORO_REGCAP=OFF
+        # CLIO_CORO_REGCAP=OFF: installing llvm-22-dev (for clio-coroc) also
+        # puts llvm-config on PATH, which switches on the register-cap pass
+        # plugin -- and loading it crashes clang 22's frontend on the
+        # lammps_md probe build. Before llvm-22-dev was installed here the
+        # plugin was never built, so OFF keeps this job's configuration as it
+        # was. The crash itself is a separate bug.
+        # gpu_vector_all, not a hand-written --target list: that list only
+        # named what someone remembered to add, so four paged benchmark
+        # drivers stopped compiling and nothing noticed. gpu_vector_all is
+        # every target under adapter/gpu_vector, including ones added later,
+        # minus an explicit, printed GV_ALL_KNOWN_BROKEN list.
         cmake --build build-gpu-compile -j "$(nproc)" \
-          --target test_yieldable test_yield_stack \
-                   test_gpu_vector_smoke test_gpu_vector_semantics \
-                   test_gpu_vector_workloads test_gpu_vector_compress \
-                   test_gpu_vector_race test_gpu_vector_hbm_nvcomp \
-                   clio_gpu_vector_weights_bench
+          --target gpu_vector_all test_yieldable test_yield_stack -- -k
 
     # NOTE: GPU tests are disabled until self-hosted GPU runners are available.
     # To re-enable, change runs-on to [self-hosted, gpu], add nvidia-smi
@@ -216,6 +209,77 @@ jobs:
   # CI has no GPU runner (see the disabled steps above), so this cannot RUN
   # them. It parses every one of them, which is the same bargain the
   # distributed_md step already makes and catches the same class of mistake.
+  # ROCm (HIP) compile-only build. No AMD runner exists, so this builds the
+  # ROCm code through HIP-NVCC (HIP_PLATFORM=nvidia): the same CTP_ENABLE_ROCM
+  # sources, HIP API and add_rocm_* CMake paths as an AMD build, compiled by
+  # nvcc. Before this job nothing in CI built CLIO_CORE_ENABLE_ROCM at all,
+  # and three breaks landed on dev unseen: the gpu2cpu device ring was
+  # CUDA-only, the devmem test hardcoded sm_89, and LINKER:--disable-new-dtags
+  # reached nvcc's device-link step ("cc1plus: unknown pass new-dtags").
+  # Runs in deps-cpu (8.6 GB) plus CUDA 12.9 + hip-dev rather than
+  # deps-nvidia (35.7 GB, larger than the runner's free disk). CUDA 12.9, not
+  # 13: ROCm 6.4's nvidia_hip_runtime_api.h does not compile against CUDA 13
+  # (cudaGraphAddNode signature change).
+  build-rocm-nvidia:
+    name: Build ROCm via HIP-NVCC (compile only)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v5
+      with:
+        submodules: recursive
+
+    - name: Free disk space
+      run: |
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+          /opt/hostedtoolcache/CodeQL
+        df -h /
+
+    - name: Compile ROCm GPU targets (inside deps-cpu)
+      run: |
+        docker run --rm -v "${{ github.workspace }}":/workspace -w /workspace -u 0 \
+          -e HIP_PLATFORM=nvidia -e CUDA_PATH=/usr/local/cuda-12.9 \
+          iowarp/deps-cpu:latest bash -c '
+            set -eux
+            git config --global --add safe.directory "*"
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -qq
+            apt-get install -y -qq --no-install-recommends wget curl gpg ca-certificates
+            # CUDA 12.9 toolkit (same repo/version as deps-nvidia.Dockerfile).
+            wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+            dpkg -i cuda-keyring_1.1-1_all.deb
+            apt-get update -qq
+            apt-get install -y -qq --no-install-recommends cuda-toolkit-12-9
+            # HIP-NVCC, exactly as deps-nvidia.Dockerfile installs it: hip-dev
+            # is force-extracted so the AMD hipcc does not replace hipcc-nvidia.
+            # Nothing may apt-get install after this (apt is left with
+            # deliberately unmet deps).
+            mkdir -p /etc/apt/keyrings
+            curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor -o /etc/apt/keyrings/rocm.gpg
+            echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/6.4 noble main" > /etc/apt/sources.list.d/rocm.list
+            printf "Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600\n" > /etc/apt/preferences.d/rocm-pin-600
+            apt-get update -qq
+            apt-get install -y -qq --no-install-recommends hipcc-nvidia hip-runtime-nvidia
+            apt-get download hip-dev
+            dpkg -i --force-overwrite --force-depends hip-dev_*.deb
+            rm -f hip-dev_*.deb cuda-keyring_*.deb
+            export PATH=/usr/local/cuda-12.9/bin:/opt/rocm/bin:$PATH
+            export LD_LIBRARY_PATH=/usr/local/lib:/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}
+            hipconfig --platform
+            # rocm-debug defaults CMAKE_CUDA_ARCHITECTURES=native, which has
+            # no device to detect here; 120 matches what this was validated on.
+            cmake --preset rocm-debug -B build-rocm \
+              -DCMAKE_CUDA_ARCHITECTURES=120 \
+              -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.9/bin/nvcc \
+              -DCUDAToolkit_ROOT=/usr/local/cuda-12.9
+            # The two ROCm GPU tests: together they build clio_run_cxx_gpu
+            # (gpu2cpu_init_hip.cc) and the CTE runtime, and exercise the
+            # nvcc device-link step.
+            cmake --build build-rocm -j"$(nproc)" \
+              --target test_gpu_kernel_stress test_cte_devmem_putget
+          '
+
   validate-gpu-vector-harnesses:
     name: gpu_vector docker harnesses parse
     runs-on: ubuntu-24.04
@@ -231,7 +295,12 @@ jobs:
                    distributed_md_paged distributed_md_bench \
                    distributed_workloads; do
             echo "== $d"
-            bash -n "$base/$d"/run_*.sh
+            # Not every harness has a run script: some are driven by compose
+            # alone (their run scripts were removed in 1034cdca), and an
+            # unmatched glob would hand bash -n a literal "run_*.sh".
+            for s in "$base/$d"/run_*.sh; do
+              if [ -e "$s" ]; then bash -n "$s"; fi
+            done
             # The harnesses require these to be set; the values are irrelevant
             # to a parse and a missing one is a hard error, not a warning.
             ( cd "$base/$d" && \

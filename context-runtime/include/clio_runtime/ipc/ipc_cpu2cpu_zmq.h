@@ -40,6 +40,23 @@ struct IpcCpu2CpuZmq {
   static bool RecvIn(IpcManager *ipc, u32 &tasks_received);
 
   /**
+   * Admit one received TCP/IPC client request: deserialize it, stamp the
+   * client's response route on a new Future, and push it onto the ingress
+   * lane. Used by RecvIn and by the deferred-request replay (issue #1039).
+   * @param ipc IpcManager
+   * @param mode Client transport (kTcp or kIpc)
+   * @param transport Transport the request arrived on
+   * @param archive The received request; its task is consumed and its
+   *        transport-owned receive handles are released
+   * @param recv_info The transport's receive info (fd / routing identity)
+   * @return true if the request was enqueued for a worker
+   */
+  static bool AdmitZmq(IpcManager *ipc, IpcMode mode,
+                       ctp::lbm::Transport *transport,
+                       LoadTaskArchive &archive,
+                       const ctp::lbm::ClientInfo &recv_info);
+
+  /**
    * Worker-inline SendOut: enqueue completed task to net_queue_.
    * The actual ZMQ send happens in the net-worker SendOut phase.
    */
@@ -67,6 +84,16 @@ struct IpcCpu2CpuZmq {
   /** Re-send a task via ZMQ after server restart. */
   template <typename TaskT>
   static void ResendTask(IpcManager *ipc, Future<TaskT> &future);
+
+  /**
+   * Emit the one-shot client-response send tally (#968).
+   *
+   * SendOut's send/fail counters were only observable through a 1-in-256
+   * kDebug line, which a default build compiles out entirely, so a run could
+   * retry or drop responses with nothing in the log to show it. Called once
+   * from ~IpcManager(); a no-op when this process sent nothing.
+   */
+  static void LogSendTally();
 };
 
 }  // namespace clio::run

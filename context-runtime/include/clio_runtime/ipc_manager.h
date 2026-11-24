@@ -40,8 +40,10 @@
 #include <condition_variable>
 #include <deque>
 #include <iostream>
+#include <list>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <random>
 #include <string>
 #include <thread>
@@ -66,6 +68,7 @@
 #include "clio_runtime/ipc/ipc_run2run.h"
 #include "clio_ctp/data_structures/serialization/serialize_common.h"
 #include "clio_ctp/lightbeam/transport_factory_impl.h"
+#include "clio_ctp/lightbeam/peer_dial_table.h"
 #include "clio_ctp/memory/backend/posix_shm_mmap.h"
 #include "clio_ctp/lightbeam/shm_mpsc_transport.h"
 #include "clio_runtime/gpu/gpu_info.h"
@@ -702,12 +705,16 @@ class IpcManager {
   bool ReconnectToOriginalHost();
 
   /**
-   * Wait for server to come back and reconnect
-   * Polls with 1-second intervals up to client_retry_timeout_
+   * Wait for server to come back and reconnect.
+   * Polls with 1-second intervals up to the lesser of client_retry_timeout_
+   * and max_sec. Returns false if either timeout elapses (issue #1096).
+   *
    * @param start Time point when the wait started (for overall timeout)
+   * @param max_sec Maximum seconds to wait (from start), or <= 0 for no limit
    * @return true if reconnection succeeded within timeout
    */
-  bool WaitForServerAndReconnect(std::chrono::steady_clock::time_point start);
+  bool WaitForServerAndReconnect(std::chrono::steady_clock::time_point start,
+                                  float max_sec = 0.0f);
 
   /**
    * Reconnect the ZMQ transport to a different host.
@@ -826,6 +833,69 @@ class IpcManager {
   void SetAlive(u64 node_id);
 
   /**
+   * Record that a message (a task or a response) just arrived from node_id.
+   * Proof of life that does not depend on how busy that node's workers are:
+   * a liveness probe is a task, so a node saturated by startup pool creates
+   * can be silent to probes for tens of seconds while it is visibly sending.
+   * Cheap (one relaxed atomic store), called from the receive threads.
+   */
+  void NoteHeardFrom(u64 node_id);
+
+  /** A peer probed this node as one it holds DEAD (rejoin notice). */
+  void NoteHeldDeadByPeer() {
+    held_dead_seq_.fetch_add(1, std::memory_order_acq_rel);
+  }
+  /** Count of rejoin notices received; a change means a peer failed this
+   *  node over since the caller last looked, so state it homes may have
+   *  been changed by a stand-in. */
+  u64 HeldDeadSeq() const {
+    return held_dead_seq_.load(std::memory_order_acquire);
+  }
+  std::atomic<u64> held_dead_seq_{0};
+  /**
+   * Record the incarnation a message from node_id carried (#1148).
+   * @param node_id the sending node
+   * @param incarnation its runtime's server generation (0 = unknown)
+   * @return true when node_id was known under a DIFFERENT incarnation: it
+   *         restarted since, and nothing sent to its old process will be
+   *         answered
+   */
+  bool NotePeerIncarnation(u64 node_id, u64 incarnation);
+  /** Nanoseconds since the last message from node_id; ~0ull if never. */
+  u64 NsSinceHeardFrom(u64 node_id) const;
+
+  /**
+   * Nanoseconds since this node last got a pong from node_id on the control
+   * channel (~0 if never). The control channel (base port + 2) is a
+   * separate ZMQ context, socket pair and thread that carries only tiny
+   * ping/pong frames, so bulk data queued on the main peer sockets cannot
+   * delay it (decision control_port: probes queued behind 1 MiB PutBlobs
+   * missed the silence window and healthy nodes were declared dead).
+   */
+  u64 NsSincePong(u64 node_id) const;
+  /** Start / stop the control channel thread (runtime only). */
+  void StartControlChannel();
+  void StopControlChannel();
+  /** Every node id in the hostfile (fixed after init; safe from any thread). */
+  std::vector<u64> GetNodeIds() const;
+  /** Number of nodes marked dead so far; a collective can never complete
+   *  once this is non-zero. Readable from any thread. */
+  u32 DeadNodeCount() const {
+    return dead_count_.load(std::memory_order_acquire);
+  }
+  /** Wall-clock time (ns since the Unix epoch) of the LAST MOMENT a peer
+   *  this node has since declared dead was heard from, the latest over all
+   *  such deaths; 0 if none. A node accepts nothing after it goes silent,
+   *  so fsync (issue #1133) fails a file only if its unsynced window opened
+   *  before that moment -- not merely before the (seconds later) death
+   *  declaration, which failed fsyncs of writes made after the node had
+   *  already died. Wall clock, so values from different nodes compare.
+   *  Readable from any thread. */
+  u64 LastLivenessChangeNs() const {
+    return last_liveness_change_ns_.load(std::memory_order_acquire);
+  }
+
+  /**
    * Get the SWIM node state for a node
    * @param node_id Node to query
    * @return NodeState (kDead for unknown nodes)
@@ -838,6 +908,12 @@ class IpcManager {
    * @param new_state New state to set
    */
   void SetNodeState(u64 node_id, NodeState new_state);
+
+ private:
+  /** SetNodeState for a caller that already holds hostfile_mu_. */
+  void SetNodeStateLocked(u64 node_id, NodeState new_state);
+
+ public:
 
   /**
    * Record that traffic was just received from this peer (issue #856).
@@ -912,9 +988,13 @@ class IpcManager {
 
   /**
    * Get the list of dead nodes for retry queue scanning
-   * @return Const reference to dead_nodes_ vector
+   * @return a snapshot of dead_nodes_, copied under hostfile_mu_ (SetDead
+   *         and SetAlive modify it from network threads)
    */
-  const std::vector<DeadNodeEntry> &GetDeadNodes() const { return dead_nodes_; }
+  std::vector<DeadNodeEntry> GetDeadNodes() const {
+    std::shared_lock<std::shared_mutex> hl(hostfile_mu_);
+    return dead_nodes_;
+  }
 
   /**
    * Add a new node to the internal hostfile
@@ -946,6 +1026,33 @@ class IpcManager {
    * @return Pointer to main server or nullptr if not initialized
    */
   ctp::lbm::Transport *GetMainTransport() const;
+
+  /**
+   * Size-tiered peer ports (experiment, CLIO_NET_TIERS / CLIO_NET_TIER_LANES).
+   * CLIO_NET_TIERS="16k,256k" splits peer messages into tiers by payload
+   * bytes (< 16k, < 256k, the rest); CLIO_NET_TIER_LANES=N gives each tier N
+   * ports, used round-robin. Tier slot i listens on base port +
+   * kNetTierPortOffset + i with its own ROUTER and recv thread, and peers
+   * send each message to the slot for its size, so small messages never
+   * queue behind bulk ones on one socket or one recv thread. Off (0 slots)
+   * when neither variable is set.
+   */
+  static constexpr u32 kNetTierPortOffset = 16;
+  /** @return number of tier slots (0 = tiers off) */
+  static int NetTierSlots();
+  /** @return tier slot for a message of `bytes` payload bytes */
+  static int NetTierSlot(size_t bytes);
+  /** CLIO_NET_TIER_ZMQ_FROM=k: tiers >= k (the larger messages) listen and
+   *  dial with ZeroMQ even when CLIO_PEER_TRANSPORT=socket. Plain sockets win
+   *  on small-message latency (4 KB 1x1 1.6x) but lose on loaded 1 MB
+   *  transfers (0.73-0.85x: one recv thread per port reads each message
+   *  synchronously, where ZeroMQ spreads it over its I/O threads).
+   *  @return true if tier slot `slot` uses ZeroMQ */
+  static bool NetTierUsesZmq(int slot);
+  /** @return the tier listener transports (empty when tiers are off) */
+  const std::vector<ctp::lbm::TransportPtr> &GetTierTransports() const {
+    return tier_transports_;
+  }
 
   /**
    * Get this host identified during host identification
@@ -1191,20 +1298,68 @@ class IpcManager {
                                          const char *lane = "");
 
   /**
+   * Dial a new runtime-peer client connection (no caching; used by
+   * GetOrCreateClient through the dial table, without any pool lock held).
+   * @param addr Peer host/IP.
+   * @param port Peer listener port.
+   * @param error Receives the failure reason.
+   * @return The connection, or null on failure.
+   */
+  ctp::lbm::TransportPtr DialPeerClient(const std::string &addr, int port,
+                                        std::string *error);
+
+  /**
+   * Dedicated network send threads (experiment, CLIO_NET_SEND_THREADS=N).
+   * Every cross-node request (SendIn) and reply (SendOut) used to be sent by
+   * ONE worker (the admin Send periodic on net_send_worker_), so a node's
+   * whole outbound path serialized there; under a 4-node 16x16 load tasks
+   * waited 0.4-1.6 ms on its queues, and a 1 MB request blocked small
+   * replies for ~0.5 s on the socket transport. With N > 0, N extra threads
+   * also drain the net queues. Each uses its own peer connections (the
+   * thread's slot is appended to the GetOrCreateClient key), because neither
+   * ZeroMQ sockets nor plain-socket writes may be shared across threads.
+   */
+  static int NetSendThreads();
+  /** Mark the calling thread as send slot `slot` (-1 = shared connections). */
+  static void SetSendSlot(int slot);
+  /** Number of inbound client SHM shards (worker w < this drains shard w). */
+  u32 GetShmInShards() const { return shm_in_shards_; }
+
+  /**
    * Get or create a dial-back connection for returning a response to a client.
-   * The (key_id, port) pair forms the cache key (hash(key_id + ":" + port)); a
-   * cache miss opens a new ZeroMQ DEALER to dial_addr:port via GetOrCreateClient
-   * (which owns it) and records the raw pointer in client_conn_cache_. Used at
-   * RecvIn to populate RunContext::response_transport_.
-   * @param key_id Routing identity of the requesting client (e.g. ZMQ identity
-   *               or peer address) used together with port as the cache key.
+   *
+   * Dial-back connections live in their own LRU-bounded table, separate from
+   * the runtime-peer client_pool_ (issue #1065): every short-lived client used
+   * to leave a DEALER in client_pool_ for the life of the daemon, so the
+   * 1024th distinct client exhausted ZeroMQ's socket limit and its response
+   * was dropped. The table holds at most GetMaxClientDialBacks() entries; a
+   * miss at capacity evicts the least recently used one.
+   *
+   * The caller receives shared ownership and must keep it for as long as it
+   * may send on the transport (RecvIn stores it in
+   * RunContext::response_transport_owner_). Eviction only drops the table's
+   * reference, so an in-flight response is never sent on a freed socket.
+   *
+   * @param key_id Routing identity of the requesting client ("hostname:pid").
    * @param dial_addr Host/IP to connect the dial-back DEALER to.
    * @param port Client's ephemeral response port (SaveTaskArchive::client_port_).
-   * @return Non-owning transport pointer, or nullptr on failure.
+   * @return Shared transport, or nullptr if the dial failed.
    */
-  ctp::lbm::Transport *GetOrCreateClientByIdentity(const std::string &key_id,
-                                                   const std::string &dial_addr,
-                                                   int port);
+  std::shared_ptr<ctp::lbm::Transport> GetOrCreateClientByIdentity(
+      const std::string &key_id, const std::string &dial_addr, int port);
+
+  /** @return the number of client dial-back connections currently cached. */
+  size_t GetClientDialBackCount() const;
+
+  /** @return the most client dial-back connections kept cached at once. */
+  size_t GetMaxClientDialBacks() const;
+
+  /**
+   * Set the most client dial-back connections kept cached at once. Lowering
+   * it evicts least recently used entries immediately.
+   * @param max_dial_backs new capacity (at least 1)
+   */
+  void SetMaxClientDialBacks(size_t max_dial_backs);
 
   /** Port of this process's client-side response listener (0 if none). */
   int GetClientResponsePort() const { return client_response_port_; }
@@ -1216,8 +1371,22 @@ class IpcManager {
   void ClearClientPool();
 
   /**
+   * Evict the cached dial-back DEALER for an undeliverable client.
+   * Called when a client response is dropped after exhausting retries (issue
+   * #722). The connection leaves the table, so its socket is closed as soon as
+   * no in-flight response still holds it, and a later request from the same
+   * client dials afresh.
+   *
+   * Thread-safe: acquires client_pool_mutex_.
+   *
+   * @param key_id The client's identity string.
+   * @param port The client's response port.
+   */
+  void EvictClientByIdentity(const std::string &key_id, int port);
+
+  /**
    * Set the net worker's lane pointers for signaling on EnqueueNetTask.
-   * Called by scheduler after DivideWorkers assigns the net workers.
+   * Called by WorkOrchestrator once worker lanes are mapped (#768).
    *
    * With the recv/send split, the cross-node Send priorities
    * (kSendIn{Latency,IO} / kSendOut{Latency,IO}) are drained by the
@@ -1241,6 +1410,13 @@ class IpcManager {
    * @param priority Network queue priority (see NetQueuePriority for
    *                 the latency-vs-IO lane split).
    */
+  /**
+   * CLIO_NET_QPROF: mark the arrival of a peer's task on this node, so the
+   * server-side residency (arrival -> response enqueued) can be attributed.
+   * A no-op unless profiling is enabled.
+   */
+  void NetProfMarkRecvIn(const clio::run::shared_ptr<Task> &task);
+
   void EnqueueNetTask(Future<Task> future, NetQueuePriority priority);
 
   /**
@@ -1266,7 +1442,9 @@ class IpcManager {
     if (net_queue_.IsNull()) {
       return 0;
     }
-    return net_queue_->GetLane(0, static_cast<u32>(priority)).Size();
+    const u32 p = static_cast<u32>(priority);
+    return net_queue_->GetLane(0, p).Size() +
+           net_overflow_size_[p].load(std::memory_order_relaxed);
   }
 
   /**
@@ -1359,10 +1537,33 @@ class IpcManager {
    * Does not reap:
    * - Segments owned by the current process
    * - The main allocator segment (AllocatorId 1.0)
+   * - A dead owner that still has tasks in flight, or that was admitted or
+   *   last seen alive within runtime.client_reap_grace_s (#1192): those
+   *   tasks may hold raw pointers into its segments, and a pid that only
+   *   LOOKS dead (another pid namespace) keeps showing activity.
    *
    * @return Number of shared memory segments reaped
    */
   size_t WreapDeadIpcs();
+
+  /**
+   * Count one task admitted from SHM client `pid` as in flight (#1192).
+   * @param pid the client process
+   */
+  void AcquireClientInflight(u32 pid);
+
+  /**
+   * Drop one in-flight task of client `pid` (see ReleaseClientInflight).
+   * @param pid the client process
+   */
+  void ReleaseClientInflightCount(u32 pid);
+
+  /**
+   * Tasks of client `pid` currently in flight (for tests and diagnostics).
+   * @param pid the client process
+   * @return the count (0 for an unknown pid)
+   */
+  u64 GetClientInflight(u32 pid);
 
   /**
    * Reap all shared memory segments
@@ -1512,9 +1713,13 @@ class IpcManager {
    * Helper method for host identification
    * Uses ZMQ port from ConfigManager and sets main_transport_
    * @param hostname Hostname to bind to
+   * @param advertise_addr Address this node advertises in the hostfile (the
+   *        one peers dial), or "" if unknown. Only the Thallium peer
+   *        transport uses it, to pick the interface for IP protocols.
    * @return true if server started successfully, false otherwise
    */
-  bool TryStartMainServer(const std::string &hostname);
+  bool TryStartMainServer(const std::string &hostname,
+                          const std::string &advertise_addr = "");
 
   /**
    * Effective runtime port for this IpcManager. Used on the client-init path for
@@ -1590,6 +1795,9 @@ class IpcManager {
 
   // Monotonic counter, set from epoch nanos at init
   std::atomic<u64> server_generation_{0};
+  /** Last incarnation seen per peer node (NotePeerIncarnation). */
+  std::mutex peer_inc_mu_;
+  std::unordered_map<u64, u64> peer_inc_;
 
   // The worker task queues (multi-lane queue)
   ctp::ipc::FullPtr<TaskQueue> worker_queues_;
@@ -1610,6 +1818,32 @@ class IpcManager {
   std::unordered_map<std::string, std::unique_ptr<ctp::lbm::ShmMpscTransport>>
       shm_conns_;
   std::mutex shm_conns_mutex_;
+#endif
+  // #1192: per-SHM-client activity, so WreapDeadIpcs never unmaps a segment
+  // an admitted task can still read.
+  struct ClientActivity {
+    u64 inflight = 0;       ///< admitted tasks not yet destroyed
+    u64 last_admit_ns = 0;  ///< steady clock, last admitted task
+    u64 dead_since_ns = 0;  ///< steady clock, first reap scan that saw it dead
+  };
+  std::unordered_map<u32, ClientActivity> client_activity_;
+  std::mutex client_activity_mu_;
+  /**
+   * Whether a dead client's segments may be reaped now: no task in flight,
+   * nothing admitted and dead for at least the grace period. Records the
+   * first time the pid was seen dead.
+   * @param pid the client process (already found dead)
+   * @param grace_ns the grace period
+   * @return true when reaping is safe
+   */
+  bool ClientReapable(u32 pid, u64 grace_ns);
+  /**
+   * Forget reaped clients: their activity entries and cached response-ring
+   * connections.
+   * @param pids the clients whose segments were just reaped
+   */
+  void ForgetReapedClients(const std::vector<u32> &pids);
+#if CTP_IS_HOST
 
   // The single named MPSC receive rings that replace the old per-thread servers.
   // Runtime: shm_in_server_ ("clio-<runtime_pid>-shm-in", ~128MB) receives every
@@ -1652,6 +1886,12 @@ class IpcManager {
   std::unordered_map<std::string, std::unique_ptr<ShmSendQueue>>
       shm_send_queues_;
   std::mutex shm_send_queues_mutex_;   // guards the MAP (not the per-queue FIFOs)
+  // Futures queued across all ShmSendQueues. DrainShmSends runs on every
+  // worker loop pass; with the default inline send the queues are always
+  // empty, yet each pass took shm_send_queues_mutex_ -- ~20 workers contending
+  // on one mutex (1 in 6 gdb worker samples under a 4-node 16x16 load). This
+  // lets an empty drain return without touching any lock.
+  std::atomic<u64> shm_send_pending_{0};
   std::atomic<bool> shm_send_running_{false};  // #807: SHM-mode gate for flush
 
  public:
@@ -1676,6 +1916,23 @@ class IpcManager {
 
   // Network queue for send operations (one lane, two priorities)
   ctp::ipc::FullPtr<NetQueue> net_queue_;
+  std::mutex net_pop_mu_;  // net_queue_ lanes are single-consumer rings
+
+  /**
+   * Spill-over for net_queue_ when a priority's ring is full.
+   *
+   * The ring waits for space when full, and its only consumer is the net
+   * worker -- which itself enqueues net tasks (liveness probes from
+   * ScanTaskProgress, retries, responses). Under a burst of cross-node
+   * metadata traffic the ring filled, the net worker blocked pushing into
+   * its own queue, and the node wedged for good (R-state spin in
+   * EnqueueNetTask, peers declaring it dead). Enqueues are serialized by
+   * net_push_mu_ so the space check and the push are atomic; once a
+   * priority has spilled, later tasks queue behind the spill to keep FIFO.
+   */
+  std::mutex net_push_mu_;
+  std::deque<Future<Task>> net_overflow_[kNetQueueNumPriorities];
+  std::atomic<size_t> net_overflow_size_[kNetQueueNumPriorities] = {};
 
   // Net workers' lane pointers for signaling on EnqueueNetTask. With the
   // recv/send split, send-side priorities wake net_send_lane_ and
@@ -1692,6 +1949,7 @@ class IpcManager {
 
   // Main ZeroMQ transport (server mode) for distributed communication
   ctp::lbm::TransportPtr main_transport_;
+  std::vector<ctp::lbm::TransportPtr> tier_transports_;  // size-tier listeners
 
   // Callbacks run at the start of ClearTransports() to stop module-owned
   // threads that hold raw transport pointers. See RegisterTransportShutdownHook.
@@ -1769,6 +2027,7 @@ class IpcManager {
   // while the client's Future (which owns them) is alive.
   struct PendingClientFuture {
     Task *task = nullptr;  // waiter (task->fut_) + SetComplete()/SetNewData()
+    unsigned long long submit_cyc = 0;  // CLIO_EVLAT c_e2e start (0 = off)
   };
   // Pending futures (client-side, keyed by net_key)
   std::unordered_map<size_t, PendingClientFuture> pending_zmq_futures_;
@@ -1782,17 +2041,58 @@ class IpcManager {
 
   // Dead node tracking for failure detection
   std::vector<DeadNodeEntry> dead_nodes_;
+  std::atomic<u32> dead_count_{0};  ///< dead_nodes_.size(), for other threads
 
   // Self-fencing flag for partition detection (SWIM protocol)
   bool self_fenced_ = false;
 
   // Hostfile management
   std::unordered_map<u64, Host> hostfile_map_;  // Map node_id -> Host
+  /**
+   * Guards hostfile_map_'s STRUCTURE (and hosts_cache_). LoadHostfile and
+   * AddNode rebuild or insert while worker threads iterate the map (e.g. the
+   * admin idle probe's GetNodeIds), which ASan caught as a heap-use-after-free.
+   * Writers that clear/insert hold it exclusively; lookups and iteration hold
+   * it shared. Never taken recursively: callers already holding it use the
+   * *Locked helpers.
+   */
+  mutable std::shared_mutex hostfile_mu_;
+  /** Last-heard-from steady-clock ns per node id (see NoteHeardFrom). */
+  static constexpr u64 kHeardSlots = 65536;
+  std::unique_ptr<std::atomic<u64>[]> last_heard_ns_{
+      new std::atomic<u64>[kHeardSlots]()};
+  /** Last pong steady-clock ns per node id (control channel). */
+  std::unique_ptr<std::atomic<u64>[]> last_pong_ns_{
+      new std::atomic<u64>[kHeardSlots]()};
+  std::thread control_thread_;
+  std::atomic<bool> control_stop_{false};
+  void ControlChannelLoop();
   /** Confirmed membership changes; see GetMembershipEpoch (issue #856). */
   std::atomic<u64> membership_epoch_{0};
+  /** Time of the latest real peer liveness transition; see
+   *  LastLivenessChangeNs (#1133). */
+  std::atomic<u64> last_liveness_change_ns_{0};
+  /**
+   * Record that a peer was just declared dead: raise the liveness-change
+   * time to the wall-clock moment it was last heard from (now, if never).
+   * @param node_id the peer
+   */
+  void NoteLivenessChange(u64 node_id) {
+    const u64 now = static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+    const u64 since = NsSinceHeardFrom(node_id);
+    const u64 at = (since == ~0ull || since > now) ? now : now - since;
+    u64 cur = last_liveness_change_ns_.load(std::memory_order_acquire);
+    while (at > cur && !last_liveness_change_ns_.compare_exchange_weak(
+                           cur, at, std::memory_order_acq_rel)) {
+    }
+  }
   mutable std::vector<Host>
       hosts_cache_;  // Cached vector of hosts for GetAllHosts
-  mutable bool hosts_cache_valid_ = false;  // Flag to track cache validity
+  // Atomic: SetNodeState clears it under hostfile_mu_'s SHARED side.
+  mutable std::atomic<bool> hosts_cache_valid_{false};  // cache validity
   Host this_host_;                          // Identified host for this node
 
   // Client-side server waiting configuration (from environment variables)
@@ -1810,28 +2110,40 @@ class IpcManager {
   int client_try_new_servers_ = 0;  // CLIO_CLIENT_TRY_NEW_SERVERS (default 0)
   std::atomic<bool> reconnecting_{false};  // Guards against recursive reconnect
 
-  // Persistent ZeroMQ transport connection pool
-  // Key format: "ip_address:port"
-  std::unordered_map<std::string, ctp::lbm::TransportPtr> client_pool_;
-  mutable std::mutex client_pool_mutex_;  // Mutex for thread-safe pool access
+  // Persistent runtime-peer connection pool. Key format:
+  // "ip_address:port[#lane][#sN]"; backoff is tracked per "ip_address:port".
+  // The table has its own lock and never holds it while dialing, so one
+  // slow/unreachable peer cannot stall connections to the others, and a
+  // failing peer is redialed with exponential backoff, not on every retry.
+  ctp::lbm::PeerDialTable<ctp::lbm::Transport, ctp::lbm::TransportDeleter>
+      client_pool_;
+  mutable std::mutex client_pool_mutex_;  // Guards the dial-back table below
 
-  // Dial-back connection cache for returning responses to clients.
-  // Keyed by hash(response-identity + client_port); value is a NON-owning raw
-  // Transport* (ownership stays in client_pool_, keyed by "addr:port"). Built
-  // at RecvIn from the requesting peer's transport identity and the archive's
-  // client_port_, then stashed in RunContext::response_transport_ so SendOut
-  // routes the response over a dedicated connection instead of the inbound
-  // socket. Self-locking (per-bucket RwLocks), so no external mutex needed.
-  // Host-only: the single-bucket-count unordered_map_ll constructor lives under
-  // CTP_IS_HOST (it pulls the global CTP_MALLOC), so nvcc's device pass has no
-  // matching constructor for this in-class initializer. The dial-back cache is
-  // host networking state used only from the host .cc, so guard the whole
-  // member out of the device pass.
-#if CTP_IS_HOST
-  static constexpr size_t kConnCacheBuckets = 1024;
-  ctp::priv::unordered_map_ll<size_t, ctp::lbm::Transport *> client_conn_cache_{
-      kConnCacheBuckets};
-#endif
+  // Dial-back connections for returning responses to TCP clients (issue
+  // #1065), keyed by "<client identity>:<response port>" and guarded by
+  // client_pool_mutex_. Kept apart from client_pool_ (runtime peers, bounded
+  // by the hostfile) because clients are unbounded over a daemon's life: the
+  // table is LRU-capped at max_client_dial_backs_. Entries share ownership
+  // with every in-flight response that will send on them
+  // (RunContext::response_transport_owner_), so eviction never frees a socket
+  // a response is about to use.
+  struct ClientDialBack {
+    std::shared_ptr<ctp::lbm::Transport> transport_;
+    std::list<std::string>::iterator lru_pos_;  // position in the LRU list
+  };
+  /** Default cap: well under ZeroMQ's 1023-socket default, leaving room for
+   *  the runtime's peer, listener and response sockets. */
+  static constexpr size_t kDefaultMaxClientDialBacks = 512;
+  std::unordered_map<std::string, ClientDialBack> client_dial_backs_;
+  std::list<std::string> client_dial_back_lru_;  // front = most recently used
+  size_t max_client_dial_backs_ = kDefaultMaxClientDialBacks;
+
+  /**
+   * Evict least recently used dial-backs until at most @p limit remain.
+   * Caller must hold client_pool_mutex_.
+   * @param limit the number of entries to keep
+   */
+  void TrimClientDialBacksLocked(size_t limit);
 
   // Client-side ephemeral ROUTER on which this process receives task responses.
   // Bound to an OS-assigned port at client init; that port is advertised to the
@@ -2105,6 +2417,31 @@ namespace clio::run {
 // shared_ptr destructor (host) when the last owner drops — no explicit free.
 template <typename TaskT, typename AllocT>
 CTP_HOST_FUN Future<TaskT, AllocT>::~Future() {
+#if CTP_IS_HOST
+  // A future dropped WITHOUT being waited on still has to deregister. Firing
+  // AsyncX in a loop and letting each future die is legal use of the API (it is
+  // exactly what test_client_crash_putblob does), and consumed_ is false on that
+  // path, so the branch below never ran: the task's shared_ptr freed it while
+  // pending_zmq_futures_ still held a RAW pointer to it, and the next response
+  // wrote through that pointer (Task::SetNewData on freed memory —
+  // AddressSanitizer's heap-use-after-free in cr_cli_client_crash_leak).
+  //
+  // Gated on being the LAST owner: a copy of a live future carries
+  // consumed_ == false too, and deregistering for one of those would strand the
+  // owner still waiting for the response. use_count() == 1 here means this
+  // object's member destructor, which runs next, frees the task.
+  if (!consumed_ && !task_ptr_.IsNull() && task_ptr_.use_count() == 1 &&
+      !FutureShmIsNull()) {
+    ctp::ipc::FullPtr<FutureT> fs = GetFutureShm();
+    TaskT *t = TaskRaw();
+    if (!fs.IsNull() && t != nullptr &&
+        (fs->origin_ == ClientOrigin::kClientTcp ||
+         fs->origin_ == ClientOrigin::kClientIpc ||
+         fs->origin_ == ClientOrigin::kClientShm)) {
+      CLIO_CPU_IPC->CleanupResponseArchive(t->task_id_.net_key_);
+    }
+  }
+#endif
   if (consumed_) {
     // Clean up zero-copy response archive (TCP/IPC only, never used on GPU).
     // The FutureShm itself is owned by the host shared_ptr and freed

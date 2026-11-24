@@ -1,0 +1,56 @@
+<!--
+title: lda
+heading: <em>lda:</em> latent Dirichlet allocation.
+description: API reference for clio-ml's LDA topic model module (batch variational EM): Python fit_lda on bag-of-words rows, C++ FitLda, LdaOptions and the topics matrix.
+eyebrow: Docs · Machine learning
+lede: Latent Dirichlet allocation fitted by batch variational EM, the equivalent of Spark MLlib's LDA with the EM optimizer. Rows are bag-of-words counts over a fixed vocabulary; each EM iteration is one paged pass with the per-document E-step in the kernel and the M-step on the host.
+facts: Module | ml_lda ; Header | clio_ml/lda.h ; Rows | one count per vocabulary word ; Limits | k at most 16
+-->
+<h2>What it does</h2>
+<p>Expected topic-word counts are summed in fixed row order, so the topics are bit-reproducible. The model holds the topic-word distributions only; per-document topic mixtures are not returned.</p>
+
+<h2>Rows</h2>
+<p>One document per row with <code>vocab_size</code> columns of word counts. <code>clio_ml.COLUMNS["lda"]</code> is 0.</p>
+
+<h2>Python</h2>
+<pre data-label="python">
+import numpy as np, clio_ml as cm
+docs = np.random.default_rng(1).poisson(2.0, (4096, 8)).astype(np.float32)
+
+r = cm.fit_lda(docs, k=2, iters=3)
+topics = np.asarray(r.model.topics).reshape(r.model.K, r.model.V)   # each row sums to 1
+print(topics.argsort(axis=1)[:, ::-1][:, :3])                        # top-3 words per topic
+</pre>
+<ul>
+  <li><code>fit_lda(X, **options)</code>.</li>
+  <li>Options (<code>LdaOptions</code>): <code>k</code> (3), <code>iters</code> (30), <code>inner</code> (20, per-document E-step iterations), <code>alpha</code> (0.1, document-topic Dirichlet), <code>eta</code> (0.01, topic-word smoothing), <code>seed</code> (1), <code>threads</code> (256).</li>
+  <li>Result <code>LdaResult</code>: <code>model</code> (<code>LdaModel</code> with <code>V</code>, <code>K</code> and <code>topics</code>, K*V) and <code>stats</code>.</li>
+  <li>No predictor.</li>
+</ul>
+
+<h2>C++</h2>
+<pre data-label="cpp">
+struct LdaOptions {
+  u32 k = 3;            // <= 16
+  u32 iters = 30;
+  u32 inner = 20;
+  float alpha = 0.1f;
+  float eta = 0.01f;
+  u32 seed = 1;
+  u32 threads = 256;
+  ClusterExchange cluster;
+};
+struct LdaModel {
+  u32 V = 0, K = 0;
+  std::vector<float> topics;  // K*V
+  std::vector<float> Flatten() const;
+};
+struct LdaResult { LdaModel model; VecStats stats; };
+LdaResult FitLda(Dataset &ds, const LdaOptions &opt);
+LdaResult FitLdaPlain(const float *data, u64 n_docs, u32 vocab, u64 elems_per_page,
+                      u32 nblocks, const LdaOptions &opt);
+LdaResult FitLdaReference(/* same arguments */);
+</pre>
+<p>The ChiMod is module <code>ml_lda</code>.</p>
+
+<p>Related: <a href="/docs/ml/w2v.html">word2vec</a>, <a href="/docs/ml/fim.html">frequent itemsets</a>.</p>

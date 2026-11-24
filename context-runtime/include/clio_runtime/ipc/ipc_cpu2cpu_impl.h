@@ -10,6 +10,7 @@
 
 #include "clio_runtime/ipc/ipc_cpu2cpu.h"
 #include "clio_runtime/ipc/ipc_cpu2cpu_zmq.h"
+#include "clio_runtime/evlat.h"
 
 #include <unordered_map>
 
@@ -91,7 +92,8 @@ Future<TaskT> IpcCpu2Cpu::SendIn(IpcManager *ipc,
   // returned Future (or a copy) is alive — the client holds it until Recv.
   {
     std::lock_guard<std::mutex> lock(ipc->pending_futures_mutex_);
-    ipc->pending_zmq_futures_[net_key] = {task_ptr.get()};
+    ipc->pending_zmq_futures_[net_key] = {task_ptr.get(),
+                                          clio::run::evlat::Now()};
   }
 
   // issue #807: shard across the runtime's S inbound rings. Key by this client
@@ -139,6 +141,27 @@ bool IpcCpu2Cpu::RecvOut(IpcManager *ipc,
 #else
   TaskT *task_ptr = future.get();
   const size_t want_key = task_ptr->task_id_.net_key_;
+
+  // Never-sent task: nothing to wait for, nothing to claim.
+  //
+  // Both SendIn paths stamp net_key_ with the task's OWN heap address, which
+  // cannot be null, and ResendTask re-stamps the same way -- so a zero
+  // net_key_ is only ever TaskId's constructor default, i.e. a task that
+  // never went over IPC at all. A future built around a task that was filled
+  // in and SetComplete()'d locally, never Sent, carries exactly that (the
+  // CLIO_RUN_INLINE path builds one). Returning true hands the caller the
+  // locally-produced result and lets WaitCpu2Cpu run Destroy(true) ->
+  // PostWait.
+  //
+  // Without this the #968 guard at the bottom treats every such future as a
+  // protocol violation: the task IS complete (locally) and there IS no parked
+  // archive, which is precisely the aliasing signature that guard looks for.
+  // That turned every cache-hit read into rc=-1 (cr_cli_cfs,
+  // cte_{get,put}blob_priv_separate, python_gil_release_test), with the bytes
+  // already correctly copied.
+  if (want_key == 0) {
+    return true;
+  }
 
   // Finalized-client escape (issue #970). A task submitted AFTER
   // ClientFinalize can never complete — the response listener is gone and the
@@ -193,13 +216,23 @@ bool IpcCpu2Cpu::RecvOut(IpcManager *ipc,
     } while (start.GetUsecFromStart(spin_now) < spin_us);
   }
 
+  double next_report_us = 60e6;  // [HANGWATCH-CLIENT], #1147
   while (!task_ptr->IsComplete()) {
     em->Wait(100);
-    if (max_sec > 0) {
+    {
       ctp::Timepoint now;
       now.Now();
-      if (start.GetUsecFromStart(now) >= static_cast<double>(max_sec) * 1e6) {
+      const double waited_us = start.GetUsecFromStart(now);
+      if (max_sec > 0 && waited_us >= static_cast<double>(max_sec) * 1e6) {
         return false;
+      }
+      if (waited_us >= next_report_us) {
+        // A response this late is lost, not slow: name the task so the
+        // runtimes' logs and tables can be searched for it.
+        HLOG(kError, "[HANGWATCH-CLIENT] waited {} ms for task {} (pool {}, "
+             "method {}) over SHM", waited_us / 1000.0, task_ptr->task_id_,
+             task_ptr->pool_id_, task_ptr->method_);
+        next_report_us *= 2;
       }
     }
     // Server-death escape (issue #851): unlike the ZMQ twin of this loop, the
@@ -208,7 +241,8 @@ bool IpcCpu2Cpu::RecvOut(IpcManager *ipc,
     // the client parked here forever, since a dead server can never set
     // FUTURE_COMPLETE. The 1s heartbeat flips server_alive_; hand the future
     // to the ZMQ RecvOut, whose kClientShm-origin head implements the
-    // reconnect/failover + resend path.
+    // reconnect/failover + resend path. Thread max_sec through so timed waits
+    // respect the deadline.
     if (!ipc->server_alive_.load(std::memory_order_acquire) &&
         !ipc->reconnecting_.load()) {
       HLOG(kWarning,
@@ -243,6 +277,28 @@ bool IpcCpu2Cpu::RecvOut(IpcManager *ipc,
     archive->ResetBulkIndex();
     archive->msg_type_ = MsgType::kSerializeOut;
     *archive >> (*task_ptr);
+  } else if (!future.consumed_ && want_key != 0) {
+    // want_key == 0: the task never went on the wire. The client completes
+    // some tasks itself -- a GetBlob served from the SHM metadata cache or
+    // from a pending deferred put (core_client.h) -- and hands back a future
+    // with origin kClientShm whose net_key was never stamped (SendIn stamps
+    // it). No response exists to claim, so a missing archive is expected.
+    //
+    // Twin of the check in IpcCpu2CpuZmq::RecvOut -- see the long comment
+    // there for why a complete task with no parked archive is a protocol
+    // violation rather than a benign miss, and why returning true here hid
+    // the #968 read failures behind untouched constructor defaults.
+    //
+    // consumed_ matters MORE on this path than on the ZMQ twin: the claim
+    // above ERASES the entry, so a second Wait() on the same future finds
+    // nothing legitimately. Destroy(true) sets consumed_ after Recv returns,
+    // so it is false only on the first claim.
+    HLOG(kError,
+         "IpcCpu2Cpu::RecvOut: task completed with NO response archive for "
+         "net_key {} -- the completion came from another task's response "
+         "(recycled address). Failing instead of returning defaults. See #968.",
+         want_key);
+    return false;
   }
   return true;
 #endif  // CTP_IS_HOST

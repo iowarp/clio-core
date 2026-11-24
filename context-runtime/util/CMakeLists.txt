@@ -12,9 +12,11 @@ add_library(clio_run_commands STATIC
   ${CMAKE_CURRENT_SOURCE_DIR}/clio_run_cmd_runtime_status.cc
   ${CMAKE_CURRENT_SOURCE_DIR}/clio_run_cmd_monitor.cc
   ${CMAKE_CURRENT_SOURCE_DIR}/clio_run_cmd_compose.cc
+  ${CMAKE_CURRENT_SOURCE_DIR}/clio_run_cmd_pool.cc
   ${CMAKE_CURRENT_SOURCE_DIR}/clio_run_cmd_config.cc
   ${CMAKE_CURRENT_SOURCE_DIR}/clio_run_cmd_migrate.cc
   ${CMAKE_CURRENT_SOURCE_DIR}/clio_run_cmd_refresh_repo.cc
+  ${CMAKE_CURRENT_SOURCE_DIR}/clio_run_cmd_viz.cc
 )
 target_link_libraries(clio_run_commands
   PUBLIC clio_run_cxx
@@ -25,13 +27,17 @@ target_include_directories(clio_run_commands
 )
 
 #==============================================================================
-# Unified clio_run binary (canonical CLIO Runtime CLI)
+# Unified CLI binary. The CMake target stays `clio_run` (dozens of tests and
+# install rules name it); the file it produces is the canonical `clio-run`,
+# and `clio_run` is kept as an alias (symlink; a copy on Windows).
 #==============================================================================
 add_executable(clio_run
   ${CMAKE_CURRENT_SOURCE_DIR}/clio_run.cc
 )
+set_target_properties(clio_run PROPERTIES OUTPUT_NAME clio-run)
 target_link_libraries(clio_run
   PUBLIC clio_run_commands
+  PRIVATE clio_core_version
 )
 
 # Regression test for issue #528: on multi-config generators, static
@@ -49,7 +55,9 @@ if(CLIO_CORE_ENABLE_TESTS AND CMAKE_CONFIGURATION_TYPES)
   )
 endif()
 
-# Install the binary under its canonical name `clio_run`.
+# Install the binary under its canonical name `clio-run`, plus the legacy
+# `clio_run` alias (build tree and install tree; see cmake/ClioCliAlias.cmake).
 install(TARGETS clio_run
   RUNTIME DESTINATION bin
 )
+clio_add_cli_alias(clio_run clio_run)

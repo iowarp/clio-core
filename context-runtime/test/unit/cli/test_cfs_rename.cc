@@ -115,6 +115,9 @@ TEST_CASE("Cfs - rename POSIX semantics + concurrency", "[cli][cfs][rename]") {
   // ---- helpers -------------------------------------------------------------
   // Create a file and fill it with `n` bytes of marker byte `mark`.
   auto mkfile = [&](const std::string& path, char mark, clio::run::u64 n) {
+    // Directories are real: the parent must exist (EEXIST is fine).
+    auto md = cfs.AsyncMkdir(path.substr(0, path.rfind('/')));
+    md.Wait();
     auto op = cfs.AsyncOpen(path, O_CREAT | O_RDWR, 0644);
     op.Wait();
     REQUIRE(op->GetReturnCode() == 0);

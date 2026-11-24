@@ -3,6 +3,26 @@
 # prevent spurious "use-of-uninitialized-value" reports that originate entirely within
 # code we cannot instrument (libstdc++, Catch2, cereal, yaml-cpp).
 
+# The C++ standard library, header half.
+#
+# libstdc++ ships as a prebuilt .so we cannot instrument, but its HEADERS are
+# compiled into our binaries, so half the standard library is instrumented and
+# half is not. That split is what manufactures most of the noise: an ostream
+# whose state the .so owns is read by our copy of basic_streambuf::sputn, a
+# directory_iterator whose dirent buffer the .so filled is parsed by our copy
+# of filesystem::path, and the compiler's own EH scratch slots get reported
+# through frames nobody here wrote. Instrumenting neither half is consistent;
+# instrumenting one is not.
+#
+# This costs only reads that happen INSIDE standard-library template code --
+# an uninitialized member our own code reads is still reported normally
+# (verified against a deliberate uninitialized-field read). Most of the
+# per-function basic_string/streambuf/vector entries further down predate
+# these two lines and are subsumed by them; they are kept because each was
+# added against a specific observed report.
+src:*/libstdc++-v3/include/*
+src:*/include/c++/*
+
 # std::string internal SBO methods (triggered by Catch2 / cereal untracked string allocations)
 # Note: patterns with 'std::' prefix + wildcard don't work in Clang SCL; use leading wildcard instead
 fun:*basic_string*_M_data*
@@ -59,7 +79,10 @@ fun:*_Sp_counted_base*
 # NOTE: Do NOT suppress all of fun:*Catch* here. Doing so disables shadow tracking
 # inside engage_platform() and other Catch2 functions, making local variables appear
 # uninitialized and causing false-positive sigaction / ostream errors.
-src:/home/hyoklee/mc3/envs/iowarp-build/include/catch2/internal/catch_clara.hpp
+# Path patterns, not one machine's conda prefix: these entries were pinned to a
+# developer's own /home/... prefix and so matched nothing in CI, where the env
+# lives under the runner's home.
+src:*/catch2/internal/catch_clara.hpp
 
 # Catch2 internal test infrastructure false positives:
 # 1. unique_ptr<ITestInvoker>::~unique_ptr() - Catch2 global test registration uses
@@ -72,14 +95,18 @@ src:/home/hyoklee/mc3/envs/iowarp-build/include/catch2/internal/catch_clara.hpp
 fun:*unique_ptr*ITestInvoker*
 fun:*Catch*AssertionHandler*
 fun:*FatalConditionHandler*
+# 4. ReusableStringStream is a Catch2 header template, so it compiles into our
+#    binary, but the std::ostringstream it wraps lives in uninstrumented
+#    libstdc++.so -- every value Catch2 stringifies for a message reads as
+#    uninitialized.
+fun:*ReusableStringStream*
 
 # cereal binary archive (not instrumented)
 fun:*cereal*
 
 # yaml-cpp (not instrumented) - match by function name for portability across conda envs
 fun:*YAML*
-src:/home/hyoklee/miniconda3/envs/iowarp/include/yaml-cpp/*
-src:/home/hyoklee/mc3/envs/iowarp-build/include/yaml-cpp/*
+src:*/yaml-cpp/*
 
 # std::vector<char> internals (uninstrumented stdlib - e.g. resize/append in string ops)
 fun:*vector*_M_default_append*

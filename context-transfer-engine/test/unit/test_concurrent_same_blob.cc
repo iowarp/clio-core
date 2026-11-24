@@ -65,6 +65,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <random>
@@ -87,10 +88,67 @@ int FromEnv(const char *name, int dflt) {
   return dflt;
 }
 
+/**
+ * SAME_BLOB_FLUSH=1: run against a self-contained split config -- a
+ * persistent core (file tier), a volatile core (RAM) and a write-back cache
+ * flushing dirty copies every 500 ms -- with the client bound to the cache,
+ * so the cache's flush of the shared blob races the writers. (The race this
+ * case was written for, RELIABILITY.md defect 14, was the core's own
+ * move-to-persistent flush; the core no longer flushes, and the write-back
+ * cache's flush is where that race lives now.) Written before CLIO_INIT so
+ * the runtime composes from it instead of whatever ~/.clio/clio.yaml holds.
+ */
+/** Whether this run is the SAME_BLOB_FLUSH variant. */
+static bool FlushMode() {
+  const char *on = std::getenv("SAME_BLOB_FLUSH");
+  return on != nullptr && *on != '\0' && *on != '0';
+}
+
+static void MaybeWriteFlushConfig() {
+  if (!FlushMode()) return;
+  const char *d = clio::run::env::GetCompat("TEST_DATA_DIR");
+  std::string dir = (d && *d) ? d : ".";
+  std::string path = dir + "/same_blob_flush.yaml";
+  std::string tier = dir + "/same_blob_flush_tier.dat";
+  std::remove(tier.c_str());
+  std::string yaml =
+      "runtime:\n  num_threads: 4\n  queue_depth: 1024\ncompose:\n"
+      "  - mod_name: clio_cte_core\n    pool_name: clio_cte\n"
+      "    pool_query: local\n    pool_id: 512.0\n"
+      "    durability: persistent\n"
+      "    targets:\n      neighborhood: 1\n"
+      "    storage:\n"
+      "      - path: \"" + tier + "\"\n        bdev_type: \"file\"\n"
+      "        capacity_limit: \"4GB\"\n        score: 0.2\n"
+      "        persistence_level: \"temporary\"\n"
+      "    dpe:\n      dpe_type: \"max_bw\"\n"
+      "  - mod_name: clio_cte_core\n    pool_name: clio_cte_volatile\n"
+      "    pool_query: local\n    pool_id: 540.0\n"
+      "    durability: volatile\n"
+      "    targets:\n      neighborhood: 1\n"
+      "    storage:\n"
+      "      - path: \"ram::same_blob_flush_dram\"\n        bdev_type: \"ram\"\n"
+      "        capacity_limit: \"4GB\"\n        score: 1.0\n"
+      "    dpe:\n      dpe_type: \"max_bw\"\n"
+      "  - mod_name: clio_cte_core_persist_write_back\n"
+      "    pool_name: clio_cte_core_persist_write_back\n"
+      "    pool_query: local\n    pool_id: 567.0\n"
+      "    next_volatile: \"540.0\"\n    next_persistent: \"512.0\"\n"
+      "    flush_period_ms: 500\n";
+  FILE *f = std::fopen(path.c_str(), "w");
+  REQUIRE(f != nullptr);
+  std::fputs(yaml.c_str(), f);
+  std::fclose(f);
+  ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", path.c_str(), 1);
+  // Every write and read goes through the cache, whose flush races them.
+  ctp::SystemInfo::Setenv("CLIO_CTE_POOL", "567.0", 1);
+}
+
 class Fixture {
  public:
   bool initialized_ = false;
   Fixture() {
+    MaybeWriteFlushConfig();
     bool ok = clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
     REQUIRE(ok);
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
@@ -98,6 +156,12 @@ class Fixture {
     REQUIRE(ok);
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
+    if (FlushMode()) {
+      // Tiers come from the composed cores; registering an extra RAM
+      // target would put a volatile device into the persistent core.
+      initialized_ = true;
+      return;
+    }
     auto *cte = CLIO_CTE_CLIENT;
     clio::run::PoolId bdev_pool_id(901, 0);
     clio::run::bdev::Client bdev_client(bdev_pool_id);
@@ -197,6 +261,38 @@ TEST_CASE("ConcurrentSameBlob - many threads write disjoint regions of ONE "
                "[same_blob] FIRST mismatch at pos={} expected=0x{:02x} "
                "got=0x{:02x} (total_bytes={})",
                base + b, static_cast<int>(expect), static_cast<int>(v), total);
+          // DIAGNOSIS: is the runtime's copy intact (RPC re-read; a non-zero
+          // flag word disables the client's shared-memory fast path and the
+          // runtime ignores it), and what did the shm record say?
+          {
+            ctp::ipc::FullPtr<char> rb2 = ipc->AllocateBuffer(win);
+            std::memset(rb2.ptr_, 0xAA, win);
+            auto again = CLIO_CTE_CLIENT->AsyncGetBlob(
+                tag_id, blob, base, win, 1u, rb2.shm_.template Cast<void>(),
+                clio::run::PoolQuery::Local());
+            again.Wait();
+            clio::run::u64 rpc_bad = 0, both_bad = 0;
+            for (clio::run::u64 k = 0; k < win; ++k) {
+              const unsigned char e2 = static_cast<unsigned char>((base + k) & 0xff);
+              if (static_cast<unsigned char>(rb2.ptr_[k]) != e2) ++rpc_bad;
+              if (static_cast<unsigned char>(rb2.ptr_[k]) != e2 &&
+                  static_cast<unsigned char>(rb.ptr_[k]) != e2) ++both_bad;
+            }
+            HLOG(kError,
+                 "[same_blob] DIAG window [{}, +{}): RPC re-read rc={} bad={} "
+                 "(bad in both={}); first-read bytes at first mismatch: {:02x} {:02x} {:02x} {:02x}",
+                 base, win, again->GetReturnCode(), rpc_bad, both_bad,
+                 (unsigned)(unsigned char)rb.ptr_[b], (unsigned)(unsigned char)rb.ptr_[std::min(b + 1, win - 1)],
+                 (unsigned)(unsigned char)rb.ptr_[std::min(b + 2, win - 1)], (unsigned)(unsigned char)rb.ptr_[std::min(b + 3, win - 1)]);
+            auto res = CLIO_CTE_CLIENT->AsyncGetResidency(tag_id, blob);
+            res.Wait();
+            HLOG(kError,
+                 "[same_blob] DIAG residency: rc={} exists={} present={} "
+                 "direct={}",
+                 res->GetReturnCode(), res->exists_, res->present_bytes_,
+                 res->direct_readable_);
+            ipc->FreeBuffer(rb2);
+          }
         }
         ++total_mismatches;
       }

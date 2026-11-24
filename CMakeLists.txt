@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(iowarp-core VERSION 2.2.1 LANGUAGES C CXX)
+project(iowarp-core VERSION 2.5.1 LANGUAGES C CXX)
 
 #------------------------------------------------------------------------------
 # MSVC-like front end detection
@@ -53,6 +53,7 @@ option(CLIO_CORE_ENABLE_COVERAGE "Enable code coverage instrumentation for all c
 option(CLIO_CORE_ENABLE_LEAK_CHECK "Enable allocator allocation-size tracking (CTP_ALLOC_TRACK_SIZE) so tests can assert no runtime memory is leaked. Adds a small per-allocation atomic; keep OFF in production." OFF)
 option(CLIO_CORE_ENABLE_DOXYGEN "Check how well the code is documented" OFF)
 option(CLIO_CORE_ENABLE_RPATH "Enable RPATH configuration with relative ($ORIGIN) paths" ON)
+option(CLIO_CORE_SEED_USER_CONFIG "On install, copy clio_default.yaml to ~/.clio/clio.yaml if absent (package builds turn this off)" ON)
 option(CLIO_CORE_ENABLE_CPACK "Enable CPack for package generation" OFF)
 option(CLIO_CORE_ENABLE_DEB_PACKAGE "Build Debian .deb package via CPack" OFF)
 option(CLIO_CORE_ENABLE_RPM_PACKAGE "Build RPM .rpm package via CPack" OFF)
@@ -162,6 +163,7 @@ option(CLIO_CORE_ENABLE_SYCL "Enable Intel GPU support via SYCL/oneAPI (icpx -fs
 option(CLIO_CORE_ENABLE_JARVIS "Enable Jarvis CI infrastructure installation" OFF)
 option(CLIO_ENABLE_AMAZON_DRIVE "Enable Amazon S3 intermediate storage" OFF)
 option(CLIO_ENABLE_GOOGLE_CLOUD "Enable Google Cloud Storage intermediate storage" OFF)
+option(CLIO_ENABLE_DAOS "Enable the native DAOS bdev transport (bdev_type: daos; needs libdaos + libdfs + libgurt)" OFF)
 
 #------------------------------------------------------------------------------
 # ClioCtp (context-transport-primitives) Options
@@ -210,7 +212,7 @@ option(CAE_ENABLE_GCS "Enable Google Cloud Storage (gs://) import in CAE" OFF)
 # LLM labeling/summary + semantic-search features and their integration tests
 # require a running Ollama service. OFF by default so default builds don't
 # build or run them without Ollama.
-option(CLIO_CAE_ENABLE_SUMMARY "Enable CAE LLM labeling/summary + semantic-search (requires a running Ollama service)" OFF)
+option(CLIO_CAE_ENABLE_SUMMARY "Enable the summarizer chimod's live-Ollama tests + semantic-search (requires a running Ollama service)" OFF)
 
 #------------------------------------------------------------------------------
 # External Examples and Applications
@@ -313,6 +315,9 @@ if(CLIO_GPU_CLANG)
 endif()
 
 include(ClioCoreCommon)
+# clio_core_version (--version stamping) + clio_add_cli_alias (clio_run ->
+# clio-run style legacy names).
+include(ClioCliAlias)
 # Measured per-kernel register ceilings for device-coroutine kernels; a no-op
 # unless CLIO_GPU_CLANG is on.
 include(ClioCoroRegCap)
@@ -392,6 +397,12 @@ find_package(cereal REQUIRED)
 if(cereal_FOUND)
     message(STATUS "found cereal at ${cereal_DIR}")
 endif()
+# Some cereal installs (Spack's package, for one) export the target as plain
+# `cereal` rather than `cereal::cereal`, which ctp::serialize links.
+if(TARGET cereal AND NOT TARGET cereal::cereal)
+    add_library(cereal::cereal INTERFACE IMPORTED)
+    set_target_properties(cereal::cereal PROPERTIES INTERFACE_LINK_LIBRARIES cereal)
+endif()
 
 # MessagePack C library (pure C, no Boost dependency)
 # Prefer static linkage so pip wheels don't need libmsgpack-c.so at runtime.
@@ -423,6 +434,13 @@ if(CLIO_CORE_ENABLE_MPI)
     find_package(MPI REQUIRED COMPONENTS C CXX)
     set(MPI_LIBS MPI::MPI_CXX)
     message(STATUS "found mpi.h at ${MPI_CXX_INCLUDE_DIRS}")
+endif()
+# The deprecated MPI C++ bindings are never used, but mpi.h pulls them in
+# (Intel MPI's mpicxx.h, OpenMPI's and MPICH's equivalents) and some of them
+# fail to compile under newer compilers, e.g. clang in CUDA mode. Skip them
+# everywhere, since clio_ctp.h includes mpi.h for every target when MPI is on.
+if(CLIO_CORE_ENABLE_MPI)
+    add_compile_definitions(OMPI_SKIP_MPICXX MPICH_SKIP_MPICXX)
 endif()
 
 # ROCm (conditional). Only require the HIP CMake package when HIP-AMD is
@@ -475,6 +493,12 @@ if(CLIO_CORE_ENABLE_ROCM)
             list(APPEND CMAKE_INSTALL_RPATH "${ROCM_ROOT}/lib")
         endif()
         add_compile_definitions(__HIP_PLATFORM_AMD__=1)
+        # ROCm 6.2-6.x declare the CUDA-style warp-sync builtins this tree
+        # uses (__shfl_sync in atomic.h; __syncwarp is shimmed in macros.h)
+        # only behind this opt-in; ROCm 7 makes them default and ignores it.
+        # Without it the first AMD wheel build (ROCm 6.4) failed with
+        # "use of undeclared identifier '__shfl_sync'".
+        add_compile_definitions(HIP_ENABLE_WARP_SYNC_BUILTINS=1)
         # ...and link the HIP runtime everywhere, for exactly the reason the
         # SYCL block below says of libsycl: gpu_api.h's inline helpers call
         # hipPointerGetAttributes, hipMemcpy and friends, so ANY target that
@@ -499,9 +523,40 @@ endif()
 
 # Thallium (conditional)
 if(CLIO_CORE_ENABLE_THALLIUM)
+    # thallium's package config resolves margo -> mercury through pkg-config.
+    # Some Mercury packages (e.g. the mercury-devel RPM shipped with DAOS on
+    # Cray systems) install mercury.pc next to libmercury.so instead of in a
+    # pkgconfig/ directory, where pkg-config never looks. When pkg-config
+    # cannot see mercury, locate the library through the normal CMake search
+    # and add the directory holding its .pc file to PKG_CONFIG_PATH.
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(CLIO_MERCURY_PC QUIET mercury)
+    if(NOT CLIO_MERCURY_PC_FOUND)
+        find_library(CLIO_MERCURY_LIBRARY NAMES mercury)
+        if(CLIO_MERCURY_LIBRARY)
+            get_filename_component(CLIO_MERCURY_LIBDIR "${CLIO_MERCURY_LIBRARY}" DIRECTORY)
+            foreach(_clio_pc_dir "${CLIO_MERCURY_LIBDIR}/pkgconfig" "${CLIO_MERCURY_LIBDIR}")
+                if(EXISTS "${_clio_pc_dir}/mercury.pc")
+                    set(ENV{PKG_CONFIG_PATH} "${_clio_pc_dir}:$ENV{PKG_CONFIG_PATH}")
+                    message(STATUS "mercury.pc found at ${_clio_pc_dir} (added to PKG_CONFIG_PATH)")
+                    break()
+                endif()
+            endforeach()
+        endif()
+    endif()
     find_package(thallium CONFIG REQUIRED)
     if(thallium_FOUND)
         message(STATUS "found thallium at ${thallium_DIR}")
+    endif()
+    # A Mercury built with its system-Boost option (HG_HAS_BOOST in
+    # mercury_config.h) includes <boost/preprocessor.hpp> from mercury_macros.h,
+    # which margo.h and so thallium.hpp pull in, but neither mercury.pc nor the
+    # thallium package config exports the Boost include directory. Attach the
+    # Boost headers to the imported thallium target so every consumer sees them.
+    find_package(Boost QUIET)
+    if(Boost_FOUND AND TARGET Boost::headers)
+        target_link_libraries(thallium INTERFACE Boost::headers)
+        message(STATUS "thallium: using Boost headers ${Boost_INCLUDE_DIRS} for mercury_macros.h")
     endif()
     set(SERIALIZATION_LIBS thallium ${SERIALIZATION_LIBS})
     set(CLIO_CORE_ENABLE_CEREAL ON)
@@ -746,16 +801,30 @@ if(CLIO_CTE_ENABLE_COMPRESS)
     # NOTE: this is DISTINCT from CLIO_CTP_ENABLE_SYCL (the SYCL-language switch,
     # controlled by CLIO_CORE_ENABLE_SYCL, which triggers <sycl/sycl.hpp> + -fsycl
     # in macros.h). zfp-sycl needs neither, so it uses its own flag/define.
+    #
+    # Opt-in (default: on only in SYCL builds). Auto-detecting it whenever
+    # /opt/zfp-sycl existed linked it into every compress-enabled build in the
+    # devcontainer, whose image ships that library: executables failed to link
+    # (its SYCL runtime symbols were unresolved) and anything that loaded it
+    # crashed before main in its static initializer, which selects a SYCL
+    # device (#1207).
+    option(CLIO_CTE_ENABLE_ZFP_SYCL
+        "Use the SYCL-enabled libzfp (zfp-sycl compressor)"
+        ${CLIO_CORE_ENABLE_SYCL})
     set(CLIO_CTP_ENABLE_ZFP_SYCL OFF)
     set(CLIO_ZFP_SYCL_ROOT "/opt/zfp-sycl" CACHE PATH
         "Install prefix of the SYCL-enabled libzfp (for zfp-sycl compressor)")
-    find_library(ZFP_SYCL_LIBRARY NAMES zfp
-        HINTS ${CLIO_ZFP_SYCL_ROOT}/lib ${CLIO_ZFP_SYCL_ROOT}/lib64
-        NO_DEFAULT_PATH)
-    find_path(ZFP_SYCL_INCLUDE_DIR NAMES zfp.h
-        HINTS ${CLIO_ZFP_SYCL_ROOT}/include
-        NO_DEFAULT_PATH)
-    if(ZFP_SYCL_LIBRARY AND ZFP_SYCL_INCLUDE_DIR)
+    if(CLIO_CTE_ENABLE_ZFP_SYCL)
+      find_library(ZFP_SYCL_LIBRARY NAMES zfp
+          HINTS ${CLIO_ZFP_SYCL_ROOT}/lib ${CLIO_ZFP_SYCL_ROOT}/lib64
+          NO_DEFAULT_PATH)
+      find_path(ZFP_SYCL_INCLUDE_DIR NAMES zfp.h
+          HINTS ${CLIO_ZFP_SYCL_ROOT}/include
+          NO_DEFAULT_PATH)
+    endif()
+    if(NOT CLIO_CTE_ENABLE_ZFP_SYCL)
+        message(STATUS "zfp-sycl compression disabled (CLIO_CTE_ENABLE_ZFP_SYCL=OFF)")
+    elseif(ZFP_SYCL_LIBRARY AND ZFP_SYCL_INCLUDE_DIR)
         message(STATUS "found SYCL libzfp at ${ZFP_SYCL_LIBRARY} (zfp-sycl GPU compression)")
         set(CLIO_CTP_ENABLE_ZFP_SYCL ON)
     else()
@@ -1057,6 +1126,8 @@ endif()
 # Poco and nlohmann_json (optional - for CAE Globus support and the Google
 # Cloud Storage bdev adapter, which uses Poco::Net for HTTPS + Poco::JSON).
 find_package(Poco COMPONENTS Net NetSSL Crypto JSON QUIET)
+include(ClioCheckPocoAbi)
+clio_check_poco_abi()
 find_package(nlohmann_json QUIET)
 if(NOT nlohmann_json_FOUND)
   include(FetchContent)
@@ -1083,18 +1154,68 @@ if(CLIO_ENABLE_GOOGLE_CLOUD)
   message(STATUS "Google Cloud Storage bdev support: ENABLED (Poco found)")
 endif()
 
+# The S3 adapter (kS3 bdev transport) signs requests itself and talks to S3
+# over HTTPS via Poco -- it does NOT link the AWS SDK, which corrupts runtime
+# init when loaded into a CLIO_INIT-ing process. Same auto-disable treatment as
+# the GCS adapter above. (CAE_ENABLE_S3 below is a different feature that
+# happens to share the word "S3": it gates the CAE assimilator, which DOES use
+# the SDK, out-of-process via cae_s3_tool.)
+if(CLIO_ENABLE_AMAZON_DRIVE AND NOT Poco_FOUND)
+  message(WARNING "CLIO_ENABLE_AMAZON_DRIVE is ON but the Poco library "
+                  "(Net, NetSSL, Crypto components) was not found. "
+                  "S3 bdev support will be disabled. "
+                  "Install Poco (libpoco-dev) to enable it.")
+  set(CLIO_ENABLE_AMAZON_DRIVE OFF)
+endif()
+if(CLIO_ENABLE_AMAZON_DRIVE)
+  message(STATUS "Amazon S3 bdev support: ENABLED (Poco found)")
+endif()
+
+# The DAOS adapter (kDaos bdev transport) talks to a DAOS pool through the
+# client library itself (libdfs files + libdaos event queues) instead of going
+# through a dfuse mount. Same auto-disable treatment as the cloud adapters
+# above: a build that asks for it without the DAOS development files warns and
+# continues without the transport (bdev_type "daos" is then rejected at pool
+# creation with an error naming this option).
+if(CLIO_ENABLE_DAOS)
+  find_package(DAOS QUIET)
+  if(NOT DAOS_FOUND)
+    message(WARNING "CLIO_ENABLE_DAOS is ON but the DAOS client development "
+                    "files (daos_fs.h, libdfs, libdaos, libgurt) were not "
+                    "found. DAOS bdev support will be disabled. Install "
+                    "daos-devel or point DAOS_ROOT / CMAKE_PREFIX_PATH at a "
+                    "DAOS install to enable it.")
+    set(CLIO_ENABLE_DAOS OFF)
+  endif()
+endif()
+if(CLIO_ENABLE_DAOS)
+  message(STATUS "DAOS bdev support: ENABLED (${DAOS_DFS_LIBRARY})")
+endif()
+
 # AWS SDK for C++ (optional - for the CAE S3 assimilator, s3://). Reuses the
 # same dependency the bdev S3 transport links (aws-cpp-sdk-s3/-core). If the
 # option is requested but the SDK isn't found, warn and disable rather than
 # fail the configure (mirrors the CAE Globus dependency check).
 if(CAE_ENABLE_S3)
+  # CAE S3 now needs BOTH: Poco for the in-process assimilator read path
+  # (s3_rest.h, Poco + SigV4 -- the AWS SDK must never load into the runtime),
+  # and the AWS SDK for the out-of-process cae_s3_tool helper (still used by the
+  # write-bench raw-PUT floor, the read-bench raw-GET floor, and test seeding).
   find_package(AWSSDK COMPONENTS s3 QUIET)
-  if(AWSSDK_FOUND)
-    message(STATUS "found AWS SDK for C++ (CAE S3 support: ENABLED)")
+  if(AWSSDK_FOUND AND Poco_FOUND)
+    message(STATUS "found AWS SDK + Poco (CAE S3 support: ENABLED)")
   else()
-    message(WARNING "CAE_ENABLE_S3 is ON but the AWS SDK for C++ (component s3) "
-                    "was not found. S3 import will be disabled. "
-                    "Install aws-sdk-cpp to enable it.")
+    if(NOT AWSSDK_FOUND)
+      message(WARNING "CAE_ENABLE_S3 is ON but the AWS SDK for C++ (component "
+                      "s3) was not found (needed for cae_s3_tool). Install "
+                      "aws-sdk-cpp to enable it.")
+    endif()
+    if(NOT Poco_FOUND)
+      message(WARNING "CAE_ENABLE_S3 is ON but Poco (Net, NetSSL, Crypto) was "
+                      "not found (needed for the in-process s3:// read path). "
+                      "Install Poco (libpoco-dev) to enable it.")
+    endif()
+    message(WARNING "S3 import will be disabled.")
     set(CAE_ENABLE_S3 OFF)
   endif()
 endif()
@@ -1112,6 +1233,21 @@ if(CAE_ENABLE_GCS)
                     "Install google-cloud-cpp to enable it.")
     set(CAE_ENABLE_GCS OFF)
   endif()
+endif()
+
+# The header-only S3 REST client (Poco::Net + SigV4, s3_rest.h) is shared by two
+# unrelated consumers: the kS3 bdev tier (CLIO_ENABLE_AMAZON_DRIVE) and the CAE
+# s3:// assimilator's in-process read path (CAE_ENABLE_S3). Both need Poco. The
+# header's own #ifdef therefore keys off this derived capability flag rather than
+# either feature flag, so it compiles whenever *either* consumer is on. Defined
+# globally (before any add_subdirectory) so it reaches every module and test TU
+# that includes s3_rest.h -- the bdev module, the CAE runtime, and their tests.
+# NOTE: the AWS SDK stays out of the runtime regardless; s3_rest.h links only
+# Poco. CAE_ENABLE_S3 still separately builds the out-of-process cae_s3_tool,
+# which is the only target that links the SDK.
+if((CLIO_ENABLE_AMAZON_DRIVE OR CAE_ENABLE_S3) AND Poco_FOUND)
+  add_compile_definitions(CLIO_ENABLE_S3_REST)
+  message(STATUS "S3 REST client (Poco+SigV4): ENABLED")
 endif()
 
 if (CLIO_CTE_ENABLE_ADIOS2_ADAPTER OR CLIO_CORE_ENABLE_GRAY_SCOTT)
@@ -1273,6 +1409,16 @@ if(CLIO_CORE_ENABLE_RPATH)
     elseif(UNIX)
         set(CMAKE_INSTALL_RPATH "$ORIGIN;$ORIGIN/../lib")
         set(CMAKE_BUILD_RPATH "${CMAKE_BINARY_DIR}/bin")
+        # Emit DT_RPATH, not DT_RUNPATH. Most current toolchains default to
+        # RUNPATH, which LD_LIBRARY_PATH outranks: an older iowarp-core in an
+        # LD_LIBRARY_PATH entry (a conda env's lib, an HPC module) then
+        # replaces the libraries this build just produced, and a freshly linked
+        # test dies in Catch's post-link discovery with "undefined symbol"
+        # (issue #836). DT_RPATH is searched before LD_LIBRARY_PATH.
+        # HOST_LINK only: CMake does not wrap LINKER: for the CUDA/HIP-NVCC
+        # device-link step, so nvcc forwarded a bare --disable-new-dtags to
+        # the host compiler ("cc1plus: unknown pass new-dtags").
+        add_link_options("$<HOST_LINK:LINKER:--disable-new-dtags>")
     endif()
 
     message(STATUS "RPATH: Using relative paths ($ORIGIN/../lib)")
@@ -1288,7 +1434,11 @@ endif()
 # Use CLIO_CORE_MSVC_LIKE (not just MSVC) so clang-cl / icx.exe on Windows take
 # the MSVC-style flag path; GNU flags break icx's /Fo handling (see issue #555).
 if(NOT CLIO_CORE_MSVC_LIKE)
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC")
+    # -fPIC has no meaning on Windows (PE/COFF) and GNU-style clang++ targeting
+    # x86_64-pc-windows-msvc rejects it outright.
+    if(NOT WIN32)
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC")
+    endif()
     if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "NVHPC")
         # Add compiler flags following Google C++ style guide
         set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -pedantic")
@@ -1390,8 +1540,32 @@ if(NOT CLIO_CORE_MSVC_LIKE)
     # always clang (DPC++) or AdaptiveCpp, never nvcc, so the reason that
     # option exists does not apply.
     if(CLIO_CORE_ENABLE_SYCL)
-        add_compile_definitions(CLIO_YIELD_CORO)
-        message(STATUS "Yieldable GPU kernels: C++20 device coroutines (SYCL)")
+        # Which yield mechanism SYCL gets is decided by the TARGET, not by
+        # preference, because SPIR-V cannot compile a device coroutine at all:
+        # clang's EmitCoroutineBody builds the coroutine-frame PHI assuming the
+        # default address space, and spir64's datalayout puts globals in
+        # addrspace 1 (-G1), so the PHI gets mismatched operand types and
+        # clang aborts on
+        #   "All operands to PHI node must be the same type as the PHI node!"
+        # Measured on Aurora oneAPI 2025.2 / 2025.3.2 AND on intel/llvm
+        # nightly-2026-09-18 (clang 24); -O0/-O1/-O2,
+        # -fno-sycl-early-optimizations and per_kernel split all abort alike.
+        # NVPTX is unaffected only because its datalayout has no -G field, so
+        # globals land in addrspace 0 and the operands happen to agree. Upstream
+        # intel/llvm#20661 was closed by a stale bot, unfixed.
+        #
+        # So: coroutines where they work (NVPTX), the macro mechanism on SPIR-V.
+        # yield_stack.h's YieldTls() already has the SYCL branch the macro path
+        # needs -- it puts the block's YieldSmem in global memory, which is why
+        # `extern __shared__` is not the blocker an older comment here claimed.
+        if(SYCL_TARGET MATCHES "spir64")
+            message(STATUS
+                "Yieldable GPU kernels: macro/Duff's device "
+                "(SPIR-V cannot compile device coroutines)")
+        else()
+            add_compile_definitions(CLIO_YIELD_CORO)
+            message(STATUS "Yieldable GPU kernels: C++20 device coroutines (SYCL)")
+        endif()
 
         # CTP_ENABLE_SYCL GLOBALLY, and this is a correctness requirement
         # rather than convenience.
@@ -1416,6 +1590,14 @@ if(NOT CLIO_CORE_MSVC_LIKE)
         # <sycl/sycl.hpp> is pulled in by macros.h whenever CTP_ENABLE_SYCL
         # is set, so every TU now needs the header path -- the driver only
         # adds it under -fsycl, which most TUs do not get.
+        #
+        # Discover it HERE rather than relying on wrp_core_enable_sycl(): that
+        # runs from the component subdirectories, which are added hundreds of
+        # lines below this point. On a cold configure CLIO_SYCL_INCLUDE_DIR was
+        # therefore still empty here, the guard below fell through, and every
+        # host TU failed with "'sycl/sycl.hpp' file not found" -- while a second
+        # configure succeeded off the cached value, making it look intermittent.
+        wrp_core_detect_sycl()
         if(CLIO_SYCL_INCLUDE_DIR)
             include_directories(SYSTEM ${CLIO_SYCL_INCLUDE_DIR})
         endif()
@@ -1573,9 +1755,14 @@ if(CLIO_CORE_ENABLE_TESTS)
     # codecov.yml ignore list.
     #   * fuse_cte_main.cc — FUSE process entry / mount glue (fuse_main + the
     #     apptainer --fusemount fd-injection path); not unit-testable.
+    #   * util/clio_cae.cc — CAE OMNI ingest process entry (CLIO_INIT, the
+    #     IPC handle check, the ParseOmni round-trip); not unit-testable.
+    #     Its OMNI parsing lives in core/src/omni_loader.cc and is covered
+    #     by test_cae_omni_loader.
     file(WRITE "${CMAKE_BINARY_DIR}/CTestCustom.cmake"
          "set(CTEST_CUSTOM_COVERAGE_EXCLUDE \${CTEST_CUSTOM_COVERAGE_EXCLUDE}\n"
-         "    \".*/fuse_cte_main\\\\.cc\")\n")
+         "    \".*/fuse_cte_main\\\\.cc\"\n"
+         "    \".*/util/clio_cae\\\\.cc\")\n")
 
     # -----------------------------------------------------------------------
     # Test cleanup fixture (pre + post)
@@ -1653,7 +1840,7 @@ if(CLIO_CORE_ENABLE_TESTS)
     # reading the GENERATED command with `ctest -N -V`.
     set(_clio_proc_kill
         "ps -eo pid,comm 2>/dev/null \
-           | awk -v self=$$ '($2 == \"clio_run\" || $2 == \"clio_daemon\") && $1 != self {print $1}' \
+           | awk -v self=$$ '($2 == \"clio-run\" || $2 == \"clio_run\" || $2 == \"clio_daemon\") && $1 != self {print $1}' \
            | while read -r _pid; do kill -9 \"$_pid\" 2>/dev/null; done; \
          true")
     set(_clio_cleanup_cmd
@@ -1806,17 +1993,6 @@ if(CLIO_CORE_ENABLE_ELF)
     set(ELF_LIB_DIRS ${libelf_LIBRARY_DIRS})
 endif()
 
-# BaM (Big Accelerator Memory) — GPU page cache with optional NVMe
-option(CLIO_CORE_ENABLE_BAM "Enable BaM GPU page cache module" OFF)
-option(CLIO_CORE_ENABLE_BAM_NVME "Enable NVMe backend for BaM (requires gpu-nvme-bridge)" OFF)
-if(CLIO_CORE_ENABLE_BAM)
-    message(STATUS "Building BaM GPU page cache module")
-    set(BAM_ENABLE_NVME ${CLIO_CORE_ENABLE_BAM_NVME} CACHE BOOL "NVMe for BaM" FORCE)
-    set(BAM_ENABLE_TESTS ${CLIO_CORE_ENABLE_TESTS} CACHE BOOL "BaM tests" FORCE)
-    add_subdirectory(external/bam)
-else()
-    message(STATUS "BaM module disabled")
-endif()
 
 set(_WRP_ENABLED_COMPONENT_DIRS "")
 
@@ -1866,7 +2042,7 @@ endif()
 # Gray-Scott Example Application
 if(CLIO_CORE_ENABLE_GRAY_SCOTT)
     message(STATUS "Building Gray-Scott ADIOS2 example")
-    add_subdirectory(external/iowarp-gray-scott)
+    add_subdirectory(context-transfer-engine/benchmark/gray_scott)
 else()
     message(STATUS "Gray-Scott example disabled")
 endif()
@@ -2277,6 +2453,21 @@ foreach(_t clio_ctp_host clio_run_cxx)
     list(APPEND PIP_LIB_TARGETS ${_t})
   endif()
 endforeach()
+# GPU twins (CUDA/ROCm/SYCL builds, i.e. the GPU wheel variants). The host
+# libraries list them as NEEDED (libclio_run_cxx.so -> libclio_run_cxx_gpu.so
+# -> libclio_ctp_rocm_gpu.so), so leaving them out made the first GPU wheel
+# fail its import test with "libclio_run_cxx_gpu.so: cannot open shared
+# object file". Only shared libraries are installed; static/interface
+# targets are already linked in.
+foreach(_t clio_run_cxx_gpu clio_ctp_cuda clio_ctp_gpu_linker
+           clio_ctp_rocm_gpu clio_ctp_rocm_host)
+  if(TARGET ${_t})
+    get_target_property(_t_type ${_t} TYPE)
+    if(_t_type STREQUAL "SHARED_LIBRARY")
+      list(APPEND PIP_LIB_TARGETS ${_t})
+    endif()
+  endif()
+endforeach()
 if(TARGET clio_admin_client)
   list(APPEND PIP_LIB_TARGETS clio_admin_client clio_admin_runtime)
 endif()
@@ -2304,10 +2495,41 @@ endif()
 if(TARGET clio_cte_replication_client)
   list(APPEND PIP_LIB_TARGETS clio_cte_replication_client clio_cte_replication_runtime)
 endif()
+# Policy caches over a volatile and a persistent core: the default config
+# composes the write-back cache (567.0), so a wheel without it fails to
+# create that pool. cache_base is compiled into each module.
+if(TARGET clio_cte_core_persist_write_back_client)
+  list(APPEND PIP_LIB_TARGETS clio_cte_core_persist_write_back_client clio_cte_core_persist_write_back_runtime)
+endif()
+if(TARGET clio_cte_core_persist_write_thru_client)
+  list(APPEND PIP_LIB_TARGETS clio_cte_core_persist_write_thru_client clio_cte_core_persist_write_thru_runtime)
+endif()
+# The shm cache: the default config composes it (568.0, metadata only) under
+# the indexer, so a wheel without it fails to create that pool.
+if(TARGET clio_cte_core_shm_cache_writethru_client)
+  list(APPEND PIP_LIB_TARGETS clio_cte_core_shm_cache_writethru_client clio_cte_core_shm_cache_writethru_runtime)
+endif()
+# Indexer chimod (#905): the default config composes it into the filesystem
+# chain (cache -> indexer -> replication), so without it the wheel's
+# `clio_run start` fails to create pool 564.0 and the runtime exits (#1240).
+if(TARGET clio_cte_indexer_client)
+  list(APPEND PIP_LIB_TARGETS clio_cte_indexer_client clio_cte_indexer_runtime)
+endif()
 # Filesystem chimod: NEEDED by the clio_cte_fuse adapter binary that ships
 # in the wheel when CLIO_CTE_ENABLE_FUSE_ADAPTER is ON (#899).
+# The filesystem chimod depends on the stream chimod (file sizes, deferred
+# appends): without it the wheel's libclio_cte_filesystem_runtime.so has
+# unresolved libclio_cte_stream_* dependencies.
+if(TARGET clio_cte_stream_client)
+  list(APPEND PIP_LIB_TARGETS clio_cte_stream_client clio_cte_stream_runtime)
+endif()
 if(TARGET clio_cte_filesystem_client)
   list(APPEND PIP_LIB_TARGETS clio_cte_filesystem_client clio_cte_filesystem_runtime)
+endif()
+# Stream chimod: NEEDED by the filesystem chimod (file sizes and deferred
+# appends) and so, transitively, by clio_cte_fuse.
+if(TARGET clio_cte_stream_client)
+  list(APPEND PIP_LIB_TARGETS clio_cte_stream_client clio_cte_stream_runtime)
 endif()
 if(CLIO_CORE_ENABLE_CAE AND TARGET clio_cae_core_client)
   list(APPEND PIP_LIB_TARGETS clio_cae_core_client clio_cae_core_runtime)
@@ -2397,10 +2619,9 @@ endif()
 if(TARGET clio_run_thrpt_bench)
   install(TARGETS clio_run_thrpt_bench RUNTIME DESTINATION bin)
 endif()
-# `clio_run` is created as a symlink to `clio_run` by an install(CODE)
-# in context-runtime/util/CMakeLists.txt — that runs after this point
-# during cmake --install, so the symlink lands in the default
-# component too. No extra rule needed here.
+# The legacy `clio_run` alias of `clio-run` is created by
+# clio_add_cli_alias() in context-runtime/util/CMakeLists.txt, in the
+# default component. No extra rule needed here.
 
 # Python extensions -> iowarp_core/ext/
 if(CLIO_CORE_ENABLE_PYTHON)
@@ -2468,4 +2689,12 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/packaging/CPackConfig.cmake)
 # Only include AppImage support if explicitly enabled
 if(CLIO_CORE_ENABLE_APPIMAGE)
     include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/packaging/AppImage.cmake)
+endif()
+
+# clio-ml (external/clio-ml, its own repo): Spark-MLlib-style algorithms over
+# gpu_vector / cpu_vector. Must come after CTE so the vector targets exist.
+option(CLIO_CORE_ENABLE_CLIO_ML "Add external/clio-ml to the build" OFF)
+if(CLIO_CORE_ENABLE_CLIO_ML)
+  set(CLIO_ML_ENABLE_CUDA ${CLIO_CORE_ENABLE_CUDA} CACHE BOOL "" FORCE)
+  add_subdirectory(external/clio-ml)
 endif()

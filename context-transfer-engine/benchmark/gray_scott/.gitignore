@@ -1,0 +1,4 @@
+# Build/install output and simulation results; never commit these.
+install/
+build/
+*.bp/

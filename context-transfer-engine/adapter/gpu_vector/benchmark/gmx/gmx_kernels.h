@@ -47,6 +47,7 @@ using ::clio_gmx::Spline4;
  * continues, which is the write-site-publish contract the md workload
  * bled for.
  */
+#if CLIO_HAS_YCORO
 CTP_GPU_FUN inline gy::YCoroMain SpreadCoro(gv::DeviceVector<unsigned long long> mesh,
                                     const float *ax, const float *ay,
                                     const float *az, const long long *aq,
@@ -117,9 +118,11 @@ CTP_GPU_FUN inline gy::YCoroMain SpreadCoro(gv::DeviceVector<unsigned long long>
   }
   co_await mesh.EndFlush();
 }
+#endif  // CLIO_HAS_YCORO
 
 
 /** Mesh checksum + exact charge total, striding planes across blocks. */
+#if CLIO_HAS_YCORO
 CTP_GPU_FUN inline gy::YCoroMain SumCoro(gv::DeviceVector<unsigned long long> mesh,
                                  u64 K, u64 plane, u64 z0, u64 z1,
                                  unsigned long long *out) {
@@ -140,6 +143,7 @@ CTP_GPU_FUN inline gy::YCoroMain SumCoro(gv::DeviceVector<unsigned long long> me
     mesh.UnpinRange(z * plane, plane);
   }
 }
+#endif  // CLIO_HAS_YCORO
 
 
 /**
@@ -150,6 +154,7 @@ CTP_GPU_FUN inline gy::YCoroMain SumCoro(gv::DeviceVector<unsigned long long> me
  * stencil. Accumulation is fixed point again, so the result is bit-equal to
  * the dense path.
  */
+#if CLIO_HAS_YCORO
 CTP_GPU_FUN inline gy::YCoroMain GatherCoro(gv::DeviceVector<unsigned long long> mesh,
                                     const float *ax, const float *ay,
                                     const float *az, const long long *aq,
@@ -206,10 +211,12 @@ CTP_GPU_FUN inline gy::YCoroMain GatherCoro(gv::DeviceVector<unsigned long long>
   }
   atomicAdd(out, acc);
 }
+#endif  // CLIO_HAS_YCORO
 
 
 /** Zero this block's planes and publish, so a fault after eviction reads
  *  zeros rather than "blob not found". */
+#if CLIO_HAS_YCORO
 CTP_GPU_FUN inline gy::YCoroMain ZeroCoro(gv::DeviceVector<unsigned long long> mesh,
                                   u64 plane, u64 z0, u64 z1) {
   for (u64 z = z0; z < z1; ++z) {
@@ -222,6 +229,7 @@ CTP_GPU_FUN inline gy::YCoroMain ZeroCoro(gv::DeviceVector<unsigned long long> m
   }
   co_await mesh.EndFlush();
 }
+#endif  // CLIO_HAS_YCORO
 
 
 // ---------------- DENSE REFERENCE (plain cudaMalloc, no paging) -----------

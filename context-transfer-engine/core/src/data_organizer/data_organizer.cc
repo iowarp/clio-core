@@ -37,6 +37,10 @@
 
 #include <clio_cte/core/data_organizer/data_organizer.h>
 #include <clio_cte/core/data_organizer/frecency_organizer.h>
+#include <clio_cte/core/data_organizer/cyclic_organizer.h>
+#include <clio_cte/core/data_organizer/grayscott_organizer.h>
+#include <clio_cte/core/data_organizer/hotset_organizer.h>
+#include <clio_cte/core/data_organizer/scatter_organizer.h>
 
 namespace clio::cte::core {
 
@@ -47,6 +51,18 @@ std::unique_ptr<DataOrganizer> DataOrganizerFactory::Get(
   }
   if (name == "frecency") {
     return std::make_unique<FrecencyDataOrganizer>();
+  }
+  if (name == "grayscott") {
+    return std::make_unique<GrayScottDataOrganizer>();
+  }
+  if (name == "cyclic") {
+    return std::make_unique<CyclicDataOrganizer>();
+  }
+  if (name == "scatter") {
+    return std::make_unique<ScatterDataOrganizer>();
+  }
+  if (name == "hotset") {
+    return std::make_unique<HotSetDataOrganizer>();
   }
   HLOG(kError, "DataOrganizerFactory: unknown organizer '{}'", name);
   return nullptr;

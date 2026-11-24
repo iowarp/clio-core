@@ -1,0 +1,80 @@
+# "Clio as a cache" multi-node test (issue #1015).
+#
+# Two nodes on a private docker network and — unlike every other integration
+# harness here — NO clio daemon on either of them. The eight MPI ranks are the
+# only clio processes; each asks for a runtime with CLIO_WITH_RUNTIME=1 and one
+# rank per node ends up hosting it. Node 1 launches `mpirun -np 8` across both
+# containers; node 2 serves sshd so mpirun can start ranks 4-7 there.
+#
+# Hostnames MUST be iowarp-wr-node1/iowarp-wr-node2 to match hostfile +
+# mpi_hostfile. Usage: ./run_tests.sh (the result is keyed on node 1).
+
+services:
+  # Node 1 — mpirun launcher; hosts ranks 0-3
+  wr-node1:
+    image: ${IOWARP_DOCKER_IMAGE:-iowarp/deps-cpu:latest}
+    security_opt:
+      - seccomp:unconfined
+    container_name: wr-node1
+    hostname: iowarp-wr-node1
+    networks:
+      wr-cluster:
+        ipv4_address: 172.31.8.10
+    volumes:
+      - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
+    tmpfs:
+      - /mnt:mode=1777
+    environment:
+      - NODE_ID=1
+      - CLIO_SERVER_CONF=/workspace/context-runtime/test/integration/with_runtime/clio_config.yaml
+      - CONTAINER_HOSTFILE=/workspace/context-runtime/test/integration/with_runtime/hostfile
+      # THE setting under test: every rank starts a runtime if there isn't one.
+      - CLIO_WITH_RUNTIME=1
+      - PATH=/workspace/build/bin:/usr/local/bin:/usr/bin:/bin
+      - LD_LIBRARY_PATH=/workspace/build/bin:/usr/local/cuda/lib64:/usr/local/lib
+      - OMPI_ALLOW_RUN_AS_ROOT=1
+      - OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+    mem_limit: 8g
+    working_dir: /workspace
+    entrypoint:
+      - /bin/bash
+      - /workspace/context-runtime/test/integration/with_runtime/node1_entrypoint.sh
+
+  # Node 2 — sshd server; hosts ranks 4-7
+  wr-node2:
+    image: ${IOWARP_DOCKER_IMAGE:-iowarp/deps-cpu:latest}
+    security_opt:
+      - seccomp:unconfined
+    container_name: wr-node2
+    hostname: iowarp-wr-node2
+    networks:
+      wr-cluster:
+        ipv4_address: 172.31.8.11
+    volumes:
+      - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
+    tmpfs:
+      - /mnt:mode=1777
+    environment:
+      - NODE_ID=2
+      - CLIO_SERVER_CONF=/workspace/context-runtime/test/integration/with_runtime/clio_config.yaml
+      - CONTAINER_HOSTFILE=/workspace/context-runtime/test/integration/with_runtime/hostfile
+      - CLIO_WITH_RUNTIME=1
+      - PATH=/workspace/build/bin:/usr/local/bin:/usr/bin:/bin
+      - LD_LIBRARY_PATH=/workspace/build/bin:/usr/local/cuda/lib64:/usr/local/lib
+      - OMPI_ALLOW_RUN_AS_ROOT=1
+      - OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+    mem_limit: 8g
+    working_dir: /workspace
+    entrypoint:
+      - /bin/bash
+      - /workspace/context-runtime/test/integration/with_runtime/node2_entrypoint.sh
+
+networks:
+  wr-cluster:
+    driver: bridge
+    ipam:
+      config:
+        # Unique to this stack. A step killed by `timeout-minutes` never reaches
+        # its own teardown, so its network survives into the next step; sharing a
+        # subnet would then let one stack's leak block an unrelated one.
+        - subnet: 172.31.8.0/24

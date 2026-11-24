@@ -35,6 +35,7 @@
 #define CLIO_RUNTIME_INCLUDE_MANAGERS_POOL_MANAGER_H_
 
 #include <unordered_map>
+#include <unordered_set>
 #include <string>
 #include <vector>
 #include <atomic>
@@ -221,11 +222,28 @@ class PoolManager {
   DynamicContainer GetRealOrStaticContainer(PoolId pool_id) const;
 
   /**
+   * The real container this node hosts for a pool, with no fallback to the
+   * static container (which carries only the task-stat model).
+   * @param pool_id Pool identifier
+   * @return DynamicContainer handle (invalid if this node hosts none)
+   */
+  DynamicContainer GetLocalContainer(PoolId pool_id) const;
+
+  /**
    * Check if pool exists on this node
    * @param pool_id Pool identifier
    * @return true if pool exists locally, false otherwise
    */
   bool HasPool(PoolId pool_id) const;
+
+  /**
+   * Whether this node destroyed `pool_id` and has not re-created it since.
+   * Routing retires a periodic task of such a pool instead of retrying it
+   * forever.
+   * @param pool_id Pool identifier
+   * @return true if the pool was destroyed here and not re-created
+   */
+  bool WasDestroyed(PoolId pool_id) const;
 
   /**
    * Check if a specific container exists on this node for a given pool
@@ -286,6 +304,33 @@ class PoolManager {
   void InitAddressMap(PoolId pool_id, u32 num_containers);
 
   /**
+   * Make a pool that lives on OTHER nodes routable from this one, without
+   * creating a container here.
+   *
+   * A pool composed on a single node (e.g. a per-node bdev created with
+   * PoolQuery::Physical) has metadata only on that node. Any other node that
+   * submits a task to it needs the pool's static container (to serialize the
+   * task) and its address map (to resolve DirectHash/Physical routing); without
+   * them SendIn drops the task and its waiter hangs. This installs exactly
+   * those two things: metadata, a ContainerId == NodeId address map, and the
+   * static container. No module Create runs and no task executes here.
+   *
+   * Does nothing if this node already knows the pool (a real local pool is
+   * never overwritten).
+   *
+   * @param pool_id Pool identifier of the remote pool
+   * @param pool_name Pool name (as created on the owning node)
+   * @param chimod_name ChiMod library name the pool was created with
+   * @param chimod_params Serialized ChiMod create parameters
+   * @param num_containers Number of containers in the pool's address map
+   * @return true if the pool is routable from this node afterwards
+   */
+  bool RegisterRemotePool(PoolId pool_id, const std::string& pool_name,
+                          const std::string& chimod_name,
+                          const std::string& chimod_params,
+                          u32 num_containers);
+
+  /**
    * Create or get a complete pool with get-or-create semantics
    * Extracts all parameters from the task (chimod_name, pool_name, chimod_params)
    * This is a coroutine that can co_await nested Create methods
@@ -294,14 +339,76 @@ class PoolManager {
    */
   TaskResume CreatePool(clio::run::shared_ptr<Task> &task);
 
+  /**
+   * Record that a pool create has started (issue #1180). Paired with
+   * EndCreate; CreatePool does both through a scope guard.
+   * @param pool_name the pool being created
+   * @param chimod_name its module
+   * @return a handle for EndCreate
+   */
+  u64 BeginCreate(const std::string &pool_name, const std::string &chimod_name);
+
+  /**
+   * Record that a pool create has finished, however it ended.
+   * @param handle the value BeginCreate returned
+   */
+  void EndCreate(u64 handle);
+
+  /**
+   * Attach the pool id to a create in progress once CreatePool knows it, so
+   * IsPoolCreating can answer by id (issue #1039).
+   * @param handle the value BeginCreate returned
+   * @param pool_id the id of the pool being created
+   */
+  void SetCreatingPoolId(u64 handle, PoolId pool_id);
+
+  /**
+   * Whether this node is still creating `pool_id` (its Create has not
+   * finished). Safe from any thread.
+   * @param pool_id Pool identifier
+   * @return true while a CreatePool for this id is in progress here
+   */
+  bool IsPoolCreating(PoolId pool_id) const;
+
+  /**
+   * Whether a CLIENT request for `pool_id` may be admitted now (issue #1039):
+   * the pool is known here (its static container exists, so the request can
+   * be deserialized) and its local Create has finished. A client that
+   * connects while the runtime is still composing must have its request held
+   * until this holds, not dropped, and not run against a half-created pool.
+   * @param pool_id Pool identifier
+   * @return true if the request can be deserialized and executed
+   */
+  bool IsClientAdmissible(PoolId pool_id) const;
+
+  /**
+   * Describe every pool create still in progress, oldest first, for a stall
+   * report: a stalled GetOrCreatePool otherwise names only its method, not
+   * which pool it is creating (issue #1180). Safe from any thread.
+   * @return e.g. "creating 'cte_main' (clio_cte_core) for 297321 ms", or ""
+   */
+  std::string DescribeCreatesInProgress() const;
+
 
   /**
    * Destroy a complete pool including metadata and local containers
    * This is a coroutine for consistency with CreatePool
    * @param pool_id Pool identifier
+   * @param keep_in_pool_log true to leave the pool's pool-log entry, so the
+   *        next start re-creates it (`compose stop`)
    * @return TaskResume coroutine handle
    */
-  TaskResume DestroyPool(PoolId pool_id);
+  TaskResume DestroyPool(PoolId pool_id, bool keep_in_pool_log = false,
+                         PoolId successor = PoolId::GetNull());
+
+  /**
+   * Successor an unplugged pool redirects to. Follows redirect chains (bounded
+   * to kMaxRedirectHops) so a pool unplugged twice still resolves to its live
+   * successor. Hot-path cheap: one relaxed atomic load when no redirect exists.
+   * @param pool_id Pool identifier, possibly unplugged
+   * @return the final successor pool, or a null PoolId when no redirect applies
+   */
+  PoolId RedirectOf(PoolId pool_id) const;
 
   /**
    * Destroy a local pool and its containers on this node (simple version)
@@ -363,7 +470,67 @@ class PoolManager {
    */
   void ReplayAddressTableWAL();
 
+  /** One durable pool as this node's pool log keeps it: what re-creating
+   *  its container here after a restart takes. */
+  struct PoolLogEntry {
+    PoolId pool_id;
+    std::string pool_name;
+    std::string chimod_name;
+    /** Compose: the serialized PoolConfig. API: the ChiMod's serialized
+     *  CreateParams. */
+    std::string chimod_params;
+    bool compose = false;
+  };
+
+  /**
+   * Record (add) or forget (!add) a durable pool in this node's pool log,
+   * <conf_dir>/wal/pools.<node>.bin -- the ONE restart registry for every
+   * pool, however it was created: compose pools with `restart: true` and
+   * API pools created by a client with SetPersistent(true).
+   * @param add true on create, false on destroy
+   * @param e the pool
+   */
+  void LogPool(bool add, const PoolLogEntry &e);
+
+  /**
+   * The live entries of this node's pool log, in creation order (a pool may
+   * need one created before it, e.g. an array's member disks), compacting
+   * the log to that set.
+   * @return live entries
+   */
+  std::vector<PoolLogEntry> LoadPoolLog();
+
+  /** Read the live entries of a pool log file without compacting it.
+   *  @param path the log file  @return live entries */
+  static std::vector<PoolLogEntry> ReadPoolLogFile(const std::string &path);
+
+  /** Forget every durable pool of this node and its address-table WAL: a
+   *  fresh (`start --fresh`) start begins a new cluster lifetime. */
+  void ClearPoolLog();
+
+  /** @return path of this node's pool log. */
+  std::string PoolLogPath() const;
+
+  /** While true, pools being created are re-creations from the pool log:
+   *  their containers take the Restart() path and are not logged again. */
+  void SetReplayingPools(bool v) { replaying_pools_ = v; }
+
  private:
+  /** One pool create in progress (issue #1180). */
+  struct CreateInProgress {
+    std::string pool_name_;  /**< pool being created */
+    std::string chimod_;     /**< its module */
+    std::chrono::steady_clock::time_point start_;  /**< when it began */
+    PoolId pool_id_;  /**< set once known (SetCreatingPoolId); null before */
+  };
+  mutable std::mutex creates_mu_;  /**< guards creates_ and next_create_ */
+  std::unordered_map<u64, CreateInProgress> creates_;  /**< by handle */
+  u64 next_create_ = 1;  /**< next BeginCreate handle */
+  /** Creates in creates_ whose pool id is known; lets IsPoolCreating skip
+      creates_mu_ on the per-request ingress path when nothing is creating. */
+  std::atomic<u32> creating_ids_{0};
+
+  bool replaying_pools_ = false;
   /**
    * Internal: Get a DynamicContainer by PoolId and ContainerId (no fallback to
    * local container; no plug check)
@@ -412,6 +579,10 @@ class PoolManager {
   // the admin SystemMonitor (1 Hz) does not rewrite every pool's model file
   // once a second. Only touched from FlushModels under model_flush_mutex_.
   std::chrono::steady_clock::time_point last_model_flush_{};
+  // Serializes model-file writers. Guards last_model_flush_ above AND the whole
+  // export-emit-rename in SaveModel, which is the part that actually needs
+  // exclusion: every writer renames its own "<path>.tmp" over the shared model
+  // file. Never taken while pool_metadata_mutex_ is held.
   std::mutex model_flush_mutex_;
 
   // Map PoolId to pool metadata (contains containers, address map, etc.)
@@ -427,6 +598,54 @@ class PoolManager {
   // always scoped to a single map operation so the lock is never held across
   // CreatePool's co_await.
   mutable std::shared_mutex pool_metadata_mutex_;
+  /**
+   * Containers of destroyed pools, as (chimod name, handle). Destroying a pool
+   * drops its handles, but other workers may still hold copies of them
+   * (cached in a RunContext), so the objects are not deleted then: they are
+   * kept here and deleted by DestroyAllContainers() once the workers have
+   * stopped. Guarded by pool_metadata_mutex_.
+   */
+  std::vector<std::pair<std::string, DynamicContainer>> retired_containers_;
+  /** Pools destroyed on this node and not re-created (see WasDestroyed). */
+  std::unordered_set<PoolId> destroyed_pools_;
+  mutable std::mutex destroyed_pools_mu_;
+
+  /**
+   * Redirects left by unplugged pools: old pool id -> successor pool id.
+   * Consulted only when the old pool has no metadata entry (see RedirectOf).
+   */
+  std::unordered_map<PoolId, PoolId> redirects_;
+  mutable std::shared_mutex redirects_mu_;  ///< readers: every routed task
+  /** Fast-path flag: false while redirects_ is empty, so lookups stay cheap. */
+  std::atomic<bool> has_redirects_{false};
+
+  /**
+   * Resolve a container lookup for `pool_id`: `pick` runs on the pool's
+   * metadata when the pool exists; otherwise on its redirect successor's
+   * metadata (if the pool was unplugged with a successor). Takes the metadata
+   * read lock once on the fast path. Defined in pool_manager.cc.
+   * @param pool_id Pool identifier, possibly unplugged
+   * @param pick Callable taking const PoolInfo& and returning DynamicContainer
+   * @return the picked container handle, or an invalid handle
+   */
+  template <typename Pick>
+  DynamicContainer PickFromServingPool(PoolId pool_id, Pick pick) const;
+
+  /**
+   * Record that `from` now redirects to `to`. No-op when from == to.
+   * @param from Unplugged pool id
+   * @param to Successor pool id
+   */
+  void InstallRedirect(PoolId from, PoolId to);
+
+  /**
+   * Drop any redirect whose key is `pool_id` (called when it is re-created).
+   * @param pool_id Pool identifier being re-created
+   */
+  void ClearRedirect(PoolId pool_id);
+
+  /** Maximum redirect hops followed by RedirectOf before giving up. */
+  static constexpr size_t kMaxRedirectHops = 8;
 
   // Pool ID counter for generating unique IDs (used as minor number)
   std::atomic<u32> next_pool_minor_{5}; // Start at 5 for safety, 1 reserved for admin

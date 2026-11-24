@@ -76,6 +76,8 @@ struct Args {
   u32 maxneigh = 96;       // Verlet-list capacity per atom slot
   u32 rowchunk = 4;        // rows per block in the force pass (hold reuse)
   u64 ckpt = 0;            // checkpoint every N steps (0 = never)
+  bool ckpt_sync = false;  // --ckpt-sync: every vector.Copy fully synchronous
+  bool no_ckpt = false;    // skip the end-of-run vector.Copy checkpoint
   u64 nl_page_kb = 0;      // list page size; 0 = one whole row per page
   u32 nlslots = 0;         // list cache frames per block; 0 = NlSlots() default
   u64 vram_mb = 0;         // cache budget across ALL vectors; 0 = size for residency
@@ -381,6 +383,8 @@ class YieldRunner {
 #endif  // GV_MD_CORO
 
 #if !CTP_IS_DEVICE_PASS
+// Host-only: the end-of-run vector.Copy checkpoint.
+#include "../bench_ckpt.h"
 
 /** Clamp a requested slot count up to what the kernels actually pin. */
 static u32 AtLeastSlots(u32 want, u32 floor_slots, const char *what) {
@@ -701,6 +705,7 @@ int main(int argc, char **argv) {
     else if (want("--maxneigh")) a.maxneigh = static_cast<u32>(atoi(argv[++i]));
     else if (want("--rowchunk")) a.rowchunk = static_cast<u32>(atoi(argv[++i]));
     else if (want("--ckpt")) a.ckpt = static_cast<u64>(atol(argv[++i]));
+    else if (std::strcmp(argv[i], "--ckpt-sync") == 0) a.ckpt_sync = true;
     else if (want("--nl-page-kb")) a.nl_page_kb = static_cast<u64>(atol(argv[++i]));
     else if (want("--nlslots")) a.nlslots = static_cast<u32>(atoi(argv[++i]));
     else if (want("--vram-mb")) a.vram_mb = static_cast<u64>(atol(argv[++i]));
@@ -711,6 +716,7 @@ int main(int argc, char **argv) {
     else if (want("--nodes")) a.nodes = static_cast<u32>(atoi(argv[++i]));
     else if (want("--node")) a.node = static_cast<u32>(atoi(argv[++i]));
     else if (std::strcmp(argv[i], "--md") == 0) a.md = 1;
+    else if (std::strcmp(argv[i], "--no-ckpt") == 0) a.no_ckpt = true;
     else if (std::strcmp(argv[i], "--readprobe") == 0) a.readprobe = 1;
     else {
       std::fprintf(stderr, "unknown arg %s\n", argv[i]);
@@ -2266,8 +2272,10 @@ gpu, *dst, g.nb, g.cap,
       const double _t = NowMs();
       ctp::GpuApi::Synchronize();
       gv::Vector<float> *cvv = (cvx == &vx) ? &vv : &vv2;
-      ck_x = cvx->Copy("md_ckpt_x_" + std::to_string(n_ckpt));
-      ck_v = cvv->Copy("md_ckpt_v_" + std::to_string(n_ckpt));
+      ck_x = cvx->Copy("md_ckpt_x_" + std::to_string(n_ckpt),
+                       a.ckpt_sync);
+      ck_v = cvv->Copy("md_ckpt_v_" + std::to_string(n_ckpt),
+                       a.ckpt_sync);
       t_ckpt += NowMs() - _t;
       const double _t2 = NowMs();
       ctp::GpuApi::Memcpy(h_ckpt_stock, d_ckpt_stock, 2 * g.nelems);
@@ -2492,6 +2500,18 @@ gpu, *dst, g.nb, g.cap,
                   c[2] * us / 1000.0, c[3] * us / 1000.0,
                   c[4] * us / 1000.0);
     }
+    // FINAL-STATE CHECKPOINT: vector.Copy of the current positions and
+    // velocities, on by default (--no-ckpt skips it). Last, because the
+    // multi-node path drops the cache first -- see bench_ckpt.h.
+    std::unique_ptr<gv::Vector<float>> fin_x, fin_v;
+    if (!a.no_ckpt) {
+      gv::Vector<float> *fin_vv = (cvx == &vx) ? &vv : &vv2;
+      fin_x = clio_bench_ckpt::FinalCheckpoint(*cvx, tag("md_ckpt_x_final"),
+                                               a.nodes, a.ckpt_sync);
+      fin_v = clio_bench_ckpt::FinalCheckpoint(*fin_vv,
+                                               tag("md_ckpt_v_final"), a.nodes,
+                                               a.ckpt_sync);
+    }
     ctp::GpuApi::Free(d_acc);
     ctp::GpuApi::Free(d_thermo);
     ctp::GpuApi::Free(d_bincnt);
@@ -2517,14 +2537,14 @@ gpu, *dst, g.nb, g.cap,
       md::LaunchIntegrate(gr, b, CLIO_YIELD_SMEM_BYTES,
 
           gpu, dx, dv, dthird, use_third, fdt, fgx, fgy, fgz, /*drift=*/1,
-          a.blocks, vw, sv);
+          slab_pg_lo, slab_pg_hi, a.blocks, vw, sv);
     });
     const u32 rr = runner.Run([&](dim3 gr, dim3 b, gy::YieldableView<> vw,
                                   gy::YieldStackView sv) {
       md::LaunchIntegrate(gr, b, CLIO_YIELD_SMEM_BYTES,
 
           gpu, dx, dv, dthird, use_third, fdt, fgx, fgy, fgz, /*drift=*/0,
-          a.blocks, vw, sv);
+          slab_pg_lo, slab_pg_hi, a.blocks, vw, sv);
     });
     if (std::getenv("MD_ROUNDS") != nullptr) {
       const auto &rl = runner.RoundLog();
@@ -2568,7 +2588,8 @@ gpu, dx, dv, d_thermo, g.nb,
     unsigned long long done = 0;
     md::SymbolRead(&done, md::MdSym::kPagesDone, sizeof(done));
     const unsigned long long want =
-        static_cast<unsigned long long>(npages) * a.steps * 2ull;
+        static_cast<unsigned long long>(slab_pg_hi - slab_pg_lo) * a.steps *
+        2ull;
     std::printf("  page iterations: %llu of %llu expected%s\n", done, want,
                 (done == want) ? "  [all work ran]"
                                : "   <-- WORK WAS DROPPED");

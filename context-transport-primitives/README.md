@@ -91,25 +91,35 @@ The canonical include root is `<clio_ctp/...>`:
 
 ## Project structure
 
+Each module owns its headers, sources and tests. Headers sit under
+`<module>/include/clio_ctp/<module>/`, so they are included as
+`clio_ctp/<module>/...` regardless of the on-disk layout.
+
 ```
-include/clio_ctp/
-  data_structures/      IPC-safe containers, serialization
-    ipc/                vector, list, unordered_map, ring queues
-    internal/           implementation details
-    serialization/      serialization utilities
-  memory/
-    allocator/          malloc, stack, heap, GPU allocators
-    backend/            memory backend implementations
-  thread/
-    lock/               lock implementations
-    thread_model/       thread model abstractions
-  util/
-    compress/           compression utilities
-    encrypt/            crypto primitives
-  lightbeam/            networking layer (ZMQ, libfabric, Thallium)
-  types/                shared type definitions
-  introspect/           system topology / NUMA introspection
-src/                    core library implementation
+<module>/
+  CMakeLists.txt        registers src/ files with the CTP libraries, adds test/
+  include/clio_ctp/<module>/
+  src/                  (only modules with compiled code)
+  test/
+
+constants/              compiler, platform and export macros
+types/                  atomics, bitfields, hashing, numeric helpers
+util/                   logging, timers, config parsing, singletons, GPU API
+thread/                 locks and CPU/GPU thread models
+memory/                 memory backends, allocators, smart pointers
+data_structures/        IPC-safe (ipc/) and private (priv/) containers, serialization
+serialize/              msgpack wrapper
+introspect/             system information, drive-failure prediction
+io/                     async I/O backends (io_uring, libaio, POSIX AIO, IOCP)
+lightbeam/              networking layer (ZMQ, libfabric, Thallium, SHM, sockets)
+compress/               compression codecs
+encrypt/                crypto primitives
+search/                 regex search engine
+solver/                 nonlinear least-squares solver
+
+include/clio_ctp/clio_ctp.h   umbrella header over all modules
+cmake/                  CTP library targets (clio_ctp_host, CUDA/ROCm builds)
+test/                   shared test harness and cross-module suites (gpu, cloud drives)
 ```
 
 ## Tests

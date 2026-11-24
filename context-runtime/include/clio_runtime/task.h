@@ -41,6 +41,7 @@ using pid_t = int;
 #endif
 
 #include <atomic>
+#include <exception>
 // ============================================================================
 // Coroutine backend selection.
 //   * Default: C++20 stackless coroutines (std::coroutine_handle).
@@ -453,14 +454,27 @@ class Task {
   void SetRouted(bool v = true);
   bool IsStarted() const;
   void SetStarted(bool v = true);
+  bool IsNetPlaced() const;
+  void SetNetPlaced(bool v = true);
   ctp::CpuTimer& RunCpuTimer();
   float PredictedLoad() const;
   void SetPredictedLoad(float v);
   float SchedReservedUs() const;       // issue #781 queued-load reservation
   void SetSchedReservedUs(float v);    // issue #781
+  /** Worker holding this task's reservation (kNoReservedWorker if none). */
+  u32 SchedReservedWorker() const;
+  void SetSchedReservedWorker(u32 v);
   ctp::HighResMonotonicTimer& RunWallTimer();
   float PredictedWallUs() const;
   void SetPredictedWallUs(float v);
+  /** Hold time (us) this task currently counts in its worker's load_: what
+   *  the worker added, so it subtracts exactly that (a re-route can change
+   *  the prediction in between). 0 while not counted. */
+  float BookedHoldUs() const;
+  void SetBookedHoldUs(float v);
+  /** How many times a worker has run this task (first run + each resume). */
+  u32 ExecSegments() const;
+  void SetExecSegments(u32 v);
   TaskStat& PredictedStat();
   /** The parent task waiting on this task's completion (i.e. whose coroutine
    *  resumes when this task finishes), read through this task's own future.
@@ -876,6 +890,14 @@ typedef ctp::ipc::multi_ext_spsc_queue<Future<Task>, CLIO_QUEUE_ALLOC_T>
 
 namespace clio::run {
 
+/**
+ * Drop one in-flight task from a SHM client's count (#1192). Defined in
+ * ipc_manager.cc; RunContext's destructor calls it so this header does not
+ * need IpcManager.
+ * @param pid the client process the task was admitted from
+ */
+void ReleaseClientInflight(u32 pid);
+
 // ============================================================================
 // RunContext (uses Future<Task> and TaskLane* - both must be complete above)
 // ============================================================================
@@ -901,6 +923,7 @@ class RunContext {
     RCTX_DID_WORK = 1u << 1,  /**< Task did work in last execution */
     RCTX_ROUTED = 1u << 2,    /**< RouteTask has placed this task */
     RCTX_STARTED = 1u << 3,   /**< Execution has begun */
+    RCTX_NET_PLACED = 1u << 4, /**< Net-received task was given a worker */
   };
 
   /** Coroutine handle for C++20 stackless coroutines (or Boost fiber handle) */
@@ -940,17 +963,47 @@ class RunContext {
   //      and read at SendOut.
   ClientOrigin origin_;            /**< Origin transport mode (completion path) */
   u32 client_pid_;                 /**< Client PID for per-client routing */
+  /** Admitted from a SHM client: this context holds one in-flight count on
+   *  client_pid_ (released by the destructor). Runtime-side only. */
+  bool counts_client_inflight_ = false;
   /** Client's net_key (task vaddr) captured at RecvIn and restored onto
    *  task_id_.net_key_ at SendOut, because AllocLoadTask reassigns the server
    *  task's identity. The ZMQ recv thread keys pending_zmq_futures_ by this, so
    *  the response must carry it for the client to match (else it hangs). */
   uintptr_t client_net_key_;
+  /** #968: the client's OWN task identity, captured at RecvIn alongside
+   *  client_net_key_ and stamped back onto the response at SendOut.
+   *
+   *  net_key_ is the client task's heap address, so it is recycled as soon as
+   *  that task is freed. Demuxing a response by net_key alone therefore has no
+   *  way to tell "the reply to the task I am waiting for" from "a late reply to
+   *  a previous task that happened to live at this address". unique_ is
+   *  monotonic per client process and is never recycled, so echoing it lets the
+   *  client recv thread corroborate the address match against a real identity.
+   *  0 means the peer did not echo one (nothing to check). */
+  u32 client_task_unique_;
+  u32 client_task_major_;  /**< Companion to client_task_unique_ (per-thread) */
   ctp::lbm::ShmTransferInfo input_;   /**< SHM transfer info (client -> worker) */
   ctp::lbm::ShmTransferInfo output_;  /**< SHM transfer info (worker -> client) */
   ctp::lbm::Transport* response_transport_; /**< Transport for the response */
+  /** Keeps a client dial-back transport alive while this task may still send
+   *  its response on it (issue #1065): the dial-back table is LRU-bounded and
+   *  may evict the entry while the task runs. Null when response_transport_ is
+   *  owned elsewhere (the inbound IPC socket). Runtime-local, never
+   *  serialized. */
+  std::shared_ptr<ctp::lbm::Transport> response_transport_owner_;
   char response_identity_[64];     /**< ZMQ echo-back identity (fallback path) */
   u32 response_identity_len_;
   int response_fd_;                /**< Socket fd for routing response (IPC) */
+  /** Client identity for TCP dial-back DEALER routing. Captured at RecvIn
+   *  (from the incoming ROUTER's identity frame) so SendOut can evict the
+   *  cached dial-back connection when a response is undeliverable (issue #722).
+   *  Empty for IPC responses (which use response_fd_). */
+  std::string client_identity_;
+  /** Client's response-listener port (SaveTaskArchive::client_port_). Used by
+   *  SendOut to evict the cached dial-back DEALER when the client is
+   *  unreachable (issue #722). Only meaningful for TCP responses. */
+  int client_response_port_;
   /** #722 bounded-drop of an undeliverable client response. When SendOut's
    *  network Send keeps failing (a client that submitted over TCP/IPC then
    *  disconnected), these bound the re-queue: after kMaxClientResponseRetries
@@ -958,6 +1011,12 @@ class RunContext {
    *  (task freed via RAII) instead of re-queued forever. Non-serialized;
    *  meaningful only on the server's outbound response future. */
   u32 send_fail_count_;            /**< Consecutive response-Send failures */
+  /** #968: how many times SendOut has put a response for THIS future on the
+   *  wire. A successful send should happen exactly once; a second one means the
+   *  client is being handed two replies for one request, and the second lands
+   *  on whatever now owns that net_key. Counted so the anomaly is reported
+   *  where it happens rather than inferred from the client's miss tally. */
+  u32 responses_sent_;
   ctp::Timepoint first_send_fail_; /**< Time of the first failure (for timeout) */
   ctp::abitfield32_t gpu_flags_;   /**< GPU device-completion bit (gpu2gpu) */
   uintptr_t gpu_task_device_ptr_;  /**< Device addr of the task POD (kDeviceMem) */
@@ -968,6 +1027,21 @@ class RunContext {
    *  0 for every task the probe did not open — which is every CPU-origin task,
    *  and all tasks when the probe is off. */
   uintptr_t probe_rec_;
+  /** Cycle stamp for the latency report (CLIO_EVLAT): set when this task's
+   *  completion event is pushed onto its parent's event queue, read when the
+   *  parent's worker pops it (channel evq_wait); and on an origin task, set
+   *  at SendIn and read when the remote reply completes it (channel
+   *  rtt_remote). 0 when unset. */
+  unsigned long long notify_ns_ = 0;
+  /** Cross-node stage stamps (CLIO_EVLAT only; see clio_runtime/evlat.h).
+   *  net_enq_cyc_: pushed onto the net send queue (SendIn or SendOut).
+   *  remote_arrive_cyc_ / remote_start_cyc_: on the serving node, when
+   *  RecvIn received the task and when a worker first ran it. 0 = unset. */
+  unsigned long long net_enq_cyc_ = 0;
+  unsigned long long remote_arrive_cyc_ = 0;
+  unsigned long long remote_start_cyc_ = 0;
+  /** CLIO_EVLAT: a worker popped this client request off its SHM shard. */
+  unsigned long long client_arrive_cyc_ = 0;
 
  private:
   std::atomic<bool> is_notified_; /**< Atomic flag to prevent duplicate event
@@ -997,9 +1071,15 @@ class RunContext {
   float sched_reserved_us_ = 0; /**< #781 queued-load reservation on a worker
                                   * (predicted cost added to worker.queued_load_
                                   * at map, released when the task starts) */
+  /** Worker whose queued_load_ holds sched_reserved_us_: the release must
+   *  go to THAT worker, which is not always the one that runs the task (a
+   *  task can be mapped more than once before it starts). */
+  u32 sched_reserved_worker_ = 0xFFFFFFFFu;
   ctp::HighResMonotonicTimer wall_timer_; /**< Wall clock time across yields */
   float predicted_wall_us_ =
       0; /**< Predicted wall time from InferWallClockTime */
+  float booked_hold_us_ = 0; /**< Hold counted in the worker's load_ (us) */
+  u32 exec_segments_ = 0; /**< Executions so far (first run + resumes) */
   TaskStat
       predicted_stat_; /**< TaskStat used for prediction (for reinforcement) */
 
@@ -1017,10 +1097,14 @@ class RunContext {
         origin_(ClientOrigin::kClientShm),
         client_pid_(0),
         client_net_key_(0),
+        client_task_unique_(0),
+        client_task_major_(0),
         response_transport_(nullptr),
         response_identity_len_(0),
         response_fd_(-1),
+        client_response_port_(0),
         send_fail_count_(0),
+        responses_sent_(0),
         gpu_task_device_ptr_(0),
         gpu_task_size_(0),
         probe_rec_(0),
@@ -1064,8 +1148,12 @@ class RunContext {
         flags_(other.flags_),
         cpu_timer_(other.cpu_timer_),
         predicted_load_(other.predicted_load_),
+        sched_reserved_us_(other.sched_reserved_us_),
+        sched_reserved_worker_(other.sched_reserved_worker_),
         wall_timer_(other.wall_timer_),
         predicted_wall_us_(other.predicted_wall_us_),
+        booked_hold_us_(other.booked_hold_us_),
+        exec_segments_(other.exec_segments_),
         predicted_stat_(other.predicted_stat_) {
 #ifndef CLIO_ENABLE_BOOST_COROUTINES
     other.coro_handle_ = nullptr;
@@ -1098,8 +1186,12 @@ class RunContext {
       flags_ = other.flags_;
       cpu_timer_ = other.cpu_timer_;
       predicted_load_ = other.predicted_load_;
+      sched_reserved_us_ = other.sched_reserved_us_;
+      sched_reserved_worker_ = other.sched_reserved_worker_;
       wall_timer_ = other.wall_timer_;
       predicted_wall_us_ = other.predicted_wall_us_;
+      booked_hold_us_ = other.booked_hold_us_;
+      exec_segments_ = other.exec_segments_;
       predicted_stat_ = other.predicted_stat_;
 #ifndef CLIO_ENABLE_BOOST_COROUTINES
       other.coro_handle_ = nullptr;
@@ -1129,6 +1221,10 @@ class RunContext {
    * not here.
    */
   ~RunContext() {
+    // #1192: a task admitted from a SHM client pins that client's segments
+    // (its ShmPtrs may be resolved to raw pointers held across yields) until
+    // the task is gone.
+    if (counts_client_inflight_) ReleaseClientInflight(client_pid_);
 #if defined(CLIO_ENABLE_BOOST_COROUTINES)
     coro_handle_ = clio::run::detail::FiberHandle{};
     // fiber_state_ (and its boost::context::fiber) destructs next, freeing the
@@ -1155,6 +1251,8 @@ class RunContext {
   void SetRouted(bool v = true) { SetFlag(RCTX_ROUTED, v); }
   bool IsStarted() const { return flags_.Any(RCTX_STARTED); }
   void SetStarted(bool v = true) { SetFlag(RCTX_STARTED, v); }
+  bool IsNetPlaced() const { return flags_.Any(RCTX_NET_PLACED); }
+  void SetNetPlaced(bool v = true) { SetFlag(RCTX_NET_PLACED, v); }
   bool IsYielded() const { return flags_.Any(RCTX_YIELDED); }
   void SetYielded(bool v = true) { SetFlag(RCTX_YIELDED, v); }
   bool DidWork() const { return flags_.Any(RCTX_DID_WORK); }
@@ -1178,8 +1276,11 @@ class RunContext {
     cpu_timer_.time_ns_ = 0;
     predicted_load_ = 0;
     sched_reserved_us_ = 0;
+    sched_reserved_worker_ = 0xFFFFFFFFu;
     wall_timer_.time_ns_ = 0;
     predicted_wall_us_ = 0;
+    booked_hold_us_ = 0;
+    exec_segments_ = 0;
     predicted_stat_ = TaskStat();
   }
 };
@@ -1260,14 +1361,21 @@ inline double Task::TruePeriodNs() const { return period_ns_; }
 CLIO_RCTX_FLAG(DidWork, SetDidWork)
 CLIO_RCTX_FLAG(IsRouted, SetRouted)
 CLIO_RCTX_FLAG(IsStarted, SetStarted)
+CLIO_RCTX_FLAG(IsNetPlaced, SetNetPlaced)
 CLIO_RCTX_REF(ctp::CpuTimer, RunCpuTimer, cpu_timer_)
 CLIO_RCTX_GET(float, PredictedLoad, predicted_load_)
 CLIO_RCTX_SET(float, SetPredictedLoad, predicted_load_)
 CLIO_RCTX_GET(float, SchedReservedUs, sched_reserved_us_)
 CLIO_RCTX_SET(float, SetSchedReservedUs, sched_reserved_us_)
+CLIO_RCTX_GET(u32, SchedReservedWorker, sched_reserved_worker_)
+CLIO_RCTX_SET(u32, SetSchedReservedWorker, sched_reserved_worker_)
 CLIO_RCTX_REF(ctp::HighResMonotonicTimer, RunWallTimer, wall_timer_)
 CLIO_RCTX_GET(float, PredictedWallUs, predicted_wall_us_)
 CLIO_RCTX_SET(float, SetPredictedWallUs, predicted_wall_us_)
+CLIO_RCTX_GET(float, BookedHoldUs, booked_hold_us_)
+CLIO_RCTX_SET(float, SetBookedHoldUs, booked_hold_us_)
+CLIO_RCTX_GET(u32, ExecSegments, exec_segments_)
+CLIO_RCTX_SET(u32, SetExecSegments, exec_segments_)
 CLIO_RCTX_REF(TaskStat, PredictedStat, predicted_stat_)
 #ifndef CLIO_ENABLE_BOOST_COROUTINES
 CLIO_RCTX_REF(std::coroutine_handle<>, CoroHandle, coro_handle_)
@@ -1845,8 +1953,13 @@ public:
  * back to the worker with an optional delay before resumption.
  *
  * Usage:
- *   co_await clio::run::yield();       // Yield immediately
+ *   co_await clio::run::yield(1.0);    // Yield, resume on the next pass
  *   co_await clio::run::yield(25.0);   // Yield with 25 microsecond delay
+ *
+ * A delay of 0 does NOT mean "yield immediately": the worker treats it as
+ * "waiting for a Future" and never re-queues the task itself, so a bare
+ * yield() suspends until some event resumes it -- possibly forever. Always
+ * pass a positive delay to yield cooperatively.
  */
 class YieldAwaiter {
  private:
@@ -1906,11 +2019,12 @@ class YieldAwaiter {
  * This function provides a clean syntax for yielding control within
  * ChiMod runtime coroutines.
  *
- * @param us Microseconds to delay before resumption (default: 0)
+ * @param us Microseconds to delay before resumption; must be > 0 for a
+ *           cooperative yield (0 waits for an event, see YieldAwaiter)
  * @return YieldAwaiter object that can be co_awaited
  *
  * Usage:
- *   co_await clio::run::yield();       // Yield immediately
+ *   co_await clio::run::yield(1.0);    // Yield, resume on the next pass
  *   co_await clio::run::yield(25.0);   // Yield with 25 microsecond delay
  */
 inline YieldAwaiter yield(double us = 0.0) { return YieldAwaiter(us); }

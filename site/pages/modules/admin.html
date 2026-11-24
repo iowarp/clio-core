@@ -1,0 +1,389 @@
+<!--
+title: Admin module
+heading: Admin: <em>the runtime's control plane.</em>
+description: The clio_admin module: the per-node control plane of the CLIO runtime. Pool creation and destruction, compose, the cross-node send loop, client handshakes, memory registration, SWIM failure detection and recovery, monitoring queries and the web dashboard.
+eyebrow: Modules · Runtime
+lede: Every runtime has exactly one admin pool, at id 1.0 and named "admin". It is not composed and not optional. Creating any other pool is a task sent to admin, and so are destroying pools, stopping the runtime, registering client memory, moving containers and deciding which nodes are alive. Most of its methods are infrastructure that the runtime and the CLI call for you.
+facts: Library | clio_admin ; Default pool | 1.0, name admin ; Build option | none, always built ; Source | context-runtime/modules/admin
+-->
+<h2>What it does</h2>
+<p>The admin module is the runtime's own module. Each node creates its admin
+container during server start, before compose runs, and keeps it until the
+runtime shuts down. Through it the runtime:</p>
+<ul>
+  <li>creates pools of every other module (<strong>GetOrCreatePool</strong>),
+  whether the request comes from a client's <code>AsyncCreate</code>, the
+  <code>compose</code> section of the configuration or the dashboard;</li>
+  <li>destroys and unplugs pools (<strong>DestroyPool</strong>), running each
+  module's own Destroy first so buffered data is made durable;</li>
+  <li>drains the cross-node send queues and answers client connection
+  handshakes;</li>
+  <li>registers shared-memory and GPU memory backends that clients allocate
+  (<strong>RegisterMemory</strong>);</li>
+  <li>adds nodes, migrates containers and redistributes a dead node's
+  containers;</li>
+  <li>probes peers for liveness (SWIM and the task-progress probe);</li>
+  <li>answers monitoring queries and serves the web dashboard.</li>
+</ul>
+
+<h2>Where it sits</h2>
+<p>Admin is not part of the data path and not in any interposition chain.
+Every other module depends on it:</p>
+<ul>
+  <li><strong>Pool creation.</strong> A module client's create task is a
+  <code>GetOrCreatePoolTask</code> addressed to the admin pool, not to the
+  module's own pool (<code>clio::run::kAdminPoolId</code>). The MOD_NAME
+  template's <code>AsyncCreate</code> shows the pattern; see
+  <a href="/modules/module-template.html">Module template</a>.</li>
+  <li><strong>Pool destruction.</strong> Each module's <code>kDestroy</code>
+  handler receives the admin <code>DestroyPoolTask</code> (it is the standard
+  <code>DestroyTask</code>), and reports what it flushed in that task's
+  <code>blobs_flushed_</code> and <code>bytes_flushed_</code>.</li>
+  <li><strong>The CLI.</strong> <code>clio-run stop</code> sends StopRuntime,
+  <code>clio-run start --induct</code> broadcasts AddNode,
+  <code>clio-run status</code> sends Heartbeat, <code>clio-run pool</code> and
+  <code>clio-run compose</code> use Compose, ListContainers and the two-phase
+  DestroyPool, <code>clio-run migrate</code> sends MigrateContainers,
+  <code>clio-run monitor</code> sends the <code>worker_stats</code> Monitor
+  query and <code>clio-run viz</code> sends the <code>viz_*</code>
+  queries.</li>
+  <li><strong>The IPC manager.</strong> A client connecting to the runtime
+  sends ClientConnect; a client that grows its shared memory, or allocates a
+  GPU backend, sends RegisterMemory.</li>
+  <li><strong>The scheduler.</strong> The default scheduler pins the admin
+  periodics that own network sockets to dedicated workers: Send (14) to the
+  network send worker; Recv (15), ClientRecv (20) and ClientSend (21) to the
+  network receive worker.</li>
+</ul>
+<p>Pool id <code>1.0</code> is reserved (<code>kAdminPoolId</code> in
+<code>context-runtime/include/clio_runtime/types.h</code>). A default-constructed
+<code>clio::run::admin::Client</code> targets it, and <code>CLIO_ADMIN</code>
+returns the process's admin client.</p>
+
+<h2>Composing it</h2>
+<p>Admin does not appear in <code>compose</code> and must not be added there.
+<code>PoolManager::ServerInit</code> creates it on every node with a local
+create of module <code>clio_admin</code>, pool name <code>admin</code>, pool id
+1.0. <code>clio-run start</code> exits with an error if it cannot find the
+<code>clio_admin</code> module. Its container count is one per node, and
+recovery never moves it (see below).</p>
+
+<h2>Operations</h2>
+<p>Every method in <code>admin/clio_mod.yaml</code>. Ids 2 to 5
+(NodeFailure, Recover, Migrate, Upgrade) are set to <code>-1</code>, not
+implemented; id 17 is unused.</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Id</th><th>Method</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td>0</td><td>Create</td><td>Initializes this node's admin container. Starts the periodic tasks listed under <a href="#background-tasks">Background tasks</a>, the dedicated receive threads, and the dashboard if it is enabled.</td></tr>
+    <tr><td>1</td><td>Destroy</td><td>Alias of DestroyPool (<code>DestroyTask</code> is <code>DestroyPoolTask</code>).</td></tr>
+    <tr><td>9</td><td>Monitor</td><td>Answers the text queries listed under <a href="#monitor-queries">Monitor queries</a>.</td></tr>
+    <tr><td>10</td><td>GetOrCreatePool</td><td>Creates a pool of any module, or binds to the existing one. Compose uses the same method with its compose flag set.</td></tr>
+    <tr><td>11</td><td>DestroyPool</td><td>Runs the pool's own Destroy on this node, then removes the pool. Controlled by destruction flags (below).</td></tr>
+    <tr><td>12</td><td>StopRuntime</td><td>Requests a graceful or forced shutdown of this runtime. The shutdown runs after the task's reply is delivered.</td></tr>
+    <tr><td>13</td><td>Flush</td><td>Waits, yielding, until no container on this node reports remaining work.</td></tr>
+    <tr><td>14</td><td>Send</td><td>Periodic: drains the cross-node send queues (see <a href="#the-send-loop">The send loop</a>).</td></tr>
+    <tr><td>15</td><td>Recv</td><td>Receives one message from the main transport and dispatches it. Create does not start it; inbound peer traffic is read by dedicated threads.</td></tr>
+    <tr><td>16</td><td>ClientConnect</td><td>Connection handshake. Returns the server's pid and generation, allocator ids, queue and metadata offsets, inbound SHM shard count and worker thread ids.</td></tr>
+    <tr><td>18</td><td>SubmitBatch</td><td>Deserializes a batch of tasks and submits them in groups of 32, awaiting each group.</td></tr>
+    <tr><td>19</td><td>WreapDeadIpcs</td><td>Periodic: reclaims shared memory of dead or zombie client processes.</td></tr>
+    <tr><td>20</td><td>ClientRecv</td><td>Receives tasks from TCP and IPC clients. Create does not start it.</td></tr>
+    <tr><td>21</td><td>ClientSend</td><td>Periodic: sends completed task outputs back to TCP and IPC clients.</td></tr>
+    <tr><td>22</td><td>RegisterMemory</td><td>Attaches a client's memory: POSIX shared memory, or (in a GPU build) pinned host, managed or device memory registered as a GPU client backend.</td></tr>
+    <tr><td>23</td><td>RestartContainers</td><td>Re-creates every pool in this node's pool log that is not already present.</td></tr>
+    <tr><td>24</td><td>AddNode</td><td>Adds a node to this runtime's host list and calls <code>Expand</code> on every pool's container.</td></tr>
+    <tr><td>25</td><td>ChangeAddressTable</td><td>Writes a write-ahead log entry, then maps one container of a pool to a new node.</td></tr>
+    <tr><td>26</td><td>MigrateContainers</td><td>Moves containers hosted on this node to other nodes.</td></tr>
+    <tr><td>27</td><td>Heartbeat</td><td>Liveness probe. Returns success and does nothing else.</td></tr>
+    <tr><td>28</td><td>HeartbeatProbe</td><td>Periodic: the SWIM failure detector.</td></tr>
+    <tr><td>29</td><td>ProbeRequest</td><td>Indirect probe: heartbeats a target on behalf of another node and reports whether it answered.</td></tr>
+    <tr><td>30</td><td>RecoverContainers</td><td>Applies a recovery plan: every node remaps the dead node's containers; each destination re-creates its share.</td></tr>
+    <tr><td>31</td><td>SystemMonitor</td><td>Periodic: samples RAM and CPU use into a ring of 1024 entries and saves learned task-cost models.</td></tr>
+    <tr><td>32</td><td>AnnounceShutdown</td><td>Marks a departing node dead at once; the leader then starts its recovery. Nothing in the tree sends it today.</td></tr>
+    <tr><td>33</td><td>RegisterGpuContainer</td><td>Placeholder that logs and returns. GPU containers are registered by pool creation.</td></tr>
+    <tr><td>34</td><td>ListContainers</td><td>Lists the names and ids of the active pools on this node.</td></tr>
+    <tr><td>35</td><td>QueryTaskProgress</td><td>Answers whether this node still holds a given cross-node task. Also carries the rejoin notice for nodes held dead.</td></tr>
+  </tbody>
+</table></div>
+
+<h3>Creating pools</h3>
+<ol class="steps">
+  <li>A create sent with a Dynamic pool query is resolved by admin's
+  scheduler hook: Local if a pool of that name exists on this node, or if the
+  create names a fixed pool id that exists here; Broadcast otherwise.</li>
+  <li>A client create for a pool that the configuration's compose section
+  defines (matched by pool id, or by name when the create names no id) waits,
+  yielding, until compose has created it, for up to 300 seconds. Without this
+  wait a client could create the pool first with default parameters.</li>
+  <li><code>PoolManager::CreatePool</code> then creates the pool, or binds to
+  the existing one, and awaits the module's own Create. An exception sets
+  return code 99.</li>
+</ol>
+
+<h3>Destroying and unplugging pools</h3>
+<p>DestroyPool takes a bit set of destruction flags, defined in
+<code>admin_tasks.h</code>. The same flags reach the module's own
+Destroy:</p>
+<dl class="notes">
+  <dt><code>kDestroyPoolKeepRestartable</code> (0x1)</dt>
+  <dd>Keep the pool's entry in each node's pool log, so the next
+  <code>clio-run start</code> re-creates it. <code>clio-run pool stop</code>
+  sets it.</dd>
+  <dt><code>kDestroyPoolNoFlush</code> (0x2)</dt>
+  <dd>Skip the flush and go on even if the module's Destroy fails
+  (<code>--force</code>). Buffered, unflushed data is discarded.</dd>
+  <dt><code>kDestroyPoolDeleteData</code> (0x4)</dt>
+  <dd>Delete the pool's data: backing files, metadata logs, cached copies.
+  <code>clio-run pool rm</code> sets it.</dd>
+  <dt><code>kDestroyPoolQuiesceOnly</code> (0x8)</dt>
+  <dd>Run the module's Destroy but keep the pool: phase one of a two-phase
+  destroy.</dd>
+</dl>
+<p>The client helper <code>UnplugPool</code> issues both phases as Broadcast:
+phase one with <code>kDestroyPoolQuiesceOnly</code> makes every node flush
+while all containers of the pool still exist, since a multi-node pool's
+containers flush to each other; phase two removes the pool. On a node that
+hosts a real container of the pool, admin first sends the module's
+<code>kDestroy</code> as a local subtask and adds its flushed counters to the
+task. A nonzero return from the module stops the destroy and leaves the pool
+running, unless <code>kDestroyPoolNoFlush</code> is set. If the module names
+an unplug successor, the pool manager installs a redirect to it.</p>
+
+<h3 id="monitor-queries">Monitor queries</h3>
+<p>Replies are msgpack, stored in <code>results_</code> under the container
+id. An unknown query returns an empty result with return code 0.</p>
+<dl class="notes">
+  <dt><code>worker_stats</code></dt>
+  <dd>Per worker: id, running and active flags, idle iterations, queued,
+  blocked, periodic and retry task counts, suspend period, tasks processed
+  and load.</dd>
+  <dt><code>container_stats</code></dt>
+  <dd>Every real container on this node with its pool, module and the
+  learned per-method cost model (coefficients and error) and learning
+  rate.</dd>
+  <dt><code>pool_stats://&lt;pool&gt;:&lt;routing&gt;:&lt;selector&gt;</code></dt>
+  <dd>Forwards <code>&lt;selector&gt;</code> as a Monitor query to another
+  pool with the given routing (<code>local</code>, <code>broadcast</code>,
+  <code>dynamic</code>, <code>direct_id:N</code>, <code>direct_hash:N</code>,
+  <code>physical:N</code> or <code>range:A:B</code>) and returns its
+  results.</dd>
+  <dt><code>system_stats</code>, <code>system_stats:&lt;min_event_id&gt;</code></dt>
+  <dd>Samples from the SystemMonitor ring: timestamps, RAM total, available
+  and percent used, CPU percent, host name, address, node id and whether
+  this node is the leader. GPU and HBM fields are present but not yet
+  filled.</dd>
+  <dt><code>bdev_stats</code></dt>
+  <dd>Sends <code>stats</code> to every <code>clio_bdev</code> pool on this node
+  and returns the answers with their pool ids.</dd>
+  <dt><code>get_host_info</code></dt>
+  <dd>Host name, address and node id.</dd>
+  <dt><code>stats</code></dt>
+  <dd>Admin's own counters: pools destroyed, unplugs, blobs and bytes
+  flushed by module Destroys, flush failures and redirects installed.</dd>
+  <dt><code>pool_id_of://&lt;name&gt;</code></dt>
+  <dd>The id of the pool with that name on this node, or an empty string.
+  <code>Client::ResolvePoolId</code> uses it to accept a pool name wherever
+  an id is expected.</dd>
+  <dt><code>viz_status</code>, <code>viz_start[?bind=&lt;addr&gt;&amp;port=&lt;n&gt;]</code>, <code>viz_stop</code></dt>
+  <dd>Report, start or stop the dashboard. <code>viz_start</code> accepts a
+  loopback address or the configured dashboard address only.</dd>
+</dl>
+
+<h2 id="background-tasks">Background tasks</h2>
+<p>Admin's Create starts these on every node, routed Local:</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Task</th><th>Period</th><th>Job</th></tr></thead>
+  <tbody>
+    <tr><td>Send</td><td>25 µs</td><td>Drains cross-node sends; runs the retry, timeout and task-progress scans every 1 ms.</td></tr>
+    <tr><td>ClientSend</td><td>100 µs</td><td>Returns outputs to TCP and IPC clients.</td></tr>
+    <tr><td>WreapDeadIpcs</td><td>1 s</td><td>Reclaims dead clients' shared memory.</td></tr>
+    <tr><td>HeartbeatProbe</td><td>2 s</td><td>SWIM failure detection (a no-op unless enabled).</td></tr>
+    <tr><td>SystemMonitor</td><td>1 s</td><td>RAM and CPU samples; periodic save of learned cost models.</td></tr>
+  </tbody>
+</table></div>
+<p>Create also starts the peer receive threads and, in SHM mode, the
+thread that drains the inbound shared-memory rings, and registers a hook that
+stops them before the transport is freed.</p>
+
+<h3 id="the-send-loop">The send loop</h3>
+<p>Each tick of Send snapshots the depth of the four network send queues.
+It drains the two latency queues completely, then drains the two bulk I/O
+queues alternately up to a byte budget per tick
+(<code>kNetQueueIoByteBudget</code>). A tick that takes 500 ms or more logs a
+<code>[SLOW-SEND-TICK]</code> warning with a per-phase breakdown. The period
+is held at or below 50 µs by a static assertion, because the worker services
+periodic tasks in buckets by period and a longer period would put every
+cross-node send into a much slower bucket.</p>
+
+<h2>Failure detection and recovery</h2>
+<h3>SWIM</h3>
+<p>HeartbeatProbe does nothing unless <code>swim: enabled: true</code>. When
+enabled, each tick:</p>
+<ol class="steps">
+  <li>Sends one direct Heartbeat to the next peer in round-robin order,
+  skipping peers that are suspected, probe-failed or already being probed.
+  Dead peers are still probed, so a node that comes back can be seen.</li>
+  <li>A direct probe that times out, or completes with an error, marks the
+  peer probe-failed and asks up to three random live peers to probe it
+  (ProbeRequest). With no live helper, the peer is marked suspected at
+  once.</li>
+  <li>When every indirect probe fails or times out, the peer becomes
+  suspected.</li>
+  <li>A suspected peer past the suspicion timeout is declared dead, unless it
+  has sent this node traffic within that timeout. Then the leader starts
+  recovery.</li>
+  <li>A successful probe of a dead peer marks it alive again (rejoined).</li>
+</ol>
+<p>If more than half of the other nodes are suspected or dead, the node
+self-fences: it logs an error, keeps probing, and skips recovery. The fence
+clears when connectivity returns.</p>
+
+<h3>Task-progress probes</h3>
+<p>Independently of SWIM, the Send loop's maintenance step probes nodes that
+hold cross-node tasks for too long:</p>
+<ul>
+  <li>Replicas outstanding beyond <code>task_progress_interval_ms</code> get a
+  QueryTaskProgress probe to the node holding them, at most 256 new probes
+  per scan, each with a 5 second network timeout. Two "gone" answers for
+  the same replica let the origin stop waiting for it.</li>
+  <li>Peers heard from before but silent for 10 seconds get an idle probe.
+  Peers held dead are re-probed every 2 seconds, so a node that only lost
+  connectivity can answer and rejoin.</li>
+  <li>A probe with no answer for <code>CLIO_PROBE_SILENCE_S</code> (default
+  30 s) marks its target dead, unless anything was heard from that node, or
+  a pong arrived on the control channel, within that window. Three
+  consecutive failed probes have the same effect. If this node's own scan
+  ran late, pending probes are re-armed instead of judged.</li>
+  <li>A node that receives rejoin notices from at least half of its peers
+  within 60 seconds records that it was failed over, so that state it homes
+  (for example the filesystem's cached home directories) is reloaded, since a
+  stand-in may have changed it.</li>
+</ul>
+
+<h3>Recovery</h3>
+<p>Recovery is run by the leader, the lowest-numbered node this node sees
+alive. It is claimed once per membership epoch and dead node, so a node that
+dies, rejoins and dies again is recovered again. The plan assigns each of the
+dead node's containers to the destination its pool's local container chooses
+(<code>ScheduleRecover</code>), or round-robin over live nodes. The plan is
+broadcast as RecoverContainers: every node updates its address table and
+write-ahead log; each destination creates the container and calls its
+<code>Recover</code>. The admin pool is never in a plan, since every node
+already has its own admin container.</p>
+
+<h2>Configuration</h2>
+<p>Admin has no compose entry. It reads these runtime settings:</p>
+<dl class="notes">
+  <dt><code>swim.enabled</code></dt>
+  <dd>Default <code>false</code>. Turns on the SWIM detector. The default
+  configuration explains why it is off: a wide collective can starve probe
+  replies long enough to declare healthy nodes dead.</dd>
+  <dt><code>swim.direct_probe_timeout_sec</code></dt>
+  <dd>Default 300.0. Deadline for a direct probe's reply.</dd>
+  <dt><code>swim.indirect_probe_timeout_sec</code></dt>
+  <dd>Default 150.0. Deadline for an indirect probe; also how long a
+  ProbeRequest waits for its heartbeat.</dd>
+  <dt><code>swim.suspicion_timeout_sec</code></dt>
+  <dd>Default 3600.0. Time from suspected to dead, which triggers
+  recovery.</dd>
+  <dt><code>runtime.task_progress_interval_ms</code></dt>
+  <dd>Default 5000. How long a cross-node task may run before its node is
+  probed. 0 disables the stuck-task and idle probes. The environment
+  variable <code>CLIO_TASK_PROGRESS_INTERVAL_MS</code> overrides it.</dd>
+  <dt><code>runtime.client_reap_grace_s</code></dt>
+  <dd>Default 30. WreapDeadIpcs reclaims a dead client's shared memory only
+  when it has no task in flight and has been idle this long. 0 never reaps
+  while the runtime runs.</dd>
+  <dt><code>viz.enabled</code>, <code>viz.port</code>, <code>viz.bind</code>, <code>viz.max_threads</code></dt>
+  <dd>The dashboard admin starts. Defaults: off for an embedded runtime,
+  port 8080, bind <code>127.0.0.1</code>, 16 threads. <code>clio-run start</code>
+  enables it unless the configuration or <code>CLIO_VIZ_ENABLE</code> says
+  otherwise. See <a href="/docs/dashboard/index.html">Dashboard</a>.</dd>
+  <dt><code>CLIO_PROBE_SILENCE_S</code> (environment)</dt>
+  <dd>Default 30. Silence window of the task-progress probes.</dd>
+</dl>
+
+<h2>The dashboard</h2>
+<p>Admin starts one HTTP server per node in its Create and owns the
+dashboard shell: <code>/</code> lands on <code>/viz/clio_admin/index.html</code>,
+with pages for nodes, pools and configuration in <code>admin/viz/</code>. Its
+routes, in <code>src/admin_viz.cc</code>, are <code>/api/health</code>,
+<code>/api/topology</code>, <code>/api/pools</code>, <code>/api/config</code>,
+<code>/api/routes</code>, <code>/api/chimods</code>, the per-node
+<code>/api/nodes/{node}/workers</code>, <code>containers</code>,
+<code>bdevs</code> and <code>system_stats</code> (Monitor queries above),
+<code>/api/pools/{pool}/monitor</code> for any module's Monitor, and two
+writes: <code>POST /api/pools/compose</code> and
+<code>POST /api/pools/{pool}/destroy</code>. The destroy route refuses the
+admin pool. A port already in use disables the dashboard; it never fails the
+runtime. See <a href="/tutorials/dashboard.html">the dashboard
+tutorial</a>.</p>
+
+<h2>Behaviors worth knowing</h2>
+<ul class="checks">
+  <li>Recovery never redistributes the admin pool. Moving it would build a
+  second admin container on a survivor and duplicate its periodic
+  tasks.</li>
+  <li>RecoverContainers is idempotent: an assignment whose container already
+  exists on the destination is skipped.</li>
+  <li>MigrateContainers fails a container that is not hosted on the node
+  running it, rather than migrating that node's own container of the pool.
+  Run it on the node that hosts the container.</li>
+  <li>StopRuntime does not tear down the runtime on the worker that runs it.
+  It requests the stop and returns; shutdown proceeds after the reply.
+  <code>StopRuntimeTask::kForceShutdown</code> (<code>clio-run stop
+  --force</code>) skips the graceful teardown.</li>
+  <li>Flush checks the containers of the node it runs on. Admin's own
+  remaining work is the number of cross-node tasks in its send and receive
+  maps.</li>
+  <li>At server start the runtime replays the pool log itself.
+  RestartContainers is the same replay as a task; the CTE restart and
+  replication-persistence integration tests use it.</li>
+  <li>With SWIM disabled, the task-progress probes can still mark a silent
+  node dead, so that tasks waiting on it fail instead of hanging.</li>
+</ul>
+
+<h2>Limits</h2>
+<ul>
+  <li>One admin pool per runtime, at 1.0 and named <code>admin</code>.
+  Multiple admin pools are not supported.</li>
+  <li>The leader is computed from each node's own membership view. During
+  churn two nodes can both believe they lead; the per-epoch claim prevents
+  one node from recovering the same death twice, not two nodes from each
+  starting one.</li>
+  <li>Recovery re-creates containers through their <code>Recover</code>
+  method. What state survives is up to each module; admin moves ownership,
+  not data.</li>
+  <li>Device memory (<code>kGpuDeviceMemory</code>) is registered by recording
+  the client's handle bytes; opening the IPC handle on the runtime side is
+  not implemented yet.</li>
+  <li>The GPU and HBM fields of <code>system_stats</code> are always zero.</li>
+</ul>
+
+<h2>How it is tested</h2>
+<ul>
+  <li><code>context-runtime/modules/admin/test</code>: <code>cr_compose_tests</code>
+  (<code>test_compose.cc</code>: PoolId and PoolQuery parsing, compose
+  configuration, Compose through the admin client, <code>CLIO_ADMIN</code>
+  targeting 1.0), <code>cr_submit_batch_tests</code>
+  (<code>test_submit_batch.cc</code>), <code>cr_create_pool_fields_tests</code>
+  (<code>test_create_pool_fields.cc</code>: how replica results of a
+  broadcast create merge) and the <code>cr_task_archive_*</code> family
+  (<code>test_task_archive.cc</code>: serialization of admin tasks). The
+  compose and batch tests also run over the network as
+  <code>cr_compose_force_net</code> and
+  <code>cr_submit_batch_force_net</code>.</li>
+  <li><code>context-runtime/modules/MOD_NAME/test/test_flush_correctness.cc</code>
+  (<code>cr_all_flush_tests</code>): admin Flush.</li>
+  <li><code>context-runtime/test/integration/recovery</code>: a Docker
+  cluster with SWIM enabled; a node is stopped and tasks must be re-routed
+  to its recovered containers. <code>leader_elect</code> stops the leader and
+  checks failover; <code>migrate</code> covers MigrateContainers and
+  re-routing; <code>expand</code> starts a third node with
+  <code>--induct</code> (AddNode); <code>reconnect</code> stops a runtime with
+  StopRuntime and checks that the client fails over to another node.</li>
+  <li><code>context-transfer-engine/test/integration/clio_fs_suite</code>:
+  partition and rejoin scenarios such as
+  <code>safe_partition_during_writes</code>, which motivated the rejoin
+  majority rule.</li>
+</ul>

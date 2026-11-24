@@ -8,21 +8,42 @@
 
 #include <clio_runtime/bdev/transports/bdev_transport.h>
 #include <clio_runtime/bdev/transports/block_allocator.h>
+#include <clio_runtime/bdev/transports/fs_stripe_layout.h>
+#include <clio_runtime/bdev/bdev_alloc_log.h>
 #include <clio_ctp/io/async_io_factory.h>
+#include <clio_ctp/introspect/system_info.h>
 
 #include <atomic>
+#include <condition_variable>
+#include <cstdint>
+#include <memory>
 #include <mutex>
+#include <new>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
 
 namespace clio::run::bdev {
 
 /**
- * Worker-local I/O context for filesystem backend
+ * Worker-local I/O context for filesystem backend. Holds one AsyncIO per
+ * backing file, in stripe order (exactly one when the device is not striped).
  */
 struct WorkerIOContext {
   bool is_initialized_{false};
-  std::unique_ptr<ctp::AsyncIO> async_io_;
+  std::vector<std::unique_ptr<ctp::AsyncIO>> async_ios_;
 
-  bool Init(const std::string &file_path, clio::run::u32 io_depth, clio::run::u32 worker_id);
+  /**
+   * Open every backing file of the device for this worker.
+   * @param paths backing files, in stripe order (index i = stripe file i)
+   * @param io_depth AsyncIO queue depth per file
+   * @param worker_id worker owning this context (for the error message)
+   * @return true when every file opened; on failure nothing stays open
+   */
+  bool Init(const std::vector<std::string> &paths, clio::run::u32 io_depth,
+            clio::run::u32 worker_id);
+  /** Close and release every file this context opened (idempotent). */
   void Cleanup();
 };
 
@@ -36,19 +57,253 @@ class FsBdevTransport : public BdevTransport {
   void Destroy() override;
 
   bool AllocateBlocks(size_t size, int worker_id, std::vector<Block>& blocks) override;
+  bool AllocateBlocksDeferred(size_t size, int worker_id,
+                              std::vector<Block>& blocks,
+                              clio::run::u64* need) override;
+  bool EnsureBacked(clio::run::u64 end) override { return EnsureFileBacked(end); }
+  void FinishAllocate(bool backed_ok, int worker_id,
+                      std::vector<Block>& blocks) override;
   void FreeBlocks(int worker_id, const std::vector<Block>& blocks) override;
 
   clio::run::TaskResume WriteBlocks(ctp::ipc::FullPtr<WriteTask> task) override;
   clio::run::TaskResume ReadBlocks(ctp::ipc::FullPtr<ReadTask> task) override;
 
   clio::run::u64 GetCapacity() const override { return allocator_.GetCapacity(); }
-  clio::run::u64 GetRemainingSize() const override { return allocator_.GetRemainingSize(); }
+  /**
+   * Bytes the device can still hand out AND back with disk (#1108): the
+   * allocator's free space, capped by the free part of the backed prefix
+   * plus what the host filesystem can still give the file. A capacity set
+   * above the disk's free space otherwise reported gigabytes free while
+   * every growth failed, and placement kept choosing a full target.
+   * @return remaining bytes
+   */
+  clio::run::u64 GetRemainingSize() const override;
+
+  void FlushAllocLog() override;
+  bool Sync() override;
 
  private:
+  /**
+   * Persistent allocator state. Without it the bump allocator restarts at
+   * offset 0 and a restart hands out bytes that live data -- placed by ANY
+   * client, local or remote -- still occupies.
+   */
+  AllocatorLog alloc_log_;
+  bool has_alloc_log_ = false;
+
+  // The log's fsync runs on its own thread, owned by the transport, so it
+  // ends with the pool: a runtime periodic task outlives a destroyed pool
+  // and retries forever.
+  static constexpr int kAllocLogSyncPeriodMs = 50;
+  std::thread sync_thread_;
+  std::mutex sync_mu_;
+  /// Sync group commit: tickets issued, the last ticket a finished
+  /// fdatasync covered, and the last ticket covered by a successful one.
+  std::mutex gc_mu_;
+  std::condition_variable gc_cv_;
+  clio::run::u64 gc_next_ = 0;
+  clio::run::u64 gc_done_ = 0;
+  clio::run::u64 gc_ok_through_ = 0;
+  bool gc_running_ = false;
+  std::condition_variable sync_cv_;
+  bool sync_stop_ = false;
+
+  /** Sync-thread body: FlushAllocLog every kAllocLogSyncPeriodMs until
+   *  StopAllocLogSync. */
+  void AllocLogSyncLoop();
+
+  /** Stop and join the sync thread (idempotent). */
+  void StopAllocLogSync();
+  /** O_DIRECT alignment: 4 KiB, or the page size when larger (Lustre on a
+   *  64 KiB-page kernel rejects 4 KiB-aligned direct writes with EINVAL). */
+  static size_t DirectAlign() { return ctp::DirectIoAlign(); }
+  /** Frees a DirectAlign()-aligned bounce buffer. */
+  struct AlignedFree {
+    void operator()(char *p) const {
+      ::operator delete[](p, std::align_val_t(DirectAlign()));
+    }
+  };
+  using AlignedBuf = std::unique_ptr<char[], AlignedFree>;
+  /** Writes at least this big are bounced to reach the O_DIRECT fd. */
+  static constexpr size_t kBounceMin = 64 * 1024;
+  /** Recycled bounce buffers kept (larger ones are freed at once). */
+  static constexpr size_t kBouncePoolMax = 32;
+  static constexpr size_t kBounceKeepMax = 4 * 1024 * 1024;
+  std::mutex bounce_mu_;
+  std::vector<std::pair<size_t, AlignedBuf>> bounce_pool_;
+
+  /**
+   * Whether a write should be copied through an aligned bounce buffer: the
+   * AIO backends send a write to the O_DIRECT fd only when the buffer, the
+   * length and the offset are all DirectAlign()-aligned, and task data in shared
+   * memory is not page-aligned. Without the bounce, every data write went
+   * through the page cache and fsync then wrote it all back (~550 MB/s on a
+   * device that takes 2.2 GB/s direct).
+   * @param buf source buffer
+   * @param size write length
+   * @param offset file offset
+   * @return true when only the buffer is misaligned
+   */
+  static bool WantsBounce(const void *buf, size_t size, clio::run::u64 offset) {
+    return size >= kBounceMin && size % DirectAlign() == 0 &&
+           offset % DirectAlign() == 0 &&
+           reinterpret_cast<uintptr_t>(buf) % DirectAlign() != 0;
+  }
+  /** @return a DirectAlign()-aligned buffer of at least `size` bytes (pooled). */
+  AlignedBuf TakeBounce(size_t size);
+  /** Return a bounce buffer of `size` bytes to the pool. */
+  void GiveBounce(AlignedBuf buf, size_t size);
+
   StandardBlockAllocator allocator_;
   std::vector<WorkerIOContext> io_contexts_;
   std::string file_path_;
   clio::run::u32 io_depth_;
+
+  /** Striping of the logical block space over the backing files. The default
+   *  (one file) keeps the classic layout: data in `file_path_` itself. With
+   *  N > 1 the data lives in `file_path_ + ".s<i>"` (see BackingPaths). */
+  StripeLayout stripe_;
+
+  // #1210: the identities of the files Init opened, one per backing file
+  // (index = stripe file). Later code opens the files again BY PATH (worker
+  // contexts, growth, sync); if a path no longer names its file (deleted,
+  // replaced), those opens must fail loudly rather than create a new empty
+  // file or sync the wrong one.
+  std::vector<ctp::SystemInfo::FileIdentity> file_ids_;
+  bool file_id_valid_ = false;
+
+  /**
+   * Paths of the backing files in stripe order: just `file_path_` when not
+   * striped, else `file_path_ + ".s<i>"` for i in [0, N).
+   * @return one path per backing file
+   */
+  std::vector<std::string> BackingPaths() const;
+
+  /**
+   * Whether every backing file still has the identity Init recorded.
+   * @param what the operation about to reopen them (for the error message)
+   * @return true when they do (or when no identity could be recorded)
+   */
+  bool BackingFileIntact(const char *what) const;
+
+  /**
+   * Create-or-open every backing file, record its identity, and measure the
+   * existing data. Closes each file again; growth reopens them.
+   * @param existing out: logical backed prefix already in the files (0 for a
+   *        fresh device; the largest fully-backed prefix when striped)
+   * @return false if a file cannot be opened or sized
+   */
+  bool OpenBackingFiles(clio::run::u64 *existing);
+
+  /**
+   * Extend the device's backing so a logical prefix of `target` bytes is
+   * backed. Striped: every stripe file is extended to PerFileBytes(target).
+   * @param target logical prefix to back, in bytes
+   * @return true on success; on failure every file grown here is restored
+   */
+  bool GrowStripedFiles(clio::run::u64 target);
+
+  /**
+   * Grow one stripe file to at least `to` bytes, reserving the new blocks.
+   * Never shrinks a file. On reserve failure the file is restored to its
+   * previous size.
+   * @param path file to grow
+   * @param to required size in bytes
+   * @param prev out: the file size before this call
+   * @return true when the file is at least `to` bytes long
+   */
+  bool ExtendStripeFile(const std::string &path, clio::run::u64 to,
+                        clio::run::u64 *prev);
+
+  /**
+   * Shrink stripe files back after a failed multi-file growth.
+   * @param grown (path, size before growth) for each file grown so far
+   */
+  void UndoStripeGrowth(
+      const std::vector<std::pair<std::string, clio::run::u64>> &grown);
+
+  /**
+   * Flush every backing file's data to media (fdatasync per stripe file).
+   * @return 0, or the errno of the first failing file
+   */
+  int SyncBackingFiles();
+
+  /**
+   * Size of the next write segment starting at logical offset `fo`: the
+   * O_DIRECT-aligned head or body split, clamped at a stripe boundary so the
+   * segment maps to one stripe file.
+   * @param fo logical offset of the segment start
+   * @param left bytes left in the block
+   * @param stripe striping of the device
+   * @return segment length in (0, left]
+   */
+  static clio::run::u64 NextWriteSegment(clio::run::u64 fo,
+                                         clio::run::u64 left,
+                                         const StripeLayout &stripe);
+
+  /**
+   * Source buffer for one write segment: the caller's memory, or a bounce
+   * copy when WantsBounce says the direct fd needs an aligned buffer.
+   * @param src caller's segment data
+   * @param seg segment length
+   * @param file_off file offset the segment is written at
+   * @param out_data out: the buffer to submit to AsyncIO::Write
+   * @return the bounce buffer that backs *out_data (empty when none is used)
+   */
+  AlignedBuf PrepareWriteSegment(char *src, clio::run::u64 seg,
+                                 clio::run::u64 file_off, void **out_data);
+
+  /**
+   * Log a failed write segment (rate-limited: first 20, then powers of two).
+   * @param error_code errno the AIO backend reported
+   * @param logical_off logical offset of the segment
+   * @param seg segment length
+   * @param file_index stripe file the segment was written to
+   */
+  void LogWriteFailure(int error_code, clio::run::u64 logical_off,
+                       clio::run::u64 seg, size_t file_index);
+
+  /**
+   * Submit one read segment, through a bounce buffer when the direct fd needs
+   * an aligned one (see WantsBounce).
+   * @param aio AsyncIO of the stripe file holding the segment
+   * @param dst caller's destination for the segment
+   * @param seg segment length
+   * @param file_off file offset of the segment
+   * @param rbounce out: the bounce buffer in use (empty when none); the
+   *        caller passes it to FinishBouncedRead after completion
+   * @return the AIO token, or ctp::kInvalidIoToken (bounce already recycled)
+   */
+  ctp::IoToken SubmitReadSegment(ctp::AsyncIO *aio, char *dst,
+                                 clio::run::u64 seg, clio::run::u64 file_off,
+                                 AlignedBuf &rbounce);
+
+  /**
+   * Finish a read segment: if it went through a bounce buffer, copy the bytes
+   * the device returned into the caller's buffer and recycle the bounce.
+   * Does nothing when `rbounce` is empty.
+   * @param rbounce bounce buffer (emptied by this call)
+   * @param dst caller's destination
+   * @param seg segment length
+   * @param result completed AIO result
+   */
+  void FinishBouncedRead(AlignedBuf &rbounce, char *dst, clio::run::u64 seg,
+                         const ctp::IoResult &result);
+
+  /**
+   * Zero-fill the unbacked tail of a short read inside the device capacity
+   * (never-written blocks read as zeros). Short reads outside the capacity
+   * are returned as they are.
+   * @param dst caller's destination for the segment
+   * @param got bytes the device returned
+   * @param seg segment length
+   * @param logical_off logical offset of the segment
+   * @param in_capacity whether the whole block lies inside the device capacity
+   * @return the number of valid bytes now at `dst` (seg after a fill)
+   */
+  clio::run::u64 ZeroFillUnbacked(char *dst, clio::run::u64 got,
+                                  clio::run::u64 seg,
+                                  clio::run::u64 logical_off, bool in_capacity);
 
   // #858: lazy backing-file growth. The file is truncated to at most one
   // growth unit at Init and extended in growth-unit steps as allocations
@@ -58,6 +313,98 @@ class FsBdevTransport : public BdevTransport {
   clio::run::u64 growth_unit_ = clio::run::u64(1) << 30;
   std::atomic<clio::run::u64> file_backed_bytes_{0};
   std::mutex grow_mu_;
+  /** Smallest end offset a grow could not reserve disk for (guarded by
+   *  grow_mu_; 0 = none), and when (steady ns): requests reaching it fail
+   *  fast for kGrowRetryNs instead of retrying the reservation. */
+  clio::run::u64 grow_fail_end_ = 0;
+  clio::run::u64 grow_fail_ns_ = 0;
+  /** Cached host filesystem free-space sample. Held by shared_ptr so a
+   *  detached refresh thread can publish into it even if the transport is
+   *  destroyed first. */
+  struct HostFreeCache {
+    /** Last sampled free bytes (~0 = unknown, do not cap). */
+    std::atomic<clio::run::u64> free_bytes{0};
+    /** Steady-clock ns when the sample finished; 0 = never sampled. */
+    std::atomic<clio::run::u64> sampled_ns{0};
+    /** Single-flight guard: only one refresh thread runs at a time. */
+    std::atomic<bool> refreshing{false};
+  };
+  std::shared_ptr<HostFreeCache> host_free_cache_ =
+      std::make_shared<HostFreeCache>();
+  // 5 s: statfs on a network filesystem (DAOS dfuse, Lustre) is an RPC that
+  // took seconds under load; GetStats calls this on every poll.
+  static constexpr clio::run::u64 kHostFreeTtlNs = 5000000000ull;
+  /**
+   * Refresh `cache` with the free bytes of `dir`'s filesystem. Runs on a
+   * detached thread so a slow statfs never blocks a runtime worker.
+   * @param cache shared cache to publish the sample into
+   * @param dir directory to stat (copied; the thread owns it)
+   */
+  static void SampleHostFreeBytes(std::shared_ptr<HostFreeCache> cache,
+                                  std::string dir);
+  /** @return free bytes on the backing file's filesystem (cached; never
+   *  blocks on statfs, refreshes asynchronously). */
+  clio::run::u64 HostFreeBytes() const;
+  /** How long a failed grow is trusted before disk space is probed again. */
+  static constexpr clio::run::u64 kGrowRetryNs = 2000000000ull;
+  /**
+   * Extend the backing file to `target` bytes and reserve its blocks.
+   * @param backed current backed size
+   * @param target new size
+   * @return true on success (on failure the file is left at `backed`)
+   */
+  bool GrowBackingFile(clio::run::u64 backed, clio::run::u64 target);
+
+  /**
+   * A TEST-ONLY fault-injection marker: a file whose presence changes how
+   * this device behaves. Off unless the file exists. It is stat'ed at most
+   * once per kFailMarkerPollNs per transport and the answer cached, so the
+   * I/O path pays one clock read, not a syscall.
+   */
+  struct InjectMarker {
+    std::string path_;                          ///< the marker file
+    std::atomic<bool> present_{false};          ///< answer of the last stat
+    std::atomic<clio::run::u64> checked_ns_{0}; ///< steady ns of it (0 = never)
+  };
+  /**
+   * `<backing file>.fail`: every read, write and sync of this device fails
+   * with an I/O error (io_error_ = DeviceFault), as a dead disk would;
+   * deleting the file makes the device work again (a disk that comes back,
+   * or is replaced in place).
+   */
+  InjectMarker fail_marker_;
+  /**
+   * `<backing file>.nospace`: every write fails with ENOSPC (io_error_ =
+   * NoSpace), as a full disk or a DAOS pool out of space would, while reads
+   * and syncs keep working; deleting the file frees the "space" again.
+   */
+  InjectMarker nospace_marker_;
+  /** Marker re-check period: 100 ms. */
+  static constexpr clio::run::u64 kFailMarkerPollNs = 100000000ull;
+
+  /**
+   * Whether a TEST-ONLY marker file is present (cached; see InjectMarker).
+   * Logs once on every transition.
+   * @param m the marker
+   * @param effect what the marker does, for the log
+   * @return true while the marker exists
+   */
+  bool MarkerPresent(InjectMarker &m, const char *effect);
+
+  /**
+   * Whether the TEST-ONLY dead-device marker is present (see fail_marker_).
+   * @return true if every I/O of this device must fail
+   */
+  bool FaultInjected() { return MarkerPresent(fail_marker_, "I/O fails"); }
+
+  /**
+   * Whether the TEST-ONLY full-device marker is present (see
+   * nospace_marker_).
+   * @return true if every write of this device must fail with ENOSPC
+   */
+  bool NoSpaceInjected() {
+    return MarkerPresent(nospace_marker_, "writes fail with ENOSPC");
+  }
 
   bool InitializeWorkerIOContexts();
   void CleanupWorkerIOContexts();
@@ -67,6 +414,22 @@ class FsBdevTransport : public BdevTransport {
    *  granularity, capped at capacity). Returns false if the extension fails
    *  (e.g. the disk is genuinely full). */
   bool EnsureFileBacked(clio::run::u64 end_offset);
+
+  /**
+   * Open the allocator-state log and, when recovering, rebuild the allocator
+   * from it. Called from Init after allocator_.Init.
+   * @param params Create parameters (alloc_log_path_ overrides the default
+   *               "<file>.alloc_log" and always recovers)
+   * @return false if the log cannot be opened
+   */
+  bool OpenAllocLog(const CreateParams& params);
+
+  /**
+   * Append one record per block to the allocator log and hand them to the OS.
+   * @param blocks Blocks just allocated or freed
+   * @param is_free true for frees, false for allocations
+   */
+  void LogBlocks(const std::vector<Block>& blocks, bool is_free);
 };
 
 } // namespace clio::run::bdev

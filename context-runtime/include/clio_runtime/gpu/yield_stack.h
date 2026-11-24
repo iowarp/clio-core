@@ -216,8 +216,22 @@ enum YieldFatal : unsigned long long {
  * device_image_scope puts the variable in the device image instead, so
  * there is no USM allocation to outlive anything. It also states the
  * constraint that is already true here: only the owning image reads it. */
+#if defined(CLIO_SYCL_DG_USM)
+/* The USM-backed default, opted into per build.
+ *
+ * The crash above is a CUDA-backend defect. On Level Zero the USM form is
+ * sound, and it is the ONLY form that lets DPC++ split a many-kernel TU into
+ * per-kernel device images: device_image_scope forbids the variable from
+ * appearing in more than one image, which is exactly what per_kernel does.
+ * lammps_md carries ~32 kernels; merged into a single image they crash IGC
+ * (Internal Compiler Error: Segmentation violation), so on spir64 the split
+ * is not an optimisation but the difference between compiling and not. */
+using SyclImageScope =
+    decltype(::sycl::ext::oneapi::experimental::properties());
+#else
 using SyclImageScope = decltype(::sycl::ext::oneapi::experimental::properties(
     ::sycl::ext::oneapi::experimental::device_image_scope));
+#endif
 inline ::sycl::ext::oneapi::experimental::device_global<unsigned long long *,
                                                         SyclImageScope>
     g_yield_fatal_dg;
@@ -518,6 +532,37 @@ __device__ __forceinline__ bool YieldSuspended() {
   return YieldTls().block_state_->status_ == kYieldSuspended;
 }
 
+/**
+ * Tell the host WHERE IN ITS DATA this block currently is -- see
+ * YieldBlockState::cursor_.
+ *
+ * Call it wherever the workload's own notion of position advances (the top of
+ * a z-iteration, of an epoch, of a bin sweep), not at every yield: a yield is
+ * a fact about the paging, and the position is a fact about the algorithm.
+ *
+ * NO PARAMETER THREADING AND NO NESTING LIMIT, because YieldTls().block_state_
+ * is the same object as view.Y() -- YieldTlsPublish stamped it at kernel entry
+ * -- so a device function ten calls deep can publish without the kernel having
+ * passed anything down to it. Works identically under the macro mechanism and
+ * under coroutines.
+ *
+ * Thread 0 stores; block-collective in the sense that every thread must reach
+ * it, which the __syncthreads makes load-bearing rather than decorative: the
+ * store must be visible to the whole block before anyone acts on the position.
+ * NO __threadfence_system: this is read by the host only AFTER the kernel has
+ * completed, and kernel completion orders it. Fencing per z-iteration would
+ * pay for a guarantee the driver already has.
+ */
+__device__ __forceinline__ void YieldPublishCursor(clio::run::u64 pos,
+                                                   clio::run::u64 aux = 0) {
+  if (threadIdx.x == 0) {
+    YieldBlockState *bs = YieldTls().block_state_;
+    bs->cursor_ = pos;
+    bs->cursor_aux_ = aux;
+  }
+  __syncthreads();
+}
+
 /** This lane's header, found without any parameter threading. */
 __device__ __forceinline__ YieldLaneHeader *YieldLane() {
   YieldSmem &s = YieldTls();
@@ -593,8 +638,23 @@ struct YieldFrame {
       __trap();
     }
 #endif
-    if (fresh_ && lcur_ > lane_->sp_) {
-      lane_->sp_ = lcur_;
+    if (fresh_) {
+      if (lcur_ > lane_->sp_) {
+        lane_->sp_ = lcur_;
+      }
+      // ZERO THE LOCAL ON FIRST ENTRY. CLIO_YLOCAL runs no constructor, and
+      // this space last held some EARLIER frame's locals -- a popped callee's
+      // page number or page pointer, say. A gv::Held declared here then
+      // carries that stale value as its page_, and the first move-assignment
+      // into it (MHoldPage's `*out = Pin(...)`) Unpins it: an atomicSub on a
+      // garbage address, which PVC reports as "Segmentation fault from GPU
+      // ... access: 2 (Atomic)". All-zero is the state the stack had when it
+      // was allocated, and it is a valid empty value for every type held here
+      // (a null Held, a zero counter).
+      char *p = lane_base_ + off;
+      for (clio::run::u32 i = 0; i < size; ++i) {
+        p[i] = 0;
+      }
     }
     return lane_base_ + off;
   }
@@ -886,13 +946,22 @@ class YieldStack {
     return v;
   }
 
+  /** Reset on `stream` and wait for it only (null: the legacy default stream and a device-wide wait). A runner
+   *  on its own stream must not wait here for unrelated work -- the model's compute, other runners' rounds. */
+  void SetStream(void *stream) { stream_ = stream; }
+
   void Reset() {
 #if CTP_ENABLE_CUDA && defined(__CUDACC__)
     const clio::run::u32 nlanes = nblocks_ * lanes_per_block_;
     const clio::run::u32 threads = 128;
     const clio::run::u32 blocks = (nlanes + threads - 1) / threads;
-    YieldStackInitKernel<<<blocks, threads>>>(View(), nlanes);
-    ctp::GpuApi::Synchronize();
+    if (stream_ != nullptr) {
+      YieldStackInitKernel<<<blocks, threads, 0, static_cast<cudaStream_t>(stream_)>>>(View(), nlanes);
+      ctp::GpuApi::Synchronize(stream_);
+    } else {
+      YieldStackInitKernel<<<blocks, threads>>>(View(), nlanes);
+      ctp::GpuApi::Synchronize();
+    }
 #elif CTP_ENABLE_SYCL
     // Out of line, into the kernel-owning TU. Both halves of this -- the
     // lane-header init kernel and the device_global publish -- are things
@@ -909,6 +978,7 @@ class YieldStack {
   char *d_base_ = nullptr;
   char *d_persist_ = nullptr;
   char *d_smem_ = nullptr;
+  void *stream_ = nullptr;
 };
 
 #if !CTP_IS_DEVICE_PASS

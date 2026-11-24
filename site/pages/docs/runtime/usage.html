@@ -1,0 +1,451 @@
+<!--
+title: Usage
+heading: Build a <em>ChiMod.</em>
+description: How a Context Runtime module is laid out, how to define its tasks and coroutine handlers, how to build it against an installed CLIO Core, how the runtime finds it, and how to create its pool from a client or from the compose file.
+eyebrow: Docs · Context Runtime
+lede: A ChiMod is a directory with a YAML descriptor, a public header set and two shared libraries: a client library that user programs link, and a runtime library the daemon loads. This page walks through writing one, building it, loading it and composing it. The signatures it relies on are in the API reference; a complete worked example is Write a chain operator.
+facts: Template | context-runtime/modules/MOD_NAME ; External example | context-runtime/test/unit/external-chimod ; Worked example | /develop/operator.html
+-->
+<h2 id="what-a-module-does">What a module does</h2>
+<p>A module adds one service to the runtime: store blocks on a device, keep a cache, index text, train a model. It defines a small set of <strong>methods</strong>, and each call to a method is a <strong>task</strong>: a struct carrying the method's inputs and, once it has run, its outputs.</p>
+<p>Every module has two pieces.</p>
+<ul class="checks">
+  <li><strong>The runtime piece</strong> is a shared library the daemon loads. It defines a <em>container</em> class with one coroutine handler per method. The runtime creates a container of it on every node for each pool of the module, and runs the handlers on its worker threads. This is where the module's state and logic live.</li>
+  <li><strong>The client piece</strong> is a shared library that programs link. It gives them one ordinary function per method, which fills in a task, submits it to the pool and returns a future. Clients never run module code themselves; they only send tasks to it.</li>
+</ul>
+<p>A handler can itself be a client of other pools: the cache handler calls the CTE, the CTE calls the block devices. That is how modules stack.</p>
+<figure class="diagram">
+  <svg viewBox="0 0 860 430" role="img" aria-label="Client processes submit tasks through queues to the runtime; the scheduler maps them to workers that run module containers; runtimes on different nodes exchange tasks over the network">
+    <defs><marker id="ud0" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+    <text class="muted" x="20" y="22">CLIENT PROCESSES</text>
+    <rect class="box alt" x="20" y="32" width="170" height="62" rx="8"/><text class="title" x="32" y="56">Application</text><text class="muted" x="32" y="76">module client library</text>
+    <rect class="box alt" x="20" y="108" width="170" height="62" rx="8"/><text class="title" x="32" y="132">FUSE daemon</text><text class="muted" x="32" y="152">module client library</text>
+    <rect class="box alt" x="20" y="184" width="170" height="62" rx="8"/><text class="title" x="32" y="208">GPU kernel</text><text class="muted" x="32" y="228">device task ring</text>
+
+    <text class="muted" x="230" y="22">NODE A: RUNTIME</text>
+    <rect class="box" x="222" y="32" width="616" height="300" rx="10" stroke-dasharray="6 5"/>
+    <rect class="box" x="240" y="46" width="150" height="190" rx="8"/><text class="title" x="252" y="70">Queues</text><text class="muted" x="252" y="92">shared memory</text><text class="muted" x="252" y="110">Unix socket / TCP</text><text class="muted" x="252" y="128">GPU ring</text><text class="muted" x="252" y="160">one per transport,</text><text class="muted" x="252" y="178">chosen automatically</text>
+    <path class="edge hl" d="M190,63 L238,90" marker-end="url(#ud0)"/>
+    <path class="edge hl" d="M190,139 L238,139" marker-end="url(#ud0)"/>
+    <path class="edge hl" d="M190,215 L238,190" marker-end="url(#ud0)"/>
+    <rect class="box hl" x="410" y="46" width="170" height="80" rx="8"/><text class="title" x="422" y="70">Scheduler</text><text class="muted" x="422" y="90">picks a worker lane</text><text class="muted" x="422" y="108">replaceable</text>
+    <path class="edge hl" d="M390,86 L408,86" marker-end="url(#ud0)"/>
+    <rect class="box" x="600" y="46" width="220" height="80" rx="8"/><text class="title" x="612" y="70">Worker threads</text><text class="muted" x="612" y="90">lanes of tasks, run as</text><text class="muted" x="612" y="108">coroutines</text>
+    <path class="edge hl" d="M580,86 L598,86" marker-end="url(#ud0)"/>
+    <rect class="box hl" x="410" y="150" width="410" height="86" rx="8"/><text class="title" x="422" y="174">Module containers (runtime pieces)</text><text class="muted" x="422" y="194">one per pool: your handlers, state, cost model</text><text class="muted" x="422" y="212">subtasks to other pools go back through the scheduler</text>
+    <path class="edge" d="M710,126 L710,148" marker-end="url(#ud0)"/>
+    <rect class="box" x="240" y="256" width="580" height="60" rx="8"/><text class="title" x="252" y="280">Network send / receive workers</text><text class="muted" x="252" y="300">tasks whose PoolQuery names another node leave here; replies come back here</text>
+    <path class="edge" d="M520,236 L520,254" marker-end="url(#ud0)"/>
+
+    <text class="muted" x="230" y="362">NODE B, C, ...: SAME RUNTIME, SAME MODULES</text>
+    <rect class="box" x="222" y="372" width="616" height="46" rx="10" stroke-dasharray="6 5"/><text class="muted" x="240" y="400">queues, scheduler, workers, containers of the same pools</text>
+    <path class="edge hl" d="M600,316 L600,370" marker-end="url(#ud0)" marker-start="url(#ud0)"/><text class="muted" x="612" y="348">TCP</text>
+  </svg>
+  <figcaption>Clients only submit tasks and wait on futures. The runtime
+  receives them through a queue, the scheduler assigns each to a worker,
+  and the worker runs the module's handler. The highlighted pieces are the ones you extend: module containers
+  and the scheduler (plus dashboard routes, not drawn); see <a href="/docs/runtime/extend.html">Extending the runtime</a>.</figcaption>
+</figure>
+<p>The rest of this page builds both pieces of a module, step by step. <a href="/docs/runtime/design.html">Design</a> describes the runtime's internals in more depth.</p>
+
+<h2>1. Lay out the module</h2>
+<p>Start from the template in <code>context-runtime/modules/MOD_NAME</code>. Replace <code>MOD_NAME</code> with your module name and <code>clio_runtime</code> with your include namespace:</p>
+<pre data-label="files">
+MOD_NAME/
+  CMakeLists.txt
+  clio_mod.yaml                           module name, namespace, method ids
+  include/clio_runtime/MOD_NAME/
+    autogen/MOD_NAME_methods.h            method id constants and names
+    MOD_NAME_tasks.h                      CreateParams and one struct per task
+    MOD_NAME_client.h                     client: Async* methods returning futures
+    MOD_NAME_runtime.h                    the container class
+  src/
+    MOD_NAME_client.cc                    usually just includes the client header
+    MOD_NAME_runtime.cc                   handler bodies, ends with CLIO_TASK_CC
+    autogen/MOD_NAME_lib_exec.cc          dispatch: Run, Save/LoadTask, NewTask, ...
+</pre>
+<p>An external repository that holds several modules adds a <code>clio_repo.yaml</code> at its root. The CMake helpers search up the directory tree for it to learn the namespace:</p>
+<pre data-label="yaml · clio_repo.yaml">
+name: external-chimod
+namespace: external_test
+version: 1.0.0
+description: External ChiMod development test repository
+
+modules:
+  - simple_mod
+</pre>
+
+<h2>2. Number the methods</h2>
+<p><code>clio_mod.yaml</code> names the module and assigns an integer id to every method. Ids 0 to 9 are reserved for the inherited methods; your own start at 10. A method set to <code>-1</code> is not implemented.</p>
+<pre data-label="yaml · clio_mod.yaml">
+module_name: MOD_NAME
+namespace: clio::run
+version: 1.0.0
+
+# Inherited methods
+kCreate: 0        # create the container
+kDestroy: 1       # destroy the container
+kNodeFailure: -1  # not implemented
+kRecover: -1
+kMigrate: -1
+kUpgrade: -1
+kMonitor: 9       # monitor container state
+
+# Custom methods (start from 10)
+kCustom: 10
+</pre>
+<p>The methods header repeats the ids as constants, defines <code>kMaxMethodId</code> (one past the largest id) and returns the method names the dashboard and the scheduler's cost model use:</p>
+<pre data-label="c++ · autogen/MOD_NAME_methods.h">
+namespace clio::run::MOD_NAME::Method {
+GLOBAL_CROSS_CONST clio::run::u32 kCreate = 0;
+GLOBAL_CROSS_CONST clio::run::u32 kDestroy = 1;
+GLOBAL_CROSS_CONST clio::run::u32 kMonitor = 9;
+GLOBAL_CROSS_CONST clio::run::u32 kCustom = 10;
+GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 11;
+
+inline const std::vector<std::string>& GetMethodNames() {
+  static const std::vector<std::string> names = [] {
+    std::vector<std::string> v(kMaxMethodId);
+    v[kCreate] = "Create";
+    v[kDestroy] = "Destroy";
+    v[kMonitor] = "Monitor";
+    v[kCustom] = "Custom";
+    return v;
+  }();
+  return names;
+}
+}  // namespace clio::run::MOD_NAME::Method
+</pre>
+
+<h2>3. Define the tasks</h2>
+<p>The tasks header defines the creation parameters, aliases the inherited tasks, and declares one struct per custom method.</p>
+<h3>CreateParams and the inherited tasks</h3>
+<p><code>CreateParams</code> is the configuration the container receives at creation. It must carry a static <code>chimod_lib_name</code> naming the library the runtime loads, a cereal <code>serialize</code>, and only fields that cereal can serialize. Create, destroy and monitor come from the admin module:</p>
+<pre data-label="c++ · MOD_NAME_tasks.h">
+#include <clio_runtime/clio_runtime.h>
+#include <clio_runtime/admin/admin_tasks.h>
+#include "autogen/MOD_NAME_methods.h"
+
+namespace clio::run::MOD_NAME {
+
+struct CreateParams {
+  clio::run::u32 worker_count_;
+  clio::run::u32 config_flags_;
+
+  // Required: the library the module manager loads (lib<name>_runtime.so).
+  static constexpr const char* chimod_lib_name = "clio_MOD_NAME";
+
+  CreateParams(clio::run::u32 worker_count = 1, clio::run::u32 config_flags = 0)
+      : worker_count_(worker_count), config_flags_(config_flags) {}
+
+  template<class Archive>
+  void serialize(Archive& ar) { ar(worker_count_, config_flags_); }
+};
+
+using CreateTask  = clio::run::admin::GetOrCreatePoolTask<CreateParams>;
+using DestroyTask = clio::run::admin::DestroyTask;
+using MonitorTask = clio::run::admin::MonitorTask;
+</pre>
+<p>A module that is created from the compose file reads its YAML entry in a <code>LoadConfig(const clio::run::PoolConfig &amp;)</code> method on its params struct. The filesystem module's <code>FilesystemConfig</code> parses <code>next_pool_id</code>, <code>metadata_log_path</code>, <code>stream_pool_id</code>, <code>dir_split_entries</code> and <code>case_insensitive</code> this way from <code>pool_config.config_</code>, which holds the entry's remaining keys as a YAML string.</p>
+<h3>A custom task</h3>
+<p>A task struct marks each field <code>IN</code>, <code>OUT</code> or <code>INOUT</code>. It needs a default constructor, an emplace constructor that sets the method id, <code>SerializeIn</code> (fields sent to the runtime), <code>SerializeOut</code> (fields sent back), <code>Copy</code> (used when the runtime replicates a task) and <code>AggregateOut</code> (merges a replica's output fields back into the original). Both serializers must call the base class first. Strings that cross the boundary use <code>clio::run::priv::string</code> allocated with <code>CLIO_PRIV_ALLOC</code>.</p>
+<pre data-label="c++ · MOD_NAME_tasks.h (continued)">
+struct CustomTask : public clio::run::Task {
+  INOUT clio::run::priv::string data_;
+  IN clio::run::u32 operation_id_;
+
+  CustomTask() : clio::run::Task(), data_(CLIO_PRIV_ALLOC), operation_id_(0) {}
+
+  explicit CustomTask(const clio::run::TaskId &task_node,
+                      const clio::run::PoolId &pool_id,
+                      const clio::run::PoolQuery &pool_query,
+                      const std::string &data, clio::run::u32 operation_id)
+      : clio::run::Task(task_node, pool_id, pool_query, Method::kCustom),
+        data_(CLIO_PRIV_ALLOC, data), operation_id_(operation_id) {
+    task_id_ = task_node;
+    pool_id_ = pool_id;
+    method_ = Method::kCustom;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  CTP_CROSS_FUN ~CustomTask() {}
+
+  template<typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive& ar) {
+    Task::SerializeIn(ar);
+    ar(data_, operation_id_);
+  }
+  template<typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive& ar) {
+    Task::SerializeOut(ar);
+    ar(data_);
+  }
+  void Copy(const ctp::ipc::FullPtr<CustomTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    data_ = other->data_;
+    operation_id_ = other->operation_id_;
+  }
+  // Merge ONLY the OUT fields of a replica. Never delegate to Copy():
+  // that would overwrite this task's identity.
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    data_ = other_base.template Cast<CustomTask>()->data_;
+  }
+};
+
+}  // namespace clio::run::MOD_NAME
+</pre>
+<p>Tasks that take part in the collective routing modes also define <code>AggregateIn</code>, which folds another submitter's input into this task before the handler runs once for the whole batch. The template's <code>ManyToOneSumTask</code> sums <code>value_</code> that way.</p>
+<div class="callout">
+  <span class="callout-title">Tasks are copied, not shared</span>
+  <p>A task lives in the submitting process. Its input fields are serialized into a buffer that crosses into the runtime, and only the output fields come back. Do not design a task around the idea that both sides see the same memory.</p>
+</div>
+
+<h2>4. Write the container and its handlers</h2>
+<p>The runtime class derives from <code>clio::run::Container</code>, exposes <code>using CreateParams = ...;</code> for the <code>CLIO_TASK_CC</code> macro, and declares one handler per method. A handler takes a <code>clio::run::shared_ptr&lt;TaskType&gt; &amp;</code> and returns <code>clio::run::TaskResume</code>.</p>
+<pre data-label="c++ · MOD_NAME_runtime.h">
+#include <clio_runtime/clio_runtime.h>
+#include <clio_runtime/container.h>
+#include <clio_runtime/comutex.h>
+#include <clio_runtime/corwlock.h>
+#include "MOD_NAME_tasks.h"
+#include "MOD_NAME_client.h"
+
+namespace clio::run::MOD_NAME {
+
+class Runtime : public clio::run::Container {
+ public:
+  using CreateParams = clio::run::MOD_NAME::CreateParams;
+
+  void Init(const clio::run::PoolId& pool_id, const std::string& pool_name,
+            clio::run::u32 container_id = 0) override;
+  clio::run::TaskResume Run(clio::run::u32 method,
+                            clio::run::shared_ptr<clio::run::Task> task_ptr) override;
+
+  clio::run::TaskResume Create(clio::run::shared_ptr<CreateTask> &task);
+  clio::run::TaskResume Custom(clio::run::shared_ptr<CustomTask> &task);
+  clio::run::TaskResume Monitor(clio::run::shared_ptr<MonitorTask> &task);
+  clio::run::TaskResume Destroy(clio::run::shared_ptr<DestroyTask> &task);
+
+  clio::run::u64 GetWorkRemaining() const override;
+  // Serialization and copy plumbing (SaveTask, LoadTask, AllocLoadTask,
+  // LocalSaveTask, LocalLoadTask, LocalAllocLoadTask, NewCopyTask, NewTask,
+  // AggregateOut, AggregateIn): see the dispatch file.
+
+ private:
+  Client client_;   // the module's own client, for subtasks
+};
+
+}  // namespace clio::run::MOD_NAME
+</pre>
+<p>Handler bodies sit between <code>CLIO_TASK_BODY_BEGIN</code> and <code>CLIO_TASK_BODY_END</code>, wait on a future with <code>CLIO_CO_AWAIT</code>, and finish with <code>CLIO_CO_RETURN</code>. The file ends with <code>CLIO_TASK_CC(Namespace::Runtime)</code>, which defines the entry points the module manager looks up.</p>
+<pre data-label="c++ · MOD_NAME_runtime.cc">
+#include "clio_runtime/MOD_NAME/MOD_NAME_runtime.h"
+
+namespace clio::run::MOD_NAME {
+
+clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  // Init() already ran. Read task->GetParams() here if you need the config.
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::Custom(clio::run::shared_ptr<CustomTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  // A subtask through the module's own client. The worker runs other tasks
+  // while this one waits; the result is read from the future afterwards.
+  auto sub = client_.AsyncCustom(task->pool_query_, "child", 0);
+  CLIO_CO_AWAIT(sub);
+  task->data_ = sub->data_;
+  task->return_code_ = 0;
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::Destroy(clio::run::shared_ptr<DestroyTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  task->return_code_ = 0;
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::u64 Runtime::GetWorkRemaining() const { return 0; }
+
+}  // namespace clio::run::MOD_NAME
+
+CLIO_TASK_CC(clio::run::MOD_NAME::Runtime)
+</pre>
+<ul class="checks">
+  <li><strong>Never hold a lock across <code>CLIO_CO_AWAIT</code>.</strong> The worker thread runs other tasks while the handler is suspended. For locks that may be held across a wait, use the coroutine-aware <code>clio::run::CoMutex</code> and <code>CoRwLock</code> with the <code>ScopedCoMutex</code>, <code>ScopedCoRwReadLock</code> and <code>ScopedCoRwWriteLock</code> guards.</li>
+  <li><strong>Several workers run handlers concurrently.</strong> Container state touched by more than one task needs an atomic or a lock.</li>
+  <li><strong>Monitor answers with msgpack.</strong> Pack the reply into <code>task-&gt;results_[container_id_]</code> and the dashboard turns it into JSON (see the operator guide).</li>
+  <li><strong>State that must survive restarts or node loss</strong> needs <code>Restart</code>, <code>Recover</code>, <code>Expand</code> or <code>Migrate</code> overrides; the defaults re-initialise or do nothing.</li>
+</ul>
+<h3>The dispatch file</h3>
+<p>The dispatch file implements the virtual methods of <code>Container</code> by switching on the method id. <code>Init</code> calls the base <code>Init</code>, builds the module's own client, and registers the cost model and method names. <code>Run</code> casts the task to its concrete type and awaits the handler:</p>
+<pre data-label="c++ · autogen/MOD_NAME_lib_exec.cc (excerpt)">
+void Runtime::Init(const clio::run::PoolId &pool_id, const std::string &pool_name,
+                   clio::run::u32 container_id) {
+  clio::run::Container::Init(pool_id, pool_name, container_id);
+  client_ = Client(pool_id);
+  DefineModel(Method::kMaxMethodId);
+  SetMethodNames(Method::GetMethodNames());
+}
+
+clio::run::TaskResume Runtime::Run(clio::run::u32 method,
+                                   clio::run::shared_ptr<clio::run::Task> task_ptr) {
+  CLIO_TASK_BODY_BEGIN
+  switch (method) {
+    case Method::kCreate: {
+      auto& typed = task_ptr.template Cast<CreateTask>();
+      CLIO_CO_AWAIT(Create(typed));
+      break;
+    }
+    case Method::kCustom: {
+      auto& typed = task_ptr.template Cast<CustomTask>();
+      CLIO_CO_AWAIT(Custom(typed));
+      break;
+    }
+    // ... kDestroy, kMonitor ...
+    default: break;
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+</pre>
+<p>The same switch appears in <code>SaveTask</code> and <code>LoadTask</code> (<code>archive &lt;&lt; *typed</code> and <code>archive &gt;&gt; *typed</code>), <code>LocalSaveTask</code> and <code>LocalLoadTask</code>, <code>NewTask</code> (<code>CLIO_IPC-&gt;NewTask&lt;T&gt;()</code>), <code>NewCopyTask</code> (allocate, then <code>Copy</code>), <code>AggregateOut</code> and <code>AggregateIn</code>. Copy the template's file and change the case list; the operator guide shows the whole file as an X-macro.</p>
+
+<h2>5. Write the client</h2>
+<p>A client derives from <code>clio::run::ContainerClient</code> and is bound to a pool id. Each method allocates a task through the IPC manager, sends it, and returns a <code>clio::run::Future&lt;TaskType&gt;</code>. <code>Wait()</code> blocks until the task completes; the fields are then read through <code>-&gt;</code>. Create goes to the admin pool as a <code>GetOrCreatePoolTask</code>, which loads the module if needed and creates the pool if it does not exist.</p>
+<pre data-label="c++ · MOD_NAME_client.h">
+namespace clio::run::MOD_NAME {
+
+class Client : public clio::run::ContainerClient {
+ public:
+  Client() = default;
+  explicit Client(const clio::run::PoolId& pool_id) { Init(pool_id); }
+
+  clio::run::Future<CreateTask> AsyncCreate(const clio::run::PoolQuery& pool_query,
+                                            const std::string& pool_name,
+                                            const clio::run::PoolId& custom_pool_id) {
+    auto* ipc_manager = CLIO_CPU_IPC;
+    auto task = ipc_manager->NewTask<CreateTask>(
+        clio::run::CreateTaskId(), clio::run::kAdminPoolId, pool_query,
+        CreateParams::chimod_lib_name, pool_name, custom_pool_id, this);
+    return ipc_manager->Send(task);
+  }
+
+  clio::run::Future<CustomTask> AsyncCustom(const clio::run::PoolQuery& pool_query,
+                                            const std::string& input_data,
+                                            clio::run::u32 operation_id) {
+    auto* ipc_manager = CLIO_CPU_IPC;
+    auto task = ipc_manager->NewTask<CustomTask>(
+        clio::run::CreateTaskId(), pool_id_, pool_query, input_data, operation_id);
+    return ipc_manager->Send(task);
+  }
+
+  clio::run::Future<MonitorTask> AsyncMonitor(const clio::run::PoolQuery& pool_query,
+                                              const std::string& query) {
+    auto* ipc_manager = CLIO_CPU_IPC;
+    auto task = ipc_manager->NewTask<MonitorTask>(
+        clio::run::CreateTaskId(), pool_id_, pool_query, query);
+    return ipc_manager->Send(task);
+  }
+};
+
+}  // namespace clio::run::MOD_NAME
+</pre>
+
+<h2>6. Build against an installed prefix</h2>
+<p>Install CLIO Core as described in <a href="/docs/runtime/install.html">Install</a>, then build the module with <code>CMAKE_PREFIX_PATH</code> pointing at the prefix. <code>add_clio_module_client</code> and <code>add_clio_module_runtime</code> read the module name from <code>clio_mod.yaml</code> and the namespace from <code>clio_repo.yaml</code>, and create the targets <code>&lt;package&gt;_&lt;module&gt;_client</code> and <code>&lt;package&gt;_&lt;module&gt;_runtime</code>. <code>LIB_NAME</code> overrides that prefix; it must then match <code>chimod_lib_name</code>.</p>
+<pre data-label="cmake · CMakeLists.txt">
+cmake_minimum_required(VERSION 3.20)
+project(MOD_NAME CXX)
+set(CMAKE_CXX_STANDARD 20)
+
+find_package(clio-core CONFIG REQUIRED)
+
+add_clio_module_client(
+  LIB_NAME clio_MOD_NAME
+  SOURCES src/MOD_NAME_client.cc)
+add_clio_module_runtime(
+  LIB_NAME clio_MOD_NAME
+  SOURCES src/MOD_NAME_runtime.cc src/autogen/MOD_NAME_lib_exec.cc)
+
+add_executable(my_program main.cc)
+target_link_libraries(my_program clio_MOD_NAME_client clio::run::admin_client)
+</pre>
+<pre data-label="shell">
+$ cmake -S . -B build -DCMAKE_PREFIX_PATH=$HOME/clio-inst
+$ cmake --build build
+</pre>
+<p>The external module test in <code>context-runtime/test/unit/external-chimod</code> uses <code>find_package(clio_run REQUIRED)</code> and <code>find_package(clio_run_admin REQUIRED)</code> instead of the umbrella package, with the namespace coming from its <code>clio_repo.yaml</code>; its targets are then <code>external_test::simple_mod_client</code> and <code>clio::run::admin_client</code>. Either form works against an installed tree.</p>
+
+<h2>7. Let the runtime find it</h2>
+<p>When a create task names a <code>chimod_lib_name</code>, the module manager scans directories for a shared library whose name ends in <code>_runtime.so</code> (<code>.dylib</code> on macOS, <code>.dll</code> on Windows). The scan order is:</p>
+<ol>
+  <li>the directory that holds the runtime's own library;</li>
+  <li>each entry of <code>CLIO_REPO_PATH</code>, separated by <code>:</code> (<code>;</code> on Windows);</li>
+  <li>each entry of <code>LD_LIBRARY_PATH</code>;</li>
+  <li><code>./lib</code>, <code>../lib</code> and <code>/usr/local/lib</code>.</li>
+</ol>
+<p>So the usual way to run a module from its build directory is to point <code>CLIO_REPO_PATH</code> at it before starting the daemon. The runtime log reports <code>Loaded ChiMod: &lt;name&gt;</code> for each library it loads.</p>
+<pre data-label="shell">
+$ export CLIO_REPO_PATH=$HOME/MOD_NAME/build
+$ export CLIO_SERVER_CONF=$HOME/clio.yaml
+$ clio-run start &
+</pre>
+
+<h2>8. Create the pool</h2>
+<h3>From a client program</h3>
+<p>A program calls <code>clio::run::CLIO_INIT</code> once before touching any client and <code>clio::run::CLIO_RUNTIME_FINALIZE()</code> before it exits. With <code>CLIO_WITH_RUNTIME=0</code> in the environment it attaches to the running daemon.</p>
+<pre data-label="c++ · main.cc">
+#include <clio_runtime/clio_runtime.h>
+#include <clio_runtime/admin/admin_client.h>
+#include <clio_runtime/MOD_NAME/MOD_NAME_client.h>
+
+int main() {
+  // Attach to a running runtime (CLIO_WITH_RUNTIME=0), else start one here.
+  if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true)) return 1;
+
+  constexpr clio::run::PoolId kMyPool = clio::run::PoolId(7001, 0);
+  clio::run::MOD_NAME::Client client(kMyPool);
+
+  auto pq = clio::run::PoolQuery::Local();
+  auto created = client.AsyncCreate(pq, "my_pool", kMyPool);
+  created.Wait();
+
+  auto fut = client.AsyncCustom(pq, "hello", 1);
+  fut.Wait();
+  // fut->data_ and fut->return_code_ are now valid.
+
+  clio::run::CLIO_RUNTIME_FINALIZE();
+  return 0;
+}
+</pre>
+<h3>From the compose file</h3>
+<p>Add an entry to the <code>compose:</code> list of the runtime's configuration, or to a separate file given to <code>clio-run compose start</code>. The runtime reads four keys and <code>restart</code>; everything else in the entry is handed to the module as a YAML string for its <code>LoadConfig</code>.</p>
+<pre data-label="yaml · clio.yaml">
+compose:
+  - mod_name: clio_MOD_NAME      # chimod_lib_name of the module
+    pool_name: my_pool
+    pool_query: local            # routing used for the create task
+    pool_id: "7001.0"            # "major.minor"
+    restart: true                # recreate on the next clio-run start
+    # module-specific keys follow; see the operator guide for next_pool_id
+</pre>
+<pre data-label="shell">
+$ clio-run compose start my_pool.yaml
+$ clio-run compose list
+$ clio-run compose stop my_pool.yaml
+</pre>
+<p>Each entry must come after the entry its <code>next_pool_id</code> names. The compose commands, the <code>pool_query</code> strings and the <code>PoolQuery</code> factories are in the <a href="/docs/runtime/api.html">API reference</a>.</p>
+
+<h2>Where to go next</h2>
+<ul>
+  <li><a href="/develop/operator.html">Write a chain operator</a>: a complete module that sits in the storage chain, built and run end to end.</li>
+  <li><a href="/docs/runtime/api.html">API reference</a>: <code>clio-run</code>, <code>PoolQuery</code>, the macros, the container callbacks and the configuration keys.</li>
+  <li><a href="/design/runtime.html">Runtime and block devices</a>: tasks, transports, workers and routing inside the runtime.</li>
+</ul>

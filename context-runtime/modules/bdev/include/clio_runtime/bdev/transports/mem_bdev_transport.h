@@ -156,6 +156,9 @@ class MemBdevTransport : public BdevTransport {
   // only to keep the existing paged call sites unchanged.
   /** Create the shared-memory backing for a node-local RAM device. */
   void InitShmBacking(const clio::run::PoolId &pool_id);
+  /** Interleave the shared pages over NUMA nodes before any pre-fault, which
+   *  would otherwise put them all on one node (CLIO_NUMA_INTERLEAVE=0: off). */
+  void InterleavePages();
 
   /**
    * True if this page's START lies inside the shared mapping.

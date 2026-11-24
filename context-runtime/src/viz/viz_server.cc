@@ -36,6 +36,35 @@
  * Poco HTTP transport that fronts them.
  */
 
+// POCO FIRST, BEFORE ANY HEADER THAT CAN PULL <format>. Poco 1.11's
+// Poco/Format.h calls format(result, fmt, values) UNQUALIFIED with no
+// dependent arguments, so it is bound where the header is parsed: if
+// C++20 std::format is already visible, argument-dependent lookup on
+// std::string finds it too and the call is ambiguous (DPC++/clang with
+// libstdc++ 13 fails here; the CUDA/CPU builds only got lucky on order).
+// CLIO_RUN_HAS_POCO is a compile definition, so it is set at this point.
+#if CLIO_RUN_HAS_POCO
+#include <Poco/Net/Net.h>
+#include <Poco/Net/HTTPRequestHandler.h>
+#include <Poco/Net/HTTPRequestHandlerFactory.h>
+#include <Poco/Net/HTTPServer.h>
+#include <Poco/Net/HTTPServerParams.h>
+#include <Poco/Net/HTTPServerRequest.h>
+#include <Poco/Net/HTTPServerResponse.h>
+#include <Poco/Net/ServerSocket.h>
+#include <Poco/Net/SocketAddress.h>
+#include <Poco/StreamCopier.h>
+#include <Poco/ThreadPool.h>
+#include <Poco/URI.h>
+// Poco/Net pulls <windows.h> on Windows, which defines an empty function-like
+// Yield() macro (winbase.h). Including Poco first (above) means that macro is
+// live for every runtime header below and mangles their Yield() methods
+// (std_thread.h, mutex.h, shm_transport.h: MSVC C2062/C2059).
+#ifdef Yield
+#undef Yield
+#endif
+#endif
+
 #include "clio_runtime/viz/viz_server.h"
 
 #include <algorithm>
@@ -54,21 +83,7 @@
 #include "clio_runtime/config_manager.h"
 #include "clio_runtime/pool_manager.h"
 #include "clio_runtime/viz/viz_json.h"
-
-#if CLIO_RUN_HAS_POCO
-#include <Poco/Net/Net.h>
-#include <Poco/Net/HTTPRequestHandler.h>
-#include <Poco/Net/HTTPRequestHandlerFactory.h>
-#include <Poco/Net/HTTPServer.h>
-#include <Poco/Net/HTTPServerParams.h>
-#include <Poco/Net/HTTPServerRequest.h>
-#include <Poco/Net/HTTPServerResponse.h>
-#include <Poco/Net/ServerSocket.h>
-#include <Poco/Net/SocketAddress.h>
-#include <Poco/StreamCopier.h>
-#include <Poco/ThreadPool.h>
-#include <Poco/URI.h>
-#endif
+#include "clio_ctp/util/msan.h"
 
 // Global pointer variable definition for the viz server singleton
 CLIO_RUN_DEFINE_GLOBAL_PTR_VAR_CC(clio::run::viz::VizServer, g_viz_server);
@@ -138,12 +153,19 @@ bool ReadWholeFile(const std::string &path, std::string *out) {
     return false;
   }
   std::ifstream in(path, std::ios::binary);
+  CTP_MSAN_UNPOISON_OBJ(in);
   if (!in) {
     return false;
   }
   std::ostringstream buf;
+  CTP_MSAN_UNPOISON_OBJ(buf);
   buf << in.rdbuf();
-  *out = buf.str();
+  // Stream objects and the bytes they moved are all libstdc++.so's; the asset
+  // this returns is then served, hashed and compared. Clear str()'s result
+  // before the assignment, which reads its length.
+  std::string contents = buf.str();
+  CTP_MSAN_UNPOISON_STRING(contents);
+  *out = contents;
   return true;
 }
 
@@ -385,8 +407,16 @@ std::vector<std::string> VizServer::AssetSearchDirs(
   if (auto *module_manager = CLIO_MODULE_MANAGER) {
     std::string lib_path = module_manager->GetChiModLibPath(mod_name);
     if (!lib_path.empty()) {
-      lib_dirs.push_back(
-          std::filesystem::path(lib_path).parent_path().string());
+      // Every std::filesystem::path operation below runs inside
+      // uninstrumented libstdc++.so, so each path and each string it yields
+      // has to be cleared where it is produced -- doing it once at the end
+      // misses the temporaries' own destructors.
+      std::filesystem::path parent =
+          std::filesystem::path(lib_path).parent_path();
+      CTP_MSAN_UNPOISON_PATH(parent);
+      std::string parent_str = parent.string();
+      CTP_MSAN_UNPOISON_STRING(parent_str);
+      lib_dirs.push_back(parent_str);
     }
     std::string self_dir = module_manager->GetModuleDirectory();
     if (!self_dir.empty()) {
@@ -395,11 +425,23 @@ std::vector<std::string> VizServer::AssetSearchDirs(
   }
   for (const std::string &lib_dir : lib_dirs) {
     std::filesystem::path dir(lib_dir);
+    CTP_MSAN_UNPOISON_PATH(dir);
     // Built, not installed: libs in <build>/bin, assets in <build>/bin/viz.
-    dirs.push_back((dir / "viz" / mod_name).string());
+    std::filesystem::path built = dir / "viz" / mod_name;
+    CTP_MSAN_UNPOISON_PATH(built);
     // Installed: libs in <prefix>/lib, assets in <prefix>/share/clio/viz.
-    dirs.push_back(
-        (dir.parent_path() / "share" / "clio" / "viz" / mod_name).string());
+    // parent_path() gets its own name: as a temporary its destructor runs
+    // while still poisoned, which is reported even though nothing reads it.
+    std::filesystem::path parent = dir.parent_path();
+    CTP_MSAN_UNPOISON_PATH(parent);
+    std::filesystem::path installed =
+        parent / "share" / "clio" / "viz" / mod_name;
+    CTP_MSAN_UNPOISON_PATH(installed);
+    dirs.push_back(built.string());
+    dirs.push_back(installed.string());
+  }
+  for (std::string &dir : dirs) {
+    CTP_MSAN_UNPOISON_STRING(dir);
   }
   return dirs;
 }
@@ -589,7 +631,10 @@ bool VizServer::ResolveAsset(const Request &req, std::string *file_path,
       continue;
     }
     *file_path = candidate.string();
-    *mime = MimeTypeOf(candidate.string());
+    // As in AssetSearchDirs: the path text is built inside uninstrumented
+    // libstdc++, and MimeTypeOf scans it for an extension.
+    CTP_MSAN_UNPOISON_STRING(*file_path);
+    *mime = MimeTypeOf(*file_path);
     return true;
   }
   return false;
@@ -706,10 +751,25 @@ class PocoVizHandler : public Poco::Net::HTTPRequestHandler {
     Request req;
     Response resp;
     try {
+      // Poco parsed all of this off the socket and is not MSan-instrumented,
+      // so nothing below -- routing, JSON quoting, the string compares in
+      // Dispatch -- may touch it until it is unpoisoned. This is the one place
+      // the request enters our code, so it is the one place that has to do it,
+      // and each value has to be cleared before it is read, not after.
       req.method = preq.getMethod();
+      CTP_MSAN_UNPOISON_STRING(req.method);
       Poco::URI uri(preq.getURI());
+      CTP_MSAN_UNPOISON_OBJ(uri);
       req.path = uri.getPath();
-      for (const auto &kv : uri.getQueryParameters()) {
+      CTP_MSAN_UNPOISON_STRING(req.path);
+      // The vector itself is Poco's too: iterating it reads a poisoned
+      // begin/end pair before any element is touched.
+      Poco::URI::QueryParameters query = uri.getQueryParameters();
+      CTP_MSAN_UNPOISON_OBJ(query);
+      CTP_MSAN_UNPOISON(query.data(), query.size() * sizeof(query[0]));
+      for (auto &kv : query) {
+        CTP_MSAN_UNPOISON_STRING(kv.first);
+        CTP_MSAN_UNPOISON_STRING(kv.second);
         req.params[kv.first] = kv.second;
       }
       // Read the body ONLY when the request declares one (Content-Length or
@@ -726,11 +786,13 @@ class PocoVizHandler : public Poco::Net::HTTPRequestHandler {
       if (req.method != "GET" && req.method != "HEAD" && has_body) {
         Poco::StreamCopier::copyToString(preq.stream(), req.body,
                                          kMaxBodyBytes);
+        CTP_MSAN_UNPOISON_STRING(req.body);
         // A form submission's fields become params, exactly as if they had been
         // query parameters — with the query string winning on a key collision
         // (ParseFormBody never overwrites). Handlers then read one map either
         // way, and pages can use plain <form> posts or fetch+URLSearchParams.
         const std::string &ctype = preq.getContentType();
+        CTP_MSAN_UNPOISON_STRING(ctype);
         if (ctype.compare(0, 33, "application/x-www-form-urlencoded") == 0) {
           VizServer::ParseFormBody(req.body, &req.params);
         }
@@ -739,7 +801,9 @@ class PocoVizHandler : public Poco::Net::HTTPRequestHandler {
         resp.Error(404, "no route or asset for " + req.path);
       }
     } catch (const Poco::Exception &e) {
-      resp.Error(400, std::string("bad request: ") + e.displayText());
+      const std::string detail = e.displayText();
+      CTP_MSAN_UNPOISON_STRING(detail);
+      resp.Error(400, std::string("bad request: ") + detail);
     } catch (const std::exception &e) {
       resp.Error(500, std::string("internal error: ") + e.what());
     }
@@ -757,6 +821,9 @@ class PocoVizHandler : public Poco::Net::HTTPRequestHandler {
     // without rebuilding, point $CLIO_VIZ_PATH at a working copy; the daemon
     // then serves them from this same origin.
     presp.setContentLength(static_cast<std::streamsize>(resp.body.size()));
+    // Poco formats the status line and headers itself and hands them to
+    // send(2) from its own frames; only the interceptor checks reach that.
+    ctp::MsanInterceptorCheckGuard msan_guard;
     std::ostream &out = presp.send();
     if (req.method != "HEAD") {
       out.write(resp.body.data(),
@@ -787,6 +854,10 @@ class PocoVizHandlerFactory : public Poco::Net::HTTPRequestHandlerFactory {
 
 bool VizServer::StartOn(const std::string &bind_addr, u32 port,
                         u32 max_threads) {
+  // Serializes against Stop() and the getters: since `clio-run viz start|stop`
+  // the lifecycle is driven from an admin task too, concurrently with the
+  // daemon's own startup/shutdown and with handlers reading GetPort().
+  std::lock_guard<std::mutex> life_lock(lifecycle_mutex_);
   if (impl_) {
     HLOG(kWarning, "Viz: server already running on {}:{}", impl_->bind_addr,
          impl_->port);
@@ -801,6 +872,14 @@ bool VizServer::StartOn(const std::string &bind_addr, u32 port,
     Poco::Net::initializeNetwork();
     impl->socket = Poco::Net::ServerSocket(
         Poco::Net::SocketAddress(bind_addr, static_cast<Poco::UInt16>(port)));
+    // Assigned from a temporary that libPocoNet built and copied in; later
+    // inline reads of it (address(), close()) would otherwise be reported.
+    CTP_MSAN_UNPOISON_OBJ(impl->socket);
+    // libPocoNet also constructed the SocketImpl the handle points to. With
+    // poison_in_malloc=0 its heap block keeps whatever shadow a previous owner
+    // left, so the vptr that the inline address()/close() dispatch through
+    // reads as uninitialized. Clear the base-class part (vptr + fd).
+    CTP_MSAN_UNPOISON(impl->socket.impl(), sizeof(Poco::Net::SocketImpl));
     auto *params = new Poco::Net::HTTPServerParams();
     params->setMaxThreads(static_cast<int>(std::max<u32>(max_threads, 1)));
     params->setMaxQueued(64);
@@ -838,12 +917,21 @@ bool VizServer::StartOn(const std::string &bind_addr, u32 port,
   return true;
 }
 
-void VizServer::Stop() {
-  if (!impl_) {
-    return;
+bool VizServer::Stop() {
+  // Detach the server under the lifecycle lock, then tear it down OUTSIDE the
+  // lock: teardown may wait up to the stop budget for handlers, and a handler
+  // may itself call GetPort()/IsRunning(). impl_ is null from here on, so a
+  // concurrent Stop() is a no-op and a concurrent Start() may bind afresh.
+  std::shared_ptr<Impl> impl;
+  {
+    std::lock_guard<std::mutex> life_lock(lifecycle_mutex_);
+    if (!impl_) {
+      return true;
+    }
+    impl = std::shared_ptr<Impl>(std::move(impl_));
   }
-  HLOG(kInfo, "Viz: stopping dashboard on {}:{}", impl_->bind_addr,
-       impl_->port);
+  HLOG(kInfo, "Viz: stopping dashboard on {}:{}", impl->bind_addr,
+       impl->port);
   // Close the LISTENING SOCKET FIRST, before asking Poco to stop. Poco is
   // thread-per-connection: TCPServer::start() spawns an acceptor parked in
   // ServerSocket::poll() on this socket, and the stop path joins it. Closing
@@ -854,7 +942,7 @@ void VizServer::Stop() {
   // down, aborting requests, and FALSE lets current requests finish. Waiting
   // is the risky one, so keep true.)
   try {
-    impl_->socket.close();
+    impl->socket.close();
   } catch (const Poco::Exception &e) {
     HLOG(kWarning, "Viz: error closing the dashboard socket: {}",
          e.displayText());
@@ -883,7 +971,6 @@ void VizServer::Stop() {
       stop_budget_ms = static_cast<int>(n);
     }
   }
-  std::shared_ptr<Impl> impl(std::move(impl_));  // impl_ is null from here on
   auto finished = std::make_shared<std::promise<void>>();
   std::future<void> done = finished->get_future();
   std::thread([impl, finished]() mutable {
@@ -905,14 +992,23 @@ void VizServer::Stop() {
          "Viz: dashboard teardown did not finish within {} ms; abandoning it "
          "so the shutdown can proceed",
          stop_budget_ms);
+    return false;
   }
+  return true;
 }
 
-bool VizServer::IsRunning() const { return impl_ != nullptr; }
+bool VizServer::IsRunning() const {
+  std::lock_guard<std::mutex> life_lock(lifecycle_mutex_);
+  return impl_ != nullptr;
+}
 
-u32 VizServer::GetPort() const { return impl_ ? impl_->port : 0; }
+u32 VizServer::GetPort() const {
+  std::lock_guard<std::mutex> life_lock(lifecycle_mutex_);
+  return impl_ ? impl_->port : 0;
+}
 
 std::string VizServer::GetBindAddr() const {
+  std::lock_guard<std::mutex> life_lock(lifecycle_mutex_);
   return impl_ ? impl_->bind_addr : std::string();
 }
 
@@ -931,7 +1027,7 @@ bool VizServer::StartOn(const std::string &bind_addr, u32 port,
   return false;
 }
 
-void VizServer::Stop() {}
+bool VizServer::Stop() { return true; }
 bool VizServer::IsRunning() const { return false; }
 u32 VizServer::GetPort() const { return 0; }
 std::string VizServer::GetBindAddr() const { return std::string(); }

@@ -37,6 +37,7 @@
 
 #include "clio_runtime/work_orchestrator.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <iostream>
@@ -167,7 +168,19 @@ bool WorkOrchestrator::StartWorkers() {
 
 void WorkOrchestrator::AwakenAllWorkers() {
   int runtime_pid = ctp::SystemInfo::GetPid();
-  for (auto *worker : all_workers_) {
+  // Walk the PUBLISHED prefix through the raw storage, never by iterator.
+  // The monitor thread appends an elastic worker (SpawnAdditionalWorker)
+  // while workers and client threads wake-all from RouteLocal; the storage is
+  // reserved up front so the append never reallocates, and every entry below
+  // the published count is complete. A checked Debug-STL iterator, however,
+  // treats the concurrent push_back as an orphaning write and raises "vector
+  // iterators incompatible" -- on Windows Debug builds a MODAL CRT dialog that
+  // froze the calling thread until ctest's 600 s timeout (cte_reorganize_all
+  // on the win-10 CDash runner).
+  const size_t n = num_workers_published_.load(std::memory_order_acquire);
+  Worker *const *workers = all_workers_.data();
+  for (size_t i = 0; i < n; ++i) {
+    Worker *worker = workers[i];
     if (!worker) continue;
     TaskLane *lane = worker->GetLane();
     if (!lane) continue;
@@ -177,6 +190,16 @@ void WorkOrchestrator::AwakenAllWorkers() {
     }
   }
 }
+
+namespace {
+/** Steady-clock microseconds, the clock worker exec start times use. */
+double NowUsForJoin() {
+  return static_cast<double>(
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
+}  // namespace
 
 void WorkOrchestrator::StopWorkers() {
   if (!workers_running_) {
@@ -194,11 +217,15 @@ void WorkOrchestrator::StopWorkers() {
       worker->Stop();
       // Wake worker from epoll_wait so it can observe is_running_ == false
       TaskLane *lane = worker->GetLane();
-      if (lane) {
-        int tid = lane->GetTid();
-        if (tid > 0) {
-          ctp::lbm::EventManager::Signal(runtime_pid, tid);
-        }
+      const int lane_tid = lane != nullptr ? lane->GetTid() : 0;
+      if (lane_tid > 0) {
+        ctp::lbm::EventManager::Signal(runtime_pid, lane_tid);
+      }
+      // An elastic worker's lane can carry another thread's tid (a lane
+      // handed over in a rescue): wake the worker's own thread as well.
+      const int own_tid = static_cast<int>(worker->GetTid());
+      if (own_tid > 0 && own_tid != lane_tid) {
+        ctp::lbm::EventManager::Signal(runtime_pid, own_tid);
       }
     }
   }
@@ -211,11 +238,20 @@ void WorkOrchestrator::StopWorkers() {
   auto thread_model = CTP_THREAD_MODEL;
   size_t joined_count = 0;
   constexpr uint64_t kJoinTimeoutMs = 5000;
-  for (auto &thread : worker_threads_) {
-    if (thread_model->TimedJoinOrDetach(thread, kJoinTimeoutMs)) {
+  for (size_t i = 0; i < worker_threads_.size(); ++i) {
+    if (thread_model->TimedJoinOrDetach(worker_threads_[i], kJoinTimeoutMs)) {
       ++joined_count;
     } else {
-      HLOG(kError, "StopWorkers: thread join timed out, detached");
+      // Which worker, and what it was running: a worker still inside a task
+      // cannot see the stop.
+      Worker *w = i < all_workers_.size() ? all_workers_[i] : nullptr;
+      HLOG(kError, "StopWorkers: thread join timed out, detached (worker {} "
+           "executing={} pool {} method {} for {} ms)",
+           w != nullptr ? static_cast<long long>(w->GetId()) : -1LL,
+           w != nullptr && w->IsExecuting(),
+           w != nullptr ? w->CurrentPoolMajor() : 0u,
+           w != nullptr ? w->CurrentMethod() : 0u,
+           w != nullptr ? w->CurrentTaskAgeMs(NowUsForJoin()) : 0.0);
     }
   }
 
@@ -232,7 +268,7 @@ Worker *WorkOrchestrator::GetWorker(u32 worker_id) const {
     return nullptr;
   }
 
-  return all_workers_[worker_id];
+  return all_workers_.data()[worker_id];  // raw: no checked-iterator race with push_back
 }
 
 size_t WorkOrchestrator::GetWorkerCount() const {
@@ -295,6 +331,19 @@ bool WorkOrchestrator::SpawnWorkerThreads() {
             worker_idx, worker->GetId(), lane_id);
     } else {
       HLOG(kWarning, "WorkOrchestrator: Worker at index {} is null", worker_idx);
+    }
+  }
+
+  // issue #768: publish the net workers' lanes now that they exist. The
+  // schedulers pick the net workers in DivideWorkers, which runs before this
+  // lane mapping, so registering there stored null lanes: EnqueueNetTask then
+  // never woke the net worker and every response waited for its next timer
+  // tick (~15.6 ms on Windows).
+  if (scheduler_) {
+    Worker *send_worker = scheduler_->GetNetSendWorker();
+    Worker *recv_worker = scheduler_->GetNetRecvWorker();
+    if (send_worker && recv_worker) {
+      ipc->SetNetLane(send_worker->GetLane(), recv_worker->GetLane());
     }
   }
 
@@ -426,6 +475,10 @@ void WorkOrchestrator::StopMonitorThread() {
   if (!monitor_running_.exchange(false)) {
     return;
   }
+  {
+    std::lock_guard<std::mutex> g(monitor_mu_);
+  }
+  monitor_cv_.notify_all();
   if (monitor_thread_.joinable()) {
     monitor_thread_.join();
   }
@@ -436,12 +489,41 @@ void WorkOrchestrator::MonitorLoop() {
   // scheduler's LoadBalance(), which owns stall detection, elastic spawn, work
   // stealing, retirement, and telemetry. Kept intentionally thin here so all
   // policy lives in the Scheduler. LoadBalance() is a no-op stub today (#781).
+  // A worker request (RequestWorker) wakes it early: the pool grows the
+  // moment a mapper finds no worker with room, not up to a period later.
+  auto next_tick = std::chrono::steady_clock::now();
   while (monitor_running_.load(std::memory_order_relaxed)) {
-    if (scheduler_) {
-      scheduler_->LoadBalance();
+    if (std::chrono::steady_clock::now() >= next_tick) {
+      if (scheduler_) {
+        scheduler_->LoadBalance();
+      }
+      next_tick = std::chrono::steady_clock::now() +
+                  std::chrono::milliseconds(kMonitorPeriodMs);
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(kMonitorPeriodMs));
+    {
+      std::unique_lock<std::mutex> lk(monitor_mu_);
+      monitor_cv_.wait_until(lk, next_tick, [this] {
+        return worker_requested_.load(std::memory_order_relaxed) ||
+               !monitor_running_.load(std::memory_order_relaxed);
+      });
+    }
+    if (worker_requested_.exchange(false, std::memory_order_relaxed) &&
+        scheduler_) {
+      scheduler_->GrowPool();
+    }
   }
+}
+
+void WorkOrchestrator::RequestWorker() {
+  if (worker_requested_.exchange(true, std::memory_order_relaxed)) {
+    return;  // already pending: the monitor will see it
+  }
+  {
+    // Under the mutex, so the flag cannot land between the monitor's
+    // predicate check and its wait (a lost wakeup).
+    std::lock_guard<std::mutex> g(monitor_mu_);
+  }
+  monitor_cv_.notify_one();
 }
 
 Worker *WorkOrchestrator::SpawnAdditionalWorker() {
@@ -488,10 +570,12 @@ Worker *WorkOrchestrator::SpawnAdditionalWorker() {
   size_t elastic_budget =
       cfg ? static_cast<size_t>(cfg->GetElasticLaneHeadroom()) : 8;
   if (all_workers_.size() >= baseline_worker_count_ + elastic_budget) {
+    // (Not necessarily CPU-bound: the stalled workers may be asleep in a
+    // syscall. The ceiling is the reserved-lane budget.)
     HLOG(kWarning,
-         "[#785] NOT spawning: {} workers >= baseline {} + {} cores. The pool "
-         "is CPU-bound; another thread would only take cycles from running "
-         "tasks. Backlog on the stalled worker stays queued.",
+         "[#785] NOT spawning: {} workers >= baseline {} + {} elastic lanes "
+         "(the reserved-lane ceiling). Backlog on the stalled worker is "
+         "redistributed to healthy workers each monitor tick.",
          all_workers_.size(), baseline_worker_count_, elastic_budget);
     return nullptr;
   }
@@ -547,6 +631,19 @@ Worker *WorkOrchestrator::SpawnAdditionalWorker() {
   return worker_ptr;
 }
 
+Worker *WorkOrchestrator::FindIdleElasticWorker(
+    const std::vector<Worker *> &exclude) {
+  for (size_t i = baseline_worker_count_; i < all_workers_.size(); ++i) {
+    Worker *w = all_workers_[i];
+    if (w == nullptr || w->IsExecuting()) continue;
+    if (std::find(exclude.begin(), exclude.end(), w) != exclude.end()) {
+      continue;
+    }
+    return w;
+  }
+  return nullptr;
+}
+
 Worker *WorkOrchestrator::FindIdleElasticWorker() {
   // issue #785: a replacement that finished its rescued work sits idle with no
   // lane. Reusing it keeps the pool proportional to how many workers are wedged
@@ -579,3 +676,16 @@ void WorkOrchestrator::RetireWorker(Worker *worker) {
 }
 
 }  // namespace clio::run
+
+/**
+ * Number of workers the in-process runtime owns (0 without one). A plain C
+ * symbol so simple_test.h can reference it weakly: the leak check needs it
+ * to tell an elastic worker spawn from a leak, but must not make tests that
+ * do not link the runtime fail to link (#1208).
+ * @return the runtime's current worker count
+ */
+extern "C" size_t clio_runtime_worker_count() {
+  auto *orch = CLIO_WORK_ORCHESTRATOR;
+  return orch == nullptr ? 0
+                         : static_cast<size_t>(orch->GetTotalWorkerCount());
+}

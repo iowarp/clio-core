@@ -3,18 +3,18 @@
 #
 # One SUBDIRECTORY per science workload, each holding every substrate
 # implementation of that workload (paged on the vector, plus mpi / nvshmem /
-# nccl / bam baselines where they exist -- a baseline links nothing from
+# nccl baselines where they exist -- a baseline links nothing from
 # clio, or it is not a baseline):
 #
-#   lammps_md/   LAMMPS melt        paged + mpi + nvshmem + nccl + bam
-#   gmx/         PME spread+gather  paged + mpi + nvshmem + nccl + bam
-#   lbann/       MLP training       paged + mpi + nvshmem + nccl + bam
-#   grayscott/   reaction-diffusion paged + mpi + nvshmem + nccl + bam
-#   kmeans/      k-means            paged + mpi + nvshmem + nccl + bam
-#   weights/     weight streaming   paged + mpi + nvshmem + nccl + bam
+#   lammps_md/   LAMMPS melt        paged + mpi + nvshmem + nccl
+#   gmx/         PME spread+gather  paged + mpi + nvshmem + nccl
+#   lbann/       MLP training       paged + mpi + nvshmem + nccl
+#   grayscott/   reaction-diffusion paged + mpi + nvshmem + nccl
+#   kmeans/      k-means            paged + mpi + nvshmem + nccl
+#   weights/     weight streaming   paged + mpi + nvshmem + nccl
 #
-# ALL SIX CARRY ALL FIVE SUBSTRATES. This list said "paged" only for five of
-# them long after the mpi/nvshmem/bam editions landed, and the nccl column
+# ALL SIX CARRY ALL FOUR SUBSTRATES. This list said "paged" only for five of
+# them long after the mpi/nvshmem editions landed, and the nccl column
 # was genuinely lammps_md-only until the five NCCL editions were written --
 # which is how a "compare paged against MPI/NVSHMEM/NCCL" campaign ran for
 # weeks with no NCCL number for five of its six workloads. Keep this table
@@ -46,6 +46,9 @@ add_subdirectory(grayscott)
 add_subdirectory(gmx)
 add_subdirectory(weights)
 add_subdirectory(lbann)
+if(CLIO_CORE_ENABLE_CUDA AND TARGET clio_cte_compressor_runtime)
+  add_subdirectory(newcoro)  # clio-coroc editions (see newcoro/CMakeLists.txt)
+endif()
 # lammps_md joined them: its seam split (md_kernels.h over md_common.h, plus
 # lammps_md/cuda and lammps_md/sycl) was the last one, and the __shared__ usage
 # that made it the outlier turned out to be only the reduction scratch -- the
@@ -114,6 +117,38 @@ if(CLIO_CORE_ENABLE_CUDA)
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     )
     install(TARGETS clio_gpu_vector_overlap_bench RUNTIME DESTINATION bin)
+
+    # vector.Copy synchronous vs lazy on a DRAM + file tier pair.
+    add_cuda_executable(clio_gpu_vector_copy_sync_bench FALSE
+        clio_gpu_vector_copy_sync_bench.cc
+        INCLUDE_DIRS
+            ${CMAKE_SOURCE_DIR}/context-runtime/include
+            ${CMAKE_SOURCE_DIR}/context-runtime/modules/admin/include
+            ${CMAKE_SOURCE_DIR}/context-runtime/modules/bdev/include
+            ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
+            ${CMAKE_SOURCE_DIR}/context-transfer-engine/checkpoint/include
+            ${CMAKE_SOURCE_DIR}/context-transfer-engine/adapter/gpu_vector/include
+        LINK_LIBS
+            clio_run_cxx
+            clio_run_cxx_gpu
+            clio_admin_client
+            clio_bdev_client
+            clio_cte_core_client
+            clio_cte_core_runtime
+            clio::cte::gpu_vector
+            ctp::cuda_cxx
+            ${CMAKE_THREAD_LIBS_INIT}
+    )
+    set_target_properties(clio_gpu_vector_copy_sync_bench PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    install(TARGETS clio_gpu_vector_copy_sync_bench RUNTIME DESTINATION bin)
+    # Copy creates the checkpoint chimod's pool, which the runtime loads
+    # rather than links.
+    if(TARGET clio_cte_checkpoint_runtime)
+      add_dependencies(clio_gpu_vector_copy_sync_bench
+                       clio_cte_checkpoint_runtime)
+    endif()
 
     add_cuda_executable(clio_gpu_vector_flush_bench FALSE
         clio_gpu_vector_flush_bench.cc

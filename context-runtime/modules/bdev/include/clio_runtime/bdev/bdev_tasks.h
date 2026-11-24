@@ -38,6 +38,7 @@
 #include <clio_runtime/config_manager.h>
 #include <clio_ctp/introspect/system_info.h>
 #include <yaml-cpp/yaml.h>
+#include <clio_ctp/util/msan.h>
 
 #include <cctype>
 #include <string>
@@ -88,7 +89,8 @@ enum class BdevType : clio::run::u32 {
   kPinned = 3,  // Pinned host memory via cudaMallocHost
   kNoop = 4,    // No-op backend for latency testing (no actual I/O)
   kS3 = 5,      // Amazon S3 object store backend
-  kGcs = 6      // Google Cloud Storage object store backend
+  kGcs = 6,     // Google Cloud Storage object store backend
+  kDaos = 7     // Native DAOS backend (a DFS file driven through libdfs)
 };
 
 /**
@@ -192,6 +194,11 @@ struct CreateParams {
 
   // Persistence level for this block device
   PersistenceLevel persistence_level_ = PersistenceLevel::kVolatile;
+  // True only when the creator SET persistence_level_ (YAML key or the
+  // AsyncCreate argument). The default kVolatile is not a promise that the
+  // data is disposable -- CTE creates every tier bdev without it -- so only
+  // an explicit "volatile" may drop the allocator WAL (see SkipsAllocLog).
+  bool persistence_explicit_ = false;
 
   // When a memory-backed bdev commits its pages (see AllocPolicy). Defaulted
   // here rather than in each constructor so every existing caller — and every
@@ -216,6 +223,14 @@ struct CreateParams {
   // Committed memory stays bounded by the allocation high-water mark plus
   // one unit. YAML key: populate_unit (size string).
   clio::run::u64 populate_unit_ = clio::run::u64(64) << 20;  // 64 MiB default
+
+  // Settings that only one bdev type understands, as the YAML text of the
+  // block named after that type in the pool's compose entry (an `s3:` block
+  // for bdev_type s3, `gcs:` for gcs). The transport parses it at Init; see
+  // S3BdevTransport / GcsBdevTransport for the keys. Empty => none given, and
+  // the transport falls back to its environment variables. Holds credentials,
+  // so it is never logged.
+  std::string ext_yaml_;
 
   // Required: chimod library name for module manager
   static constexpr const char *chimod_lib_name = "clio_bdev";
@@ -265,13 +280,21 @@ struct CreateParams {
   CreateParams(BdevType bdev_type, clio::run::u64 total_size, clio::run::u32 io_depth,
                clio::run::u32 alignment, const PerfMetrics *perf_metrics = nullptr,
                const std::string &alloc_log_path = "",
-               clio::run::u64 growth_unit = clio::run::u64(1) << 30)
+               clio::run::u64 growth_unit = clio::run::u64(1) << 30,
+               int persistence_level = -1,
+               const std::string &ext_yaml = "")
       : bdev_type_(bdev_type),
         total_size_(total_size),
         io_depth_(io_depth),
         alignment_(alignment),
         alloc_log_path_(alloc_log_path),
-        growth_unit_(growth_unit) {
+        growth_unit_(growth_unit),
+        ext_yaml_(ext_yaml) {
+    // persistence_level < 0: not specified (keep the default, not explicit).
+    if (persistence_level >= 0) {
+      persistence_level_ = static_cast<PersistenceLevel>(persistence_level);
+      persistence_explicit_ = true;
+    }
     // Set performance metrics (use provided metrics or defaults)
     if (perf_metrics != nullptr) {
       perf_metrics_ = *perf_metrics;
@@ -303,7 +326,19 @@ struct CreateParams {
   void serialize(Archive &ar) {
     ar(bdev_type_, total_size_, io_depth_, alignment_, perf_metrics_,
        persistence_level_, alloc_policy_, alloc_log_path_, growth_unit_,
-       populate_unit_);
+       populate_unit_, persistence_explicit_, ext_yaml_);
+  }
+
+  /**
+   * A bdev explicitly marked volatile keeps no allocator WAL: its contents
+   * do not survive a restart by contract (CTE already drops every block on a
+   * volatile target when it recovers), so the log's appends and its periodic
+   * fdatasync are pure overhead. An explicit alloc_log path still wins.
+   */
+  bool SkipsAllocLog() const {
+    return persistence_explicit_ &&
+           persistence_level_ == PersistenceLevel::kVolatile &&
+           alloc_log_path_.empty();
   }
 
   /**
@@ -336,7 +371,8 @@ struct CreateParams {
         perf_metrics_.write_latency_us_ = 10.0;
         perf_metrics_.iops_ = 500000.0;
         break;
-      default:  // kFile / kS3 / kGcs / kNoop keep the conservative estimates
+      default:  // kFile / kS3 / kGcs / kDaos / kNoop keep the conservative
+                // estimates
         break;
     }
   }
@@ -348,6 +384,11 @@ struct CreateParams {
   void LoadConfig(const clio::run::PoolConfig &pool_config) {
     // Parse YAML config string
     YAML::Node config = YAML::Load(pool_config.config_);
+    // yaml-cpp is a prebuilt .so: the scalars its scanner just
+    // produced carry no MSan shadow, so every key lookup and
+    // .as<>() below reads memory it has no record of. One walk
+    // here covers the whole tree.
+    ctp::MsanUnpoisonYaml(config);
 
     // Load bdev type (optional, defaults to kFile)
     if (config["bdev_type"]) {
@@ -366,6 +407,13 @@ struct CreateParams {
         bdev_type_ = BdevType::kS3;
       } else if (type_str == "gcs") {
         bdev_type_ = BdevType::kGcs;
+      } else if (type_str == "daos") {
+        bdev_type_ = BdevType::kDaos;
+      }
+      // The type's own settings block, e.g. `s3: {region: ..., access_key_id:
+      // ...}` for bdev_type s3. Kept as YAML text for the transport to read.
+      if (config[type_str] && config[type_str].IsMap()) {
+        ext_yaml_ = YAML::Dump(config[type_str]);
       }
       // The type now implies its speed. Before this, EVERY bdev type kept the
       // conservative file defaults (100/80 MB/s), so a kHbm tier and a kRam
@@ -462,10 +510,13 @@ struct CreateParams {
       std::string pl_str = config["persistence_level"].as<std::string>();
       if (pl_str == "volatile") {
         persistence_level_ = PersistenceLevel::kVolatile;
+        persistence_explicit_ = true;
       } else if (pl_str == "temporary") {
         persistence_level_ = PersistenceLevel::kTemporaryNonVolatile;
+        persistence_explicit_ = true;
       } else if (pl_str == "long_term") {
         persistence_level_ = PersistenceLevel::kLongTerm;
+        persistence_explicit_ = true;
       }
     }
   }
@@ -755,7 +806,13 @@ struct ReadTask : public clio::run::Task {
   template <typename Archive>
   CTP_CROSS_FUN void SerializeOut(Archive &ar) {
     Task::SerializeOut(ar);
-    ar(length_, bytes_read_, io_error_);
+    // length_ is INOUT: a response may shorten it (a short read) but never
+    // grow it past the buffer the caller exposed, because the bulk below is
+    // copied into that buffer using it. When saving, `length` is just
+    // length_; when loading, a larger value from the wire is ignored.
+    size_t length = length_;
+    ar(length, bytes_read_, io_error_);
+    if (length < length_) length_ = length;
     // Use BULK_XFER to actually transfer the read data back
     ar.bulk(data_, length_, BULK_XFER);
   }
@@ -803,16 +860,22 @@ struct GetStatsTask : public clio::run::Task {
   // Task-specific data (no inputs)
   OUT PerfMetrics metrics_;            // Performance metrics
   OUT clio::run::u64 remaining_size_;  // Remaining allocatable space
+  /** The device's allocatable capacity (its configured size -- not the
+   *  physical disk under a file bdev). 0 = unknown. */
+  OUT clio::run::u64 total_size_;
   OUT clio::run::u32 predicted_ttl_days_; // Predicted device TTL in days (999999 = healthy)
 
   /** SHM default constructor */
-  GetStatsTask() : clio::run::Task(), remaining_size_(0), predicted_ttl_days_(999999) {}
+  GetStatsTask()
+      : clio::run::Task(), remaining_size_(0), total_size_(0),
+        predicted_ttl_days_(999999) {}
 
   /** Emplace constructor */
   explicit GetStatsTask(const clio::run::TaskId &task_node,
                         const clio::run::PoolId &pool_id,
                         const clio::run::PoolQuery &pool_query)
-      : clio::run::Task(task_node, pool_id, pool_query, 10), remaining_size_(0), predicted_ttl_days_(999999) {
+      : clio::run::Task(task_node, pool_id, pool_query, 10), remaining_size_(0),
+        total_size_(0), predicted_ttl_days_(999999) {
     // Initialize task
     task_id_ = task_node;
     pool_id_ = pool_id;
@@ -832,7 +895,7 @@ struct GetStatsTask : public clio::run::Task {
   template <typename Archive>
   CTP_CROSS_FUN void SerializeOut(Archive &ar) {
     Task::SerializeOut(ar);
-    ar(metrics_, remaining_size_, predicted_ttl_days_);
+    ar(metrics_, remaining_size_, total_size_, predicted_ttl_days_);
   }
 
   /**
@@ -845,6 +908,7 @@ struct GetStatsTask : public clio::run::Task {
     // Copy GetStatsTask-specific fields
     metrics_ = other->metrics_;
     remaining_size_ = other->remaining_size_;
+    total_size_ = other->total_size_;
     predicted_ttl_days_ = other->predicted_ttl_days_;
   }
 
@@ -865,6 +929,7 @@ struct GetStatsTask : public clio::run::Task {
       metrics_ = replica->metrics_;
     }
     remaining_size_ += replica->remaining_size_;
+    total_size_ += replica->total_size_;
     if (replica->predicted_ttl_days_ < predicted_ttl_days_) {
       predicted_ttl_days_ = replica->predicted_ttl_days_;
     }
@@ -968,6 +1033,50 @@ struct FlushAllocLogTask : public clio::run::Task {
     // allocator segments. See Task::AggregateOut for the full contract.
     // This task declares no OUT fields, so the base call above (return code +
     // completer) is the entire merge.
+  }
+};
+
+/**
+ * SyncTask - Make every byte written to this bdev, and its allocator state,
+ * durable (fdatasync on a file bdev; a no-op for memory tiers). The fsync
+ * path of the CTE sends one per bdev that holds a synced file's blocks.
+ */
+struct SyncTask : public clio::run::Task {
+  /** SHM default constructor */
+  CTP_CROSS_FUN SyncTask() : clio::run::Task() {}
+
+  /** Emplace constructor */
+  CTP_CROSS_FUN explicit SyncTask(const clio::run::TaskId &task_node,
+                                  const clio::run::PoolId &pool_id,
+                                  const clio::run::PoolQuery &pool_query)
+      : clio::run::Task(task_node, pool_id, pool_query, Method::kSync) {
+    task_id_ = task_node;
+    pool_id_ = pool_id;
+    method_ = Method::kSync;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  /** Serialize IN and INOUT parameters */
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+  }
+
+  /** Serialize OUT and INOUT parameters */
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+  }
+
+  /** Copy from another SyncTask */
+  void Copy(const ctp::ipc::FullPtr<SyncTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+  }
+
+  /** AggregateOut replica results into this task (no OUT fields). */
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
   }
 };
 

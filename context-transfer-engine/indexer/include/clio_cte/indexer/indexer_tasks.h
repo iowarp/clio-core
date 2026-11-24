@@ -35,6 +35,7 @@
 #define CLIO_CTE_INDEXER_INDEXER_TASKS_H_
 
 #include <clio_runtime/clio_runtime.h>
+#include <clio_ctp/util/msan.h>
 #include <clio_runtime/task.h>
 #include <clio_runtime/admin/admin_tasks.h>
 #include <clio_ctp/util/config_parse.h>
@@ -117,6 +118,11 @@ struct IndexerConfig {
     if (!pool_config.config_.empty()) {
       try {
         YAML::Node node = YAML::Load(pool_config.config_);
+        // yaml-cpp is a prebuilt .so: the scalars its scanner just
+        // produced carry no MSan shadow, so every key lookup and
+        // .as<>() below reads memory it has no record of. One walk
+        // here covers the whole tree.
+        ctp::MsanUnpoisonYaml(node);
         if (node["next_pool_id"]) {
           std::string next_str = node["next_pool_id"].as<std::string>();
           auto dot = next_str.find('.');

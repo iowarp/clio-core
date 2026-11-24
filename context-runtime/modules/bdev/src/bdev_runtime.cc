@@ -23,9 +23,12 @@ extern "C" void clio_direct_dev_base_register(unsigned long long pool_id,
                                               char *base);
 extern "C" void clio_direct_dev_base_unregister(unsigned long long pool_id);
 #include <clio_runtime/bdev/bdev_runtime.h>
+#include <clio_runtime/bdev/blocking_offload.h>
+#include <clio_runtime/bdev/prediction_parse.h>
 #include <clio_runtime/bdev/transports/mem_bdev_transport.h>
 #include <clio_runtime/comutex.h>
 #include <clio_ctp/util/gpu_api.h>
+#include <clio_ctp/util/msan.h>
 #include <clio_runtime/work_orchestrator.h>
 #include <clio_runtime/worker.h>
 #include <clio_ctp/introspect/system_info.h>
@@ -34,8 +37,15 @@ extern "C" void clio_direct_dev_base_unregister(unsigned long long pool_id);
 #include <clio_runtime/viz/viz_json.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cmath>
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <thread>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -64,14 +74,21 @@ std::string Runtime::MakePerfStatsPath(const std::string &pool_name) {
   if (ctp::SystemInfo::Getenv("CLIO_BDEV_PERSIST_STATS") == "0") {
     return std::string();
   }
+  // CLIO_BDEV_STATS_DIR wins if set (explicit override).
   std::string dir = ctp::SystemInfo::Getenv("CLIO_BDEV_STATS_DIR");
   if (dir.empty()) {
-    std::string home = ctp::SystemInfo::GetHomeDir();
-    if (home.empty()) {
-      return std::string();  // nowhere to persist
+    // Fall back to CLIO_STORAGE_ROOT (set by --disk or defaults to ~/.clio).
+    dir = ctp::SystemInfo::Getenv("CLIO_STORAGE_ROOT");
+    if (dir.empty()) {
+      std::string home = ctp::SystemInfo::GetHomeDir();
+      if (home.empty()) {
+        return std::string();  // nowhere to persist
+      }
+      dir = home + "/.clio";
     }
-    dir = home + "/.clio/bdev_perf";
+    dir += "/bdev_perf";
   }
+  dir = ctp::SystemInfo::NormalizePath(dir);  // no "\\?\" prefix (#1356)
   // Sanitize the pool name (it may be a filesystem path or "ram::name")
   // into a flat file name.
   std::string name = pool_name;
@@ -90,12 +107,19 @@ bool Runtime::SavePerfStatsFile(const std::string &path,
   if (path.empty()) return false;
   try {
     namespace fs = std::filesystem;
-    fs::create_directories(fs::path(path).parent_path());
+    // Named, not a temporary: libstdc++.so builds it, so its destructor reads
+    // memory MSan has no record of. See VizServer::AssetSearchDirs.
+    fs::path parent = fs::path(path).parent_path();
+    CTP_MSAN_UNPOISON_PATH(parent);
+    fs::create_directories(parent);
     // Write to a tmp file then rename so a crash mid-write never leaves a
     // truncated stats file for the next session to trip over.
     const std::string tmp = path + ".tmp";
     {
       std::ofstream ofs(tmp, std::ios::trunc);
+      // Stream state lives in uninstrumented libstdc++.so, so is_open()/good()
+      // read bytes MSan has no record of.
+      CTP_MSAN_UNPOISON_OBJ(ofs);
       if (!ofs.is_open()) return false;
       ofs << kPerfStatsHeader << "\n"
           << "read_bandwidth_mbps " << metrics.read_bandwidth_mbps_ << "\n"
@@ -105,6 +129,7 @@ bool Runtime::SavePerfStatsFile(const std::string &path,
           << "iops " << metrics.iops_ << "\n"
           << "model_wall_read " << model_wall_read << "\n"
           << "model_wall_write " << model_wall_write << "\n";
+      CTP_MSAN_UNPOISON_OBJ(ofs);
       if (!ofs.good()) return false;
     }
     std::error_code ec;
@@ -121,6 +146,7 @@ bool Runtime::LoadPerfStatsFile(const std::string &path, PerfMetrics &metrics,
                                 float &model_wall_write) {
   if (path.empty()) return false;
   std::ifstream ifs(path);
+  CTP_MSAN_UNPOISON_OBJ(ifs);  // see SavePerfStatsFile
   if (!ifs.is_open()) return false;
   std::string header;
   if (!std::getline(ifs, header) || header != kPerfStatsHeader) {
@@ -204,39 +230,97 @@ void Runtime::SavePerfStats(bool force) {
   SavePerfStatsFile(perf_stats_path_, perf_metrics_, wall_read, wall_write);
 }
 
+namespace {
+
+/**
+ * True for the tiers whose bytes live in memory (no device underneath).
+ * @param type the bdev's backend type
+ * @return true for kRam, kHbm and kPinned
+ */
+bool IsMemoryClass(BdevType type) {
+  return type == BdevType::kRam || type == BdevType::kHbm ||
+         type == BdevType::kPinned;
+}
+
+/**
+ * Wall-time feature for one bdev Read/Write of `aligned` bytes.
+ *
+ * Memory-class tiers move bytes at memcpy speed (~5 GB/s), so they use
+ * cost::kMemoryBytesPerWallUs; they never restore a persisted profile
+ * (LoadPerfStats), so nothing learned against another scale is invalidated.
+ * Disk-class and object-store tiers (file, DAOS, S3, GCS) keep the ~500 MB/s
+ * house scale: LoadPerfStats seeds their wall coefficient from a profile
+ * learned against exactly that feature, and a different scale here would
+ * mis-scale every restored profile. kNoop does no I/O at all.
+ * @param type the bdev's backend type
+ * @param aligned 4 KiB-aligned transfer size in bytes
+ * @return the wall_time_ feature in microseconds
+ */
+float BdevWallFeature(BdevType type, size_t aligned) {
+  if (type == BdevType::kNoop) {
+    return 1.0f;
+  }
+  const float rate = IsMemoryClass(type) ? clio::run::cost::kMemoryBytesPerWallUs
+                                         : clio::run::cost::kStorageBytesPerWallUs;
+  return static_cast<float>(aligned) / rate;
+}
+
+}  // namespace
+
+/**
+ * Per-task cost estimate for the scheduler (see Container::GetTaskStats).
+ *
+ * Read/Write scale with their 4 KiB-aligned length: compute_ is the staging
+ * copy (~10 KB per CPU microsecond), wall_time_ the device rate for this
+ * bdev's type (BdevWallFeature). Every other method is an explicit constant
+ * so none is predicted as a silent zero.
+ * @param task the task to estimate
+ * @return the task's cost features
+ */
 clio::run::TaskStat Runtime::GetTaskStats(const clio::run::Task *task) const {
+  namespace cost = clio::run::cost;
   if (!task) return clio::run::TaskStat();
   switch (task->method_) {
-    case Method::kWrite: {
-      auto *wt = static_cast<const WriteTask *>(task);
-      clio::run::TaskStat stat;
-      stat.io_size_ = wt->length_;
-      size_t aligned = ((stat.io_size_ + 4095) / 4096) * 4096;
-      // compute_ is the feature InferCpuTime scales — without it the CPU model
-      // is one constant per method and cannot tell 4 KiB from 1 MiB. The CPU
-      // half of a device write is the staging copy, ~10 KB per microsecond.
-      stat.compute_ = static_cast<size_t>(aligned / 10000.0f) + 2;
-      stat.wall_time_ = static_cast<float>(aligned) / 500.0f;
-      return stat;
-    }
+    case Method::kWrite:
     case Method::kRead: {
-      auto *rt = static_cast<const ReadTask *>(task);
-      clio::run::TaskStat stat;
-      stat.io_size_ = rt->length_;
-      size_t aligned = ((stat.io_size_ + 4095) / 4096) * 4096;
-      stat.compute_ = static_cast<size_t>(aligned / 10000.0f) + 2;
-      stat.wall_time_ = static_cast<float>(aligned) / 500.0f;
+      const size_t length =
+          task->method_ == Method::kWrite
+              ? static_cast<const WriteTask *>(task)->length_
+              : static_cast<const ReadTask *>(task)->length_;
+      const size_t aligned = ((length + 4095) / 4096) * 4096;
+      clio::run::TaskStat stat = cost::Data(aligned);
+      stat.io_size_ = length;
+      stat.wall_time_ = BdevWallFeature(bdev_type_, aligned);
       return stat;
     }
     case Method::kAllocateBlocks:
-    case Method::kFreeBlocks: {
+    case Method::kFreeBlocks:
       // Pure allocator bookkeeping: no payload, a handful of microseconds.
-      clio::run::TaskStat stat;
-      stat.compute_ = 5;
-      stat.wall_time_ = 8.0f;
-      return stat;
-    }
-    default: return clio::run::TaskStat();
+      return cost::Fixed(5, 8.0f);
+    case Method::kGetStats:
+      // Reads cached metrics and two model inferences.
+      return cost::Fixed(3, 5.0f);
+    case Method::kUpdate:
+    case Method::kSetLifespan:
+      // Swap a buffer pointer / a lifespan field.
+      return cost::Fixed(3, 5.0f);
+    case Method::kSync:
+      // fdatasync of the tier file on disk-class bdevs (offloaded; the task
+      // polls it); a no-op for memory tiers.
+      return IsMemoryClass(bdev_type_) ? cost::Trivial() : cost::DeviceSync();
+    case Method::kFlushAllocLog:
+      // Periodic: append + fsync of the allocator log, offloaded like Sync.
+      return cost::DeviceSync();
+    case Method::kMonitor:
+      // "stats" query: serialize metrics into a msgpack buffer.
+      return cost::Fixed(10, 15.0f);
+    case Method::kCreate:
+      return cost::ContainerCreate();
+    case Method::kDestroy:
+      // Final unthrottled perf-stats save to disk.
+      return cost::ContainerDestroy();
+    default:
+      return cost::Metadata();
   }
 }
 
@@ -387,6 +471,9 @@ bool Runtime::InlineOp(clio::run::u32 method, void *in, void *out) {
   return true;
 }
 
+using clio::run::bdev::BlockingOffload;
+using clio::run::bdev::kOffloadPollUs;
+
 clio::run::TaskResume Runtime::AllocateBlocks(clio::run::shared_ptr<AllocateBlocksTask> &task) {
   CLIO_TASK_BODY_BEGIN
 
@@ -399,10 +486,30 @@ clio::run::TaskResume Runtime::AllocateBlocks(clio::run::shared_ptr<AllocateBloc
   int worker_id = (worker != nullptr) ? static_cast<int>(worker->GetId()) : 0;
   std::vector<Block> local_blocks;
 
-  if (!transport_->AllocateBlocks(task->size_, worker_id, local_blocks)) {
+  clio::run::u64 need = 0;
+  if (!transport_->AllocateBlocksDeferred(task->size_, worker_id, local_blocks,
+                                          &need)) {
     task->blocks_.clear();
     task->return_code_ = 1;
     CLIO_CO_RETURN;
+  }
+  if (need != 0) {
+    // Growing the backing file (fallocate) can take seconds: off the worker.
+    BdevTransport *t = transport_.get();
+    auto job = BlockingOffload::Get().Submit(
+        [t, need] { return t->EnsureBacked(need) ? 0 : 1; }, "bdev grow");
+    while (!job->done.load(std::memory_order_acquire)) {
+      CLIO_CO_AWAIT(clio::run::yield(kOffloadPollUs));
+    }
+    // Resumed possibly on another worker: free into the current one's list.
+    clio::run::Worker *now = CLIO_CUR_WORKER;
+    const int wid = now != nullptr ? static_cast<int>(now->GetId()) : 0;
+    transport_->FinishAllocate(job->rc == 0, wid, local_blocks);
+    if (job->rc != 0) {
+      task->blocks_.clear();
+      task->return_code_ = 1;
+      CLIO_CO_RETURN;
+    }
   }
 
   for (const auto& block : local_blocks) {
@@ -612,8 +719,10 @@ clio::run::TaskResume Runtime::GetStats(clio::run::shared_ptr<GetStatsTask> &tas
 
   if (transport_) {
     task->remaining_size_ = transport_->GetRemainingSize();
+    task->total_size_ = transport_->GetCapacity();
   } else {
     task->remaining_size_ = 0;
+    task->total_size_ = 0;
   }
 
   // Expose the latest ML-predicted TTL so the CTE can make
@@ -654,6 +763,46 @@ clio::run::TaskResume Runtime::SetLifespan(
   CLIO_TASK_BODY_BEGIN
   predicted_ttl_days_.store(task->lifespan_days_, std::memory_order_relaxed);
   task->return_code_ = 0;
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::FlushAllocLog(
+    clio::run::shared_ptr<FlushAllocLogTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  if (transport_) {
+    // fsyncs the allocator log: off the worker (see BlockingOffload).
+    BdevTransport *t = transport_.get();
+    auto job = BlockingOffload::Get().Submit([t] {
+      t->FlushAllocLog();
+      return 0;
+    }, "bdev alloc-log sync");
+    while (!job->done.load(std::memory_order_acquire)) {
+      CLIO_CO_AWAIT(clio::run::yield(kOffloadPollUs));
+    }
+  }
+  task->return_code_ = 0;
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::Sync(clio::run::shared_ptr<SyncTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  if (!transport_) {
+    task->return_code_ = 0;
+    CLIO_CO_RETURN;
+  }
+  {
+    // fdatasync of a large tier file: seconds to over a minute under load.
+    // Never on the worker (see BlockingOffload).
+    BdevTransport *t = transport_.get();
+    auto job = BlockingOffload::Get().Submit(
+        [t] { return t->Sync() ? 0 : 1; }, "bdev sync");
+    while (!job->done.load(std::memory_order_acquire)) {
+      CLIO_CO_AWAIT(clio::run::yield(kOffloadPollUs));
+    }
+    task->return_code_ = static_cast<clio::run::u32>(job->rc);
+  }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
@@ -974,34 +1123,14 @@ void Runtime::PollPredictionServer() {
       const std::string pred_json =
           ctp::SystemInfo::PredictDriveFailure(drive_type, health_json, pool_name_);
 
-      // Parse days_remaining out of the JSON string.  We use a lightweight
-      // hand-rolled search to avoid pulling in a full JSON library here.
-      //  • "days_remaining": 42   → 42
-      //  • "days_remaining": null → keep current value (healthy)
-      auto extract_days = [](const std::string &json) -> clio::run::u32 {
-        const std::string key = "\"days_remaining\"";
-        auto pos = json.find(key);
-        if (pos == std::string::npos) return 999999;
-        pos += key.size();
-        // Skip whitespace and colon
-        while (pos < json.size() && (json[pos] == ' ' || json[pos] == ':')) ++pos;
-        // "null" means the server says the drive is healthy
-        if (json.size() >= pos + 4 && json.substr(pos, 4) == "null") return 999999;
-        // Parse integer
-        if (pos < json.size() && std::isdigit(static_cast<unsigned char>(json[pos]))) {
-          clio::run::u32 days = 0;
-          while (pos < json.size() &&
-                 std::isdigit(static_cast<unsigned char>(json[pos]))) {
-            days = days * 10 + static_cast<clio::run::u32>(json[pos] - '0');
-            ++pos;
-          }
-          return days;
-        }
-        return 999999;  // Unparseable → treat as healthy
-      };
-
-      clio::run::u32 new_ttl = extract_days(pred_json);
-      predicted_ttl_days_.store(new_ttl, std::memory_order_relaxed);
+      // Only a response that actually carries "days_remaining" updates the
+      // TTL. An {"error": ...} reply (server unreachable) must retain the last
+      // known value -- otherwise it clobbers a lifespan injected via
+      // SetLifespan whenever this poll lands after it.
+      std::optional<clio::run::u32> new_ttl = ParseDaysRemaining(pred_json);
+      if (new_ttl.has_value()) {
+        predicted_ttl_days_.store(*new_ttl, std::memory_order_relaxed);
+      }
 
     } catch (...) {
       // If the prediction server is unreachable, silently retain the last

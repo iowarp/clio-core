@@ -28,16 +28,20 @@
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/core/core_tasks.h>
 #include <clio_cte/replication/replication_client.h>
+#include <clio_runtime/admin/admin_client.h>
+#include <clio_runtime/config_manager.h>
 
 #include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "simple_test.h"
+#include "clio_ctp/util/msan.h"
 
 namespace fs = std::filesystem;
 
@@ -47,18 +51,29 @@ static std::string chi_test_data_dir() {
 }
 
 static constexpr clio::run::u64 kValSize = 4096;
+/** A volatile core (RAM + a small persistent file tier): the only kind of
+ *  core that holds both, so the one where REPLICA_PERSISTENT has a choice. */
+static const clio::run::PoolId kMixedPool(530, 0);
 
 class BlobReplicasFixture {
  public:
   std::string config_path_;
   std::string file_storage_path_;
   std::string metadata_log_path_;
+  std::string mixed_storage_path_;
 
   BlobReplicasFixture() {
     config_path_ = chi_test_data_dir() + "/blob_replicas_config.yaml";
     file_storage_path_ = chi_test_data_dir() + "/blob_replicas_file.dat";
     metadata_log_path_ = chi_test_data_dir() + "/blob_replicas_meta.log";
+    mixed_storage_path_ = chi_test_data_dir() + "/blob_replicas_mixed.dat";
     Cleanup();
+    // The mixed core's backing file (<path>_node0) is removed only HERE,
+    // before the runtime starts: the fixture is destroyed at the end of the
+    // first test case while the runtime and its cores keep running, so
+    // removing it in Cleanup() deleted a live bdev's file (later reads
+    // failed: "cannot open a worker I/O context").
+    RemovePrefixed(mixed_storage_path_);
     CreateConfigFile();
     ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", config_path_.c_str(), 1);
 
@@ -72,6 +87,20 @@ class BlobReplicasFixture {
 
   ~BlobReplicasFixture() { Cleanup(); }
 
+  /** Remove every file in the test data dir whose name starts with the
+   *  basename of `path_prefix`. */
+  static void RemovePrefixed(const std::string &path_prefix) {
+    const fs::path base(path_prefix);
+    const std::string stem = base.filename().string();
+    std::error_code ec;
+    for (const auto &entry : fs::directory_iterator(base.parent_path(), ec)) {
+      CTP_MSAN_UNPOISON_OBJ(entry);
+      std::string name = entry.path().filename().string();
+      CTP_MSAN_UNPOISON_STRING(name);
+      if (name.rfind(stem, 0) == 0) fs::remove(entry.path(), ec);
+    }
+  }
+
   void Cleanup() {
     if (fs::exists(config_path_)) fs::remove(config_path_);
     if (fs::exists(file_storage_path_)) fs::remove(file_storage_path_);
@@ -80,7 +109,10 @@ class BlobReplicasFixture {
     for (const auto &entry :
          fs::directory_iterator(fs::path(metadata_log_path_).parent_path(),
                                 ec)) {
-      const std::string name = entry.path().filename().string();
+      // libstdc++.so assembled this path; its destructor reads it too.
+      CTP_MSAN_UNPOISON_OBJ(entry);
+      std::string name = entry.path().filename().string();
+      CTP_MSAN_UNPOISON_STRING(name);
       if (name.rfind("blob_replicas_meta.log", 0) == 0) {
         fs::remove(entry.path(), ec);
       }
@@ -115,11 +147,7 @@ compose:
       poll_period_ms: 5000
 
     storage:
-      - path: "ram::blob_replicas_dram"
-        bdev_type: "ram"
-        capacity_limit: "64MB"
-        score: 1.0
-
+      # A core is uniform in durability: the persistent tier only.
       - path: ")" << file_storage_path_ << R"("
         bdev_type: "file"
         capacity_limit: "1MB"
@@ -136,7 +164,26 @@ compose:
       metadata_log_path: )" << metadata_log_path_ << R"(
       transaction_log_capacity: 4MB
       flush_metadata_period_ms: 0
-      flush_data_period_ms: 0
+
+  # Volatile (RAM + persistent file): REPLICA_PERSISTENT must pick the file.
+  - mod_name: clio_cte_core
+    pool_name: clio_cte_mixed
+    pool_query: local
+    pool_id: 530.0
+    targets:
+      neighborhood: 1
+    storage:
+      - path: "ram::blob_replicas_mixed_dram"
+        bdev_type: "ram"
+        capacity_limit: "64MB"
+        score: 1.0
+      - path: ")" << mixed_storage_path_ << R"("
+        bdev_type: "file"
+        capacity_limit: "1MB"
+        score: 0.2
+        persistence_level: "temporary"
+    dpe:
+      dpe_type: "max_bw"
 )";
     config_file.close();
   }
@@ -333,15 +380,19 @@ TEST_CASE("BlobReplicas - REPLICA_FIXED pins a replica against the organizer",
 
 TEST_CASE("BlobReplicas - REPLICA_PERSISTENT excludes volatile tiers",
           "[cte][replicas][persistence][886]") {
-  auto *client = CLIO_CTE_CLIENT;
-  REQUIRE(client != nullptr);
+  // On the volatile core that holds both a RAM tier and a persistent file
+  // tier: a persistent core refuses volatile bdevs, so only a core like
+  // this one gives REPLICA_PERSISTENT a volatile tier to keep off.
+  clio::cte::core::Client mixed(kMixedPool);
+  auto *client = &mixed;
+  auto tf = client->AsyncGetOrCreateTag("replica_persist_tag");
+  tf.Wait();
+  REQUIRE(tf->GetReturnCode() == 0);
+  const clio::cte::core::TagId tag_id = tf->tag_id_;
 
-  clio::cte::core::Tag tag("replica_persist_tag");
-  const clio::cte::core::TagId tag_id = tag.GetTagId();
-
-  // A payload bigger than the ONLY non-volatile tier (1MB file): as a plain
+  // A payload bigger than the ONLY persistent tier (1MB file): as a plain
   // replica it lands in RAM; as a PERSISTENT replica it has nowhere legal
-  // to go and the put must fail — proof the flag really excludes the
+  // to go and the put must fail -- proof the flag really excludes the
   // volatile tier rather than merely preferring the file one.
   const clio::run::u64 kBig = 4ULL * 1024 * 1024;
   const std::string big(kBig, 'B');
@@ -361,8 +412,8 @@ TEST_CASE("BlobReplicas - REPLICA_PERSISTENT excludes volatile tiers",
   }
 
   // A small PERSISTENT replica fits the file tier; seed it with a LOW score,
-  // then reorganize it toward the volatile tier's score — the move must
-  // succeed while staying on non-volatile storage (rc 0, bytes intact).
+  // then reorganize it to a high score -- the move must succeed with its
+  // bytes intact.
   const clio::run::u64 kSmall = 64 * 1024;
   const std::string small_val(kSmall, 'S');
   PutTo(client, tag_id, "persist_small", std::string(kSmall, 'p'), 0);
@@ -401,6 +452,9 @@ TEST_CASE("BlobReplicas - replication module ReplicateBlob and FlushTag",
   {
     clio::cte::replication::ReplicationConfig params;
     params.next_pool_id_ = clio::cte::core::kCtePoolId;
+    // These tests exercise the persistent same-node replica, which the
+    // default (replication_factor 1: one copy) does not make.
+    params.num_replicas_ = 1;
     auto create = repl.AsyncCreateReplication(
         clio::run::PoolQuery::Local(),
         clio::cte::replication::kReplicationPoolName,
@@ -524,13 +578,16 @@ TEST_CASE("BlobReplicas - transparent interposition on the core Put/Get",
   REQUIRE(client != nullptr);
 
   // Bind the replication pool (GetOrCreatePool is idempotent; the module
-  // test earlier created it with default params: num_replicas=1,
-  // cache_score=1.0, replica_score=0.2).
+  // test earlier created it with num_replicas=1, cache_score=1.0,
+  // replica_score=0.2).
   clio::cte::replication::Client repl(
       clio::cte::replication::kReplicationPoolId, clio::cte::core::kCtePoolId);
   {
     clio::cte::replication::ReplicationConfig params;
     params.next_pool_id_ = clio::cte::core::kCtePoolId;
+    // These tests exercise the persistent same-node replica, which the
+    // default (replication_factor 1: one copy) does not make.
+    params.num_replicas_ = 1;
     auto create = repl.AsyncCreateReplication(
         clio::run::PoolQuery::Local(),
         clio::cte::replication::kReplicationPoolName,
@@ -559,8 +616,12 @@ TEST_CASE("BlobReplicas - transparent interposition on the core Put/Get",
     REQUIRE(psz->size_ == kValSize);
   }
   {
+    // Polled under a long deadline: a slow runner's sweep may take longer;
+    // a replica that never appears still fails.
     bool replicated = false;
-    for (int attempt = 0; attempt < 200 && !replicated; ++attempt) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    while (!replicated && std::chrono::steady_clock::now() < deadline) {
       auto rsz = client->AsyncGetBlobSize(tag_id, "cache_blob",
                                           clio::run::PoolQuery::Dynamic(), 1);
       rsz.Wait();
@@ -617,7 +678,7 @@ TEST_CASE("BlobReplicas - transparent interposition on the core Put/Get",
   // 6. Metadata ops forward untouched: a tag op through the interposer
   //    behaves exactly like the core pool's.
   {
-    auto sz = repl_io.AsyncGetTagSize(tag_id);
+    auto sz = repl_io.AsyncGetTagSize(tag_id, clio::run::PoolQuery::Broadcast(0.0f));
     sz.Wait();
     REQUIRE(sz->GetReturnCode() == 0);
   }
@@ -690,6 +751,201 @@ TEST_CASE("BlobReplicas - metadata snapshot covers replica layouts",
   REQUIRE(std::memcmp(got.data(), primary_val.data(), kValSize) == 0);
   REQUIRE(GetFrom(client, tag_id, "snap_blob", &got, 1) == 0);
   REQUIRE(std::memcmp(got.data(), replica_val.data(), kValSize) == 0);
+}
+
+TEST_CASE("BlobReplicas - snapshot replica layouts restore into a fresh pool",
+          "[cte][replicas][wal][886][noleak]") {
+  // Covers RestoreMetadataFromLog's REPLICA branch, which nothing else in the
+  // unit suite reaches.
+  //
+  // That branch was dead code until the entry tag was separated: replica
+  // records were written as type 3, the blob branch above it claims 1|2|3, so
+  // every replica record was parsed as a blob and the stream desynchronised
+  // from there (the reader went on to read string bytes as binary fields --
+  // observed as bdev "pool ids" that decode to ASCII, 1936876912 == "pers").
+  // It went unnoticed because no test ever restored a snapshot holding
+  // replicas.
+  //
+  // Restarting the EXISTING pool cannot test this: the container is already
+  // live, so a re-create returns it with its in-memory metadata intact and
+  // RestoreMetadataFromLog never runs. Compose a SECOND CTE pool instead --
+  // new id, same metadata_log_path, restart_ = true -- which is a genuinely
+  // cold container and must rebuild its state from the snapshot alone. That is
+  // the same path admin's RestartContainers drives after a reboot.
+  auto *client = CLIO_CTE_CLIENT;
+  REQUIRE(client != nullptr);
+
+  clio::cte::core::Tag tag("replica_restore_tag");
+  const clio::cte::core::TagId tag_id = tag.GetTagId();
+
+  const std::string primary_val(kValSize, 'p');
+  const std::string replica_val(kValSize, 'r');
+  PutTo(client, tag_id, "restore_blob", primary_val, 0);
+  // PERSISTENT, so the replica lands on the file tier. A plain replica would
+  // land on the volatile RAM tier, and RestoreMetadataFromLog drops volatile
+  // blocks by design -- the copy is meant to die with the machine. Only a
+  // non-volatile replica has a layout that SHOULD survive, which is what makes
+  // its absence after a restore a real defect rather than correct behaviour.
+  {
+    clio::cte::core::Context ctx = ReplicaCtx(1);
+    ctx.replica_flags_ = clio::cte::core::REPLICA_PERSISTENT;
+    auto fut = client->AsyncPutBlob(tag_id, "restore_blob", 0, kValSize,
+                                    replica_val.data(), -1.0f, ctx);
+    fut.Wait();
+    REQUIRE(fut->GetReturnCode() == 0);
+  }
+
+  // Snapshot. This truncates the WAL, so afterwards the replica's layout lives
+  // ONLY in the snapshot and the restore below has to parse it correctly.
+  auto flush = client->AsyncFlushMetadata(clio::run::PoolQuery::Local(), 0);
+  flush.Wait();
+  REQUIRE(flush->GetReturnCode() == 0);
+
+  // Second CTE pool over the same storage + the same metadata log.
+  clio::run::PoolConfig cfg;
+  cfg.mod_name_ = "clio_cte_core";
+  cfg.pool_name_ = "clio_cte_restored";
+  cfg.pool_id_ = clio::run::PoolId(514, 0);
+  cfg.pool_query_ = clio::run::PoolQuery::Local();
+  cfg.restart_ = true;  // -> Runtime::Restart -> is_restart_ -> replay the log
+  {
+    std::ostringstream y;
+    y << "targets:\n"
+      << "  neighborhood: 1\n"
+      << "storage:\n"
+      // Same storage as the source core: its persistent file tier only, so
+      // this core is persistent and replays the log.
+      << "  - path: \"" << chi_test_data_dir() + "/blob_replicas_file.dat" << "\"\n"
+      << "    bdev_type: \"file\"\n"
+      << "    capacity_limit: \"1MB\"\n"
+      << "    score: 0.2\n"
+      << "    persistence_level: \"temporary\"\n"
+      << "performance:\n"
+      << "  metadata_log_path: " << chi_test_data_dir() + "/blob_replicas_meta.log" << "\n";
+    cfg.config_ = y.str();
+  }
+
+  clio::run::admin::Client admin_client(clio::run::kAdminPoolId);
+  auto compose = admin_client.AsyncCompose(cfg);
+  compose.Wait();
+  REQUIRE(compose->GetReturnCode() == 0);
+
+  // Read the replica back THROUGH THE RESTORED POOL. Its metadata came from
+  // the snapshot and nowhere else, so a misparsed replica record shows up here
+  // as a lost layout: a non-zero rc or the wrong bytes.
+  clio::cte::core::Client restored(clio::run::PoolId(514, 0));
+  std::vector<char> got;
+  const clio::run::u32 read_rc =
+      GetFrom(&restored, tag_id, "restore_blob", &got, 1);
+
+  // Tear the restored pool down BEFORE asserting, so a failing assertion does
+  // not leave a stray pool composed for the tests that follow.
+  //
+  // [noleak] on this case: composing a pool builds a container the PoolManager
+  // owns for the PROCESS lifetime -- DestroyPool unregisters it but does not
+  // return its rebuilt metadata image (~96 KB here) to the runtime private
+  // heap, which only ServerFinalize's DestroyAllContainers does. Measured with
+  // -DCLIO_CORE_ENABLE_LEAK_CHECK=ON: the delta is identical with and without
+  // this DestroyPool call, so the tag reflects real runtime-lifetime state
+  // rather than papering over a leak this test could actually release.
+  {
+    clio::run::admin::Client admin_cleanup(clio::run::kAdminPoolId);
+    auto destroy = admin_cleanup.AsyncDestroyPool(clio::run::PoolQuery::Local(),
+                                                  clio::run::PoolId(514, 0));
+    destroy.Wait();
+  }
+
+  REQUIRE(read_rc == 0);
+  REQUIRE(got.size() == kValSize);
+  REQUIRE(std::memcmp(got.data(), replica_val.data(), kValSize) == 0);
+}
+
+TEST_CASE("BlobReplicas - legacy type-0 tag snapshot restores into a new pool",
+          "[cte][wal][noleak]") {
+  // Covers RestoreMetadataFromLog's legacy TagInfo branch (entry type 0).
+  // FlushMetadata only writes type 5 now, so type 0 exists only in a snapshot
+  // left behind by an older binary. Write one by hand and replay it into a
+  // cold pool the same way the replica-restore case above does.
+  const std::string log_path = chi_test_data_dir() + "/legacy_tag_meta.log";
+  const std::string tag_name = "legacy_v0_tag";
+  const clio::cte::core::TagId tag_id(1, 4242);
+  const clio::run::u64 total_size = 12345;
+  {
+    std::ofstream out(log_path, std::ios::binary | std::ios::trunc);
+    CTP_MSAN_UNPOISON_OBJ(out);  // stream state is owned by libstdc++.so
+    REQUIRE(out.is_open());
+    const uint8_t entry_type = 0;
+    const uint32_t name_len = static_cast<uint32_t>(tag_name.size());
+    out.write(reinterpret_cast<const char *>(&entry_type), sizeof(entry_type));
+    out.write(reinterpret_cast<const char *>(&name_len), sizeof(name_len));
+    out.write(tag_name.data(), name_len);
+    out.write(reinterpret_cast<const char *>(&tag_id), sizeof(tag_id));
+    out.write(reinterpret_cast<const char *>(&total_size), sizeof(total_size));
+    CTP_MSAN_UNPOISON_OBJ(out);
+    REQUIRE(out.good());
+  }
+
+  const clio::run::PoolId pool_id(515, 0);
+  clio::run::PoolConfig cfg;
+  cfg.mod_name_ = "clio_cte_core";
+  cfg.pool_name_ = "clio_cte_legacy_restored";
+  cfg.pool_id_ = pool_id;
+  cfg.pool_query_ = clio::run::PoolQuery::Local();
+  cfg.restart_ = true;  // -> Runtime::Restart -> replay the snapshot
+  {
+    std::ostringstream y;
+    y << "targets:\n"
+      << "  neighborhood: 1\n"
+      << "storage:\n"
+      // A persistent core: a RAM-only core is volatile, runs without a
+      // WAL, and would (correctly) restore nothing.
+      << "  - path: \"" << log_path + ".dat" << "\"\n"
+      << "    bdev_type: \"file\"\n"
+      << "    capacity_limit: \"16MB\"\n"
+      << "    persistence_level: \"temporary\"\n"
+      << "performance:\n"
+      << "  metadata_log_path: " << log_path << "\n";
+    cfg.config_ = y.str();
+  }
+
+  clio::run::admin::Client admin_client(clio::run::kAdminPoolId);
+  auto compose = admin_client.AsyncCompose(cfg);
+  compose.Wait();
+  const clio::run::u32 compose_rc = compose->GetReturnCode();
+
+  // The tag must be known to the restored pool under its original id.
+  clio::run::u32 found = 0;
+  std::string restored_name;
+  if (compose_rc == 0) {
+    clio::cte::core::Client restored(pool_id);
+    auto name = restored.AsyncGetTagName(tag_id, clio::run::PoolQuery::Local());
+    name.Wait();
+    found = name->found_;
+    restored_name = name->tag_name_.str();
+    CTP_MSAN_UNPOISON_STRING(restored_name);
+
+    // Same reasoning as the replica-restore case for tearing down first and
+    // for the [noleak] tag.
+    auto destroy = admin_client.AsyncDestroyPool(clio::run::PoolQuery::Local(),
+                                                 pool_id);
+    destroy.Wait();
+  }
+
+  // The snapshot and any WAL shards the restored pool opened beside it.
+  std::error_code ec;
+  for (const auto &entry :
+       fs::directory_iterator(fs::path(log_path).parent_path(), ec)) {
+    CTP_MSAN_UNPOISON_OBJ(entry);
+    std::string name = entry.path().filename().string();
+    CTP_MSAN_UNPOISON_STRING(name);
+    if (name.rfind("legacy_tag_meta.log", 0) == 0) {
+      fs::remove(entry.path(), ec);
+    }
+  }
+
+  REQUIRE(compose_rc == 0);
+  REQUIRE(found == 1);
+  REQUIRE(restored_name == tag_name);
 }
 
 TEST_CASE("BlobReplicas - ReplicationConfig parses compose YAML",

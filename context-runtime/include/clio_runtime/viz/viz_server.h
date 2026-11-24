@@ -188,8 +188,13 @@ class VizServer {
    */
   bool StartOn(const std::string &bind_addr, u32 port, u32 max_threads);
 
-  /** Stop the server and wait for in-flight requests. Idempotent. */
-  void Stop();
+  /**
+   * Stop the server and wait for in-flight requests, up to the stop budget
+   * (CLIO_VIZ_STOP_BUDGET_MS, default 3000 ms). Idempotent.
+   * @return true if the teardown finished (or there was nothing to stop);
+   *         false if it outlived the budget and was abandoned.
+   */
+  bool Stop();
 
   /** @return true between a successful Start() and Stop(). */
   bool IsRunning() const;
@@ -332,6 +337,9 @@ class VizServer {
    *  with the POSIX interception adapters -- see CTP's src/CMakeLists.txt). */
   struct Impl;
   std::unique_ptr<Impl> impl_;
+  /** Guards impl_ (Start/Stop/IsRunning/GetPort/GetBindAddr). Separate from
+   *  mutex_ so a slow teardown never blocks request routing. */
+  mutable std::mutex lifecycle_mutex_;
 };
 
 /**

@@ -9,16 +9,12 @@ name: CI Linux
 
 on:
   push:
-    branches: [main, dev]
+    branches: [main]
+  # Push to dev does NOT trigger this directly: dev-full-ci.yml dispatches
+  # the full matrix once dev has been quiet for 30 minutes, so a burst of
+  # merges gets one full run instead of one per merge.
   pull_request:
     branches: [main, dev]
-  # Merge queue (issue #1013): the full matrix -- macFUSE, WinFsp, the boost
-  # backend, the wide macOS sweep -- is gated on `event_name != pull_request`,
-  # so it never ran on a PR and only spoke up AFTER the merge, on dev, where a
-  # single bad commit turns every later push red. A merge_group run is that
-  # same full matrix executed on the PROSPECTIVE merge commit, before it lands.
-  # Cost is unchanged for PRs; dev stops being where breakage is discovered.
-  merge_group:
   workflow_dispatch:
 
 concurrency:
@@ -39,16 +35,25 @@ jobs:
   # node containers, with gcov pulled out of the nodes) is folded in next; until
   # then it still runs, without coverage, in cluster-tests.yml.
   # ---- Matrix tier selection (issue #921) -----------------------------------
-  # A pull request runs the `unit amd64` phase only; the full phase sweep runs
-  # on push to main/dev. Every PR commit fanning out to six phases plus four
+  # A pull request runs `unit amd64` and `cae`; the full phase sweep runs on
+  # push to main/dev. Every PR commit fanning out to six phases plus four
   # variant jobs made Linux the slowest gate and multiplied flake exposure
-  # without multiplying signal -- the non-unit phases each scope themselves to
+  # without multiplying signal -- the remaining phases each scope themselves to
   # one subtree and rarely fail alone. They still gate what lands, at the merge
   # point rather than on every push to a branch.
   #
-  # `unit amd64` is the PR phase because it is the only one that runs the core
+  # `unit amd64` is a PR phase because it is the only one that runs the core
   # suite (everything except adapter/integration/docker/cae/cee), so a
   # regression in the runtime, transport, or CTE shows up there first.
+  #
+  # `cae` is a PR phase because it is the ONLY phase that runs the CAE suite at
+  # all: those tests are label-gated (`ctest -L cae`) and the `unit` phase's
+  # default exclude set drops every CAE test carrying `integration` -- which is
+  # most of the ones that exercise a live runtime, since that label is what
+  # keeps them off macOS (issue #504). Without this phase a PR touching CAE
+  # skipped its own tests entirely and reported near-zero patch coverage, so a
+  # CAE regression only surfaced after merge. It is amd64-only and scoped to
+  # */context-assimilation-engine/*, so it adds one job, not a sweep.
   #
   # The phase list lives here as JSON rather than as a `strategy.matrix.include`
   # block because a job-level `if:` cannot see the `matrix` context -- filtering
@@ -73,12 +78,30 @@ jobs:
   #              adapter (== the codecov "fuse" component) instead of a
   #              whole-repo number diluted by code the fuse-only selection does
   #              not exercise.
-  #   cae/cee    Context Assimilation / Exploration Engine.
+  #   cae/cee    Context Assimilation / Exploration Engine. Both carry
+  #              cdash_scope for the same reason fuse does: the subtrees sit at
+  #              ~85% and ~78% on Codecov, but the CDash headline measured the
+  #              whole phase build under a cae-only/cee-only test selection and
+  #              read 64% and 33%. cee is the starkest -- a 784-line subtree
+  #              against a 36k-line denominator, which no amount of CEE testing
+  #              could ever lift.
   #   prediction Stands up the real Python model server and drives a LightGBM
   #              inference through the C++ prediction path and the bdev
   #              Monitor("stats") entry point. Needs the Git-LFS models and the
-  #              server's Python deps, both installed in the job below.
+  #              server's Python deps, both installed in the job below. Its
+  #              cdash_scope is the first one that is not a top-level
+  #              component: keeping context-runtime/modules/bdev (plus the one
+  #              system_info.cc file) is what forced the exclusion generator to
+  #              recurse, since the old flat sweep kept all of context-runtime
+  #              as an ancestor. Scoping alone only took it from 18% to ~21%
+  #              though: the phase claimed the bdev subtree but ran just the
+  #              two prediction_e2e tests, while the bdev suite that covers it
+  #              (~83%) ran in the unit phase. Hence the `bdev` label in the
+  #              selection -- a phase should run the tests for the code it
+  #              measures.
   matrix-tier:
+    # Skipped on dev -> main PRs: dev-to-main-gate.yml checks dev's full CI on the same commit instead.
+    if: ${{ !(github.event_name == 'pull_request' && github.head_ref == 'dev' && github.base_ref == 'main') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -93,14 +116,14 @@ jobs:
             {"phase":"unit","arch":"amd64","os":"ubuntu-24.04","site":"ubu-24.amd64.unit","flag":"unit","apt":"","cmake_args":"-DCLIO_CORE_ENABLE_LLAMA=ON","labels":"","extract":""},
             {"phase":"unit","arch":"arm64","os":"ubuntu-24.04-arm","site":"ubu-24.arm64.unit","flag":"unit","apt":"","cmake_args":"-DCLIO_CORE_ENABLE_LLAMA=ON","labels":"","extract":""},
             {"phase":"fuse","arch":"amd64","os":"ubuntu-24.04","site":"ubu-24.amd64.fuse","flag":"fuse","apt":"libfuse3-dev fuse3","pkgconfig":"/usr/lib/x86_64-linux-gnu/pkgconfig","cmake_args":"-DCLIO_CTE_ENABLE_FUSE_ADAPTER=ON -DCLIO_CTE_ENABLE_FILESYSTEM=ON","labels":"fuse|adapter","exclude_labels":"docker|copy_workspace|integration","extract":"*/context-transfer-engine/adapter/* */context-transfer-engine/filesystem/*","cdash_scope":"context-transfer-engine/adapter"},
-            {"phase":"cae","arch":"amd64","os":"ubuntu-24.04","site":"ubu-24.amd64.cae","flag":"cae","apt":"","cmake_args":"-DCLIO_CORE_ENABLE_CAE=ON","labels":"cae","extract":"*/context-assimilation-engine/*"},
-            {"phase":"cee","arch":"amd64","os":"ubuntu-24.04","site":"ubu-24.amd64.cee","flag":"cee","apt":"","cmake_args":"-DCLIO_CORE_ENABLE_CEE=ON","labels":"cee","extract":"*/context-exploration-engine/*"},
-            {"phase":"prediction","arch":"amd64","os":"ubuntu-24.04","site":"ubu-24.amd64.prediction","flag":"prediction","apt":"python3-venv","cmake_args":"","labels":"prediction_e2e","extract":"*/hw_failure_monitor/* */context-transport-primitives/src/system_info.cc */context-runtime/modules/bdev/*"}
+            {"phase":"cae","arch":"amd64","os":"ubuntu-24.04","site":"ubu-24.amd64.cae","flag":"cae","apt":"","cmake_args":"-DCLIO_CORE_ENABLE_CAE=ON -DCLIO_CORE_ENABLE_HDF5=ON","labels":"cae","extract":"*/context-assimilation-engine/*","cdash_scope":"context-assimilation-engine"},
+            {"phase":"cee","arch":"amd64","os":"ubuntu-24.04","site":"ubu-24.amd64.cee","flag":"cee","apt":"","cmake_args":"-DCLIO_CORE_ENABLE_CEE=ON","labels":"cee","extract":"*/context-exploration-engine/*","cdash_scope":"context-exploration-engine"},
+            {"phase":"prediction","arch":"amd64","os":"ubuntu-24.04","site":"ubu-24.amd64.prediction","flag":"prediction","apt":"python3-venv","cmake_args":"","labels":"prediction_e2e|bdev","extract":"*/hw_failure_monitor/* */context-transport-primitives/introspect/src/system_info.cc */context-runtime/modules/bdev/*","cdash_scope":"context-runtime/modules/bdev context-transport-primitives/introspect/src/system_info.cc"}
           ]
           JSON
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             echo "full=false" >> "$GITHUB_OUTPUT"
-            sel=$(jq -c '{include: [.[] | select(.phase == "unit" and .arch == "amd64")]}' /tmp/phases.json)
+            sel=$(jq -c '{include: [.[] | select(.arch == "amd64")]}' /tmp/phases.json)
           else
             echo "full=true" >> "$GITHUB_OUTPUT"
             sel=$(jq -c '{include: .}' /tmp/phases.json)
@@ -108,10 +131,25 @@ jobs:
           echo "phases=$sel" >> "$GITHUB_OUTPUT"
 
   build-test:
+    # Skipped on dev -> main PRs: dev-to-main-gate.yml checks dev's full CI on the same commit instead.
+    if: ${{ !(github.event_name == 'pull_request' && github.head_ref == 'dev' && github.base_ref == 'main') }}
     name: build-test (${{ matrix.phase }} ${{ matrix.arch }})
     needs: matrix-tier
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
+    # Dependencies come from the published iowarp/deps-cpu image (amd64 +
+    # arm64), not a per-run conda solve: that install alone was ~28 min of
+    # every PR. The image user (iowarp, uid 1001) matches the hosted runner's
+    # uid, so the mounted workspace stays writable; it has passwordless sudo
+    # for the per-phase apt packages. /dev/fuse + SYS_ADMIN + unconfined
+    # apparmor/seccomp let the FUSE phase mount and io_uring work (the default
+    # seccomp profile blocks io_uring); --shm-size matches a bare runner's
+    # /dev/shm so the runtime's GB-scale segments fit.
+    container:
+      image: iowarp/deps-cpu:latest
+      options: >-
+        --shm-size=8g --device /dev/fuse --cap-add SYS_ADMIN
+        --security-opt apparmor=unconfined --security-opt seccomp=unconfined
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.matrix-tier.outputs.phases) }}
@@ -120,14 +158,11 @@ jobs:
         uses: actions/checkout@v5
         with:
           submodules: recursive
-      - name: Install lcov (+ phase deps)
+      - name: Install phase packages (lcov and HDF5 are already in deps-cpu)
+        if: matrix.apt != '' || matrix.phase == 'prediction'
         run: |
           bash CI/retry.sh sudo apt-get update
-          bash CI/retry.sh sudo apt-get install -y lcov ${{ matrix.apt }}
-      - name: Install project dependencies (CI/ci-deps.sh)
-        run: |
-          chmod +x CI/ci-deps.sh
-          ./CI/ci-deps.sh
+          bash CI/retry.sh sudo apt-get install -y ${{ matrix.apt }} ${{ matrix.phase == 'prediction' && 'git-lfs' || '' }}
       # The prediction phase's E2E tests SKIP without the trained models and the
       # server's Python deps; provide both so they actually run.
       - name: Pull prediction models (Git LFS)
@@ -158,15 +193,83 @@ jobs:
           PHASE_CDASH_KEEP: ${{ matrix.cdash_scope }}
           PKG_CONFIG_PATH: ${{ matrix.pkgconfig }}
         run: |
-          if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
-            source "$HOME/miniconda3/etc/profile.d/conda.sh"
-          elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
-            source "$HOME/anaconda3/etc/profile.d/conda.sh"
-          elif command -v conda &>/dev/null; then
-            eval "$(conda shell.bash hook)"
-          fi
-          conda activate iowarp
           ./CI/calculate_coverage.sh --build --run-ctest --clean --site ${{ matrix.site }}
+      - name: Require real Python conditional-write and capacity coverage
+        if: matrix.phase == 'unit' && matrix.arch == 'amd64'
+        # These daemon/restart fixtures are excluded from the broad CDash
+        # UNTIL_PASS sweep. Each must be discovered once and run once, without
+        # retry; missing, skipped or failed execution is a failure.
+        run: |
+          python3 -m pip install psutil
+          python3 - <<'PY'
+          from collections import Counter
+          import json
+          from pathlib import Path
+          import subprocess
+          import xml.etree.ElementTree as ET
+
+          for test, report in (("python_conditional_put_test", "conditional-python.xml"),
+                               ("python_capacity_test", "capacity-python.xml")):
+              command = ["ctest", "--test-dir", "build", "-R", f"^{test}$"]
+              discovered = json.loads(subprocess.check_output(command + ["--show-only=json-v1"], text=True))
+              # CTest adds the required cleanup fixture around the selected test.
+              expected_names = Counter({
+                  "cr_pre_test_cleanup": 1,
+                  test: 1,
+                  "cr_post_test_cleanup": 1,
+              })
+              discovered_names = Counter(t["name"] for t in discovered["tests"])
+              print(f"Focused {test}: {dict(discovered_names)}", flush=True)
+              if discovered_names != expected_names:
+                  raise SystemExit(f"{test} must be registered exactly once with its cleanup fixture")
+              junit = Path("build", report).resolve()
+              subprocess.run(command + ["--output-on-failure", "--no-tests=error", "--output-junit", str(junit)], check=True)
+              results = list(ET.parse(junit).getroot().iter("testcase"))
+              result_names = Counter(result.attrib["name"] for result in results)
+              unsuccessful = any(result.find(tag) is not None for result in results for tag in ("skipped", "failure", "error"))
+              if result_names != expected_names or unsuccessful:
+                  raise SystemExit(f"{test} and its cleanup fixture must execute once and pass; absent/skipped/failed is failure")
+              print(f"Verified: {test} executed once and passed against the real runtime")
+          PY
+          # Refresh the report (native counters after healthy client finalizers
+          # ran) without rebuilding, clearing counters, or rerunning any tests.
+          ./CI/calculate_coverage.sh
+      - name: Require real Python capacity coverage
+        if: matrix.phase == 'unit' && matrix.arch == 'amd64'
+        # This daemon/restart fixture executes exactly once, outside the broad
+        # UNTIL_PASS sweep. Missing, skipped or failed execution is a failure.
+        run: |
+          python3 -m pip install psutil
+          python3 - <<'PY'
+          from collections import Counter
+          import json
+          from pathlib import Path
+          import subprocess
+          import xml.etree.ElementTree as ET
+
+          command = ["ctest", "--test-dir", "build", "-R", "^python_capacity_test$"]
+          discovered = json.loads(subprocess.check_output(command + ["--show-only=json-v1"], text=True))
+          expected_names = Counter({
+              "cr_pre_test_cleanup": 1,
+              "python_capacity_test": 1,
+              "cr_post_test_cleanup": 1,
+          })
+          discovered_names = Counter(test["name"] for test in discovered["tests"])
+          print(f"Focused capacity tests: {dict(discovered_names)}", flush=True)
+          if discovered_names != expected_names:
+              raise SystemExit("python_capacity_test must be registered exactly once with its cleanup fixture")
+          junit = Path("build/capacity-python.xml").resolve()
+          subprocess.run(command + ["--output-on-failure", "--no-tests=error", "--output-junit", str(junit)], check=True)
+          results = list(ET.parse(junit).getroot().iter("testcase"))
+          result_names = Counter(result.attrib["name"] for result in results)
+          unsuccessful = any(result.find(tag) is not None for result in results for tag in ("skipped", "failure", "error"))
+          if result_names != expected_names or unsuccessful:
+              raise SystemExit("python_capacity_test and its cleanup fixture must execute once and pass; absent/skipped/failed is failure")
+          print("Verified: python_capacity_test executed once and passed against the real runtime")
+          PY
+          # Capture the real native counters after healthy client finalizers ran.
+          # Do not rebuild, clear counters, or repeat any tests.
+          ./CI/calculate_coverage.sh
       - name: Upload coverage to Codecov
         if: always()
         uses: codecov/codecov-action@v5
@@ -180,6 +283,22 @@ jobs:
   # Docker (deps-cpu) is the canonical reproducible build; native + arm64 cover
   # the io_uring path the container seccomp profile blocks, and the arm64 memory
   # model.
+  # Stand-in for the ruleset-required check `build-test (unit amd64)` on
+  # dev->main PRs. build-test is skipped there (dev's full CI already ran it,
+  # and the "dev full CI passed" gate on the same PR enforces that), but a
+  # skipped matrix job reports under its unexpanded name
+  # "build-test (${{ matrix.phase }} ${{ matrix.arch }})", so the required
+  # check never appears and the PR stays BLOCKED. This job reports that name
+  # only on dev->main PRs; on every other event it is named differently, so a
+  # skipped copy can never stand in for the real build-test result.
+  devmain-required-check:
+    if: ${{ github.event_name == 'pull_request' && github.head_ref == 'dev' && github.base_ref == 'main' }}
+    name: ${{ (github.event_name == 'pull_request' && github.head_ref == 'dev' && github.base_ref == 'main') && 'build-test (unit amd64)' || 'dev-to-main required-check stand-in' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Covered by the dev full CI gate
+        run: echo "dev->main PR - build-test ran in dev's full CI; see the 'dev full CI passed' check."
+
   boost-docker:
     name: boost (docker deps-cpu)
     # Push-only (#921): a coroutine-backend build variant, not an arch. It
@@ -214,22 +333,13 @@ jobs:
               # not belong in this containerized build. Excluded by label so
               # new force_net tests are handled automatically.
               #
-              # -E excludes tests incompatible with THIS docker variant
-              # specifically -- they pass on the native amd64 + arm64 boost
-              # jobs (verified), which provide the real coverage:
-              #  * cte_tiered_storage_all and cte_tiered_dram_default_all --
-              #    the reorganize-down leg intermittently fails a few blob
-              #    PutBlobs with rc=7 (3/96) ONLY in the constrained deps-cpu
-              #    container. Enlarging the slow file tier to hold the whole
-              #    working set was tried and did NOT help, so the binding
-              #    constraint is the deps-cpu container memory/CPU limits
-              #    during the rapid Get/Del/Put reorganize burst, not the tier
-              #    size. The
-              #    failure count varies run to run (95 vs 93 /96), consistent
-              #    with a transient container-resource limit rather than a code
-              #    bug. Tracked for a deeper in-container bdev-allocation fix.
-              #  * ctp_async_io -- unrelated deps-cpu incompatibility.
-              ctest --output-on-failure --timeout 180 --repeat until-pass:3 -LE "ollama|force_net|flaky" -E "ctp_async_io|cte_tiered_storage_all|cte_tiered_dram_default_all"
+              # cte_tiered_storage_all / cte_tiered_dram_default_all used to be
+              # excluded here: their reorganize-down leg failed a few blobs
+              # with rc=7 in this constrained container (#706). Reorganize now
+              # places the new copy before freeing the old one (756097c94) and
+              # the tests assert real placement (#794); both ran 20x clean in
+              # deps-cpu with 2 CPUs and the default 64 MB /dev/shm.
+              ctest --output-on-failure --timeout 180 --repeat until-pass:3 -LE "ollama|force_net|flaky"
             '
 
   boost-native:
@@ -241,7 +351,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm]
+        # x86_64 on the newer toolchain (the deps-cpu job covers 24.04 x86_64)
+        # and arm64 for its memory model and Boost.Context's aarch64 switch.
+        os: [ubuntu-26.04, ubuntu-24.04-arm]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
@@ -275,9 +387,80 @@ jobs:
         # did not" (#919/#921). Reports only -- never fails the job.
         run: bash CI/report_flaky_tests.sh build-boost/Testing/Temporary/LastTest.log "linux boost ${{ matrix.os }}"
 
+  # ---- S3 bdev (kS3): SigV4 + REST client ------------------------------------
+  # CLIO_ENABLE_AMAZON_DRIVE defaults OFF and no other job turns it on, so
+  # without this job the S3 bdev transport is never compiled in CI and
+  # cr_bdev_s3_rest -- which is registered only under that flag -- never runs
+  # anywhere. cr_bdev_sigv4 does run in the ordinary jobs (it is gated on
+  # Poco_FOUND alone, deliberately, since it is pure string manipulation); it is
+  # repeated here because it is the first thing to check when a signing change
+  # breaks the round trip.
+  #
+  # Neither test touches the network: cr_bdev_sigv4 replays botocore-generated
+  # vectors offline, and cr_bdev_s3_rest is driven by s3_stub_server.py, a
+  # stdlib-only in-memory S3 stand-in on an ephemeral port that verifies SigV4
+  # itself. No AWS account, no credentials, no egress -- so this gates PRs too,
+  # unlike the push-only boost variants above.
+  s3-bdev:
+    # Skipped on dev -> main PRs: dev-to-main-gate.yml checks dev's full CI on the same commit instead.
+    if: ${{ !(github.event_name == 'pull_request' && github.head_ref == 'dev' && github.base_ref == 'main') }}
+    name: s3-bdev (sigv4 + rest)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - name: Build + test the S3 bdev (inside deps-cpu)
+        run: |
+          # deps-cpu already carries libpoco-dev, libssl-dev and python3, which
+          # is everything this job needs.
+          docker run --rm -v "${{ github.workspace }}":/workspace -w /workspace -u 0 \
+            iowarp/deps-cpu:latest bash -c '
+              set -eo pipefail
+              export LD_LIBRARY_PATH=/usr/local/lib:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
+              export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/lib/x86_64-linux-gnu/pkgconfig:$PKG_CONFIG_PATH
+              git config --global --add safe.directory /workspace
+              # release, not boost: this job has no reason to pull in
+              # libboost-context-dev. PYTHON=OFF mirrors the boost preset --
+              # the bindings are unrelated here and only slow the configure.
+              cmake --preset release \
+                -DCLIO_ENABLE_AMAZON_DRIVE=ON \
+                -DCLIO_CORE_ENABLE_PYTHON=OFF 2>&1 | tee /tmp/configure.log
+              # Fail loudly if the flag was silently auto-disabled. The root
+              # CMakeLists does a plain `set(CLIO_ENABLE_AMAZON_DRIVE OFF)` when
+              # Poco is missing -- a normal variable that shadows the cache, so
+              # CMakeCache.txt still says ON and cannot be used to detect this.
+              # The STATUS line is emitted only when the flag actually survived.
+              grep -q "Amazon S3 bdev support: ENABLED" /tmp/configure.log || {
+                echo "ERROR: CLIO_ENABLE_AMAZON_DRIVE was disabled during configure (Poco not found?)." >&2
+                exit 1
+              }
+              # clio_bdev_runtime is built for compile coverage of
+              # s3_bdev_transport.cc, which nothing else in CI compiles. The two
+              # test targets do not link it, so it would not be built otherwise.
+              cmake --build build -j"$(nproc)" --target \
+                clio_run_sigv4_test clio_run_s3_rest_test clio_bdev_runtime
+              # No retries: both tests are deterministic and network-free, so a
+              # failure here is a real one.
+              ctest --test-dir build --output-on-failure --timeout 180 \
+                -R "cr_bdev_sigv4|cr_bdev_s3_rest"
+              # ctest exits 0 when a filter matches nothing, which would make a
+              # renamed or dropped test look like a pass. Match the two names
+              # exactly rather than counting lines: -R also pulls in the
+              # cr_pre/post_test_cleanup fixtures, so a raw line count is 4.
+              test "$(ctest --test-dir build -N -R "cr_bdev_sigv4|cr_bdev_s3_rest" \
+                | grep -cE "Test +#[0-9]+: (cr_bdev_sigv4|cr_bdev_s3_rest)$")" -eq 2 || {
+                echo "ERROR: expected both cr_bdev_sigv4 and cr_bdev_s3_rest to be registered." >&2
+                exit 1
+              }
+            '
+
   # ---- Sanitizers: asan / ubsan / msan --------------------------------------
   sanitizers:
     name: sanitizer (${{ matrix.sanitizer }})
+    if: github.event_name != 'pull_request'
     needs: matrix-tier
     runs-on: ubuntu-24.04
     timeout-minutes: 120
@@ -323,6 +506,7 @@ jobs:
   # ---- Leak check (gating allocation-leak detection, #560/#563) -------------
   leak-check:
     name: leak-check
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -353,8 +537,10 @@ jobs:
           # In a leak-tracking build every test auto-checks that the runtime
           # private heap returns to its pre-test level. Run the calibrated
           # force-net suites + the per-RPC leak test. cte_tag_force_net /
-          # cte_query_force_net are excluded (pre-existing CI-only hang, #579).
+          # cte_query_force_net were excluded for a CI-only hang (#579): the
+          # process hung at exit in zmq_ctx_term, fixed by d7598a6e4. Its
+          # later ~148 KB "leak" was an elastic worker the per-test check
+          # could not see (#1208, fixed in simple_test.h).
           ctest --test-dir build-leak \
             -R "leak|cr_streaming_force_net|cte_.*force_net" \
-            -E "cte_tag_force_net|cte_query_force_net" \
             --output-on-failure --no-tests=error

@@ -39,7 +39,7 @@ __global__ MD_LAUNCH_BOUNDS void IntegrateKernel(clio::run::IpcManagerGpuInfo in
                                 gv::DeviceVector<float> v,
                                 gv::DeviceVector<float> third, int use_third,
                                 float dt, float gx, float gy_, float gz,
-                                int drift, u32 nblocks,
+                                int drift, u64 pg_lo, u64 pg_hi, u32 nblocks,
                                 gy::YieldableView<> yv,
                                 gy::YieldStackView ys) {
   CLIO_GPU_INIT(info, nullptr);
@@ -49,7 +49,7 @@ __global__ MD_LAUNCH_BOUNDS void IntegrateKernel(clio::run::IpcManagerGpuInfo in
   gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
   __syncthreads();
   CLIO_YCORO_RUN(IntegrateCoro(x, v, third, use_third, dt, gx, gy_, gz,
-                               drift, nblocks, yv.Block()));
+                               drift, pg_lo, pg_hi, nblocks, yv.Block()));
 }
 
 
@@ -400,11 +400,14 @@ void LaunchIntegrate(dim3 grid,
                      float gy_,
                      float gz,
                      int drift,
+                     u64 pg_lo,
+                     u64 pg_hi,
                      u32 nblocks,
                      gy::YieldableView<> yv,
                      gy::YieldStackView ys) {
   IntegrateKernel<<<grid, block, smem>>>(
-      info, x, v, third, use_third, dt, gx, gy_, gz, drift, nblocks, yv, ys);
+      info, x, v, third, use_third, dt, gx, gy_, gz, drift, pg_lo, pg_hi,
+      nblocks, yv, ys);
 }
 
 void LaunchPublishSlab(dim3 grid,

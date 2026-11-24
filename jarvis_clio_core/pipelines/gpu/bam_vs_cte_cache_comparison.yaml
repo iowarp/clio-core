@@ -15,7 +15,7 @@
 # Requirements:
 #   - clio_cte_gpu_bench in PATH
 #   - CUDA-capable GPU
-#   - BaM tests require -DWRP_CORE_ENABLE_BAM=ON
+#   - BaM tests need BaM support, which this tree no longer builds (no CMake option)
 #
 # Usage:
 #   jarvis pipeline test gpu/bam_vs_cte_cache_comparison.yaml

@@ -257,8 +257,10 @@ TEST_CASE("RefreshRepo - generates methods header and lib_exec source",
 
   REQUIRE(CallRefreshRepo({tmp.path.string()}) == 0);
 
-  // module_name overrides the directory name in the include path
-  fs::path header = tmp.path / "alpha" / "include" / "test::ns" / "alpha_mod" /
+  // module_name overrides the directory name in the include path. With no
+  // include/ tree yet, the prefix is the namespace with "::" as "_" -- never
+  // a literal "test::ns" directory (#1249).
+  fs::path header = tmp.path / "alpha" / "include" / "test_ns" / "alpha_mod" /
                     "autogen" / "alpha_methods.h";
   fs::path source = tmp.path / "alpha" / "src" / "autogen" / "alpha_lib_exec.cc";
   REQUIRE(fs::exists(header));
@@ -300,8 +302,9 @@ TEST_CASE("RefreshRepo - generates methods header and lib_exec source",
 
   const std::string s = ReadAll(source);
   SECTION("source includes runtime + autogen headers via module_name");
-  REQUIRE(Contains(s, "#include \"test::ns/alpha_mod/alpha_runtime.h\""));
-  REQUIRE(Contains(s, "test::ns/alpha_mod/autogen/alpha_methods.h"));
+  REQUIRE(Contains(s, "#include \"test_ns/alpha_mod/alpha_runtime.h\""));
+  REQUIRE(Contains(s, "test_ns/alpha_mod/autogen/alpha_methods.h"));
+  REQUIRE_FALSE(Contains(s, "test::ns/"));
 
   SECTION("kRestart >= 0 generates Runtime::Restart");
   REQUIRE(Contains(s, "void Runtime::Restart("));
@@ -335,6 +338,33 @@ TEST_CASE("RefreshRepo - generates methods header and lib_exec source",
 
   SECTION("malformed module yaml produced no output but no failure");
   REQUIRE_FALSE(fs::exists(tmp.path / "badmod" / "src"));
+}
+
+TEST_CASE("RefreshRepo - include prefix follows the module's header layout",
+          "[cli][refresh_repo]") {
+  // A namespace is not a path: clio::run lives under include/clio_runtime/,
+  // which no "::" mapping produces. The generator must use the directory
+  // that holds <module>/<chimod>_runtime.h (#1249).
+  TempDir tmp;
+  WriteFile(tmp.path / "clio_repo.yaml",
+            "namespace: clio::run\n"
+            "modules:\n"
+            "  - gamma\n");
+  WriteFile(tmp.path / "gamma" / "clio_mod.yaml", "module_name: gamma\n");
+  WriteFile(tmp.path / "gamma" / "include" / "clio_runtime" / "gamma" /
+                "gamma_runtime.h",
+            "// runtime header\n");
+
+  REQUIRE(CallRefreshRepo({tmp.path.string()}) == 0);
+
+  REQUIRE(fs::exists(tmp.path / "gamma" / "include" / "clio_runtime" /
+                     "gamma" / "autogen" / "gamma_methods.h"));
+  REQUIRE_FALSE(fs::exists(tmp.path / "gamma" / "include" / "clio_run"));
+  const std::string s =
+      ReadAll(tmp.path / "gamma" / "src" / "autogen" / "gamma_lib_exec.cc");
+  REQUIRE(Contains(s, "#include \"clio_runtime/gamma/gamma_runtime.h\""));
+  REQUIRE(Contains(s, "clio_runtime/gamma/autogen/gamma_methods.h"));
+  REQUIRE(Contains(s, "namespace clio::run::gamma {"));
 }
 
 TEST_CASE("RefreshRepo - default namespace and module with no methods",
@@ -418,9 +448,9 @@ TEST_CASE("CliDispatch - legacy nested forms", "[cli][dispatch]") {
   SECTION("runtime with unknown subcommand exits 1");
   REQUIRE(RunCli("runtime bogus") == 1);
 
-  SECTION("runtime start/restart --help exit 0");
+  SECTION("runtime start --help exits 0; the removed restart exits 1");
   REQUIRE(RunCli("runtime start --help") == 0);
-  REQUIRE(RunCli("runtime restart --help") == 0);
+  REQUIRE(RunCli("runtime restart --help") == 1);
 
   SECTION("repo with no subcommand exits 1");
   REQUIRE(RunCli("repo") == 1);
@@ -433,12 +463,17 @@ TEST_CASE("CliDispatch - legacy nested forms", "[cli][dispatch]") {
 }
 
 TEST_CASE("CliDispatch - command help and argument errors", "[cli][dispatch]") {
-  SECTION("start/restart help exits 0; unknown arg exits 1");
+  SECTION("start help exits 0; unknown arg exits 1; restart is removed");
   REQUIRE(RunCli("start --help") == 0);
   REQUIRE(RunCli("start -h") == 0);
   REQUIRE(RunCli("start --bogus") == 1);
-  REQUIRE(RunCli("restart --help") == 0);
-  REQUIRE(RunCli("restart --bogus") == 1);
+  REQUIRE(RunCli("restart") == 1);
+  REQUIRE(RunCli("restart --help") == 1);
+
+  SECTION("--disk needs a path (#551)");
+  REQUIRE(RunCli("start --disk") == 1);
+  REQUIRE(RunCli("restart --disk") == 1);
+  REQUIRE(RunCli("start --disk \"\"") == 1);
 
   SECTION("refresh dispatch: no args / bad repo exit 1");
   REQUIRE(RunCli("refresh") == 1);
@@ -463,6 +498,25 @@ TEST_CASE("CliDispatch - command help and argument errors", "[cli][dispatch]") {
   REQUIRE(RunCli("compose --help") == 0);
   REQUIRE(RunCli("compose -h") == 0);
   REQUIRE(RunCli("compose --unregister") == 1);   // missing config path
+
+  SECTION("--version under every spelling");
+  REQUIRE(RunCli("--version") == 0);
+  REQUIRE(RunCli("-V") == 0);
+  REQUIRE(RunCli("version") == 0);
+
+  SECTION("viz argument errors never reach the runtime");
+  REQUIRE(RunCli("viz") == 1);                    // no action
+  REQUIRE(RunCli("viz --help") == 0);
+  REQUIRE(RunCli("viz -h") == 0);
+  REQUIRE(RunCli("viz status --help") == 0);
+  REQUIRE(RunCli("viz bogus") == 1);              // unknown action
+  REQUIRE(RunCli("viz status --port 1") == 1);    // options are start-only
+  REQUIRE(RunCli("viz start --bogus") == 1);
+  REQUIRE(RunCli("viz start --port") == 1);       // missing value
+  REQUIRE(RunCli("viz start --port 70000") == 1); // out of range
+  REQUIRE(RunCli("viz start --port 12ab") == 1);  // not a number
+  REQUIRE(RunCli("viz start --bind \"\"") == 1);  // empty
+  REQUIRE(RunCli("viz start --bind 'a&b'") == 1); // would split the query
 }
 
 //==============================================================================
@@ -498,6 +552,11 @@ TEST_CASE("CliClientError - commands fail fast without a runtime",
   REQUIRE(RunCli("compose " + (tmp.path / "compose.yaml").string()) == 1);
   REQUIRE(RunCli("compose --unregister " +
                  (tmp.path / "compose.yaml").string()) == 1);
+
+  SECTION("viz reports the runtime as unreachable (exit 2)");
+  REQUIRE(RunCli("viz status") == 2);
+  REQUIRE(RunCli("viz start --port 0") == 2);
+  REQUIRE(RunCli("viz stop") == 2);
 }
 
 //==============================================================================
@@ -564,6 +623,29 @@ TEST_CASE("CliRuntime - client commands against a live runtime",
   int migrate_rc = RunCliTimed({"migrate", "--pool-id", "320.0",
                                 "--container-id", "0", "--node-id", "1"}, 60);
   REQUIRE((migrate_rc == 0 || migrate_rc == 1));
+
+  SECTION("viz stop/status/start/status round trip");
+  // Whatever the daemon's configured dashboard state, stop converges it.
+  REQUIRE(RunCliTimed({"viz", "stop"}, 60) == 0);
+  REQUIRE(RunCliTimed({"viz", "stop"}, 60) == 0);   // idempotent
+  REQUIRE(RunCliTimed({"viz", "status"}, 60) == 1);  // not running
+#if CLIO_RUN_HAS_POCO
+  // A query may not move the dashboard off loopback unless the runtime's
+  // configuration names that address (here it names the default, loopback).
+  REQUIRE(RunCliTimed({"viz", "start", "--port", "0", "--bind", "0.0.0.0"},
+                      60) == 1);
+  REQUIRE(RunCliTimed({"viz", "status"}, 60) == 1);
+  // Ephemeral port: CI runs many daemons at once.
+  REQUIRE(RunCliTimed({"viz", "start", "--port", "0", "--bind", "127.0.0.1"},
+                      60) == 0);
+  REQUIRE(RunCliTimed({"viz", "status"}, 60) == 0);
+  REQUIRE(RunCliTimed({"viz", "start"}, 60) == 0);   // already running
+  REQUIRE(RunCliTimed({"viz", "stop"}, 60) == 0);
+  REQUIRE(RunCliTimed({"viz", "status"}, 60) == 1);
+#else
+  // Built without Poco: the dashboard cannot start, and says so.
+  REQUIRE(RunCliTimed({"viz", "start", "--port", "0"}, 60) == 1);
+#endif
 
   SECTION("stop shuts the runtime down cleanly");
   REQUIRE(RunCliTimed({"stop", "--grace-period", "2000"}, 90) == 0);

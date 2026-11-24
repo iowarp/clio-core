@@ -259,20 +259,14 @@ macro(wrp_core_enable_rocm GPU_RUNTIME CXX_STANDARD)
     endif()
 endmacro()
 
-# Enable Intel GPU / SYCL (oneAPI icpx -fsycl, or AdaptiveCpp acpp)
+# Detect the SYCL compiler flavor and locate <sycl/sycl.hpp>.
 #
-# Detects the SYCL compiler flavor and sets CLIO_SYCL_COMPILER (DPCPP|ACPP).
-# Configures default values for SYCL_TARGET / SYCL_DEVICE / SYCL_CUDA_ARCH
-# that callers can override on the CMake command line.
-#
-# Flags are NOT applied globally to avoid breaking PCH and non-SYCL targets.
-# Use add_sycl_library / add_sycl_executable (defined below near
-# add_cuda_library / add_cuda_executable), or call wrp_core_apply_sycl_flags()
-# directly on a target that contains SYCL device code.
-macro(wrp_core_enable_sycl CXX_STANDARD)
-    set(CMAKE_CXX_STANDARD ${CXX_STANDARD})
-    set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
+# Split out of wrp_core_enable_sycl() because the top-level CMakeLists defines
+# CTP_ENABLE_SYCL globally -- and therefore needs CLIO_SYCL_INCLUDE_DIR -- at a
+# point BEFORE any add_subdirectory() has had a chance to call
+# wrp_core_enable_sycl(). Everything set here is cached and guarded, so calling
+# it from both places is idempotent.
+macro(wrp_core_detect_sycl)
     # Compiler flavor detection. Override with -DWRP_SYCL_COMPILER=DPCPP|ACPP.
     if(NOT DEFINED CLIO_SYCL_COMPILER)
         get_filename_component(_wrp_cxx_name "${CMAKE_CXX_COMPILER}" NAME)
@@ -286,31 +280,6 @@ macro(wrp_core_enable_sycl CXX_STANDARD)
                 "SYCL compiler flavor (DPCPP|ACPP)")
         endif()
     endif()
-
-    # SYCL target triple. Override with -DSYCL_TARGET=...
-    #   spir64               JIT, runs on any OpenCL/Level Zero device
-    #   spir64_gen           AOT, requires SYCL_DEVICE (e.g. pvc, dg2, gen12lp)
-    #   nvptx64-nvidia-cuda  NVIDIA GPUs via DPC++ CUDA backend
-    #   amdgcn-amd-amdhsa    AMD GPUs via DPC++ ROCm backend
-    if(NOT DEFINED CACHE{SYCL_TARGET})
-        set(SYCL_TARGET "spir64" CACHE STRING
-            "SYCL target triple (spir64|spir64_gen|nvptx64-nvidia-cuda|amdgcn-amd-amdhsa)")
-    endif()
-    if(NOT DEFINED CACHE{SYCL_DEVICE})
-        set(SYCL_DEVICE "" CACHE STRING
-            "SYCL AOT device for spir64_gen target (e.g. pvc, dg2, gen12lp)")
-    endif()
-    if(NOT DEFINED CACHE{SYCL_CUDA_ARCH})
-        set(SYCL_CUDA_ARCH "sm_70" CACHE STRING
-            "CUDA architecture when SYCL_TARGET=nvptx64-nvidia-cuda")
-    endif()
-
-    # Opt-in flag for SYCL device-side virtual functions.
-    # -fsycl-allow-virtual-functions is supported by recent DPC++ nightlies;
-    # leave OFF unless you have confirmed your toolchain accepts it.
-    option(CLIO_SYCL_ALLOW_VIRTUAL_FUNCTIONS
-        "Pass -fsycl-allow-virtual-functions to DPC++ (recent compiler only)"
-        OFF)
 
     # Locate the SYCL headers so HOST translation units -- compiled with
     # CTP_ENABLE_SYCL=1 but WITHOUT -fsycl (see context-runtime/src and
@@ -345,6 +314,62 @@ macro(wrp_core_enable_sycl CXX_STANDARD)
             "nor at the legacy /opt prefixes. Host TUs that include it will fail to "
             "compile. Set -DCLIO_SYCL_INCLUDE_DIR=<dir containing sycl/sycl.hpp>.")
     endif()
+endmacro()
+
+# Enable Intel GPU / SYCL (oneAPI icpx -fsycl, or AdaptiveCpp acpp)
+#
+# Detects the SYCL compiler flavor and sets CLIO_SYCL_COMPILER (DPCPP|ACPP).
+# Configures default values for SYCL_TARGET / SYCL_DEVICE / SYCL_CUDA_ARCH
+# that callers can override on the CMake command line.
+#
+# Flags are NOT applied globally to avoid breaking PCH and non-SYCL targets.
+# Use add_sycl_library / add_sycl_executable (defined below near
+# add_cuda_library / add_cuda_executable), or call wrp_core_apply_sycl_flags()
+# directly on a target that contains SYCL device code.
+macro(wrp_core_enable_sycl CXX_STANDARD)
+    set(CMAKE_CXX_STANDARD ${CXX_STANDARD})
+    set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+    wrp_core_detect_sycl()
+
+    # SYCL target triple. Override with -DSYCL_TARGET=...
+    #   spir64               JIT, runs on any OpenCL/Level Zero device
+    #   spir64_gen           AOT, requires SYCL_DEVICE (e.g. pvc, dg2, gen12lp)
+    #   nvptx64-nvidia-cuda  NVIDIA GPUs via DPC++ CUDA backend
+    #   amdgcn-amd-amdhsa    AMD GPUs via DPC++ ROCm backend
+    if(NOT DEFINED CACHE{SYCL_TARGET})
+        set(SYCL_TARGET "spir64" CACHE STRING
+            "SYCL target triple (spir64|spir64_gen|nvptx64-nvidia-cuda|amdgcn-amd-amdhsa)")
+    endif()
+    if(NOT DEFINED CACHE{SYCL_DEVICE})
+        set(SYCL_DEVICE "" CACHE STRING
+            "SYCL AOT device for spir64_gen target (e.g. pvc, dg2, gen12lp)")
+    endif()
+    if(NOT DEFINED CACHE{SYCL_CUDA_ARCH})
+        set(SYCL_CUDA_ARCH "sm_70" CACHE STRING
+            "CUDA architecture when SYCL_TARGET=nvptx64-nvidia-cuda")
+    endif()
+    # PTX ISA version for the NVPTX backend, as a target feature (ptx87, ...).
+    #
+    # DPC++ pins a default PTX version per nightly, and an arch newer than that
+    # default is a HARD BACKEND ERROR rather than a diagnostic at the flag:
+    #   "PTX version 8.5 does not support target 'sm_120'. Minimum required
+    #    PTX version is 8.7."
+    # Empty means "use the compiler's default", which is right everywhere the
+    # default already covers SYCL_CUDA_ARCH; set it only when it does not
+    # (sm_120 / Blackwell needs -DSYCL_PTX_FEATURE=ptx87).
+    if(NOT DEFINED CACHE{SYCL_PTX_FEATURE})
+        set(SYCL_PTX_FEATURE "" CACHE STRING
+            "PTX ISA target feature for the NVPTX SYCL backend (e.g. ptx87); empty uses the compiler default")
+    endif()
+
+    # Opt-in flag for SYCL device-side virtual functions.
+    # -fsycl-allow-virtual-functions is supported by recent DPC++ nightlies;
+    # leave OFF unless you have confirmed your toolchain accepts it.
+    option(CLIO_SYCL_ALLOW_VIRTUAL_FUNCTIONS
+        "Pass -fsycl-allow-virtual-functions to DPC++ (recent compiler only)"
+        OFF)
+
 
     message(STATUS "SYCL enabled: compiler=${CLIO_SYCL_COMPILER} target=${SYCL_TARGET} device=${SYCL_DEVICE} include=${CLIO_SYCL_INCLUDE_DIR}")
 endmacro()
@@ -404,6 +429,19 @@ function(wrp_core_apply_sycl_flags target)
             target_link_options(${target} PRIVATE
                 "SHELL:-Xsycl-target-backend=nvptx64-nvidia-cuda --cuda-gpu-arch=${SYCL_CUDA_ARCH}"
             )
+            # --cuda-feature goes on the DRIVER line, not through
+            # -Xsycl-target-backend. Only the first -Xsycl-target-backend is
+            # honoured during compilation (the arch one above); a second is
+            # silently dropped with "argument unused during compilation" and
+            # the backend still dies on the default PTX version. Folding both
+            # into one quoted pass-through does not work either -- the arch
+            # parser then reads the whole string as the arch name.
+            if(SYCL_PTX_FEATURE)
+                target_compile_options(${target} PRIVATE
+                    --cuda-feature=+${SYCL_PTX_FEATURE})
+                target_link_options(${target} PRIVATE
+                    --cuda-feature=+${SYCL_PTX_FEATURE})
+            endif()
         endif()
 
         if(CLIO_SYCL_ALLOW_VIRTUAL_FUNCTIONS)
@@ -1601,7 +1639,6 @@ message(STATUS "IowarpCoreCommon.cmake loaded successfully")
 # and the helper functions gained `clio` branding (e.g. add_chimod_client ->
 # add_clio_module_client). The legacy names below are macro wrappers that
 # forward to the new names so out-of-tree CMake code keeps building unchanged.
-# See docs/deprecation-notes.md.
 #==============================================================================
 
 # Function wrappers

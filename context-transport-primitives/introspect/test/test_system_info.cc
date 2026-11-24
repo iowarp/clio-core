@@ -1,0 +1,433 @@
+/*
+ * Copyright (c) 2024, Gnosis Research Center, Illinois Institute of Technology
+ * All rights reserved.
+ * This file is part of IOWarp Core.
+ * BSD 3-Clause License. See LICENSE file.
+ */
+
+/**
+ * Unit tests for SystemInfo (system_info.cc): CPU info accessors, TLS,
+ * memfd bookkeeping paths, hostname resolution, and directory listing.
+ */
+
+#include "basic_test.h"
+
+#include <clio_ctp/introspect/system_info.h>
+#include <clio_ctp/memory/backend/posix_shm_mmap.h>
+
+#include <cerrno>
+#include <cstdlib>
+#include <cstring>
+#include <atomic>
+#include <string>
+#include <thread>
+#include <vector>
+
+using ctp::SystemInfo;
+using ctp::ipc::PosixShmMmap;
+
+TEST_CASE("SystemInfoCpu") {
+  int cpus = SystemInfo::GetCpuCount();
+  REQUIRE(cpus >= 1);
+
+  // Frequency getters: values are platform-dependent (may be 0 inside
+  // containers without cpufreq), the point is exercising the read paths.
+  auto *sysinfo = CTP_SYSTEM_INFO;
+  sysinfo->RefreshCpuFreqKhz();
+  (void)sysinfo->GetCpuFreqKhz(0);
+  (void)sysinfo->GetCpuMaxFreqKhz(0);
+  (void)sysinfo->GetCpuMinFreqKhz(0);
+  (void)sysinfo->GetCpuMinFreqMhz(0);
+  (void)sysinfo->GetCpuMaxFreqMhz(0);
+
+  // Setters write to /sys cpufreq files; as an unprivileged user the
+  // streams silently fail to open, which still covers the formatting and
+  // write paths without changing system state.
+  sysinfo->SetCpuFreqMhz(0, 1000);
+  sysinfo->SetCpuFreqKhz(0, 1000000);
+  sysinfo->SetCpuMinFreqKhz(0, 1000000);
+  sysinfo->SetCpuMaxFreqKhz(0, 1000000);
+
+  REQUIRE(SystemInfo::GetPageSize() >= 512);
+  REQUIRE(SystemInfo::GetPid() > 0);
+  REQUIRE(SystemInfo::GetTid() >= 0);
+  (void)SystemInfo::GetUid();
+  (void)SystemInfo::GetGid();
+}
+
+TEST_CASE("SystemInfoMemoryAndCpuTimes") {
+  REQUIRE(SystemInfo::GetRamCapacity() > 0);
+  (void)SystemInfo::GetRamAvailable();
+  auto times = SystemInfo::GetCpuTimes();
+  (void)times;
+  SystemInfo::YieldThread();
+}
+
+TEST_CASE("SystemInfoTls") {
+  ctp::ThreadLocalKey key;
+  int value = 42;
+  REQUIRE(SystemInfo::CreateTls(key, &value));
+  int other = 7;
+  REQUIRE(SystemInfo::SetTls(key, &other));
+}
+
+TEST_CASE("SystemInfoMemfdDir") {
+  // CLIO_MEMFD_DIR override takes precedence (GetCompat also accepts the
+  // legacy CLIO_MEMFD_DIR spelling).
+  SystemInfo::Setenv("CLIO_MEMFD_DIR", "/tmp/ctp_memfd_test_override", 1);
+  std::string dir = SystemInfo::GetMemfdDir();
+  REQUIRE(dir == "/tmp/ctp_memfd_test_override");
+  std::string path = SystemInfo::GetMemfdPath("unit_test_seg");
+  REQUIRE(path.find("unit_test_seg") != std::string::npos);
+  SystemInfo::Unsetenv("CLIO_MEMFD_DIR");
+
+  // Default (user-derived) directory.
+  std::string default_dir = SystemInfo::GetMemfdDir();
+  REQUIRE(!default_dir.empty());
+}
+
+#ifndef _WIN32
+TEST_CASE("SystemInfoMemfdDirMustBePrivate") {
+  using State = SystemInfo::MemfdDirState;
+  const std::string base =
+      "/tmp/ctp_memfd_private_test_" + std::to_string(getpid());
+  const std::string dir = base + "_dir";
+  const std::string link = base + "_link";
+  SystemInfo::Setenv("CLIO_MEMFD_DIR", dir, 1);
+
+  // Missing, then created by EnsureMemfdDir with mode 0700.
+  rmdir(dir.c_str());
+  REQUIRE(SystemInfo::CheckMemfdDir() == State::kMissing);
+  REQUIRE(SystemInfo::EnsureMemfdDir());
+  struct stat st;
+  REQUIRE(lstat(dir.c_str(), &st) == 0);
+  REQUIRE((st.st_mode & 0777) == 0700);
+  REQUIRE(SystemInfo::CheckMemfdDir() == State::kPrivate);
+
+  // Readable by others is fine; writable by others is not.
+  chmod(dir.c_str(), 0755);
+  REQUIRE(SystemInfo::EnsureMemfdDir());
+  chmod(dir.c_str(), 0777);
+  REQUIRE(SystemInfo::CheckMemfdDir() == State::kUnsafe);
+  REQUIRE_FALSE(SystemInfo::EnsureMemfdDir());
+  chmod(dir.c_str(), 0770);
+  REQUIRE_FALSE(SystemInfo::EnsureMemfdDir());
+  chmod(dir.c_str(), 0700);
+
+  // A link is refused even when it points at a private directory.
+  unlink(link.c_str());
+  REQUIRE(symlink(dir.c_str(), link.c_str()) == 0);
+  SystemInfo::Setenv("CLIO_MEMFD_DIR", link, 1);
+  REQUIRE(SystemInfo::CheckMemfdDir() == State::kUnsafe);
+  REQUIRE_FALSE(SystemInfo::EnsureMemfdDir());
+
+  // No segment is created in, or opened from, a refused directory.
+  ctp::File fd;
+  REQUIRE_FALSE(SystemInfo::CreateNewSharedMemory(fd, "/memfd_private_seg", 4096));
+  REQUIRE_FALSE(SystemInfo::SharedMemoryExists("/memfd_private_seg"));
+
+  unlink(link.c_str());
+  rmdir(dir.c_str());
+  SystemInfo::Unsetenv("CLIO_MEMFD_DIR");
+}
+#endif
+
+TEST_CASE("SystemInfoNormalizePath") {
+  // Ordinary paths are untouched on every platform.
+  REQUIRE(SystemInfo::NormalizePath("/tmp/clio_x") == "/tmp/clio_x");
+  REQUIRE(SystemInfo::NormalizePath("C:\\Users\\u") == "C:\\Users\\u");
+  REQUIRE(SystemInfo::NormalizePath("").empty());
+#ifdef _WIN32
+  // Win32 verbatim paths lose their prefix (#1356).
+  REQUIRE(SystemInfo::NormalizePath("\\\\?\\C:\\Users\\u\\data") ==
+          "C:\\Users\\u\\data");
+  REQUIRE(SystemInfo::NormalizePath("//?/C:/Users/u") == "C:/Users/u");
+  REQUIRE(SystemInfo::NormalizePath("\\\\?\\UNC\\srv\\share\\d") ==
+          "\\\\srv\\share\\d");
+  // A verbatim CLIO_MEMFD_DIR yields usable segment paths.
+  SystemInfo::Setenv("CLIO_MEMFD_DIR", "\\\\?\\C:\\clio_test_dir", 1);
+  REQUIRE(SystemInfo::GetMemfdDir() == "C:\\clio_test_dir");
+  SystemInfo::Unsetenv("CLIO_MEMFD_DIR");
+#else
+  // On POSIX a "\\?\" prefix is just part of a file name.
+  REQUIRE(SystemInfo::NormalizePath("\\\\?\\C:\\x") == "\\\\?\\C:\\x");
+#endif
+}
+
+TEST_CASE("SystemInfoHostnameResolution") {
+  // localhost must resolve to at least one address.
+  std::vector<std::string> ips = SystemInfo::ResolveHostname("localhost");
+  REQUIRE(!ips.empty());
+
+  // RFC 2606 reserved TLD: resolution must fail and return empty.
+  std::vector<std::string> none =
+      SystemInfo::ResolveHostname("no-such-host.invalid");
+  REQUIRE(none.empty());
+}
+
+TEST_CASE("SystemInfoSharedMemory") {
+  const std::string seg = "ctp_sysinfo_test_seg";
+  constexpr size_t kSize = 64 * 1024;
+
+  // Create, map, write, unmap, reopen, destroy.
+  ctp::File fd;
+  SystemInfo::DestroySharedMemory(seg);  // clean slate; missing is a no-op
+  REQUIRE(SystemInfo::CreateNewSharedMemory(fd, seg, kSize));
+  void *mapped = SystemInfo::MapSharedMemory(fd, kSize, 0);
+  REQUIRE(mapped != nullptr);
+  memset(mapped, 0x5A, kSize);
+  SystemInfo::UnmapMemory(mapped, kSize);
+
+  ctp::File fd2;
+  REQUIRE(SystemInfo::OpenSharedMemory(fd2, seg));
+  SystemInfo::CloseSharedMemory(fd2);
+  SystemInfo::CloseSharedMemory(fd);
+  SystemInfo::DestroySharedMemory(seg);
+
+  // Reopening a destroyed segment fails.
+  ctp::File fd3;
+  REQUIRE_FALSE(SystemInfo::OpenSharedMemory(fd3, seg));
+
+  // Private anonymous mapping.
+  void *priv = SystemInfo::MapPrivateMemory(kSize);
+  REQUIRE(priv != nullptr);
+  memset(priv, 1, kSize);
+  SystemInfo::UnmapMemory(priv, kSize);
+}
+
+TEST_CASE("SystemInfoListDirectory") {
+  std::vector<std::string> entries = SystemInfo::ListDirectory("/tmp");
+  // /tmp exists; "." and ".." must be filtered out.
+  for (const auto &e : entries) {
+    REQUIRE(e != ".");
+    REQUIRE(e != "..");
+  }
+
+  std::vector<std::string> missing =
+      SystemInfo::ListDirectory("/nonexistent_ctp_dir");
+  REQUIRE(missing.empty());
+}
+
+TEST_CASE("SystemInfoProcessAndModule") {
+  // The current process must report as alive; a clearly-unused PID must not.
+  REQUIRE(SystemInfo::IsProcessAlive(SystemInfo::GetPid()));
+  // PID 0x7FFFFFFF is not a realistic live process on this host.
+  REQUIRE_FALSE(SystemInfo::IsProcessAlive(0x7FFFFFFF));
+
+  // GetModuleDirectory resolves the directory of the loaded module via
+  // dladdr/realpath (POSIX) or GetModuleFileNameA (Windows); it must return a
+  // non-empty absolute path for this binary.
+  std::string mod_dir = SystemInfo::GetModuleDirectory();
+  REQUIRE(!mod_dir.empty());
+#ifdef _WIN32
+  // Windows absolute paths are drive-letter rooted ("D:\...") or UNC ("\\...").
+  bool is_absolute = (mod_dir.size() >= 2 && mod_dir[1] == ':') ||
+                     (mod_dir.size() >= 2 && mod_dir[0] == '\\' &&
+                      mod_dir[1] == '\\');
+  REQUIRE(is_absolute);
+#else
+  REQUIRE(mod_dir.front() == '/');
+#endif
+}
+
+TEST_CASE("SystemInfoSharedMemoryError") {
+  // GetLastSharedMemoryError() renders whatever the platform's shared-memory
+  // calls last reported: strerror(errno) on POSIX, FormatMessage over
+  // GetLastError() plus the numeric code on Windows. It must always produce
+  // something a human can read -- the point of it is that the previous
+  // "shm_open failed: {strerror(errno)}" reported a Win32 commit-limit failure
+  // as EAGAIN, because the Win32 calls do not set errno at all.
+  std::string msg = SystemInfo::GetLastSharedMemoryError();
+  REQUIRE(!msg.empty());
+
+  // After a call that genuinely failed it must still be non-empty, and must
+  // not fall through to the "unknown error" placeholder.
+  ctp::File missing;
+  REQUIRE_FALSE(
+      SystemInfo::OpenSharedMemory(missing, "ctp_no_such_segment_xyz"));
+  std::string after = SystemInfo::GetLastSharedMemoryError();
+  REQUIRE(!after.empty());
+  REQUIRE(after != "unknown error");
+}
+
+TEST_CASE("SystemInfoSharedMemoryCreateFailure") {
+  // A name far past any platform's limit: memfd_create(2) caps the name at
+  // 249 bytes, and the macOS/Windows branches open a file whose path this
+  // makes far too long. Every platform therefore fails the create, which is
+  // the one path that reports through GetLastSharedMemoryError().
+  const std::string too_long(4096, 'x');
+
+  ctp::File fd;
+  REQUIRE_FALSE(SystemInfo::CreateNewSharedMemory(fd, too_long, 1024 * 1024));
+
+  // The same failure one layer up: shm_init() must report it and return false
+  // rather than going on to map a backend it never created.
+  PosixShmMmap backend;
+  REQUIRE_FALSE(backend.shm_init(ctp::ipc::MemoryBackendId::GetRoot(),
+                                 1024 * 1024, too_long));
+
+  // Destroying a segment that was never created is a no-op everywhere, and
+  // must stay one now that the Windows branch actually deletes a file.
+  SystemInfo::DestroySharedMemory(too_long);
+  SystemInfo::DestroySharedMemory("ctp_no_such_segment_xyz");
+}
+
+TEST_CASE("SystemInfoSharedMemoryAttachFailure") {
+  // Regression for #1173: the attach path reported "shm_open failed:
+  // strerror(errno)", which on Windows is unrelated to the failing call.
+  // Attaching a segment that does not exist must fail cleanly, and the error
+  // the platform reports must be "not found", not a stale code.
+  const std::string missing_name = "ctp_no_such_segment_attach_1173";
+  SystemInfo::DestroySharedMemory(missing_name);
+  PosixShmMmap backend;
+  REQUIRE_FALSE(backend.shm_attach(missing_name));
+
+  ctp::File missing;
+  REQUIRE_FALSE(SystemInfo::OpenSharedMemory(missing, missing_name));
+  std::string open_err = SystemInfo::GetLastSharedMemoryError();
+#if defined(_WIN32)
+  REQUIRE(open_err.find("(Win32 error 2)") != std::string::npos);
+#else
+  REQUIRE(open_err == strerror(ENOENT));
+#endif
+
+  // MapSharedMemory prints its own diagnostic on failure; that must not
+  // overwrite the error the caller then reads.
+  ctp::File invalid;
+#if defined(_WIN32)
+  invalid.windows_fd_ = nullptr;
+#else
+  invalid.posix_fd_ = -1;
+#endif
+  REQUIRE(SystemInfo::MapSharedMemory(invalid, 4096, 0) == nullptr);
+  std::string map_err = SystemInfo::GetLastSharedMemoryError();
+#if defined(_WIN32)
+  REQUIRE(map_err.find("(Win32 error 6)") != std::string::npos);
+#else
+  REQUIRE(map_err == strerror(EBADF));
+#endif
+}
+
+TEST_CASE("SystemInfoShmRecreateAfterDestroy") {
+  // Regression for #1069. shm_destroy() must actually release the mapping, so
+  // the same segment name can be created again -- the pattern every test
+  // fixture and every restarting client uses.
+  //
+  // On Windows this failed: UnmapMemory() called VirtualFree(ptr, size,
+  // MEM_RELEASE), which cannot free a MapViewOfFile region at all (and, for a
+  // VirtualAlloc region, MEM_RELEASE requires dwSize == 0). Nothing was ever
+  // unmapped. Once segments gained a sparse backing file (#1063), the leaked
+  // view kept a live section on that file and the second create could not
+  // truncate it: ERROR_USER_MAPPED_FILE. The whole cycle has to run at least
+  // three times, because the first create is the one that passed even when
+  // this was broken.
+  const std::string name = "ctp_shm_recreate_test_" +
+                           std::to_string(SystemInfo::GetPid());
+  const size_t kSize = 4 * 1024 * 1024;
+
+  for (int i = 0; i < 3; ++i) {
+    PosixShmMmap backend;
+    REQUIRE(backend.shm_init(ctp::ipc::MemoryBackendId::GetRoot(), kSize,
+                             name));
+    // Touch the region: a create that "succeeded" against a stale section
+    // from a previous iteration must not be mistaken for a good one.
+    REQUIRE(backend.data_ != nullptr);
+    backend.data_[0] = static_cast<char>('a' + i);
+    REQUIRE(backend.data_[0] == static_cast<char>('a' + i));
+    backend.shm_destroy();
+  }
+
+  SystemInfo::DestroySharedMemory(name);
+}
+
+TEST_CASE("SystemInfoShmLargerThan4GiB") {
+  // Regression for #1061 / #1069. A segment past 4 GiB exercises the
+  // high-order DWORD of the Windows section size and of the view length: a
+  // spelling that truncated size to 32 bits created a 4 KiB section and the
+  // write to the last page below faulted. The backing is sparse on every
+  // platform (memfd / regular file / sparse file), so only the two touched
+  // pages are ever committed.
+  const std::string name = "ctp_shm_large_test_" +
+                           std::to_string(SystemInfo::GetPid());
+  const size_t kSize = (4ull << 30) + 4096;
+  const size_t kPage = 4096;
+
+  ctp::File fd;
+  SystemInfo::DestroySharedMemory(name);
+  REQUIRE(SystemInfo::CreateNewSharedMemory(fd, name, kSize));
+  char *mapped = static_cast<char *>(SystemInfo::MapSharedMemory(fd, kSize, 0));
+  REQUIRE(mapped != nullptr);
+
+  mapped[0] = 'F';
+  char *last = mapped + kSize - kPage;
+  memset(last, 0xA5, kPage);
+  REQUIRE(mapped[0] == 'F');
+  REQUIRE(static_cast<unsigned char>(last[0]) == 0xA5);
+  REQUIRE(static_cast<unsigned char>(last[kPage - 1]) == 0xA5);
+
+  // A second view of the same section sees the bytes written past 4 GiB.
+  ctp::File fd2;
+  REQUIRE(SystemInfo::OpenSharedMemory(fd2, name));
+  char *view2 = static_cast<char *>(SystemInfo::MapSharedMemory(fd2, kSize, 0));
+  REQUIRE(view2 != nullptr);
+  REQUIRE(static_cast<unsigned char>(view2[kSize - 1]) == 0xA5);
+  SystemInfo::UnmapMemory(view2, kSize);
+  SystemInfo::CloseSharedMemory(fd2);
+
+  SystemInfo::UnmapMemory(mapped, kSize);
+  SystemInfo::CloseSharedMemory(fd);
+  SystemInfo::DestroySharedMemory(name);
+
+  // Destroyed: the name no longer opens, and it can be created again.
+  ctp::File fd3;
+  REQUIRE_FALSE(SystemInfo::OpenSharedMemory(fd3, name));
+  REQUIRE(SystemInfo::CreateNewSharedMemory(fd3, name, kPage));
+  SystemInfo::CloseSharedMemory(fd3);
+  SystemInfo::DestroySharedMemory(name);
+}
+
+/**
+ * Write 1 MiB blocks across a fresh region while another thread runs
+ * TouchPages over it, as a RAM bdev populates the rest of a unit while
+ * workers already write blocks inside it.
+ * @param bytes region size
+ * @return bytes that do not hold what was written (lost to the touch)
+ */
+static size_t LostBytesUnderTouch(size_t bytes) {
+  char *base = static_cast<char *>(SystemInfo::MapPrivateMemory(bytes));
+  REQUIRE(base != nullptr);
+  std::atomic<bool> go{false};
+  std::thread toucher([&] {
+    while (!go.load()) {
+    }
+    SystemInfo::TouchPages(base, bytes);
+  });
+  go.store(true);
+  constexpr size_t kBlock = 1u << 20;
+  for (size_t off = 0; off < bytes; off += kBlock) {
+    std::memset(base + off, 0x5a, kBlock);
+  }
+  toucher.join();
+  size_t lost = 0;
+  for (size_t i = 0; i < bytes; ++i) {
+    lost += base[i] != 0x5a;
+  }
+  SystemInfo::UnmapMemory(base, bytes);
+  return lost;
+}
+
+TEST_CASE("SystemInfoTouchPagesKeepsConcurrentWrites") {
+  // A plain `p[i] = p[i]` touch lost ~2000 bytes per 64 MiB round here
+  // (the write lands between its load and store); the atomic touch none.
+  size_t lost = 0;
+  for (int round = 0; round < 8; ++round) {
+    lost += LostBytesUnderTouch(size_t(64) << 20);
+  }
+  INFO("bytes lost to a concurrent TouchPages: " << lost);
+  REQUIRE(lost == 0);
+  // BulkFault keeps contents too (it may take the same touch path).
+  std::vector<char> v(size_t(1) << 20, 'q');
+  REQUIRE(SystemInfo::BulkFault(v.data(), v.size()));
+  REQUIRE(v[0] == 'q');
+  REQUIRE(v[v.size() - 1] == 'q');
+}

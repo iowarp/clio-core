@@ -93,6 +93,16 @@ clio::run::TaskResume Runtime::Run(clio::run::u32 method, clio::run::shared_ptr<
       CLIO_CO_AWAIT(SetLifespan(typed_task));
       break;
     }
+    case Method::kFlushAllocLog: {
+      auto& typed_task = task_ptr.template Cast<FlushAllocLogTask>();
+      CLIO_CO_AWAIT(FlushAllocLog(typed_task));
+      break;
+    }
+    case Method::kSync: {
+      auto& typed_task = task_ptr.template Cast<SyncTask>();
+      CLIO_CO_AWAIT(Sync(typed_task));
+      break;
+    }
     default: {
       // Unknown method - do nothing
       break;
@@ -155,6 +165,16 @@ void Runtime::SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive& archiv
       archive << *typed_task;
       break;
     }
+    case Method::kFlushAllocLog: {
+      auto& typed_task = task_ptr.template Cast<FlushAllocLogTask>();
+      archive << *typed_task;
+      break;
+    }
+    case Method::kSync: {
+      auto& typed_task = task_ptr.template Cast<SyncTask>();
+      archive << *typed_task;
+      break;
+    }
     default: {
       // Unknown method - do nothing
       break;
@@ -212,6 +232,16 @@ void Runtime::LoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archiv
     }
     case Method::kSetLifespan: {
       auto& typed_task = task_ptr.template Cast<SetLifespanTask>();
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kFlushAllocLog: {
+      auto& typed_task = task_ptr.template Cast<FlushAllocLogTask>();
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kSync: {
+      auto& typed_task = task_ptr.template Cast<SyncTask>();
       archive >> *typed_task;
       break;
     }
@@ -293,6 +323,18 @@ void Runtime::LocalLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive
       archive >> *typed_task;
       break;
     }
+    case Method::kFlushAllocLog: {
+      auto& typed_task = task_ptr.template Cast<FlushAllocLogTask>();
+      // Use archive operator which respects msg_type
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kSync: {
+      auto& typed_task = task_ptr.template Cast<SyncTask>();
+      // Use archive operator which respects msg_type
+      archive >> *typed_task;
+      break;
+    }
     default: {
       // Unknown method - do nothing
       break;
@@ -367,6 +409,18 @@ void Runtime::LocalSaveTask(clio::run::u32 method, clio::run::DefaultSaveArchive
     }
     case Method::kSetLifespan: {
       auto& typed_task = task_ptr.template Cast<SetLifespanTask>();
+      // Use archive operator which respects msg_type
+      archive << *typed_task;
+      break;
+    }
+    case Method::kFlushAllocLog: {
+      auto& typed_task = task_ptr.template Cast<FlushAllocLogTask>();
+      // Use archive operator which respects msg_type
+      archive << *typed_task;
+      break;
+    }
+    case Method::kSync: {
+      auto& typed_task = task_ptr.template Cast<SyncTask>();
       // Use archive operator which respects msg_type
       archive << *typed_task;
       break;
@@ -494,6 +548,26 @@ clio::run::shared_ptr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 metho
       }
       break;
     }
+    case Method::kFlushAllocLog: {
+      // Allocate new task
+      auto new_task_ptr = ipc_manager->NewTask<FlushAllocLogTask>();
+      if (!new_task_ptr.IsNull()) {
+        auto& task_typed = orig_task_ptr.template Cast<FlushAllocLogTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<FlushAllocLogTask>(task_typed.get()));
+        return new_task_ptr.template Cast<clio::run::Task>();
+      }
+      break;
+    }
+    case Method::kSync: {
+      // Allocate new task
+      auto new_task_ptr = ipc_manager->NewTask<SyncTask>();
+      if (!new_task_ptr.IsNull()) {
+        auto& task_typed = orig_task_ptr.template Cast<SyncTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<SyncTask>(task_typed.get()));
+        return new_task_ptr.template Cast<clio::run::Task>();
+      }
+      break;
+    }
     default: {
       // For unknown methods, create base Task copy
       auto new_task_ptr = ipc_manager->NewTask<clio::run::Task>();
@@ -556,6 +630,14 @@ clio::run::shared_ptr<clio::run::Task> Runtime::NewTask(clio::run::u32 method) {
       auto new_task_ptr = ipc_manager->NewTask<SetLifespanTask>();
       return new_task_ptr.template Cast<clio::run::Task>();
     }
+    case Method::kFlushAllocLog: {
+      auto new_task_ptr = ipc_manager->NewTask<FlushAllocLogTask>();
+      return new_task_ptr.template Cast<clio::run::Task>();
+    }
+    case Method::kSync: {
+      auto new_task_ptr = ipc_manager->NewTask<SyncTask>();
+      return new_task_ptr.template Cast<clio::run::Task>();
+    }
     default: {
       // For unknown methods, return null pointer
       return clio::run::shared_ptr<clio::run::Task>();
@@ -613,6 +695,16 @@ void Runtime::AggregateOut(clio::run::u32 method, clio::run::shared_ptr<clio::ru
     }
     case Method::kSetLifespan: {
       auto& typed_task = orig_task.template Cast<SetLifespanTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
+      break;
+    }
+    case Method::kFlushAllocLog: {
+      auto& typed_task = orig_task.template Cast<FlushAllocLogTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
+      break;
+    }
+    case Method::kSync: {
+      auto& typed_task = orig_task.template Cast<SyncTask>();
       typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }

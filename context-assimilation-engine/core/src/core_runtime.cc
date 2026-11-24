@@ -34,7 +34,7 @@
 #include <clio_cae/core/core_runtime.h>
 #include <clio_cae/core/factory/assimilation_ctx.h>
 #include <clio_cae/core/factory/assimilator_factory.h>
-#include <clio_cae/core/label_client.h>
+#include <clio_cae/core/factory/path_policy.h>
 #ifdef CLIO_CAE_ENABLE_HDF5
 #include <hdf5.h>
 #include <clio_cae/core/factory/hdf5_file_assimilator.h>
@@ -47,11 +47,21 @@
 #endif
 
 #include "clio_ctp/data_structures/serialization/global_serialize.h"
+
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cerrno>
+#include <climits>
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <thread>
 #include <cstring>
+#include "clio_ctp/util/gpu_api.h"
 #include <fstream>
-#include <regex>
-#include <string_view>
 #include <vector>
 
 // Include clio_cte headers before opening namespace to avoid Method namespace
@@ -90,9 +100,6 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   // PoolConfig stored on the task into a CreateParams via LoadConfig.
   CreateParams params = task->GetParams();
   next_pool_id_ = params.next_pool_id_;
-  label_matches_ = std::move(params.label_matches_);
-  label_prompts_ = std::move(params.label_prompts_);
-  label_endpoint_ = std::move(params.label_endpoint_);
 
   // Initialize CTE client. When CAE is wired as a transparent interceptor
   // (compose YAML sets next_pool_id), forward to that pool instead of the
@@ -105,9 +112,8 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
 
   HLOG(kInfo,
        "Core container created and initialized for pool: {} (ID: {}), "
-       "CTE next_pool_id={}, label_matches={}, label_endpoint='{}'",
-       pool_name_, pool_id_, cte_pool, label_matches_.size(),
-       label_endpoint_);
+       "CTE next_pool_id={}",
+       pool_name_, pool_id_, cte_pool);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
@@ -138,44 +144,15 @@ clio::run::PoolQuery Runtime::ScheduleTask(
   }
 }
 
-/**
- * Walk label_matches_ and return the first rule (if any) whose tag_re_
- * matches `tag_name` and blob_re_ matches `blob_name`. std::regex_search
- * (not _match) so ".*\\.txt" matches any name ending in .txt without
- * needing an explicit anchor. An invalid regex in either side disables
- * that rule (logged once at kWarning).
- */
-static const LabelMatch *FindLabelMatch(
-    const std::vector<LabelMatch> &rules, const std::string &tag_name,
-    const std::string &blob_name) {
-  for (const auto &rule : rules) {
-    try {
-      std::regex tag_rx(rule.tag_re_);
-      std::regex blob_rx(rule.blob_re_);
-      if (std::regex_search(tag_name, tag_rx) &&
-          std::regex_search(blob_name, blob_rx)) {
-        return &rule;
-      }
-    } catch (const std::regex_error &e) {
-      HLOG(kWarning,
-           "FindLabelMatch: invalid regex in label rule (tag='{}' blob='{}'): {}",
-           rule.tag_re_, rule.blob_re_, e.what());
-    }
-  }
-  return nullptr;
-}
-
 clio::run::TaskResume Runtime::PutBlob(clio::run::shared_ptr<PutBlobTask> &task) {
   CLIO_TASK_BODY_BEGIN
   if (!cte_client_) {
     cte_client_ = std::make_shared<clio::cte::core::Client>(ResolveNextPoolId());
   }
-  // 1. Forward the original blob through to CTE first so the user's
-  //    semantic is preserved regardless of labeling outcome. CO_AWAIT
-  //    yields the worker while the downstream CTE task runs — Wait()
-  //    would block this worker and deadlock when only a single worker is
-  //    available (or when this and the downstream task happen to land on
-  //    the same worker).
+  // Pure forward. CO_AWAIT yields the worker while the downstream CTE task
+  // runs — Wait() would block this worker and deadlock when only a single
+  // worker is available (or when this and the downstream task happen to land
+  // on the same worker).
   auto fwd = cte_client_->AsyncPutBlob(
       task->tag_id_, task->blob_name_.str(), task->offset_, task->size_,
       task->blob_data_, task->score_, task->context_, task->flags_,
@@ -183,130 +160,6 @@ clio::run::TaskResume Runtime::PutBlob(clio::run::shared_ptr<PutBlobTask> &task)
   CLIO_CO_AWAIT(fwd);
   task->context_ = fwd->context_;
   task->SetReturnCode(fwd->GetReturnCode());
-
-  // 2. Transparent labeling. Skipped silently when no rules are
-  //    configured or no rule matches; labeling failures are logged but
-  //    must not flip the PutBlob return code.
-  if (label_matches_.empty() || fwd->GetReturnCode() != 0) {
-    CLIO_CO_RETURN;
-  }
-  std::string tag_name;
-  {
-    std::lock_guard<std::mutex> lock(tag_names_mu_);
-    auto it = tag_names_.find(task->tag_id_);
-    if (it != tag_names_.end()) tag_name = it->second;
-  }
-  std::string blob_name = task->blob_name_.str();
-  const LabelMatch *rule = FindLabelMatch(label_matches_, tag_name, blob_name);
-  if (!rule) {
-    CLIO_CO_RETURN;
-  }
-
-  // 3. Resolve the prompt template (named in the rule).
-  auto pit = label_prompts_.find(rule->prompt_);
-  if (pit == label_prompts_.end()) {
-    HLOG(kWarning,
-         "CAE::PutBlob: label rule references unknown prompt '{}', skipping",
-         rule->prompt_);
-    CLIO_CO_RETURN;
-  }
-
-  // 4. Snapshot the blob payload off shared memory into a plain string.
-  //    The label_client uses libcurl synchronously so we want a stable
-  //    buffer that doesn't share lifetime with the inbound ShmPtr.
-  std::string payload;
-  if (!task->blob_data_.IsNull() && task->size_ > 0) {
-    auto fullptr =
-        CLIO_IPC->ToFullPtr<char>(task->blob_data_.template Cast<char>());
-    if (fullptr.ptr_) {
-      payload.assign(fullptr.ptr_, task->size_);
-    }
-  }
-  const std::string &prompt_template = pit->second;
-
-  // 5. Decide whether to chunk. The Ollama API counts both prompt and
-  //    generated tokens against num_ctx. Reserve ~25% of context for
-  //    the prompt template + the response budget; the remaining 75% is
-  //    available for blob payload. Convert tokens to bytes via a
-  //    conservative ~3 bytes/token English ratio (binary blobs run
-  //    closer to 1 byte/token, so this errs on splitting *more*).
-  //
-  //    context_length_<=0 disables chunking entirely — caller takes
-  //    Ollama's default 2048 and accepts whatever truncation it does.
-  const int ctx_tokens = rule->context_length_;
-  std::vector<std::string_view> chunks;
-  if (ctx_tokens <= 0 || payload.empty()) {
-    chunks.emplace_back(payload);
-  } else {
-    size_t budget_tokens = static_cast<size_t>(ctx_tokens) * 3 / 4;
-    size_t budget_bytes = budget_tokens * 3;
-    if (budget_bytes > prompt_template.size() + 256) {
-      budget_bytes -= prompt_template.size();
-    }
-    if (budget_bytes == 0) budget_bytes = 256;  // sanity floor
-    for (size_t off = 0; off < payload.size(); off += budget_bytes) {
-      size_t take = std::min(budget_bytes, payload.size() - off);
-      chunks.emplace_back(payload.data() + off, take);
-    }
-  }
-
-  // 6. Inference per chunk, then concatenate. A labeling failure on any
-  //    one chunk doesn't abort the whole label — we skip the chunk and
-  //    log; the user still gets a partial label. A real production
-  //    deploy would dispatch each chunk to a dedicated labeling worker
-  //    pool; v1 keeps everything inline.
-  std::string label_text;
-  size_t successful_chunks = 0;
-  for (size_t i = 0; i < chunks.size(); ++i) {
-    std::string full_prompt = prompt_template;
-    full_prompt.append("\n\n");
-    full_prompt.append(chunks[i].data(), chunks[i].size());
-
-    std::string chunk_label;
-    bool ok = OllamaGenerate(label_endpoint_, rule->model_, full_prompt,
-                             ctx_tokens, rule->num_predict_, chunk_label);
-    if (!ok || chunk_label.empty()) {
-      HLOG(kWarning,
-           "CAE::PutBlob: chunk {} of {} failed for tag='{}' blob='{}' "
-           "model='{}'",
-           i + 1, chunks.size(), tag_name, blob_name, rule->model_);
-      continue;
-    }
-    if (!label_text.empty()) label_text.append("\n\n");
-    label_text.append(chunk_label);
-    ++successful_chunks;
-  }
-  if (successful_chunks == 0 || label_text.empty()) {
-    HLOG(kWarning,
-         "CAE::PutBlob: labeling produced no output for tag='{}' blob='{}'",
-         tag_name, blob_name);
-    CLIO_CO_RETURN;
-  }
-
-  // 7. Store the concatenated label as "{blob_name}_label" in the same
-  //    tag, via the same CTE forwarding path so it lands on the same
-  //    backend as the original blob.
-  std::string label_blob_name = blob_name + "_label";
-  auto *ipc = CLIO_IPC;
-  auto label_buf = ipc->AllocateBuffer(label_text.size());
-  if (label_buf.IsNull()) {
-    HLOG(kWarning, "CAE::PutBlob: label SHM allocation failed");
-    CLIO_CO_RETURN;
-  }
-  std::memcpy(label_buf.ptr_, label_text.data(), label_text.size());
-  ctp::ipc::ShmPtr<> label_shm = label_buf.shm_.template Cast<void>();
-  clio::cte::core::Context label_ctx;
-  auto label_fut = cte_client_->AsyncPutBlob(
-      task->tag_id_, label_blob_name, 0,
-      static_cast<clio::run::u64>(label_text.size()), label_shm, task->score_,
-      label_ctx, 0, clio::run::PoolQuery::Local());
-  CLIO_CO_AWAIT(label_fut);
-  ipc->FreeBuffer(label_buf);
-  if (label_fut->GetReturnCode() != 0) {
-    HLOG(kWarning,
-         "CAE::PutBlob: failed to store label blob '{}' (rc={})",
-         label_blob_name, label_fut->GetReturnCode());
-  }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
@@ -335,10 +188,380 @@ bool ParsePageName(const std::string &name, clio::run::u64 *page_id) {
 }
 }  // namespace
 
+namespace {
+/** Strip "<proto>::" or "<proto>://" from a URL. */
+std::string StripProto(const std::string &url) {
+  size_t p = url.find("://");
+  if (p != std::string::npos) return url.substr(p + 3);
+  p = url.find("::");
+  if (p != std::string::npos) return url.substr(p + 2);
+  return url;
+}
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// Ingest on fault: stage counters (CLIO_CAE_FAULT_STATS=1 logs them every 5 s)
+// ---------------------------------------------------------------------------
+namespace {
+struct FaultStats {
+  std::atomic<long long> entered{0}, read_done{0}, stored{0}, store_fail{0},
+      done{0}, alloc_fail{0}, read_fail{0};
+};
+FaultStats &FStats() {
+  static FaultStats *s = new FaultStats();
+  return *s;
+}
+void MaybeLogFaultStats() {
+  static const bool on = [] {
+    const char *e = std::getenv("CLIO_CAE_FAULT_STATS");
+    return e != nullptr && *e == '1';
+  }();
+  if (!on) return;
+  static std::atomic<long long> last{0};
+  const long long now = std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+  long long prev = last.load();
+  if (now - prev < 5 || !last.compare_exchange_strong(prev, now)) return;
+  FaultStats &f = FStats();
+  HLOG(kInfo,
+       "CAE_FAULT_STATS entered={} read_done={} stored={} store_fail={} "
+       "done={} inflight={} alloc_fail={} read_fail={}",
+       f.entered.load(), f.read_done.load(), f.stored.load(),
+       f.store_fail.load(), f.done.load(), f.entered.load() - f.done.load(),
+       f.alloc_fail.load(), f.read_fail.load());
+}
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// Ingest on fault: context registry
+// ---------------------------------------------------------------------------
+namespace {
+void PutField(std::string *o, const std::string &v) {
+  *o += std::to_string(v.size());
+  *o += ':';
+  *o += v;
+}
+bool GetField(const std::string &in, size_t *pos, std::string *v) {
+  const size_t c = in.find(':', *pos);
+  if (c == std::string::npos) return false;
+  const size_t n = std::strtoull(in.c_str() + *pos, nullptr, 10);
+  if (c + 1 + n > in.size()) return false;
+  *v = in.substr(c + 1, n);
+  *pos = c + 1 + n;
+  return true;
+}
+}  // namespace
+
+std::string Runtime::EncodeCtx(const AssimilationCtx &c) {
+  // Length-prefixed fields: everything an assimilator needs to ingest one
+  // blob later, on any node.
+  std::string o;
+  for (const std::string *f :
+       {&c.src, &c.dst, &c.format, &c.src_token, &c.dst_token, &c.s3_region,
+        &c.s3_profile, &c.src_data, &c.blob_prefix}) {
+    PutField(&o, *f);
+  }
+  PutField(&o, std::to_string(c.range_off));
+  PutField(&o, std::to_string(c.range_size));
+  PutField(&o, std::to_string(c.chunk_size));
+  return o;
+}
+
+bool Runtime::DecodeCtx(const char *buf, size_t n, AssimilationCtx *c) {
+  const std::string in(buf, strnlen(buf, n));
+  size_t pos = 0;
+  for (std::string *f :
+       {&c->src, &c->dst, &c->format, &c->src_token, &c->dst_token,
+        &c->s3_region, &c->s3_profile, &c->src_data, &c->blob_prefix}) {
+    if (!GetField(in, &pos, f)) return false;
+  }
+  std::string ro, rs, cs;
+  if (!GetField(in, &pos, &ro) || !GetField(in, &pos, &rs) ||
+      !GetField(in, &pos, &cs)) {
+    return false;
+  }
+  c->range_off = std::strtoull(ro.c_str(), nullptr, 10);
+  c->range_size = std::strtoull(rs.c_str(), nullptr, 10);
+  c->chunk_size = std::strtoull(cs.c_str(), nullptr, 10);
+  c->on_fault = true;
+  return true;
+}
+
+std::string Runtime::OnFaultId(const AssimilationCtx &ctx) {
+  const std::string k = EncodeCtx(ctx);
+  clio::run::u64 h = 1469598103934665603ull;  // FNV-1a 64
+  for (unsigned char ch : k) {
+    h ^= ch;
+    h *= 1099511628211ull;
+  }
+  char id[32];
+  std::snprintf(id, sizeof(id), "%s%016llx", kOnFaultPrefix,
+                (unsigned long long)h);
+  return id;
+}
+
+std::shared_ptr<Runtime::OnFault> Runtime::MakeOnFault(
+    const AssimilationCtx &ctx) {
+#ifdef CLIO_ENABLE_S3_REST
+  AssimilatorFactory factory(cte_client_, &s3_conn_pool_);
+#else
+  AssimilatorFactory factory(cte_client_);
+#endif
+  std::unique_ptr<BaseAssimilator> a = factory.Get(ctx.src);
+  if (!a) return nullptr;
+  auto of = std::make_shared<OnFault>();
+  of->ctx = ctx;
+  of->blob_bytes = a->BlobBytes(ctx);
+  of->assimilator = std::move(a);
+  if (of->blob_bytes == 0) {
+    HLOG(kError, "CAE on_fault: assimilator for '{}' cannot ingest per blob",
+         ctx.src);
+    return nullptr;
+  }
+  return of;
+}
+
+namespace {
+/**
+ * Blocking source I/O for by-reference faults runs HERE, never on a runtime
+ * worker: a pread on a parallel filesystem can take milliseconds to seconds,
+ * and a worker parked in one stalls every task queued behind it (measured:
+ * all compute workers stalled on 1-3 s CAE GetBlobs). The fault task hands
+ * the read to this pool and yields until it completes.
+ */
+class RefIoPool {
+ public:
+  static RefIoPool &Get() {
+    // Leaked on purpose: its threads are detached and park on cv_, so
+    // destroying the mutex/cv at static teardown hung process exit.
+    static RefIoPool *pool = new RefIoPool();
+    return *pool;
+  }
+  void Submit(std::function<void()> fn) {
+    {
+      std::lock_guard<std::mutex> g(mu_);
+      q_.push_back(std::move(fn));
+    }
+    cv_.notify_one();
+  }
+
+ private:
+  RefIoPool() {
+    const char *e = std::getenv("CLIO_CAE_REF_IO_THREADS");
+    unsigned n = (e != nullptr && *e) ? (unsigned)std::strtoul(e, nullptr, 10)
+                                      : 32u;
+    if (n == 0) n = 1;
+    for (unsigned i = 0; i < n; ++i) {
+      std::thread([this]() {
+        for (;;) {
+          std::function<void()> fn;
+          {
+            std::unique_lock<std::mutex> l(mu_);
+            cv_.wait(l, [this]() { return !q_.empty(); });
+            fn = std::move(q_.front());
+            q_.pop_front();
+          }
+          fn();
+        }
+      }).detach();
+    }
+  }
+  std::mutex mu_;
+  std::condition_variable cv_;
+  std::deque<std::function<void()>> q_;
+};
+}  // namespace
+
 clio::run::TaskResume Runtime::GetBlob(clio::run::shared_ptr<GetBlobTask> &task) {
   CLIO_TASK_BODY_BEGIN
   if (!cte_client_) {
     cte_client_ = std::make_shared<clio::cte::core::Client>(ResolveNextPoolId());
+  }
+  // INGEST ON FAULT: CTE dispatched a miss on a tag assimilated with
+  // on_fault. Have the source's assimilator ingest exactly this blob, store
+  // it in the tag, and serve the read from it.
+  if (std::strncmp(task->context_.fault_params_, kOnFaultPrefix,
+                   std::strlen(kOnFaultPrefix)) == 0) {
+    const std::string key(task->context_.fault_params_);
+    std::shared_ptr<OnFault> of;
+    {
+      std::lock_guard<std::mutex> g(on_fault_mu_);
+      auto it = on_fault_.find(key);
+      if (it != on_fault_.end()) of = it->second;
+    }
+    if (!of) {
+      // Registered on another node: load the context from the registry.
+      auto tf = cte_client_->AsyncGetOrCreateTag(kOnFaultRegistryTag);
+      CLIO_CO_AWAIT(tf);
+      auto dbuf = CLIO_IPC->AllocateBuffer(kOnFaultDescBytes);
+      if (tf->GetReturnCode() != 0 || dbuf.IsNull()) {
+        task->SetReturnCode(1);
+        CLIO_CO_RETURN;
+      }
+      std::memset(dbuf.ptr_, 0, kOnFaultDescBytes);
+      clio::cte::core::Context gctx;
+      gctx.op_flags_ |= clio::cte::core::Context::kNoFault;
+      auto gf = cte_client_->AsyncGetBlob(
+          tf->tag_id_, key.c_str(), 0, kOnFaultDescBytes, 0,
+          dbuf.shm_.template Cast<void>(), clio::run::PoolQuery::Dynamic(),
+          gctx);
+      CLIO_CO_AWAIT(gf);
+      AssimilationCtx ctx;
+      const bool ok = gf->GetReturnCode() == 0 &&
+                      DecodeCtx(dbuf.ptr_, kOnFaultDescBytes, &ctx);
+      CLIO_IPC->FreeBuffer(dbuf);
+      if (ok) of = MakeOnFault(ctx);
+      if (!of) {
+        HLOG(kError, "CAE on_fault: no context for {}", key);
+        task->SetReturnCode(1);
+        CLIO_CO_RETURN;
+      }
+      std::lock_guard<std::mutex> g(on_fault_mu_);
+      auto ins = on_fault_.emplace(key, of);
+      of = ins.first->second;  // a concurrent fault may have won
+    }
+    const clio::run::u64 cap = of->blob_bytes;
+    FStats().entered++;
+    MaybeLogFaultStats();
+    auto stage = CLIO_IPC->AllocateBuffer(cap);
+    if (stage.IsNull()) {
+      FStats().alloc_fail++;
+      FStats().done++;
+      task->SetReturnCode(4);
+      CLIO_CO_RETURN;
+    }
+    // The assimilator's read is blocking source I/O: run it off the workers.
+    auto st = std::make_shared<std::atomic<long long>>(LLONG_MIN);
+    {
+      const std::string bname = task->GetBlobName();
+      char *buf = stage.ptr_;
+      RefIoPool::Get().Submit([of, bname, buf, cap, st]() {
+        st->store(of->assimilator->ReadBlob(of->ctx, bname, buf, cap),
+                  std::memory_order_release);
+      });
+      clio::run::u64 polls = 0;
+      while (st->load(std::memory_order_acquire) == LLONG_MIN) {
+        CLIO_CO_AWAIT(clio::run::yield(polls++ < 64 ? 20.0 : 200.0));
+      }
+    }
+    const long long n = st->load();
+    FStats().read_done++;
+    if (n < 0) {
+      FStats().read_fail++;
+      FStats().done++;
+      HLOG(kError, "CAE on_fault: ingest of {} from '{}' failed ({})",
+           task->GetBlobName(), of->ctx.src, n);
+      CLIO_IPC->FreeBuffer(stage);
+      task->SetReturnCode(static_cast<clio::run::u32>(-n));
+      CLIO_CO_RETURN;
+    }
+    // A short last blob reads as zeros past the source, like a page.
+    if (static_cast<clio::run::u64>(n) < cap) {
+      std::memset(stage.ptr_ + n, 0, cap - static_cast<clio::run::u64>(n));
+    }
+    // CLIO_CAE_FAULT_STORE=0: never store (pure read-through on fault).
+    static const bool kStore = [] {
+      const char *e = std::getenv("CLIO_CAE_FAULT_STORE");
+      return !(e != nullptr && *e == '0');
+    }();
+    // Never take the last of the tier (see tier_free_): keep this much free
+    // for everything that is NOT re-ingestable. CLIO_CAE_FAULT_RESERVE_MB.
+    static const long long kReserve = [] {
+      const char *e = std::getenv("CLIO_CAE_FAULT_RESERVE_MB");
+      return ((e != nullptr && *e) ? std::atoll(e) : 512LL) << 20;
+    }();
+    // A size-0 "materialise" fault precedes a PARTIAL WRITE: storing the blob
+    // IS the write path there, so it always stores (no headroom, no skip).
+    const bool materialise = task->size_ == 0 || task->blob_data_.IsNull();
+    bool store = n > 0 && (kStore || materialise);
+    if (store && !materialise) {
+      // Refresh the free-space reading at most every 250 ms, one refresher
+      // at a time; everyone else uses (and debits) the cached value.
+      const long long now_ns = (long long)std::chrono::duration_cast<
+          std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count();
+      if (now_ns - tier_free_at_ns_.load() > 250LL * 1000 * 1000 &&
+          !tier_refreshing_.exchange(true)) {
+        auto lt = cte_client_->AsyncListTargets(clio::run::PoolQuery::Local());
+        CLIO_CO_AWAIT(lt);
+        long long free_b = 0;
+        if (lt->GetReturnCode() == 0) {
+          for (size_t ti = 0; ti < lt->target_names_.size(); ++ti) {
+            auto gi = cte_client_->AsyncGetTargetInfo(
+                lt->target_names_[ti], clio::run::PoolQuery::Local());
+            CLIO_CO_AWAIT(gi);
+            if (gi->GetReturnCode() == 0) {
+              free_b += (long long)gi->remaining_space_;
+            }
+          }
+          tier_free_.store(free_b);
+        }
+        tier_free_at_ns_.store(now_ns);
+        tier_refreshing_.store(false);
+      }
+      const long long free_now = tier_free_.load();
+      if (free_now >= 0 && free_now - (long long)cap < kReserve) {
+        store = false;  // keep the headroom: serve from the source only
+      } else if (free_now >= 0) {
+        tier_free_.fetch_sub((long long)cap);
+      }
+    }
+    if (store && !materialise &&
+        of->skip_stores.load(std::memory_order_relaxed) > 0) {
+      of->skip_stores.fetch_sub(1, std::memory_order_relaxed);
+      store = false;  // tier recently full: serve from the source only
+    }
+    if (store) {
+      // Ingest: the blob now lives in the tag, exactly as eager ingestion
+      // would have stored it, so the next read does not fault (kNoFault: the
+      // put must not fault back into us).
+      clio::cte::core::Context pctx;
+      pctx.op_flags_ |= clio::cte::core::Context::kNoFault;
+      auto put = cte_client_->AsyncPutBlob(task->tag_id_, task->GetBlobName(),
+                                           0, cap,
+                                           stage.shm_.template Cast<void>(),
+                                           -1.0f, pctx);
+      CLIO_CO_AWAIT(put);
+      const clio::run::u32 prc = put->GetReturnCode();
+      if (prc == 0) FStats().stored++;
+      if (prc != 0) {
+        FStats().store_fail++;
+        // A failed put can leave a partial blob behind; a later read would
+        // find it and never fault. Drop it so the next read ingests again.
+        auto del = cte_client_->AsyncDelBlob(task->tag_id_,
+                                             task->GetBlobName(),
+                                             clio::run::PoolQuery::Dynamic());
+        CLIO_CO_AWAIT(del);
+        of->skip_stores.store(256, std::memory_order_relaxed);
+        if (!of->warned_full.exchange(true)) {
+          HLOG(kWarning,
+               "CAE on_fault: tag of '{}' cannot store more (rc={}); serving "
+               "faults from the source, retrying every 256 faults",
+               of->ctx.src, prc);
+        }
+      }
+    }
+    // Serve the read that faulted (none for a size-0 "materialise" request
+    // CTE sends before a partial write: the put above was the point).
+    if (task->size_ != 0 && !task->blob_data_.IsNull()) {
+      auto dst = CLIO_IPC->ToFullPtr<char>(task->blob_data_.Cast<char>());
+      const clio::run::u64 off = task->offset_;
+      const clio::run::u64 len =
+          off < cap ? std::min<clio::run::u64>(task->size_, cap - off) : 0;
+      if (len > 0) {
+        if (ctp::IsDeviceAccessible(dst.ptr_)) {
+          ctp::DeviceAwareMemcpy(dst.ptr_, stage.ptr_ + off, (size_t)len);
+        } else {
+          std::memcpy(dst.ptr_, stage.ptr_ + off, (size_t)len);
+        }
+      }
+    }
+    CLIO_IPC->FreeBuffer(stage);
+    FStats().done++;
+    MaybeLogFaultStats();
+    task->SetReturnCode(0);
+    CLIO_CO_RETURN;
   }
   // pagify: a request named "page:<id>" asks for a UNIFIED PAGE NUMBER, not
   // a blob. The caller (e.g. the gpu_vector) knows only page 0, page 1, ...
@@ -434,14 +657,6 @@ clio::run::TaskResume Runtime::GetOrCreateTag(
   CLIO_CO_AWAIT(fwd);
   task->tag_id_ = fwd->tag_id_;
   task->SetReturnCode(fwd->GetReturnCode());
-
-  // Remember tag_id → tag_name so PutBlob can later match against
-  // LabelMatch::tag_re_ without re-querying CTE. Only the resolved
-  // (non-null) tag id is cached.
-  if (!task->tag_id_.IsNull() && !tag_name.empty()) {
-    std::lock_guard<std::mutex> lock(tag_names_mu_);
-    tag_names_[task->tag_id_] = std::move(tag_name);
-  }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
@@ -496,9 +711,26 @@ clio::run::TaskResume Runtime::ParseOmni(clio::run::shared_ptr<ParseOmniTask> &t
   HLOG(kInfo, "ParseOmni: Processing {} assimilation contexts",
        assimilation_contexts.size());
 
+  // Reject unsatisfiable dependencies before anything is scheduled, so a bad
+  // OMNI file fails whole instead of half-transferred. Satisfiable ones need no
+  // further handling: the loop below runs the contexts in order.
+  const std::string dep_error = CheckDependencies(assimilation_contexts);
+  if (!dep_error.empty()) {
+    HLOG(kError, "ParseOmni: {}", dep_error);
+    task->result_code_ = -3;
+    task->error_message_ = dep_error;
+    task->num_tasks_scheduled_ = 0;
+    task->SetReturnCode(static_cast<clio::run::u32>(-3));
+    CLIO_CO_RETURN;
+  }
+
   // Process each assimilation context
   clio::run::u32 tasks_scheduled = 0;
+#ifdef CLIO_ENABLE_S3_REST
+  AssimilatorFactory factory(cte_client_, &s3_conn_pool_);
+#else
   AssimilatorFactory factory(cte_client_);
+#endif
 
   for (size_t i = 0; i < assimilation_contexts.size(); ++i) {
     const auto& assimilation_ctx = assimilation_contexts[i];
@@ -507,6 +739,72 @@ clio::run::TaskResume Runtime::ParseOmni(clio::run::shared_ptr<ParseOmniTask> &t
          "ParseOmni: Processing context {}/{} - src: {}, dst: {}, format: {}",
          i + 1, assimilation_contexts.size(), assimilation_ctx.src,
          assimilation_ctx.dst, assimilation_ctx.format);
+
+    // on_fault: ingest nothing now; register as the tag's fault handler.
+    if (assimilation_ctx.on_fault) {
+      std::shared_ptr<OnFault> of = MakeOnFault(assimilation_ctx);
+      int rc = of ? 0 : -20;
+      const std::string id = OnFaultId(assimilation_ctx);
+      const std::string tag_name = StripProto(assimilation_ctx.dst);
+      if (rc == 0) {
+        {
+          std::lock_guard<std::mutex> g(on_fault_mu_);
+          on_fault_.emplace(id, of);
+        }
+        // Publish the context so the CAE on any node can serve faults.
+        const std::string desc = EncodeCtx(assimilation_ctx);
+        auto rt = cte_client_->AsyncGetOrCreateTag(kOnFaultRegistryTag);
+        CLIO_CO_AWAIT(rt);
+        rc = (int)rt->GetReturnCode();
+        auto dbuf = CLIO_IPC->AllocateBuffer(kOnFaultDescBytes);
+        if (rc == 0 && (dbuf.IsNull() || desc.size() >= kOnFaultDescBytes)) {
+          rc = -13;
+        }
+        if (rc == 0) {
+          std::memset(dbuf.ptr_, 0, kOnFaultDescBytes);
+          std::memcpy(dbuf.ptr_, desc.data(), desc.size());
+          clio::cte::core::Context pctx;
+          pctx.op_flags_ |= clio::cte::core::Context::kNoFault;
+          auto pf = cte_client_->AsyncPutBlob(
+              rt->tag_id_, id.c_str(), 0, kOnFaultDescBytes,
+              dbuf.shm_.template Cast<void>(), -1.0f, pctx);
+          CLIO_CO_AWAIT(pf);
+          rc = (int)pf->GetReturnCode();
+        }
+        if (!dbuf.IsNull()) CLIO_IPC->FreeBuffer(dbuf);
+      }
+      if (rc == 0) {
+        // Register the handler for the canonical tag on EVERY CTE container:
+        // a read is resolved by the container it lands on.
+        auto tf = cte_client_->AsyncGetOrCreateTag(tag_name);
+        CLIO_CO_AWAIT(tf);
+        rc = (int)tf->GetReturnCode();
+        const clio::cte::core::TagId tid = tf->tag_id_;
+        const clio::run::PoolInfo *cinfo =
+            CLIO_POOL_MANAGER->GetPoolInfo(ResolveNextPoolId());
+        const clio::run::u32 ncont =
+            cinfo != nullptr ? cinfo->num_containers_ : 1;
+        for (clio::run::u32 c = 0; rc == 0 && c < ncont; ++c) {
+          auto cf = cte_client_->AsyncGetOrCreateTag(
+              tag_name, pool_id_, pool_name_, id, tid,
+              clio::run::PoolQuery::DirectId(
+                  static_cast<clio::run::ContainerId>(c)));
+          CLIO_CO_AWAIT(cf);
+          rc = (int)cf->GetReturnCode();
+        }
+      }
+      if (rc != 0) {
+        task->result_code_ = rc;
+        task->error_message_ = "on_fault assimilation setup failed";
+        task->num_tasks_scheduled_ = tasks_scheduled;
+        task->SetReturnCode(static_cast<clio::run::u32>(rc));
+        CLIO_CO_RETURN;
+      }
+      HLOG(kInfo, "CAE on_fault: '{}' -> tag '{}' ({}), {} B per blob",
+           assimilation_ctx.src, tag_name, id, of->blob_bytes);
+      tasks_scheduled++;
+      continue;
+    }
 
     // Get appropriate assimilator for this context
     auto assimilator = factory.Get(assimilation_ctx.src);
@@ -518,6 +816,9 @@ clio::run::TaskResume Runtime::ParseOmni(clio::run::shared_ptr<ParseOmniTask> &t
       task->error_message_ =
           "No assimilator found for source: " + assimilation_ctx.src;
       task->num_tasks_scheduled_ = tasks_scheduled;
+      // Mirror onto the task-framework code: clients that check GetReturnCode()
+      // would otherwise see 0 and report success.
+      task->SetReturnCode(static_cast<clio::run::u32>(-2));
       CLIO_CO_RETURN;
     }
 
@@ -532,6 +833,7 @@ clio::run::TaskResume Runtime::ParseOmni(clio::run::shared_ptr<ParseOmniTask> &t
       task->result_code_ = result;
       task->error_message_ = std::string("Assimilator failed");
       task->num_tasks_scheduled_ = tasks_scheduled;
+      task->SetReturnCode(static_cast<clio::run::u32>(result));
       CLIO_CO_RETURN;
     }
 
@@ -611,6 +913,21 @@ clio::run::TaskResume Runtime::ExportData(clio::run::shared_ptr<ExportDataTask> 
   HLOG(kInfo, "ExportData: tag='{}', output='{}', format='{}'",
        tag_name, output_path, format);
 
+  // The output path and the bytes written there both come from the client.
+  // Check the path against the runtime's path policy before creating it.
+  {
+    std::string reason;
+    if (!PathPolicy::Get().Allows(output_path, /*write=*/true, reason)) {
+      HLOG(kError, "ExportData: refusing output '{}': {}", output_path,
+           reason);
+      task->result_code_ = -1;
+      const std::string message = "Output path refused: " + reason;
+      task->error_message_ =
+          clio::run::priv::string(message.c_str(), CTP_MALLOC);
+      CLIO_CO_RETURN;
+    }
+  }
+
   // Step 1: resolve the tag ID
   auto tag_future = cte_client_->AsyncGetOrCreateTag(tag_name);
   CLIO_CO_AWAIT(tag_future);
@@ -623,7 +940,7 @@ clio::run::TaskResume Runtime::ExportData(clio::run::shared_ptr<ExportDataTask> 
   }
 
   // Step 2: list all blobs in the tag
-  auto blobs_future = cte_client_->AsyncGetContainedBlobs(tag_id);
+  auto blobs_future = cte_client_->AsyncGetContainedBlobs(tag_id, clio::run::PoolQuery::Broadcast());
   CLIO_CO_AWAIT(blobs_future);
   const auto &blob_names = blobs_future->blob_names_;
 

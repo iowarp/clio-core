@@ -187,7 +187,7 @@ int main(int argc, char **argv) {
 
   u32 blocks = 64, threads = 256, steps = 4;
   u64 page_kb = 1024, data_mb = 2048;
-  float Du = 0.2f, Dv = 0.1f, F = 0.02f, K = 0.048f, dt = 1.0f;
+  float Du = 0.2f, Dv = 0.1f, F = 0.02f, K = 0.048f, dt = 0.5f;
   double check_csum = 0.0, check_tol = 1e-3;
   bool do_check = false;
   for (int i = 1; i < argc; ++i) {

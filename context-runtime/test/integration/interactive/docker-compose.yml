@@ -40,7 +40,7 @@ x-worker-command: &worker-command >
     sudo /usr/sbin/sshd;
 
     echo \"Node $${NODE_ID}: Starting runtime...\" &&
-    /workspace/build/bin/clio_run runtime start &
+    /workspace/build/bin/clio_run runtime start --fresh &
     sleep infinity
   "
 
@@ -78,7 +78,7 @@ services:
         sudo /usr/sbin/sshd;
 
         echo 'Node 1: Starting runtime (dashboard built in, on :5000)...' &&
-        /workspace/build/bin/clio_run runtime start &
+        /workspace/build/bin/clio_run runtime start --fresh &
         RUNTIME_PID=\$!;
         sleep 5;
 

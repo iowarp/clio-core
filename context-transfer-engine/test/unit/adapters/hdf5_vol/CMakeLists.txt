@@ -75,6 +75,8 @@ add_executable(test_hdf5_vol_io
 
 target_include_directories(test_hdf5_vol_io PRIVATE
     ${CMAKE_SOURCE_DIR}/context-transfer-engine/adapter/hdf5_vol
+    # clio_vol_layout.h includes "adapter/clio_coherence_stamp.h"
+    ${CMAKE_SOURCE_DIR}/context-transfer-engine
     ${CMAKE_SOURCE_DIR}/context-runtime/test
     ${HDF5_INCLUDE_DIRS}
 )
@@ -106,10 +108,21 @@ if(NOT WIN32)
   add_test(NAME cte_hdf5_vol_io_passthrough
       COMMAND test_hdf5_vol_io "HDF5 VOL IO - Passthrough callbacks")
 
+  # The cache layout the CAE's hdf5_vol format stages into (clio_vol_layout.h).
+  add_test(NAME cte_hdf5_vol_io_prestaged
+      COMMAND test_hdf5_vol_io
+          "HDF5 VOL IO - An image staged ahead of the open is served")
+
+  add_test(NAME cte_hdf5_vol_io_prestaged_chunk
+      COMMAND test_hdf5_vol_io
+          "HDF5 VOL IO - A staged image with another chunk size is a miss")
+
   set_tests_properties(
       cte_hdf5_vol_io_dataset
       cte_hdf5_vol_io_groups_attrs
       cte_hdf5_vol_io_passthrough
+      cte_hdf5_vol_io_prestaged
+      cte_hdf5_vol_io_prestaged_chunk
       PROPERTIES
           TIMEOUT 300
           LABELS "unit;adapter;hdf5_vol;cte"
@@ -133,26 +146,18 @@ if(NOT WIN32)
           # every sibling suite does, and they matter the moment anyone runs
           # ctest with -j -- but nothing here is known to fix that failure.
           RESOURCE_LOCK "clio_runtime"
-          # HDF5_USE_FILE_LOCKING=FALSE: these tests close a file and
-          # immediately reopen it. H5Fclose() returns success before the
-          # OS-level flock is released, so the reopen intermittently fails on
-          # macOS with:
-          #   H5FD__sec2_lock(): unable to lock file, errno = 35,
-          #                      'Resource temporarily unavailable'
-          # Each test owns its own .h5 path and is single-writer, so the lock
-          # buys nothing here; it only adds a race.
-          #
-          # CAVEAT: this is a mitigation, not a root-cause fix. The holder of
-          # the lingering descriptor was not identified, and one candidate is
-          # the clio VOL connector keeping a runtime-side handle open past
-          # H5Fclose(). If that is real, disabling the lock hides it rather
-          # than fixing it -- worth chasing separately.
+          # File locking stays ON (issue #809). These tests close a file and
+          # reopen it at once, and the reopen used to fail on macOS with
+          # "unable to lock file, errno = 35": the runtime forked a shell
+          # (popen "df") that inherited the .h5 descriptor and its flock, so
+          # the lock outlived H5Fclose(). The device lookup no longer forks, so
+          # HDF5_USE_FILE_LOCKING=FALSE is no longer set here.
           # CLIO_RESTART_LOG is NOT set here: the top-level CMakeLists stamps a
           # per-test WAL path on every test now, so isolation from the shared
           # ~/.clio/restart_log.bin is the default rather than something each
           # suite remembers to ask for. Setting it here too would be a second
           # mechanism for one job.
-          ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10620;HDF5_USE_FILE_LOCKING=FALSE"
+          ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10620"
   )
 endif()
 

@@ -68,10 +68,13 @@
 #include <aws/core/Aws.h>
 #include <aws/core/auth/AWSAuthSigner.h>
 #include <aws/core/client/ClientConfiguration.h>
+#include <aws/core/VersionConfig.h>
 #include <aws/core/utils/memory/stl/AWSStringStream.h>
 #include <aws/s3/S3Client.h>
 #include <aws/s3/model/CreateBucketRequest.h>
 #include <aws/s3/model/DeleteObjectRequest.h>
+#include <aws/core/auth/AWSCredentialsProvider.h>
+#include <aws/core/auth/AWSCredentialsProviderChain.h>
 #include <aws/s3/model/GetObjectRequest.h>
 #include <aws/s3/model/PutObjectRequest.h>
 
@@ -85,10 +88,35 @@ namespace {
  * overridden and path-style addressing is used. Credentials resolve through the
  * SDK's default provider chain.
  *
+ * ANONYMOUS ACCESS. Public buckets must be read WITHOUT signing: a signed
+ * request carrying no usable credentials is rejected outright, so the default
+ * chain cannot reach them at all. That rules out the AWS Open Data registry,
+ * whose datasets are documented with `aws s3 --no-sign-request`. Two ways in,
+ * mirroring the CLI:
+ *
+ *   - AWS_NO_SIGN_REQUEST=1   force anonymous, the explicit equivalent of
+ *                             --no-sign-request;
+ *   - otherwise, if the default chain yields no credentials, fall back to
+ *     anonymous and say so. Signing would have failed regardless, so this
+ *     turns a guaranteed failure into the request that can succeed, and it
+ *     cannot weaken a request that had credentials to use.
+ *
+ * PROXY. The SDK clears libcurl's proxy unless allowSystemProxy is set, so
+ * https_proxy / http_proxy / no_proxy would be ignored and a node that reaches
+ * the internet only through a proxy (HPC compute nodes) would time out.
+ *
  * @return A configured Aws::S3::S3Client.
  */
 Aws::S3::S3Client MakeS3Client() {
   Aws::Client::ClientConfiguration cfg;
+  // allowSystemProxy appeared in aws-sdk-cpp 1.11.169; older SDKs (Spack's
+  // 1.11.144, for one) build without it and ignore the proxy variables.
+#if AWS_SDK_VERSION_MAJOR > 1 ||                                    \
+    (AWS_SDK_VERSION_MAJOR == 1 && (AWS_SDK_VERSION_MINOR > 11 ||    \
+                                    (AWS_SDK_VERSION_MINOR == 11 &&  \
+                                     AWS_SDK_VERSION_PATCH >= 169)))
+  cfg.allowSystemProxy = true;
+#endif
   const char* region_env = std::getenv("AWS_DEFAULT_REGION");
   cfg.region = (region_env && *region_env) ? region_env : "us-east-1";
 
@@ -100,6 +128,30 @@ Aws::S3::S3Client MakeS3Client() {
   if (endpoint_env && *endpoint_env) {
     cfg.endpointOverride = endpoint_env;
     use_path_style = true;
+  }
+  bool anonymous = false;
+  const char* no_sign = std::getenv("AWS_NO_SIGN_REQUEST");
+  if (no_sign && *no_sign && std::strcmp(no_sign, "0") != 0) {
+    anonymous = true;
+  } else {
+    // Ask the default chain once. Empty keys mean nothing resolved -- no
+    // environment, profile, instance role or container role -- in which case a
+    // signed request can only be rejected.
+    Aws::Auth::DefaultAWSCredentialsProviderChain chain;
+    auto creds = chain.GetAWSCredentials();
+    if (creds.GetAWSAccessKeyId().empty() && creds.GetAWSSecretKey().empty()) {
+      anonymous = true;
+      std::fprintf(stderr,
+                   "cae_s3_tool: no AWS credentials resolved; requesting "
+                   "anonymously (set AWS_NO_SIGN_REQUEST=1 to force this)\n");
+    }
+  }
+
+  if (anonymous) {
+    return Aws::S3::S3Client(
+        Aws::Auth::AWSCredentials(),  // empty -> unsigned requests
+        cfg, Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::Never,
+        /*useVirtualAddressing=*/!use_path_style);
   }
   return Aws::S3::S3Client(
       cfg, Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::Never,

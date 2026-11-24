@@ -7,3 +7,5 @@ description: "Content Transfer Engine - A system for placing data in tiered stor
 modules:
   - core
   - compressor
+  - stream
+  - core_shm_cache_writethru

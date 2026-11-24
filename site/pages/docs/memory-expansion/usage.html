@@ -1,0 +1,61 @@
+<!--
+title: Usage
+heading: Using the <em>paged vectors.</em>
+description: What cpu_vector and gpu_vector share: starting the runtime, the fetch, hold, flush, unpin cycle, bulk preload and download, lazy copy-on-write copies, and tier placement hints.
+eyebrow: Docs · Memory expansion
+lede: Both vectors follow the same cycle: fetch the ranges you will touch, hold a page to read or write it, flush what you wrote, unpin what you fetched. The <a href="/docs/memory-expansion/gpu-vector.html">gpu_vector</a> and <a href="/docs/memory-expansion/cpu-vector.html">cpu_vector</a> pages walk through it with a complete example each; this page covers what the two share. The <a href="/docs/memory-expansion/api.html">API reference</a> lists every method.
+facts: Host | clio::cte::cpu_vector::Vector&lt;T&gt; ; Device | clio::cte::gpu_vector::Vector&lt;T&gt; + DeviceVector&lt;T&gt; ; Ranges per call | up to 8 (offset, count) pairs
+-->
+<h2>Start the runtime and the client</h2>
+<p>A vector needs a CTE core pool with at least one storage tier. Point <code>CLIO_SERVER_CONF</code> at a configuration like the one on the <a href="/docs/memory-expansion/install.html">install page</a>. <code>CLIO_INIT(kClient, true)</code> starts a runtime inside the process when none is running, which is how the adapter tests run; <code>CLIO_INIT(kClient)</code> attaches to one started with <code>clio-run start</code>. Then attach the CTE client.</p>
+<pre data-label="cpp">
+#include <clio_runtime/clio_runtime.h>
+#include <clio_cte/core/core_client.h>
+
+if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true)) return 1;
+if (!clio::cte::core::CLIO_CTE_CLIENT_INIT()) return 1;
+// ... use vectors ...
+clio::run::CLIO_RUNTIME_FINALIZE();
+</pre>
+
+<h2>Pick a vector</h2>
+<p>Each vector has its own step-by-step page with a complete example:</p>
+<ul>
+  <li><a href="/docs/memory-expansion/gpu-vector.html"><strong>gpu_vector</strong></a>: page an array from inside a CUDA or SYCL kernel. Shows the CPU side and the GPU side, and how to build with clang.</li>
+  <li><a href="/docs/memory-expansion/cpu-vector.html"><strong>cpu_vector</strong></a>: page an array from ordinary host threads, with any C++ compiler.</li>
+</ul>
+<p>The rest of this page covers what both vectors share: moving data in bulk, lazy copies and tier placement hints.</p>
+
+<h2 id="bulk">Bulk movement and cache control</h2>
+<ul>
+  <li><code>Preload(src, n)</code> writes <code>n</code> elements straight to the CTE, page by page, bypassing the cache. <code>PreloadPages(pg_lo, pg_hi, fill)</code> does the same with a callable that fills each page buffer.</li>
+  <li><code>Download(dst, n)</code> and <code>DownloadPages(pg_lo, pg_hi, sink)</code> read straight from the CTE. Flush first, or resident writes are not seen.</li>
+  <li><code>Prefetch(pg_lo, pg_hi)</code> makes a page range resident, best effort, and leaves it unpinned.</li>
+  <li><code>FlushResidentToCte()</code> writes every resident frame's valid elements back. <code>ClearCache()</code> drops every resident page and discards unflushed writes.</li>
+</ul>
+
+<h2 id="copies">Lazy copies</h2>
+<p><code>Copy("my_vector_ckpt")</code> flushes resident state, creates the tag <code>my_vector_ckpt</code> with the checkpoint module as its fault handler and <code>my_vector</code> as the source, and returns a new <code>Vector</code> on that tag with the same geometry. No bytes are copied: a page of the copy is materialized from the source the first time it is read. Because the source may keep changing, a snapshot meant as a checkpoint should be materialized while the source still holds the state you want: pass <code>sync = true</code>, or call <code>MaterializeAll()</code> on the copy, which returns the number of pages materialized. <code>ScoreAllPages(score)</code> rescores every page of a vector, for draining a checkpoint out of the fast tier.</p>
+<pre data-label="cpp">
+auto ckpt = v.Copy("my_vector_ckpt", /*sync=*/true);   // std::unique_ptr<clio::cte::cpu_vector::Vector<u64>>
+ckpt->ScoreAllPages(0.0f);                             // push the snapshot to the slowest tier
+</pre>
+
+<h2 id="gpu-host">Host-side control of a gpu_vector</h2>
+<p>The host never pages. It moves data in and out with <code>Preload</code>, <code>PreloadPages</code>, <code>Download</code> and <code>DownloadPages</code>, warms the cache with <code>Prefetch(pg_lo, pg_hi, gpu_id)</code>, drops it with <code>ClearCache(gpu_id)</code>, and writes resident frames back with <code>FlushResidentToCte()</code>. <code>Copy</code>, <code>MaterializeAll</code> and <code>ScoreAllPages</code> work as on the CPU. A copy made with <code>Copy</code> builds no device views; a kernel that must read it opens its own <code>Vector</code> on the copy's tag.</p>
+
+<h2 id="hints">Tier placement hints</h2>
+<p>Pages are written at score 0.5, so with tiers scored HBM 1.0, host RAM 0.2 and storage 0.0 a page never lands in HBM on its own. A hint at 1.0 is what moves a page into such a tier. <code>PrefetchNow(hints)</code> takes a vector of <code>PrefetchHint{page_, score_}</code> and submits them as batched rescores; <code>DrainPrefetch()</code> waits for them. On <code>gpu_vector</code>, <code>RegisterPrefetcher(p)</code> installs a <code>Prefetcher</code> whose <code>OnYield</code> runs once per block per yield round and emits hints from what the kernel just touched; <code>YieldObserver()</code> gives the driver the callback that feeds it.</p>
+
+<h2>SYCL</h2>
+<p>A SYCL kernel body is a lambda rather than a <code>__global__</code> function, so the launch code differs, but the <code>DeviceVector</code> verbs are the same. The SYCL tests in <code>context-transfer-engine/adapter/gpu_vector/test/sycl</code> are the reference for the launch sequence.</p>
+
+<h2>clio-coroc</h2>
+<p>Under the clio-coroc transpiler (<code>-DCLIO_COROC</code>) the same verbs are spelled <code>CoFetch</code>, <code>CoBeginFetch</code>, <code>CoAwaitFetch</code>, <code>CoHoldPage</code> (returning a <code>PageRef&lt;T&gt;</code>), <code>CoFlush</code>, <code>CoBeginFlush</code> and <code>CoEndFlush</code>, used with <code>CO_AWAIT</code> instead of <code>co_await</code>.</p>
+
+<h2>Where to go next</h2>
+<ul>
+  <li><a href="/docs/memory-expansion/api.html">API reference</a>: every constructor argument, method and configuration key.</li>
+  <li><a href="/docs/cte/usage.html">Context Transfer Engine usage</a>: reading pages as blobs from any client.</li>
+  <li><a href="/design/placement.html">Placement and tiering</a>: how scores decide where a page lives.</li>
+</ul>

@@ -294,7 +294,7 @@ TEST_CASE("CLIO_IPC AllocateBuffer documentation examples",
           "[ipc][allocate_buffer][documentation]") {
   REQUIRE(initialize_clio());
 
-  SECTION("MODULE_DEVELOPMENT_GUIDE.md examples") {
+  SECTION("module_dev_guide.md examples") {
     // Test the exact examples from the documentation
 
     // Get the IPC manager singleton

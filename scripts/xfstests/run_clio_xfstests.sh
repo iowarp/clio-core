@@ -144,7 +144,14 @@ pass=0; fail=0; notrun=0; hang=0; failed_list=""
 for t in "${LIST[@]}"; do
   : > "${CLIO_FUSE_RT_LOG:-/tmp/clio_fuse_rt.log}"   # fresh runtime log per test (hang diagnosis)
   remount >/dev/null 2>&1 || { echo "${t}: MOUNTFAIL"; fail=$((fail+1)); failed_list="${failed_list} ${t}"; continue; }
-  out=$(timeout "${CLIO_XFS_PERTEST_TIMEOUT:-90}" ./check "${t}" 2>/dev/null)
+  # Long by design, not hung (fixed-duration / soak; 190-240 s on clio-fs):
+  # a flat budget reported them as hangs. See run_generic_sweep.sh.
+  budget="${CLIO_XFS_PERTEST_TIMEOUT:-90}"
+  case " generic/074 generic/208 generic/521 generic/522 " in *" ${t} "*)
+    [ "${CLIO_XFS_LONG_TIMEOUT:-600}" -gt "${budget}" ] &&
+      budget="${CLIO_XFS_LONG_TIMEOUT:-600}" ;;
+  esac
+  out=$(timeout "${budget}" ./check "${t}" 2>/dev/null)
   rc=$?
   # NOTE: check "Not run:" BEFORE "Passed all". ./check prints BOTH
   # "Not run: <t>" AND "Passed all 0 tests" when the only test notruns, so

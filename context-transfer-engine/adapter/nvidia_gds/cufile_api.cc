@@ -38,64 +38,107 @@ bool cuFile_Intercepted = true;
 #include <limits.h>
 #include <sys/file.h>
 
+#include <cerrno>
 #include <cstdio>
 
-#include "adapter/posix/posix_api.h"
+// pread/pwrite below resolve to whatever is interposed (the POSIX adapter
+// when it is preloaded), so a clio:: path reaches the CTE.
+#include <unistd.h>
 
-namespace stdfs = std::filesystem;
+namespace {
+
+/**
+ * Bounce-buffer one cuFile transfer between a file range and device memory.
+ * Batch I/O (cuFileBatchIO*) is NOT routed here; it goes to the real cuFile
+ * library unchanged.
+ * @param fh the registered handle (a heap copy of the caller's descriptor)
+ * @param dev_base device buffer base the caller passed
+ * @param size bytes to transfer
+ * @param file_offset file offset of the transfer
+ * @param dev_offset offset into dev_base
+ * @param to_device true: file -> device (read); false: device -> file
+ * @return bytes transferred, -1 with errno set on a file error, or
+ *         -CU_FILE_CUDA_DRIVER_ERROR when the device copy failed
+ */
+ssize_t BounceIo(CUfileHandle_t fh, char *dev_base, size_t size,
+                 off_t file_offset, off_t dev_offset, bool to_device) {
+  if (fh == nullptr || dev_base == nullptr) {
+    errno = EINVAL;
+    return -1;
+  }
+  if (size == 0) return 0;
+  const int fd = static_cast<CUfileDescr_t *>(fh)->handle.fd;
+  char *dev = dev_base + dev_offset;
+  char *host = static_cast<char *>(malloc(size));
+  if (host == nullptr) {
+    errno = ENOMEM;
+    return -1;
+  }
+  ssize_t ret;
+  if (to_device) {
+    // At file_offset, into dev_base + devPtr_offset: both offsets used to be
+    // ignored, so every transfer hit the fd's position and the buffer's
+    // start (#1191).
+    ret = pread(fd, host, size, file_offset);
+    if (ret > 0 &&
+        cudaMemcpy(dev, host, static_cast<size_t>(ret),
+                   cudaMemcpyHostToDevice) != cudaSuccess) {
+      ret = -static_cast<ssize_t>(CU_FILE_CUDA_DRIVER_ERROR);
+    }
+  } else {
+    if (cudaMemcpy(host, dev, size, cudaMemcpyDeviceToHost) != cudaSuccess) {
+      ret = -static_cast<ssize_t>(CU_FILE_CUDA_DRIVER_ERROR);
+    } else {
+      ret = pwrite(fd, host, size, file_offset);
+    }
+  }
+  const int saved = errno;
+  free(host);
+  errno = saved;
+  return ret;
+}
+
+}  // namespace
 
 extern "C" {
 // Interceptor functions
 CUfileError_t cuFileHandleRegister(CUfileHandle_t *fh, CUfileDescr_t *descr) {
-  //    printf("Intercepted the REAL API\n");
-  (*fh) = descr;
   CUfileError_t ret;
+  if (fh == nullptr || descr == nullptr) {
+    ret.err = CU_FILE_INVALID_VALUE;
+    return ret;
+  }
+  // Keep a copy: the caller's descriptor is commonly a stack variable that
+  // is gone by the first cuFileRead.
+  *fh = new CUfileDescr_t(*descr);
   ret.err = CU_FILE_SUCCESS;
   return ret;
-  // return CLIO_CTE_CUFILE_API->cuFileHandleRegister(fh, descr);
 }
 
 void cuFileHandleDeregister(CUfileHandle_t fh) {
-  //    printf("Intercepted the REAL API\n");
-  close(((CUfileDescr_t *)fh)->handle.fd);
-  // CLIO_CTE_CUFILE_API->cuFileHandleDeregister(fh);
+  // The fd belongs to the caller, as with the real cuFile: deregistering
+  // must not close it.
+  delete static_cast<CUfileDescr_t *>(fh);
 }
 
 CUfileError_t cuFileBufRegister(const void *buf, size_t size, int flags) {
-  //    printf("Intercepted the REAL API\n");
   return CLIO_CTE_CUFILE_API->cuFileBufRegister(buf, size, flags);
 }
 
 CUfileError_t cuFileBufDeregister(const void *buf) {
-  //    printf("Intercepted the REAL API\n");
   return CLIO_CTE_CUFILE_API->cuFileBufDeregister(buf);
 }
 
-ssize_t cuFileRead(CUfileHandle_t fh, void *buf, size_t size, off_t offset,
-                   off_t offset2) {
-  //    printf("Intercepted the REAL API\n");
-  char *host_data = (char *)malloc(size);
-  CUfileDescr_t *descr = (CUfileDescr_t *)fh;
-  ssize_t ret = read(descr->handle.fd, host_data, size);
-  cudaMemcpy(buf, host_data, size, cudaMemcpyHostToDevice);
-  free(host_data);
-  return ret;
-  // return CLIO_CTE_CUFILE_API->cuFileRead(fh, buf, size, offset, offset2);
+ssize_t cuFileRead(CUfileHandle_t fh, void *devPtr_base, size_t size,
+                   off_t file_offset, off_t devPtr_offset) {
+  return BounceIo(fh, static_cast<char *>(devPtr_base), size, file_offset,
+                  devPtr_offset, /*to_device=*/true);
 }
 
-ssize_t cuFileWrite(CUfileHandle_t fh, const void *buf, size_t size,
-                    off_t offset, off_t offset2) {
-  //    printf("Intercepted the REAL API\n");
-  // Read data from GPU using cudaMemcpy
-  // FullPtr<char> p = CLIO_CLIENT->AllocateBuffer(size);
-  char *host_data = (char *)malloc(size);
-  cudaMemcpy(host_data, buf, size, cudaMemcpyDeviceToHost);
-  // Write data to Clio
-  CUfileDescr_t *descr = (CUfileDescr_t *)fh;
-  ssize_t ret = write(descr->handle.fd, host_data, size);
-  free(host_data);
-  return ret;
-  // return CLIO_CTE_CUFILE_API->cuFileWrite(fh, buf, size, offset, offset2);
+ssize_t cuFileWrite(CUfileHandle_t fh, const void *devPtr_base, size_t size,
+                    off_t file_offset, off_t devPtr_offset) {
+  return BounceIo(fh, const_cast<char *>(static_cast<const char *>(devPtr_base)),
+                  size, file_offset, devPtr_offset, /*to_device=*/false);
 }
 
 long cuFileUseCount() {

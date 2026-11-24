@@ -33,6 +33,10 @@
 
 #include <clio_cae/core/factory/assimilator_factory.h>
 #include <clio_cae/core/factory/binary_file_assimilator.h>
+#include <clio_cae/core/factory/path_policy.h>
+#ifdef CAE_ENABLE_HTTP
+#include <clio_cae/core/factory/http_file_assimilator.h>
+#endif
 #include <clio_cae/core/factory/string_data_assimilator.h>
 #ifdef CLIO_CAE_ENABLE_HDF5
 #include <clio_cae/core/factory/hdf5_file_assimilator.h>
@@ -53,8 +57,9 @@
 namespace clio::cae::core {
 
 AssimilatorFactory::AssimilatorFactory(
-    std::shared_ptr<clio::cte::core::Client> cte_client)
-    : cte_client_(cte_client) {}
+    std::shared_ptr<clio::cte::core::Client> cte_client,
+    S3ConnectionPool* s3_pool)
+    : cte_client_(cte_client), s3_pool_(s3_pool) {}
 
 std::unique_ptr<BaseAssimilator> AssimilatorFactory::Get(
     const std::string& src) {
@@ -79,12 +84,38 @@ std::unique_ptr<BaseAssimilator> AssimilatorFactory::Get(
   std::string protocol = GetUrlProtocol(src);
   HLOG(kDebug, "AssimilatorFactory: Extracted protocol='{}'", protocol);
 
+  // Local-file sources name a path on the runtime's host, chosen by whoever
+  // sent the task. Check it against the runtime's path policy before any
+  // assimilator opens it (the assimilators read the same "<proto>::<path>").
+  if (protocol == "file" || protocol == "hdf5") {
+    size_t sep = src.find("::");
+    std::string path = sep == std::string::npos ? "" : src.substr(sep + 2);
+    std::string reason;
+    if (!PathPolicy::Get().Allows(path, /*write=*/false, reason)) {
+      HLOG(kError, "AssimilatorFactory: refusing source '{}': {}", src,
+           reason);
+      return nullptr;
+    }
+  }
+
   if (protocol == "file") {
     HLOG(kDebug,
          "AssimilatorFactory: Creating BinaryFileAssimilator for 'file' "
          "protocol");
     // For file protocol, return a BinaryFileAssimilator
     return std::make_unique<BinaryFileAssimilator>(cte_client_);
+  } else if (protocol == "http" || protocol == "https") {
+    HLOG(kDebug,
+         "AssimilatorFactory: Creating HttpFileAssimilator for '{}' protocol",
+         protocol);
+#ifdef CAE_ENABLE_HTTP
+    // Plain web downloads (curl children; credentials from
+    // ~/.clio/cae_http_auth.ini). Globus web URLs were caught above.
+    return std::make_unique<HttpFileAssimilator>(cte_client_);
+#else
+    HLOG(kError, "AssimilatorFactory: http(s) sources need a POSIX build");
+    return nullptr;
+#endif
   } else if (protocol == "string") {
     HLOG(kDebug,
          "AssimilatorFactory: Creating StringDataAssimilator for 'string' "
@@ -103,7 +134,7 @@ std::unique_ptr<BaseAssimilator> AssimilatorFactory::Get(
     HLOG(kError,
          "AssimilatorFactory: HDF5 protocol requested but HDF5 support not "
          "compiled in. "
-         "Rebuild with -DWRP_CORE_ENABLE_HDF5=ON to enable HDF5 support.");
+         "Rebuild with -DCLIO_CORE_ENABLE_HDF5=ON to enable HDF5 support.");
     return nullptr;
 #endif
   } else if (protocol == "globus") {
@@ -125,8 +156,9 @@ std::unique_ptr<BaseAssimilator> AssimilatorFactory::Get(
 #ifdef CAE_ENABLE_S3
     HLOG(kDebug,
          "AssimilatorFactory: Creating S3FileAssimilator for 's3' protocol");
-    // For s3 protocol, return an S3FileAssimilator
-    return std::make_unique<S3FileAssimilator>(cte_client_);
+    // For s3 protocol, return an S3FileAssimilator wired to the shared
+    // keep-alive connection pool (may be null -> it connects per object).
+    return std::make_unique<S3FileAssimilator>(cte_client_, s3_pool_);
 #else
     // S3 support not compiled in
     HLOG(kError,

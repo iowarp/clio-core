@@ -14,8 +14,11 @@
 #include <clio_runtime/bdev/bdev_tasks.h>
 #include <clio_runtime/comutex.h>
 #include <atomic>
+#include <map>
+#include <mutex>
 #include <vector>
-#include <list>
+#include <iterator>
+#include <set>
 
 namespace clio::run::bdev {
 
@@ -40,46 +43,83 @@ enum class BlockSizeCategory : clio::run::u32 {
 extern const size_t kBlockSizes[];
 
 /**
- * Worker-local block map to reduce lock contention
- */
-class WorkerBlockMap {
- public:
-  WorkerBlockMap();
-
-  bool AllocateBlock(int block_type, Block& block, size_t min_size = 0);
-  /** Pull ANY freed block whose size_ is <= max_bytes (largest first), for
-   *  fragmentation reuse (issue #820). Unlike AllocateBlock, which finds a
-   *  block >= a size in one category, this scans every bucket for a block that
-   *  FITS what is left -- a freed 8 KiB block bucketed under 16 KiB is exactly
-   *  the case the >= match could never reach. */
-  bool AllocateAnyUpTo(size_t max_bytes, Block& block);
-  void FreeBlock(Block block);
-
- private:
-  std::vector<std::list<Block>> blocks_;
-};
-
-/**
- * Global block map with per-worker caching and locking
+ * Coalescing free-extent index shared by every worker (issue #1333).
+ *
+ * Freed space is kept as maximal extents: a free merges with the extents on
+ * either side, so 4 KiB blocks freed next to each other become one extent a
+ * later 1 MiB request can take whole. The old design filed every freed block
+ * in a per-worker, per-size-class list and never merged them; after small-I/O
+ * churn a 1 MiB write was assembled from 256 scattered 4 KiB blocks and hit
+ * the device as 256 separate writes (~4x slower on NVMe).
+ *
+ * Two indexes over the same extents: by offset (merge on free) and by
+ * (length, offset) (best fit on allocate). All offsets/lengths are physical
+ * footprints in allocator-alignment units. One CoMutex guards both; every
+ * operation is O(log n) and never yields while holding it.
  */
 class GlobalBlockMap {
  public:
   GlobalBlockMap();
-
+  /** Kept for API compatibility; the index is shared, not per worker. */
   void Init(size_t num_workers);
-  bool AllocateBlock(int worker, size_t io_size, Block& block);
-  /** @copydoc WorkerBlockMap::AllocateAnyUpTo -- searches this worker's map
-   *  first, then steals from the others. */
+  /** Best fit: take the smallest free extent >= footprint, split off the
+   *  rest. On success block = {offset, footprint, type of footprint}. */
+  bool AllocateBlock(int worker, size_t footprint, Block& block);
+  /**
+   * Like AllocateBlock, but the block starts on a multiple of `align`.
+   * Takes the smallest free extent that holds an aligned run of `footprint`
+   * bytes; the unaligned head and the tail of that extent stay free.
+   * @param footprint physical bytes wanted
+   * @param align required alignment of the block's offset in bytes (> 0)
+   * @param block out: {aligned offset, footprint, type of footprint}
+   * @return false if no free extent holds such a run
+   */
+  bool AllocateAlignedBlock(size_t footprint, clio::run::u64 align,
+                            Block& block);
+  /** Take the LARGEST free extent, clipped to max_bytes (the remainder stays
+   *  free), so a request assembled from pieces uses as few as possible. */
   bool AllocateAnyUpTo(int worker, size_t max_bytes, Block& block);
+  /** Return [offset_, offset_ + size_) (size_ = footprint), merging with
+   *  adjacent free extents. */
   bool FreeBlock(int worker, Block& block);
-
+  /** Return a free range (recovery). Same as FreeBlock. */
+  void SeedFreeRange(clio::run::u64 offset, clio::run::u64 size);
+  /** While the highest free extent [start, end) is accepted by
+   *  retract(start, end) (run under the index lock), remove it -- hands the
+   *  heap's free tail back to the bump cursor. @return true if any removed. */
+  template <typename Fn>
+  bool RetractTail(Fn&& retract);
   /** Map an I/O size to its block-size category, or -1 if larger than all. */
   static int FindBlockType(size_t io_size);
+  /** Total free bytes and extent count (stats / tests). */
+  clio::run::u64 FreeBytes();
+  size_t NumExtents();
 
  private:
-  std::vector<WorkerBlockMap> worker_maps_;
-  std::vector<clio::run::CoMutex> worker_locks_;
+  void InsertLocked(clio::run::u64 off, clio::run::u64 len);
+  void EraseLocked(std::map<clio::run::u64, clio::run::u64>::iterator it);
+  void AddLocked(clio::run::u64 off, clio::run::u64 len);
+  clio::run::CoMutex mu_;
+  std::map<clio::run::u64, clio::run::u64> by_off_;                 // off -> len
+  std::set<std::pair<clio::run::u64, clio::run::u64>> by_size_;     // (len, off)
+  clio::run::u64 free_bytes_ = 0;
 };
+
+template <typename Fn>
+bool GlobalBlockMap::RetractTail(Fn&& retract) {
+  bool any = false;
+  clio::run::ScopedCoMutex lock(mu_);
+  for (;;) {
+    if (by_off_.empty()) return any;
+    auto last = std::prev(by_off_.end());
+    const clio::run::u64 start = last->first;
+    const clio::run::u64 end = start + last->second;
+    if (!retract(start, end)) return any;
+    EraseLocked(last);
+    any = true;
+  }
+}
+
 
 /**
  * Heap allocator for new blocks
@@ -90,7 +130,40 @@ class Heap {
 
   void Init(clio::run::u64 total_size, clio::run::u32 alignment = 4096);
   bool Allocate(size_t block_size, int block_type, Block& block);
+  /**
+   * Like Allocate, but the block starts on a multiple of `align`. The bytes
+   * skipped to reach that boundary are reported so the caller can return
+   * them to the free index.
+   * @param block_size bytes wanted (rounded up to the heap alignment)
+   * @param block_type size category recorded in the block
+   * @param align required alignment of the block's offset in bytes (> 0)
+   * @param block out: the block, at an aligned offset
+   * @param gap_off out: start of the skipped range
+   * @param gap_len out: length of the skipped range (0 = none)
+   * @return false if the heap has no room
+   */
+  bool AllocateAligned(size_t block_size, int block_type, clio::run::u64 align,
+                       Block& block, clio::run::u64* gap_off,
+                       clio::run::u64* gap_len);
   clio::run::u64 GetRemainingSize() const;
+
+  /**
+   * Move the bump cursor to `cursor` (used on recovery: past every live
+   * block, so the heap can never hand out a live offset).
+   * @param cursor New bump offset in bytes
+   */
+  void SetCursor(clio::run::u64 cursor) { heap_.store(cursor); }
+  /**
+   * Move the cursor back from `end` to `start` iff it is exactly `end`: the
+   * free extent [start, end) is the heap's tail and becomes untouched heap
+   * again. A concurrent Allocate that already advanced the cursor makes the
+   * CAS fail, so a byte is never both free and handed out.
+   */
+  bool Retract(clio::run::u64 start, clio::run::u64 end) {
+    clio::run::u64 expected = end;
+    return heap_.compare_exchange_strong(expected, start);
+  }
+  clio::run::u64 GetCursor() const { return heap_.load(); }
 
  private:
   std::atomic<clio::run::u64> heap_;
@@ -113,16 +186,77 @@ class StandardBlockAllocator {
   }
 
   bool AllocateBlocks(size_t size, int worker_id, std::vector<Block>& blocks);
+
+  /**
+   * Start every block of at least `align` bytes on a multiple of `align`.
+   *
+   * For devices whose backend stores data in fixed units (a DAOS file's
+   * chunks, which are also its erasure-coding stripes): a block that
+   * straddles two units costs two partial-unit writes instead of one whole
+   * one. Smaller blocks are placed as before and fill the gaps this leaves.
+   * @param align unit size in bytes; 0 (default) turns the rule off
+   */
+  void SetLargeBlockAlign(clio::run::u64 align) { large_align_ = align; }
+
+  /**
+   * Rebuild the allocator from a recovered set of live extents (after Init).
+   * The heap cursor moves past the highest live byte, every gap below it is
+   * returned to the free list, and the live bytes are charged as allocated,
+   * so no live extent is ever handed out again and freed space is reused.
+   * @param live Live extents as (offset, size) pairs; sizes may be unaligned
+   */
+  void InitFromLive(
+      const std::vector<std::pair<clio::run::u64, clio::run::u64>>& live);
   void FreeBlocks(int worker_id, const std::vector<Block>& blocks);
 
   clio::run::u64 GetRemainingSize() const;
   clio::run::u64 GetCapacity() const { return capacity_; }
+  /** Free-index stats and heap cursor (tests / diagnostics). */
+  clio::run::u64 GetFreeIndexBytes() { return global_block_map_.FreeBytes(); }
+  size_t GetFreeExtentCount() { return global_block_map_.NumExtents(); }
+  clio::run::u64 GetHeapCursor() const { return heap_.GetCursor(); }
+
+  /** @return whether CLIO_BDEV_CHECK_ALLOC=1 enables the live-extent checker */
+  static bool CheckEnabled();
 
  private:
+  /**
+   * Checker (CLIO_BDEV_CHECK_ALLOC=1): record newly allocated extents,
+   * logging an error with a backtrace if one overlaps an extent already
+   * live -- two owners of the same bytes.
+   * @param blocks the blocks just handed out
+   */
+  void CheckAllocated(const std::vector<Block> &blocks);
+  /**
+   * Checker: drop freed extents, logging an error with a backtrace for a
+   * range that is not (entirely) live -- a double free.
+   * @param blocks the blocks being freed
+   */
+  void CheckFreed(const std::vector<Block> &blocks);
+  /** AllocateBlocks without the checker. */
+  bool AllocateBlocksImpl(size_t size, int worker_id,
+                          std::vector<Block> &blocks);
+  /**
+   * One block starting on a multiple of large_align_, from the free index or
+   * else the heap (SetLargeBlockAlign).
+   * @param footprint physical bytes wanted
+   * @param type size category recorded in the block
+   * @param block out: the block (size_ = footprint)
+   * @return false if neither has an aligned run of that size
+   */
+  bool AllocateLargeAligned(clio::run::u64 footprint, int type, Block &block);
+  /** Hand free extents at the top of the used range back to the heap. */
+  void RetractHeapTail();
+  std::mutex check_mu_;
+  /** Live extents (offset -> aligned end), only with the checker on. */
+  std::map<clio::run::u64, clio::run::u64> live_;
+
   GlobalBlockMap global_block_map_;
   Heap heap_;
   clio::run::u32 alignment_;
   clio::run::u64 capacity_;
+  /** Blocks >= this start on a multiple of it; 0 = off. */
+  clio::run::u64 large_align_ = 0;
   std::atomic<clio::run::u64> allocated_bytes_{0};
 
   clio::run::u64 AlignSize(clio::run::u64 size) {

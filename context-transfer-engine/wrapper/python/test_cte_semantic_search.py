@@ -12,7 +12,7 @@ matching blob names and verifies:
     in the top-k when the query is about space exploration.
 
 The labeling pipeline (CAE -> Ollama -> {name}_label blobs) is exercised
-separately by the C++ test_cae_semantic_search; this test scores the
+separately by the C++ test_summarizer_semantic_search; this test scores the
 raw document text so it doesn't need Ollama to run.
 
 Usage:

@@ -37,7 +37,11 @@ class Runtime : public clio::run::Container {
   ~Runtime() override;
 
   /**
-   * Get live task statistics for this task instance.
+   * Get live task statistics for this task instance (every bdev method).
+   * Read/Write scale with their length at this bdev type's device rate;
+   * every other method returns an explicit constant.
+   * @param task the task to estimate
+   * @return the task's cost features
    */
   clio::run::TaskStat GetTaskStats(const clio::run::Task *task) const override;
 
@@ -70,6 +74,23 @@ class Runtime : public clio::run::Container {
   clio::run::TaskResume Read(clio::run::shared_ptr<ReadTask> &task);
   clio::run::TaskResume GetStats(clio::run::shared_ptr<GetStatsTask> &task);
   clio::run::TaskResume SetLifespan(clio::run::shared_ptr<SetLifespanTask> &task);
+
+  /**
+   * Make the transport's allocator-state log durable (fsync) and compact it
+   * when it has outgrown the live set, for transports that
+   * keep a log (file bdevs). The file transport also syncs on its own
+   * 50 ms thread; this one-shot form forces a sync now.
+   * @param task Flush task (no parameters)
+   */
+  clio::run::TaskResume FlushAllocLog(
+      clio::run::shared_ptr<FlushAllocLogTask> &task);
+
+  /**
+   * Make written data and allocator state durable (Method::kSync).
+   * @param task Sync task; rc 1 if the device could not be synced
+   */
+  clio::run::TaskResume Sync(clio::run::shared_ptr<SyncTask> &task);
+
   clio::run::TaskResume Update(clio::run::shared_ptr<UpdateTask> &task);
   clio::run::TaskResume Monitor(clio::run::shared_ptr<MonitorTask> &task);
   clio::run::TaskResume Destroy(clio::run::shared_ptr<DestroyTask> &task);

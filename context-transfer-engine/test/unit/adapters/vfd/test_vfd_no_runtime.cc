@@ -26,13 +26,33 @@
 #include <hdf5.h>
 
 #include <cstdio>
+#ifdef _WIN32
+#include <crtdbg.h>
+#endif
+#include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <string>
 #include <vector>
 
 #include "adapter/vfd/H5FDclio.h"
+#include "adapter/vfd/H5FDclio_trace.h"
 
 namespace {
+
+/** setenv(3) is POSIX; MSVC spells it _putenv_s and has no "don't overwrite"
+ *  mode, so honor overwrite=0 by checking first. Kept local rather than shared
+ *  with test_vfd_adapter.cc on purpose: this test deliberately links nothing
+ *  beyond the driver, which is the whole point of "no runtime". */
+inline void TestSetenv(const char *name, const char *value, int overwrite) {
+#ifdef _WIN32
+  if (!overwrite && std::getenv(name) != nullptr) return;
+  (void)_putenv_s(name, value);
+#else
+  (void)setenv(name, value, overwrite);
+#endif
+}
+
 constexpr hsize_t kN = 4096;
 
 #define CHECK(cond, msg)                                              \
@@ -106,10 +126,47 @@ int RoundTrip(const char *label, hbool_t cache_enabled, const char *path) {
 }  // namespace
 
 int main() {
+  // Make a hard failure in this binary say something. Every one of these was
+  // load-bearing while diagnosing an abort in the driver's close path, and they
+  // are cheap enough to keep permanently: without them the process exited 3
+  // having printed NOTHING, because abort() discards buffered stdout and takes
+  // every case marker with it. Unbuffer both streams so the last thing printed
+  // survives, and name the terminating exception rather than leaving a silent
+  // exit code.
+  std::setvbuf(stdout, nullptr, _IONBF, 0);
+  std::setvbuf(stderr, nullptr, _IONBF, 0);
+#ifdef _WIN32
+  // A Debug HDF5 has its internal assert()s live, and the debug CRT reports
+  // those through a MODAL DIALOG once a debugger is attached -- which blocks an
+  // unattended run forever instead of failing it. Route them to stderr so the
+  // assert text is captured and the process proceeds to abort().
+  _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
+  _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
+  _CrtSetReportMode(_CRT_ERROR, _CRTDBG_MODE_FILE);
+  _CrtSetReportFile(_CRT_ERROR, _CRTDBG_FILE_STDERR);
+  _set_error_mode(_OUT_TO_STDERR);
+  _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+#endif
+  std::set_terminate([] {
+    if (auto e = std::current_exception()) {
+      try {
+        std::rethrow_exception(e);
+      } catch (const std::exception &ex) {
+        std::fprintf(stderr, "[vfd-no-runtime] TERMINATE: %s\n", ex.what());
+      } catch (...) {
+        std::fprintf(stderr, "[vfd-no-runtime] TERMINATE: non-std exception\n");
+      }
+    } else {
+      std::fprintf(stderr, "[vfd-no-runtime] TERMINATE: no active exception\n");
+    }
+    std::fflush(stderr);
+    std::_Exit(3);
+  });
+
   // Give up on a missing runtime immediately instead of retrying for the
   // default 60s. Without this the second case below spends a minute confirming
   // what it already knows, and the fallback it is checking looks like a hang.
-  setenv("CLIO_CLIENT_RETRY_TIMEOUT", "0", /*overwrite*/ 0);
+  TestSetenv("CLIO_CLIENT_RETRY_TIMEOUT", "0", /*overwrite*/ 0);
 
   hid_t driver = H5FD_clio_init();
   CHECK(driver >= 0, "the driver registers without a runtime");
@@ -138,6 +195,80 @@ int main() {
     CHECK(gone < 0, "the deleted file is really gone");
     H5Pclose(fapl);
     std::printf("[vfd-no-runtime] ok: delete works with no runtime\n");
+  }
+
+  // The static_assert in H5FDclio.cc pins the constant; this pins the
+  // comparison, which a correct constant alone does not.
+  {
+    CHECK(std::string(clio::vfdtrace::MemClass(H5FD_MEM_DRAW)) == "raw",
+          "H5FD_MEM_DRAW classifies as raw");
+    for (H5FD_mem_t t : {H5FD_MEM_SUPER, H5FD_MEM_BTREE, H5FD_MEM_GHEAP,
+                         H5FD_MEM_LHEAP, H5FD_MEM_OHDR, H5FD_MEM_DEFAULT}) {
+      CHECK(std::string(clio::vfdtrace::MemClass(t)) == "meta",
+            "non-DRAW memory types classify as meta");
+    }
+    std::printf("[vfd-no-runtime] ok: raw/meta classification\n");
+  }
+
+  // The durability barrier is opt-in for close as well as flush. Without it the
+  // driver must not fsync -- that was ~4 ms per file and made file-per-step
+  // output 8-24x slower than sec2 -- and with it both callbacks must. The bytes
+  // a reader sees are the same either way, so the fsync counter is the only
+  // witness.
+  {
+    const char *path = "/tmp/clio_cte_vfd_nort_fsync.h5";
+    const std::vector<double> w = MakeF64(256);
+    // Write session: create, write, explicit flush, close. Reports the fsyncs
+    // issued by the flush and by the close separately.
+    auto session = [&](hid_t fapl, unsigned long *at_flush,
+                       unsigned long *at_close) -> bool {
+      std::remove(path);
+      const unsigned long f0 = H5FDclio_fsyncs_g;
+      hid_t f = H5Fcreate(path, H5F_ACC_TRUNC, H5P_DEFAULT, fapl);
+      if (f < 0 || !WriteDset(f, "d", w)) return false;
+      if (H5Fflush(f, H5F_SCOPE_GLOBAL) < 0) return false;
+      const unsigned long f1 = H5FDclio_fsyncs_g;
+      if (H5Fclose(f) < 0) return false;
+      *at_flush = f1 - f0;
+      *at_close = H5FDclio_fsyncs_g - f1;
+      return true;
+    };
+    unsigned long at_flush = 0, at_close = 0;
+
+    hid_t plain = H5Pcreate(H5P_FILE_ACCESS);
+    CHECK(plain >= 0 && H5Pset_fapl_clio(plain, 0) >= 0, "fsync: default fapl");
+    CHECK(session(plain, &at_flush, &at_close), "fsync: default session");
+    CHECK(at_flush == 0, "fsync: flush does not fsync by default");
+    CHECK(at_close == 0, "fsync: close does not fsync by default");
+
+    hid_t barrier = H5Pcreate(H5P_FILE_ACCESS);
+    CHECK(barrier >= 0 &&
+              H5Pset_driver_by_name(barrier, "clio_vfd", "cache=0;fsync=1") >= 0,
+          "fsync: fsync=1 fapl");
+    CHECK(session(barrier, &at_flush, &at_close), "fsync: fsync=1 session");
+    CHECK(at_flush >= 1, "fsync: fsync=1 makes flush fsync");
+    CHECK(at_close >= 1, "fsync: fsync=1 makes close fsync");
+
+    // A read-only open has nothing to persist and must never fsync, barrier
+    // or not (on Windows the equivalent call fails on a read-only handle).
+    const unsigned long r0 = H5FDclio_fsyncs_g;
+    hid_t rf = H5Fopen(path, H5F_ACC_RDONLY, barrier);
+    CHECK(rf >= 0 && ReadDsetEq(rf, "d", w), "fsync: read back under fsync=1");
+    CHECK(H5Fclose(rf) >= 0, "fsync: close read-only");
+    CHECK(H5FDclio_fsyncs_g == r0, "fsync: a read-only open never fsyncs");
+
+    // The environment can switch the barrier on for a FAPL that left it off.
+    TestSetenv("CLIO_VFD_FSYNC", "1", /*overwrite*/ 1);
+    const bool env_ok = session(plain, &at_flush, &at_close);
+    TestSetenv("CLIO_VFD_FSYNC", "0", /*overwrite*/ 1);
+    CHECK(env_ok, "fsync: CLIO_VFD_FSYNC=1 session");
+    CHECK(at_close >= 1, "fsync: CLIO_VFD_FSYNC=1 makes close fsync");
+
+    H5Pclose(plain);
+    H5Pclose(barrier);
+    std::remove(path);
+    std::printf("[vfd-no-runtime] ok: the fsync barrier is opt-in for flush "
+                "and close\n");
   }
 
   std::printf("[vfd-no-runtime] PASS: the driver is complete without CLIO\n");

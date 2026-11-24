@@ -108,7 +108,7 @@ sudo cmake --install build
 For the per-feature apt / dnf dependency list and the complete
 `CLIO_*_ENABLE_*` flag checklist, see [INSTALL.md](INSTALL.md). Other install
 methods (Conda, Docker, Spack) are documented in
-[docs/getting-started/installation](docs/docs/getting-started/installation.mdx).
+[Install CLIO Core](https://core.iowarp.ai/docs/installation.html).
 
 ## Components
 
@@ -138,6 +138,16 @@ To override the configuration, point `CLIO_SERVER_CONF` at your own YAML file:
 export CLIO_SERVER_CONF=/path/to/my_config.yaml
 clio_run start
 ```
+
+A single-node runtime listens on loopback only. The runtime does not
+authenticate clients or peers, so listening on the network is opt-in.
+
+- **Clients on other hosts.** Start the runtime with `CLIO_BIND_ADDR=0.0.0.0`,
+  or with one of this machine's addresses. Clients connect with
+  `CLIO_SERVER_ADDR=<runtime address>`. Do this only on a network you trust.
+- **Multi-node runtimes.** A runtime with a hostfile listens on every interface,
+  because its peers must reach it. Run multi-node deployments on a trusted
+  network.
 
 ### FUSE filesystem
 
@@ -285,7 +295,7 @@ clio_cte_bench       --op PutGet --threads 8 --depth 16 --io-size 1m --io-count 
 
 ## Documentation
 
-- **[AGENTS.md](AGENTS.md)** — unified development guide and coding standards.
+- **[Contributing guide](.claude-plugin/plugins/iowarp-contributing/skills/contributing/SKILL.md)** — git workflow, code standards and codemap.
 - **[INSTALL.md](INSTALL.md)** — bare-metal source-build instructions.
 - **[Context Transport Primitives](context-transport-primitives/README.md)**
 - **[CLIO Runtime](context-runtime/README.md)**
@@ -318,7 +328,7 @@ streaming analytics.
 
 1. Fork the repository.
 2. Create a feature branch: `git checkout -b feature/amazing-feature`.
-3. Follow the standards in [AGENTS.md](AGENTS.md).
+3. Follow the [contributing guide](.claude-plugin/plugins/iowarp-contributing/skills/contributing/SKILL.md).
 4. `ctest --test-dir build/release` before opening a PR.
 5. Submit a pull request against `iowarp/clio-core`.
 

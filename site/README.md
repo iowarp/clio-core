@@ -1,0 +1,123 @@
+# CLIO Core website
+
+The public website for CLIO Core, a composable I/O stack for data-intensive
+pipelines: **Overview** (with the install feature matrix), **Technologies** (the composable stack and its
+products: Context FS, key-value store, memory expansion, machine learning,
+each with measured results against alternative systems), **Docs** (basic
+usage, concepts, CLI, Python API), **Tutorials** (composing the context
+filesystem from RAM/NVMe/SSD/disk and S3/GCS, FUSE on Linux/macOS/Windows, the
+dashboard, Python semantic query, AI agents over MCP) and **Design** (how the
+storage stack works).
+
+It follows the editorial style of the sibling Clio sites
+([clio-coder](https://github.com/iowarp/clio-coder) and
+[clio-agent](https://github.com/iowarp/clio-agent)): black and warm ivory,
+cyan accent, copper secondary, Newsreader headings, IBM Plex text and code,
+dark by default with a light theme. It is the documentation for CLIO Core.
+
+## Build and preview
+
+No dependencies beyond Python 3.12+ (build.py uses 3.12 f-string syntax):
+
+```bash
+python3 site/build.py            # writes site/_site and checks every internal link
+python3 site/build.py --serve    # build, then serve on http://127.0.0.1:8000/
+```
+
+`.github/workflows/pages.yml` runs the same build on pull requests and deploys
+`main` to GitHub Pages. Enable it once under Settings → Pages → Source:
+"GitHub Actions". All links are relative, so the site works at
+`https://iowarp.github.io/clio-core/` or on a custom domain. Links to section
+indexes are written as directories (`../docs/`), so browse it through
+`--serve` rather than from disk.
+
+## Search engines and LLMs
+
+The public origin is `SITE_URL` in `build.py` (`https://core.iowarp.ai`,
+override with the `SITE_URL` environment variable). From it the build adds:
+
+- a `<link rel="canonical">` and `og:url` on every page. Directory indexes use
+  the trailing-slash form (`/docs/`, never `/docs/index.html`), matching the
+  internal links; redirect stubs point at their new page.
+- JSON-LD: `WebSite` and `SoftwareSourceCode` on the home page, a
+  `BreadcrumbList` (Home › section › page) everywhere else.
+- `sitemap.xml` with every page, in nav order. `<lastmod>` is the date of the
+  last commit that touched the page source (the file's mtime if it has
+  uncommitted changes), which is why the workflow checks out full history.
+- `robots.txt` allowing all crawlers and naming the sitemap.
+- `llms.txt`: `SITE_SUMMARY` from `build.py`, then each section's pages with
+  their `description`.
+
+New pages need nothing extra: add them to `NAV` and they appear in all of these.
+
+## Layout
+
+```
+site/
+  build.py              Wraps pages in the shared layout, writes _site/, checks links
+  pages/                Page sources (one HTML fragment per page)
+    index.html          Overview (landing layout)
+    technologies/       The stack, Context FS, key-value store, memory expansion, machine learning
+    docs/               Introduction, basic usage, concepts, CLI, Python API
+    tutorials/          Compose, cloud storage, FUSE x3, dashboard, Python query, AI agents
+    design/             Runtime, CTE, placement, durability, chain, filesystem, adapters
+  assets/
+    css/site.css        All styling; colors only through semantic variables
+    js/site.js          Theme toggle, phone menu, copy buttons, tabs, TOC highlight
+    brand/              CLIO Core mark (dark and light) plus Clio Agent, Clio Coder, IOWarp marks
+    fonts/              Self-hosted Newsreader and IBM Plex, with their OFL licenses
+```
+
+## Writing a page
+
+Each file in `pages/` starts with a metadata comment, then body HTML:
+
+```html
+<!--
+title: FUSE on Linux
+heading: Mount on <em>Linux.</em>
+description: One sentence for search results and link previews.
+eyebrow: Tutorial · Mount
+lede: The answer, in one or two sentences, under the title.
+facts: Time | 10 minutes ; Driver | libfuse3
+-->
+<h2>1. Install FUSE 3</h2>
+<pre data-label="shell">
+$ sudo apt install fuse3
+</pre>
+```
+
+- Add the page to `NAV` in `build.py` so it appears in the sidebar and in the
+  previous/next links. Sections listed in `DROPDOWNS` (Technologies) also get
+  a header dropdown built from their `NAV` entries.
+- Every performance figure on a Technologies page must come from a benchmark
+  document in the repository; state its hardware and caveats next to it.
+- Write internal links root-relative (`href="/docs/cli.html"`). The build
+  rewrites them relative to each page.
+- `<pre data-label="...">` blocks hold raw text. The build escapes them, adds
+  light highlighting for shell, YAML and Python, and adds a copy button.
+- `<h2>` and `<h3>` headings get ids automatically and feed "On this page".
+- Tabs: `<div class="tabs"><section class="tab-panel" data-tab="Linux">…`.
+  Add `data-platform` to open the visitor's OS first.
+- Other components: `.callout` (and `.callout.warn`), `ol.steps`,
+  `ul.checks`, `.card-list`, `dl.notes`.
+
+## The logo
+
+`assets/brand/clio-core-mark.svg` is a "C" built from three stacked storage
+tiers (RAM, NVMe, disk) with a copper block of data at its core. It uses the
+Clio family colors: cyan `#00d4db` and copper `#ee852f`. The light-theme
+variant uses deep teal `#0a666c` and a darker copper.
+
+## Keeping content accurate
+
+Commands, flags, config keys and API names were checked against the code
+when written: `context-runtime/util/clio_run*.cc`,
+`context-runtime/config/clio_default.yaml`,
+`context-transfer-engine/core/src/core_config.cc`,
+`context-transfer-engine/adapter/libfuse/`,
+`context-transfer-engine/wrapper/python/core_bindings.cc`,
+`context-exploration-engine/api/src/python_bindings.cc`,
+`context-exploration-engine/iowarp-cei-mcp/` and `CMakePresets.json`.
+Update the matching page when those change. Nothing regenerates
+automatically.

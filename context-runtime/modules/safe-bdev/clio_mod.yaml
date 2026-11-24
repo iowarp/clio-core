@@ -1,7 +1,7 @@
 # safe-bdev ChiMod Configuration
 # Declustered, erasure-coded block device aggregating one or more member bdevs.
 # Reuses the bdev module's task types for the data plane and adds management
-# methods for membership and parity maintenance (issue #543).
+# methods for membership and parity maintenance (issue #543, #1120, #1121).
 
 module_name: safe_bdev
 namespace: clio::run
@@ -23,9 +23,14 @@ kWrite: 12              # Write data
 kRead: 13               # Read data
 kGetStats: 14           # Get performance statistics
 
+# IDs 15, 16, 17 are left unused to match bdev's kSetLifespan=16, kFlushAllocLog=17
+# (safe_bdev aliases these, but doesn't override them with distinct methods)
+# ID 18 is kSync, aliased from bdev
+
 # safe_bdev-specific methods (erasure-coding management)
-kAddBdev: 16            # Add a member bdev
-kRemoveBdev: 17         # Remove a member bdev
-kRecoverBdev: 18        # Recover a failed member bdev onto a new member
-kBuildParity: 19        # Build/raise parity for dirty stripes (periodic)
-kFlushAllocLog: 20      # Flush/compact the persistent allocator-state log (periodic)
+# Renumbered to start at 21 to avoid collisions with bdev (issue #1120)
+kAddBdev: 21            # Add a member bdev
+kRemoveBdev: 22         # Remove a member bdev
+kRecoverBdev: 23        # Recover a failed member bdev onto a new member
+kBuildParity: 24        # Build/raise parity for dirty stripes (periodic)
+kFlushAllocLog: 25      # Flush/compact the persistent allocator-state log (periodic)

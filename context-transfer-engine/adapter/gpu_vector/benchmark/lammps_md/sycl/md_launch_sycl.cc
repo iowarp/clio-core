@@ -188,6 +188,8 @@ void LaunchIntegrate(dim3 grid,
                      float gy_,
                      float gz,
                      int drift,
+                     u64 pg_lo,
+                     u64 pg_hi,
                      u32 nblocks,
                      gy::YieldableView<> yv,
                      gy::YieldStackView ys) {
@@ -204,7 +206,7 @@ void LaunchIntegrate(dim3 grid,
     third_.Init(yv.Block());
     gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
     __syncthreads();
-    CLIO_YCORO_RUN(IntegrateCoro(x_, v_, third_, use_third, dt, gx, gy_, gz, drift, nblocks, yv.Block()));
+    CLIO_YCORO_RUN(IntegrateCoro(x_, v_, third_, use_third, dt, gx, gy_, gz, drift, pg_lo, pg_hi, nblocks, yv.Block()));
   });
 }
 

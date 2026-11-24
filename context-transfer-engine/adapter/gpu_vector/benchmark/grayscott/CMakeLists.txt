@@ -33,6 +33,13 @@ if(CLIO_CORE_ENABLE_CUDA)
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     )
     install(TARGETS clio_grayscott_paged_bench RUNTIME DESTINATION bin)
+    # vector.Copy (the end-of-run checkpoint, bench_ckpt.h) creates the
+    # checkpoint chimod's pool, which the runtime LOADS rather than links:
+    # without this, building just this target leaves the chimod unbuilt and
+    # Copy throws "checkpoint pool create failed" at the end of the run.
+    if(TARGET clio_cte_checkpoint_runtime)
+      add_dependencies(clio_grayscott_paged_bench clio_cte_checkpoint_runtime)
+    endif()
 
     # The CUDA paged row had NO ctest entry while its SYCL twin did -- so a
     # break here would have been caught only on the backend that is harder to
@@ -194,51 +201,6 @@ if(CLIO_CORE_ENABLE_CUDA AND CLIO_CORE_ENABLE_NVSHMEM)
     endif()
 endif()
 
-#------------------------------------------------------------------------------
-# grayscott, BaM edition: compiles BaM's sources itself with nvcc (clang rejects
-# --expt-relaxed-constexpr, see the lammps_md sibling).
-#------------------------------------------------------------------------------
-if(CLIO_CORE_ENABLE_CUDA AND EXISTS ${CMAKE_SOURCE_DIR}/external/bam/src/array.cu)
-    find_program(MD_BAM_NVCC nvcc
-        HINTS ${CUDAToolkit_BIN_DIR} ENV CUDA_HOME
-        PATH_SUFFIXES bin)
-    if(MD_BAM_NVCC)
-        set(_arch_flags "")
-        foreach(_arch IN LISTS CMAKE_CUDA_ARCHITECTURES)
-            string(REGEX REPLACE "-(real|virtual)$" "" _arch "${_arch}")
-            list(APPEND _arch_flags "-gencode=arch=compute_${_arch},code=sm_${_arch}")
-        endforeach()
-        if(NOT _arch_flags)
-            list(APPEND _arch_flags "-arch=sm_80")
-        endif()
-        set(_out ${CMAKE_BINARY_DIR}/bin/clio_grayscott_bam_bench)
-        set(_src ${CMAKE_CURRENT_SOURCE_DIR}/clio_grayscott_bam_bench.cc)
-        add_custom_command(
-            OUTPUT ${_out}
-            COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/bin
-            COMMAND ${MD_BAM_NVCC}
-                -x cu -std=c++17 -O3 -rdc=true --expt-relaxed-constexpr
-                ${_arch_flags}
-                -I${CMAKE_SOURCE_DIR}/external/bam/include
-                ${_src}
-                ${CMAKE_SOURCE_DIR}/external/bam/src/array.cu
-                ${CMAKE_SOURCE_DIR}/external/bam/src/page_cache.cu
-                ${CMAKE_SOURCE_DIR}/external/bam/src/controller.cc
-                ${CMAKE_SOURCE_DIR}/external/bam/src/page_cache_host.cc
-                -o ${_out}
-            DEPENDS ${_src}
-                ${CMAKE_SOURCE_DIR}/external/bam/src/array.cu
-                ${CMAKE_SOURCE_DIR}/external/bam/src/page_cache.cu
-                ${CMAKE_SOURCE_DIR}/external/bam/src/controller.cc
-                ${CMAKE_SOURCE_DIR}/external/bam/src/page_cache_host.cc
-            COMMENT "Building clio_grayscott_bam_bench (nvcc + BaM page cache)"
-            VERBATIM)
-        add_custom_target(clio_grayscott_bam_bench ALL DEPENDS ${_out})
-        install(PROGRAMS ${_out} DESTINATION bin)
-        message(STATUS "grayscott BaM baseline: ON")
-    endif()
-endif()
-
 
 #------------------------------------------------------------------------------
 # Gray-Scott over a paged field -- SYCL.
@@ -297,7 +259,6 @@ if(CLIO_CORE_ENABLE_SYCL AND NOT SYCL_TARGET MATCHES "spir64")
     )
     message(STATUS "grayscott paged bench (SYCL): ON")
 endif()
-
 
 
 #------------------------------------------------------------------------------
@@ -413,4 +374,66 @@ if(TARGET clio_grayscott_nccl_bench AND MPIEXEC_EXECUTABLE)
     set_tests_properties(bench_grayscott_nccl_2rank PROPERTIES
         TIMEOUT 900 LABELS "bench;gpu;nccl;distributed" RUN_SERIAL TRUE
         SKIP_RETURN_CODE 77)
+endif()
+
+#------------------------------------------------------------------------------
+# grayscott paged bench, MACRO-form edition -- the one that reaches Intel GPUs.
+#
+# NOTE THE GUARD: no `NOT SYCL_TARGET MATCHES "spir64"`. That exclusion exists
+# on the coroutine target above because clang cannot compile a device coroutine
+# for SPIR-V (EmitCoroutineBody builds the frame PHI in addrspace 0 and
+# llvm.coro.* is declared llvm_ptr_ty, while spir64 carries -G1). The macro
+# mechanism needs no compiler coroutine support, so it builds for spir64 --
+# which is what Aurora's Ponte Vecchio GPUs require.
+#------------------------------------------------------------------------------
+if(CLIO_CORE_ENABLE_SYCL)
+    set(_gsm_inc
+        ${CMAKE_SOURCE_DIR}/context-runtime/include
+        ${CMAKE_SOURCE_DIR}/context-runtime/modules/admin/include
+        ${CMAKE_SOURCE_DIR}/context-runtime/modules/bdev/include
+        ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
+        ${CMAKE_SOURCE_DIR}/context-transfer-engine/adapter/gpu_vector/include)
+
+    add_library(grayscott_macros_sycl_launch SHARED sycl/grayscott_macros_launch_sycl.cc)
+    wrp_core_apply_sycl_flags(grayscott_macros_sycl_launch)
+    set_target_properties(grayscott_macros_sycl_launch PROPERTIES
+        POSITION_INDEPENDENT_CODE ON
+        LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    target_include_directories(grayscott_macros_sycl_launch PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR} ${_gsm_inc})
+    target_link_libraries(grayscott_macros_sycl_launch PUBLIC
+        clio_run_cxx clio_run_cxx_gpu clio_cte_core_client)
+
+    add_executable(clio_grayscott_macros_bench_sycl clio_grayscott_macros_bench.cc)
+    target_link_options(clio_grayscott_macros_bench_sycl PRIVATE
+        -fsycl -fsycl-targets=${SYCL_TARGET})
+    target_include_directories(clio_grayscott_macros_bench_sycl PRIVATE
+        ${CLIO_SYCL_INCLUDE_DIR} ${CMAKE_CURRENT_SOURCE_DIR} ${_gsm_inc})
+    target_link_libraries(clio_grayscott_macros_bench_sycl PRIVATE
+        grayscott_macros_sycl_launch
+        clio_run_cxx clio_run_cxx_gpu clio_admin_client clio_bdev_client
+        clio_cte_core_client clio_cte_core_runtime clio::cte::gpu_vector
+        ${CMAKE_THREAD_LIBS_INIT})
+    set_target_properties(clio_grayscott_macros_bench_sycl PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    install(TARGETS clio_grayscott_macros_bench_sycl RUNTIME DESTINATION bin)
+
+    # REGRESSION COVERAGE for the SYCL row. Without an entry here the row is
+    # only ever as correct as the last time someone ran it by hand.
+    # --blocks 8 is the SYCL backend's documented ceiling, not a taste.
+    # --data-mb 2048 --hbm-mb 512 keeps the default's 4:1 data:HBM ratio, so
+    # the run still pages out of core, at 1/8 the size: the 16 GB default
+    # takes ~1900 s on an Aurora PVC, past the 900 s timeout; this takes ~170 s.
+    add_test(NAME cte_gpu_vector_grayscott_macros_sycl
+        COMMAND clio_grayscott_macros_bench_sycl --blocks 8 --steps 2
+                --data-mb 2048 --hbm-mb 512
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    set_tests_properties(cte_gpu_vector_grayscott_macros_sycl PROPERTIES
+        TIMEOUT 900
+        LABELS "cte;gpu;gpu_vector;sycl;macros"
+        FIXTURES_REQUIRED clio_test_cleanup_fixture
+        RUN_SERIAL TRUE
+    )
+    message(STATUS "grayscott paged bench (SYCL, macro form): ON")
 endif()

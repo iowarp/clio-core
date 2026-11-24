@@ -1,0 +1,77 @@
+# Debounced full CI for dev.
+#
+# Pull requests run only the fast tier (build on Linux/macOS/Windows, Linux
+# unit tests, cpplint, VFD). The full matrix runs on dev, but NOT once per
+# merge: every push to dev restarts a quiet-period timer, and only when dev
+# has had no new merge for DEV_CI_QUIET_MINUTES (default 5) is the full
+# sweep dispatched against the dev tip.
+#
+# How the debounce works: this workflow's concurrency group cancels the
+# in-progress run on every new push, so a burst of merges leaves exactly one
+# run that survives the full wait. That run dispatches each full-CI workflow
+# with workflow_dispatch (GITHUB_TOKEN may trigger workflow_dispatch). Those
+# workflows keep their own per-ref concurrency groups with
+# cancel-in-progress: false, so if the previous sweep is still running the new
+# one queues behind it (GitHub keeps only the newest pending run per group).
+#
+# Override the wait with the repo variable DEV_CI_QUIET_MINUTES, or skip the
+# wait with "Run workflow" -> quiet_minutes: 0.
+name: Dev Full CI (debounced)
+
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch:
+    inputs:
+      quiet_minutes:
+        description: 'Minutes to wait before dispatching (blank = repo default)'
+        required: false
+        default: ''
+
+concurrency:
+  group: dev-full-ci-debounce
+  cancel-in-progress: true
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  wait-for-quiet:
+    name: wait for dev to go quiet
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Sleep
+        env:
+          QUIET: ${{ inputs.quiet_minutes != '' && inputs.quiet_minutes || vars.DEV_CI_QUIET_MINUTES || '5' }}
+        run: |
+          echo "Waiting ${QUIET} min; a new push to dev cancels this run and restarts the timer."
+          sleep "$(( QUIET * 60 ))"
+
+  dispatch:
+    name: dispatch full CI on dev
+    needs: wait-for-quiet
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          sparse-checkout: .github
+      - name: Dispatch full-CI workflows
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -u
+          sha=$(gh api "repos/$GH_REPO/commits/dev" -q .sha)
+          echo "## Full CI dispatched for dev @ \`${sha:0:9}\`" >> "$GITHUB_STEP_SUMMARY"
+          fail=0
+          for wf in $(grep -v '^#' .github/dev-full-ci-workflows.txt); do
+            if gh workflow run "$wf" --ref dev; then
+              echo "- $wf" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "::error::failed to dispatch $wf"; fail=1
+            fi
+          done
+          exit $fail

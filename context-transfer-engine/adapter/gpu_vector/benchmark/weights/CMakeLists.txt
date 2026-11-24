@@ -196,51 +196,6 @@ if(CLIO_CORE_ENABLE_CUDA AND CLIO_CORE_ENABLE_NVSHMEM)
     endif()
 endif()
 
-#------------------------------------------------------------------------------
-# weights, BaM edition: compiles BaM's sources itself with nvcc (clang rejects
-# --expt-relaxed-constexpr, see the lammps_md sibling).
-#------------------------------------------------------------------------------
-if(CLIO_CORE_ENABLE_CUDA AND EXISTS ${CMAKE_SOURCE_DIR}/external/bam/src/array.cu)
-    find_program(MD_BAM_NVCC nvcc
-        HINTS ${CUDAToolkit_BIN_DIR} ENV CUDA_HOME
-        PATH_SUFFIXES bin)
-    if(MD_BAM_NVCC)
-        set(_arch_flags "")
-        foreach(_arch IN LISTS CMAKE_CUDA_ARCHITECTURES)
-            string(REGEX REPLACE "-(real|virtual)$" "" _arch "${_arch}")
-            list(APPEND _arch_flags "-gencode=arch=compute_${_arch},code=sm_${_arch}")
-        endforeach()
-        if(NOT _arch_flags)
-            list(APPEND _arch_flags "-arch=sm_80")
-        endif()
-        set(_out ${CMAKE_BINARY_DIR}/bin/clio_weights_bam_bench)
-        set(_src ${CMAKE_CURRENT_SOURCE_DIR}/clio_weights_bam_bench.cc)
-        add_custom_command(
-            OUTPUT ${_out}
-            COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/bin
-            COMMAND ${MD_BAM_NVCC}
-                -x cu -std=c++17 -O3 -rdc=true --expt-relaxed-constexpr
-                ${_arch_flags}
-                -I${CMAKE_SOURCE_DIR}/external/bam/include
-                ${_src}
-                ${CMAKE_SOURCE_DIR}/external/bam/src/array.cu
-                ${CMAKE_SOURCE_DIR}/external/bam/src/page_cache.cu
-                ${CMAKE_SOURCE_DIR}/external/bam/src/controller.cc
-                ${CMAKE_SOURCE_DIR}/external/bam/src/page_cache_host.cc
-                -o ${_out}
-            DEPENDS ${_src}
-                ${CMAKE_SOURCE_DIR}/external/bam/src/array.cu
-                ${CMAKE_SOURCE_DIR}/external/bam/src/page_cache.cu
-                ${CMAKE_SOURCE_DIR}/external/bam/src/controller.cc
-                ${CMAKE_SOURCE_DIR}/external/bam/src/page_cache_host.cc
-            COMMENT "Building clio_weights_bam_bench (nvcc + BaM page cache)"
-            VERBATIM)
-        add_custom_target(clio_weights_bam_bench ALL DEPENDS ${_out})
-        install(PROGRAMS ${_out} DESTINATION bin)
-        message(STATUS "weights BaM baseline: ON")
-    endif()
-endif()
-
 
 #------------------------------------------------------------------------------
 # weights over a paged model -- SYCL.
@@ -411,4 +366,62 @@ if(TARGET clio_weights_nccl_bench AND MPIEXEC_EXECUTABLE)
     set_tests_properties(bench_weights_nccl_2rank PROPERTIES
         TIMEOUT 900 LABELS "bench;gpu;nccl;distributed" RUN_SERIAL TRUE
         SKIP_RETURN_CODE 77)
+endif()
+
+#------------------------------------------------------------------------------
+# weights paged bench, MACRO-form edition -- the one that reaches Intel GPUs.
+#
+# NOTE THE GUARD: no `NOT SYCL_TARGET MATCHES "spir64"`. That exclusion exists
+# on the coroutine target above because clang cannot compile a device coroutine
+# for SPIR-V (EmitCoroutineBody builds the frame PHI in addrspace 0 and
+# llvm.coro.* is declared llvm_ptr_ty, while spir64 carries -G1). The macro
+# mechanism needs no compiler coroutine support, so it builds for spir64 --
+# which is what Aurora's Ponte Vecchio GPUs require.
+#------------------------------------------------------------------------------
+if(CLIO_CORE_ENABLE_SYCL)
+    set(_wtm_inc
+        ${CMAKE_SOURCE_DIR}/context-runtime/include
+        ${CMAKE_SOURCE_DIR}/context-runtime/modules/admin/include
+        ${CMAKE_SOURCE_DIR}/context-runtime/modules/bdev/include
+        ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
+        ${CMAKE_SOURCE_DIR}/context-transfer-engine/adapter/gpu_vector/include)
+
+    add_library(weights_macros_sycl_launch SHARED sycl/weights_macros_launch_sycl.cc)
+    wrp_core_apply_sycl_flags(weights_macros_sycl_launch)
+    set_target_properties(weights_macros_sycl_launch PROPERTIES
+        POSITION_INDEPENDENT_CODE ON
+        LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    target_include_directories(weights_macros_sycl_launch PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR} ${_wtm_inc})
+    target_link_libraries(weights_macros_sycl_launch PUBLIC
+        clio_run_cxx clio_run_cxx_gpu clio_cte_core_client)
+
+    add_executable(clio_weights_macros_bench_sycl clio_weights_macros_bench.cc)
+    target_link_options(clio_weights_macros_bench_sycl PRIVATE
+        -fsycl -fsycl-targets=${SYCL_TARGET})
+    target_include_directories(clio_weights_macros_bench_sycl PRIVATE
+        ${CLIO_SYCL_INCLUDE_DIR} ${CMAKE_CURRENT_SOURCE_DIR} ${_wtm_inc})
+    target_link_libraries(clio_weights_macros_bench_sycl PRIVATE
+        weights_macros_sycl_launch
+        clio_run_cxx clio_run_cxx_gpu clio_admin_client clio_bdev_client
+        clio_cte_core_client clio_cte_core_runtime clio::cte::gpu_vector
+        ${CMAKE_THREAD_LIBS_INIT})
+    set_target_properties(clio_weights_macros_bench_sycl PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    install(TARGETS clio_weights_macros_bench_sycl RUNTIME DESTINATION bin)
+
+    # REGRESSION COVERAGE for the SYCL row. Without an entry here the row is
+    # only ever as correct as the last time someone ran it by hand.
+    # --blocks 8 is the SYCL backend's documented ceiling, not a taste.
+    add_test(NAME cte_gpu_vector_weights_macros_sycl
+        COMMAND clio_weights_macros_bench_sycl --blocks 8
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    set_tests_properties(cte_gpu_vector_weights_macros_sycl PROPERTIES
+        TIMEOUT 900
+        LABELS "cte;gpu;gpu_vector;sycl;macros"
+        FIXTURES_REQUIRED clio_test_cleanup_fixture
+        RUN_SERIAL TRUE
+    )
+    message(STATUS "weights paged bench (SYCL, macro form): ON")
 endif()

@@ -15,16 +15,12 @@ name: CI VFD
 
 on:
   push:
-    branches: [main, dev, 'feat/vfd-**']
+    branches: [main, 'feat/vfd-**']
+  # Push to dev does NOT trigger this directly: dev-full-ci.yml dispatches
+  # the full matrix once dev has been quiet for 30 minutes, so a burst of
+  # merges gets one full run instead of one per merge.
   pull_request:
     branches: [main, dev]
-  # Merge queue (issue #1013): the full matrix -- macFUSE, WinFsp, the boost
-  # backend, the wide macOS sweep -- is gated on `event_name != pull_request`,
-  # so it never ran on a PR and only spoke up AFTER the merge, on dev, where a
-  # single bad commit turns every later push red. A merge_group run is that
-  # same full matrix executed on the PROSPECTIVE merge commit, before it lands.
-  # Cost is unchanged for PRs; dev stops being where breakage is discovered.
-  merge_group:
   workflow_dispatch:
 
 concurrency:
@@ -38,6 +34,8 @@ concurrency:
 
 jobs:
   vfd:
+    # Skipped on dev -> main PRs: dev-to-main-gate.yml checks dev's full CI on the same commit instead.
+    if: ${{ !(github.event_name == 'pull_request' && github.head_ref == 'dev' && github.base_ref == 'main') }}
     name: vfd (linux, native write-through)
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -124,8 +122,12 @@ jobs:
               # Both test binaries must be named here. ctest below selects by
               # name (-R vfd), so any target left out is still selected and then
               # reported as "Not Run" 
+              # The adapter test config composes the shm cache (pool 568), a
+              # runtime module the test binaries do not link, so build it too.
               cmake --build build-vfd -j"$(nproc)" \
-                --target clio_cte_vfd_unit_tests clio_cte_vfd_no_runtime_tests
+                --target clio_cte_vfd_unit_tests clio_cte_vfd_no_runtime_tests \
+                         clio_cte_core_shm_cache_writethru_runtime \
+                         clio_cte_core_shm_cache_writethru_client
               # ABI gate: the VFD MUST link the same libhdf5 the tools use.
               echo "== VFD libhdf5 linkage =="
               ldd build-vfd/bin/libclio_vfd.so | grep -i hdf5

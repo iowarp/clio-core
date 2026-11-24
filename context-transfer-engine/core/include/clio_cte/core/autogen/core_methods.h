@@ -71,24 +71,68 @@ GLOBAL_CROSS_CONST clio::run::u32 kMultiPutBlob = 48;
 // registered node's copy (write-invalidate) before completing.
 GLOBAL_CROSS_CONST clio::run::u32 kRegisterReplicaContainer = 49;
 
+/**
+ * Residency (issue #980 follow-on / VFD_VOL_PLAN §1): "is this byte range
+ * actually PRESENT in the tier, or a hole the tier would silently zero-fill?"
+ *
+ * Distinct from coherence, which asks whether the tier's copy still matches
+ * the authoritative native file — only an adapter can answer that, because
+ * only it knows which POSIX file a tag stands for. Residency is the opposite:
+ * only the TIER can answer it, which is why this is a chimod op and not
+ * per-adapter interval bookkeeping repeated in the VFD, the VOL and CFS.
+ */
+GLOBAL_CROSS_CONST clio::run::u32 kGetResidency = 50;
+
 // Batched POD paging: one task carries many page requests. A page fault costs
 // ~110 us of round trip -- GPU->CPU submission, worker pickup, CTE and bdev
 // traversal, completion -- against ~6 us for the 256 KB device-to-device copy
 // it performs, so data movement is about 5% of a read and the trip is the
 // rest. These amortize the trip across a batch, which is the only change that
 // touches the dominant term.
-GLOBAL_CROSS_CONST clio::run::u32 kPodMultiPutBlob = 50;
-GLOBAL_CROSS_CONST clio::run::u32 kPodMultiGetBlob = 51;
-GLOBAL_CROSS_CONST clio::run::u32 kPodMultiScore = 52;
+//
+// NUMBERED FROM 51, not 50: kGetResidency landed on dev while this branch was
+// out, and both had claimed 50. The id is a wire value every node decodes, so
+// the branch's own additions moved rather than the one already integrated.
+GLOBAL_CROSS_CONST clio::run::u32 kPodMultiPutBlob = 51;
+GLOBAL_CROSS_CONST clio::run::u32 kPodMultiGetBlob = 52;
+GLOBAL_CROSS_CONST clio::run::u32 kPodMultiScore = 53;
 
-GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 53;
+// Organizer phase hint (issue: ReorganizeHint). A single integer the
+// application sets to tell the data organizer which phase of its algorithm
+// it is in; stored per container as Runtime::organizer_hint_ and read by
+// DataOrganizer::Reorganize through Runtime::OrganizerHint(). Broadcast.
+GLOBAL_CROSS_CONST clio::run::u32 kReorganizeHint = 54;
+
+// Batched, broadcast tag-NAME maintenance (add / remove / rename a name,
+// set the root) for tags whose data and ids are owned elsewhere -- the
+// filesystem chimod publishes its namespace here so tag search sees paths.
+GLOBAL_CROSS_CONST clio::run::u32 kUpdateTagNames = 55;
+
+// fsync(2) for one tag: move its blobs to a persistent tier and sync the
+// devices and WAL that hold them. Broadcast.
+GLOBAL_CROSS_CONST clio::run::u32 kSyncTag = 56;
+
+// List a container's blobs (tag id + name) matching a name pattern, for
+// modules whose state lives in blobs of nameless tags.
+GLOBAL_CROSS_CONST clio::run::u32 kListLocalBlobs = 57;
+
+// Per-tag key/value section (set / get / delete / list one key), held in
+// memory on the container that owns it and logged per key in the WAL.
+GLOBAL_CROSS_CONST clio::run::u32 kTagXattr = 58;
+
+// Switch the core between volatile and persistent at runtime.
+GLOBAL_CROSS_CONST clio::run::u32 kSetDurability = 59;
+/** Delete a set of blobs in one task (split by owner, one plan per owner). */
+GLOBAL_CROSS_CONST clio::run::u32 kMultiDelBlob = 60;
+/** Delete a set of tags (by id) in one task (each container its share). */
+GLOBAL_CROSS_CONST clio::run::u32 kMultiDelTag = 61;
+
+GLOBAL_CROSS_CONST clio::run::u32 kCowLink = 62;
+GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 63;
 
 inline const std::vector<std::string>& GetMethodNames() {
   static const std::vector<std::string> names = [] {
     std::vector<std::string> v(kMaxMethodId);
-    v[50] = "PodMultiPutBlob";
-    v[51] = "PodMultiGetBlob";
-    v[52] = "PodMultiScore";
     v[0] = "Create";
     v[1] = "Destroy";
     v[9] = "Monitor";
@@ -119,6 +163,11 @@ inline const std::vector<std::string>& GetMethodNames() {
     v[38] = "RenameTag";
     v[39] = "GetOrCreateTagAlias";
     v[40] = "GetTagName";
+    v[55] = "UpdateTagNames";
+    v[56] = "SyncTag";
+    v[57] = "ListLocalBlobs";
+    v[58] = "TagXattr";
+    v[59] = "SetDurability";
     v[41] = "GetCapacity";
     v[42] = "GetNumAliases";
     v[43] = "PodPutBlob";
@@ -127,7 +176,14 @@ inline const std::vector<std::string>& GetMethodNames() {
     v[46] = "DynamicReorganize";
     v[47] = "Evict";
     v[48] = "MultiPutBlob";
+    v[60] = "MultiDelBlob";
+    v[61] = "MultiDelTag";
+    v[62] = "CowLink";
     v[49] = "RegisterReplicaContainer";
+    v[50] = "GetResidency";
+    v[51] = "PodMultiPutBlob";
+    v[52] = "PodMultiGetBlob";
+    v[53] = "PodMultiScore";
     return v;
   }();
   return names;

@@ -14,6 +14,12 @@ if(CLIO_CORE_ENABLE_ELF AND CLIO_CTE_ENABLE_MPIIO_ADAPTER AND CLIO_CORE_ENABLE_M
     add_subdirectory(mpiio)
 endif()
 
+# cuFile (GDS) interceptor offsets (#1191). Needs a GPU at run time.
+if(CLIO_CORE_ENABLE_ELF AND CLIO_CTE_ENABLE_NVIDIA_GDS_ADAPTER AND
+   TARGET clio_cte_nvidia_gds)
+    add_subdirectory(nvidia_gds)
+endif()
+
 # HDF5 VFD smoke test (requires the VFD target, which requires HDF5 >= 1.14).
 if(CLIO_CTE_ENABLE_VFD AND TARGET clio_vfd)
     add_subdirectory(vfd)

@@ -55,10 +55,15 @@
 #include <cstdio>   // snprintf, fprintf
 #include <cstdlib>  // atoi, getenv
 #include <cstring>  // strncmp, strerror
+#include <string>
+#include <vector>
 #include <fcntl.h>
 
 #ifndef _WIN32
 #include <unistd.h>  // getuid, getgid, read
+#if defined(__linux__)
+#include <sys/prctl.h>  // PR_SET_PTRACER
+#endif
 #ifndef __APPLE__
 #include <fuse3/fuse_lowlevel.h>  // fuse_session_custom_io, struct fuse_custom_io
 #include <dlfcn.h>                // dlsym (resolve fuse_session_custom_io at runtime)
@@ -88,14 +93,157 @@ static ssize_t cte_custom_read(int fd, void *buf, size_t buf_len,
 #endif  // !__APPLE__ && FUSE_VERSION >= 3.14
 #endif  // _WIN32
 
+/**
+ * Whether the kernel should enforce permission bits (FUSE
+ * default_permissions): mode, owner and group are checked against every
+ * access like on ext4. CLIO_FUSE_PERMISSIONS=0 turns it off.
+ * @return true unless disabled
+ */
+static bool EnforcePermissions() {
+  const char *e = std::getenv("CLIO_FUSE_PERMISSIONS");
+  return e == nullptr || std::strcmp(e, "0") != 0;
+}
+
+/** FUSE worker threads when CLIO_FUSE_MAX_THREADS is unset. */
+static constexpr unsigned kDefaultFuseMaxThreads = 64;
+
+/**
+ * Most FUSE requests the mount serves at once (CLIO_FUSE_MAX_THREADS).
+ * libfuse >= 3.12 caps fuse_main's worker pool at 10 threads unless told
+ * otherwise, so a node with more writing ranks than that queues their
+ * writes in the kernel however fast the store behind them is.
+ * @return the thread count; 0 leaves the libfuse default
+ */
+static unsigned FuseMaxThreads() {
+  const char *e = std::getenv("CLIO_FUSE_MAX_THREADS");
+  if (e == nullptr || *e == '\0') return kDefaultFuseMaxThreads;
+  const long v = std::strtol(e, nullptr, 10);
+  return v > 0 ? static_cast<unsigned>(v) : 0;
+}
+
+/**
+ * argv for fuse_main, plus "-o default_permissions" when enforced and
+ * "-o max_threads=N" when the loaded libfuse knows that option (3.12+).
+ * @param argc argument count
+ * @param argv arguments
+ * @return null-terminated argument vector (size() - 1 arguments)
+ */
+static std::vector<char *> MountArgv(int argc, char *argv[]) {
+  static char opt_flag[] = "-o";
+  static char opt_perm[] = "default_permissions";
+  static char opt_threads[64];
+  std::vector<char *> v(argv, argv + argc);
+  if (EnforcePermissions()) {
+    v.push_back(opt_flag);
+    v.push_back(opt_perm);
+  }
+  const unsigned threads = FuseMaxThreads();
+  if (threads != 0 && fuse_version() >= 312) {
+    std::snprintf(opt_threads, sizeof(opt_threads), "max_threads=%u",
+                  threads);
+    v.push_back(opt_flag);
+    v.push_back(opt_threads);
+  }
+  v.push_back(nullptr);
+  return v;
+}
+
+/**
+ * Default the runtime-connect wait (CLIO_WAIT_SERVER) to 10 minutes for the
+ * mount unless the caller set it. A mount started with the runtime after a
+ * reboot must outlast the runtime's recovery (WAL replay), which can take
+ * longer than the generic 30 s client default; giving up leaves a dead mount.
+ */
+static void DefaultMountServerWait() {
+  if (std::getenv("CLIO_WAIT_SERVER") == nullptr) {
+#ifdef _WIN32
+    _putenv_s("CLIO_WAIT_SERVER", "600");
+#else
+    setenv("CLIO_WAIT_SERVER", "600", 0);
+#endif
+  }
+}
+
+/**
+ * Take the atime mount options (-o noatime / strictatime / relatime and
+ * their negations) out of argv and carry the choice to the read path as
+ * CLIO_FUSE_ATIME. FUSE leaves atime to the filesystem, so the kernel flag
+ * would change nothing -- and libfuse rejects relatime/strictatime as
+ * unknown, failing the mount. An explicit CLIO_FUSE_ATIME wins. The option
+ * strings are rewritten in place (they only shrink); one left empty becomes
+ * "rw".
+ * @param argc argument count
+ * @param argv arguments (modified)
+ */
+static void AtimeFromMountOptions(int argc, char *argv[]) {
+  const char *mode = nullptr;
+  for (int i = 1; i < argc; ++i) {
+    char *opts = nullptr;
+    if (std::strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
+      opts = argv[++i];
+    } else if (std::strncmp(argv[i], "-o", 2) == 0) {
+      opts = argv[i] + 2;
+    } else {
+      continue;
+    }
+    std::string kept;
+    std::string all(opts);
+    size_t pos = 0;
+    while (pos <= all.size()) {
+      size_t end = all.find(',', pos);
+      if (end == std::string::npos) end = all.size();
+      const std::string tok = all.substr(pos, end - pos);
+      pos = end + 1;
+      if (tok == "noatime") { mode = "0"; continue; }
+      if (tok == "strictatime") { mode = "strict"; continue; }
+      if (tok == "relatime" || tok == "atime") { mode = "relatime"; continue; }
+      if (tok == "norelatime" || tok == "nostrictatime" ||
+          tok == "nodiratime" || tok == "diratime") {
+        continue;
+      }
+      if (tok.empty()) continue;
+      if (!kept.empty()) kept += ',';
+      kept += tok;
+    }
+    if (kept.empty()) kept = "rw";
+    std::memcpy(opts, kept.c_str(), kept.size() + 1);
+  }
+  if (mode == nullptr || std::getenv("CLIO_FUSE_ATIME") != nullptr) return;
+#ifdef _WIN32
+  _putenv_s("CLIO_FUSE_ATIME", mode);
+#else
+  setenv("CLIO_FUSE_ATIME", mode, 1);
+#endif
+}
+
+/**
+ * Let a debugger attach to this mount daemon when CLIO_ALLOW_PTRACE=1, as
+ * clio_run does: hosts with kernel.yama.ptrace_scope=1 only allow tracing
+ * descendants, and a hung FUSE request (one the runtime is not working on)
+ * can only be located from this process's thread stacks. Opt-in only.
+ */
+static void MaybeAllowPtrace() {
+#if defined(__linux__) && defined(PR_SET_PTRACER)
+  const char *e = std::getenv("CLIO_ALLOW_PTRACE");
+  if (e != nullptr && e[0] == '1') {
+    prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
+  }
+#endif
+}
+
 int main(int argc, char *argv[]) {
+  MaybeAllowPtrace();
+  DefaultMountServerWait();
+  AtimeFromMountOptions(argc, argv);
 #if defined(_WIN32) || defined(__APPLE__)
   // Native Windows (WinFsp) and macOS (macFUSE): no Apptainer-style
   // /dev/fuse fd injection. fuse_main() parses argv (on Windows the
   // mountpoint is a drive letter like "Z:" or a host directory) and drives
   // the FUSE protocol. The callbacks and the entire CTE data path below them
   // are identical to the Linux build.
-  return fuse_main(argc, argv, &cte_fuse_ops, nullptr);
+  cte_fuse_mark_session_live();
+  const int rc = fuse_main(argc, argv, &cte_fuse_ops, nullptr);
+  return cte_fuse_init_failed() ? 1 : rc;
 #else
   // Apptainer's --fusemount opens /dev/fuse on the host, performs the
   // kernel mount, and passes the fd to the FUSE binary as the last
@@ -121,7 +269,11 @@ int main(int argc, char *argv[]) {
   }
 
   if (prefd == -1) {
-    return fuse_main(argc, argv, &cte_fuse_ops, nullptr);
+    cte_fuse_mark_session_live();
+    std::vector<char *> mount_argv = MountArgv(argc, argv);
+    const int rc = fuse_main(static_cast<int>(mount_argv.size()) - 1,
+                             mount_argv.data(), &cte_fuse_ops, nullptr);
+    return cte_fuse_init_failed() ? 1 : rc;
   }
 
 #if FUSE_VERSION < FUSE_MAKE_VERSION(3, 14)
@@ -175,8 +327,10 @@ int main(int argc, char *argv[]) {
                mountpoint, prefd);
 
   struct fuse_args args = FUSE_ARGS_INIT(new_argc, argv);
+  if (EnforcePermissions()) fuse_opt_add_arg(&args, "-odefault_permissions");
   struct fuse *fuse =
-      fuse_new(&args, &cte_fuse_ops, sizeof(cte_fuse_ops), nullptr);
+      (cte_fuse_mark_session_live(),
+       fuse_new(&args, &cte_fuse_ops, sizeof(cte_fuse_ops), nullptr));
   if (!fuse) {
     fuse_opt_free_args(&args);
     return 1;

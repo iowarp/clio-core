@@ -5,11 +5,11 @@
 # CTE adapter singleton implementation - moved to filesystem directory
 # to leverage existing working build configuration
 
-# The HDF5 VFD is a plugin the library dlopen's, not an interceptor: it
-# never touches real_api.h, so it does not need ELF support. Gate it on
-# UNIX -- H5FDclio.cc uses <sys/file.h>, <unistd.h> and flock, so Windows
-# needs porting work rather than a gate change.
-if(UNIX AND CLIO_CTE_ENABLE_VFD)
+# The HDF5 VFD is a plugin the library dlopen's, not an interceptor: it never
+# touches real_api.h, so it does not need ELF support and is not restricted to
+# the platforms the interceptors work on. Its file I/O goes through
+# adapter/vfd/H5FDclio_compat.h, which supplies the Win32 equivalents.
+if(CLIO_CTE_ENABLE_VFD)
     add_subdirectory(vfd)
 endif()
 
@@ -33,7 +33,7 @@ if(CLIO_CORE_ENABLE_ELF)
     endif()
 else()
     message(STATUS "CTE Adapters: DISABLED (ELF support not enabled)")
-    message(STATUS "  To enable adapters, configure with -DWRP_CORE_ENABLE_ELF=ON")
+    message(STATUS "  To enable adapters, configure with -DCLIO_CORE_ENABLE_ELF=ON")
 endif()
 
 # ADIOS2 adapter does not require ELF support (it's a plugin engine)
@@ -50,6 +50,10 @@ endif()
 if (CLIO_CTE_ENABLE_HDF5_VOL)
     add_subdirectory(hdf5_vol)
 endif()
+
+# CPU Vector adapter (host-paged vector over the CTE). The CPU sibling of
+# gpu_vector below; it needs no GPU toolchain, so it is always built.
+add_subdirectory(cpu_vector)
 
 # GPU Vector adapter (device-paged vector over the CTE).
 #

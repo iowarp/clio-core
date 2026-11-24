@@ -20,8 +20,13 @@ extern "C" {
 #define CLIO_VOL_CONNECTOR_VALUE   600  /* Unique connector class value */
 #define CLIO_VOL_CONNECTOR_VERSION 1
 
-/* Default chunk size for async PutBlob/GetBlob (1 MB) */
-#define CLIO_VOL_DEFAULT_CHUNK_SIZE (1024 * 1024)
+/* Default chunk size for async PutBlob/GetBlob (64 KiB).
+ *
+ * A partial read fetches every chunk its selection touches, so the chunk size
+ * is the floor on what a small read costs: at 1 MiB an 8 KiB hyperslab paid a
+ * 1 MiB fetch. Smaller still stops paying: at 16 KiB whole-dataset reads slow
+ * by ~20% for the extra blobs, against ~7% at 64 KiB. */
+#define CLIO_VOL_DEFAULT_CHUNK_SIZE (64 * 1024)
 
 /* Values for clio_vol_info_t::cache_enabled.
  *

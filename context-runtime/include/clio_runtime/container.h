@@ -49,10 +49,23 @@
 #include "clio_runtime/pool_query.h"
 #include "clio_runtime/task.h"
 #include "clio_runtime/task_archives.h"
+#include "clio_runtime/task_cost.h"
 #include "clio_runtime/local_task_archives.h"
 #include "clio_runtime/task_stat_model.h"
 #include "clio_runtime/types.h"
 #include "clio_runtime/viz/viz_server.h"
+
+// ABI fingerprint of the headers this TU is compiled against (generated at
+// build time; see cmake/ClioAbiFingerprint.cmake). Exported by every ChiMod
+// through get_chimod_abi() so ModuleManager can refuse a stale module. The
+// fallback only matters for TUs outside the clio_run_cxx include set, which
+// never define a ChiMod; a ChiMod built with it is refused at load time.
+#if __has_include("clio_runtime/abi_fingerprint_generated.h")
+#include "clio_runtime/abi_fingerprint_generated.h"
+#endif
+#ifndef CLIO_RUNTIME_ABI_FINGERPRINT
+#define CLIO_RUNTIME_ABI_FINGERPRINT ""
+#endif
 
 // Forward declarations to avoid circular dependencies
 namespace clio::run {
@@ -290,7 +303,7 @@ class Container {
   float InferCpuTime(u32 method_id, const TaskStat &stat) const {
     float x = static_cast<float>(stat.compute_) + 1.0f;
     if (method_id < method_model_.size()) {
-      return method_model_[method_id] * x;
+      return SanePrediction(method_model_[method_id] * x, x);
     }
     return x;
   }
@@ -302,11 +315,61 @@ class Container {
    * @return Predicted wall clock time in microseconds
    */
   float InferWallClockTime(u32 method_id, const TaskStat &stat) const {
-    float x = stat.wall_time_ + 1.0f;
+    float x = SaneInput(stat.wall_time_) + 1.0f;
     if (method_id < method_model_wall_.size()) {
-      return method_model_wall_[method_id] * x;
+      return SanePrediction(method_model_wall_[method_id] * x, x);
     }
     return x;
+  }
+
+  /** Smallest coefficient a model keeps: an update that overshoots below
+   *  zero (a large over-prediction with a high learning rate) lands here. */
+  static constexpr float kMinModelCoef = 1.0e-6f;
+
+  /**
+   * A model coefficient that inference and learning can use. A NaN or
+   * infinity (one bad sample makes every later update NaN, and it persists
+   * in the saved model) becomes the seed 1.0; an overshoot below zero is
+   * clamped to kMinModelCoef, keeping the direction of the update.
+   * @param coef the stored or updated coefficient
+   * @return a finite coefficient >= kMinModelCoef
+   */
+  static float SaneCoef(float coef) {
+    if (!std::isfinite(coef)) return 1.0f;
+    return coef < kMinModelCoef ? kMinModelCoef : coef;
+  }
+
+  /**
+   * A model input (TaskStat field) clamped to a finite, non-negative value.
+   * @param v the input
+   * @return v, or 0 when it is negative or not finite
+   */
+  static float SaneInput(float v) {
+    return (std::isfinite(v) && v > 0.0f) ? v : 0.0f;
+  }
+
+  /**
+   * A prediction the scheduler can book: finite and non-negative.
+   * @param pred the model's prediction (us)
+   * @param x the model input it was computed from (fallback: one us per unit)
+   * @return pred, or x when pred is unusable
+   */
+  static float SanePrediction(float pred, float x) {
+    return (std::isfinite(pred) && pred >= 0.0f) ? pred : x;
+  }
+
+  /**
+   * Whether a completed task's measurement may train a model. A negative or
+   * non-finite time is a timer artifact, not a cost (a thread CPU timer read
+   * on two threads when the task resumed on another worker).
+   * @param pred the prediction made for it
+   * @param real the measured time
+   * @param x the model input
+   * @return true if the sample is usable
+   */
+  static bool SaneSample(float pred, float real, float x) {
+    return std::isfinite(pred) && std::isfinite(real) && real >= 0.0f &&
+           std::isfinite(x) && x >= 1.0f;
   }
 
   /**
@@ -318,8 +381,10 @@ class Container {
     if (method_id >= method_model_.size()) return;
     float lr = learning_rate_;
     float x = static_cast<float>(stat.compute_) + 1.0f;
+    if (!SaneSample(pred_cpu, real_cpu, x)) return;
     float e = pred_cpu - real_cpu;
-    method_model_[method_id] -= lr * (e / x);
+    method_model_[method_id] =
+        SaneCoef(method_model_[method_id] - lr * (e / x));
     if (real_cpu > 0) {
       float ape = std::abs(e) / real_cpu;
       method_mape_[method_id] =
@@ -336,9 +401,11 @@ class Container {
                           const TaskStat &stat) {
     if (method_id >= method_model_wall_.size()) return;
     float lr = learning_rate_;
-    float x = stat.wall_time_ + 1.0f;
+    float x = SaneInput(stat.wall_time_) + 1.0f;
+    if (!SaneSample(pred_wall, real_wall, x)) return;
     float e = pred_wall - real_wall;
-    method_model_wall_[method_id] -= lr * (e / x);
+    method_model_wall_[method_id] =
+        SaneCoef(method_model_wall_[method_id] - lr * (e / x));
     if (real_wall > 0) {
       float ape = std::abs(e) / real_wall;
       method_mape_wall_[method_id] =
@@ -355,12 +422,12 @@ class Container {
    */
   void SetMethodCpuCoef(u32 method_id, float coef) {
     if (method_id >= method_model_.size()) return;
-    method_model_[method_id] = coef;
+    method_model_[method_id] = SaneCoef(coef);
     model_dirty_.store(true, std::memory_order_relaxed);
   }
   void SetMethodWallCoef(u32 method_id, float coef) {
     if (method_id >= method_model_wall_.size()) return;
-    method_model_wall_[method_id] = coef;
+    method_model_wall_[method_id] = SaneCoef(coef);
     model_dirty_.store(true, std::memory_order_relaxed);
   }
 
@@ -577,6 +644,38 @@ class Container {
   virtual void PostGpuContainerCreate() {}
 
   /**
+   * The pool this container forwards requests to when it sits in a module
+   * chain (an interposer's next pool). Lets the runtime walk a chain from
+   * its top to the pool at its bottom without knowing any module's config.
+   * @return the next pool, or a null PoolId when this container does not
+   *         forward (the bottom of a chain, or a standalone module)
+   */
+  virtual PoolId GetNextPool() const { return PoolId::GetNull(); }
+
+  /**
+   * The pool that takes this pool's traffic once it is unplugged (stopped or
+   * removed). When non-null, destroying this pool leaves a redirect behind:
+   * tasks still addressed to it -- from pools stacked above it that were
+   * never reconfigured -- are routed to the successor instead of failing.
+   * Opt-in, unlike GetNextPool: only a module whose next pool speaks its
+   * full interface and holds a superset of its data may name one (a cache
+   * over its backing store; not a compressor, whose next pool holds
+   * transformed bytes).
+   * @return the successor pool, or a null PoolId for no redirect
+   */
+  virtual PoolId GetUnplugSuccessor() const { return PoolId::GetNull(); }
+
+  /**
+   * Fill the OUT fields of a create task that found this pool already
+   * existing. Get-or-create on an existing pool never runs the module's
+   * Create, so without this hook a later caller would receive only the
+   * params it sent. Called on the node that answered the create, only when
+   * the task names this pool's ChiMod.
+   * @param create_task the create task (an admin::CreatePoolFields)
+   */
+  virtual void FillExistingCreate(Task *create_task) { (void)create_task; }
+
+  /**
    * Serialize task parameters for network transfer (unified method)
    * Must be implemented by derived classes
    * Uses switch-case structure based on method ID to dispatch to appropriate serialization
@@ -751,6 +850,18 @@ class ContainerClient {
  public:
   PoolId pool_id_;  ///< The unique ID of the pool this client connects to
   u32 return_code_; ///< Return code from the last Create operation (0=success, non-zero=error)
+  /** Pools this client creates are recorded in each node's pool log and
+   *  re-created when the node restarts (see SetPersistent). */
+  bool persist_create_ = false;
+
+  /**
+   * Make the pools this client creates durable: each node records the
+   * create in its pool log and re-creates its container after a restart --
+   * the API counterpart of `restart: true` on a compose pool. Off by
+   * default, so test and benchmark pools are never resurrected.
+   * @param v true to persist later creates
+   */
+  CTP_CROSS_FUN void SetPersistent(bool v) { persist_create_ = v; }
 
   /**
    * Default constructor
@@ -840,6 +951,7 @@ typedef clio::run::Container* (*new_chimod_t)(const clio::run::PoolId* pool_id,
                                         const char* pool_name);
 typedef const char* (*get_chimod_name_t)(void);
 typedef void (*destroy_chimod_t)(clio::run::Container* container);
+typedef const char* (*get_chimod_abi_t)(void);
 }
 
 /**
@@ -867,6 +979,8 @@ typedef void (*destroy_chimod_t)(clio::run::Container* container);
   void destroy_chimod(clio::run::Container* container) {                   \
     delete reinterpret_cast<CONTAINER_CLASS*>(container);            \
   }                                                                  \
+                                                                     \
+  const char* get_chimod_abi() { return CLIO_RUNTIME_ABI_FINGERPRINT; } \
                                                                      \
   static bool is_clio_chimod_ = true;                            \
   }
@@ -901,6 +1015,8 @@ typedef void (*destroy_chimod_t)(clio::run::Container* container);
   void destroy_chimod(clio::run::Container* container) {                   \
     delete reinterpret_cast<CONTAINER_CLASS*>(container);            \
   }                                                                  \
+                                                                     \
+  const char* get_chimod_abi() { return CLIO_RUNTIME_ABI_FINGERPRINT; } \
                                                                      \
   static bool is_clio_chimod_ = true;                            \
   }

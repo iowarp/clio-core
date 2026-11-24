@@ -16,8 +16,6 @@
  *     and updates the raw REPLICA_CACHE copy with it;
  *   - overwrites replace both copies before their ack — reads through any
  *     path observe the final bytes immediately;
- *   - the zero-IPC SHM fast path serves the blob from its (untransformed,
- *     RAM-local) copies;
  *   - a read MISS (blob written behind the cache's back) forwards down and
  *     best-effort re-populates the cache replica;
  *   - batched puts get scalar-equivalent semantics for all of the above.
@@ -152,11 +150,8 @@ TEST_CASE("CacheInterpose - async write-through cache over core",
     REQUIRE(create->GetReturnCode() == 0);
   }
 
-  // Task-path client at the top of the chain (no SHM mirror), plus a
-  // mirror-attached one for the fast-path assertions.
+  // Task-path client at the top of the chain.
   clio::cte::core::Client cache_io(clio::cte::cache::kCachePoolId);
-  clio::cte::core::Client shm_io(clio::cte::cache::kCachePoolId);
-  REQUIRE(shm_io.AttachShmCacheOf(clio::cte::core::kCtePoolId));
 
   clio::cte::core::Tag tag("cache_tag");
   const clio::cte::core::TagId tag_id = tag.GetTagId();
@@ -165,7 +160,7 @@ TEST_CASE("CacheInterpose - async write-through cache over core",
   // ======================================================================
   // 1. ASYNC WRITE-THROUGH: after the ack, BOTH copies are current — the
   //    authoritative primary below (consistency: nothing acked lives only
-  //    in the cache) AND the raw cache replica the fast path serves from.
+  //    in the cache) AND the raw cache replica.
   // ======================================================================
   {
     auto put = cache_io.AsyncPutBlob(tag_id, "wb_blob", 0, kValSize,
@@ -209,18 +204,6 @@ TEST_CASE("CacheInterpose - async write-through cache over core",
       get.Wait();
       REQUIRE(get->GetReturnCode() == 0);
       REQUIRE(std::memcmp(got.data(), val.data(), kValSize) == 0);
-    }
-
-    // Zero-IPC fast path serves the blob (primary or serving replica —
-    // both are current and untransformed here).
-    {
-      const char *view = nullptr;
-      clio::run::u64 view_size = 0, gen = 0;
-      REQUIRE(shm_io.TryGetBlobViewShm(tag_id, "wb_blob", &view, &view_size,
-                                       &gen));
-      REQUIRE(view_size == kValSize);
-      REQUIRE(std::memcmp(view, val.data(), kValSize) == 0);
-      REQUIRE(shm_io.CheckBlobGenShm(tag_id, "wb_blob", gen));
     }
 
     // And the primary holds the same bytes.
@@ -343,13 +326,6 @@ TEST_CASE("CacheInterpose - async write-through cache over core",
       rsz.Wait();
       REQUIRE(rsz->GetReturnCode() == 0);
       REQUIRE(rsz->size_ == kRecSize);
-      // Zero-IPC fast path serves the record.
-      const char *view = nullptr;
-      clio::run::u64 view_size = 0, gen = 0;
-      REQUIRE(shm_io.TryGetBlobViewShm(tag_id, name, &view, &view_size,
-                                       &gen));
-      REQUIRE(view_size == kRecSize);
-      REQUIRE(std::memcmp(view, vals[i].data(), kRecSize) == 0);
       // And the primary's bytes match.
       std::vector<char> got(kRecSize, 0);
       auto g = core->AsyncGetBlob(tag_id, name, 0, kRecSize, /*flags=*/0,
@@ -359,6 +335,76 @@ TEST_CASE("CacheInterpose - async write-through cache over core",
       REQUIRE(std::memcmp(got.data(), vals[i].data(), kRecSize) == 0);
     }
   }
+}
+
+TEST_CASE("CacheInterpose - tag metadata cache is write-through",
+          "[cte][cache][tags]") {
+  CacheInterposeFixture fixture;
+  {
+    clio::cte::cache::Client cache(clio::cte::cache::kCachePoolId,
+                                   clio::cte::core::kCtePoolId);
+    clio::cte::cache::CacheConfig params;
+    params.next_pool_id_ = clio::cte::core::kCtePoolId;
+    auto create = cache.AsyncCreateCache(
+        clio::run::PoolQuery::Local(), clio::cte::cache::kCachePoolName,
+        clio::cte::cache::kCachePoolId, params);
+    create.Wait();
+    REQUIRE(create->GetReturnCode() == 0);
+  }
+  clio::cte::core::Client via_cache(clio::cte::cache::kCachePoolId);
+  clio::cte::core::Client core(clio::cte::core::kCtePoolId);
+  using clio::cte::core::TagId;
+  auto lookup = [](clio::cte::core::Client &c, const std::string &n) {
+    auto f = c.AsyncGetOrCreateTag(n);
+    f.Wait();
+    REQUIRE(f->GetReturnCode() == 0);
+    return std::make_pair(f->tag_id_, f->created_);
+  };
+
+  // Create through the cache, then the lookup is a cache hit for the same id
+  // -- and the owner agrees.
+  auto [a, a_created] = lookup(via_cache, "tmeta_a");
+  REQUIRE(!a.IsNull());
+  REQUIRE(a_created == 1);
+  auto [a2, a2_created] = lookup(via_cache, "tmeta_a");
+  REQUIRE(a2 == a);
+  REQUIRE(a2_created == 0);
+  REQUIRE(lookup(core, "tmeta_a").first == a);
+
+  // A fault-handler registration is a WRITE: it goes to the owner and every
+  // node's cache before it returns; the id does not change.
+  {
+    auto f = via_cache.AsyncGetOrCreateTag(
+        "tmeta_a", clio::run::PoolId(4242, 0), "no_such_handler", "p");
+    f.Wait();
+    REQUIRE(f->GetReturnCode() == 0);
+    REQUIRE(f->tag_id_ == a);
+  }
+
+  // DELETE invalidates everywhere before returning: the next lookup must not
+  // be answered with the dead id.
+  {
+    auto d = via_cache.AsyncDelTag("tmeta_a");
+    d.Wait();
+    REQUIRE(d->GetReturnCode() == 0);
+  }
+  auto [a3, a3_created] = lookup(via_cache, "tmeta_a");
+  REQUIRE(a3_created == 1);
+  REQUIRE(!(a3 == a));
+
+  // RENAME drops the old name's entry on every node: the old name is now a
+  // different tag, and the new name resolves to the renamed one.
+  auto [b, b_created] = lookup(via_cache, "tmeta_b");
+  REQUIRE(b_created == 1);
+  {
+    auto r = via_cache.AsyncRenameTag("tmeta_b", "tmeta_c", b);
+    r.Wait();
+    REQUIRE(r->GetReturnCode() == 0);
+  }
+  REQUIRE(lookup(via_cache, "tmeta_c").first == b);
+  auto [b2, b2_created] = lookup(via_cache, "tmeta_b");
+  REQUIRE(b2_created == 1);
+  REQUIRE(!(b2 == b));
 }
 
 SIMPLE_TEST_MAIN()

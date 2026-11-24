@@ -30,7 +30,7 @@ cp /home/iowarp/.ssh/id_rsa.pub "${SSH_SHARE}/node1.pub"
 sudo /usr/sbin/sshd
 
 echo '=== Node 1: starting local clio daemon ==='
-/workspace/build/bin/clio_run runtime start &
+/workspace/build/bin/clio_run runtime start --fresh &
 echo "Node 1: daemon PID $!"
 
 echo '=== Node 1: waiting for node2 SSH ==='

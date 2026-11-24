@@ -112,6 +112,17 @@ typedef int (*MPI_File_iwrite_shared_t)(MPI_File fh, const void* buf, int count,
                                         MPI_Datatype datatype,
                                         MPI_Request* request);
 typedef int (*MPI_File_sync_t)(MPI_File fh);
+typedef int (*MPI_File_get_size_t)(MPI_File fh, MPI_Offset* size);
+typedef int (*MPI_File_set_size_t)(MPI_File fh, MPI_Offset size);
+typedef int (*MPI_File_get_info_t)(MPI_File fh, MPI_Info* info_used);
+typedef int (*MPI_File_set_info_t)(MPI_File fh, MPI_Info info);
+typedef int (*MPI_File_get_amode_t)(MPI_File fh, int* amode);
+typedef int (*MPI_File_set_atomicity_t)(MPI_File fh, int flag);
+typedef int (*MPI_File_get_atomicity_t)(MPI_File fh, int* flag);
+typedef int (*MPI_File_set_view_t)(MPI_File fh, MPI_Offset disp,
+                                   MPI_Datatype etype, MPI_Datatype filetype,
+                                   const char* datarep, MPI_Info info);
+typedef int (*MPI_File_delete_t)(const char* filename, MPI_Info info);
 }
 
 namespace clio::cae {
@@ -177,6 +188,24 @@ class MpiioApi : public RealApi {
   MPI_File_iwrite_shared_t MPI_File_iwrite_shared = nullptr;
   /** MPI_File_sync */
   MPI_File_sync_t MPI_File_sync = nullptr;
+  /** MPI_File_get_size */
+  MPI_File_get_size_t MPI_File_get_size = nullptr;
+  /** MPI_File_set_size */
+  MPI_File_set_size_t MPI_File_set_size = nullptr;
+  /** MPI_File_get_info */
+  MPI_File_get_info_t MPI_File_get_info = nullptr;
+  /** MPI_File_set_info */
+  MPI_File_set_info_t MPI_File_set_info = nullptr;
+  /** MPI_File_get_amode */
+  MPI_File_get_amode_t MPI_File_get_amode = nullptr;
+  /** MPI_File_set_atomicity */
+  MPI_File_set_atomicity_t MPI_File_set_atomicity = nullptr;
+  /** MPI_File_get_atomicity */
+  MPI_File_get_atomicity_t MPI_File_get_atomicity = nullptr;
+  /** MPI_File_set_view */
+  MPI_File_set_view_t MPI_File_set_view = nullptr;
+  /** MPI_File_delete */
+  MPI_File_delete_t MPI_File_delete = nullptr;
 
   MpiioApi() : RealApi("MPI_Init", "mpiio_intercepted") {
     MPI_Init = (MPI_Init_t)dlsym(real_lib_, "MPI_Init");
@@ -250,6 +279,32 @@ class MpiioApi : public RealApi {
     REQUIRE_API(MPI_File_iwrite_shared)
     MPI_File_sync = (MPI_File_sync_t)dlsym(real_lib_, "MPI_File_sync");
     REQUIRE_API(MPI_File_sync)
+    MPI_File_get_size =
+        (MPI_File_get_size_t)dlsym(real_lib_, "MPI_File_get_size");
+    REQUIRE_API(MPI_File_get_size)
+    MPI_File_set_size =
+        (MPI_File_set_size_t)dlsym(real_lib_, "MPI_File_set_size");
+    REQUIRE_API(MPI_File_set_size)
+    MPI_File_get_info =
+        (MPI_File_get_info_t)dlsym(real_lib_, "MPI_File_get_info");
+    REQUIRE_API(MPI_File_get_info)
+    MPI_File_set_info =
+        (MPI_File_set_info_t)dlsym(real_lib_, "MPI_File_set_info");
+    REQUIRE_API(MPI_File_set_info)
+    MPI_File_get_amode =
+        (MPI_File_get_amode_t)dlsym(real_lib_, "MPI_File_get_amode");
+    REQUIRE_API(MPI_File_get_amode)
+    MPI_File_set_atomicity =
+        (MPI_File_set_atomicity_t)dlsym(real_lib_, "MPI_File_set_atomicity");
+    REQUIRE_API(MPI_File_set_atomicity)
+    MPI_File_get_atomicity =
+        (MPI_File_get_atomicity_t)dlsym(real_lib_, "MPI_File_get_atomicity");
+    REQUIRE_API(MPI_File_get_atomicity)
+    MPI_File_set_view =
+        (MPI_File_set_view_t)dlsym(real_lib_, "MPI_File_set_view");
+    REQUIRE_API(MPI_File_set_view)
+    MPI_File_delete = (MPI_File_delete_t)dlsym(real_lib_, "MPI_File_delete");
+    REQUIRE_API(MPI_File_delete)
   }
 };
 }  // namespace clio::cae

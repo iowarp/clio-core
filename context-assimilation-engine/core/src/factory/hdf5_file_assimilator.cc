@@ -35,15 +35,21 @@
 #include <clio_runtime/ipc_manager.h>
 #ifndef _WIN32
 #include <fnmatch.h>
-#include <sys/stat.h>
 #endif
 #include <clio_cae/core/constants.h>  // For kCaePoolId
 #include <clio_cae/core/core_client.h>
 #include <clio_cae/core/core_tasks.h>
 #include <clio_cae/core/factory/hdf5_file_assimilator.h>
 
+#include "adapter/hdf5_vol/clio_vol_layout.h"
+
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <system_error>
 #include <vector>
 
 // Include clio_cte headers after closing any clio_cae namespace to avoid Method
@@ -57,12 +63,100 @@ Hdf5FileAssimilator::Hdf5FileAssimilator(
     std::shared_ptr<clio::cte::core::Client> cte_client)
     : cte_client_(cte_client) {}
 
+
+// ---------------------------------------------------------------------------
+// CAE telemetry
+//
+// Set CLIO_CAE_TELEMETRY=<path> to append one JSON object per assimilation to
+// that file. Each record carries the phase timings needed to locate a
+// bottleneck (open / discover / filter / assimilate) and enough of the request
+// to replay it (src, dst, include/exclude patterns).
+//
+// Off by default: with the variable unset this writes nothing and costs one
+// getenv per transfer.
+// ---------------------------------------------------------------------------
+namespace {
+
+double CaeNowMs() {
+  return std::chrono::duration<double, std::milli>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+std::string CaeJsonEscape(const std::string& in) {
+  std::string out;
+  out.reserve(in.size() + 8);
+  for (char c : in) {
+    if (c == '"' || c == '\\') { out += '\\'; out += c; }
+    else if (c == '\n') { out += "\\n"; }
+    else { out += c; }
+  }
+  return out;
+}
+
+std::string CaeJsonArray(const std::vector<std::string>& v) {
+  std::string out = "[";
+  for (size_t i = 0; i < v.size(); ++i) {
+    if (i) out += ",";
+    out += "\"" + CaeJsonEscape(v[i]) + "\"";
+  }
+  return out + "]";
+}
+
+/** Append one telemetry record. Silently does nothing unless
+ *  CLIO_CAE_TELEMETRY names a writable path. */
+void CaeEmitTelemetry(const std::string& src, const std::string& dst,
+                      const std::vector<std::string>& include_patterns,
+                      const std::vector<std::string>& exclude_patterns,
+                      size_t discovered, size_t filtered, int errors,
+                      const char* mode, size_t num_nodes,
+                      double t_open_ms, double t_discover_ms,
+                      double t_filter_ms, double t_assimilate_ms,
+                      int error_code) {
+  const char* path = std::getenv("CLIO_CAE_TELEMETRY");
+  if (path == nullptr || *path == '\0') {
+    return;
+  }
+  std::ofstream f(path, std::ios::app);
+  if (!f.is_open()) {
+    return;
+  }
+  const double total = t_open_ms + t_discover_ms + t_filter_ms + t_assimilate_ms;
+  f << "{"
+    << "\"wall_ms\":" << CaeNowMs()
+    << ",\"src\":\"" << CaeJsonEscape(src) << "\""
+    << ",\"dst\":\"" << CaeJsonEscape(dst) << "\""
+    << ",\"include_patterns\":" << CaeJsonArray(include_patterns)
+    << ",\"exclude_patterns\":" << CaeJsonArray(exclude_patterns)
+    << ",\"datasets_discovered\":" << discovered
+    << ",\"datasets_filtered\":" << filtered
+    << ",\"dataset_errors\":" << errors
+    << ",\"mode\":\"" << mode << "\""
+    << ",\"num_nodes\":" << num_nodes
+    << ",\"open_ms\":" << t_open_ms
+    << ",\"discover_ms\":" << t_discover_ms
+    << ",\"filter_ms\":" << t_filter_ms
+    << ",\"assimilate_ms\":" << t_assimilate_ms
+    << ",\"total_ms\":" << total
+    << ",\"error_code\":" << error_code
+    << "}\n";
+}
+
+}  // namespace
+
 clio::run::TaskResume Hdf5FileAssimilator::Schedule(const AssimilationCtx& ctx,
                                               int& error_code) {
 #ifdef CLIO_ENABLE_BOOST_COROUTINES
   clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
 #endif
   CLIO_TASK_BODY_BEGIN
+  // Telemetry phase timers (see CaeEmitTelemetry above; inert unless
+  // CLIO_CAE_TELEMETRY is set).
+  double t_phase0 = CaeNowMs();
+  double t_open_ms = 0, t_discover_ms = 0, t_filter_ms = 0, t_assimilate_ms = 0;
+  size_t tele_discovered = 0, tele_filtered = 0;
+  const char* tele_mode = "single";
+  size_t tele_nodes = 1;
   HLOG(kDebug, "Hdf5FileAssimilator::Schedule() - ENTRY");
   HLOG(kDebug, "  ctx.src: '{}'", ctx.src);
   HLOG(kDebug, "  ctx.dst: '{}'", ctx.dst);
@@ -80,6 +174,16 @@ clio::run::TaskResume Hdf5FileAssimilator::Schedule(const AssimilationCtx& ctx,
     CLIO_CO_RETURN;
   }
 
+  // format: hdf5_vol stages the file in the HDF5 VOL connector's own cache
+  // layout instead of one tag per dataset, so an application reading the file
+  // through that connector is served from the tier on its first read.
+  if (ctx.format == "hdf5_vol") {
+    int vol_rc = 0;
+    CLIO_CO_AWAIT(StageForVol(ctx, vol_rc));
+    error_code = vol_rc;
+    CLIO_CO_RETURN;
+  }
+
   // Extract tag prefix from destination URL (remove iowarp:: prefix)
   std::string tag_prefix = GetUrlPath(ctx.dst);
   HLOG(kDebug, "Hdf5FileAssimilator: Extracted tag prefix: '{}'", tag_prefix);
@@ -87,18 +191,6 @@ clio::run::TaskResume Hdf5FileAssimilator::Schedule(const AssimilationCtx& ctx,
     HLOG(kError,
          "Hdf5FileAssimilator: Invalid destination URL, no tag name found");
     error_code = -2;
-    CLIO_CO_RETURN;
-  }
-
-  // Handle dependency-based scheduling
-  if (!ctx.depends_on.empty()) {
-    // TODO: Implement dependency handling
-    // For now, log that dependencies are not yet supported
-    HLOG(kDebug,
-         "Hdf5FileAssimilator: Dependency handling not yet implemented "
-         "(depends_on: {})",
-         ctx.depends_on);
-    error_code = 0;
     CLIO_CO_RETURN;
   }
 
@@ -124,6 +216,8 @@ clio::run::TaskResume Hdf5FileAssimilator::Schedule(const AssimilationCtx& ctx,
   HLOG(kDebug,
        "Hdf5FileAssimilator: HDF5 file opened successfully (file_id: {})",
        file_id);
+  t_open_ms = CaeNowMs() - t_phase0;
+  t_phase0 = CaeNowMs();
 
   // Discover all datasets in the file
   HLOG(kDebug, "Hdf5FileAssimilator: Discovering datasets...");
@@ -137,8 +231,11 @@ clio::run::TaskResume Hdf5FileAssimilator::Schedule(const AssimilationCtx& ctx,
     CLIO_CO_RETURN;
   }
 
-  HLOG(kDebug, "Hdf5FileAssimilator: Discovered {} dataset(s) in '{}'",
-       dataset_paths.size(), src_path);
+  t_discover_ms = CaeNowMs() - t_phase0;
+  t_phase0 = CaeNowMs();
+  tele_discovered = dataset_paths.size();
+  HLOG(kInfo, "Hdf5FileAssimilator: Discovered {} dataset(s) in '{}' ({:.1f} ms)",
+       dataset_paths.size(), src_path, t_discover_ms);
 
   // Apply dataset filtering if patterns are specified
   std::vector<std::string> filtered_paths;
@@ -167,14 +264,38 @@ clio::run::TaskResume Hdf5FileAssimilator::Schedule(const AssimilationCtx& ctx,
         filtered_paths.push_back(dataset_path);
       }
     }
-    HLOG(kDebug, "Hdf5FileAssimilator: Filtered to {} dataset(s) (from {})",
+    HLOG(kInfo, "Hdf5FileAssimilator: Filtered to {} dataset(s) (from {})",
          filtered_paths.size(), dataset_paths.size());
+    if (filtered_paths.empty() && !ctx.include_patterns.empty()) {
+      // The caller asked for specific datasets and got none. Returning success
+      // here is what made a mistyped pattern indistinguishable from a working
+      // ingest: the transfer still counts as "scheduled", so the client prints
+      // "ParseOmni completed successfully! Tasks scheduled: 1" over an empty
+      // run. Treat it as an error (-9) so it reaches the exit status.
+      HLOG(kError,
+           "Hdf5FileAssimilator: NO datasets matched the {} include pattern(s) "
+           "out of {} discovered -- nothing would be assimilated. Check pattern "
+           "syntax against the discovered dataset paths (CTP_LOG_LEVEL=debug "
+           "lists them); note '*' DOES cross '/' here (fnmatch flags=0).",
+           ctx.include_patterns.size(), dataset_paths.size());
+      CaeEmitTelemetry(src_path, ctx.dst, ctx.include_patterns,
+                       ctx.exclude_patterns, dataset_paths.size(), 0, 0,
+                       "single", 1, t_open_ms, t_discover_ms,
+                       CaeNowMs() - t_phase0, 0.0, -9);
+      CloseHdf5File(file_id);
+      error_code = -9;
+      CLIO_CO_RETURN;
+    }
   } else {
     HLOG(kDebug,
          "Hdf5FileAssimilator: No dataset filters specified, processing all "
          "datasets");
     filtered_paths = dataset_paths;
   }
+
+  t_filter_ms = CaeNowMs() - t_phase0;
+  t_phase0 = CaeNowMs();
+  tele_filtered = filtered_paths.size();
 
   // Get distributed processing info from CTE/IPC manager
   size_t num_nodes = 1;
@@ -209,6 +330,8 @@ clio::run::TaskResume Hdf5FileAssimilator::Schedule(const AssimilationCtx& ctx,
     // Create a local CAE client with the correct pool_id for distributed tasks
     // Do NOT use CLIO_CAE_CLIENT global singleton as it may not be properly initialized
     // with the correct pool_id from the runtime's compose configuration
+    tele_mode = "distributed";
+    tele_nodes = num_nodes;
     clio::cae::core::Client cae_client(kCaePoolId);
     HLOG(kInfo, "Hdf5FileAssimilator: Created CAE client with pool_id {} for distributed tasks",
           kCaePoolId);
@@ -290,10 +413,16 @@ clio::run::TaskResume Hdf5FileAssimilator::Schedule(const AssimilationCtx& ctx,
 
   HLOG(kDebug, "Hdf5FileAssimilator: HDF5 file closed");
 
+  t_assimilate_ms = CaeNowMs() - t_phase0;
+
   if (total_errors > 0) {
     HLOG(kError,
          "Hdf5FileAssimilator: Completed with {} error(s) out of {} dataset(s)",
          total_errors, filtered_paths.size());
+    CaeEmitTelemetry(src_path, ctx.dst, ctx.include_patterns,
+                     ctx.exclude_patterns, tele_discovered, tele_filtered,
+                     total_errors, tele_mode, tele_nodes, t_open_ms,
+                     t_discover_ms, t_filter_ms, t_assimilate_ms, -6);
     error_code = -6;
     CLIO_CO_RETURN;
   }
@@ -302,6 +431,16 @@ clio::run::TaskResume Hdf5FileAssimilator::Schedule(const AssimilationCtx& ctx,
       kDebug,
       "Hdf5FileAssimilator: Successfully processed all {} dataset(s) from '{}'",
       filtered_paths.size(), src_path);
+  HLOG(kInfo,
+       "Hdf5FileAssimilator: assimilated {} dataset(s) "
+       "[open {:.1f} ms, discover {:.1f} ms, filter {:.1f} ms, "
+       "assimilate {:.1f} ms]",
+       filtered_paths.size(), t_open_ms, t_discover_ms, t_filter_ms,
+       t_assimilate_ms);
+  CaeEmitTelemetry(src_path, ctx.dst, ctx.include_patterns,
+                   ctx.exclude_patterns, tele_discovered, tele_filtered, 0,
+                   tele_mode, tele_nodes, t_open_ms, t_discover_ms,
+                   t_filter_ms, t_assimilate_ms, 0);
   HLOG(kDebug, "Hdf5FileAssimilator::Schedule() - EXIT (success)");
 
   error_code = 0;
@@ -309,15 +448,218 @@ clio::run::TaskResume Hdf5FileAssimilator::Schedule(const AssimilationCtx& ctx,
   CLIO_TASK_BODY_END
 }
 
+clio::run::TaskResume Hdf5FileAssimilator::StageForVol(
+    const AssimilationCtx& ctx, int& error_code) {
+#ifdef CLIO_ENABLE_BOOST_COROUTINES
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
+#endif
+  CLIO_TASK_BODY_BEGIN
+  namespace layout = clio::adapter::vol_layout;
+  namespace fstamp = clio::adapter::stamp;
+
+  // The connector derives the tag from the file, so a destination path here
+  // would name a tag nothing reads. Refuse it rather than ignore it.
+  if (!GetUrlPath(ctx.dst).empty()) {
+    HLOG(kError,
+         "Hdf5FileAssimilator: format hdf5_vol stages into the VOL "
+         "connector's tag for the source file; dst must be 'iowarp::' with no "
+         "tag name, got '{}'",
+         ctx.dst);
+    error_code = -2;
+    CLIO_CO_RETURN;
+  }
+  const std::string src_path = GetUrlPath(ctx.src);
+  if (src_path.empty()) {
+    HLOG(kError, "Hdf5FileAssimilator: Invalid source URL, no file path found");
+    error_code = -3;
+    CLIO_CO_RETURN;
+  }
+  const std::string path = layout::CanonicalPath(src_path);
+  // The chunk size of the runtime's environment. A reader configured with a
+  // different one misses on the stamp instead of misreading the blobs.
+  const size_t chunk_size = layout::ChunkSizeFromEnv();
+
+  // The stamp vouches for the file as it is now, so the file must be quiet
+  // now: an mtime younger than the timestamp granule cannot rule out a write
+  // landing right after it. Waiting out one granule is cheap here.
+  if (!fstamp::SettleForStamp(path.c_str(), 2 * fstamp::GranularityNs())) {
+    HLOG(kError,
+         "Hdf5FileAssimilator: cannot stamp '{}' for the VOL cache (missing, "
+         "or still being modified)",
+         path);
+    error_code = -11;
+    CLIO_CO_RETURN;
+  }
+  const std::string stamp_before = layout::Stamp(path.c_str(), chunk_size);
+
+  // Native VOL explicitly: the runtime may have inherited
+  // HDF5_VOL_CONNECTOR=clio, and this read must come from the file itself.
+  hid_t fapl = H5Pcreate(H5P_FILE_ACCESS);
+  H5Pset_vol(fapl, H5VL_NATIVE, nullptr);
+  hid_t file_id = H5Fopen(path.c_str(), H5F_ACC_RDONLY, fapl);
+  H5Pclose(fapl);
+  if (file_id < 0) {
+    HLOG(kError, "Hdf5FileAssimilator: Failed to open HDF5 file '{}'", path);
+    error_code = -4;
+    CLIO_CO_RETURN;
+  }
+  std::vector<std::string> dataset_paths;
+  if (DiscoverDatasets(file_id, dataset_paths) != 0) {
+    H5Fclose(file_id);
+    error_code = -5;
+    CLIO_CO_RETURN;
+  }
+
+  // Start from an empty tag: blobs left from an older version of the file,
+  // or from datasets the filters now exclude, must not survive under a fresh
+  // stamp.
+  const std::string tag_name = layout::TagName(path);
+  auto del_task = cte_client_->AsyncDelTag(tag_name);
+  CLIO_CO_AWAIT(del_task);
+  auto tag_task = cte_client_->AsyncGetOrCreateTag(tag_name);
+  CLIO_CO_AWAIT(tag_task);
+  const clio::cte::core::TagId tag_id = tag_task->tag_id_;
+  if (tag_id.IsNull()) {
+    HLOG(kError, "Hdf5FileAssimilator: Failed to get or create tag '{}'",
+         tag_name);
+    H5Fclose(file_id);
+    error_code = -5;
+    CLIO_CO_RETURN;
+  }
+
+  static constexpr size_t kMaxParallelTasks = 32;
+  size_t staged = 0, skipped = 0, staged_bytes = 0;
+  bool put_failed = false;
+  for (size_t d = 0; d < dataset_paths.size() && !put_failed; ++d) {
+    const std::string& ds_path = dataset_paths[d];
+    if (!MatchesFilter(ds_path, ctx.include_patterns, ctx.exclude_patterns)) {
+      continue;
+    }
+    hid_t dset = H5Dopen2(file_id, ds_path.c_str(), H5P_DEFAULT);
+    if (dset < 0) {
+      ++skipped;
+      continue;
+    }
+    // Only what the connector caches in the native representation of the
+    // stored type: atomic, fixed-size types whose native form is the stored
+    // size. Anything else the connector stages itself on a whole read.
+    hid_t ftype = H5Dget_type(dset);
+    hid_t ntype = H5I_INVALID_HID;
+    bool stageable = false;
+    switch (ftype >= 0 ? H5Tget_class(ftype) : H5T_NO_CLASS) {
+      case H5T_INTEGER:
+      case H5T_FLOAT:
+      case H5T_ENUM:
+      case H5T_BITFIELD:
+      case H5T_STRING:
+        if (H5Tis_variable_str(ftype) > 0) break;
+        ntype = H5Tget_native_type(ftype, H5T_DIR_DEFAULT);
+        stageable = ntype >= 0 && H5Tget_size(ntype) == H5Tget_size(ftype);
+        break;
+      default:
+        break;
+    }
+    hid_t space = H5Dget_space(dset);
+    const hssize_t nelem = space >= 0 ? H5Sget_simple_extent_npoints(space) : 0;
+    if (space >= 0) H5Sclose(space);
+    const size_t total =
+        stageable && nelem > 0 ? static_cast<size_t>(nelem) * H5Tget_size(ntype)
+                               : 0;
+    char* image = total > 0 ? static_cast<char*>(malloc(total)) : nullptr;
+    const bool read_ok =
+        image && H5Dread(dset, ntype, H5S_ALL, H5S_ALL, H5P_DEFAULT, image) >= 0;
+    if (ntype >= 0) H5Tclose(ntype);
+    if (ftype >= 0) H5Tclose(ftype);
+    H5Dclose(dset);
+    if (!read_ok) {
+      free(image);
+      ++skipped;
+      continue;
+    }
+
+    // Same blobs the connector's whole-read staging writes: chunk_i holds
+    // bytes [i*chunk, (i+1)*chunk) of the image at blob offset 0.
+    const size_t num_chunks = (total + chunk_size - 1) / chunk_size;
+    std::vector<clio::run::Future<clio::cte::core::PutBlobTask>> active;
+    for (size_t i = 0; i < num_chunks || !active.empty();) {
+      while (i < num_chunks && active.size() < kMaxParallelTasks) {
+        const size_t off = i * chunk_size;
+        const size_t len = std::min(chunk_size, total - off);
+        auto buffer = CLIO_IPC->AllocateBuffer(len);
+        std::memcpy(buffer.ptr_, image + off, len);
+        active.push_back(cte_client_->AsyncPutBlob(
+            tag_id, layout::ChunkBlobName(ds_path, i), 0, len,
+            buffer.shm_.template Cast<void>(), -1.0f,
+            clio::cte::core::Context(), clio::cte::core::kCtePutDroppable));
+        ++i;
+      }
+      auto& first = active.front();
+      CLIO_CO_AWAIT(first);
+      if (first->return_code_ != 0) {
+        HLOG(kError,
+             "Hdf5FileAssimilator: PutBlob for '{}' failed with code {}",
+             ds_path, first->return_code_);
+        put_failed = true;
+      }
+      CLIO_IPC->FreeBuffer(first->blob_data_.template Cast<char>());
+      active.erase(active.begin());
+    }
+    free(image);
+    ++staged;
+    staged_bytes += total;
+  }
+  H5Fclose(file_id);
+
+  // A partial image must not be vouched for, and neither may a file that
+  // changed while it was being read.
+  const std::string stamp_after = layout::Stamp(path.c_str(), chunk_size);
+  if (put_failed || stamp_after != stamp_before) {
+    HLOG(kError,
+         "Hdf5FileAssimilator: {} while staging '{}' for the VOL cache; "
+         "dropping the partial image",
+         put_failed ? "a put failed" : "the file changed", path);
+    auto drop = cte_client_->AsyncDelTag(tag_name);
+    CLIO_CO_AWAIT(drop);
+    error_code = put_failed ? -9 : -12;
+    CLIO_CO_RETURN;
+  }
+
+  auto stamp_buf = CLIO_IPC->AllocateBuffer(stamp_after.size());
+  std::memcpy(stamp_buf.ptr_, stamp_after.data(), stamp_after.size());
+  auto stamp_task = cte_client_->AsyncPutBlob(
+      tag_id, layout::kStampBlobName, 0, stamp_after.size(),
+      stamp_buf.shm_.template Cast<void>(), -1.0f, clio::cte::core::Context(),
+      clio::cte::core::kCtePutDroppable);
+  CLIO_CO_AWAIT(stamp_task);
+  CLIO_IPC->FreeBuffer(stamp_task->blob_data_.template Cast<char>());
+  if (stamp_task->return_code_ != 0) {
+    HLOG(kError,
+         "Hdf5FileAssimilator: coherence stamp for '{}' failed to store "
+         "(code {}); the VOL connector will not trust the image",
+         path, stamp_task->return_code_);
+    error_code = -10;
+    CLIO_CO_RETURN;
+  }
+
+  HLOG(kInfo,
+       "Hdf5FileAssimilator: staged {} dataset(s), {} bytes of '{}' for the "
+       "HDF5 VOL connector (tag '{}', chunk {} B); {} left to the connector",
+       staged, staged_bytes, path, tag_name, chunk_size, skipped);
+  error_code = 0;
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 hid_t Hdf5FileAssimilator::OpenHdf5File(const std::string& file_path) {
   HLOG(kDebug, "OpenHdf5File: Checking if file exists: '{}'", file_path);
-  // Check if file exists
-  struct stat st;
-  if (stat(file_path.c_str(), &st) != 0) {
+  // Check if file exists (std::filesystem: portable across POSIX and Windows)
+  std::error_code ec;
+  const auto file_size = std::filesystem::file_size(file_path, ec);
+  if (ec) {
     HLOG(kError, "Hdf5FileAssimilator: File does not exist: '{}'", file_path);
     return -1;
   }
-  HLOG(kDebug, "OpenHdf5File: File exists, size: {} bytes", st.st_size);
+  HLOG(kDebug, "OpenHdf5File: File exists, size: {} bytes", file_size);
 
   // Open HDF5 file for reading (serial, read-only)
   HLOG(kDebug, "OpenHdf5File: Calling H5Fopen...");
@@ -732,13 +1074,121 @@ std::string Hdf5FileAssimilator::GetUrlPath(const std::string& url) {
   return url.substr(pos + 2);
 }
 
+#ifdef _WIN32
+namespace {
+
+/**
+ * Match one character against a bracket expression in a glob pattern.
+ *
+ * Supports "[abc]", ranges "[a-z]" and negation "[!abc]" / "[^abc]", with a
+ * leading ']' taken literally, mirroring fnmatch(3). An unterminated bracket
+ * is treated as a literal '[' character, as fnmatch does.
+ *
+ * @param pattern The full glob pattern.
+ * @param pos In: index of the opening '['. Out: index just past the
+ *            expression (or past the literal '[' when unterminated).
+ * @param c The character to test.
+ * @return true if c matches the bracket expression.
+ */
+bool MatchBracket(const std::string& pattern, size_t& pos, char c) {
+  size_t i = pos + 1;
+  bool negate = false;
+  if (i < pattern.size() && (pattern[i] == '!' || pattern[i] == '^')) {
+    negate = true;
+    ++i;
+  }
+  bool matched = false;
+  bool first = true;
+  while (i < pattern.size() && (first || pattern[i] != ']')) {
+    first = false;
+    char lo = pattern[i];
+    char hi = lo;
+    if (i + 2 < pattern.size() && pattern[i + 1] == '-' &&
+        pattern[i + 2] != ']') {
+      hi = pattern[i + 2];
+      i += 2;
+    }
+    if (lo <= c && c <= hi) {
+      matched = true;
+    }
+    ++i;
+  }
+  if (i >= pattern.size()) {  // no closing ']': literal '['
+    pos = pos + 1;
+    return c == '[';
+  }
+  pos = i + 1;
+  return matched != negate;
+}
+
+/**
+ * Portable glob matcher equivalent to fnmatch(pattern, str, 0).
+ *
+ * '*' matches any sequence (including '/'), '?' any single character,
+ * "[...]" a bracket expression, and '\\' escapes the next pattern character.
+ * Uses the classic single-backtrack-point algorithm for '*'.
+ *
+ * @param pattern Glob pattern.
+ * @param str String to test.
+ * @return true if the whole string matches the whole pattern.
+ */
+bool GlobMatch(const std::string& pattern, const std::string& str) {
+  const size_t npos = std::string::npos;
+  size_t p = 0, s = 0, star_p = npos, star_s = 0;
+  while (s < str.size()) {
+    if (p < pattern.size()) {
+      size_t next_p = p + 1;
+      bool matched = false;
+      char pc = pattern[p];
+      if (pc == '*') {
+        star_p = p;
+        star_s = s;
+        ++p;
+        continue;
+      } else if (pc == '?') {
+        matched = true;
+      } else if (pc == '[') {
+        next_p = p;
+        matched = MatchBracket(pattern, next_p, str[s]);
+      } else {
+        if (pc == '\\' && p + 1 < pattern.size()) {
+          pc = pattern[p + 1];
+          next_p = p + 2;
+        }
+        matched = (pc == str[s]);
+      }
+      if (matched) {
+        p = next_p;
+        ++s;
+        continue;
+      }
+    }
+    if (star_p == npos) {
+      return false;
+    }
+    p = star_p + 1;  // backtrack: let the last '*' absorb one more char
+    s = ++star_s;
+  }
+  while (p < pattern.size() && pattern[p] == '*') {
+    ++p;
+  }
+  return p == pattern.size();
+}
+
+}  // namespace
+#endif
+
 bool Hdf5FileAssimilator::MatchGlobPattern(const std::string& str,
                                            const std::string& pattern) {
+#ifdef _WIN32
+  // MSVC/icx-cl have no fnmatch(3); use the portable matcher above.
+  return GlobMatch(pattern, str);
+#else
   // Use fnmatch for glob pattern matching (supports *, ?, [])
-  // FNM_PATHNAME: '/' must be matched explicitly
-  // FNM_PERIOD: leading '.' must be matched explicitly
+  // No FNM_PATHNAME: '*' also matches '/', so "*/RawData" spans groups.
   int result = fnmatch(pattern.c_str(), str.c_str(), 0);
   return result == 0;
+#endif
 }
 
 bool Hdf5FileAssimilator::MatchesFilter(

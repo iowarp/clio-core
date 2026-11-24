@@ -40,6 +40,7 @@
 #include "clio_runtime/work_orchestrator.h"
 #include <cstdlib>
 #include <cstring>
+#include <yaml-cpp/yaml.h>
 
 namespace clio::run {
 
@@ -77,17 +78,81 @@ bool ClioInitImpl(RuntimeMode mode, bool default_with_runtime,
     init_runtime = with_runtime;
   }
 
-  // Initialize runtime first if needed
+  // "Clio as a cache" (issue #1015): asking for a runtime means asking for one
+  // to EXIST, not to be the process running it. Try to become the runtime; if
+  // something already owns the port, fall back to being its client.
+  //
+  // ZMQ is the arbiter here, not a lock of our own: binding the local server
+  // port is a kernel-level atomic claim, so of N processes racing to start
+  // (mpirun -np 4) exactly one can win it. The losers see ServerInit fail and
+  // continue to ClientInit, which attaches them to the winner.
+  //
+  // The foreign-program case falls out of the same path: if the port is held by
+  // something that is not a clio runtime, ServerInit fails to bind AND ClientInit
+  // finds nobody answering, so initialization fails — which is what we want, and
+  // is why this must not swallow a ClientInit failure.
   if (init_runtime) {
     if (!runtime_manager->ServerInit()) {
+      if (mode != RuntimeMode::kClient) {
+        // `clio_run runtime start` is an explicit "be the runtime" and must
+        // still fail loudly rather than silently become a client with no daemon.
+        return false;
+      }
+      HLOG(kInfo,
+           "CLIO_WITH_RUNTIME=1: could not start a runtime (port already "
+           "bound); attaching to the existing one as a client");
+    }
+  }
+
+  // Initialize client components. In the fall-back case above this is also the
+  // check that something real is listening: a foreign program on the port
+  // leaves nothing to attach to, and this fails.
+  if (init_client) {
+    if (!runtime_manager->ClientInit()) {
       return false;
     }
   }
 
-  // Initialize client components
-  if (init_client) {
-    if (!runtime_manager->ClientInit()) {
-      return false;
+  // FORCE yaml-cpp's lazy statics into existence BEFORE the atexit below.
+  //
+  // The registration below only orders CLIO_RUNTIME_FINALIZE ahead of statics
+  // that ALREADY EXIST: __cxa_atexit is LIFO, so anything constructed later is
+  // destroyed EARLIER. yaml-cpp builds its Exp:: regex singletons as
+  // function-local statics on first use, and the emitter reaches them through
+  // YAML::Utils::IsValidPlainScalar (it has to decide whether a scalar can be
+  // written unquoted). In this process the first such emit is the learned-model
+  // flush -- which happens DURING the run, after this point -- so those
+  // regexes get destroyed before CLIO_RUNTIME_FINALIZE, and the shutdown flush
+  // it drives (ServerFinalize -> DestroyAllContainers -> PoolManager::
+  // FlushModels -> TaskStatModelSnapshot::Save) then emits YAML through freed
+  // RegEx objects.
+  //
+  // Measured: RegEx::MatchUnchecked switches on m_op, whose 4 bytes had been
+  // overwritten with an allocator freelist pointer (0x2b97e5554928), and GCC
+  // compiles that switch to a .rodata jump table -- so control transferred
+  // into non-executable data. The fault is an instruction fetch (si_addr ==
+  // rip) at a .rodata address in libclio_run_cxx, with no call stack, strictly
+  // AFTER "Success rate: 100%". That is the cr_task_archive_task_base_tests
+  // SIGSEGV on CDash build 4248705. Same corner that already produced a
+  // yaml-cpp bad_alloc escaping into atexit (see task_stat_model.cc).
+  //
+  // Touching both the emitter and the parser here registers their statics
+  // first, so LIFO destroys them AFTER our handler has finished using them.
+  // CLIO_YAML_WARMUP=0 disables it, which is how the fix was A/B'd.
+  {
+    const char *warm = std::getenv("CLIO_YAML_WARMUP");
+    const bool do_warm = (warm == nullptr) || std::strcmp(warm, "0") != 0;
+    if (do_warm) {
+      try {
+        YAML::Emitter probe;
+        probe << YAML::BeginMap << YAML::Key << "w" << YAML::Value << "w"
+              << YAML::EndMap;
+        (void)probe.c_str();
+        YAML::Node parsed = YAML::Load("w: w");
+        (void)parsed.IsMap();
+      } catch (const std::exception &) {
+        // A warm-up that cannot run is not a reason to fail init.
+      }
     }
   }
 

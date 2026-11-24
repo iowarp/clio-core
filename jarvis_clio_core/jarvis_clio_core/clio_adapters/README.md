@@ -225,7 +225,7 @@ If you get an error like "Could not find clio_cte_posix library":
 
 1. Ensure CTE is built with the adapter enabled:
    ```bash
-   cmake --preset=debug -DWRP_CTE_ENABLE_POSIX_ADAPTER=ON
+   cmake --preset=debug -DCLIO_CTE_ENABLE_POSIX_ADAPTER=ON
    ```
 
 2. Check installation:
@@ -251,7 +251,7 @@ jarvis interceptor conf cte_adapters posix=true
 
 If MPI-IO adapter is not found:
 - MPI-IO adapter requires MPI support during build
-- Enable with: `-DWRP_CTE_ENABLE_MPIIO_ADAPTER=ON`
+- Enable with: `-DCLIO_CTE_ENABLE_MPIIO_ADAPTER=ON`
 - Ensure MPI is installed and findable by CMake
 
 ### HDF5 VFD Issues
@@ -270,10 +270,10 @@ To enable specific adapters, use these CMake options:
 -DBUILD_WRP_CTE=ON
 
 # Optional adapters
--DWRP_CTE_ENABLE_STDIO_ADAPTER=ON
--DWRP_CTE_ENABLE_MPIIO_ADAPTER=ON
--DWRP_CTE_ENABLE_VFD=ON
--DWRP_CTE_ENABLE_NVIDIA_GDS_ADAPTER=ON
+-DCLIO_CTE_ENABLE_STDIO_ADAPTER=ON
+-DCLIO_CTE_ENABLE_MPIIO_ADAPTER=ON
+-DCLIO_CTE_ENABLE_VFD=ON
+-DCLIO_CTE_ENABLE_NVIDIA_GDS_ADAPTER=ON
 ```
 
 ## Integration with CTE Runtime
@@ -304,7 +304,7 @@ pkgs:
 
 ## See Also
 
-- [CTE Core Documentation](../../../../docs/cte/cte.md)
-- [WRP CTE Service Package](../clio_cte/README.md)
-- [Jarvis-CD Package Development Guide](../../../../docs/jarvis/package_dev_guide.md)
+- [CTE Core Documentation](https://core.iowarp.ai/docs/cte/index.html)
+- [CTE Service Package](../clio_cte/README.md)
+- [Jarvis-CD](https://github.com/grc-iit/jarvis-cd)
 - [IoWarp Project Documentation](../../../../README.md)

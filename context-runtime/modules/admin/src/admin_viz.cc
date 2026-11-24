@@ -50,6 +50,7 @@
  */
 
 #include <clio_ctp/serialize/msgpack_wrapper.h>
+#include <clio_ctp/util/msan.h>
 #include <yaml-cpp/yaml.h>
 
 #include <algorithm>
@@ -164,6 +165,12 @@ std::string ResultsToJsonArray(
       continue;
     }
     try {
+      // The payload arrived over ZMQ, which is not MSan-instrumented: the
+      // bytes are real but carry no shadow, so unpacking them yields an object
+      // whose every field reads as uninitialized. Unpoison the buffer, not the
+      // unpacked object -- that keeps a genuinely short/garbage payload
+      // detectable as a msgpack parse error rather than silently accepted.
+      CTP_MSAN_UNPOISON_STRING(kv.second);
       msgpack::object_handle oh =
           msgpack::unpack(kv.second.data(), kv.second.size());
       const msgpack::object &obj = oh.get();
@@ -196,6 +203,7 @@ std::string ResultsToJsonMap(
       continue;
     }
     try {
+      CTP_MSAN_UNPOISON_STRING(kv.second);  // see ResultsToJsonArray
       msgpack::object_handle oh =
           msgpack::unpack(kv.second.data(), kv.second.size());
       ObjToJson(oh.get(), w);
@@ -642,8 +650,11 @@ void Runtime::RegisterViz(clio::run::viz::VizServer &viz,
          HLOG(kInfo, "Viz: destroyed pool {} ({}) from the dashboard",
               pool_str, pool_name);
          if (future->GetReturnCode() != 0) {
+           // A failed module flush leaves the pool running; say why.
+           std::string why = future->error_message_.str();
            resp.Error(500, "DestroyPool failed with rc=" +
-                               std::to_string(future->GetReturnCode()));
+                               std::to_string(future->GetReturnCode()) +
+                               (why.empty() ? "" : ": " + why));
            return;
          }
          JsonWriter w;
@@ -765,6 +776,7 @@ void Runtime::RegisterViz(clio::run::viz::VizServer &viz,
          if (!config.empty()) {
            try {
              config_node = YAML::Load(config);
+             ctp::MsanUnpoisonYaml(config_node);
              if (!config_node.IsMap()) {
                fail("config", "must be a YAML mapping (key: value lines)");
              }
@@ -797,6 +809,9 @@ void Runtime::RegisterViz(clio::run::viz::VizServer &viz,
          config_node["pool_id"] = pool_id_str;
          config_node["pool_query"] = pool_query_str;
          YAML::Emitter emitter;
+  // libyaml-cpp.so reads its own bookkeeping back out of this stack slot; see
+  // TaskStatModelSnapshot::Save.
+  CTP_MSAN_UNPOISON_OBJ(emitter);
          emitter << config_node;
 
          clio::run::PoolConfig pool_config;

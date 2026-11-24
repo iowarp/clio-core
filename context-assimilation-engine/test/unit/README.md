@@ -122,9 +122,9 @@ TEST SUITE PASSED
    - Very large files (> 1GB)
    - Files exactly at chunk boundaries
 
-4. **Dependency Handling**
-   - Tests with `depends_on` set
-   - Dependency chain validation
+4. **Dependency Handling** (`cae_error_handling`)
+   - `depends_on` naming no transfer, or a later one: rejected, nothing scheduled
+   - `depends_on` naming an earlier transfer: both run and both tags hold the data
 
 5. **Concurrent Operations**
    - Multiple simultaneous ParseOmni calls

@@ -45,7 +45,10 @@
 
 #include <yaml-cpp/yaml.h>
 
+#include <clio_ctp/util/msan.h>
+
 #include <cctype>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 
@@ -93,55 +96,104 @@ bool TaskStatModelSnapshot::Save(const std::string &path) const {
     return false;
   }
   std::error_code ec;
-  std::filesystem::create_directories(
-      std::filesystem::path(path).parent_path(), ec);
+  // parent_path() runs inside uninstrumented libstdc++.so, so the temporary it
+  // returns is poisoned and its destructor is reported.
+  std::filesystem::path parent = std::filesystem::path(path).parent_path();
+  CTP_MSAN_UNPOISON_PATH(parent);
+  std::filesystem::create_directories(parent, ec);
   if (ec) {
     HLOG(kError, "TaskStatModel: cannot create model directory for {}: {}",
          path, ec.message());
     return false;
   }
 
-  YAML::Emitter out;
-  out << YAML::BeginMap;
-  out << YAML::Key << "chimod_name" << YAML::Value << chimod_name_;
-  out << YAML::Key << "pool_name" << YAML::Value << pool_name_;
-  out << YAML::Key << "container_id" << YAML::Value << container_id_;
-  out << YAML::Key << "learning_rate" << YAML::Value << learning_rate_;
-  out << YAML::Key << "methods" << YAML::Value << YAML::BeginMap;
-  for (const auto &kv : methods_) {
-    out << YAML::Key << kv.first << YAML::Value << YAML::BeginMap;
-    out << YAML::Key << "cpu_coef" << YAML::Value << kv.second.cpu_coef_;
-    out << YAML::Key << "cpu_mape" << YAML::Value << kv.second.cpu_mape_;
-    out << YAML::Key << "wall_coef" << YAML::Value << kv.second.wall_coef_;
-    out << YAML::Key << "wall_mape" << YAML::Value << kv.second.wall_mape_;
+  // Everything below is guarded for the same reason Load() is: the model is an
+  // optimization, and losing a save is correct (just slower) behaviour. The
+  // stakes are higher here than on the read side, though -- SaveModel runs from
+  // PoolManager::DestroyAllContainers inside RuntimeManager::ServerFinalize,
+  // which CLIO_RUNTIME_FINALIZE drives from an atexit handler. An exception
+  // escaping into atexit is an uncaught exception with no frame left to catch
+  // it, so std::terminate aborts a process whose work is already finished. That
+  // is how a yaml-cpp allocation failure during the shutdown flush turned into
+  // "terminate called after throwing an instance of std::bad_alloc" AFTER every
+  // test in cr_task_archive_* had passed.
+  try {
+    YAML::Emitter out;
+    // libyaml-cpp.so writes and reads this object's members itself, on a stack
+    // slot MSan poisoned on entry, so its own bookkeeping reads are reported
+    // while the document is being built -- before c_str() is ever called.
+    CTP_MSAN_UNPOISON_OBJ(out);
+    out << YAML::BeginMap;
+    out << YAML::Key << "chimod_name" << YAML::Value << chimod_name_;
+    out << YAML::Key << "pool_name" << YAML::Value << pool_name_;
+    out << YAML::Key << "container_id" << YAML::Value << container_id_;
+    out << YAML::Key << "learning_rate" << YAML::Value << learning_rate_;
+    out << YAML::Key << "methods" << YAML::Value << YAML::BeginMap;
+    for (const auto &kv : methods_) {
+      out << YAML::Key << kv.first << YAML::Value << YAML::BeginMap;
+      out << YAML::Key << "cpu_coef" << YAML::Value << kv.second.cpu_coef_;
+      out << YAML::Key << "cpu_mape" << YAML::Value << kv.second.cpu_mape_;
+      out << YAML::Key << "wall_coef" << YAML::Value << kv.second.wall_coef_;
+      out << YAML::Key << "wall_mape" << YAML::Value << kv.second.wall_mape_;
+      out << YAML::EndMap;
+    }
     out << YAML::EndMap;
-  }
-  out << YAML::EndMap;
-  out << YAML::EndMap;
+    out << YAML::EndMap;
 
-  // Write to a temp file and rename: a crash (or a kill during the periodic
-  // flush) must not be able to leave a half-written file that the next startup
-  // would happily load as the learned model.
-  const std::string tmp_path = path + ".tmp";
-  {
-    std::ofstream ofs(tmp_path, std::ios::trunc);
-    if (!ofs.is_open()) {
-      HLOG(kError, "TaskStatModel: failed to open {} for writing", tmp_path);
+    // Write to a temp file and rename: a crash (or a kill during the periodic
+    // flush) must not be able to leave a half-written file that the next startup
+    // would happily load as the learned model.
+    const std::string tmp_path = path + ".tmp";
+    {
+      // The models directory does not exist on a fresh node; every runtime
+      // start then logged an ERROR per container and learned nothing across
+      // runs. Create it (best effort) before complaining.
+      std::error_code dir_ec;
+      std::filesystem::create_directories(
+          std::filesystem::path(path).parent_path(), dir_ec);
+      std::ofstream ofs(tmp_path, std::ios::trunc);
+      // Neither the stream's state (read by is_open/good below) nor the text
+      // the yaml-cpp emitter accumulated is visible to MSan: libstdc++.so and
+      // libyaml-cpp.so are both uninstrumented.
+      CTP_MSAN_UNPOISON_OBJ(ofs);
+      if (!ofs.is_open()) {
+        HLOG(kWarning,
+             "TaskStatModel: cannot write {} (directory create: {}); the "
+             "model will not persist across runs",
+             tmp_path, dir_ec ? dir_ec.message() : "ok");
+        return false;
+      }
+      CTP_MSAN_UNPOISON(out.c_str(), out.size() + 1);
+      ofs << out.c_str() << "\n";
+      // close() here, not at the end of the scope: the model is small enough to
+      // sit entirely in the stream buffer, so the write to the device happens
+      // at flush time. Letting the destructor do that puts the failure after
+      // this check -- good() would say the write succeeded and the rename below
+      // would install a file the filesystem never accepted (ENOSPC, a full
+      // quota, a dying disk). Closing explicitly moves the flush in front of
+      // the check; close() sets failbit if it cannot complete.
+      ofs.close();
+      CTP_MSAN_UNPOISON_OBJ(ofs);
+      if (!ofs.good()) {
+        HLOG(kError, "TaskStatModel: failed to write {}", tmp_path);
+        std::filesystem::remove(tmp_path, ec);
+        return false;
+      }
+    }
+    std::filesystem::rename(tmp_path, path, ec);
+    if (ec) {
+      HLOG(kError, "TaskStatModel: failed to install {}: {}", path, ec.message());
+      std::filesystem::remove(tmp_path, ec);
       return false;
     }
-    ofs << out.c_str() << "\n";
-    if (!ofs.good()) {
-      HLOG(kError, "TaskStatModel: failed to write {}", tmp_path);
-      return false;
-    }
-  }
-  std::filesystem::rename(tmp_path, path, ec);
-  if (ec) {
-    HLOG(kError, "TaskStatModel: failed to install {}: {}", path, ec.message());
-    std::filesystem::remove(tmp_path, ec);
+    return true;
+  } catch (const std::exception &e) {
+    HLOG(kWarning, "TaskStatModel: failed to save {} ({}); model not persisted",
+         path, e.what());
+    std::error_code rm_ec;
+    std::filesystem::remove(path + ".tmp", rm_ec);
     return false;
   }
-  return true;
 }
 
 bool TaskStatModelSnapshot::Load(const std::string &path) {
@@ -155,6 +207,10 @@ bool TaskStatModelSnapshot::Load(const std::string &path) {
   }
   try {
     YAML::Node root = YAML::LoadFile(path);
+    // Every key compare and every .as<std::string>() below reads scalar bytes
+    // that uninstrumented libyaml-cpp.so produced; clear the tree once here
+    // rather than at each of them.
+    ctp::MsanUnpoisonYaml(root);
     if (!root || !root.IsMap()) {
       HLOG(kWarning, "TaskStatModel: {} is not a YAML map; ignoring", path);
       return false;
@@ -229,10 +285,18 @@ size_t Container::ImportModel(const TaskStatModelSnapshot &snapshot) {
       continue;  // new method, or one this container never exercised: keep seed
     }
     const MethodStatWeights &w = it->second;
-    if (i < method_model_.size()) method_model_[i] = w.cpu_coef_;
-    if (i < method_mape_.size()) method_mape_[i] = w.cpu_mape_;
-    if (i < method_model_wall_.size()) method_model_wall_[i] = w.wall_coef_;
-    if (i < method_mape_wall_.size()) method_mape_wall_[i] = w.wall_mape_;
+    // A saved model can hold a NaN or negative coefficient learned before
+    // samples were checked; restore those as the seed, not as poison.
+    if (i < method_model_.size()) method_model_[i] = SaneCoef(w.cpu_coef_);
+    if (i < method_mape_.size()) {
+      method_mape_[i] = std::isfinite(w.cpu_mape_) ? w.cpu_mape_ : 0.0f;
+    }
+    if (i < method_model_wall_.size()) {
+      method_model_wall_[i] = SaneCoef(w.wall_coef_);
+    }
+    if (i < method_mape_wall_.size()) {
+      method_mape_wall_[i] = std::isfinite(w.wall_mape_) ? w.wall_mape_ : 0.0f;
+    }
     ++restored;
   }
   // A restore is not new learning: leaving the flag clear keeps the periodic

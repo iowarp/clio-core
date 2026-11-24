@@ -1,0 +1,52 @@
+# Issue #624 reproducer: several clio_run processes on one host (distinct
+# ports, "host:port" hostfile entries) plus a peer that never answers, with
+# fast SWIM timings so the dead peer is confirmed within ~10 s.
+networking:
+  port: @PORT@
+  neighborhood_size: 4
+  hostfile: "@HOSTFILE@"
+  wait_for_restart: 5
+  wait_for_restart_poll_period: 1
+
+runtime:
+  num_threads: 4
+  queue_depth: 1024
+  local_sched: "default"
+  first_busy_wait: 50
+
+# Several runtimes share this host: keep the dashboard (port 8080) off.
+viz:
+  enabled: false
+
+swim:
+  enabled: true
+  direct_probe_timeout_sec: 2.0
+  indirect_probe_timeout_sec: 2.0
+  suspicion_timeout_sec: 3.0
+
+# Same module set as the issue: bdev + CAE + CTE.
+compose:
+  - mod_name: clio_bdev
+    pool_name: "ram::chi_default_bdev"
+    pool_query: local
+    pool_id: "301.0"
+    bdev_type: ram
+    capacity: "256MB"
+
+  - mod_name: clio_cae_core
+    pool_name: cae_main
+    pool_query: local
+    pool_id: "400.0"
+    next_pool_id: "512.0"
+
+  - mod_name: clio_cte_core
+    pool_name: cte_main
+    pool_query: local
+    pool_id: "512.0"
+    storage:
+      - path: "ram::cte_ram_tier1"
+        bdev_type: "ram"
+        capacity_limit: "256MB"
+        score: 1.0
+    dpe:
+      dpe_type: "max_bw"

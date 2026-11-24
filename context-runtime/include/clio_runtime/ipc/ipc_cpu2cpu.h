@@ -14,6 +14,7 @@
 namespace clio::run {
 
 class IpcManager;
+class LoadTaskArchive;
 
 /**
  * IPC transport for CPU client → CPU runtime via shared memory (lightbeam).
@@ -41,6 +42,18 @@ struct IpcCpu2Cpu {
   // a resolved Future for the calling worker to route + execute INLINE. Empty
   // Future (get()==nullptr) when the ring has nothing. No lane push, no wakeup.
   static Future<Task> RecvIn(IpcManager *ipc, u32 shard);
+
+  /**
+   * Turn one received SHM client request into a resolved server-side Future:
+   * deserialize it with its pool's static container and stamp the client's
+   * response identity (origin, pid, net_key, waiter) on it. Shared by RecvIn
+   * and by the deferred-request replay (issue #1039), which admits a request
+   * that arrived before its pool existed.
+   * @param archive The received request; its task is consumed.
+   * @return The resolved Future, or an empty one (get()==nullptr) when the
+   *         pool is still unknown or the task fails to deserialize.
+   */
+  static Future<Task> AdmitShm(LoadTaskArchive &archive);
 
   /** Deserialize task from SHM ring buffer on runtime side (inbound). */
   static clio::run::shared_ptr<clio::run::Task> RecvIn(

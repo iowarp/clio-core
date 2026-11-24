@@ -58,12 +58,16 @@ struct PerformanceConfig {
 
   clio::run::u32 flush_metadata_period_ms_;  // Period for periodic metadata flush
                                        // (default 5s)
-  std::string metadata_log_path_;   // Path for metadata log (empty = disabled)
-  clio::run::u32 flush_data_period_ms_;   // Period for data flush (default 10s)
-  int flush_data_min_persistence_;  // Min persistence level to flush to
-                                    // (1=temp-nonvolatile)
+  std::string metadata_log_path_;   // Path for metadata log (empty = disabled;
+                                    // always cleared on a volatile core)
   clio::run::u64
       transaction_log_capacity_bytes_;  // Total WAL capacity (default 32MB)
+  /** fsync(2) through clio-fs: false ("durable", the default) returns only
+   *  once the devices holding the file's bytes are synced, with the metadata
+   *  WAL that locates them (the write-back cache flushes dirty volatile
+   *  copies first); true ("deferred") returns at once and leaves durability
+   *  to the periodic cache flush and flush_metadata tasks. */
+  bool fsync_deferred_;
 
   PerformanceConfig()
       : target_stat_interval_ms_(5000),
@@ -71,15 +75,14 @@ struct PerformanceConfig {
         // saturating the bdev pool's worker (50 ms default fired
         // 20×/s and starved real PutBlob/GetBlob traffic on a single-
         // worker setup).
-        stat_targets_period_ms_(5000),
+        stat_targets_period_ms_(1000),
         max_concurrent_operations_(64),
         score_threshold_(0.7f),
         score_difference_threshold_(0.05f),
         flush_metadata_period_ms_(5000),
         metadata_log_path_(""),
-        flush_data_period_ms_(10000),
-        flush_data_min_persistence_(1),
-        transaction_log_capacity_bytes_(32ULL * 1024ULL * 1024ULL) {}
+        transaction_log_capacity_bytes_(32ULL * 1024ULL * 1024ULL),
+        fsync_deferred_(false) {}
 };
 
 /**
@@ -89,11 +92,16 @@ struct TargetConfig {
   clio::run::u32 neighborhood_;  // Number of targets (nodes CTE can buffer to)
   clio::run::u32 default_target_timeout_ms_;  // Default timeout for target operations
   clio::run::u32 poll_period_ms_;  // Period to rescan targets for statistics
+  /** Route a blob whose owner node is dead to the first live successor
+   *  container (which holds a copy when the replication chimod keeps
+   *  remote_copies). Off: such operations fail until the owner returns. */
+  bool failover_to_successor_;
 
   TargetConfig()
       : neighborhood_(4),
         default_target_timeout_ms_(30000),
-        poll_period_ms_(5000) {}
+        poll_period_ms_(5000),
+        failover_to_successor_(false) {}
 };
 
 /**
@@ -107,6 +115,9 @@ struct StorageDeviceConfig {
   float score_;  // Optional manual score (0.0-1.0), -1.0 means use automatic
                  // scoring
   std::string persistence_level_;  // "volatile", "temporary", "long_term"
+  // Whether persistence_level_ came from the config. An unlabeled disk or
+  // object device inherits its core's durability class (ResolveDurability).
+  bool persistence_explicit_ = false;
 
   // When set (major_ != 0), this storage target binds to an ALREADY-EXISTING
   // pool (e.g. a safe-bdev pool composed elsewhere) instead of having CTE
@@ -117,12 +128,23 @@ struct StorageDeviceConfig {
   // Optional module name of the existing pool, for logging/validation only
   // (e.g. "clio_safe_bdev"). Not used to route — routing is purely by pool id.
   std::string existing_pool_module_;
+  // File tiers only: how far the backing file grows (and reserves) at a time.
+  // The bdev reserves its first unit when it is created, so on a RAM-backed
+  // filesystem (tmpfs) every file tier costs this much memory up front.
+  // YAML key: growth_unit (size string). Default matches the bdev's 1 GiB.
+  clio::run::u64 growth_unit_;
+  // The bdev type's own settings: the YAML text of the block named after the
+  // type in this storage entry (`s3:` for bdev_type s3, `gcs:` for gcs),
+  // handed to the bdev as CreateParams::ext_yaml_. Holds credentials; never
+  // logged. Empty when the entry has no such block.
+  std::string bdev_ext_yaml_;
 
   StorageDeviceConfig()
       : capacity_limit_(0),
         score_(-1.0f),
         persistence_level_("volatile"),
-        existing_pool_id_(clio::run::PoolId::GetNull()) {}
+        existing_pool_id_(clio::run::PoolId::GetNull()),
+        growth_unit_(clio::run::u64(1) << 30) {}
   StorageDeviceConfig(const std::string &path, const std::string &bdev_type,
                       clio::run::u64 capacity, float score = -1.0f,
                       const std::string &persistence_level = "volatile")
@@ -131,7 +153,9 @@ struct StorageDeviceConfig {
         capacity_limit_(capacity),
         score_(score),
         persistence_level_(persistence_level),
-        existing_pool_id_(clio::run::PoolId::GetNull()) {}
+        persistence_explicit_(persistence_level != "volatile"),
+        existing_pool_id_(clio::run::PoolId::GetNull()),
+        growth_unit_(clio::run::u64(1) << 30) {}
 
   // True when this target should bind to an existing pool rather than create
   // its own bdev. Pool-id major 0 is reserved for "not set" (CTE/admin pools
@@ -179,31 +203,14 @@ struct OrganizerConfig {
 };
 
 /**
- * GPU metadata cache configuration.
- *
- * When enabled, CTE Core allocates a chunk of GPU-accessible memory
- * (managed/shared USM) at Create time and projects a fixed-capacity
- * snapshot of tag and blob metadata into it. The cache is updated by
- * GPU kernels launched from the CTE Core server side as PutBlob /
- * GetOrCreateTag / DelBlob / DelTag run on the CPU; downstream GPU
- * kernels can read entries directly to discover what the CTE has
- * placed in DRAM-tier (GPU-reachable) storage.
- *
- * Sizing: capacity_bytes_ caps the memory footprint of the cache. The
- * actual map slot counts (max_blobs_ / max_tags_) are derived from
- * capacity_bytes_ / sizeof(GpuBlobEntry|GpuTagEntry) in the Create path.
+ * Durability class of one CTE core: stated by its `durability` key, or
+ * inferred from its devices' persistence_level at Create. Moving data
+ * between a volatile and a persistent
+ * core is the job of a cache module above them.
  */
-struct GpuMetadataCacheConfig {
-  bool enabled_;             /**< Master switch — off by default. */
-  clio::run::u64 capacity_bytes_;  /**< Total GPU memory footprint cap. */
-  clio::run::u32 max_blobs_;       /**< Hash slot count for blob entries.  */
-  clio::run::u32 max_tags_;        /**< Hash slot count for tag entries.   */
-
-  GpuMetadataCacheConfig()
-      : enabled_(false),
-        capacity_bytes_(64ULL * 1024ULL * 1024ULL),  // 64 MB default
-        max_blobs_(8192),
-        max_tags_(1024) {}
+enum class CoreDurability {
+  kVolatile,    ///< no WAL; empty after every start
+  kPersistent,  ///< WAL on when metadata_log_path is set; rejects volatile bdevs
 };
 
 /**
@@ -238,9 +245,11 @@ class Config {
   OrganizerConfig organizer_;
 
   /**
-   * GPU metadata cache (optional, off by default).
+   * Durability class (YAML key `durability`): "volatile", "persistent",
+   * or empty to infer it from the devices' persistence_level at Create.
+   * Read it through ResolveDurability.
    */
-  GpuMetadataCacheConfig gpu_metadata_cache_;
+  std::string durability_;
 
   /**
    * Default constructor
@@ -287,6 +296,20 @@ class Config {
    * @return true if configuration is valid, false otherwise
    */
   bool Validate() const;
+
+  /**
+   * Resolve this core's durability class.
+   *
+   * A stated durability_ wins. Unstated: persistent when the core has
+   * devices and every one has persistence_level temporary or long_term,
+   * else volatile (including no devices). Devices are checked against the
+   * class one at a time when they register (Runtime::RegisterTarget).
+   *
+   * @param out receives the resolved class on success
+   * @param error receives a human-readable reason on failure
+   * @return false only for an unknown durability_ value
+   */
+  bool ResolveDurability(CoreDurability *out, std::string *error) const;
 
   /**
    * Get configuration parameter as string for debugging

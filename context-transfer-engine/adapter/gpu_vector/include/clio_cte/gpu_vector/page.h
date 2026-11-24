@@ -17,6 +17,29 @@ namespace clio::cte::gpu_vector {
 /** page_num of an empty slot. */
 constexpr clio::run::u64 kNoPage = ~static_cast<clio::run::u64>(0);
 
+/**
+ * The CTE BLOB score every page is written at, by both the flush path and the
+ * create-on-get in the fetch path.
+ *
+ * NOT the same thing as kDefaultScore, which is a frame's eviction rank
+ * inside the GPU page cache and never leaves the device. This one is the
+ * number the DPE tiers on, and the two being both "a score" and both
+ * per-page is exactly how they got confused.
+ *
+ * IT IS 0.5, AND THAT DECIDES WHICH TIERS A PAGE CAN EVER REACH. MaxBwDpe
+ * splits tiers on target_score <= blob_score, so a tier scored ABOVE 0.5 is
+ * excluded from the preferred group for every page this vector writes. In the
+ * Gray-Scott config -- HBM 1.0, host RAM 0.2, storage 0.0 -- that means pages
+ * never land in HBM at all on their own, which the benchmark's TIER SPLIT
+ * line reports as "nothing landed in the fastest tier". A prefetcher hinting
+ * at 1.0 is what makes the fast tier reachable.
+ *
+ * Named here rather than repeated as a literal at the two Add() call sites
+ * because a prefetcher has to know what score a page starts at in order to
+ * say whether its own hint is a promotion or a demotion.
+ */
+constexpr float kVectorBlobScore = 0.5f;
+
 using MultiGetSlot = clio::cte::core::PodMultiGetBlobTask;
 using MultiPutSlot = clio::cte::core::PodMultiPutBlobTask;
 
@@ -24,8 +47,16 @@ using MultiPutSlot = clio::cte::core::PodMultiPutBlobTask;
 struct Page {
   clio::run::u64 page_num;    // kNoPage when free
   void *data;                 // this page's bytes
-  float score;                // eviction rank; EvictPages takes the lowest
   clio::run::u64 last_access; // breaks score ties (LRU)
+  /** THE COMPLETION WORD OF THE TRANSFER IN FLIGHT ON THIS FRAME: the fetch
+   *  future of the block that claimed it to fill it, or the flush future of
+   *  the block writing it back (0 = none recorded). A block that finds the
+   *  frame claimed by someone else -- or needs a frame while this one is
+   *  being written back so it can be evicted -- parks on this word, so the
+   *  host relaunches it when that transfer lands instead of every round.
+   *  (Fields reordered so the record stays 64 bytes.) */
+  clio::run::u64 fetch_tag;
+  float score;                // eviction rank; EvictPages takes the lowest
   clio::run::u32 pins;        // holders; a pinned page is never a victim
   clio::run::u32 flushing;    // a put is outstanding
   clio::run::u32 fetching;    // a get is outstanding
@@ -56,6 +87,9 @@ struct BlockTasks {
   clio::run::u32 flush_busy;  // a flush is in flight
   clio::run::u32 fetch_busy;  // a fetch is in flight
   clio::run::u32 seq;         // bumped per submission so TaskIds differ
+  /** A partial fetch waiting on another block's write-back parks on this
+   *  completion word (0 = no such wait: retry next round). */
+  clio::run::u64 park_tag;
   /** Page table index each record came from, so completion can clear the
    *  right frames' flags. */
   clio::run::u32 flush_slot[clio::cte::core::kPodMultiMax];
@@ -83,6 +117,19 @@ struct BlockTasks {
   clio::run::u64 fetch_gen_sub;
   /** Generation stamped on the in-flight flush (0 = ordinary flush). */
   clio::run::u64 flush_generation;
+  /** A SubmitFetch that could not claim every page keeps what it claimed and
+   *  says where to resume: fetch_partial != 0 means fetch_n records are
+   *  staged and the walk continues at range fetch_resume_r, page
+   *  fetch_resume_pn. fetch_stalls counts the yields taken while waiting. */
+  clio::run::u32 fetch_partial;
+  clio::run::u32 fetch_resume_r;
+  clio::run::u64 fetch_resume_pn;
+  clio::run::u32 fetch_stalls;
+  /** GV_COMM_TIMING: GPU clock at the start of this block's current resident
+   *  segment. A Fetch/Hold/Flush call that parked started in an earlier
+   *  segment; it is charged only from here, so the park itself (the host
+   *  round trip, and a different EU's clock) never counts as GPU time. */
+  clio::run::u64 seg_t0;
 };
 
 /**

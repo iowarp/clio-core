@@ -69,12 +69,16 @@ class ReedSolomon {
    */
   ReedSolomon(int k, int m_max) : k_(k), m_max_(m_max) {
     // Cauchy element for parity row r, data column c:
-    //   1 / (x_r XOR y_c), with x_r = k + r and y_c = c.
-    // x_r and y_c are drawn from disjoint ranges so x_r XOR y_c is never 0.
+    //   1 / (x_r XOR y_c), with x_r = 255 - r and y_c = c.
+    // x_r and y_c are drawn from disjoint ranges so x_r XOR y_c is never 0,
+    // and every square submatrix is nonsingular (any k of the k + m shards
+    // decode). x_r does NOT depend on k: a column's coefficient is the same
+    // in every width, so a column that holds zeros adds nothing and an
+    // array can gain a data column without re-encoding (#1126).
     // Requires k + m_max <= 256.
     cauchy_.assign(static_cast<size_t>(m_max_) * k_, 0);
     for (int r = 0; r < m_max_; ++r) {
-      const uint8_t x = static_cast<uint8_t>(k_ + r);
+      const uint8_t x = static_cast<uint8_t>(255 - r);
       for (int c = 0; c < k_; ++c) {
         const uint8_t y = static_cast<uint8_t>(c);
         cauchy_[static_cast<size_t>(r) * k_ + c] = GfInv(GfAdd(x, y));

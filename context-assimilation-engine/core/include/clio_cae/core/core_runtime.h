@@ -36,12 +36,25 @@
 
 #include <clio_runtime/clio_runtime.h>
 #include <clio_cae/core/core_tasks.h>
+#include <clio_cte/core/core_task_stats.h>
 #include <clio_cae/core/factory/pagify.h>
+#include <clio_cae/core/factory/assimilation_ctx.h>
+#include <clio_cae/core/factory/base_assimilator.h>
 #include <clio_cae/core/core_client.h>
+#include <atomic>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
-#include <unordered_map>
+
+// The long-lived container owns the S3 keep-alive connection pool the s3://
+// assimilator leases from (see s3_conn_pool.h). Only runtime TUs include this
+// header, and they carry the bdev module's include path, so pulling in the Poco
+// transport here is confined to the runtime library.
+#ifdef CLIO_ENABLE_S3_REST
+#include <clio_cae/core/factory/s3_conn_pool.h>
+#include <clio_cae/core/factory/s3_file_assimilator.h>
+#endif
 
 // Forward declaration for CTE client
 namespace clio::cte::core {
@@ -56,7 +69,32 @@ class Runtime : public clio::run::Container {
   using CreateParams = clio::cae::core::CreateParams;
 
   Runtime() = default;
-  ~Runtime() override = default;
+
+  /**
+   * The keep-alive tally is emitted here, in the C++ destructor, NOT in the
+   * kDestroy task method. PoolManager::DestroyAllContainers() (the graceful
+   * runtime-shutdown path) runs container destructors only -- it deliberately
+   * does not dispatch ChiMod Destroy *task* methods, because driving a
+   * coroutine inline during finalize crashes; routing them through the workers
+   * is tracked as #563. A tally in kDestroy is therefore unreachable on every
+   * ordinary shutdown. The destructor runs on both paths (explicit pool
+   * destroy and shutdown), so it is the only placement that always fires.
+   * Still early enough for HLOG: DestroyAllContainers precedes StopWorkers,
+   * and logs its own "Destroyed N container(s)" line right after this.
+   */
+  ~Runtime() override {
+#ifdef CLIO_ENABLE_S3_REST
+    // sockets==1 & requests>>1 is reuse. No-ops when no S3 I/O happened.
+    s3_conn_pool_.LogTally();
+#ifdef CAE_ENABLE_S3
+    // Where each object's latency actually went. Same placement, same reason.
+    // Defined with the S3 assimilator, which only CAE_ENABLE_S3 builds:
+    // CLIO_ENABLE_S3_REST alone also comes from the S3 storage tier
+    // (CLIO_ENABLE_AMAZON_DRIVE), which does not.
+    S3AssimLogPhaseTally();
+#endif
+#endif
+  }
 
   /**
    * Per-task cost estimate for the scheduler (see Container::GetTaskStats).
@@ -65,57 +103,50 @@ class Runtime : public clio::run::Container {
    * per-method coefficient by. CAE had no override at all, so every one of its
    * tasks reported all-zero stats and the CPU model degenerated to a single
    * constant per method — a 4 KiB PutBlob and a 1 MiB PutBlob were
-   * indistinguishable to the scheduler. wall_time_ seeds InferWallClockTime
-   * at the ~500 MB/s convention shared with CTE and bdev; both coefficients
-   * are learned from real completions afterwards.
+   * indistinguishable to the scheduler. PutBlob/GetBlob (CTE's task types)
+   * scale with their payload at the shared rates in clio_runtime/task_cost.h;
+   * every other method is an explicit constant. Both coefficients are learned
+   * from real completions afterwards.
+   * @param task the task to estimate
+   * @return the task's cost features
    */
   clio::run::TaskStat GetTaskStats(
       const clio::run::Task *task) const override {
-    clio::run::TaskStat stat;
+    namespace cost = clio::run::cost;
     if (task == nullptr) {
-      return stat;
+      return clio::run::TaskStat();
     }
-    constexpr float kBytesPerComputeUs = 10000.0f;
-    constexpr float kBytesPerWallUs = 500.0f;
     switch (task->method_) {
-      case Method::kPutBlob: {
+      case Method::kPutBlob:
         // CAE reuses CTE's blob task types (core_tasks.h aliases them).
-        const auto *t = static_cast<const PutBlobTask *>(task);
-        stat.io_size_ = t->size_;
-        stat.compute_ = static_cast<size_t>(t->size_ / kBytesPerComputeUs) + 2;
-        stat.wall_time_ = static_cast<float>(t->size_) / kBytesPerWallUs;
-        return stat;
-      }
-      case Method::kGetBlob: {
-        const auto *t = static_cast<const GetBlobTask *>(task);
-        stat.io_size_ = t->size_;
-        stat.compute_ = static_cast<size_t>(t->size_ / kBytesPerComputeUs) + 2;
-        stat.wall_time_ = static_cast<float>(t->size_) / kBytesPerWallUs;
-        return stat;
-      }
+        return cost::Data(clio::cte::core::CoreBlobBytes(
+            static_cast<const PutBlobTask *>(task)));
+      case Method::kGetBlob:
+        return cost::Data(clio::cte::core::CoreBlobBytes(
+            static_cast<const GetBlobTask *>(task)));
       case Method::kParseOmni:
         // Parsing an OMNI record is CPU-bound text work whose size is not
         // known from the task alone; seed it as clearly non-trivial.
-        stat.compute_ = 300;
-        stat.wall_time_ = 400.0f;
-        return stat;
+        return cost::Fixed(300, 400.0f);
       case Method::kExportData:
-        // Writes a dataset out to a file — dominated by the write, not CPU.
-        stat.compute_ = 50;
-        stat.wall_time_ = 5000.0f;
-        return stat;
+      case Method::kImportData:
+        // Moves a whole dataset between a file and CTE — dominated by the
+        // file I/O, whose size is only known once the tag/file is opened.
+        return cost::Fixed(50, 5000.0f);
       case Method::kSemanticSearch:
         // Embedding comparison across the indexed set: the most CPU-hungry
         // verb this chimod serves.
-        stat.compute_ = 1000;
-        stat.wall_time_ = 1200.0f;
-        return stat;
+        return cost::Fixed(1000, 1200.0f);
       case Method::kGetOrCreateTag:
-        stat.compute_ = 10;
-        stat.wall_time_ = 15.0f;
-        return stat;
+        return cost::Metadata();
+      case Method::kCreate:
+        return cost::ContainerCreate();
+      case Method::kDestroy:
+        return cost::ContainerDestroy();
+      case Method::kMonitor:
+        return cost::Fixed(5, 10.0f);
       default:
-        return stat;
+        return cost::Metadata();
     }
   }
 
@@ -158,6 +189,9 @@ class Runtime : public clio::run::Container {
    * Destroy the container (Method::kDestroy)
    */
   clio::run::TaskResume Destroy(clio::run::shared_ptr<DestroyTask> &task) {
+    // The "CAE S3 keepalive TOTAL" tally is emitted from ~Runtime(), not here:
+    // this task method is not dispatched on runtime shutdown (see the ctor
+    // comment and #563), so a tally here would never be seen in practice.
     HLOG(kInfo, "Core container destroyed for pool: {} (ID: {})",
           pool_name_, pool_id_);
     CLIO_TASK_BODY_BEGIN
@@ -195,10 +229,13 @@ class Runtime : public clio::run::Container {
   clio::run::TaskResume ImportData(clio::run::shared_ptr<ImportDataTask> &task);
 
   /**
-   * CTE interceptor handlers (Method::kPutBlob / kGetBlob / kGetOrCreateTag).
-   * Each forwards the inbound task to the configured next CTE pool. No
-   * labeling/intelligence yet — just passthrough so a client pointed at
-   * the CAE pool transparently lands data in CTE behind it.
+   * CTE interceptor handlers (Method::kPutBlob / kGetBlob / kGetOrCreateTag /
+   * kSemanticSearch). Each forwards the inbound task to the configured next
+   * CTE pool verbatim, so a client pointed at the CAE pool transparently
+   * lands data in whatever is behind it. Transparent LLM summarization used
+   * to hang off PutBlob here; it is now its own interposer chimod (see
+   * context-assimilation-engine/summarizer), composed between this pool and
+   * CTE.
    */
   clio::run::TaskResume PutBlob(clio::run::shared_ptr<PutBlobTask> &task);
   clio::run::TaskResume GetBlob(clio::run::shared_ptr<GetBlobTask> &task);
@@ -221,22 +258,53 @@ class Runtime : public clio::run::Container {
   /** pagify: per-tag page map, loaded once from the tag's "pagemap" blob.
    *  Keyed by tag so a pool serving several datasets keeps them apart. */
   std::map<clio::cte::core::TagId, clio::cae::core::Pagify> page_maps_;
+
+  /**
+   * Ingest on fault (AssimilationCtx::on_fault): ParseOmni ingests nothing,
+   * records the context, and registers the CAE as the destination tag's fault
+   * handler. A read of a blob the tag does not hold makes the source's own
+   * assimilator ingest exactly that blob (BaseAssimilator::ReadBlob); the
+   * blob is stored in the tag and serves the read.
+   *
+   * Key = fault_params id "fault:<16 hex>", a hash of the context, so it
+   * names the same source on EVERY node: a miss is handled by the CAE on the
+   * node the read landed on, which loads the context from the shared registry
+   * tag when it did not register it itself. Entries are never erased.
+   */
+  struct OnFault {
+    AssimilationCtx ctx;
+    std::shared_ptr<BaseAssimilator> assimilator;
+    clio::run::u64 blob_bytes = 0;
+    // The tag's tier is full: serve faults from the source without storing
+    // for the next `skip_stores` faults, then try again (space may free).
+    std::atomic<clio::run::u32> skip_stores{0};
+    std::atomic<bool> warned_full{false};
+  };
+  std::map<std::string, std::shared_ptr<OnFault>> on_fault_;
+  std::mutex on_fault_mu_;
+  static constexpr const char *kOnFaultRegistryTag = "__cae_on_fault";
+  static constexpr const char *kOnFaultPrefix = "fault:";
+  static constexpr clio::run::u64 kOnFaultDescBytes = 16384;
+  static std::string OnFaultId(const AssimilationCtx &ctx);
+  static std::string EncodeCtx(const AssimilationCtx &ctx);
+  static bool DecodeCtx(const char *buf, size_t n, AssimilationCtx *ctx);
+  std::shared_ptr<OnFault> MakeOnFault(const AssimilationCtx &ctx);
+
+  /** HEADROOM. Ingested-on-fault blobs can always be re-ingested from their
+   *  source, so they must never take the last of a tier: when they did, the
+   *  application's own writes (e.g. a cross-node collective) found no space
+   *  and the job deadlocked. Free space across this node's CTE targets, as
+   *  last measured and debited by our own stores since. */
+  std::atomic<long long> tier_free_{-1};
+  std::atomic<long long> tier_free_at_ns_{0};
+  std::atomic<bool> tier_refreshing_{false};
+#ifdef CLIO_ENABLE_S3_REST
+  /// Keep-alive S3 connections leased by the s3:// assimilator, one lease per
+  /// object for its whole lifetime (safe across worker migration). Long-lived
+  /// with the container so sockets persist across imports.
+  S3ConnectionPool s3_conn_pool_;
+#endif
   clio::run::PoolId next_pool_id_;  // CTE core pool when CAE is the interceptor
-
-  // Transparent labeling config snapshotted from CreateParams at Create
-  // time. Read-only afterwards, so no synchronization is needed for the
-  // PutBlob fast path.
-  std::vector<LabelMatch> label_matches_;
-  std::unordered_map<std::string, std::string> label_prompts_;
-  std::string label_endpoint_;
-
-  // tag_id → tag_name cache populated by GetOrCreateTag forwards.
-  // PutBlobTask carries tag_id but not tag_name; matching against
-  // LabelMatch::tag_re_ needs the name, so we remember it on the way
-  // through. Read under shared lock from PutBlob, written under
-  // exclusive lock from GetOrCreateTag.
-  std::unordered_map<clio::cte::core::TagId, std::string> tag_names_;
-  std::mutex tag_names_mu_;
 };
 
 }  // namespace clio::cae::core

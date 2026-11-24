@@ -64,7 +64,7 @@ if(CLIO_GPU_SOURCES)
         ${CMAKE_CURRENT_SOURCE_DIR}/../modules/admin/include
         ${CMAKE_CURRENT_SOURCE_DIR}/../modules/MOD_NAME/include
         ${CMAKE_CURRENT_SOURCE_DIR}/../modules/bdev/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/../../context-transport-primitives/include
+        ${CLIO_CTP_INCLUDE_DIRS}
         ${CMAKE_CURRENT_SOURCE_DIR}/../../context-transfer-engine/core/include
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
@@ -73,7 +73,7 @@ if(CLIO_GPU_SOURCES)
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../modules/admin/include>
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../modules/MOD_NAME/include>
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../modules/bdev/include>
-      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../../context-transport-primitives/include>
+      "$<BUILD_INTERFACE:${CLIO_CTP_INCLUDE_DIRS}>"
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../../context-transfer-engine/core/include>
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
     )
@@ -89,7 +89,7 @@ if(CLIO_GPU_SOURCES)
         ${CMAKE_CURRENT_SOURCE_DIR}/../modules/admin/include
         ${CMAKE_CURRENT_SOURCE_DIR}/../modules/MOD_NAME/include
         ${CMAKE_CURRENT_SOURCE_DIR}/../modules/bdev/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/../../context-transport-primitives/include
+        ${CLIO_CTP_INCLUDE_DIRS}
         ${CMAKE_CURRENT_SOURCE_DIR}/../../context-transfer-engine/core/include
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
@@ -98,7 +98,7 @@ if(CLIO_GPU_SOURCES)
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../modules/admin/include>
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../modules/MOD_NAME/include>
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../modules/bdev/include>
-      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../../context-transport-primitives/include>
+      "$<BUILD_INTERFACE:${CLIO_CTP_INCLUDE_DIRS}>"
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../../context-transfer-engine/core/include>
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
     )
@@ -126,7 +126,7 @@ if(CLIO_GPU_SOURCES)
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../modules/admin/include>
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../modules/MOD_NAME/include>
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../modules/bdev/include>
-      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../../context-transport-primitives/include>
+      "$<BUILD_INTERFACE:${CLIO_CTP_INCLUDE_DIRS}>"
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../../context-transfer-engine/core/include>
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
     )
@@ -150,13 +150,62 @@ endif()
 
 # Set include directories as PUBLIC so they propagate to consumers
 # Use CMAKE_CURRENT_SOURCE_DIR/.. to get runtime directory (this is runtime/src)
-# Also include clio_ctp headers which are in context-transport-primitives/include
+# Also include the clio_ctp headers (one include dir per CTP module)
 target_include_directories(${CLIO_LIB_NAME} PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../modules/admin/include>
-  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../../context-transport-primitives/include>
+  "$<BUILD_INTERFACE:${CLIO_CTP_INCLUDE_DIRS}>"
   $<INSTALL_INTERFACE:include>
 )
+
+# ChiMod ABI fingerprint (clio_runtime/abi_fingerprint_generated.h). A hash
+# of every public header a ChiMod shares with the runtime, plus the options
+# that change struct layouts; container.h compiles it into each ChiMod's
+# get_chimod_abi() and ModuleManager skips libraries that disagree, so a stale
+# module .so (e.g. one renamed away but still in bin/) is never loaded against
+# a newer runtime. Regenerated at build time whenever one of the headers
+# changes; the header itself is only rewritten when the hash changes.
+set(CLIO_ABI_GEN_INCLUDE_DIR ${CMAKE_CURRENT_BINARY_DIR}/abi_include)
+set(CLIO_ABI_HEADER
+    ${CLIO_ABI_GEN_INCLUDE_DIR}/clio_runtime/abi_fingerprint_generated.h)
+set(CLIO_ABI_STAMP ${CMAKE_CURRENT_BINARY_DIR}/abi_fingerprint.stamp)
+set(_clio_abi_globs
+  ${CMAKE_CURRENT_SOURCE_DIR}/../include/*.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/../modules/admin/include/*.h)
+foreach(_dir IN LISTS CLIO_CTP_INCLUDE_DIRS)
+  list(APPEND _clio_abi_globs ${_dir}/*.h ${_dir}/*.hpp)
+endforeach()
+file(GLOB_RECURSE CLIO_ABI_HEADERS CONFIGURE_DEPENDS ${_clio_abi_globs})
+list(JOIN CLIO_ABI_HEADERS "\n" _clio_abi_header_lines)
+file(CONFIGURE OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/abi_headers.txt
+     CONTENT "${_clio_abi_header_lines}\n")
+set(CLIO_ABI_OPTIONS
+    "boost_coro=${CLIO_CORE_ENABLE_BOOST_COROUTINES};cuda=${CLIO_CORE_ENABLE_CUDA};rocm=${CLIO_CORE_ENABLE_ROCM};sycl=${CLIO_CORE_ENABLE_SYCL}")
+add_custom_command(
+  OUTPUT ${CLIO_ABI_STAMP}
+  BYPRODUCTS ${CLIO_ABI_HEADER}
+  COMMAND ${CMAKE_COMMAND}
+          -DHEADER_LIST=${CMAKE_CURRENT_BINARY_DIR}/abi_headers.txt
+          -DSOURCE_ROOT=${CMAKE_SOURCE_DIR}
+          "-DABI_OPTIONS=${CLIO_ABI_OPTIONS}"
+          -DOUTPUT=${CLIO_ABI_HEADER}
+          -P ${CMAKE_SOURCE_DIR}/cmake/ClioAbiFingerprint.cmake
+  COMMAND ${CMAKE_COMMAND} -E touch ${CLIO_ABI_STAMP}
+  DEPENDS ${CLIO_ABI_HEADERS}
+          ${CMAKE_CURRENT_BINARY_DIR}/abi_headers.txt
+          ${CMAKE_SOURCE_DIR}/cmake/ClioAbiFingerprint.cmake
+  COMMENT "Computing ChiMod ABI fingerprint"
+  VERBATIM)
+add_custom_target(clio_run_abi_fingerprint DEPENDS ${CLIO_ABI_STAMP})
+add_dependencies(${CLIO_LIB_NAME} clio_run_abi_fingerprint)
+target_include_directories(${CLIO_LIB_NAME} PUBLIC
+  $<BUILD_INTERFACE:${CLIO_ABI_GEN_INCLUDE_DIR}>)
+if(TARGET ${CLIO_LIB_NAME}_gpu)
+  add_dependencies(${CLIO_LIB_NAME}_gpu clio_run_abi_fingerprint)
+  target_include_directories(${CLIO_LIB_NAME}_gpu PUBLIC
+    $<BUILD_INTERFACE:${CLIO_ABI_GEN_INCLUDE_DIR}>)
+endif()
+install(FILES ${CLIO_ABI_HEADER} DESTINATION include/clio_runtime)
 
 # Boost.Context stackful coroutine backend (#620). PUBLIC so the single macro
 # CLIO_ENABLE_BOOST_COROUTINES reaches EVERY translation unit that includes
@@ -239,7 +288,7 @@ target_link_libraries(${CLIO_LIB_NAME}
 # headers never mention a Poco type. CLIO_RUN_HAS_POCO is PUBLIC so ChiMods and
 # tests can #if on whether a dashboard exists in this build.
 if(Poco_FOUND)
-  target_link_libraries(${CLIO_LIB_NAME} PRIVATE Poco::Net Poco::Foundation)
+  clio_link_poco_private(${CLIO_LIB_NAME})
   target_compile_definitions(${CLIO_LIB_NAME} PUBLIC CLIO_RUN_HAS_POCO=1)
 else()
   target_compile_definitions(${CLIO_LIB_NAME} PUBLIC CLIO_RUN_HAS_POCO=0)

@@ -224,7 +224,7 @@ def run_globus_assim_test(output_dir: str | None = None) -> int:
         # Start runtime
         print("Starting Clio runtime...")
         runtime_proc = subprocess.Popen(
-            ["clio_run", "runtime", "start"],
+            ["clio_run", "runtime", "start", "--fresh"],
             env=env,
         )
 

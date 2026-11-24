@@ -83,13 +83,8 @@ void LocalScheduler::DivideWorkers(WorkOrchestrator *work_orch) {
 
   IpcManager *ipc = CLIO_IPC;
   if (ipc) {
+    // Net lanes are published by WorkOrchestrator after lane mapping (#768).
     ipc->SetNumSchedQueues(num_sched_workers);
-    if (net_worker_) {
-      // LocalScheduler keeps a single net worker — pass the same lane for
-      // both send and recv so EnqueueNetTask's priority-based dispatch
-      // still works.
-      ipc->SetNetLane(net_worker_->GetLane(), net_worker_->GetLane());
-    }
   }
 
   HLOG(kInfo,

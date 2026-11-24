@@ -1,0 +1,442 @@
+<!--
+title: Persistent Context FS on a cluster
+heading: Keep the filesystem <em>after the job ends.</em>
+description: On an HPC cluster such as NCSA Delta, run Context FS with RAM and node-local NVMe in the volatile CTE core and SSD and HDD Lustre in the persistent core, save it when the Slurm job ends, and open it again on one node from your own code.
+eyebrow: Tutorial · Deploy
+lede: The volatile core holds RAM and the node-local NVMe that the job writes to at full speed. The persistent core holds the shared SSD and HDD filesystems, and the write-back cache moves every byte there before the job ends. Afterwards you either copy the files out, or keep the store and open it on one node, the way you open a file with an I/O library.
+facts: Time | 45 minutes ; You need | A Slurm cluster with node-local NVMe and a shared filesystem ; Example | NCSA Delta
+-->
+<h2>Delta's storage, and which core each one joins</h2>
+<p>Context FS has two CTE cores. The <strong>volatile core</strong> (pool 540.0) has no write-ahead log and starts empty on every start. The <strong>persistent core</strong> (pool 512.0) logs its metadata and recovers it. The write-back cache (pool 567.0) sits over both: a write lands in the volatile core and is acknowledged, and the cache flushes it to the persistent core later.</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Delta storage</th><th>Survives the job</th><th>Core</th><th>Tier path</th><th><code>persistence_level</code></th><th><code>score</code></th></tr></thead>
+  <tbody>
+    <tr><td>Node memory</td><td>no</td><td>volatile 540.0</td><td><code>ram::cte_ram</code></td><td><code>volatile</code></td><td>1.0</td></tr>
+    <tr><td><code>/tmp</code>: node-local NVMe, deleted after the job</td><td>no</td><td>volatile 540.0</td><td><code>/tmp/$USER/clio/cte_nvme_tier.dat</code></td><td><code>volatile</code></td><td>0.7</td></tr>
+    <tr><td><code>/work/nvme/&lt;project&gt;</code>: SSD Lustre, shared</td><td>yes</td><td>persistent 512.0</td><td><code>$SSD_STORE/node&lt;id&gt;/cte_ssd_tier.dat</code></td><td><code>long_term</code></td><td>0.4</td></tr>
+    <tr><td><code>/work/hdd/&lt;project&gt;</code>: HDD Lustre, shared</td><td>yes</td><td>persistent 512.0</td><td><code>$HDD_STORE/node&lt;id&gt;/cte_hdd_tier.dat</code></td><td><code>long_term</code></td><td>0.1</td></tr>
+  </tbody>
+</table></div>
+<p>Run <code>df -h /tmp</code> on a compute node of your partition to see its local NVMe, and <code>quota</code> for your <code>/work</code> quotas. <code>/work/nvme</code> is usually much smaller than <code>/work/hdd</code>, and <code>/work</code> has no backups.</p>
+<p>A tier's <code>persistence_level</code> is set in the configuration, not by its device, so a file on <code>/tmp</code> marked <code>volatile</code> is treated exactly like RAM. The persistent core refuses a volatile device. Inside each core, placement prefers the tier with the higher score: RAM before NVMe, SSD before HDD.</p>
+
+<h3>When data reaches the persistent core</h3>
+<ul class="checks">
+  <li><strong>Periodically</strong>: the write-back cache flushes dirty copies every <code>flush_period_ms</code>, when the volatile core is <code>flush_fill_pct</code> full, and after every <code>flush_dirty_mb</code> of new writes.</li>
+  <li><strong>On <code>fsync(2)</code></strong>: with <code>fsync_mode: "durable"</code>, fsync returns once the file's dirty copies are flushed and synced.</li>
+  <li><strong>On <code>clio-run stop</code></strong>: the cache flushes every dirty copy before the runtime exits, bounded by <code>--grace-period</code>.</li>
+  <li><strong>Before eviction</strong>: a dirty copy is flushed before the volatile core drops it.</li>
+</ul>
+<p>Anything still dirty when a node dies, or when Slurm kills the job at the walltime, is lost. The volatile core comes back empty, so the file comes back with the persistent core's older bytes.</p>
+
+<h2>What has to survive</h2>
+<p>The bytes on the SSD and HDD are half of a filesystem. A restart also needs the logs that say which bytes belong to which blob, file and size. All of them go to <code>/work</code>, under one storage root per node:</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>State</th><th>Configured by</th><th>Without it, after a restart</th></tr></thead>
+  <tbody>
+    <tr><td>Blob and tag metadata (WAL and snapshots)</td><td><code>clio_cte_core</code> 512.0 → <code>performance.metadata_log_path</code></td><td>the bytes persist, but nothing knows which blob they belong to</td></tr>
+    <tr><td>File sizes and pending appends</td><td><code>clio_cte_stream</code> → <code>log_path</code></td><td>files come back empty or truncated</td></tr>
+    <tr><td>Directory blocks</td><td><code>clio_cte_filesystem</code> → <code>metadata_log_path</code></td><td>the namespace is lost</td></tr>
+    <tr><td>Search index</td><td><code>clio_cte_indexer</code> → <code>index_log_path</code></td><td>search finds nothing until a rescan</td></tr>
+    <tr><td>Restart log</td><td><code>${CLIO_STORAGE_ROOT}/restart_log.bin</code>, set with <code>clio-run start --disk</code></td><td>pools composed at run time are not re-created</td></tr>
+    <tr><td>Pool log</td><td><code>runtime.conf_dir</code> → <code>&lt;conf_dir&gt;/wal/pools.&lt;node&gt;.bin</code></td><td>the same</td></tr>
+  </tbody>
+</table></div>
+<div class="callout warn">
+  <span class="callout-title">Two defaults that lose the store</span>
+  <p><code>runtime.conf_dir</code> defaults to <code>/tmp/clio_$USER</code>, which Delta deletes when the job ends. <code>clio_cte_stream</code>'s <code>log_path</code> defaults to unset, so file sizes do not survive a stop. It is also not expanded: <code>${CLIO_STORAGE_ROOT}</code> in it stays literal. The generator below writes both out as plain paths.</p>
+</div>
+
+<h2>Node identity is the hostfile line</h2>
+<p>Blobs are partitioned across nodes by hash, and a node's share belongs to its <strong>node id</strong>: its line number in the hostfile, counting from 0, not its hostname. CTE also names each node's tier file <code>&lt;path&gt;_node&lt;id&gt;</code>. So:</p>
+<ul>
+  <li>A saved store must be reopened with <strong>the same number of nodes</strong>, because the hash depends on the node count.</li>
+  <li>Name each node's directories by hostfile position (<code>node0</code>, <code>node1</code>, ...). The next job can run on different hosts: node 2's state is whatever runtime sits on line 3 of the new hostfile.</li>
+</ul>
+
+<h2>1. Choose the paths</h2>
+<p>Replace <code>bekn</code> with your Delta project.</p>
+<pre data-label="shell">
+PROJ=bekn
+RUN=run42
+SSD_STORE=/work/nvme/$PROJ/$USER/clio-stores/$RUN   # SSD tier, every log, storage roots
+HDD_STORE=/work/hdd/$PROJ/$USER/clio-stores/$RUN    # HDD tier
+
+export RAM_TIER=64GB      # volatile, per node
+export NVME_TIER=1TB      # volatile, per node, on /tmp
+export SSD_TIER=200GB     # persistent, per node, on /work/nvme
+export HDD_TIER=2TB       # persistent, per node, on /work/hdd
+</pre>
+<p>Keep <code>SSD_TIER</code> × nodes under your <code>/work/nvme</code> quota. File tiers grow in 1 GB steps, so a capacity is a cap, not an upfront allocation.</p>
+
+<h2>2. Generate each node's configuration</h2>
+<p>Save this as <code>make_clio_conf.sh</code>. It writes one node's full configuration, with every path written out:</p>
+<pre data-label="shell · make_clio_conf.sh">
+#!/bin/bash
+# Usage: make_clio_conf.sh <hostfile> <node-id> <ssd-store> <hdd-store>
+#                          <port> <volatile-dir> <out.yaml>
+set -euo pipefail
+HOSTFILE=$1; ID=$2; SSD=$3/node$2; HDD=$4/node$2; PORT=$5; VOL=$6; OUT=$7
+mkdir -p "$SSD/conf" "$HDD" "$VOL"
+
+cat > "$OUT" <<EOF
+networking:
+  port: $PORT
+  hostfile: "$HOSTFILE"
+
+runtime:
+  num_threads: ${CLIO_THREADS:-32}
+  conf_dir: "$SSD/conf"                    # pool log; must outlive the job
+
+compose:
+  - mod_name: clio_bdev
+    pool_name: "ram::chi_default_bdev"
+    pool_query: local
+    pool_id: "301.0"
+    bdev_type: ram
+    capacity: "${CLIO_SHM:-16GB}"
+
+  # Persistent core: SSD and HDD Lustre. Keep this list in this order in
+  # every job that opens the store: a tier's id is its position in it.
+  - mod_name: clio_cte_core
+    pool_name: cte_main
+    pool_query: local
+    pool_id: "512.0"
+    durability: persistent
+    storage:
+      - path: "$SSD/cte_ssd_tier.dat"
+        bdev_type: file
+        capacity_limit: "${SSD_TIER:-200GB}"
+        score: 0.4
+        persistence_level: "long_term"
+      - path: "$HDD/cte_hdd_tier.dat"
+        bdev_type: file
+        capacity_limit: "${HDD_TIER:-2TB}"
+        score: 0.1
+        persistence_level: "long_term"
+    dpe:
+      dpe_type: max_bw
+    targets:
+      neighborhood: 1
+    performance:
+      metadata_log_path: "$SSD/cte_metadata_log"
+      transaction_log_capacity: "32MB"
+      fsync_mode: "durable"
+
+  # Volatile core: RAM and node-local NVMe. Empty after every start.
+  - mod_name: clio_cte_core
+    pool_name: cte_volatile
+    pool_query: local
+    pool_id: "540.0"
+    durability: volatile
+    storage:
+      - path: "ram::cte_ram"
+        bdev_type: ram
+        capacity_limit: "${RAM_TIER:-64GB}"
+        score: 1.0
+      - path: "$VOL/cte_nvme_tier.dat"
+        bdev_type: file
+        capacity_limit: "${NVME_TIER:-1TB}"
+        score: 0.7
+        persistence_level: "volatile"
+    dpe:
+      dpe_type: max_bw
+    targets:
+      neighborhood: 1
+
+  - mod_name: clio_cte_replication
+    pool_name: clio_cte_replication
+    pool_query: local
+    pool_id: "561.0"
+    next_pool_id: "512.0"
+    replication_factor: 1
+
+  - mod_name: clio_cte_core_persist_write_back
+    pool_name: clio_cte_core_persist_write_back
+    pool_query: local
+    pool_id: "567.0"
+    next_volatile: "540.0"
+    next_persistent: "561.0"
+    fill: on_hit_count:2
+    evict: lru
+    flush_period_ms: ${CLIO_FLUSH_MS:-10000}
+    flush_fill_pct: 80
+    flush_dirty_mb: 256
+    flush_pool: "568.0"
+    fallback_to_persistent: true
+
+  - mod_name: clio_cte_core_shm_cache_writethru
+    pool_name: clio_cte_core_shm_cache_writethru
+    pool_query: local
+    pool_id: "568.0"
+    next_pool_id: "567.0"
+    entry_pool_id: "564.0"
+    md_only: true
+    invalidate_on_flush: true
+    capacity: "256M"
+
+  - mod_name: clio_cte_indexer
+    pool_name: clio_cte_indexer
+    pool_query: local
+    pool_id: "564.0"
+    next_pool_id: "568.0"
+    index_log_path: "$SSD/cte_indexer_index"
+
+  - mod_name: clio_cte_stream              # before the filesystem
+    pool_name: clio_cte_stream
+    pool_query: local
+    pool_id: "565.0"
+    next_pool_id: "564.0"
+    staging_pool_id: "561.0"
+    log_path: "$SSD/cte_stream_log"        # file sizes survive a restart
+
+  - mod_name: clio_cte_filesystem
+    pool_name: clio_cte_filesystem
+    pool_query: local
+    pool_id: "560.0"
+    next_pool_id: "564.0"
+    stream_pool_id: "565.0"
+    metadata_log_path: "$SSD/cfs_namespace_log"
+EOF
+</pre>
+<dl class="notes">
+  <dt>Two volatile tiers</dt><dd>RAM absorbs write bursts and the local NVMe takes over when RAM is full. Neither is trusted to keep data. When both are full, <code>fallback_to_persistent: true</code> writes straight to Lustre instead of failing the write.</dd>
+  <dt><code>flush_period_ms</code></dt><dd>How long data may sit only in the volatile core. Shorter is safer and keeps the final stop short. Longer lets short-lived files (scratch, overwritten checkpoints) die in RAM without reaching Lustre, but loses more if the job is killed before the stop.</dd>
+  <dt><code>replication_factor: 1</code></dt><dd>One durable copy per blob, the ext4 contract. Use 2 or more, with <code>targets.failover_to_successor: true</code> on the persistent core, if the filesystem must stay readable while a node is down. It multiplies the <code>/work</code> footprint.</dd>
+  <dt>Order</dt><dd>Each <code>compose</code> entry must come after every pool it names.</dd>
+</dl>
+<p>The chain is the same as the default configuration's: indexer → shm cache → write-back cache → volatile core, and replication → persistent core. See <a href="/tutorials/operators.html">Compose data operators</a> for each layer.</p>
+
+<h2>3. Start it in a Slurm job</h2>
+<p>The job script writes the hostfile, generates each node's configuration from its position in it, starts one runtime per node with its storage root on <code>/work</code>, and mounts the filesystem on every node.</p>
+<pre data-label="shell · job.sbatch">
+#!/bin/bash
+#SBATCH --account=bekn-delta-cpu
+#SBATCH --partition=cpu
+#SBATCH --nodes=4
+#SBATCH --ntasks-per-node=1
+#SBATCH --exclusive
+#SBATCH --time=02:00:00
+#SBATCH --signal=B:USR1@900        # 15 min warning before the walltime
+#SBATCH --output=logs/%j.out
+set -euo pipefail
+
+PROJ=bekn; RUN=run42
+SSD_STORE=/work/nvme/$PROJ/$USER/clio-stores/$RUN
+HDD_STORE=/work/hdd/$PROJ/$USER/clio-stores/$RUN
+VOL=/tmp/$USER/clio                # volatile tier and the node's config
+MNT=/tmp/$USER/clio-fs
+PORT=9413
+export RAM_TIER=64GB NVME_TIER=1TB SSD_TIER=200GB HDD_TIER=2TB
+
+mkdir -p "$SSD_STORE" "$HDD_STORE"
+HOSTFILE=$SSD_STORE/hostfile
+# A later job writes its own hostnames here; only the line count must match.
+scontrol show hostnames "$SLURM_JOB_NODELIST" > "$HOSTFILE"
+
+# One runtime per node. Its id is its line in the hostfile; its storage
+# root (restart log) is that node's directory on /work/nvme.
+srun --overlap --ntasks-per-node=1 bash -c '
+  ID=$(( $(grep -nx "$(hostname -s)" '"$HOSTFILE"' | cut -d: -f1) - 1 ))
+  ./make_clio_conf.sh '"$HOSTFILE"' $ID '"$SSD_STORE"' '"$HDD_STORE"' \
+                      '"$PORT"' '"$VOL"' '"$VOL"'/clio.yaml
+  CLIO_SERVER_CONF='"$VOL"'/clio.yaml \
+    exec clio-run start --no-viz --disk '"$SSD_STORE"'/node$ID
+' &
+RUNTIMES=$!
+sleep 20                           # wait for every node to come up
+
+# Mount on every node as a client of its runtime. Keep the FUSE daemon in
+# the foreground (-f): Slurm kills a step's leftover processes.
+srun --overlap --ntasks-per-node=1 bash -c '
+  mkdir -p '"$MNT"'
+  CLIO_SERVER_CONF='"$VOL"'/clio.yaml CLIO_WITH_RUNTIME=0 \
+    exec clio_cte_fuse '"$MNT"' -f
+' &
+MOUNTS=$!
+sleep 5
+</pre>
+<p><code>clio-run start</code> always recovers. If the stores already hold a filesystem from an earlier job, this same script reopens it; if not, it starts empty. Only <code>clio-run start --fresh</code> discards a node's state.</p>
+<p>Mount with <code>CLIO_WITH_RUNTIME=0</code>. With <code>1</code>, the FUSE daemon would become the runtime itself, and an in-process runtime does not recover (see <a href="#an-in-process-runtime-starts-fresh">below</a>).</p>
+
+<h2>4. Run the workload, then stop before the job ends</h2>
+<p>The volatile core holds everything written since the last flush. A <code>scancel</code>, a node crash or the walltime kill skips the final flush. Unmount and stop inside the job:</p>
+<pre data-label="shell · job.sbatch (continued)">
+shutdown_clio() {
+  # 1. Unmount, so no new writes arrive and open files are closed.
+  srun --overlap --ntasks-per-node=1 fusermount3 -u "$MNT" || true
+  wait "$MOUNTS" || true
+  # 2. Stop: the write-back cache flushes RAM and /tmp NVMe data to /work.
+  srun --overlap --ntasks-per-node=1 bash -c \
+    "CLIO_SERVER_CONF=$VOL/clio.yaml clio-run stop --grace-period 600000"
+  wait "$RUNTIMES" || true
+}
+trap shutdown_clio USR1            # walltime warning from #SBATCH --signal
+
+srun --overlap --ntasks-per-node=32 ./my_simulation --output "$MNT/out"
+
+shutdown_clio
+</pre>
+<p>Size <code>--grace-period</code> (in ms; the default is 5000 ms) to the dirty data that can be in the volatile core when the stop starts, divided by each node's write bandwidth to <code>/work</code>. While Lustre keeps up, that is about one flush period of writes. When the application writes faster than Lustre absorbs, the backlog grows into the NVMe tier, up to <code>RAM_TIER + NVME_TIER</code> per node: a full 1 TB NVMe tier at 1 GB/s takes about 17 minutes. Lower <code>NVME_TIER</code> if that is more than the job can spend at its end, and set the <code>--signal</code> lead time larger than the grace period plus the unmount.</p>
+<p>Files the workload fsyncs are durable without the stop. The stop still matters for everything else.</p>
+
+<h2>5. Keep it after the job</h2>
+<p>After the stop, the store is entirely on <code>/work</code>; the local NVMe is wiped when the job ends. Choose what to keep:</p>
+<div class="table-wrap"><table>
+  <thead><tr><th></th><th>A. Stage out plain files</th><th>B. Keep the CTE store</th></tr></thead>
+  <tbody>
+    <tr><td>What is kept</td><td>ordinary files and directories</td><td>the store itself, on <code>/work/nvme</code> and <code>/work/hdd</code></td></tr>
+    <tr><td>End-of-job cost</td><td>copy every byte through the mount</td><td>the stop only</td></tr>
+    <tr><td>Read later with</td><td>anything (<code>h5py</code>, <code>cat</code>, ...)</td><td>CLIO Core, with the same node count</td></tr>
+    <tr><td>Keeps tiers, tags and the search index</td><td>no</td><td>yes</td></tr>
+  </tbody>
+</table></div>
+
+<h3>A. Stage out plain files</h3>
+<p>Copy out of the mount before stopping. The copy needs no CLIO Core to read:</p>
+<pre data-label="shell">
+srun --overlap -N 1 -n 1 rsync -a "$MNT/out/" "/work/hdd/$PROJ/$USER/results/$RUN/"
+shutdown_clio
+</pre>
+<p>Every node's mount shows the same namespace, so for large outputs run one rsync per subtree on several nodes. If you will not reopen the store, delete <code>$SSD_STORE</code> and <code>$HDD_STORE</code> afterwards to free the quota.</p>
+
+<h3>B. Keep the CTE store</h3>
+<p>The stop is all the end of the job needs. The two stores then hold:</p>
+<pre data-label="text">
+/work/nvme/bekn/$USER/clio-stores/run42/         # SSD
+├── hostfile                        # its line count is the store's node count
+├── node0/
+│   ├── restart_log.bin             # storage root (--disk)
+│   ├── conf/wal/pools.0.bin        # pool log
+│   ├── cte_ssd_tier.dat_node0      # SSD tier bytes
+│   ├── cte_metadata_log*           # blob and tag WAL, snapshots
+│   ├── cte_stream_log.*            # file sizes
+│   ├── cfs_namespace_log.dirs.*    # directory blocks
+│   └── cte_indexer_index*
+├── node1/ ...
+└── node3/ ...
+
+/work/hdd/bekn/$USER/clio-stores/run42/          # HDD
+├── node0/cte_hdd_tier.dat_node0
+└── node1/ ...
+</pre>
+<p>Reopen it in a later job by running the step 3 script with the same <code>RUN</code> and node count; the hosts can differ. Keep these the same in every job that opens the store:</p>
+<ul class="checks">
+  <li>the number of nodes;</li>
+  <li>the order of the persistent core's <code>storage</code> list;</li>
+  <li>the absolute paths of the SSD and HDD tiers, the logs and each node's <code>--disk</code>.</li>
+</ul>
+<p>The volatile core's paths and sizes may change between jobs; it is empty after every start anyway.</p>
+
+<h2>6. Open the store on one node like an I/O library</h2>
+<p>For method A the outputs are plain files. For method B, start as many runtimes on one node as the store has nodes, one per saved node, each on its own port, and reach the filesystem through any client. Use an interactive job, not a login node:</p>
+<pre data-label="shell">
+srun --account=bekn-delta-cpu --partition=cpu-interactive \
+     --nodes=1 --exclusive --time=01:00:00 --pty bash
+</pre>
+
+<h3>Start one runtime per saved node</h3>
+<p>A hostfile entry may be <code>host:port</code>; each runtime takes the line whose port matches its own. A runtime binds <code>port</code>, <code>port+1</code> and <code>port+3</code>, so space the ports at least 4 apart:</p>
+<pre data-label="shell">
+PROJ=bekn; RUN=run42
+SSD_STORE=/work/nvme/$PROJ/$USER/clio-stores/$RUN
+HDD_STORE=/work/hdd/$PROJ/$USER/clio-stores/$RUN
+N=$(wc -l < "$SSD_STORE/hostfile")      # the saved store's node count
+H=/tmp/$USER/clio-reader
+mkdir -p $H
+: > $H/hostfile
+for i in $(seq 0 $((N-1))); do
+  echo "$(hostname -s):$((9413 + 10*i))" >> $H/hostfile
+done
+
+# N runtimes share this node: smaller volatile tiers. The persistent tier
+# sizes stay as they were in the job.
+export RAM_TIER=4GB NVME_TIER=16GB CLIO_SHM=2GB CLIO_THREADS=4
+export SSD_TIER=200GB HDD_TIER=2TB
+for i in $(seq 0 $((N-1))); do
+  ./make_clio_conf.sh $H/hostfile $i "$SSD_STORE" "$HDD_STORE" \
+                      $((9413 + 10*i)) $H/vol$i $H/node$i.yaml
+  CLIO_SERVER_CONF=$H/node$i.yaml nohup clio-run start --no-viz \
+      --disk "$SSD_STORE/node$i" > $H/node$i.log 2>&1 &
+done
+sleep 20
+</pre>
+<p>Runtime <code>i</code> recovers <code>node$i</code> of both stores. The clients below use runtime 0 (its config names port 9413) and reach the others through it.</p>
+
+<h3>Mount it, for any program</h3>
+<pre data-label="shell">
+mkdir -p $H/mnt
+CLIO_SERVER_CONF=$H/node0.yaml CLIO_WITH_RUNTIME=0 clio_cte_fuse $H/mnt -f &
+ls $H/mnt/out
+python analyze.py $H/mnt/out/step_100.h5
+</pre>
+
+<h3>Link it into your program</h3>
+<p>Without a mount, preload the POSIX adapter. Paths that start with <code>clio::</code> go to Context FS and the rest to the kernel. The marker is stripped, so the file written at <code>$MNT/out/step_100.dat</code> in the job is <code>clio::/out/step_100.dat</code>:</p>
+<pre data-label="shell">
+CLIO_SERVER_CONF=$H/node0.yaml CLIO_WITH_RUNTIME=0 \
+LD_PRELOAD=libclio_cte_posix.so ./my_reader clio::/out/step_100.dat
+</pre>
+<p><code>libclio_cte_stdio.so</code> does the same for <code>fopen</code> and <code>fread</code>. For HDF5, use the <a href="/docs/io-adapters/hdf5-vol.html">VOL</a> or <a href="/docs/io-adapters/hdf5-vfd.html">VFD</a> connector.</p>
+
+<h3>Call the CTE directly</h3>
+<p>Code that works with tags and blobs links <code>clio::cte::core_client</code> and attaches as a client. See the <a href="/docs/cte/api.html">CTE API reference</a>.</p>
+<pre data-label="cpp">
+#include <clio_cte/core/core_client.h>
+
+int main() {
+  // Attach to the running runtimes; do not start one in-process.
+  if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, false)) return 1;
+  if (!clio::cte::core::CLIO_CTE_CLIENT_INIT()) return 1;
+  clio::cte::core::Tag tag("my_dataset");
+  for (const std::string &name : tag.GetContainedBlobs()) {
+    std::vector<char> buf(tag.GetBlobSize(name));
+    tag.GetBlob(name, buf.data(), buf.size());
+    // ... analyze buf ...
+  }
+  clio::run::CLIO_RUNTIME_FINALIZE();
+  return 0;
+}
+</pre>
+
+<h3>An in-process runtime starts fresh</h3>
+<p><code>CLIO_WITH_RUNTIME=1</code>, or <code>CLIO_INIT(kClient, true)</code>, makes the process the runtime when none is running. That runtime starts with <code>is_restart = false</code>, like <code>clio-run start --fresh</code>: <strong>it clears the pool log and does not recover the store.</strong> Never point it at a saved store.</p>
+<p>A store saved from a <em>single-node</em> job can be opened by one program that embeds the runtime, with nothing else started. Set <code>CLIO_STORAGE_ROOT</code> to the node's directory and pass <code>is_restart = true</code>:</p>
+<pre data-label="cpp">
+// Become the runtime (or attach to a running one) and recover the state
+// named by $CLIO_SERVER_CONF and $CLIO_STORAGE_ROOT.
+clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient,
+                     /*default_with_runtime=*/true, /*is_restart=*/true);
+</pre>
+<p>A store from an N-node job needs all N runtimes, so use the daemons above.</p>
+
+<h3>Shut down</h3>
+<pre data-label="shell">
+fusermount3 -u $H/mnt
+for i in $(seq 0 $((N-1))); do
+  CLIO_SERVER_CONF=$H/node$i.yaml clio-run stop --grace-period 600000
+done
+</pre>
+<p>Writes made here land in the same store, so the next multi-node job sees them. Stop before the interactive job ends: this node's <code>/tmp</code> goes with it.</p>
+
+<h2>Check that the store survived</h2>
+<pre data-label="shell">
+# in the job, before shutdown_clio
+(cd "$MNT" && find out -type f -print0 | xargs -0 sha256sum) > "$SSD_STORE/manifest.sha256"
+
+# after reopening
+(cd $H/mnt && sha256sum -c "$SSD_STORE/manifest.sha256")
+</pre>
+
+<h2>Troubleshooting</h2>
+<div class="table-wrap"><table>
+  <thead><tr><th>Symptom</th><th>Likely cause</th></tr></thead>
+  <tbody>
+    <tr><td>Files have the right size but old or zero contents</td><td>Their newest bytes were still dirty in the volatile core when the job ended. Raise the <code>--signal</code> lead time or <code>--grace-period</code>, lower <code>flush_period_ms</code> or <code>NVME_TIER</code>.</td></tr>
+    <tr><td>Files come back empty or truncated, directory listing intact</td><td><code>clio_cte_stream</code>'s <code>log_path</code> was unset, on <code>/tmp</code>, or written with <code>${...}</code>.</td></tr>
+    <tr><td>Directory listing empty after a restart</td><td>A <code>metadata_log_path</code> was unset or on <code>/tmp</code>, or the store was opened with <code>--fresh</code> or by an in-process runtime.</td></tr>
+    <tr><td>Some files read back, others fail</td><td>The store was reopened with a different node count, a node's directory was given to a different hostfile line, or the <code>storage</code> list was reordered.</td></tr>
+    <tr><td>Writes slow to Lustre speed while <code>/tmp</code> has room</td><td>The volatile core is full of dirty data the flush has not caught up with, and <code>fallback_to_persistent</code> sends new writes to Lustre.</td></tr>
+    <tr><td>Runtime 1, 2, ... fail to start on the reader node</td><td>Ports too close: each needs <code>port</code>, <code>port+1</code> and <code>port+3</code> free.</td></tr>
+  </tbody>
+</table></div>

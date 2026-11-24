@@ -98,29 +98,26 @@ void Tag::PutBlob(const std::string &blob_name, const char *data, size_t data_si
   using clk = std::chrono::steady_clock;
   auto t0 = clk::now();
 
-  // Private-memory path (issue #830): hand the caller's buffer straight to the
-  // client, which picks the runtime-mode no-copy path or client-mode SHM
-  // staging (TASK_DATA_OWNER) itself — no manual allocate/copy/free at this
-  // layer. Write-side analog of the #823 private GetBlob.
-  auto fut = AsyncPutBlob(blob_name, data, data_size, off, score, context);
-  fut.Wait();
+  if (data == nullptr && data_size > 0) {
+    throw std::invalid_argument("data buffer must not be null for PutBlob");
+  }
+  // Synchronous client PutBlob: the shm cache path when the client is
+  // connected and the put carries no explicit score/context, else the task
+  // path (runtime-mode no-copy or client-mode staging).
+  auto *cte_client = CLIO_CTE_CLIENT;
+  const clio::run::u32 rc = cte_client->PutBlob(
+      tag_id_, blob_name, off, data_size, data, score, &context);
 
   auto t3 = clk::now();
 
-  // Empty future -> client-mode SHM staging could not be allocated.
-  if (fut.get() == nullptr) {
-    throw std::runtime_error("Failed to allocate shared memory for PutBlob");
-  }
-  if (fut.get()->GetReturnCode() != 0) {
+  if (rc != 0) {
     // Log the actual return code so callers (e.g. the POSIX adapter, IOR,
     // wfbench) can correlate "PutBlob operation failed" with the failure mode.
     HLOG(kError,
          "PutBlob failed: tag_id={},{} blob='{}' off={} size={} rc={}",
-         tag_id_.major_, tag_id_.minor_, blob_name, off, data_size,
-         fut.get()->GetReturnCode());
-    throw std::runtime_error(
-        std::string("PutBlob operation failed (rc=") +
-        std::to_string(fut.get()->GetReturnCode()) + ")");
+         tag_id_.major_, tag_id_.minor_, blob_name, off, data_size, rc);
+    throw std::runtime_error(std::string("PutBlob operation failed (rc=") +
+                             std::to_string(rc) + ")");
   }
 
   auto ns = [](clk::time_point a, clk::time_point b) {
@@ -197,20 +194,13 @@ void Tag::GetBlob(const std::string &blob_name, char *data, size_t data_size, si
     throw std::invalid_argument("data buffer must be pre-allocated by caller");
   }
 
-  // The zero-IPC fast path is NATIVE to CoreClient::AsyncGetBlob now (issue
-  // #783/#817 via TryShmGet) — delegating to the private-buffer overload gets
-  // shared-cache hit, runtime-mode direct read, and client-mode staging in one
-  // place instead of duplicating the cache probe here.
-  auto fut = CLIO_CTE_CLIENT->AsyncGetBlob(tag_id_, blob_name, off, data_size,
-                                           0, data);
-  if (fut.get() == nullptr) {
-    // Only reachable when client-mode SHM staging could not be allocated.
-    throw std::runtime_error("Failed to allocate shared memory for GetBlob");
-  }
-  fut.Wait();
-  if (fut->GetReturnCode() != 0) {
-    throw std::runtime_error("GetBlob failed with code " +
-                             std::to_string(fut->GetReturnCode()));
+  // Synchronous client GetBlob: the shm cache when connected and the range
+  // is cached, else the task path.
+  auto *cte_client = CLIO_CTE_CLIENT;
+  const clio::run::u32 rc =
+      cte_client->GetBlob(tag_id_, blob_name, off, data_size, data);
+  if (rc != 0) {
+    throw std::runtime_error("GetBlob failed with code " + std::to_string(rc));
   }
 }
 
@@ -225,9 +215,8 @@ clio::run::Future<GetBlobTask> Tag::AsyncGetBlob(const std::string &blob_name,
     throw std::invalid_argument("data buffer must be pre-allocated by caller");
   }
 
-  // issue #823: read straight into the caller's PRIVATE buffer. The client
-  // picks the fastest of shared-cache / runtime-direct / client-staging; the
-  // returned Future is empty on a cache hit and readable otherwise.
+  // issue #823: read straight into the caller's PRIVATE buffer (task path:
+  // runtime-direct or client-staging).
   auto *cte_client = CLIO_CTE_CLIENT;
   return cte_client->AsyncGetBlob(tag_id_, blob_name, off, data_size,
                                   /*flags=*/0, data);
@@ -267,36 +256,16 @@ float Tag::GetBlobScore(const std::string &blob_name) {
 clio::run::u64 Tag::GetBlobSize(const std::string &blob_name) {
   auto *cte_client = CLIO_CTE_CLIENT;
 
-  // issue #783 fast path: answer from the shared-memory metadata cache with
-  // ZERO IPC when the blob is cached. A miss (or an inconsistent read) simply
-  // falls through to the RPC below -- the cache is never treated as
-  // authoritative, and "not cached" must never be reported as "size 0".
-  //
-  // A cached record with total_size_ == 0 is ALSO untrustworthy (issue #862):
-  // a freshly created blob's record can be visible in the mirror before the
-  // completing put's size is republished, and callers cannot tell "empty
-  // blob" from "absent" from a zero return. Confirm zero via the RPC below --
-  // genuinely empty blobs are degenerate and rare, so the extra round trip is
-  // irrelevant; the stale zero showed up as read-after-write NOT_FOUNDs on
-  // freshly inserted keys (YCSB workload D).
-  if (cte_client->HasShmCache()) {
-    ShmBlobRecord rec;
-    if (cte_client->TryGetBlobRecordShm(tag_id_, blob_name, &rec) &&
-        rec.total_size_ != 0) {
-      return rec.total_size_;
-    }
-  }
-
-  auto task = cte_client->AsyncGetBlobSize(tag_id_, blob_name);
-  task.Wait();
-
-  clio::run::u64 size = task->size_;
+  // The shm cache answers when connected and it knows the size; otherwise a
+  // GetBlobSize task.
+  clio::run::u64 size = 0;
+  cte_client->GetBlobSize(tag_id_, blob_name, &size);
   return size;
 }
 
 std::vector<std::string> Tag::GetContainedBlobs() {
   auto *cte_client = CLIO_CTE_CLIENT;
-  auto task = cte_client->AsyncGetContainedBlobs(tag_id_);
+  auto task = cte_client->AsyncGetContainedBlobs(tag_id_, clio::run::PoolQuery::Broadcast());
   task.Wait();
 
   std::vector<std::string> blobs = task->blob_names_;

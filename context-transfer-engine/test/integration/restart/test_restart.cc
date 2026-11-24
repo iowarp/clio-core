@@ -176,9 +176,12 @@ int VerifyBlobs() {
   targets_task.Wait();
   HLOG(kInfo, "Phase 2: ListTargets rc={}", targets_task->GetReturnCode());
 
-  // Attempt blob recovery (informational - data persistence is WIP)
+  // Blob recovery. Bytes on a persistent tier come back; bytes that lived on
+  // the volatile RAM tier are LOST and must read as an error, not as zeros.
   int recovered = 0;
+  int lost = 0;
   int failed = 0;
+  int silent_wrong = 0;
   for (int i = 0; i < kNumBlobs; ++i) {
     std::string blob_name = "restart_blob_" + std::to_string(i);
     char expected_pattern = static_cast<char>('A' + i);
@@ -195,6 +198,15 @@ int VerifyBlobs() {
         tag_id, blob_name, 0, kBlobSize, 0, shm_ptr);
     get_task.Wait();
 
+    if (get_task->GetReturnCode() == clio::cte::core::kGetBlobIoErrorRc) {
+      // The blob's bytes lived on the volatile tier and died with the
+      // process: the restore keeps the blob but marks the range lost, and a
+      // read into it must FAIL (#1163) -- never zero-fill with rc 0.
+      ++lost;
+      HLOG(kInfo, "Phase 2: Blob '{}' reports its bytes lost (rc {})",
+           blob_name, get_task->GetReturnCode());
+      continue;
+    }
     if (get_task->GetReturnCode() != 0) {
       ++failed;
       continue;
@@ -213,12 +225,22 @@ int VerifyBlobs() {
       ++recovered;
       HLOG(kInfo, "Phase 2: Blob '{}' data recovered OK", blob_name);
     } else {
-      ++failed;
+      // rc 0 with the wrong bytes is the one outcome that must never happen:
+      // an application would take these for its data (#1124, #1147, #1163).
+      ++silent_wrong;
+      HLOG(kError, "Phase 2: FAILED - Blob '{}' read rc 0 with wrong bytes "
+           "after the restart", blob_name);
     }
   }
 
-  HLOG(kInfo, "Phase 2: Blob recovery: {}/{} recovered, {}/{} pending implementation",
-       recovered, kNumBlobs, failed, kNumBlobs);
+  HLOG(kInfo, "Phase 2: Blob recovery: {}/{} recovered, {}/{} reported lost, "
+       "{}/{} failed otherwise", recovered, kNumBlobs, lost, kNumBlobs, failed,
+       kNumBlobs);
+  if (silent_wrong != 0) {
+    HLOG(kError, "Phase 2: FAILED - {} blob(s) returned wrong bytes with rc 0",
+         silent_wrong);
+    return 1;
+  }
 
   // The test passes if RestartContainers worked and the pool is functional.
   // Full blob data recovery requires completing FlushData and metadata

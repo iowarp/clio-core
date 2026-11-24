@@ -39,8 +39,28 @@
 #include "clio_runtime/task_archives.h"
 #include "clio_runtime/ipc_manager.h"
 #include "clio_ctp/util/logging.h"
+#include <clio_ctp/util/gpu_api.h>
 
 namespace clio::run {
+
+SaveTaskArchive::SaveTaskArchive(MsgType msg_type,
+                                 ctp::lbm::Transport *lbm_transport)
+    : NetTaskArchive(msg_type),
+      serializer_(buffer_),
+      lbm_transport_(lbm_transport) {
+  buffer_.reserve(256);
+}
+
+SaveTaskArchive::SaveTaskArchive(SaveTaskArchive &&other) noexcept
+    : NetTaskArchive(std::move(other)),
+      buffer_(std::move(other.buffer_)),
+      serializer_(buffer_, true),
+      lbm_transport_(other.lbm_transport_),
+      staged_(std::move(other.staged_)) {
+  other.lbm_transport_ = nullptr;
+}
+
+SaveTaskArchive::~SaveTaskArchive() = default;
 
 /**
  * SaveTaskArchive bulk transfer implementation
@@ -51,6 +71,22 @@ namespace clio::run {
  */
 void SaveTaskArchive::bulk(ctp::ipc::ShmPtr<> ptr, size_t size, uint32_t flags) {
   ctp::ipc::FullPtr<char> full_ptr = CLIO_IPC->ToFullPtr(ptr).template Cast<char>();
+  // DEVICE MEMORY IS STAGED THROUGH THE HOST. A task bound for another node
+  // can carry a bulk buffer that lives in GPU memory -- a paged vector's
+  // frame being written back to the node that owns its blob -- and the
+  // transport copies bulk bytes with a host memcpy inside Send. On Aurora
+  // that was zmq_send(0xff000000112e0000, 65536) dying in memmove, on the
+  // first cross-node page flush of a two-node kmeans. Managed memory is
+  // host-readable and needs nothing; device-only memory is copied once into
+  // a buffer this archive owns for as long as the send needs it.
+  if (size != 0 && full_ptr.ptr_ != nullptr &&
+      ctp::IsDevicePointer(full_ptr.ptr_)) {
+    staged_.emplace_back(new char[size]);
+    char *host = staged_.back().get();
+    ctp::DeviceAwareMemcpy(host, full_ptr.ptr_, size);
+    full_ptr.ptr_ = host;
+    full_ptr.shm_ = ctp::ipc::ShmPtr<char>::GetNull();
+  }
   ctp::lbm::Bulk bulk;
   bulk.data = full_ptr;
   bulk.size = size;
@@ -67,6 +103,37 @@ void SaveTaskArchive::bulk(ctp::ipc::ShmPtr<> ptr, size_t size, uint32_t flags) 
   if (flags & BULK_XFER) {
     send_bulks++;
   }
+}
+
+/**
+ * Copy one received bulk into a buffer the task owns, bounded by what the
+ * message actually carried.
+ *
+ * `size` comes from the deserialized task and `bulk.size` from the transport
+ * (the bytes it received). They can disagree, and copying `size` bytes from a
+ * `bulk.size` buffer would read past its end. The task still gets the
+ * `size`-byte buffer it expects; any bytes the message did not carry are zero.
+ * @param bulk The received bulk (data and the size actually received)
+ * @param size The size the task declares for this bulk
+ * @return The owned buffer (null if allocation failed)
+ */
+ctp::ipc::FullPtr<char> LoadTaskArchive::CopyInBulk(const ctp::lbm::Bulk &bulk,
+                                                    size_t size) {
+  ctp::ipc::FullPtr<char> buf = CLIO_IPC->AllocateBuffer(size);
+  if (buf.ptr_) {
+    size_t carried = bulk.data.ptr_ ? bulk.size : 0;
+    size_t n = carried < size ? carried : size;
+    if (n) memcpy(buf.ptr_, bulk.data.ptr_, n);
+    if (n < size) memset(buf.ptr_ + n, 0, size - n);
+    if (size > carried) {
+      HLOG(kError,
+           "[LoadTaskArchive::bulk] task declares {} bytes but the message "
+           "carried {}; the rest is zero-filled",
+           size, carried);
+    }
+  }
+  ++daemon_allocated_bulk_count_;
+  return buf;
 }
 
 /**
@@ -98,14 +165,10 @@ void LoadTaskArchive::bulk(ctp::ipc::ShmPtr<> &ptr, size_t size, uint32_t flags)
           // immediately after AllocLoadTask. One extra 1 MiB memcpy on
           // the TCP path (which already memcpys); SHM path (desc==null)
           // stays zero-copy and untouched.
-          ctp::ipc::FullPtr<char> buf = CLIO_IPC->AllocateBuffer(size);
-          char *src = recv[current_bulk_index_].data.ptr_;
-          if (buf.ptr_ && src) {
-            memcpy(buf.ptr_, src, size);
-          }
+          ctp::ipc::FullPtr<char> buf =
+              CopyInBulk(recv[current_bulk_index_], size);
           ptr = buf.shm_.template Cast<void>();
           recv[current_bulk_index_].data = buf;
-          ++daemon_allocated_bulk_count_;
         } else if (recv[current_bulk_index_].data.shm_.alloc_id_ ==
                        ctp::ipc::AllocatorId(UINT32_MAX - 1,
                                               UINT32_MAX - 1)) {
@@ -119,17 +182,20 @@ void LoadTaskArchive::bulk(ctp::ipc::ShmPtr<> &ptr, size_t size, uint32_t flags)
           // the ZMQ path: copy into a CTP buffer the task owns via
           // TASK_DATA_OWNER, leaving recv[i].data alone so
           // ClearRecvHandles still frees the malloc'd buffer.
-          ctp::ipc::FullPtr<char> buf = CLIO_IPC->AllocateBuffer(size);
-          char *src = recv[current_bulk_index_].data.ptr_;
-          if (buf.ptr_ && src) {
-            memcpy(buf.ptr_, src, size);
-          }
-          ptr = buf.shm_.template Cast<void>();
-          ++daemon_allocated_bulk_count_;
+          ptr = CopyInBulk(recv[current_bulk_index_], size)
+                    .shm_.template Cast<void>();
         } else {
           // Valid ShmPtr, no zmq handle: SHM transport (data already in
-          // shared memory) — keep zero-copy.
-          ptr = recv[current_bulk_index_].data.shm_.template Cast<void>();
+          // shared memory) — keep zero-copy, unless the task claims more
+          // bytes than the message carried: then readers of `size` bytes
+          // would run past the segment, so give the task an owned,
+          // zero-padded copy instead (recv[i].data is left for its owner).
+          if (size > recv[current_bulk_index_].size) {
+            ptr = CopyInBulk(recv[current_bulk_index_], size)
+                      .shm_.template Cast<void>();
+          } else {
+            ptr = recv[current_bulk_index_].data.shm_.template Cast<void>();
+          }
         }
       } else {
         // Null ShmPtr: BULK_EXPOSE via ZMQ/socket where no data was sent.
@@ -161,10 +227,34 @@ void LoadTaskArchive::bulk(ctp::ipc::ShmPtr<> &ptr, size_t size, uint32_t flags)
         if (!ptr.IsNull()) {
           ctp::ipc::FullPtr<char> dst = CLIO_IPC->ToFullPtr(ptr).template Cast<char>();
           char *src = recv[current_bulk_index_].data.ptr_;
+          // `size` is the caller's own buffer size (the task's field as the
+          // caller set it); `recv[i].size` is what the response carried.
+          // Never copy more than the caller's buffer holds.
           size_t copy_size = recv[current_bulk_index_].size;
-          if (dst.ptr_ && src) {
-            memcpy(dst.ptr_, src, copy_size);
+          if (copy_size > size) {
+            HLOG(kError,
+                 "[LoadTaskArchive::bulk] response carries {} bytes for a "
+                 "{}-byte buffer; truncating",
+                 copy_size, size);
+            copy_size = size;
           }
+          if (dst.ptr_ && src) {
+            // THE CALLER'S BUFFER MAY BE DEVICE MEMORY. A paged vector's
+            // page fault on a blob another node owns is a bdev ReadTask
+            // whose destination is the GPU frame; the reply's bytes arrive
+            // in host memory and a plain memcpy into the frame is the
+            // mirror image of the send-side crash above (kmeans two-node
+            // rank 0, __memmove into 0xff00... from RecvOut). Host
+            // destinations take the same memcpy as before.
+            ctp::DeviceAwareMemcpy(dst.ptr_, src, copy_size);
+          }
+        } else if (size > recv[current_bulk_index_].size) {
+          // No original buffer, and the response carried fewer bytes than
+          // the task says it holds: pointing the task at the recv buffer
+          // would let readers of `size` bytes run past it. Give it an
+          // owned, zero-padded copy instead.
+          ptr = CopyInBulk(recv[current_bulk_index_], size)
+                    .shm_.template Cast<void>();
         } else {
           // No original buffer — zero-copy, point directly at recv buffer
           ptr = recv[current_bulk_index_].data.shm_.template Cast<void>();

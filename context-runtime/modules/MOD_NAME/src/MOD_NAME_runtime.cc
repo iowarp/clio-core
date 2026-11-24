@@ -126,6 +126,27 @@ clio::run::TaskResume Runtime::ManyToOneSum(clio::run::shared_ptr<ManyToOneSumTa
   CLIO_TASK_BODY_END
 }
 
+clio::run::TaskResume Runtime::AllReduce(clio::run::shared_ptr<AllReduceTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  // The AllToOne barrier has already released, so AggregateIn has folded every
+  // container's contribution into this aggregate's value_. Echo it into the OUT
+  // field; the engine broadcasts sum_ back to all participants.
+  task->sum_ = task->value_;
+  HLOG(kDebug, "MOD_NAME: AllReduce total={}", task->sum_);
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::Barrier(clio::run::shared_ptr<BarrierTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  // Intentionally no work: reaching here means tasks from every container have
+  // arrived, and completing broadcasts that fact back to all of them. That is
+  // the entire barrier.
+  HLOG(kDebug, "MOD_NAME: Barrier released");
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 clio::run::TaskResume Runtime::Destroy(clio::run::shared_ptr<DestroyTask> &task) {
   CLIO_TASK_BODY_BEGIN
   HLOG(kDebug, "MOD_NAME: Executing Destroy task - Pool ID: {}",

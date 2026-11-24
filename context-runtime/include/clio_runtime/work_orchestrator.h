@@ -35,7 +35,9 @@
 #define CLIO_RUNTIME_INCLUDE_WORKERS_WORK_ORCHESTRATOR_H_
 
 #include <atomic>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -183,6 +185,24 @@ class WorkOrchestrator {
   Worker *FindIdleElasticWorker();
 
   /**
+   * FindIdleElasticWorker, skipping workers the caller already uses (a worker
+   * in the scheduler's pool is idle between tasks, but it is not spare).
+   * Monitor thread only.
+   * @param exclude workers that must not be returned
+   * @return an idle elastic worker outside  exclude, or nullptr
+   */
+  Worker *FindIdleElasticWorker(const std::vector<Worker *> &exclude);
+
+  /**
+   * Ask the monitor thread to grow the scheduler's worker pool now
+   * (Scheduler::GrowPool) rather than on its next kMonitorPeriodMs tick.
+   * Callable from any thread; spawning stays on the monitor thread, so the
+   * caller pays no thread creation. Repeated requests before the monitor
+   * wakes collapse into one.
+   */
+  void RequestWorker();
+
+  /**
    * Retire an idle elastic worker spawned by SpawnAdditionalWorker (issue #781):
    * park it, join its thread, and drop it from the pool — the hysteresis that
    * returns the runtime to the minimum thread count after a burst clears.
@@ -190,7 +210,10 @@ class WorkOrchestrator {
   void RetireWorker(Worker *worker);
 
   /** Interval between monitor-thread LoadBalance() ticks. */
-  static constexpr u32 kMonitorPeriodMs = 500;
+  /// How often LoadBalance (stall detection, rescue, rebalancing) runs. With
+  /// the 300 ms stall cutoff this bounds a stalled worker's backlog to about
+  /// 0.4 s before it moves (was 500 ms + 1 s).
+  static constexpr u32 kMonitorPeriodMs = 100;
 
  private:
   /** Monitor-thread body: LoadBalance() loop on a kMonitorPeriodMs cadence. */
@@ -270,6 +293,10 @@ class WorkOrchestrator {
   // issue #781: dedicated monitor thread (not a worker) that drives LoadBalance.
   std::thread monitor_thread_;
   std::atomic<bool> monitor_running_{false};
+  /** Set by RequestWorker; the monitor grows the pool and clears it. */
+  std::atomic<bool> worker_requested_{false};
+  std::mutex monitor_mu_;              ///< pairs with monitor_cv_
+  std::condition_variable monitor_cv_; ///< wakes MonitorLoop early
 
   // Scheduler pointer (owned by IpcManager, not WorkOrchestrator)
   Scheduler *scheduler_;

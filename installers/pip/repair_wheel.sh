@@ -41,16 +41,30 @@ chmod +x "$WORK_DIR"/unpack/iowarp_core/bin/* 2>/dev/null || true
 # Fix RPATHs
 echo "Fixing RPATHs..."
 
+# GPU wheel variants (CLIO_WHEEL_GPU, set by build-pip.yml) link a GPU
+# runtime that is NOT bundled. Append where it lives on the user's machine,
+# relative to <site-packages>/iowarp_core/{lib,ext}:
+#   cuda12  nvidia-cuda-runtime-cu12 -> <site>/nvidia/cuda_runtime/lib
+#   sycl    intel-sycl-rt            -> <prefix>/lib (= <site>/../../..)
+#   rocm6   system ROCm              -> /opt/rocm/lib
+# _cli.py adds the same dirs to LD_LIBRARY_PATH for the executables.
+case "${CLIO_WHEEL_GPU:-}" in
+    cuda12) GPU_RPATH=':$ORIGIN/../../nvidia/cuda_runtime/lib' ;;
+    sycl)   GPU_RPATH=':$ORIGIN/../../../..' ;;
+    rocm6)  GPU_RPATH=':/opt/rocm/lib' ;;
+    *)      GPU_RPATH='' ;;
+esac
+
 # Shared libraries: find each other via $ORIGIN
 for so in "$WORK_DIR"/unpack/iowarp_core/lib/*.so*; do
     [ -f "$so" ] || continue
-    patchelf --set-rpath '$ORIGIN' "$so" 2>/dev/null || true
+    patchelf --set-rpath '$ORIGIN'"$GPU_RPATH" "$so" 2>/dev/null || true
 done
 
 # Python extensions: find libs via $ORIGIN/../lib
 for so in "$WORK_DIR"/unpack/iowarp_core/ext/*.so*; do
     [ -f "$so" ] || continue
-    patchelf --set-rpath '$ORIGIN/../lib' "$so" 2>/dev/null || true
+    patchelf --set-rpath '$ORIGIN/../lib'"$GPU_RPATH" "$so" 2>/dev/null || true
 done
 
 # NOTE: Deliberately do NOT patchelf executables in iowarp_core/bin/.
@@ -131,6 +145,10 @@ with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as zf:
             info = zipfile.ZipInfo(arc)
             st = os.stat(full)
             info.external_attr = (st.st_mode & 0xFFFF) << 16
+            # writestr(ZipInfo) uses the ZipInfo's own compress_type, which
+            # defaults to STORED (the archive's ZIP_DEFLATED is ignored), so
+            # every wheel shipped uncompressed: 26.8 MB instead of ~9.7 MB.
+            info.compress_type = zipfile.ZIP_DEFLATED
             with open(full, 'rb') as fh:
                 zf.writestr(info, fh.read())
 " "$WORK_DIR/unpack" "$REPACK_DIR/$WHEEL_NAME"

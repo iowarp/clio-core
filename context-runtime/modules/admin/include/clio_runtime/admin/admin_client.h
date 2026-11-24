@@ -39,6 +39,13 @@
 #include "clio_ctp/data_structures/serialization/global_serialize.h"
 
 #include "admin_tasks.h"
+#include <clio_runtime/pool_manager.h>
+
+#include <cctype>
+#include <string>
+#if CTP_IS_HOST
+#include "clio_ctp/serialize/msgpack_wrapper.h"
+#endif
 
 /**
  * Client API for Admin ChiMod
@@ -53,13 +60,16 @@ namespace clio::run::admin {
 class Client : public clio::run::ContainerClient {
  public:
   /**
-   * Default constructor
+   * Default constructor: targets the admin pool.
+   *
+   * There is exactly one admin pool (kAdminPoolId), so a default admin
+   * client means that pool. CLIO_ADMIN default-constructs on first use; when
+   * that first use came before ClientInit published its client (ServerInit's
+   * pool-log replay does), g_admin kept PoolId(0,0) for the life of the
+   * process and every admin task it sent -- `clio_run start`'s AddNode
+   * induction among them -- failed to route.
    */
-  Client() {
-    HLOG(kWarning,
-         "AdminClient: Default constructor called - pool_id_ will be "
-         "PoolId(0,0)");
-  }
+  Client() { Init(clio::run::kAdminPoolId); }
 
   /**
    * Constructor with pool ID
@@ -105,6 +115,102 @@ class Client : public clio::run::ContainerClient {
     // Submit to runtime and return Future
     return ipc_manager->Send(task);
   }
+
+#if CTP_IS_HOST
+  /**
+   * Parse "major.minor" (or a bare "major", minor 0) into a PoolId.
+   * @param text candidate pool id text
+   * @param out receives the parsed id on success
+   * @return true if text is a well-formed pool id
+   */
+  static bool ParsePoolIdText(const std::string &text, clio::run::PoolId *out) {
+    const size_t dot = text.find('.');
+    const std::string major_text = text.substr(0, dot);
+    const std::string minor_text =
+        dot == std::string::npos ? std::string("0") : text.substr(dot + 1);
+    auto all_digits = [](const std::string &s) {
+      if (s.empty()) return false;
+      for (char c : s) {
+        if (!std::isdigit(static_cast<unsigned char>(c))) return false;
+      }
+      return true;
+    };
+    // Ids are u32; the length cap keeps std::stoul from throwing out_of_range.
+    constexpr size_t kMaxDigits = 9;
+    if (!all_digits(major_text) || !all_digits(minor_text) ||
+        major_text.size() > kMaxDigits || minor_text.size() > kMaxDigits) {
+      return false;
+    }
+    *out = clio::run::PoolId(static_cast<clio::run::u32>(std::stoul(major_text)),
+                             static_cast<clio::run::u32>(std::stoul(minor_text)));
+    return true;
+  }
+
+  /**
+   * Resolve a user-supplied pool reference to a pool id. Accepts "major.minor",
+   * a bare "major", or a pool name; a name is looked up on the local runtime
+   * with the admin Monitor query "pool_id_of://<name>".
+   * @param name_or_id pool id text or pool name
+   * @return the pool id, or a null PoolId when nothing matches
+   */
+  clio::run::PoolId ResolvePoolId(const std::string &name_or_id) {
+    clio::run::PoolId resolved;
+    if (ParsePoolIdText(name_or_id, &resolved)) {
+      return resolved;
+    }
+    auto task = AsyncMonitor(clio::run::PoolQuery::Local(),
+                             "pool_id_of://" + name_or_id);
+    task.Wait();
+    if (task->GetReturnCode() != 0) {
+      return clio::run::PoolId::GetNull();
+    }
+    for (const auto &[container_id, blob] : task->results_) {
+      if (blob.empty()) continue;
+      msgpack::object_handle oh = msgpack::unpack(blob.data(), blob.size());
+      std::string text;
+      oh.get().convert(text);
+      if (ParsePoolIdText(text, &resolved)) {
+        return resolved;
+      }
+    }
+    return clio::run::PoolId::GetNull();
+  }
+
+  /**
+   * Stop or remove a pool across the cluster, synchronously. Two phases:
+   * phase one (kDestroyPoolQuiesceOnly) runs every node's module Destroy so
+   * dirty data is made durable while all containers still exist; phase two
+   * removes the pool. A nonzero module rc stops the unplug before phase two
+   * (the pool stays running) unless kDestroyPoolNoFlush is set. Both phases
+   * use Broadcast: a Dynamic query on kDestroyPool resolves to Local.
+   * @param pool_id pool to unplug
+   * @param flags level flags (kDestroyPoolKeepRestartable, NoFlush, DeleteData)
+   * @param err receives the failure message when the result is nonzero (may be null)
+   * @param blobs_flushed receives the blobs phase one made durable (may be null)
+   * @param bytes_flushed receives the bytes phase one made durable (may be null)
+   * @return 0 on success, otherwise the failing return code
+   */
+  clio::run::u32 UnplugPool(clio::run::PoolId pool_id, clio::run::u32 flags,
+                            std::string *err, clio::run::u64 *blobs_flushed,
+                            clio::run::u64 *bytes_flushed) {
+    auto quiesce = AsyncDestroyPool(clio::run::PoolQuery::Broadcast(), pool_id,
+                                    flags | kDestroyPoolQuiesceOnly);
+    quiesce.Wait();
+    if (blobs_flushed != nullptr) *blobs_flushed = quiesce->blobs_flushed_;
+    if (bytes_flushed != nullptr) *bytes_flushed = quiesce->bytes_flushed_;
+    const clio::run::u32 flush_rc = quiesce->GetReturnCode();
+    if (flush_rc != 0 && (flags & kDestroyPoolNoFlush) == 0) {
+      if (err != nullptr) *err = quiesce->error_message_.str();
+      return flush_rc;
+    }
+
+    auto remove = AsyncDestroyPool(clio::run::PoolQuery::Broadcast(), pool_id, flags);
+    remove.Wait();
+    const clio::run::u32 rc = remove->GetReturnCode();
+    if (rc != 0 && err != nullptr) *err = remove->error_message_.str();
+    return rc;
+  }
+#endif  // CTP_IS_HOST
 
   /**
    * Create a periodic SendTask for polling the network queue
@@ -367,6 +473,36 @@ class Client : public clio::run::ContainerClient {
     return ipc_manager->Send(task);
   }
 
+#if CTP_IS_HOST
+  /**
+   * Re-create THIS node's container of a durable pool from its pool-log
+   * entry (restart replay). Compose entries are re-composed with restart
+   * semantics; API entries re-run their create with the recorded params.
+   * @param e the pool-log entry
+   * @return Future for the create task
+   */
+  clio::run::Future<GetOrCreatePoolTask<CreateParams>> AsyncRecreatePool(
+      const clio::run::PoolManager::PoolLogEntry &e) {
+    auto* ipc_manager = CLIO_IPC;
+    auto task = ipc_manager->NewTask<GetOrCreatePoolTask<CreateParams>>(
+        clio::run::CreateTaskId(), clio::run::kAdminPoolId,
+        clio::run::PoolQuery::Local(), e.chimod_name, e.pool_name, e.pool_id,
+        nullptr);
+    task->do_compose_ = e.compose;
+    clio::run::priv::string raw(CLIO_PRIV_ALLOC, e.chimod_params);
+    if (e.compose) {
+      auto pool_config =
+          clio::run::Task::Deserialize<clio::run::PoolConfig>(raw);
+      pool_config.restart_ = true;
+      clio::run::Task::Serialize(CLIO_PRIV_ALLOC, task->chimod_params_,
+                                 pool_config);
+    } else {
+      task->chimod_params_ = raw;  // byte for byte: binary CreateParams
+    }
+    return ipc_manager->Send(task);
+  }
+#endif
+
   /**
    * ListContainers - Enumerate active pools/containers in the local daemon.
    * @param pool_query Pool routing information (use Dynamic/local).
@@ -429,6 +565,7 @@ class Client : public clio::run::ContainerClient {
     auto* ipc_manager = CLIO_IPC;
     auto task = ipc_manager->NewTask<HeartbeatTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query);
+    task->SetFlags(TASK_LIVENESS_PROBE);  // reaches a node marked dead (#1222)
     return ipc_manager->Send(task);
   }
 
@@ -484,6 +621,7 @@ class Client : public clio::run::ContainerClient {
 
     auto task = ipc_manager->NewTask<ProbeRequestTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, target_node_id);
+    task->SetFlags(TASK_LIVENESS_PROBE);  // reaches a node marked dead (#1222)
 
     return ipc_manager->Send(task);
   }

@@ -129,7 +129,7 @@ cd /opt/iowarp
 # to trace the SWIM probe RPC path. Default release preset uses 1 (kInfo)
 # which strips them entirely.
 cmake --preset ##CMAKE_PRESET## -DCMAKE_INSTALL_PREFIX=/usr/local \
-    -DWRP_CORE_ENABLE_BENCHMARKS=ON \
+    -DCLIO_CORE_ENABLE_BENCHMARKS=ON \
     -DHSHM_LOG_LEVEL=0
 cmake --build build -j"$(nproc)"
 cmake --install build

@@ -6,7 +6,7 @@
 #       (4 file bdevs -> safe0 erasure-coded bdev -> CAE + CTE), then
 #   * mounts the CTE FUSE filesystem.
 #
-# By default this is a FRESH session (clio_run start --ephemeral). resume.sh
+# By default this is a FRESH session (clio_run start --fresh --ephemeral). resume.sh
 # re-invokes this script with EPHEMERAL=0 to recover the persisted state
 # instead (the bdev/safe-bdev alloc-logs + member superblocks).
 #
@@ -37,7 +37,7 @@ mkdir -p "$BDEV_DIR"
 
 # 1) Runtime (composes safe.yaml's `compose:` section at startup).
 START_FLAGS=()
-[[ "$EPHEMERAL" == "1" ]] && START_FLAGS+=(--ephemeral)
+[[ "$EPHEMERAL" == "1" ]] && START_FLAGS+=(--fresh --ephemeral)
 echo "[start] launching clio runtime (${START_FLAGS[*]:-persistent}) with $CONF"
 nohup "$BIN/clio_run" start "${START_FLAGS[@]}" \
   > "$BDEV_DIR/runtime.log" 2>&1 &

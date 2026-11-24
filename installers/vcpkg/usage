@@ -7,8 +7,8 @@ Core Components:
     target_link_libraries(main PRIVATE
         clio::run::admin_client      # Admin ChiMod
         clio::run::bdev_client       # Block device ChiMod
-        clio_cte::core_client        # Context Transfer Engine (if enabled)
-        clio_cae::core_client        # Context Assimilation Engine (if enabled)
+        clio::cte::core_client       # Context Transfer Engine (if enabled)
+        clio::cae::core_client       # Context Assimilation Engine (if enabled)
     )
 
 Individual Components (advanced usage):

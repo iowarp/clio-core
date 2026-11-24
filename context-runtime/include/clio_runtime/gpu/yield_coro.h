@@ -78,6 +78,12 @@
 #if defined(CLIO_YIELD_CORO) && defined(__clang__) && \
     (defined(__CUDA__) || CTP_ENABLE_SYCL)
 
+/* Device coroutines are available in this build. Consumers that carry both a
+ * coroutine and a macro spelling (device_vector.h) test this rather than
+ * repeating the three-part condition above. SPIR-V never satisfies it: clang
+ * cannot compile a device coroutine for spir64 at all. */
+#define CLIO_HAS_YCORO 1
+
 /* ------------------------------------------------------------------ */
 /* MEASUREMENT MODE: -DCLIO_YIELD_SYNC                                  */
 /*                                                                      */
@@ -416,3 +422,8 @@ struct YCoroMain {
 #endif  // CLIO_YIELD_SYNC
 #endif  // CLIO_YIELD_CORO && __clang__ && __CUDA__
 #endif  // CLIO_RUNTIME_GPU_YIELD_CORO_H_
+
+#ifndef CLIO_HAS_YCORO
+/** No device coroutines in this build (nvcc, or any SPIR-V target). */
+#define CLIO_HAS_YCORO 0
+#endif

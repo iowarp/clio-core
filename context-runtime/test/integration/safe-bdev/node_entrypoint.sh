@@ -28,7 +28,7 @@ fail() { echo "[safe-bdev-test] FAIL: $*" >&2; exit 1; }
 # 1. Start the runtime (its built-in dashboard serves :5000 off-container).
 export CLIO_VIZ_ENABLE=1 CLIO_VIZ_PORT=5000 CLIO_VIZ_BIND=0.0.0.0
 log "starting clio runtime..."
-CLIO_WITH_RUNTIME=1 "$BIN/clio_run" start &
+CLIO_WITH_RUNTIME=1 "$BIN/clio_run" start --fresh &
 RUNTIME_PID=$!
 sleep 5
 kill -0 "$RUNTIME_PID" 2>/dev/null || fail "runtime did not start"

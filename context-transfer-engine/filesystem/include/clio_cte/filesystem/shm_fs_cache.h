@@ -6,6 +6,7 @@
 #define CLIO_CTE_FILESYSTEM_SHM_FS_CACHE_H_
 
 #include <clio_cte/core/shm_metadata_cache.h>
+#include <clio_cte/filesystem/fs_canonical.h>
 
 #include <string>
 
@@ -28,11 +29,10 @@ enum ShmFileFlags : clio::run::u32 {
   /** Directory, not a regular file. Never payload-readable. */
   kShmFileIsDir = 1u << 1,
   /**
-   * The file has appends staged but not yet merged into its tail (see
-   * Runtime::Append). Until the AppendSequence pipeline drains them the bytes
-   * live under the staging tag, not under this file's page blobs, and the
-   * tracked size is explicitly best-effort -- so neither size nor pages may be
-   * trusted for a direct read.
+   * The file has appends staged but not yet merged into its tail: neither
+   * size nor pages may be trusted for a direct read. Reserved: deferred
+   * appends now go through the stream pool, whose writers flush before they
+   * read, so the runtime no longer sets it.
    */
   kShmFilePendingAppend = 1u << 2,
   /** Catch-all refusal for states the fast path does not model. */
@@ -57,14 +57,13 @@ static constexpr clio::run::u32 kShmFileNoOverride = 0xFFFFFFFFu;
 /**
  * Cached per-path filesystem metadata (issue #817).
  *
- * WHY THIS EXISTS SEPARATELY FROM ShmTagRecord: the filesystem chimod owns a
- * LOGICAL size (FileInfo::size_) that is not the tag's physical size. They
+ * WHY THIS EXISTS: the filesystem chimod owns a LOGICAL size (FileInfo::size_) that is not the tag's physical size. They
  * diverge after ftruncate-grow, sparse writes and staged appends, and POSIX
  * read semantics -- short read at EOF, zeros inside a hole -- depend on the
  * logical one. A client that clamped against the physical size would return
  * the wrong bytes, so the fs number has to be published in its own right.
  *
- * POD ONLY, for the same reason as ShmBlobRecord: the map's reader copies the
+ * POD ONLY: the map's reader copies the
  * whole record out between two reads of the slot generation, so an
  * allocator-owned member here would defeat the seqlock. The PATH is the map
  * key and is therefore not duplicated in the record.
@@ -77,9 +76,9 @@ struct ShmFileRecord {
    * utimens OVERRIDES, not timestamps (0 = unset, defer to the tag).
    *
    * Only the overrides live here because only they are the chimod's to own --
-   * the natural atime/mtime/ctime belong to the CTE tag and are already
-   * mirrored in ShmTagRecord. Duplicating them here would invent a second,
-   * drifting copy of a number this module does not maintain.
+   * the natural atime/mtime/ctime belong to the CTE tag. Duplicating them
+   * here would invent a second, drifting copy of a number this module does
+   * not maintain.
    */
   clio::run::u64 ov_atime_ns_;
   clio::run::u64 ov_mtime_ns_;
@@ -124,14 +123,13 @@ using ShmFsFileMap =
 /**
  * Root of the filesystem chimod's shared-memory cache (issue #817).
  *
- * Same ownership contract as ShmMetadataCacheRoot: written only by the
- * runtime, attached read-mostly by clients, never authoritative, droppable at
- * any moment. Registered in the process-wide MetadataDirectory under the
- * FILESYSTEM pool id, so it coexists with the CTE core pool's cache root
- * rather than competing for one slot.
+ * Written only by the runtime, attached read-mostly by clients, never
+ * authoritative, droppable at any moment. Registered in the process-wide
+ * MetadataDirectory under the FILESYSTEM pool id, so it coexists with other
+ * modules' roots rather than competing for one slot.
  */
 struct ShmFsCacheRoot {
-  static constexpr clio::run::u32 kLayoutVersion = 3;
+  static constexpr clio::run::u32 kLayoutVersion = 4;
 
   clio::run::u32 version_;
   clio::run::u32 ready_;  /**< 0 until fully constructed; clients must check */
@@ -145,15 +143,29 @@ struct ShmFsCacheRoot {
   /** Namespace generation: bumped on every DIRECTORY rename (see
    *  ShmFileRecord::nsgen_). */
   std::atomic<clio::run::u32> nsgen_;
+  /** Nonzero on a case-insensitive volume: records are keyed by
+   *  FsCanonicalPath, which every reader and writer applies (Key). */
+  clio::run::u32 case_insensitive_;
   ShmFsFileMap path_to_file_;
 
-  ShmFsCacheRoot() : version_(0), ready_(0), overflow_(0), nsgen_(0) {}
+  ShmFsCacheRoot()
+      : version_(0), ready_(0), overflow_(0), nsgen_(0),
+        case_insensitive_(0) {}
+
+  /**
+   * The key a path's record is stored under.
+   * @param path the path as spelled
+   * @return its canonical form on this volume
+   */
+  std::string Key(const std::string &path) const {
+    return FsCanonicalPath(path, case_insensitive_ != 0);
+  }
 };
 
 /**
  * Runtime-side owner of the filesystem cache.
  *
- * Entirely best-effort, exactly like ShmMetadataCache: every method is a no-op
+ * Entirely best-effort: every method is a no-op
  * when disabled and every failure is swallowed, because a filesystem operation
  * must never fail on account of a cache mirror.
  */
@@ -167,12 +179,16 @@ class ShmFsCache {
    * @param capacity permanent slot count -- the map never rehashes, so a full
    *        table degrades to the RPC path rather than growing.
    * @param owner_pool the filesystem pool, used as the directory key.
+   * @param case_insensitive the volume compares names case-insensitively
+   *        (records are then keyed by canonical path)
    * @return true if the cache is live; false simply means caching is off.
    */
-  bool Create(size_t capacity, const clio::run::PoolId &owner_pool) {
+  bool Create(size_t capacity, const clio::run::PoolId &owner_pool,
+              bool case_insensitive) {
 #if !CTP_IS_HOST
     (void)capacity;
     (void)owner_pool;
+    (void)case_insensitive;
     return false;
 #else
     auto *ipc = CLIO_IPC;
@@ -191,6 +207,7 @@ class ShmFsCache {
       }
       root_ = fp.ptr_;
       new (root_) ShmFsCacheRoot();
+      root_->case_insensitive_ = case_insensitive ? 1u : 0u;
       new (&root_->path_to_file_) ShmFsFileMap(alloc_, capacity);
       if (!root_->path_to_file_.valid()) {
         root_ = nullptr;
@@ -230,11 +247,12 @@ class ShmFsCache {
       return;
     }
     try {
-      ShmFsFileMap::BytesProbe p{path.data(), path.size()};
+      const std::string key = root_->Key(path);
+      ShmFsFileMap::BytesProbe p{key.data(), key.size()};
       ShmFileRecord stamped = rec;
       stamped.nsgen_ = root_->nsgen_.load(std::memory_order_relaxed);
       bool ok = root_->path_to_file_.InsertOrAssign(
-          p, ShmCacheString::HashBytes(path.data(), path.size()), stamped);
+          p, ShmCacheString::HashBytes(key.data(), key.size()), stamped);
       // A false return means the table is full: the path is simply not
       // cached and clients keep using RPC for it — and authoritative
       // negatives must stand down forever (see overflow_).
@@ -268,9 +286,10 @@ class ShmFsCache {
       return;
     }
     try {
-      ShmFsFileMap::BytesProbe p{path.data(), path.size()};
+      const std::string key = root_->Key(path);
+      ShmFsFileMap::BytesProbe p{key.data(), key.size()};
       root_->path_to_file_.Erase(
-          p, ShmCacheString::HashBytes(path.data(), path.size()));
+          p, ShmCacheString::HashBytes(key.data(), key.size()));
     } catch (...) {
     }
   }
@@ -281,7 +300,8 @@ class ShmFsCache {
     if (!IsEnabled() || out == nullptr) {
       return false;
     }
-    return root_->path_to_file_.TryGetBytes(path.data(), path.size(), out);
+    const std::string key = root_->Key(path);
+    return root_->path_to_file_.TryGetBytes(key.data(), key.size(), out);
   }
 
   ShmFsCacheRoot *root() { return root_; }

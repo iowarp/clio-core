@@ -40,19 +40,86 @@
 #include <clio_runtime/corwlock.h>
 #include <clio_ctp/data_structures/ipc/ring_buffer.h>
 #include <clio_ctp/introspect/system_info.h>
+#include <clio_ctp/compress/compress_factory.h>
 #include <memory>
 #include <unordered_map>
 #include <thread>
 #include <vector>
 #include <clio_cte/compressor/compressor_tasks.h>
 #include <clio_cte/compressor/compressor_client.h>
+#include <clio_cte/compressor/models/compression_features.h>
+#include <clio_cte/compressor/models/qtable_predictor.h>
+#include <clio_cte/compressor/models/linreg_table_predictor.h>
+#include <clio_cte/compressor/models/distribution_classifier.h>
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/core/core_interposer.h>
 
 #ifdef CLIO_COMPRESSOR_ENABLE_DENSE_NN
+#include <clio_cte/compressor/models/dense_nn_predictor.h>
 #endif
 
 namespace clio::cte::compressor {
+
+/** Compression presets as stored in Context::compress_preset_ and
+ *  CompressionHeader::compress_preset_. The estimator, the executor and the
+ *  decompressor all use this one encoding (#1189). */
+static constexpr int kPresetFast = 1;
+static constexpr int kPresetBalanced = 2;
+static constexpr int kPresetBest = 3;
+
+/**
+ * Map a stored preset to the codec preset.
+ * @param preset kPresetFast / kPresetBalanced / kPresetBest (anything else
+ *        is treated as balanced)
+ * @return the matching ctp::CompressionPreset
+ */
+inline ctp::CompressionPreset PresetFromWire(int preset) {
+  switch (preset) {
+    case kPresetFast:
+      return ctp::CompressionPreset::FAST;
+    case kPresetBest:
+      return ctp::CompressionPreset::BEST;
+    default:
+      return ctp::CompressionPreset::BALANCED;
+  }
+}
+
+/**
+ * Model input features for one candidate (library, preset).
+ * @param lib_id wire library id (CompressionHeader::compress_lib_)
+ * @param preset kPresetFast / kPresetBalanced / kPresetBest
+ * @param chunk_size chunk size in bytes
+ * @param entropy Shannon entropy of the sampled chunk
+ * @param mad mean absolute deviation of the sampled chunk
+ * @param second_derivative_mean mean second derivative of the sample
+ * @param context the put's context (data type)
+ * @return features with library_config_id in GetLibraryId's ML scheme
+ */
+CompressionFeatures MakeCodecFeatures(int lib_id, int preset,
+                                      clio::run::u64 chunk_size,
+                                      double entropy, double mad,
+                                      double second_derivative_mean,
+                                      const clio::cte::core::Context &context);
+
+/**
+ * Compression statistics predicted by AI models
+ */
+struct CompressionStats {
+  int compress_lib_;           // Compression library ID
+  int compress_preset_;        // kPresetFast / kPresetBalanced / kPresetBest
+  double compression_ratio_;   // Predicted compression ratio
+  double compress_time_ms_;    // Predicted compression time in milliseconds
+  double decompress_time_ms_;  // Predicted decompression time in milliseconds
+  double psnr_db_;             // Predicted PSNR for lossy compression (0 for lossless)
+
+  CompressionStats()
+      : compress_lib_(0), compress_preset_(2), compression_ratio_(1.0), compress_time_ms_(0.0),
+        decompress_time_ms_(0.0), psnr_db_(0.0) {}
+
+  CompressionStats(int lib, int preset, double ratio, double comp_time, double decomp_time, double psnr)
+      : compress_lib_(lib), compress_preset_(preset), compression_ratio_(ratio), compress_time_ms_(comp_time),
+        decompress_time_ms_(decomp_time), psnr_db_(psnr) {}
+};
 
 /**
  * CTE Compressor Runtime Container
@@ -80,42 +147,37 @@ public:
   /**
    * Per-task cost estimate for the scheduler (see Container::GetTaskStats).
    *
-   * compute_ is the feature Container::InferCpuTime multiplies its learned
-   * per-method coefficient by; leaving it 0 — as every chimod but MOD_NAME and
-   * admin did — collapses that model to one constant per method with no
-   * dependence on request size. wall_time_ seeds InferWallClockTime at the
-   * ~500 MB/s house convention. Both coefficients are then learned from real
-   * completions, so these only need the right order of magnitude.
+   * Covers every method this pool serves. Compress/Decompress/DynamicSchedule
+   * and the interposed PutBlob/MultiPutBlob/GetBlob are charged at codec
+   * speed (compression ~300 B per CPU us, decompression ~900) when a codec
+   * will actually run, which is 30x / 10x the CPU per byte of a plain copy
+   * — exactly the distinction the cost model needs. Every other core verb
+   * falls back to CoreInterposer::GetTaskStats (the core's own estimate).
+   * @param task the task to estimate
+   * @return the task's cost features
    */
-  clio::run::TaskStat GetTaskStats(const clio::run::Task *task) const override {
-    clio::run::TaskStat stat;
-    if (task == nullptr) {
-      return stat;
-    }
-    switch (task->method_) {
-      case Method::kCompress: {
-        const auto *t = static_cast<const CompressTask *>(task);
-        stat.io_size_ = t->size_;
-        // Compression is genuinely CPU-bound: ~300 MB/s, i.e. ~300 bytes per
-        // microsecond of CPU. That is 30x more CPU per byte than a plain copy,
-        // which is exactly the distinction the cost model needs to see.
-        stat.compute_ = static_cast<size_t>(t->size_ / 300.0f) + 5;
-        stat.wall_time_ = static_cast<float>(t->size_) / 300.0f;
-        return stat;
-      }
-      case Method::kDecompress: {
-        const auto *t = static_cast<const DecompressTask *>(task);
-        stat.io_size_ = t->size_;
-        // Decompression runs ~3x faster than compression.
-        stat.compute_ = static_cast<size_t>(t->size_ / 900.0f) + 5;
-        stat.wall_time_ = static_cast<float>(t->size_) / 900.0f;
-        return stat;
-      }
-      default:
-        return clio::cte::core::CoreInterposer::GetTaskStats(task);
-    }
-  }
+  clio::run::TaskStat GetTaskStats(
+      const clio::run::Task *task) const override;
 
+ private:
+  /**
+   * Whether an interposed PutBlob will be compressed by this pool: the
+   * caller's (or the configured default) codec is set and the write is a
+   * whole-blob, non-replica, non-emulated put — the same gate PutBlob uses.
+   * @param task the put
+   * @return true if PutBlob will run a codec over the payload
+   */
+  bool PutWillCompress(const clio::cte::core::PutBlobTask *task) const;
+
+  /**
+   * Whether a batch put will compress its records (codec requested, not
+   * replica-addressed, not emulated) — the gate MultiPutBlob uses.
+   * @param ctx the batch-wide context
+   * @return true if the records run through a codec
+   */
+  bool BatchWillCompress(const clio::cte::core::Context &ctx) const;
+
+ public:
 
 private:
   // Client for this ChiMod
@@ -163,15 +225,35 @@ private:
    */
   clio::run::TaskResume Monitor(clio::run::shared_ptr<MonitorTask> &task);
 
-
   /**
-   * The put entry point (Method::kDynamicSchedule).
-   *
-   * Forwards to Compress with the caller's codec. It does NOT choose one --
-   * the predictor layer that used to overwrite context.compress_lib_ here has
-   * been removed.
+   * Dynamic compression scheduling (Method::kDynamicSchedule)
+   * Analyzes data and determines optimal compression strategy
    */
   clio::run::TaskResume DynamicSchedule(clio::run::shared_ptr<DynamicScheduleTask> &task);
+
+  /**
+   * Codec autoselection: predict each candidate codec's ratio and time on
+   * this chunk and write the best one into task.context_ (compress_lib_,
+   * compress_preset_) and task.tier_score_. Runs only when the caller asked
+   * for it (context.dynamic_compress_ == kCompressDynamic).
+   * @param task the put being scheduled
+   * @param chunk_data the blob bytes (host-readable)
+   * @param chunk_size number of bytes at chunk_data
+   */
+  void SelectCodec(DynamicScheduleTask &task, void *chunk_data,
+                   clio::run::u64 chunk_size);
+
+  /**
+   * SelectCodec on a bare context, for the interposer PutBlob path, which
+   * has no DynamicScheduleTask.
+   * @param context the put's context; compress_lib_/compress_preset_ are
+   *        overwritten (compress_lib_ 0 = store raw)
+   * @param chunk_data the blob bytes (host-readable)
+   * @param chunk_size number of bytes at chunk_data
+   * @param tier_score out: the selected tier's score
+   */
+  void SelectCodecFor(Context &context, void *chunk_data,
+                      clio::run::u64 chunk_size, float *tier_score);
 
   /**
    * Compress data (Method::kCompress)
@@ -185,7 +267,17 @@ private:
    */
   clio::run::TaskResume Decompress(clio::run::shared_ptr<DecompressTask> &task);
 
+  /**
+   * Sample this node's CPU utilization and aggregated worker load
+   * (Method::kPollNodeLoad). Writes results into task->sample_.
+   */
+  clio::run::TaskResume PollNodeLoad(clio::run::shared_ptr<PollNodeLoadTask> &task);
 
+  /**
+   * Periodic task that iterates the tracked consumer list and dispatches
+   * PollNodeLoad to each consumer node (Method::kPollConsumers).
+   */
+  clio::run::TaskResume PollConsumers(clio::run::shared_ptr<PollConsumersTask> &task);
 
   // ---- Interposed core data verbs (issue #886 interposition) ----
   // The compressor speaks the CTE core's task interface: a default put with
@@ -265,6 +357,15 @@ private:
 
 private:
   // AI model predictors
+  std::unique_ptr<QTablePredictor> qtable_predictor_;
+  std::unique_ptr<LinRegTablePredictor> linreg_predictor_;
+  // Note: DistributionClassifier is a template - use DistributionClassifierFactory for type-erased access
+
+#ifdef CLIO_COMPRESSOR_ENABLE_DENSE_NN
+  std::unique_ptr<DenseNNPredictor> nn_predictor_;
+#endif
+
+  // Compression telemetry ring buffer for performance monitoring
   using CompressionTelemetryLog = ctp::ipc::ring_buffer<CompressionTelemetry, CLIO_TASK_ALLOC_T>;
   ctp::ipc::ShmPtr<CompressionTelemetryLog> compression_telemetry_log_;
   std::atomic<std::uint64_t> compression_logical_time_;
@@ -631,6 +732,16 @@ private:
   size_t RetireBatches();
   std::mutex batch_mu_;
   std::vector<std::shared_ptr<PendingDecomp>> batch_;
+  /**
+   * Take `req` back out of batch_ if the drainer has not gathered it yet.
+   *
+   * True: withdrawn, and nothing will ever touch its source or destination.
+   * False: the drainer already owns it, so a kernel may still be reading
+   * src_device and writing dst until `done`; the waiter must wait that out
+   * before releasing either. Giving up on an owned request let the caller
+   * free the page and the scratch under a live decode (CUDA error 700).
+   */
+  bool WithdrawDecomp(const std::shared_ptr<PendingDecomp> &req);
   std::thread batch_thread_;
   std::atomic<bool> batch_stop_{false};
   bool batch_enabled_ = false;
@@ -695,6 +806,24 @@ private:
   // Configuration
   CompressorConfig config_;
 
+  /** Resolved default_compress (#1251): mode kCompressSkip = no default. */
+  int default_mode_ = 0;
+  int default_lib_ = 0;     ///< wire ID when default_mode_ is static
+  int default_preset_ = 2;  ///< wire preset (kPresetBalanced)
+
+  /**
+   * Resolve config_.default_compress_ / default_preset_ into
+   * default_mode_ / default_lib_ / default_preset_. An unknown or unbuilt
+   * library is reported and leaves no default.
+   */
+  void ResolveDefaultCodec();
+
+  /**
+   * Give a write that requests no codec the pool's default (#1251).
+   * @param ctx the write's context; left alone if it names a codec or mode
+   */
+  void ApplyDefaultCodec(clio::cte::core::Context &ctx) const;
+
   // Target state cache for compression/tiering decisions
   std::unordered_map<std::string, TargetState> target_states_;
   std::mutex target_states_mutex_;
@@ -704,6 +833,110 @@ private:
   // future Compress traffic for tag T toward the most-recent reader of
   // T rather than the union of all consumers seen across all tags. The
   // bound applies per tag so a tag with more readers than this caps at
+  // kMaxConsumersPerTag and silently drops the rest (kDebug-logged).
+  static constexpr std::size_t kMaxConsumersPerTag = 32;
+
+  // Per-tag consumer node-id sets (small unsorted vector per tag, size
+  // capped at kMaxConsumersPerTag). Map entry is created on first
+  // Decompress for the tag. Guarded by tag_consumers_lock_.
+  //
+  // Skipped entirely when CompressorConfig::tracking_enabled_ is false —
+  // ScheduleTask then routes Compress via DirectHash(tag_id) and the
+  // periodic PollConsumers becomes a no-op.
+  std::unordered_map<clio::cte::core::TagId, std::vector<clio::run::u32>>
+      tag_consumers_;
+  clio::run::CoRwLock tag_consumers_lock_;
+
+  // Previous CPU times sample, used by PollNodeLoad to compute CPU%.
+  ctp::CpuTimes prev_cpu_times_;
+  std::mutex cpu_times_mutex_;
+
+  /**
+   * Append node_id to tag_consumers_[tag_id] if not already present and
+   * under the kMaxConsumersPerTag cap. No-op when
+   * CompressorConfig::tracking_enabled_ is false. Acquires
+   * tag_consumers_lock_ as a writer when an insert is needed.
+   * @param tag_id Tag that the inbound Decompress is reading.
+   * @param node_id Originating node ID of the Decompress request.
+   */
+  void RegisterConsumer(const clio::cte::core::TagId &tag_id, clio::run::u32 node_id);
+
+  /**
+   * Pick the best consumer node for placing future Compress traffic for
+   * `tag_id`. Returns:
+   *   - When tracking_enabled_=false OR no consumers known: invalid
+   *     (caller should fall back to DirectHash).
+   *   - When tracking_enabled_=true AND consumers known: the most
+   *     recently registered consumer (back of the per-tag vector).
+   * Acquires tag_consumers_lock_ as a reader.
+   * @param tag_id Tag the Compress task is operating on.
+   * @param node_id_out Out param: receives the chosen node ID on success.
+   * @return true if a consumer was found, false otherwise.
+   */
+  bool PickConsumerForTag(const clio::cte::core::TagId &tag_id,
+                          clio::run::u32 &node_id_out);
+
+  /**
+   * Estimate compression statistics using AI models
+   * @param chunk Pointer to data chunk
+   * @param chunk_size Size of chunk in bytes
+   * @param context Compression context with parameters
+   * @return Vector of compression statistics for candidate libraries
+   */
+  std::vector<CompressionStats> EstCompressionStats(
+      const void* chunk, clio::run::u64 chunk_size, const Context& context);
+
+  /**
+   * Estimate workflow compression time for a specific tier
+   * @param chunk_size Size of chunk in bytes
+   * @param tier_bw Tier bandwidth in bytes/second
+   * @param stats Compression statistics for library
+   * @param context Compression context
+   * @return Estimated time in milliseconds
+   */
+  double EstWorkflowCompressTime(
+      clio::run::u64 chunk_size, double tier_bw, const CompressionStats& stats,
+      const Context& context);
+
+  /**
+   * Find best compression for ratio optimization
+   * @param chunk Pointer to data chunk
+   * @param chunk_size Size of chunk
+   * @param container_id Container ID for placement
+   * @param stats Vector of compression statistics
+   * @param context Compression context
+   * @return Tuple of (tier_id, compress_lib, compress_preset, estimated_time, tier_score)
+   */
+  std::tuple<int, int, int, double, float> BestCompressRatio(
+      const void* chunk, clio::run::u64 chunk_size, int container_id,
+      const std::vector<CompressionStats>& stats, const Context& context);
+
+  /**
+   * Find best compression for time optimization
+   * @param chunk Pointer to data chunk
+   * @param chunk_size Size of chunk
+   * @param container_id Container ID for placement
+   * @param stats Vector of compression statistics
+   * @param context Compression context
+   * @return Tuple of (tier_id, compress_lib, compress_preset, estimated_time, tier_score)
+   */
+  std::tuple<int, int, int, double, float> BestCompressTime(
+      const void* chunk, clio::run::u64 chunk_size, int container_id,
+      const std::vector<CompressionStats>& stats, const Context& context);
+
+  /**
+   * Choose best compression based on context objective
+   * @param context Compression context
+   * @param chunk Pointer to data chunk
+   * @param chunk_size Size of chunk
+   * @param container_id Container ID for placement
+   * @param stats Vector of compression statistics
+   * @return Tuple of (tier_id, compress_lib, compress_preset, estimated_time, tier_score)
+   */
+  std::tuple<int, int, int, double, float> BestCompressForNode(
+      const Context& context, const void* chunk, clio::run::u64 chunk_size,
+      int container_id, const std::vector<CompressionStats>& stats);
+
   /**
    * Log compression telemetry for performance monitoring
    * @param telemetry Compression telemetry entry

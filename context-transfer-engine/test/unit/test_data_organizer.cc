@@ -75,6 +75,43 @@ static constexpr clio::run::u64 kBlobSize = 1 * 1024 * 1024;  // 1MB per blob
 // Fast organizer cadence so the test observes rescoring within seconds
 static constexpr clio::run::u32 kOrganizerPeriodMs = 500;
 
+/** Longest a test waits for the organizer to move a score (ms). Generous:
+ *  a slow runner takes more rounds to get there; a score that never moves
+ *  still fails. */
+static constexpr double kScoreDeadlineMs = 60000.0;
+
+/**
+ * Poll a blob's score until `pred` holds or kScoreDeadlineMs passes, instead
+ * of sleeping a fixed number of organizer periods. A read that lands inside
+ * a move window (issue #753) fails transiently and is simply retried.
+ * @param client CTE client
+ * @param tag_id tag of the blob
+ * @param name blob name
+ * @param pred condition on the score that ends the wait
+ * @return the last score read (-1 if no read ever succeeded)
+ */
+template <class Pred>
+static float WaitForScore(clio::cte::core::Client *client,
+                          const clio::cte::core::TagId &tag_id,
+                          const std::string &name, Pred pred) {
+  const auto t0 = std::chrono::steady_clock::now();
+  float score = -1.0f;
+  while (true) {
+    auto score_task = client->AsyncGetBlobScore(tag_id, name);
+    score_task.Wait();
+    if (score_task->GetReturnCode() == 0) {
+      score = score_task->score_;
+      if (pred(score)) break;
+    }
+    const double ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - t0)
+                          .count();
+    if (ms >= kScoreDeadlineMs) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  return score;
+}
+
 /**
  * Test fixture: two-tier CTE with the frecency organizer enabled
  * (organizer_tasks: 2 exercises the replica partitioning).
@@ -349,21 +386,9 @@ TEST_CASE("DataOrganizer - Hot Blob Promoted", "[organizer][promote][noleak]") {
   INFO("successful reads: " << ok_reads << "/30");
   REQUIRE(ok_reads >= 10);
 
-  // Let several organizer periods elapse
-  std::this_thread::sleep_for(
-      std::chrono::milliseconds(5 * kOrganizerPeriodMs));
-
-  float score = -1.0f;
-  for (int attempt = 0; attempt < 10; ++attempt) {
-    auto score_task = cte_client->AsyncGetBlobScore(tag_id, blob_name);
-    score_task.Wait();
-    if (score_task->GetReturnCode() == 0) {
-      score = score_task->score_;
-      break;
-    }
-    // Mid-move window (issue #753) — retry.
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-  }
+  // Wait for organizer rounds to promote it (polled, not a fixed sleep).
+  const float score = WaitForScore(cte_client, tag_id, blob_name,
+                                   [](float v) { return v > 0.5f; });
   INFO("hot blob score after organizer rounds: " << score);
   REQUIRE(score > 0.5f);
 
@@ -421,21 +446,9 @@ TEST_CASE("DataOrganizer - Cold Blob Demoted", "[organizer][demote][noleak]") {
   put_task.Wait();
   REQUIRE(put_task->GetReturnCode() == 0);
 
-  // No further accesses; let several organizer periods elapse
-  std::this_thread::sleep_for(
-      std::chrono::milliseconds(5 * kOrganizerPeriodMs));
-
-  float score = -1.0f;
-  for (int attempt = 0; attempt < 10; ++attempt) {
-    auto score_task = cte_client->AsyncGetBlobScore(tag_id, blob_name);
-    score_task.Wait();
-    if (score_task->GetReturnCode() == 0) {
-      score = score_task->score_;
-      break;
-    }
-    // Mid-move window (issue #753) — retry.
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-  }
+  // No further accesses; wait for organizer rounds to demote it.
+  const float score = WaitForScore(cte_client, tag_id, blob_name,
+                                   [](float v) { return v >= 0.0f && v < 0.7f; });
   INFO("cold blob score after organizer rounds: " << score);
   REQUIRE(score < 0.7f);
   REQUIRE(score > 0.2f);  // still recent — not bottomed out

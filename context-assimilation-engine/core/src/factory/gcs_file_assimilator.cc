@@ -123,16 +123,6 @@ clio::run::TaskResume GcsFileAssimilator::Schedule(const AssimilationCtx& ctx,
     CLIO_CO_RETURN;
   }
 
-  // Dependency-based scheduling is not yet supported (mirrors binary backend).
-  if (!ctx.depends_on.empty()) {
-    HLOG(kDebug,
-         "GcsFileAssimilator: Dependency handling not yet implemented "
-         "(depends_on: {})",
-         ctx.depends_on);
-    error_code = 0;
-    CLIO_CO_RETURN;
-  }
-
   // Parse the GCS source URL into bucket + object
   std::string bucket;
   std::string object;

@@ -26,6 +26,11 @@
 #include <yaml-cpp/yaml.h>
 
 #include <cstddef>
+#include <cstdint>
+
+#if !defined(_WIN32)
+#include <pthread.h>
+#endif
 #include <string>
 #include <vector>
 
@@ -33,7 +38,9 @@
 #include "clio_runtime/bdev/bdev_tasks.h"
 #include "clio_runtime/bdev/transports/mem_bdev_transport.h"
 #include "clio_runtime/config_manager.h"
+#include "clio_runtime/comutex.h"
 #include "clio_runtime/ipc_manager.h"
+#include "clio_runtime/worker.h"
 #include "simple_test.h"
 
 using clio::run::bdev::AllocPolicy;
@@ -189,6 +196,39 @@ bool AllBytesAre(const std::vector<char> &buf, size_t from, size_t to,
 //    with a *different* policy so a dropped field cannot be masked by the
 //    receiver's default.
 // ---------------------------------------------------------------------------
+// Runs first (definition order): no runtime has created the worker TLS key.
+TEST_CASE("BdevAllocPolicy - no runtime: CLIO_CUR_WORKER is null and a "
+          "CoMutex locks",
+          "[bdev][alloc_policy][tls]") {
+#if !defined(_WIN32)
+  // Reproduce macOS on any POSIX libc: the never-created key is the
+  // zero-initialised global, i.e. pthread key 0. libsystem keeps real
+  // pointers in its low keys; glibc leaves key 0 free. Take it and plant a
+  // bogus pointer there, as libsystem effectively does. Before the fix,
+  // CLIO_CUR_WORKER returned it and CoMutex::Lock dereferenced it as a Worker
+  // (cr_bdev_alloc_policy_tests SIGSEGV, macos-15 Boost leg).
+  REQUIRE(!clio::run::chi_cur_worker_key_created_);
+  pthread_key_t k;
+  bool planted = false;
+  if (pthread_key_create(&k, nullptr) == 0) {
+    if (k == clio::run::chi_cur_worker_key_.pthread_key_) {
+      pthread_setspecific(k, reinterpret_cast<void *>(uintptr_t{0x10}));
+      planted = true;
+    }
+  }
+  REQUIRE(CLIO_CUR_WORKER == nullptr);
+  {
+    clio::run::CoMutex mu;
+    clio::run::ScopedCoMutex lock(mu);
+  }
+  // The allocator path that crashed: GlobalBlockMap::Init takes its CoMutex.
+  MemBdevTransport t;
+  InitTransport(t, BdevType::kRam, kPoolSize, AllocPolicy::kEager);
+  REQUIRE(t.IsRamPageCommitted(0));
+  if (planted) pthread_setspecific(k, nullptr);
+#endif
+}
+
 TEST_CASE("BdevAllocPolicy - CreateParams round-trips alloc_policy_",
           "[bdev][alloc_policy][serialize]") {
   const AllocPolicy kPolicies[] = {AllocPolicy::kAuto, AllocPolicy::kEager,

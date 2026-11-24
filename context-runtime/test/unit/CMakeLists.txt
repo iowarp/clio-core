@@ -55,6 +55,12 @@ set(TASK_STAT_MODEL_TEST_SOURCES
   test_task_stat_model.cc
 )
 
+# LoadTaskArchive::bulk size bounds
+set(TASK_ARCHIVE_BULK_TEST_TARGET clio_run_task_archive_bulk_tests)
+set(TASK_ARCHIVE_BULK_TEST_SOURCES
+  test_task_archive_bulk.cc
+)
+
 # Web dashboard test executable (issue #990). Needs Poco: the dashboard's HTTP
 # transport is Poco::Net, and the test drives it with Poco's HTTP client.
 set(VIZ_TEST_TARGET clio_run_viz_tests)
@@ -108,6 +114,15 @@ set(IPC_TRANSPORT_MODES_TEST_SOURCES
 set(CLIENT_RETRY_TEST_TARGET clio_run_client_retry_tests)
 set(CLIENT_RETRY_TEST_SOURCES
   test_client_retry.cc
+)
+
+# Worker load-reservation test executable. ReservationUs is a static member
+# function, so this needs no worker, no orchestrator and no runtime -- which is
+# the point: the values it guards against (non-positive, NaN, past the integer
+# range) are exactly the ones a scheduler run does not reliably produce.
+set(WORKER_RESERVATION_TEST_TARGET clio_run_worker_reservation_tests)
+set(WORKER_RESERVATION_TEST_SOURCES
+  test_worker_reservation.cc
 )
 
 # Bdev AllocPolicy test executable (pure host: no server, no IPC, no GPU)
@@ -302,6 +317,75 @@ set_target_properties(${TASK_STAT_MODEL_TEST_TARGET} PROPERTIES
 set_target_properties(${TASK_STAT_MODEL_TEST_TARGET} PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
+
+# Create LoadTaskArchive bulk bounds test executable
+add_executable(${TASK_ARCHIVE_BULK_TEST_TARGET} ${TASK_ARCHIVE_BULK_TEST_SOURCES})
+
+target_include_directories(${TASK_ARCHIVE_BULK_TEST_TARGET} PRIVATE
+  ${CLIO_RUN_ROOT}/include
+  ${CLIO_RUN_ROOT}/test  # For simple_test.h
+  ${CLIO_RUN_ROOT}/modules/admin/include
+)
+
+target_link_libraries(${TASK_ARCHIVE_BULK_TEST_TARGET}
+  clio_admin_runtime
+  clio_admin_client
+  ctp::cxx
+  ${CMAKE_THREAD_LIBS_INIT}
+)
+
+set_target_properties(${TASK_ARCHIVE_BULK_TEST_TARGET} PROPERTIES
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
+# ChiMod ABI-fingerprint check. Three stand-in ChiMods from one source, built
+# into their own directory (NOT bin/, which ScanForChiMods walks): one with
+# the runtime's fingerprint, one with a different one, one with none.
+set(CHIMOD_ABI_TEST_TARGET clio_run_chimod_abi_check_tests)
+set(_abi_fake_dir ${CMAKE_BINARY_DIR}/test_chimod_abi)
+set(_abi_fake_defs "")
+foreach(_mode_name IN ITEMS 0:match 1:stale 2:none 3:bare)
+  string(REPLACE ":" ";" _pair ${_mode_name})
+  list(GET _pair 0 _mode)
+  list(GET _pair 1 _name)
+  set(_tgt clio_run_abi_fake_${_name})
+  add_library(${_tgt} MODULE test_chimod_abi_fake.cc)
+  target_compile_definitions(${_tgt} PRIVATE FAKE_ABI_MODE=${_mode})
+  # Link admin like every real module runtime does: its get_chimod_abi() is
+  # then reachable through dlsym on the "none" library's handle, which the
+  # check must not mistake for the library's own. "bare" links no module, so
+  # no get_chimod_abi() is reachable from it at all.
+  if(_name STREQUAL "bare")
+    target_link_libraries(${_tgt} PRIVATE clio_run_cxx)
+  else()
+    target_link_libraries(${_tgt} PRIVATE clio_run_cxx clio_admin_runtime)
+    if(NOT APPLE AND NOT WIN32)
+      target_link_options(${_tgt} PRIVATE -Wl,--no-as-needed)
+    endif()
+  endif()
+  set_target_properties(${_tgt} PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    WINDOWS_EXPORT_ALL_SYMBOLS ON  # as add_clio_module_runtime does
+    LIBRARY_OUTPUT_DIRECTORY ${_abi_fake_dir})
+  string(TOUPPER ${_name} _upper)
+  list(APPEND _abi_fake_defs
+    "ABI_FAKE_${_upper}_LIB=\"$<TARGET_FILE:${_tgt}>\"")
+  list(APPEND _abi_fake_targets ${_tgt})
+endforeach()
+add_executable(${CHIMOD_ABI_TEST_TARGET} test_chimod_abi_check.cc)
+target_include_directories(${CHIMOD_ABI_TEST_TARGET} PRIVATE
+  ${CLIO_RUN_ROOT}/test)  # For simple_test.h
+target_compile_definitions(${CHIMOD_ABI_TEST_TARGET} PRIVATE ${_abi_fake_defs})
+target_link_libraries(${CHIMOD_ABI_TEST_TARGET} clio_run_cxx ctp::cxx
+  ${CMAKE_THREAD_LIBS_INIT})
+add_dependencies(${CHIMOD_ABI_TEST_TARGET} ${_abi_fake_targets})
+set_target_properties(${CHIMOD_ABI_TEST_TARGET} PROPERTIES
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 # Create web dashboard test executable (issue #990). Skipped entirely when Poco
 # is absent: without it the build has no HTTP transport to test.
@@ -513,6 +597,23 @@ set_target_properties(${RUNTIME_CLEANUP_TEST_TARGET} PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
+# Address-table WAL replay order (#1193)
+add_executable(test_address_table_wal test_address_table_wal.cc)
+target_include_directories(test_address_table_wal PRIVATE
+  ${CLIO_RUN_ROOT}/include
+  ${CLIO_RUN_ROOT}/test  # For simple_test.h
+)
+target_link_libraries(test_address_table_wal
+  clio_run_cxx
+  ctp::cxx
+  ${CMAKE_THREAD_LIBS_INIT}
+)
+set_target_properties(test_address_table_wal PROPERTIES
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
 # Create IPC Errors test executable
 add_executable(${IPC_ERRORS_TEST_TARGET} ${IPC_ERRORS_TEST_SOURCES})
 
@@ -681,6 +782,26 @@ set_target_properties(${QUEUE_DEPTH_FLURRY_TEST_TARGET} PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 endif()
+
+# Create Worker load-reservation test executable (pure: no server, no GPU).
+add_executable(${WORKER_RESERVATION_TEST_TARGET} ${WORKER_RESERVATION_TEST_SOURCES})
+
+target_include_directories(${WORKER_RESERVATION_TEST_TARGET} PRIVATE
+  ${CLIO_RUN_ROOT}/include
+  ${CLIO_RUN_ROOT}/test  # For simple_test.h
+)
+
+target_link_libraries(${WORKER_RESERVATION_TEST_TARGET}
+  clio_run_cxx                # Main CLIO Runtime library
+  ctp::cxx                    # ClioCtp library
+  ${CMAKE_THREAD_LIBS_INIT}   # Threading support
+)
+
+set_target_properties(${WORKER_RESERVATION_TEST_TARGET} PROPERTIES
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
 
 # Create Bdev AllocPolicy test executable.
 # Exercises CreateParams (serialization + YAML `alloc:` parsing) and drives
@@ -891,8 +1012,12 @@ if(CLIO_CORE_ENABLE_SYCL)
 endif()
 
 # GPU task-trace, POD-transfer, and runtime tests were removed along
-# with the GPU runtime. Coverage of the kernel→CPU path now lives in
-# the SYCL kernel-side tests (test_sycl_chimod_to_cpu, test_sycl_cte_*).
+# with the GPU runtime. On SYCL the kernel→CPU path currently has NO running
+# test: cr_gpu_kernel_stress_sycl above is disabled, and the
+# test_sycl_chimod_to_cpu / test_sycl_cte_* tests this note used to cite do
+# not exist. On Intel GPUs the in-kernel Future::Wait() cannot observe the
+# host's completion write at all (issue #1086), so that path needs a design
+# change, not just a test.
 
 # GPU coroutine test removed along with the GPU runtime concept.
 
@@ -913,6 +1038,27 @@ if(CLIO_CORE_ENABLE_TESTS)
     ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;CLIO_TEST_MODE=1;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
     TIMEOUT 300
   )
+
+  # LoadTaskArchive::bulk size bounds. Own process: in-process runtime.
+  add_test(
+    NAME cr_task_archive_bulk_tests
+    COMMAND ${TASK_ARCHIVE_BULK_TEST_TARGET}
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_task_archive_bulk_tests PROPERTIES
+    ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;CLIO_TEST_MODE=1;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
+    TIMEOUT 300
+    RESOURCE_LOCK "clio_runtime_port"
+  )
+
+  # ChiMod ABI-fingerprint check: no runtime, just ModuleManager::LoadChiMod
+  # on the stand-in libraries.
+  add_test(
+    NAME cr_chimod_abi_check
+    COMMAND ${CHIMOD_ABI_TEST_TARGET}
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_chimod_abi_check PROPERTIES TIMEOUT 60)
 
   # Web dashboard (issue #990). Own ctest entry => own process: it brings up an
   # in-process runtime, and CLIO_INIT is once-per-process. The dashboard binds an
@@ -1166,6 +1312,18 @@ if(CLIO_CORE_ENABLE_TESTS)
     TIMEOUT 120
   )
 
+  # Issue #1015: CLIO_WITH_RUNTIME=1 must attach to a running daemon, not fail
+  # and not start a second runtime. Own process: CLIO_INIT is once-per-process.
+  add_test(
+    NAME cr_external_client_with_runtime_attaches
+    COMMAND ${EXTERNAL_CLIENT_TEST_TARGET} "ExternalClient - WITH_RUNTIME=1 attaches to a running runtime"
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_external_client_with_runtime_attaches PROPERTIES
+    ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
+    TIMEOUT 120
+  )
+
   add_test(
     NAME cr_external_client_operations
     COMMAND ${EXTERNAL_CLIENT_TEST_TARGET} "ExternalClient - Client Operations"
@@ -1202,6 +1360,28 @@ if(CLIO_CORE_ENABLE_TESTS)
   set_tests_properties(cr_runtime_cleanup_tests PROPERTIES
     ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
     TIMEOUT 120
+  )
+
+  add_test(
+    NAME cr_address_table_wal
+    COMMAND test_address_table_wal
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_address_table_wal PROPERTIES
+    ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1"
+    RESOURCE_LOCK "clio_runtime"
+    TIMEOUT 120
+  )
+
+  # Worker load-reservation Tests (no server, no GPU — safe to run anywhere)
+  add_test(
+    NAME cr_worker_reservation_tests
+    COMMAND ${WORKER_RESERVATION_TEST_TARGET}
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_worker_reservation_tests PROPERTIES
+    ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 60
   )
 
   # Bdev AllocPolicy Tests (no server, no GPU — safe to run anywhere)
@@ -1269,6 +1449,21 @@ if(CLIO_CORE_ENABLE_TESTS)
     ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
     TIMEOUT 300
   )
+  # issue #1039: a request that reaches the runtime before its pool exists
+  # (client started mid-compose) must be held until the pool is created, not
+  # consumed and dropped. One case per client ingress path.
+  foreach(_late_mode SHM TCP)
+    string(TOLOWER "${_late_mode}" _late_lc)
+    add_test(
+      NAME cr_ipc_transport_${_late_lc}_late_pool
+      COMMAND ${IPC_TRANSPORT_MODES_TEST_TARGET} "IpcTransportMode - ${_late_mode} Task Before Pool Exists"
+      WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    set_tests_properties(cr_ipc_transport_${_late_lc}_late_pool PROPERTIES
+      ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
+      TIMEOUT 300
+    )
+  endforeach()
   endif()  # NOT WIN32 (ipc_transport_modes tests)
 
   # Shutdown Battletest (issue #710) — POSIX-only. Each scenario runs in its
@@ -1433,7 +1628,7 @@ if(CLIO_CORE_ENABLE_TESTS)
       cr_ipc_transport_default
     )
   endif()
-  set_tests_properties(${_msan_skip_tests} PROPERTIES LABELS "msan_skip")
+  set_property(TEST ${_msan_skip_tests} APPEND PROPERTY LABELS "msan_skip")
 endif()
 
 # macOS (issue #482, fixed): the cross-process client/transport tests reach the
@@ -1528,9 +1723,11 @@ set(_install_test_targets
   ${SAVE_LOAD_TASK_TEST_TARGET}
   ${LOCAL_TASK_ARCHIVE_TEST_TARGET}
   ${TASK_STAT_MODEL_TEST_TARGET}
+  ${TASK_ARCHIVE_BULK_TEST_TARGET}
   ${STREAMING_TEST_TARGET}
   ${RUNTIME_CLEANUP_TEST_TARGET}
   ${IPC_ERRORS_TEST_TARGET}
+  ${WORKER_RESERVATION_TEST_TARGET}
 )
 if(NOT WIN32)
   list(APPEND _install_test_targets
@@ -1594,8 +1791,12 @@ if(CLIO_CORE_ENABLE_MPI)
               ${MPIEXEC_POSTFLAGS}
       WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     )
+    # 4 ranks: OpenMPI refuses to start more ranks than it counts slots
+    # (physical cores), so a small VM or laptop failed this before the test
+    # ran. The MCA env var lets it oversubscribe; MPICH ignores it (unlike
+    # --oversubscribe, which MPICH rejects).
     set_tests_properties(cr_mpi_bdev_transport_all_modes PROPERTIES
-      ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
+      ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500;OMPI_MCA_rmaps_base_oversubscribe=1"
       RESOURCE_LOCK "clio_runtime"
       TIMEOUT 300
     )

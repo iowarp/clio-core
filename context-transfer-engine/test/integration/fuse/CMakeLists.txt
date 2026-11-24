@@ -15,6 +15,9 @@ add_test(
 set_tests_properties(cte_fuse_integration PROPERTIES
     LABELS "integration;docker;fuse"
     TIMEOUT 300
+    # Keep the script's own deadline (CI/compose_wait.sh) inside ctest's, so a
+    # hang prints node diagnostics before ctest kills the script.
+    ENVIRONMENT "CW_BUDGET_SEC=240"
 )
 
 message(STATUS "CTE FUSE integration test configured")

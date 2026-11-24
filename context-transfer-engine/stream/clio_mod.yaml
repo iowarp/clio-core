@@ -1,0 +1,17 @@
+# Stream ChiMod: a byte-stream layer over CTE tags. Owns the page layout
+# (1 MiB page blobs named by decimal page index), each stream's
+# authoritative logical size, and a deferred append pipeline that stages
+# appended bytes and merges them into the stream tail in batches.
+module_name: stream
+namespace: clio::cte
+version: 1.0.0
+
+kCreate: 0
+kDestroy: 1
+kMonitor: 9
+
+kSizeOp: 10     # get / max / reserve / set / drop a stream's logical size
+kAppend: 11     # stage bytes for a deferred append (runs on the caller's node)
+kFlush: 12      # wait until this node's appends to a stream are merged
+kSequence: 13   # periodic: drain this node's pending appends
+kPlan: 14       # at the stream home: order a batch, reserve the tail, copy

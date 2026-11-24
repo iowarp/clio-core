@@ -1,8 +1,12 @@
 #include <chrono>
 #include <csignal>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <vector>
 #include <string>
 #include <thread>
 
@@ -14,6 +18,13 @@
 #include "clio_runtime/singletons.h"
 #include "clio_runtime/types.h"
 #include "clio_run_commands.h"
+
+#ifdef __linux__
+#include <sys/prctl.h>
+#include <execinfo.h>
+#include <signal.h>
+#include <unistd.h>
+#endif
 
 namespace {
 volatile sig_atomic_t g_keep_running = 1;
@@ -127,8 +138,8 @@ bool InductNode() {
 /**
  * Block until the runtime should exit: either a SIGTERM/SIGINT flipped
  * g_keep_running, or a StopRuntimeTask requested a graceful stop via
- * RuntimeManager::RequestStop. Returning lets main() exit normally so the
- * atexit teardown (ServerFinalize) runs on this main thread.
+ * RuntimeManager::RequestStop. The caller then finalizes the runtime
+ * (ServerFinalize) on this main thread while the workers are still alive.
  */
 void RunUntilStopped() {
   auto* runtime_manager = CLIO_RUNTIME_MANAGER;
@@ -154,20 +165,20 @@ void PrintVizUsage() {
   HIPRINT("      free one). Also CLIO_VIZ_PORT / `viz: port:`.");
   HIPRINT("  --viz-bind <addr>: Dashboard bind address (default 127.0.0.1).");
   HIPRINT("      Also CLIO_VIZ_BIND / `viz: bind:`.");
+  HIPRINT("  The dashboard can be started/stopped later without a restart:");
+  HIPRINT("      clio-run viz <start|stop|status>");
 }
 
 void PrintRuntimeStartUsage() {
-  HIPRINT("Usage: clio runtime start [--induct] [--ephemeral] [viz options]");
-  HIPRINT("  Starts the Clio runtime server");
+  HIPRINT("Usage: clio-run start [--fresh] [--induct] [--ephemeral] [viz options]");
+  HIPRINT("  Starts the Clio runtime server. It RECOVERS every piece of persistent");
+  HIPRINT("  state it finds (pools, metadata logs, allocators, data); it never");
+  HIPRINT("  discards state unless asked to.");
+  HIPRINT("  --fresh: Discard this node's persistent state and start empty");
   HIPRINT("  --induct: Register this node with all existing cluster nodes");
   HIPRINT("  --ephemeral: Skip the default compose; start bare (admin only)");
-  PrintVizUsage();
-}
-
-void PrintRuntimeRestartUsage() {
-  HIPRINT("Usage: clio runtime restart [--induct] [viz options]");
-  HIPRINT("  Restarts the Clio runtime, replaying WAL to recover address table");
-  HIPRINT("  --induct: Register this node with all existing cluster nodes");
+  HIPRINT("  --disk <path>: Override storage root directory for this run");
+  HIPRINT("      (default: ~/.clio). Also CLIO_STORAGE_ROOT env var.");
   PrintVizUsage();
 }
 
@@ -192,6 +203,52 @@ enum class VizArg {
   // NOTE: not kError -- logging.h #defines kError as a log level, so it cannot
   // be used as an identifier anywhere in this tree.
 };
+
+/** Outcome of looking at one argument through the disk flag's eyes. */
+enum class DiskArg {
+  kNotMine,   ///< not a disk flag; the caller should handle it
+  kConsumed,  ///< consumed (i advanced past any value)
+  kBadValue,  ///< a disk flag, but malformed
+};
+
+/**
+ * Parse one argument as a disk flag.
+ *
+ * The value is pushed into the environment rather than into ConfigManager
+ * because ConfigManager does not exist yet (this runs before CLIO_INIT) and
+ * because environment overrides are re-applied after every config load.
+ * The directory is created if it does not exist.
+ */
+DiskArg ParseDiskArg(int argc, char* argv[], int& i) {
+  const std::string arg = argv[i];
+  if (arg == "--disk") {
+    if (i + 1 >= argc) {
+      HLOG(kError, "--disk requires a path value");
+      return DiskArg::kBadValue;
+    }
+    const std::string disk_path = argv[i + 1];
+    if (disk_path.empty()) {
+      HLOG(kError, "--disk path cannot be empty");
+      return DiskArg::kBadValue;
+    }
+
+    // Create the directory if it does not exist.
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::create_directories(disk_path, ec);
+    if (ec) {
+      HLOG(kError, "Failed to create disk directory {}: {}", disk_path,
+           ec.message());
+      return DiskArg::kBadValue;
+    }
+
+    // Set the environment variable so ConfigManager picks it up during CLIO_INIT.
+    SetEnv("CLIO_STORAGE_ROOT", disk_path);
+    ++i;
+    return DiskArg::kConsumed;
+  }
+  return DiskArg::kNotMine;
+}
 
 /**
  * Parse one argument as a viz flag.
@@ -251,15 +308,101 @@ void EnableVizForDaemon() {
 
 }  // namespace
 
+/**
+ * Let a debugger attach to this daemon when CLIO_ALLOW_PTRACE=1. Hosts with
+ * kernel.yama.ptrace_scope=1 only allow tracing of descendants, so a hung or
+ * stalled runtime could not be sampled with `gdb -p` without restarting it
+ * under gdb (which yields one snapshot and then kills it). Opt-in only.
+ */
+static void MaybeAllowPtrace() {
+#if defined(__linux__) && defined(PR_SET_PTRACER)
+  const char *e = std::getenv("CLIO_ALLOW_PTRACE");
+  if (e != nullptr && e[0] == '1') {
+    prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
+  }
+#endif
+}
+
+namespace {
+
+#if defined(__SANITIZE_ADDRESS__)
+#define CLIO_FATAL_REPORT_ENABLED 0  // ASan reports SEGV itself, better
+#elif defined(__linux__)
+#define CLIO_FATAL_REPORT_ENABLED 1
+#else
+#define CLIO_FATAL_REPORT_ENABLED 0  // siginfo_t/backtrace are POSIX/glibc
+#endif
+
+#if CLIO_FATAL_REPORT_ENABLED
+/**
+ * Fatal-signal reporter: the runtime has died mid-run with nothing in its
+ * log and no core (core dumps are often off on clusters), so a crash was
+ * indistinguishable from a kill. Writes the signal, faulting address and a
+ * raw backtrace to stderr (the runtime log) with async-signal-safe calls,
+ * then re-raises with the default action so the exit status is unchanged.
+ */
+void FatalSignalReport(int sig, siginfo_t *si, void *) {
+  char msg[160];
+  int n = std::snprintf(msg, sizeof(msg),
+                        "\n=== clio_run FATAL signal %d (%s) addr=%p pid=%d\n",
+                        sig, strsignal(sig), si ? si->si_addr : nullptr,
+                        static_cast<int>(getpid()));
+  if (n > 0) {
+    ssize_t w = write(STDERR_FILENO, msg, static_cast<size_t>(n));
+    (void)w;
+  }
+  void *frames[64];
+  int depth = backtrace(frames, 64);
+  backtrace_symbols_fd(frames, depth, STDERR_FILENO);
+  signal(sig, SIG_DFL);
+  raise(sig);
+}
+
+void InstallFatalSignalReport() {
+  // backtrace() loads libgcc on first use, which is not signal-safe: do it
+  // now.
+  void *warm[1];
+  (void)backtrace(warm, 1);
+  struct sigaction sa;
+  std::memset(&sa, 0, sizeof(sa));
+  sa.sa_sigaction = FatalSignalReport;
+  sa.sa_flags = SA_SIGINFO | SA_RESETHAND | SA_ONSTACK;
+  sigemptyset(&sa.sa_mask);
+  for (int sig : {SIGSEGV, SIGBUS, SIGABRT, SIGFPE, SIGILL}) {
+    sigaction(sig, &sa, nullptr);
+  }
+}
+#else
+void InstallFatalSignalReport() {}
+#endif
+
+}  // namespace
+
 int RuntimeStart(int argc, char* argv[]) {
+  InstallFatalSignalReport();
+  MaybeAllowPtrace();
   bool induct = false;
+  bool fresh = false;
   for (int i = 0; i < argc; ++i) {
+    DiskArg disk_arg = ParseDiskArg(argc, argv, i);
+    if (disk_arg == DiskArg::kBadValue) {
+      PrintRuntimeStartUsage();
+      return 1;
+    }
+    if (disk_arg == DiskArg::kConsumed) {
+      continue;
+    }
+
     VizArg viz_arg = ParseVizArg(argc, argv, i);
     if (viz_arg == VizArg::kBadValue) {
       PrintRuntimeStartUsage();
       return 1;
     }
     if (viz_arg == VizArg::kConsumed) {
+      continue;
+    }
+    if (std::strcmp(argv[i], "--fresh") == 0) {
+      fresh = true;
       continue;
     }
     if (std::strcmp(argv[i], "--induct") == 0) {
@@ -283,9 +426,19 @@ int RuntimeStart(int argc, char* argv[]) {
   std::signal(SIGTERM, SignalHandler);
   std::signal(SIGINT, SignalHandler);
 
-  HLOG(kDebug, "Starting Clio runtime...");
+  // Recovery is the default and only `--fresh` discards state: an operator
+  // (re)starting a service must never lose its data because a flag was
+  // missing.
+  const bool recover = !fresh;
+  if (recover) {
+    HLOG(kInfo, "Starting Clio runtime (recovering persistent state)...");
+  } else {
+    HLOG(kWarning, "Starting Clio runtime with --fresh: this node's "
+         "persistent state is discarded");
+  }
 
-  if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kRuntime, true)) {
+  if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kRuntime, true,
+                           /*is_restart=*/recover)) {
     HLOG(kError, "Failed to initialize Clio runtime");
     return 1;
   }
@@ -315,70 +468,16 @@ int RuntimeStart(int argc, char* argv[]) {
   // DestroyAllContainers() does it after StopWorkers(). See the
   // "no ShutdownAdminChiMod()" note near the top of this file for why tearing
   // it down while the workers still run wedges the shutdown.
-  HLOG(kDebug, "Clio runtime stopped (finalization will happen automatically)");
+  //
+  // Finalize explicitly, here on the main thread, instead of leaving it to
+  // the atexit handler (#1365, #1357). On Windows that handler belongs to the
+  // runtime DLL and runs while the DLL unloads, after the OS has already
+  // terminated every other thread: the stop hooks then queue work that no
+  // worker will ever run and wait out the whole grace period. Calling it here
+  // runs the teardown with the workers alive on every platform; the atexit
+  // registration stays as the fallback and is a no-op once this has run.
+  clio::run::CLIO_RUNTIME_FINALIZE();
+  HLOG(kDebug, "Clio runtime stopped");
   return 0;
 }
 
-int RuntimeRestart(int argc, char* argv[]) {
-  bool induct = false;
-  for (int i = 0; i < argc; ++i) {
-    VizArg viz_arg = ParseVizArg(argc, argv, i);
-    if (viz_arg == VizArg::kBadValue) {
-      PrintRuntimeRestartUsage();
-      return 1;
-    }
-    if (viz_arg == VizArg::kConsumed) {
-      continue;
-    }
-    if (std::strcmp(argv[i], "--induct") == 0) {
-      induct = true;
-    } else if (std::strcmp(argv[i], "--help") == 0 ||
-               std::strcmp(argv[i], "-h") == 0) {
-      PrintRuntimeRestartUsage();
-      return 0;
-    } else {
-      HLOG(kError, "Unknown argument: {}", argv[i]);
-      PrintRuntimeRestartUsage();
-      return 1;
-    }
-  }
-
-  std::signal(SIGTERM, SignalHandler);
-  std::signal(SIGINT, SignalHandler);
-
-  HLOG(kInfo, "Restarting Clio runtime (WAL replay enabled)...");
-
-  if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kRuntime, true,
-                           /*is_restart=*/true)) {
-    HLOG(kError, "Failed to restart Clio runtime");
-    return 1;
-  }
-
-  HLOG(kInfo, "Clio runtime restarted successfully");
-
-  if (!InitializeAdminChiMod()) {
-    HLOG(kError, "FATAL ERROR: Failed to find or initialize admin ChiMod");
-    return 1;
-  }
-
-  HLOG(kDebug, "Admin ChiMod initialized successfully with pool ID {}", clio::run::kAdminPoolId);
-
-  EnableVizForDaemon();
-
-  if (induct) {
-    if (!InductNode()) {
-      HLOG(kError, "FATAL ERROR: Failed to induct node into cluster");
-      return 1;
-    }
-  }
-
-  RunUntilStopped();
-
-  HLOG(kDebug, "Shutting down Clio runtime...");
-  // The admin pool is NOT destroyed here — ServerFinalize()'s
-  // DestroyAllContainers() does it after StopWorkers(). See the
-  // "no ShutdownAdminChiMod()" note near the top of this file for why tearing
-  // it down while the workers still run wedges the shutdown.
-  HLOG(kDebug, "Clio runtime stopped (finalization will happen automatically)");
-  return 0;
-}

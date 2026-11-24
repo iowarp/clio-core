@@ -43,7 +43,7 @@ services:
     command: >
       "
         echo 'Node 1: Starting runtime in background...' &&
-        /workspace/build/bin/clio_run runtime start &
+        /workspace/build/bin/clio_run runtime start --fresh &
         RUNTIME_PID=\$! &&
         echo 'Node 1: Runtime started (PID \$RUNTIME_PID). Container stays alive for test runner.' &&
         sleep infinity
@@ -77,7 +77,7 @@ services:
     command: >
       "
         echo 'Node 2: Starting runtime...' &&
-        /workspace/build/bin/clio_run runtime start
+        /workspace/build/bin/clio_run runtime start --fresh
       "
 
   # Node 3
@@ -108,7 +108,7 @@ services:
     command: >
       "
         echo 'Node 3: Starting runtime...' &&
-        /workspace/build/bin/clio_run runtime start
+        /workspace/build/bin/clio_run runtime start --fresh
       "
 
   # Node 4
@@ -139,7 +139,7 @@ services:
     command: >
       "
         echo 'Node 4: Starting runtime...' &&
-        /workspace/build/bin/clio_run runtime start
+        /workspace/build/bin/clio_run runtime start --fresh
       "
 
 networks:

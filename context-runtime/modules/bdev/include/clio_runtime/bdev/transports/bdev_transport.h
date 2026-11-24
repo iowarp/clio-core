@@ -54,8 +54,9 @@ class BdevTransport {
   /**
    * Initialize the transport
    * @param params Creation parameters
-   * @param pool_name Pool name; doubles as the file path (kFile) or S3 bucket
-   *   name (kS3). Carried on the create task, not in CreateParams.
+   * @param pool_name Pool name; doubles as the file path (kFile), the S3
+   *   bucket name (kS3) or the daos:// URI (kDaos). Carried on the create
+   *   task, not in CreateParams.
    * @param runtime Pointer to the parent bdev runtime
    * @return true if successful
    */
@@ -75,6 +76,35 @@ class BdevTransport {
    * @return true if successful
    */
   virtual bool AllocateBlocks(size_t size, int worker_id, std::vector<Block>& blocks) = 0;
+
+  /**
+   * AllocateBlocks without its blocking part. Picks the blocks (fast,
+   * worker-local state) and reports how far the device must be backed for
+   * them; the caller runs EnsureBacked(need) OFF the runtime worker (it may
+   * fallocate a file for seconds) and then FinishAllocate. A worker blocked
+   * in that syscall can neither run tasks nor answer liveness probes.
+   * @param need receives the end offset that must be backed (0: nothing to do,
+   *        the allocation is already complete)
+   */
+  virtual bool AllocateBlocksDeferred(size_t size, int worker_id,
+                                      std::vector<Block>& blocks,
+                                      clio::run::u64* need) {
+    *need = 0;
+    return AllocateBlocks(size, worker_id, blocks);
+  }
+  /** Back the device up to end (may block; thread-safe). */
+  virtual bool EnsureBacked(clio::run::u64 end) {
+    (void)end;
+    return true;
+  }
+  /** Complete a deferred allocation once EnsureBacked returned backed_ok. On
+   *  failure the blocks are freed (into worker_id's list) and cleared. */
+  virtual void FinishAllocate(bool backed_ok, int worker_id,
+                              std::vector<Block>& blocks) {
+    (void)backed_ok;
+    (void)worker_id;
+    (void)blocks;
+  }
 
   /**
    * Free previously allocated blocks
@@ -108,6 +138,19 @@ class BdevTransport {
    * Get the remaining allocatable size
    */
   virtual clio::run::u64 GetRemainingSize() const = 0;
+
+  /**
+   * Make the allocator-state log durable (fsync) and compact it once it has
+   * grown well past the live-block count. No-op without a log.
+   */
+  virtual void FlushAllocLog() {}
+
+  /**
+   * Make every completed write durable, then the allocator state. Memory
+   * tiers have nothing to sync.
+   * @return false if the device could not be synced
+   */
+  virtual bool Sync() { return true; }
 };
 
 /**

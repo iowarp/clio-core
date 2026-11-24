@@ -63,6 +63,7 @@
 #include "clio_runtime/ipc_manager.h"
 #include "clio_runtime/pool_manager.h"
 #include "clio_runtime/viz/viz_json.h"
+#include "clio_ctp/util/msan.h"
 #include "clio_runtime/viz/viz_server.h"
 
 #include <clio_runtime/bdev/bdev_client.h>
@@ -87,9 +88,23 @@ struct HttpReply {
   std::string body;
 };
 
+/** Clear the MSan shadow on everything uninstrumented Poco just produced.
+ *  Poco parses the response off the socket, so the status line, the headers
+ *  and the body all arrive as bytes MSan has no record of; every assertion
+ *  below reads them. */
+void UnpoisonReply(HttpReply *reply) {
+  CTP_MSAN_UNPOISON_OBJ(*reply);
+  CTP_MSAN_UNPOISON_STRING(reply->content_type);
+  CTP_MSAN_UNPOISON_STRING(reply->body);
+}
+
 /** GET @p path from the dashboard on 127.0.0.1:@p port. */
 HttpReply HttpGet(clio::run::u32 port, const std::string &path) {
   HttpReply reply;
+  // Nothing under test runs in here -- it is all Poco, uninstrumented, doing
+  // its own address parsing and socket work through libc. See UnpoisonReply
+  // for the data it hands back.
+  ctp::MsanInterceptorCheckGuard msan_guard;
   Poco::Net::HTTPClientSession session("127.0.0.1",
                                        static_cast<Poco::UInt16>(port));
   session.setTimeout(Poco::Timespan(15, 0));
@@ -98,9 +113,13 @@ HttpReply HttpGet(clio::run::u32 port, const std::string &path) {
   session.sendRequest(request);
   Poco::Net::HTTPResponse response;
   std::istream &stream = session.receiveResponse(response);
+  CTP_MSAN_UNPOISON_OBJ(response);
   Poco::StreamCopier::copyToString(stream, reply.body);
   reply.status = static_cast<int>(response.getStatus());
-  reply.content_type = response.getContentType();
+  const std::string &ctype = response.getContentType();
+  CTP_MSAN_UNPOISON_STRING(ctype);  // read by operator= before we could clear it
+  reply.content_type = ctype;
+  UnpoisonReply(&reply);
   return reply;
 }
 
@@ -110,6 +129,7 @@ HttpReply HttpGet(clio::run::u32 port, const std::string &path) {
 HttpReply HttpPostForm(clio::run::u32 port, const std::string &path,
                        const std::string &form) {
   HttpReply reply;
+  ctp::MsanInterceptorCheckGuard msan_guard;  // see HttpGet
   Poco::Net::HTTPClientSession session("127.0.0.1",
                                        static_cast<Poco::UInt16>(port));
   session.setTimeout(Poco::Timespan(60, 0));
@@ -120,9 +140,13 @@ HttpReply HttpPostForm(clio::run::u32 port, const std::string &path,
   session.sendRequest(request) << form;
   Poco::Net::HTTPResponse response;
   std::istream &stream = session.receiveResponse(response);
+  CTP_MSAN_UNPOISON_OBJ(response);
   Poco::StreamCopier::copyToString(stream, reply.body);
   reply.status = static_cast<int>(response.getStatus());
-  reply.content_type = response.getContentType();
+  const std::string &ctype = response.getContentType();
+  CTP_MSAN_UNPOISON_STRING(ctype);  // see HttpGet
+  reply.content_type = ctype;
+  UnpoisonReply(&reply);
   return reply;
 }
 
@@ -133,7 +157,9 @@ bool Contains(const std::string &haystack, const std::string &needle) {
 /** Report what a failing body actually said -- a 200 with the wrong shape and a
  *  503 from a timed-out Monitor are very different bugs. */
 void Explain(const std::string &what, const HttpReply &reply) {
-  std::cout << "  " << what << " -> " << reply.status << " "
+  // std::to_string, not operator<<: libstdc++'s integer formatter builds its
+  // digits on stack HttpGet's Poco session left poisoned.
+  std::cout << "  " << what << " -> " + std::to_string(reply.status) + " "
             << reply.body.substr(0, 300) << std::endl;
 }
 
@@ -407,6 +433,7 @@ TEST_CASE("Viz asset search covers build and install layouts", "[viz]") {
 
   // CLIO_VIZ_PATH takes precedence, so assets can be edited without a rebuild.
   std::filesystem::path root = MakeAssetTree();
+  CTP_MSAN_UNPOISON_PATH(root);  // assembled inside libstdc++.so
   std::filesystem::path viz_root = root.parent_path() / "clio_viz_test_root";
   std::filesystem::remove_all(viz_root);
   std::filesystem::create_directories(viz_root / "clio_admin");
@@ -536,6 +563,21 @@ TEST_CASE("Viz HTTP server answers the dashboard API", "[viz]") {
   HttpReply missing = HttpGet(port, "/api/does-not-exist");
   REQUIRE(missing.status == 404);
   REQUIRE(Contains(missing.body, "\"error\":"));
+
+  // A request line Poco itself cannot turn into a URI: "%zz" is not a valid
+  // percent-escape, so the URI parse throws while the request is still being
+  // unpacked -- before the router ever sees a path. That exception has to
+  // become a 400 naming what was wrong; letting it escape would take down the
+  // HTTP worker thread and leave the browser with a dropped connection.
+  HttpReply bad_uri = HttpGet(port, "/api/%zz");
+  Explain("/api/%zz", bad_uri);
+  REQUIRE(bad_uri.status == 400);
+  REQUIRE(Contains(bad_uri.body, "bad request"));
+
+  // The dashboard is still serving afterwards -- the handler recovered, it did
+  // not just happen to answer once before dying.
+  HttpReply after_bad_uri = HttpGet(port, "/api/health");
+  REQUIRE(after_bad_uri.status == 200);
 
   // ---- static assets and the home page ----
   // The admin ChiMod's viz/ directory is mounted automatically because its
@@ -937,9 +979,17 @@ TEST_CASE("Viz pools can be shut down from the dashboard", "[viz]") {
   // succeeded. Sent raw because a well-behaved HTTP client library always
   // adds Content-Length and would never exercise this.
   {
-    Poco::Net::StreamSocket socket(Poco::Net::SocketAddress(
-        "127.0.0.1", static_cast<Poco::UInt16>(port)));
-    socket.setReceiveTimeout(Poco::Timespan(10, 0));
+    // Poco constructs both of these inside its own uninstrumented .so, so the
+    // socket's state is read by every call below with no MSan shadow behind
+    // it -- starting with setReceiveTimeout, which reads the fd.
+    Poco::Net::SocketAddress address("127.0.0.1",
+                                     static_cast<Poco::UInt16>(port));
+    CTP_MSAN_UNPOISON_OBJ(address);
+    Poco::Net::StreamSocket socket(address);
+    CTP_MSAN_UNPOISON_OBJ(socket);
+    // 30 s: far above any honest answer on a slow runner, yet below the
+    // server's 60 s body-receive timeout that the regression waited out.
+    socket.setReceiveTimeout(Poco::Timespan(30, 0));
     const std::string raw =
         "POST /api/pools/4995.0/destroy HTTP/1.1\r\n"
         "Host: 127.0.0.1\r\nConnection: close\r\n\r\n";
@@ -953,7 +1003,8 @@ TEST_CASE("Viz pools can be shut down from the dashboard", "[viz]") {
     std::cout << "  bare POST answered in " << sec << "s" << std::endl;
     REQUIRE(n > 0);
     REQUIRE(Contains(std::string(buf, static_cast<size_t>(n)), "404"));
-    REQUIRE(sec < 5.0);
+    // No wall-clock assert: a regressed bridge answers only after Poco's
+    // 60 s receive timeout, so receiveBytes() above throws first.
   }
 }
 
@@ -980,18 +1031,22 @@ TEST_CASE("Viz dashboard starts and stops without wedging", "[viz][shutdown]") {
   REQUIRE(server.GetPort() != 0);
   REQUIRE(server.GetBindAddr() == "127.0.0.1");
 
-  // The regression: this call is what used to never return. Time it, and hold
-  // it to a budget far below the watchdog's, so a reintroduced deadlock fails
-  // the test instead of quietly slowing every shutdown down.
+  // The regression: this call is what used to never return. Stop() bounds the
+  // Poco teardown by a budget and reports whether it finished or was
+  // abandoned. Give it a budget no runner needs (60 s) and require a clean
+  // finish: a reintroduced deadlock is abandoned and fails here, while a slow
+  // runner merely takes longer.
+  SIMPLE_TEST_SETENV("CLIO_VIZ_STOP_BUDGET_MS", "60000");
   auto t0 = std::chrono::steady_clock::now();
-  server.Stop();
+  const bool clean = server.Stop();
+  SIMPLE_TEST_SETENV("CLIO_VIZ_STOP_BUDGET_MS", "");
   double ms = std::chrono::duration<double, std::milli>(
                   std::chrono::steady_clock::now() - t0)
                   .count();
   std::cout << "  Stop() took " << ms << " ms" << std::endl;
   REQUIRE(!server.IsRunning());
   REQUIRE(server.GetPort() == 0);
-  REQUIRE(ms < 3000.0);  // the teardown budget; a deadlock would spend it all
+  REQUIRE(clean);  // finished, not abandoned at the budget
 
   // Idempotent: stopping an already-stopped dashboard is a no-op, not a crash.
   server.Stop();
@@ -1018,7 +1073,8 @@ TEST_CASE("Viz teardown abandons a slow dashboard instead of blocking",
                   .count();
   std::cout << "  Stop() with a 0 ms budget took " << ms << " ms" << std::endl;
   REQUIRE(!server.IsRunning());
-  REQUIRE(ms < 1000.0);  // must not wait out anything
+  // No wall-clock bound: with a 0 ms budget Stop() never waits on the Poco
+  // teardown (wait_for(0)), so how long it took only measures the runner.
 
   SIMPLE_TEST_SETENV("CLIO_VIZ_STOP_BUDGET_MS", "");
 }

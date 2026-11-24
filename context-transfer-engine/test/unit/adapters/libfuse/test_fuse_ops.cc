@@ -127,6 +127,11 @@ class FuseOpsFixture {
     success = clio::cte::filesystem::CLIO_CFS_CLIENT_INIT();
     REQUIRE(success);
 
+    // The namespace is strict POSIX: a create under a directory that does
+    // not exist is ENOENT, so the directory the file tests share must exist.
+    const int mk = cte_fuse_mkdir("/ops", 0755);
+    REQUIRE((mk == 0 || mk == -EEXIST));
+
     g_initialized = true;
     INFO("Embedded runtime + CTE pool + RAM target + CFS chimod ready");
   }
@@ -266,11 +271,17 @@ TEST_CASE("FUSE ops - read/write bad handle", "[fuse][ops]") {
   REQUIRE(cte_fuse_write("/x", &c, 1, 0, &fi) == -EBADF);
 }
 
-TEST_CASE("FUSE ops - open missing file is ENOENT", "[fuse][ops]") {
+TEST_CASE("FUSE ops - open missing file is ESTALE", "[fuse][ops]") {
   Fx();
   auto fi = MakeFi();
+  // The kernel only opens a path it just looked up, so a missing file at
+  // open means it vanished in between: ESTALE makes the kernel look the path
+  // up again, and that lookup (getattr) is what reports ENOENT.
   int rc = cte_fuse_open("/definitely/not/here.dat", &fi);
-  REQUIRE(rc == -ENOENT);
+  REQUIRE(rc == -kOpenVanishedErrno);  // ESTALE (ENOENT on Windows)
+  cte_stat_t st;
+  REQUIRE(cte_fuse_getattr("/definitely/not/here.dat", &st, nullptr) ==
+          -ENOENT);
 }
 
 // ============================================================================
@@ -489,6 +500,21 @@ TEST_CASE("FUSE ops - fallocate modes", "[fuse][ops]") {
   REQUIRE(cte_fuse_getattr(path, &st, &fi) == 0);
   REQUIRE(st.st_size == 4096);
 
+  // ZERO_RANGE past EOF without KEEP_SIZE grows the file to its end, also
+  // right after truncates down (generic/075 fsx: write, truncate, truncate,
+  // zero -> "Size error: expected 0x146ee stat 0x13226").
+  {
+    std::vector<char> buf(0x3e99b, 'a');
+    REQUIRE(cte_fuse_write(path, buf.data(), buf.size(), 0, &fi) ==
+            static_cast<int>(buf.size()));
+  }
+  REQUIRE(cte_fuse_truncate(path, 0x17cac, &fi) == 0);
+  REQUIRE(cte_fuse_truncate(path, 0x13226, &fi) == 0);
+  REQUIRE(cte_fuse_fallocate(path, FALLOC_FL_ZERO_RANGE, 0x8a25, 0xbcc9,
+                             &fi) == 0);
+  REQUIRE(cte_fuse_getattr(path, &st, &fi) == 0);
+  REQUIRE(st.st_size == 0x146ee);
+
   REQUIRE(cte_fuse_release(path, &fi) == 0);
   REQUIRE(cte_fuse_unlink(path) == 0);
 }
@@ -601,6 +627,112 @@ TEST_CASE("FUSE ops - rename", "[fuse][ops]") {
 
   REQUIRE(cte_fuse_unlink(a) == 0);
   REQUIRE(cte_fuse_unlink(c) == 0);
+}
+
+// ============================================================================
+// Close-to-open size: a stat or read right after close(2)
+// ============================================================================
+
+/** What one writer thread of the close-to-open race test observed. */
+struct CloseRaceResult {
+  int failed_ops = 0;    ///< a callback returned an error
+  int short_stats = 0;   ///< getattr right after close reported too few bytes
+  int short_reads = 0;   ///< a read right after close returned too few bytes
+  int bad_bytes = 0;     ///< a read returned the right count, wrong bytes
+};
+
+/**
+ * Write `files` files through the FUSE callbacks and, right after each
+ * close (flush + release, whose size publish runs on the lazy closer),
+ * stat it and read it back through a new open -- the cp-then-stat-then-cp
+ * pattern of xfstests generic/001.
+ * @param tid writer index (names its files)
+ * @param files number of files to write
+ * @param bytes size of each file
+ * @param out what this writer observed
+ */
+static void CloseRaceWriter(int tid, int files, size_t bytes,
+                            CloseRaceResult *out) {
+  std::vector<char> data(bytes);
+  std::vector<char> back(bytes);
+  constexpr size_t kChunk = 64 * 1024;  // what the kernel hands one write
+  for (int n = 0; n < files; ++n) {
+    for (size_t i = 0; i < bytes; ++i) {
+      data[i] = static_cast<char>('a' + (i * 7 + n + tid) % 26);
+    }
+    const std::string path =
+        "/ops/close_race_" + std::to_string(tid) + "_" + std::to_string(n);
+    auto fi = MakeFi();
+    fi.flags = O_WRONLY | O_CREAT | O_EXCL;
+    if (cte_fuse_create(path.c_str(), 0644, &fi) != 0) {
+      ++out->failed_ops;
+      continue;
+    }
+    bool ok = true;
+    for (size_t off = 0; off < bytes && ok; off += kChunk) {
+      const size_t len = std::min(kChunk, bytes - off);
+      ok = cte_fuse_write(path.c_str(), data.data() + off, len,
+                          static_cast<cte_off_t>(off), &fi) ==
+           static_cast<int>(len);
+    }
+    ok = ok && cte_fuse_flush(path.c_str(), &fi) == 0;
+    ok = ok && cte_fuse_release(path.c_str(), &fi) == 0;
+    // No wait: the size publish close queued may still be landing.
+    cte_stat_t st;
+    std::memset(&st, 0, sizeof(st));
+    ok = ok && cte_fuse_getattr(path.c_str(), &st, nullptr) == 0;
+    if (ok && st.st_size != static_cast<cte_off_t>(bytes)) ++out->short_stats;
+    auto fr = MakeFi();
+    fr.flags = O_RDONLY;
+    ok = ok && cte_fuse_open(path.c_str(), &fr) == 0;
+    if (ok) {
+      const int got = cte_fuse_read(path.c_str(), back.data(), bytes, 0, &fr);
+      if (got != static_cast<int>(bytes)) {
+        ++out->short_reads;
+      } else if (std::memcmp(back.data(), data.data(), bytes) != 0) {
+        ++out->bad_bytes;
+      }
+      ok = cte_fuse_release(path.c_str(), &fr) == 0;
+    }
+    ok = cte_fuse_unlink(path.c_str()) == 0 && ok;
+    if (!ok) ++out->failed_ops;
+  }
+}
+
+// Regression (xfstests generic/001 "corruption for sub/n00"): close queues
+// the file's size push on the lazy closer, which drops the local size
+// overlay once the push is acknowledged. A stat or read that asked the
+// chimod for the size just before the push landed, and consulted the
+// overlay just after it was dropped, reported the file empty -- the kernel
+// then cached size 0 and the next cp copied nothing.
+TEST_CASE("FUSE ops - stat and read right after close see every byte",
+          "[fuse][ops][close_race]") {
+  Fx();
+  constexpr int kWriters = 6;
+  constexpr int kFiles = 120;
+  constexpr size_t kBytes = 4 * 64 * 1024 + 1000;  // several pages, ragged end
+  std::vector<CloseRaceResult> results(kWriters);
+  std::vector<std::thread> writers;
+  for (int t = 0; t < kWriters; ++t) {
+    writers.emplace_back(CloseRaceWriter, t, kFiles, kBytes, &results[t]);
+  }
+  for (auto &w : writers) w.join();
+  CloseRaceResult sum;
+  for (const auto &r : results) {
+    sum.failed_ops += r.failed_ops;
+    sum.short_stats += r.short_stats;
+    sum.short_reads += r.short_reads;
+    sum.bad_bytes += r.bad_bytes;
+  }
+  INFO("failed ops " + std::to_string(sum.failed_ops) + ", short stats " +
+       std::to_string(sum.short_stats) + ", short reads " +
+       std::to_string(sum.short_reads) + ", wrong bytes " +
+       std::to_string(sum.bad_bytes) + " of " +
+       std::to_string(kWriters * kFiles) + " files");
+  REQUIRE(sum.failed_ops == 0);
+  REQUIRE(sum.short_stats == 0);
+  REQUIRE(sum.short_reads == 0);
+  REQUIRE(sum.bad_bytes == 0);
 }
 
 // ============================================================================

@@ -77,11 +77,16 @@
  */
 enum class TestCase {
   kBDevIO,         // Full I/O (Allocate -> Write -> Free)
+  kBDevWrite,      // Raw write: overwrite a pre-allocated working set
+  kBDevRead,       // Raw read: read back a pre-written working set
   kBDevAllocation, // Allocation only (Allocate -> Free)
   kBDevTaskAlloc,  // Task allocation/deletion (NewTask -> DelTask)
   kLatency,        // Round-trip latency using MOD_NAME Custom
   kSchedVariety    // issue #781: mixed 1us..1s compute; p99 by class (starvation)
 };
+
+/** Threads that finished their bdev_write/bdev_read fill phase. */
+static std::atomic<size_t> g_raw_ready{0};
 
 /**
  * Benchmark configuration
@@ -92,6 +97,9 @@ struct BenchmarkConfig {
   double duration_seconds = 10.0;         // Duration to run benchmark (seconds)
   size_t max_file_size = 1ULL << 30;      // Maximum file size (default: 1GB)
   size_t io_size = 4096; // I/O size per operation (default: 4KB)
+  // bdev_write / bdev_read: total bytes pre-allocated (split across threads)
+  // and cycled through. Larger than RAM-sized caches keeps reads honest.
+  size_t working_set = 1ULL << 30;
   bool verbose = false;  // Print detailed output
   std::string lane_policy =
       ""; // Lane mapping policy override (empty = use config)
@@ -133,6 +141,12 @@ bool ParseTestCase(const std::string &str, TestCase &test_case) {
   if (str == "bdev_io") {
     test_case = TestCase::kBDevIO;
     return true;
+  } else if (str == "bdev_write") {
+    test_case = TestCase::kBDevWrite;
+    return true;
+  } else if (str == "bdev_read") {
+    test_case = TestCase::kBDevRead;
+    return true;
   } else if (str == "bdev_allocation") {
     test_case = TestCase::kBDevAllocation;
     return true;
@@ -158,11 +172,13 @@ bool ParseArgs(int argc, char **argv, BenchmarkConfig &config) {
 
     if (arg == "--test-case" && i + 1 < argc) {
       if (!ParseTestCase(argv[++i], config.test_case)) {
-        HLOG(kError, "ERROR: Invalid test case. Valid options: bdev_io, bdev_allocation, bdev_task_alloc, latency, sched_variety");
+        HLOG(kError, "ERROR: Invalid test case. Valid options: bdev_io, bdev_write, bdev_read, bdev_allocation, bdev_task_alloc, latency, sched_variety");
         return false;
       }
     } else if (arg == "--threads" && i + 1 < argc) {
       config.num_threads = std::stoull(argv[++i]);
+    } else if (arg == "--working-set" && i + 1 < argc) {
+      config.working_set = ctp::ConfigParse::ParseSize(argv[++i]);
     } else if (arg == "--duration" && i + 1 < argc) {
       config.duration_seconds = std::stod(argv[++i]);
     } else if (arg == "--max-file-size" && i + 1 < argc) {
@@ -184,9 +200,10 @@ bool ParseArgs(int argc, char **argv, BenchmarkConfig &config) {
     } else if (arg == "--help" || arg == "-h") {
       HIPRINT("Usage: {} [options]", argv[0]);
       HIPRINT("Options:");
-      HIPRINT("  --test-case <case>      Test case: bdev_io, bdev_allocation, bdev_task_alloc, latency, sched_variety (default: bdev_io)");
+      HIPRINT("  --test-case <case>      Test case: bdev_io, bdev_write, bdev_read, bdev_allocation, bdev_task_alloc, latency, sched_variety (default: bdev_io)");
       HIPRINT("  --threads <N>           Number of client threads (default: 4)");
       HIPRINT("  --duration <seconds>    Duration to run benchmark in seconds (default: 10.0)");
+      HIPRINT("  --working-set <size>    bdev_write/bdev_read: bytes pre-allocated across threads (default: 1g)");
       HIPRINT("  --max-file-size <size>  Maximum file size with suffix: k, m, g (default: 1g)");
       HIPRINT("  --io-size <size>        I/O size per operation with suffix: k, m, g (default: 4k)");
       HIPRINT("  --lane-policy <P>       Lane policy: map_by_pid_tid, round_robin, random (default: from config)");
@@ -198,6 +215,8 @@ bool ParseArgs(int argc, char **argv, BenchmarkConfig &config) {
       HIPRINT("");
       HIPRINT("Test Cases:");
       HIPRINT("  bdev_io          - BDev I/O throughput (Allocate -> Write -> Free)");
+      HIPRINT("  bdev_write       - Raw write: overwrite a pre-allocated working set");
+      HIPRINT("  bdev_read        - Raw read: read back a pre-written working set");
       HIPRINT("  bdev_allocation  - BDev allocation throughput (Allocate -> Free)");
       HIPRINT("  bdev_task_alloc  - BDev task allocation (NewTask -> DelTask)");
       HIPRINT("  latency          - Round-trip task latency using MOD_NAME Custom");
@@ -433,6 +452,111 @@ void IOWorkerThread(size_t thread_id, const BenchmarkConfig &config,
     HIPRINT("Thread {}: {} I/O ops in {} ms, {} ops/sec, {} MB/s",
             thread_id, local_ops, (elapsed_time.count() / 1e6), thread_throughput, bandwidth_mbps);
   }
+}
+
+/**
+ * Raw I/O worker (bdev_write / bdev_read). Allocation is kept out of the
+ * timed loop: each thread allocates its share of --working-set up front as
+ * io_size extents, writes every extent once (so reads return real data),
+ * then cycles through the extents in a fixed shuffled order issuing one
+ * Write or Read per extent until stopped. Extents are freed afterwards.
+ */
+void RawIOWorkerThread(size_t thread_id, const BenchmarkConfig &config,
+                       clio::run::PoolId pool_id, bool do_read,
+                       std::atomic<bool> &stop_flag,
+                       std::atomic<size_t> &completed_ops,
+                       std::atomic<size_t> &total_bytes,
+                       std::chrono::nanoseconds &elapsed_time) {
+  clio::run::bdev::Client bdev_client(pool_id);
+  // 4 KiB-aligned I/O buffer. The file bdev bounces unaligned WRITES into
+  // an aligned buffer for O_DIRECT, but issues unaligned READS on the
+  // buffered fd, so an unaligned buffer measures the page cache on reads
+  // (2.5 GB/s against ~100 MB/s at the device). Align so both directions
+  // reach the NVMe.
+  constexpr size_t kAlign = 4096;
+  auto raw = CLIO_IPC->AllocateBuffer(config.io_size + kAlign);
+  size_t pad = (kAlign - reinterpret_cast<uintptr_t>(raw.ptr_) % kAlign) % kAlign;
+  ctp::ipc::FullPtr<char> buffer = raw;
+  buffer.ptr_ = raw.ptr_ + pad;
+  buffer.shm_.off_ = raw.shm_.off_.load() + pad;
+  std::memset(buffer.ptr_, static_cast<int>(thread_id + 1), config.io_size);
+
+  size_t share = config.working_set / config.num_threads;
+  size_t n_extents = std::max<size_t>(1, share / config.io_size);
+  std::vector<std::vector<clio::run::bdev::Block>> extents;
+  extents.reserve(n_extents);
+  auto fail = [&](const char *what, size_t i) {
+    HLOG(kError, "Thread {}: {} failed at extent {}", thread_id, what, i);
+    stop_flag.store(true, std::memory_order_relaxed);
+  };
+
+  // One Write/Read per block, as bdev_io does; an extent is usually 1 block.
+  auto do_io = [&](const std::vector<clio::run::bdev::Block> &ext,
+                   bool read) -> bool {
+    size_t done = 0;
+    for (const auto &b : ext) {
+      size_t n = std::min(config.io_size - done, static_cast<size_t>(b.size_));
+      clio::run::priv::vector<clio::run::bdev::Block> one(CTP_MALLOC);
+      one.push_back(b);
+      if (read) {
+        auto t = bdev_client.AsyncRead(clio::run::PoolQuery::Local(), one,
+                                       buffer.shm_.template Cast<void>(), n);
+        t.Wait();
+        if (t->GetReturnCode() != 0 || t->bytes_read_ != n) return false;
+      } else {
+        auto t = bdev_client.AsyncWrite(clio::run::PoolQuery::Local(), one,
+                                        buffer.shm_.template Cast<void>(), n);
+        t.Wait();
+        if (t->bytes_written_ != n) return false;
+      }
+      done += n;
+    }
+    return true;
+  };
+
+  for (size_t i = 0; i < n_extents && !stop_flag.load(); ++i) {
+    auto a = bdev_client.AsyncAllocateBlocks(clio::run::PoolQuery::Local(),
+                                             config.io_size);
+    a.Wait();
+    if (a->GetReturnCode() != 0 || a->blocks_.empty()) { fail("AllocateBlocks", i); break; }
+    std::vector<clio::run::bdev::Block> ext;
+    for (size_t k = 0; k < a->blocks_.size(); ++k) ext.push_back(a->blocks_[k]);
+    if (!do_io(ext, false)) { fail("fill Write", i); break; }
+    extents.push_back(std::move(ext));
+  }
+  // Fixed per-thread shuffle: a random-access pattern without RNG cost
+  // inside the timed loop.
+  std::vector<size_t> order(extents.size());
+  for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+  std::mt19937_64 rng(1000 + thread_id);
+  std::shuffle(order.begin(), order.end(), rng);
+
+  size_t local_ops = 0, local_bytes = 0, pos = 0;
+  auto start_time = std::chrono::high_resolution_clock::now();
+  // The timer starts once every thread has finished its fill (see the
+  // barrier in main via g_raw_ready).
+  g_raw_ready.fetch_add(1);
+  while (g_raw_ready.load() < config.num_threads && !stop_flag.load()) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  start_time = std::chrono::high_resolution_clock::now();
+  while (!stop_flag.load(std::memory_order_relaxed) && !order.empty()) {
+    if (!do_io(extents[order[pos]], do_read)) { fail(do_read ? "Read" : "Write", pos); break; }
+    ++local_ops;
+    local_bytes += config.io_size;
+    if (++pos == order.size()) pos = 0;
+  }
+  auto end_time = std::chrono::high_resolution_clock::now();
+  elapsed_time = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      end_time - start_time);
+
+  for (auto &ext : extents) {
+    auto f = bdev_client.AsyncFreeBlocks(clio::run::PoolQuery::Local(), ext);
+    f.Wait();
+  }
+  CLIO_IPC->FreeBuffer(raw);
+  completed_ops.fetch_add(local_ops, std::memory_order_relaxed);
+  total_bytes.fetch_add(local_bytes, std::memory_order_relaxed);
 }
 
 /**
@@ -749,6 +873,17 @@ int main(int argc, char **argv) {
     }
     break;
 
+  case TestCase::kBDevWrite:
+  case TestCase::kBDevRead:
+    for (size_t i = 0; i < config.num_threads; i++) {
+      threads.emplace_back(RawIOWorkerThread, i, std::ref(config),
+                           test_pool_id,
+                           config.test_case == TestCase::kBDevRead,
+                           std::ref(stop_flag), std::ref(completed_ops),
+                           std::ref(total_bytes), std::ref(thread_times[i]));
+    }
+    break;
+
   case TestCase::kLatency:
     // Spawn latency worker threads
     for (size_t i = 0; i < config.num_threads; i++) {
@@ -767,6 +902,20 @@ int main(int argc, char **argv) {
                            std::ref(variety_samples[i]));
     }
     break;
+  }
+
+  // bdev_write / bdev_read: the fill phase is setup, not measurement. Wait
+  // for every worker to finish it, then start the clock and the duration.
+  if (config.test_case == TestCase::kBDevWrite ||
+      config.test_case == TestCase::kBDevRead) {
+    while (g_raw_ready.load() < config.num_threads && !stop_flag.load()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    HIPRINT("Fill phase done in {:.1f} s; measuring",
+            std::chrono::duration<double>(
+                std::chrono::high_resolution_clock::now() - benchmark_start)
+                .count());
+    benchmark_start = std::chrono::high_resolution_clock::now();
   }
 
   // Sleep for the specified duration
@@ -792,6 +941,10 @@ int main(int argc, char **argv) {
   // Calculate statistics
   double total_seconds = total_elapsed.count() / 1e9;
   double throughput = final_ops / total_seconds;
+  if (final_ops == 0) {
+    HLOG(kError, "No operations completed; see worker errors above");
+    return 1;
+  }
   double avg_latency_us = (total_elapsed.count() / final_ops) / 1e3;
 
   // Calculate average per-thread time
@@ -820,6 +973,8 @@ int main(int argc, char **argv) {
     HIPRINT("Avg latency: {} us/task", avg_latency_us);
     break;
 
+  case TestCase::kBDevWrite:
+  case TestCase::kBDevRead:
   case TestCase::kBDevIO:
     // I/O mode results
     {

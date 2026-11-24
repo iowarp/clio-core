@@ -6,6 +6,9 @@
 #define CLIO_CTE_CACHE_CACHE_RUNTIME_H_
 
 #include <memory>
+#include <mutex>
+#include <unordered_map>
+#include <unordered_set>
 #include <string>
 
 #include <clio_runtime/clio_runtime.h>
@@ -36,6 +39,10 @@ namespace clio::cte::cache {
  *    down (decompressed below) and best-effort re-populates.
  *  - GetBlobSize answers from the cache replica (raw size == logical size)
  *    before consulting the chain.
+ *
+ * Metadata-only mode (CacheConfig::md_only_) keeps NO node-local data copy:
+ * puts, gets and size queries bypass the cache replica entirely and use only
+ * the authoritative owner chain. Tag write-through and routing are unchanged.
  */
 class Runtime : public clio::cte::core::CoreInterposer {
  public:
@@ -74,6 +81,15 @@ class Runtime : public clio::cte::core::CoreInterposer {
       clio::run::shared_ptr<clio::cte::core::GetBlobSizeTask> &task);
   clio::run::TaskResume MultiPutBlob(
       clio::run::shared_ptr<clio::cte::core::MultiPutBlobTask> &task);
+  clio::run::TaskResume PodMultiGetBlob(
+      clio::run::shared_ptr<clio::cte::core::PodMultiGetBlobTask> &task);
+  // ---- Tag metadata, write-through to every node's core ----
+  clio::run::TaskResume GetOrCreateTag(
+      clio::run::shared_ptr<
+          clio::cte::core::GetOrCreateTagTask<clio::cte::core::CreateParams>>
+          &task);
+  clio::run::TaskResume DelTag(
+      clio::run::shared_ptr<clio::cte::core::DelTagTask> &task);
 
   // ---- Container virtuals (defined in autogen/cache_lib_exec.cc) ----
   void Init(const clio::run::PoolId &pool_id, const std::string &pool_name,
@@ -119,6 +135,51 @@ class Runtime : public clio::cte::core::CoreInterposer {
   void AimAtCacheReplica(Context *ctx) const;
 
   /**
+   * True when metadata-only mode is on (no node-local blob data copies).
+   * @return The configured CacheConfig::md_only_ value.
+   */
+  bool MdOnly() const { return config_.md_only_; }
+
+  /**
+   * Metadata-only PutBlob: no cache replica is written, created or deleted.
+   * An owner-local blob runs the put inline on the next pool (the put IS the
+   * authoritative write). A remote-owned blob gets only the authoritative
+   * put(s) to the owner chain: no origin registration, no VERIFY_COMPLETE,
+   * no local delete tail. Also the path for kCtePutAppend puts: an append's
+   * position is only known to the owner, so no node-local copy can be written
+   * at a guessed offset. Any registered local copy is dropped by the owner's
+   * invalidation, which completes before the authoritative put returns.
+   * @param task The put task. Its return code and OUT context are set on
+   *             completion, matching the full write-through path; for an
+   *             append its offset_ is the landed offset.
+   * @return Coroutine resume token.
+   */
+  clio::run::TaskResume PutBlobMdOnly(
+      clio::run::shared_ptr<clio::cte::core::PutBlobTask> &task);
+
+  /**
+   * Metadata-only GetBlob: no cache replica read and no populate. An
+   * owner-local blob is read inline on the next pool; any other blob is
+   * fetched from the owner chain straight into the caller's buffers.
+   * @param task The get task. Its buffers, return code and transform/version
+   *             OUT fields are set on completion.
+   * @return Coroutine resume token.
+   */
+  clio::run::TaskResume GetBlobMdOnly(
+      clio::run::shared_ptr<clio::cte::core::GetBlobTask> &task);
+
+  /**
+   * Read every region of a get task from the authoritative owner chain
+   * (Dynamic routing) directly into the caller's buffers. Stops at the first
+   * failing region. Sets the task's transform_flags_, version_ and return
+   * code from the chain's answer. Does not populate any local copy.
+   * @param task The get task whose regions are fetched.
+   * @return Coroutine resume token.
+   */
+  clio::run::TaskResume FetchFromOwnerChain(
+      clio::run::shared_ptr<clio::cte::core::GetBlobTask> &task);
+
+  /**
    * True when THIS node hosts the blob's owner container (issue #894).
    * The owner node keeps NO cache-slot copy: its primary is already
    * node-local DRAM (and zero-IPC readable), and an owner-side copy sits
@@ -127,6 +188,8 @@ class Runtime : public clio::cte::core::CoreInterposer {
    * after a foreign write (the CI-caught fragmented winner split).
    */
   bool IsBlobOwnerLocal(const TagId &tag_id, const std::string &blob_name);
+  /** Whether this node serves the blob for its dead owner (failover). */
+  bool IsStandingIn(const TagId &tag_id, const std::string &blob_name);
 
   /**
    * Best-effort population of THIS node's raw local copy from the blob's
@@ -137,14 +200,43 @@ class Runtime : public clio::cte::core::CoreInterposer {
   clio::run::TaskResume PopulateLocal(const TagId &tag_id,
                                       const std::string &blob_name);
 
+  /**
+   * Take THIS node's copy lock for one blob, yielding while another task
+   * holds it. A non-owner put (local copy update + authoritative put) and a
+   * non-owner read (copy read, owner fetch, populate, registration) of the
+   * same blob hold it, so a populate can never install bytes older than a
+   * put on this node already wrote into the copy, and no read is served the
+   * copy while a populate that may be rejected is still in flight.
+   * @param key CopyKey of the blob
+   */
+  clio::run::TaskResume LockCopy(const std::string &key);
+  /** Release a lock taken with LockCopy. */
+  void UnlockCopy(const std::string &key);
+  /** Copy-lock key of a blob. */
+  static std::string CopyKey(const TagId &tag_id, const std::string &name) {
+    return std::to_string(tag_id.major_) + "." +
+           std::to_string(tag_id.minor_) + "/" + name;
+  }
+  /** Releases a copy lock when the holding scope ends. */
+  struct CopyUnlocker {
+    Runtime *rt_;
+    std::string key_;
+    ~CopyUnlocker() { rt_->UnlockCopy(key_); }
+  };
+
   /** Lazily bind the next-pool client (compose next_pool_id). */
   clio::cte::core::Client *GetNextClient();
   /** Lazily bind a direct core client for node-LOCAL copy access. */
   clio::cte::core::Client *GetLocalClient();
 
+  /** Apply a tag write to EVERY core container (existing core verbs). */
+  clio::run::u32 NumCoreContainers();
+
   CacheConfig config_;
   std::unique_ptr<clio::cte::core::Client> next_client_;
   std::unique_ptr<clio::cte::core::Client> local_client_;
+  std::mutex copy_busy_mu_;                  /**< guards copy_busy_ */
+  std::unordered_set<std::string> copy_busy_; /**< blobs whose copy is locked */
 };
 
 }  // namespace clio::cte::cache

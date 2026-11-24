@@ -53,7 +53,7 @@ try {
     # --- Start runtime ------------------------------------------------------
     Info "starting Clio runtime"
     $runtimeProc = Start-Process -FilePath (Join-Path $bin "clio_run.exe") `
-        -ArgumentList "runtime", "start" -PassThru -NoNewWindow `
+        -ArgumentList "runtime", "start", "--fresh" -PassThru -NoNewWindow `
         -RedirectStandardOutput "$env:TEMP\clio_runtime.out" `
         -RedirectStandardError "$env:TEMP\clio_runtime.err"
     Start-Sleep -Seconds 5

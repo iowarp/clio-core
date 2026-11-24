@@ -140,6 +140,13 @@ class Runtime : public clio::cte::core::CoreInterposer {
       clio::run::shared_ptr<clio::cte::core::DelTagTask> &task);
   clio::run::TaskResume TruncateBlob(
       clio::run::shared_ptr<clio::cte::core::TruncateBlobTask> &task);
+  /**
+   * Published tag names changed (a filesystem create/rename/unlink): apply
+   * them on the core, then forget the cached names so documents re-resolve
+   * their (possibly re-parented) paths before the next search.
+   */
+  clio::run::TaskResume UpdateTagNames(
+      clio::run::shared_ptr<clio::cte::core::UpdateTagNamesTask> &task);
   clio::run::TaskResume RenameTag(
       clio::run::shared_ptr<clio::cte::core::RenameTagTask> &task);
   clio::run::TaskResume SemanticSearch(
@@ -275,6 +282,10 @@ class Runtime : public clio::cte::core::CoreInterposer {
   std::unordered_map<std::string, IndexedDoc> index_;
   /** TagId -> resolved full tag name (rewritten by RenameTag). */
   std::unordered_map<clio::run::u64, std::string> tag_names_;
+  /** Set by UpdateTagNames: documents' tag names must be re-resolved. */
+  bool doc_names_stale_ = false;
+  /** Re-resolve every indexed document's tag name (after name updates). */
+  clio::run::TaskResume RefreshDocNames();
 
   /** Dirty blobs awaiting re-tokenization, keyed like index_ so overwrites
    *  COALESCE (N puts to a hot blob = one drain-time read+scan). Guarded by

@@ -10,7 +10,7 @@
             "includePath": [
                 "${workspaceFolder}/include",
                 "${workspaceFolder}/context-transfer-engine/include",
-                "${workspaceFolder}/context-transport-primitives/include",
+                "${workspaceFolder}/context-transport-primitives/**",
                 "${workspaceFolder}/context-assimilation-engine/include",
                 "${workspaceFolder}/context-exploration-engine/include",
                 "${workspaceFolder}/runtime/include",

@@ -9,16 +9,16 @@
 #include <atomic>
 #include "clio_cte/filesystem/api.h"
 
+#include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
-#if !defined(_WIN32)
-// The descriptor layer below is POSIX-shaped (ssize_t/off_t/O_SYNC/S_IFREG)
-// and has no Windows port -- this is the same constraint that kept the old
-// adapter/cfs out of Windows builds at the CMake level. The rest of this
-// client (tasks, deferred writes, the SHM caches) is portable and still
-// compiles there, so guard the descriptor layer rather than the whole header.
-#include <fcntl.h>
-#include <sys/stat.h>
+// The descriptor layer below is POSIX-SHAPED but not POSIX-only: nothing
+// in it makes a system call. posix_compat.h supplies the vocabulary it is
+// written in (FsSsize/FsOff/FsSsize) on every platform.
+#include "clio_cte/filesystem/api.h"
+#include "clio_cte/filesystem/posix_compat.h"
+#ifndef _WIN32
 #include <unistd.h>
 #endif
 #include <cerrno>
@@ -26,6 +26,8 @@
 #include <vector>
 #include <mutex>
 #include <clio_cte/filesystem/filesystem_tasks.h>
+#include <clio_cte/stream/stream_client.h>
+#include <clio_cte/filesystem/fs_shard.h>
 #include <clio_cte/filesystem/shm_fs_cache.h>
 
 namespace clio::cte::filesystem {
@@ -70,14 +72,12 @@ inline std::string StripClioPrefix(const std::string &path) {
   return path.substr(0, pos) + path.substr(pos + kClioPrefixLen);
 }
 
-#if !defined(_WIN32)
 /** CTE-issued descriptors start here so they never collide with kernel fds. */
 static constexpr int kCfsFdBase = 8192;
 /** Preferred block size reported by stat (matches the chimod page size). */
 static constexpr size_t kCfsBlkSize = 1024 * 1024;
 /** Synthetic device id -- same for every clio:: file. */
 static constexpr dev_t kClioStDev = static_cast<dev_t>(0xC110);
-#endif  // !_WIN32
 
 /**
  * Filesystem client — the single API every interceptor (POSIX, STDIO,
@@ -91,17 +91,19 @@ class Client : public clio::cte::core::Client {
   Client() = default;
   explicit Client(const clio::run::PoolId &fs_pool_id) { Init(fs_pool_id); }
 
-#if CTP_IS_HOST && !defined(_WIN32)
+#if CTP_IS_HOST
   // Copyable by hand, because the descriptor table below carries a std::mutex
   // and the compiler-generated copies would be deleted. The base client is
-  // copyable by contract (its deferred-write registry is process-wide for
-  // exactly that reason), and callers do copy it, so losing that here would be
-  // a silent API break.
+  // copyable by contract, and callers do copy it, so losing that here would
+  // be a silent API break.
   //
   // The lock is on the SOURCE: we are reading its table. Our own mutex is
   // freshly constructed -- a lock is not state worth copying, and copying one
   // would be undefined anyway.
-  Client(const Client &other) : clio::cte::core::Client(other) {
+  Client(const Client &other)
+      : clio::cte::core::Client(other),
+        data_cte_(other.data_cte_),
+        stream_(other.stream_) {
     std::lock_guard<std::mutex> g(other.fd_mu_);
     shm_fs_root_ = other.shm_fs_root_;
     fds_ = other.fds_;
@@ -113,6 +115,8 @@ class Client : public clio::cte::core::Client {
       return *this;
     }
     clio::cte::core::Client::operator=(other);
+    data_cte_ = other.data_cte_;
+    stream_ = other.stream_;
     // Both tables are touched, so both locks are taken -- ordered by address
     // so two threads assigning A=B and B=A cannot deadlock.
     std::mutex *first = &fd_mu_;
@@ -189,12 +193,23 @@ class Client : public clio::cte::core::Client {
            shm_fs_root_->overflow_.load(std::memory_order_acquire) != 0;
   }
 
-  bool TryGetFileRecordShm(const std::string &path, ShmFileRecord *out) const {
+  /**
+   * @param absent if non-null, set true only when a false return PROVES the
+   *        path has no record (or only a stale-generation one); a torn or
+   *        contended read leaves it false. Authoritative negatives must use
+   *        it: a record being rewritten (a size push right after close) used
+   *        to read as missing, and a COMPLETE parent turned that into ENOENT
+   *        for a file that existed ("unable to stat just-written file").
+   */
+  bool TryGetFileRecordShm(const std::string &path, ShmFileRecord *out,
+                           bool *absent = nullptr) const {
+    if (absent != nullptr) *absent = false;
     if (shm_fs_root_ == nullptr || out == nullptr) {
       return false;
     }
-    if (!shm_fs_root_->path_to_file_.TryGetBytes(path.data(), path.size(),
-                                                 out)) {
+    const std::string key = shm_fs_root_->Key(path);
+    if (!shm_fs_root_->path_to_file_.TryGetBytes(key.data(), key.size(),
+                                                 out, 16, absent)) {
       return false;
     }
     // A FILE record from an older namespace generation may sit under a stale
@@ -208,6 +223,7 @@ class Client : public clio::cte::core::Client {
     if (out->nsgen_ !=
         shm_fs_root_->nsgen_.load(std::memory_order_relaxed)) {
       if (!(out->flags_ & kShmFileIsDir)) {
+        if (absent != nullptr) *absent = true;  // stale name: no record
         return false;
       }
       out->flags_ &= ~kShmDirComplete;
@@ -217,7 +233,96 @@ class Client : public clio::cte::core::Client {
 #endif  // CTP_IS_HOST
 
 #if CTP_IS_HOST
-  /** Create/initialize the filesystem container over a CTE core pool. */
+  /**
+   * Ask the local filesystem container for one of the pools it uses
+   * (Monitor query; the filesystem's config is the only source of pool ids).
+   * @param key "next_pool" (the data chain its pages go through) or
+   *        "stream_pool" (where file sizes live)
+   * @param out receives the pool id on success
+   * @return true when the container answered with a valid pool id
+   */
+  bool QueryPoolId(const std::string &key, clio::run::PoolId *out) {
+    auto *ipc = CLIO_CPU_IPC;
+    auto task = ipc->NewTask<MonitorTask>(clio::run::CreateTaskId(), pool_id_,
+                                          clio::run::PoolQuery::Local(), key);
+    auto fut = ipc->Send(task);
+    fut.Wait();
+    if (fut->GetReturnCode() != 0 || fut->results_.empty()) {
+      return false;
+    }
+    const std::string v = fut->results_.begin()->second;
+    const size_t dot = v.find('.');
+    if (dot == std::string::npos) {
+      return false;
+    }
+    *out = clio::run::PoolId(
+        static_cast<clio::run::u32>(std::strtoul(v.c_str(), nullptr, 10)),
+        static_cast<clio::run::u32>(
+            std::strtoul(v.c_str() + dot + 1, nullptr, 10)));
+    return !out->IsNull();
+  }
+
+  /**
+   * The pool this filesystem stores page blobs through (the top of its
+   * interposition chain).
+   * @param out receives the pool id on success
+   * @return true when the filesystem answered
+   */
+  bool GetDataPoolId(clio::run::PoolId *out) {
+    return QueryPoolId("next_pool", out);
+  }
+
+  /**
+   * Bind the data-path and stream clients to the pools this filesystem
+   * pool is configured with. Every CTE call a clio-fs client makes (page
+   * I/O, fsync, capacity) must take the same chain the filesystem does, or
+   * it bypasses the caches and replication above the cores.
+   * @return true when both pools were learned
+   */
+  bool BindPools() {
+    clio::run::PoolId data_pool;
+    clio::run::PoolId stream_pool;
+    if (!QueryPoolId("next_pool", &data_pool) ||
+        !QueryPoolId("stream_pool", &stream_pool)) {
+      return false;
+    }
+    data_cte_.Init(data_pool);
+    // Connect the data client to the shm cache module when the data pool
+    // fronts it (the keys come from the CTE Create; a lookup, no create).
+    // Otherwise it stays on the task path.
+    data_cte_.ConnectCache();
+    stream_.Init(stream_pool);
+    return true;
+  }
+
+  /** CTE client bound to this filesystem's data chain (see BindPools). */
+  clio::cte::core::Client *Cte() { return &data_cte_; }
+
+  /** Stream client bound to this filesystem's stream pool. */
+  clio::cte::stream::Client *Stream() { return &stream_; }
+
+  /**
+   * Ask the local filesystem container for its file-data score rule (YAML
+   * `data_score` / `data_score_head_pages`). A client that puts page blobs
+   * itself applies it the way the container's own Write does:
+   * `policy.ScoreOf(offset / kFsPageSize)` is the score of that page's put.
+   * @param out receives the rule on success (untouched otherwise)
+   * @return true when the home answered with a well-formed rule
+   */
+  bool GetPageScorePolicy(clio::cte::core::PageScorePolicy *out) {
+    auto *ipc = CLIO_CPU_IPC;
+    auto task = ipc->NewTask<MonitorTask>(clio::run::CreateTaskId(), pool_id_,
+                                          clio::run::PoolQuery::Local(),
+                                          std::string("data_score"));
+    auto fut = ipc->Send(task);
+    fut.Wait();
+    if (fut->GetReturnCode() != 0 || fut->results_.empty()) {
+      return false;
+    }
+    return DecodePageScore(fut->results_.begin()->second, out);
+  }
+
+  /** Create/initialize the filesystem container over a CTE core pool. */  /** Create/initialize the filesystem container over a CTE core pool. */
   clio::run::Future<CreateTask> AsyncCreate(const clio::run::PoolQuery &pool_query,
                                       const std::string &pool_name,
                                       const clio::run::PoolId &custom_pool_id,
@@ -234,20 +339,70 @@ class Client : public clio::cte::core::Client {
                                   clio::run::u32 mode = 0644) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<OpenTask>(clio::run::CreateTaskId(), pool_id_,
-                                       clio::run::PoolQuery::Local(), path, flags,
+                                       FsPathQuery(), path, flags,
                                        mode);
     return ipc->Send(task);
   }
 
-  /** Tag-keyed size advance (see AdvanceSizeTask). */
+  /**
+   * fsync the namespace log on every container (see SyncMetaTask).
+   * @return future; rc != 0 if any container failed to sync
+   */
+  clio::run::Future<SyncMetaTask> AsyncSyncMeta() {
+    auto *ipc = CLIO_CPU_IPC;
+    auto task = ipc->NewTask<SyncMetaTask>(clio::run::CreateTaskId(), pool_id_,
+                                           clio::run::PoolQuery::Broadcast());
+    return ipc->Send(task);
+  }
+
+  /**
+   * Tag-keyed size advance (see AdvanceSizeTask).
+   * @param tag_packed the file's packed TagId
+   * @param size the new size (never lowers it)
+   * @param mtime_ns wall time (ns) of the last write the size covers, the
+   *        file's new mtime; 0 = the time the push lands
+   */
   clio::run::Future<AdvanceSizeTask> AsyncAdvanceSize(
-      clio::run::u64 tag_packed, clio::run::u64 size) {
+      clio::run::u64 tag_packed, clio::run::u64 size,
+      clio::run::u64 mtime_ns = 0) {
+    // Local: the local container forwards to the inode's live home (the
+    // encoded one, or its successor while that node is down).
+    return AsyncAdvanceSizeAt(clio::run::PoolQuery::Local(), tag_packed, size,
+                              0u, mtime_ns);
+  }
+
+  /**
+   * Size advance / append reservation sent to an explicit container (the
+   * runtime's forwarding step; clients use AsyncAdvanceSize /
+   * AsyncReserveAppend).
+   * @param query where to run it
+   * @param tag_packed the file's packed TagId
+   * @param size new size (raise) or length (reserve)
+   * @param reserve nonzero for an append reservation
+   * @param mtime_ns raise mode: the file's new mtime (0 = when it lands)
+   */
+  clio::run::Future<AdvanceSizeTask> AsyncAdvanceSizeAt(
+      const clio::run::PoolQuery &query, clio::run::u64 tag_packed,
+      clio::run::u64 size, clio::run::u32 reserve,
+      clio::run::u64 mtime_ns = 0) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<AdvanceSizeTask>(clio::run::CreateTaskId(),
-                                              pool_id_,
-                                              clio::run::PoolQuery::Local(),
-                                              tag_packed, size);
+                                              pool_id_, query, tag_packed,
+                                              size, reserve, mtime_ns);
     return ipc->Send(task);
+  }
+
+  /**
+   * Reserve `len` bytes at the end of a file, cluster-wide: the home grows
+   * the logical size atomically and reports the old end in old_size_ (the
+   * offset an O_APPEND write must use).
+   * @param tag_packed the file's packed TagId
+   * @param len        bytes being appended
+   */
+  clio::run::Future<AdvanceSizeTask> AsyncReserveAppend(
+      clio::run::u64 tag_packed, clio::run::u64 len) {
+    return AsyncAdvanceSizeAt(clio::run::PoolQuery::Local(), tag_packed, len,
+                              1u);
   }
 
   /** Batched sieve-flushed creation (see MultiCreateTask). */
@@ -265,7 +420,7 @@ class Client : public clio::cte::core::Client {
                                           clio::run::u64 advance_size = 0) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<CloseTask>(clio::run::CreateTaskId(), pool_id_,
-                                        clio::run::PoolQuery::Local(), handle,
+                                        FsHandleQuery(handle), handle,
                                         advance_size);
     return ipc->Send(task);
   }
@@ -280,7 +435,7 @@ class Client : public clio::cte::core::Client {
                           clio::run::u64 advance_size = 0) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<CloseTask>(clio::run::CreateTaskId(), pool_id_,
-                                        clio::run::PoolQuery::Local(), handle,
+                                        FsHandleQuery(handle), handle,
                                         advance_size);
     // Flag must be set before Send (same ordering rule as the PutBlob
     // staging flags).
@@ -292,7 +447,7 @@ class Client : public clio::cte::core::Client {
                                   clio::run::u64 size, ctp::ipc::ShmPtr<> data) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<ReadTask>(clio::run::CreateTaskId(), pool_id_,
-                                       clio::run::PoolQuery::Local(), handle, offset,
+                                       FsHandleQuery(handle), handle, offset,
                                        size, data);
     return ipc->Send(task);
   }
@@ -301,24 +456,15 @@ class Client : public clio::cte::core::Client {
                                     clio::run::u64 size, ctp::ipc::ShmPtr<> data) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<WriteTask>(clio::run::CreateTaskId(), pool_id_,
-                                        clio::run::PoolQuery::Local(), handle, offset,
+                                        FsHandleQuery(handle), handle, offset,
                                         size, data);
-    return ipc->Send(task);
-  }
-
-  clio::run::Future<AppendTask> AsyncAppend(clio::run::u64 handle, clio::run::u64 size,
-                                      ctp::ipc::ShmPtr<> data) {
-    auto *ipc = CLIO_CPU_IPC;
-    auto task = ipc->NewTask<AppendTask>(clio::run::CreateTaskId(), pool_id_,
-                                         clio::run::PoolQuery::Local(), handle, size,
-                                         data);
     return ipc->Send(task);
   }
 
   clio::run::Future<GetattrTask> AsyncGetattr(const std::string &path) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<GetattrTask>(clio::run::CreateTaskId(), pool_id_,
-                                          clio::run::PoolQuery::Local(), path);
+                                          FsPathQuery(), path);
     return ipc->Send(task);
   }
 
@@ -328,7 +474,7 @@ class Client : public clio::cte::core::Client {
                                           clio::run::u64 old_extent = 0) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<TruncateTask>(clio::run::CreateTaskId(), pool_id_,
-                                           clio::run::PoolQuery::Local(), path,
+                                           FsPathQuery(), path,
                                            new_size, tag_packed, old_extent);
     return ipc->Send(task);
   }
@@ -336,7 +482,7 @@ class Client : public clio::cte::core::Client {
   clio::run::Future<UnlinkTask> AsyncUnlink(const std::string &path) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<UnlinkTask>(clio::run::CreateTaskId(), pool_id_,
-                                         clio::run::PoolQuery::Local(), path);
+                                         FsPathQuery(), path);
     return ipc->Send(task);
   }
 
@@ -346,10 +492,17 @@ class Client : public clio::cte::core::Client {
                                               clio::run::u32 flags) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<UtimensTask>(clio::run::CreateTaskId(), pool_id_,
-                                          clio::run::PoolQuery::Local(), path,
+                                          FsPathQuery(), path,
                                           atime_ns, mtime_ns, flags);
     return ipc->Send(task);
   }
+
+  /**
+   * Create every missing ancestor directory of `path` (mkdir -p of its
+   * parent). Existing directories are left alone.
+   * @param path a normalized clio-fs path
+   */
+  void MakeParents(const std::string &path);
 
   /** Fire-and-forget utimens (TASK_FIRE_AND_FORGET; see AsyncCloseDetached).
    *  Timestamp stamping is pure metadata with no caller-visible output — the
@@ -359,7 +512,7 @@ class Client : public clio::cte::core::Client {
                             clio::run::u64 mtime_ns, clio::run::u32 flags) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<UtimensTask>(clio::run::CreateTaskId(), pool_id_,
-                                          clio::run::PoolQuery::Local(), path,
+                                          FsPathQuery(), path,
                                           atime_ns, mtime_ns, flags);
     task.get()->task_flags_.SetBits(TASK_FIRE_AND_FORGET);
     ipc->Send(task);
@@ -371,7 +524,7 @@ class Client : public clio::cte::core::Client {
                                           clio::run::u32 mode = 0xFFFFFFFFu) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<ChownTask>(clio::run::CreateTaskId(), pool_id_,
-                                        clio::run::PoolQuery::Local(), path, uid,
+                                        FsPathQuery(), path, uid,
                                         gid, mode);
     return ipc->Send(task);
   }
@@ -386,14 +539,14 @@ class Client : public clio::cte::core::Client {
   clio::run::Future<MkdirTask> AsyncMkdir(const std::string &path) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<MkdirTask>(clio::run::CreateTaskId(), pool_id_,
-                                        clio::run::PoolQuery::Local(), path);
+                                        FsPathQuery(), path);
     return ipc->Send(task);
   }
 
   clio::run::Future<RmdirTask> AsyncRmdir(const std::string &path) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<RmdirTask>(clio::run::CreateTaskId(), pool_id_,
-                                        clio::run::PoolQuery::Local(), path);
+                                        FsPathQuery(), path);
     return ipc->Send(task);
   }
 
@@ -401,7 +554,7 @@ class Client : public clio::cte::core::Client {
                                       const std::string &dst) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<RenameTask>(clio::run::CreateTaskId(), pool_id_,
-                                         clio::run::PoolQuery::Local(), src, dst);
+                                         FsPathQuery(), src, dst);
     return ipc->Send(task);
   }
 
@@ -409,7 +562,7 @@ class Client : public clio::cte::core::Client {
                                   const std::string &link) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<LinkTask>(clio::run::CreateTaskId(), pool_id_,
-                                       clio::run::PoolQuery::Local(), target, link);
+                                       FsPathQuery(), target, link);
     return ipc->Send(task);
   }
 
@@ -417,7 +570,7 @@ class Client : public clio::cte::core::Client {
                                               const std::string &path) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<SymlinkTask>(clio::run::CreateTaskId(), pool_id_,
-                                          clio::run::PoolQuery::Local(), target,
+                                          FsPathQuery(), target,
                                           path);
     return ipc->Send(task);
   }
@@ -425,7 +578,7 @@ class Client : public clio::cte::core::Client {
   clio::run::Future<ReadlinkTask> AsyncReadlink(const std::string &path) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<ReadlinkTask>(clio::run::CreateTaskId(), pool_id_,
-                                           clio::run::PoolQuery::Local(), path);
+                                           FsPathQuery(), path);
     return ipc->Send(task);
   }
 
@@ -435,7 +588,7 @@ class Client : public clio::cte::core::Client {
                                                 clio::run::u32 flags) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<SetxattrTask>(clio::run::CreateTaskId(), pool_id_,
-                                           clio::run::PoolQuery::Local(), path,
+                                           FsPathQuery(), path,
                                            name, value, flags);
     return ipc->Send(task);
   }
@@ -444,7 +597,7 @@ class Client : public clio::cte::core::Client {
                                                 const std::string &name) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<GetxattrTask>(clio::run::CreateTaskId(), pool_id_,
-                                           clio::run::PoolQuery::Local(), path,
+                                           FsPathQuery(), path,
                                            name);
     return ipc->Send(task);
   }
@@ -452,7 +605,7 @@ class Client : public clio::cte::core::Client {
   clio::run::Future<ListxattrTask> AsyncListxattr(const std::string &path) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<ListxattrTask>(clio::run::CreateTaskId(), pool_id_,
-                                            clio::run::PoolQuery::Local(), path);
+                                            FsPathQuery(), path);
     return ipc->Send(task);
   }
 
@@ -461,19 +614,25 @@ class Client : public clio::cte::core::Client {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<RemovexattrTask>(clio::run::CreateTaskId(),
                                               pool_id_,
-                                              clio::run::PoolQuery::Local(),
+                                              FsPathQuery(),
                                               path, name);
     return ipc->Send(task);
   }
 
-  // ---- deferred-append pipeline ----
-  /** Kick off (or tick) the periodic local pending-append drain. */
-  clio::run::Future<AppendSequenceTask> AsyncAppendSequence(
-      double period_us = 0.0,
-      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Local()) {
+  /**
+   * Internal: run one ShardOp on the container `pool_query` names (the
+   * owner of the directory or inode the request addresses).
+   * @param op FsShardOp code
+   * @param req encoded request
+   * @param pool_query owner container
+   * @param period_us nonzero = periodic task with this period
+   */
+  clio::run::Future<ShardOpTask> AsyncShardOp(
+      clio::run::u32 op, const std::string &req,
+      const clio::run::PoolQuery &pool_query, double period_us = 0.0) {
     auto *ipc = CLIO_CPU_IPC;
-    auto task = ipc->NewTask<AppendSequenceTask>(clio::run::CreateTaskId(), pool_id_,
-                                                 pool_query);
+    auto task = ipc->NewTask<ShardOpTask>(clio::run::CreateTaskId(), pool_id_,
+                                          pool_query, op, req);
     if (period_us > 0.0) {
       task->SetPeriod(period_us, clio::run::kMicro);
       task->SetFlags(TASK_PERIODIC);
@@ -481,59 +640,49 @@ class Client : public clio::cte::core::Client {
     return ipc->Send(task);
   }
 
-  /** Collect one tag's pending appends at its sequencer (ManyToOne batch). */
-  clio::run::Future<AppendCollectTask> AsyncAppendCollect(
-      const clio::cte::core::TagId &tag_id,
-      const std::vector<AppendEntry> &entries, const clio::run::PoolQuery &pool_query) {
-    auto *ipc = CLIO_CPU_IPC;
-    auto task = ipc->NewTask<AppendCollectTask>(clio::run::CreateTaskId(), pool_id_,
-                                                pool_query, tag_id, entries);
-    return ipc->Send(task);
-  }
-
-  /** Plan + dispatch one tag's batch (suspendable; submitted by AppendCollect). */
-  clio::run::Future<AppendPlanTask> AsyncAppendPlan(
-      const clio::cte::core::TagId &tag_id,
-      const std::vector<AppendEntry> &entries, const clio::run::PoolQuery &pool_query) {
-    auto *ipc = CLIO_CPU_IPC;
-    auto task = ipc->NewTask<AppendPlanTask>(clio::run::CreateTaskId(), pool_id_,
-                                             pool_query, tag_id, entries);
-    return ipc->Send(task);
-  }
-
-  /** Apply a slice of the merge plan (GetBlob->PutBlob->DelBlob). */
-  clio::run::Future<AppendExecutionTask> AsyncAppendExecution(
-      const clio::cte::core::TagId &tag_id,
-      const clio::cte::core::TagId &staging_tag_id,
-      const std::vector<AppendPlanStep> &steps, const clio::run::PoolQuery &pool_query) {
-    auto *ipc = CLIO_CPU_IPC;
-    auto task = ipc->NewTask<AppendExecutionTask>(
-        clio::run::CreateTaskId(), pool_id_, pool_query, tag_id, staging_tag_id, steps);
-    return ipc->Send(task);
-  }
-
   clio::run::Future<ReaddirTask> AsyncReaddir(const std::string &path) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<ReaddirTask>(clio::run::CreateTaskId(), pool_id_,
-                                          clio::run::PoolQuery::Local(), path);
+                                          FsPathQuery(), path);
+    return ipc->Send(task);
+  }
+
+  /**
+   * List one chunk of a directory in offset order (Method::kReaddirRange).
+   * @param path directory path
+   * @param start_off first offset wanted: 0 for the start, else a previous
+   *        chunk's next_off_ or any offset to seek to
+   * @param max_entries entries after which the chunk ends (it may run a
+   *        little over: chunks are never cut inside a table block)
+   * @return future of the chunk; next_off_ is kDirOffEnd at the end
+   */
+  clio::run::Future<ReaddirRangeTask> AsyncReaddirRange(
+      const std::string &path, clio::run::u64 start_off,
+      clio::run::u32 max_entries = 8192) {
+    auto *ipc = CLIO_CPU_IPC;
+    auto task = ipc->NewTask<ReaddirRangeTask>(
+        clio::run::CreateTaskId(), pool_id_, FsPathQuery(), path, start_off,
+        max_entries);
     return ipc->Send(task);
   }
 
   clio::run::Future<StatSizeTask> AsyncStatSize(const std::string &path) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<StatSizeTask>(clio::run::CreateTaskId(), pool_id_,
-                                           clio::run::PoolQuery::Local(), path);
+                                           FsPathQuery(), path);
     return ipc->Send(task);
   }
 
-#if !defined(_WIN32)
   // =========================================================================
   // Byte-oriented filesystem I/O with POSIX semantics (issues #817, #862).
   //
-  // POSIX-only: these return ssize_t and the descriptor layer below adds
-  // off_t/O_SYNC/S_IFREG. Windows builds get the task API (AsyncRead/
-  // AsyncWrite/...) which is portable; the old adapter/cfs was excluded from
-  // Windows at the CMake level for exactly this reason.
+  // POSIX-SHAPED, but not POSIX-only: nothing here makes a system call. The
+  // layer is a descriptor table and a set of seek offsets over the task API,
+  // so what tied it to POSIX was its vocabulary -- ssize_t, off_t, O_SYNC --
+  // rather than its behaviour. That vocabulary comes from posix_compat.h now
+  // (FsSsize/FsOff), and the layer builds on Windows too. Offsets are FsOff
+  // and deliberately not off_t: MSVC's off_t is 32 bits and would cap every
+  // offset here at 2 GiB.
   //
   // THIS is the interface an interceptor calls. An adapter (POSIX, STDIO,
   // MPI-IO, libfuse) should own nothing but its handle table and its seek
@@ -542,224 +691,72 @@ class Client : public clio::cte::core::Client {
   // the POSIX adapter, which meant the next adapter either duplicated them or
   // silently did without.
   //
-  // The write-behind window is the CTE core's deferred-write registry, not a
-  // private one — it already owns the in-flight FIFO, the per-key pending
-  // table, the byte budget, the recycled staging pool (issue #892) and the
-  // per-key error latch. Two consequences worth knowing:
-  //
-  //  - The byte budget is now GLOBAL rather than per-file. It bounds what it
-  //    is actually protecting (shared-memory staging capacity), which a
-  //    per-file bound never did: 100 files under a 64 MiB per-file window
-  //    could pin 6.4 GiB.
-  //  - Read-your-own-writes no longer WAITS. The registry keeps each in-flight
-  //    write's staging bytes addressable, so a read overlapping one is served
-  //    from them (DeferTryServe) and only a partially-covered read has to
-  //    drain. The old adapter drained on any overlap.
+  // Writes are synchronous: write(2) returns once the filesystem chimod has
+  // the bytes, and a failure is reported by that write(2) itself.
   // =========================================================================
 
-  /** Whether write(2) may return before the runtime has the bytes (issue
-   *  #817). ON by default; CLIO_CFS_ASYNC_WRITES=0 restores blocking writes.
-   *
-   *  Measured on 128 x 64 KiB overwrite + fsync, five runs each, medians:
-   *  queued 5.77 ms vs blocking 6.86 ms — "no worse, probably a little
-   *  better", not a headline.
-   *
-   *  A NOTE ON HOW EASY THIS IS TO MEASURE WRONG: the first pass over a fresh
-   *  file allocates every block and a second pass does not, so timing one mode
-   *  on a new file and the other on the warmed one compares allocation against
-   *  overwrite. Doing exactly that produced a confident, entirely spurious
-   *  "async is 2.3x SLOWER". Warm first; time only overwrites. */
-  static bool AsyncWritesEnabled() {
-    static const bool v = [] {
-      if (const char *e = std::getenv("CLIO_CFS_ASYNC_WRITES")) {
-        return !(std::string(e) == "0" || std::string(e) == "false");
-      }
-      return true;
-    }();
-    return v;
-  }
-
-  /** Deferred writes allowed in flight before a write blocks on the oldest.
-   *
-   *  This is the bound that actually binds for small I/O -- see
-   *  AwaitPutsUntilSpace for why a byte-only window lets 4 KiB writes queue
-   *  16k deep and lose 1.59x throughput to page-token contention. 256 was the
-   *  best of {256, 512, 1024, 2048, 4096, 16384} measured at 4 KiB, and is
-   *  well above what large I/O ever reaches (a 1 MiB writer hits the 64 MiB
-   *  byte bound at 64 in flight), so it costs large writes nothing.
-   *  CLIO_CFS_WRITE_WINDOW_COUNT overrides. */
-  static clio::run::u64 WriteWindowCount() {
-    static const clio::run::u64 v = [] {
-      if (const char *e = std::getenv("CLIO_CFS_WRITE_WINDOW_COUNT")) {
-        char *end = nullptr;
-        unsigned long long n = std::strtoull(e, &end, 10);
-        if (end != e && n > 0) return static_cast<clio::run::u64>(n);
-      }
-      return static_cast<clio::run::u64>(256);
-    }();
-    return v;
-  }
-
-  /** Staging bytes allowed in flight before a write blocks on the oldest.
-   *  Back-pressure, never a failure. CLIO_CFS_WRITE_WINDOW_BYTES overrides. */
-  static clio::run::u64 WriteWindowBytes() {
-    static const clio::run::u64 v = [] {
-      if (const char *e = std::getenv("CLIO_CFS_WRITE_WINDOW_BYTES")) {
-        char *end = nullptr;
-        unsigned long long n = std::strtoull(e, &end, 10);
-        if (end != e && n > 0) return static_cast<clio::run::u64>(n);
-      }
-      return static_cast<clio::run::u64>(64ULL * 1024 * 1024);
-    }();
-    return v;
-  }
-
-  /** Registry key for a file. Writes and reads of one path must agree on it,
-   *  and it is what makes read-your-own-writes a property of the FILE rather
-   *  than of a handle — two descriptors on one file see each other's writes. */
-  static clio::run::u64 FileKey(const std::string &path) {
-    return DeferKeyHashName(path);
-  }
-
   /**
-   * write(2) at an explicit offset. Copies `buf` into pooled shared memory
-   * (mandatory: the caller may reuse its buffer the instant write(2) returns),
-   * submits, and — unless `sync` — registers the write as deferred and
-   * returns without waiting.
+   * write(2) at an explicit offset. Copies `buf` into a runtime buffer (the
+   * caller may reuse its buffer the instant write(2) returns), sends the
+   * Write task and waits for it.
    *
-   * ALWAYS SUCCEEDS when deferred: a queued write that fails latches its
-   * errno against the path for Flush/close to report, exactly as the kernel
-   * page cache reports writeback failures to fsync rather than to an
-   * unrelated later write(2).
-   *
-   * @param sync O_SYNC/O_DSYNC — wait for completion. The caller asked for
-   *        durability over latency and honouring that is the point of the flag.
-   * @return bytes accepted, or -1 with errno set.
+   * @param handle chimod handle of the open file
+   * @param path bare path of the file (unused; kept for the descriptor API)
+   * @param off file offset
+   * @param buf source bytes
+   * @param count bytes to write
+   * @param sync O_SYNC/O_DSYNC (writes already complete before returning)
+   * @return bytes written, or -1 with errno set (ENOSPC for a full store,
+   *         ENOMEM when no buffer could be allocated, else EIO).
    */
-  ssize_t Write(clio::run::u64 handle, const std::string &path,
+  FsSsize Write(clio::run::u64 handle, const std::string &path,
                 clio::run::u64 off, const void *buf, size_t count,
                 bool sync = false) {
+    (void)path;
+    (void)sync;
     if (count == 0) {
       return 0;
     }
-    const bool blocking = sync || !AsyncWritesEnabled();
-    // Recycle completed writes' staging so this burst feeds its own pool
-    // instead of allocating fault-cold buffers (issue #892 measured cold
-    // allocation as THE submit bottleneck). Opportunistic: it gives up rather
-    // than queue when another submitter is already reaping, which is what
-    // keeps this off the critical path as thread count rises.
-    const bool prof = ProfileEnabled();
-    auto tick = [] { return std::chrono::steady_clock::now(); };
-    auto t0 = prof ? tick() : std::chrono::steady_clock::time_point{};
-    DeferReapCompletedIfUncontended();
-    ctp::ipc::FullPtr<char> staging = PoolTryAlloc(count);
+    auto *ipc = CLIO_IPC;
+    ctp::ipc::FullPtr<char> staging = ipc->AllocateBuffer(count);
     if (staging.IsNull()) {
-      // Pool miss. NOW it is worth reaping completed writes -- that refills
-      // the pool with pre-faulted buffers, and a fresh allocation is the
-      // expensive thing we are trying to avoid (issue #892 measured cold
-      // allocation as THE submit bottleneck). Doing this on every write
-      // instead, hit or miss, is what made the global registry mutex the
-      // busiest lock in the client.
-      DeferReapCompleted();
-      staging = PoolAllocStaging(count);
+      errno = ENOMEM;
+      return -1;
     }
-    if (staging.IsNull()) {
-      // Draining hands those buffers straight back, so a write that would
-      // have failed with ENOMEM waits instead — the same trade the window
-      // bound already makes, triggered by the allocator rather than a count.
-      AwaitPutsUntilSpace(0);
-      staging = PoolAllocStaging(count);
-      if (staging.IsNull()) {
-        errno = ENOMEM;
-        return -1;
-      }
-    }
-    auto t1 = prof ? tick() : std::chrono::steady_clock::time_point{};
     std::memcpy(staging.ptr_, buf, count);
-    auto t2 = prof ? tick() : std::chrono::steady_clock::time_point{};
     auto fut = AsyncWrite(handle, off, count,
                           ctp::ipc::ShmPtr<>(staging.shm_));
-    auto t3 = prof ? tick() : std::chrono::steady_clock::time_point{};
-    if (blocking) {
-      fut.Wait();
-      ssize_t ret;
-      if (fut->GetReturnCode() == 0) {
-        ret = static_cast<ssize_t>(fut->bytes_written_);
-      } else {
-        errno = EIO;
-        ret = -1;
-      }
-      PoolFreeStaging(staging, count);
-      return ret;
+    fut.Wait();
+    FsSsize ret;
+    if (fut->GetReturnCode() == 0) {
+      ret = static_cast<FsSsize>(fut->bytes_written_);
+    } else {
+      // The chimod reports a full store as ENOSPC; all else is EIO.
+      errno = fut->GetReturnCode() == ENOSPC ? ENOSPC : EIO;
+      ret = -1;
     }
-    // Deferred. The staging pointer is handed to the registry as the write's
-    // readable extent, which is what lets a subsequent read of these bytes be
-    // served without waiting for the task.
-    //
-    // Note what is NOT ordered: two writes to overlapping bytes with no
-    // intervening flush race the runtime's write token, and a client-side
-    // wait cannot fix it (measured: 512 rewrites of one range lose the last
-    // write ~30% of runs even WITH a same-range wait). An application needing
-    // strict last-writer-wins across overlapping unsynced writes must flush
-    // between them or open O_SYNC. Disjoint writes — every sequential or
-    // random writer — are unaffected.
-    DeferRegisterWrite(fut, FileKey(path), off, count, staging.ptr_, staging,
-                       count);
-    auto t4 = prof ? tick() : std::chrono::steady_clock::time_point{};
-    // Enforce the window AFTER accounting, so this write is included in the
-    // bound rather than being the one that overshoots it. This can block —
-    // that is the back-pressure — but it cannot fail.
-    AwaitPutsUntilSpace(WriteWindowBytes(), WriteWindowCount());
-    if (prof) {
-      auto t5 = tick();
-      using ns = std::chrono::nanoseconds;
-      SubmitProfile &p = Profile();
-      p.n.fetch_add(1, std::memory_order_relaxed);
-      p.stage_ns.fetch_add(std::chrono::duration_cast<ns>(t1 - t0).count(),
-                           std::memory_order_relaxed);
-      p.copy_ns.fetch_add(std::chrono::duration_cast<ns>(t2 - t1).count(),
-                          std::memory_order_relaxed);
-      p.send_ns.fetch_add(std::chrono::duration_cast<ns>(t3 - t2).count(),
-                          std::memory_order_relaxed);
-      p.reg_ns.fetch_add(std::chrono::duration_cast<ns>(t4 - t3).count(),
-                         std::memory_order_relaxed);
-      p.window_ns.fetch_add(std::chrono::duration_cast<ns>(t5 - t4).count(),
-                            std::memory_order_relaxed);
-    }
-    return static_cast<ssize_t>(count);
+    ipc->FreeBuffer(staging);
+    return ret;
   }
 
   /**
-   * read(2) at an explicit offset, with read-your-own-writes.
+   * read(2) at an explicit offset. Committed bytes come from shared memory
+   * when the mirrors can serve them (no IPC); anything else is one task to
+   * the chimod.
    *
-   * Three tiers, cheapest first: bytes still in flight are copied out of the
-   * pending write's staging (no wait, no IPC); committed bytes come from the
-   * shared-memory mirror (no IPC); anything else is one RPC to the chimod.
-   *
+   * @param handle chimod handle of the open file
+   * @param path bare path of the file
+   * @param off file offset
+   * @param buf destination
+   * @param count bytes to read
    * @return bytes read (possibly 0 at EOF), or -1 with errno set.
    */
-  ssize_t Read(clio::run::u64 handle, const std::string &path,
+  FsSsize Read(clio::run::u64 handle, const std::string &path,
                clio::run::u64 off, void *buf, size_t count) {
     if (count == 0) {
       return 0;
     }
-    const clio::run::u64 key = FileKey(path);
-    int served = DeferTryServe(key, off, static_cast<char *>(buf), count);
-    if (served > 0) {
-      // Fully covered by in-flight writes: those bytes ARE the current value,
-      // and the file is necessarily at least this long.
-      return static_cast<ssize_t>(count);
-    }
-    if (served == -1) {
-      // PARTIAL coverage: the bytes outside the in-flight writes are stale in
-      // the file until those writes land, so this is the one case that has to
-      // wait. -2 means writes are in flight for this file but none touches
-      // these bytes -- the overwhelmingly common case for a mixed workload --
-      // and waiting there would let any concurrent writer stall every reader
-      // of the same file.
-      DeferAwaitKey(key);
-    }
-    ssize_t fast = TryReadShm(path, off, buf, count);
+    FsSsize fast = TryReadShm(path, off, buf, count);
     if (fast >= 0) {
       return fast;
     }
@@ -771,13 +768,13 @@ class Client : public clio::cte::core::Client {
     }
     auto t = AsyncRead(handle, off, count, ctp::ipc::ShmPtr<>(shm.shm_));
     t.Wait();
-    ssize_t ret;
+    FsSsize ret;
     if (t->GetReturnCode() == 0) {
       size_t got = static_cast<size_t>(t->bytes_read_);
       if (got > 0) {
         std::memcpy(buf, shm.ptr_, got);
       }
-      ret = static_cast<ssize_t>(got);
+      ret = static_cast<FsSsize>(got);
     } else {
       errno = EIO;
       ret = -1;
@@ -787,71 +784,30 @@ class Client : public clio::cte::core::Client {
   }
 
   /**
-   * fsync(2): wait for every deferred write to `path` and report — once —
-   * any failure they latched. Before deferred writes this was a no-op,
-   * because every write blocked.
-   */
-  int Flush(const std::string &path) {
-    const clio::run::u64 key = FileKey(path);
-    DeferAwaitKey(key);
-    int err = DeferTakeKeyError(key);
-    if (err != 0) {
-      errno = err;
-      return -1;
-    }
-    return 0;
-  }
-
-  /** Wait for every deferred write this client has outstanding, on any path.
-   *  For teardown and for benchmarks that must time a complete flush. */
-  static void FlushAll() { AwaitPutsUntilSpace(0); }
-
-  /**
    * stat(2)-shaped query: existence and logical size.
    *
-   * Drains `path` first — a queued write has not updated the file's logical
-   * size yet, and stat(2) must report the size a completed write(2)
-   * established. The drain does NOT consume a latched error: stat is not one
-   * of the two calls (fsync, close) that owns that report.
-   *
+   * @param path bare path
+   * @param exists receives whether the file is there
+   * @param size receives the logical size
    * @return false when the query itself failed (ask again); *exists says
    *         whether the file is there.
    */
   bool GetAttr(const std::string &path, bool *exists, clio::run::u64 *size) {
-    const clio::run::u64 key = FileKey(path);
-    // Serve from the shared-memory mirror when nothing is in flight for this
-    // file. stat(2) is the most frequent metadata call a filesystem sees, and
-    // the record the runtime already publishes carries both answers -- paying
-    // a round trip for them made stat cost ~325 us against ~4 us for a
-    // fast-pathed 4 KiB read, i.e. metadata became the bottleneck of a
-    // workload whose DATA path had stopped doing IPC at all.
-    //
-    // The pending-write check is what keeps this honest: a queued write has
-    // not advanced the published size yet, so with anything in flight we take
-    // the slow path (drain, then ask the runtime) exactly as before. Same
-    // staleness argument as TryReadShm otherwise -- the runtime publishes the
-    // new size at the end of the Write handler, so it lands before the
-    // write(2) that grew the file returns to its caller.
+    // Serve from the filesystem's shared-memory mirror when it has the path:
+    // stat(2) is the most frequent metadata call a filesystem sees, and the
+    // record the runtime publishes carries both answers. Writes are
+    // synchronous, so the published size already includes every write(2)
+    // that has returned.
     if (HasShmCache() || AttachShmCache()) {
       ShmFileRecord rec;
       if (TryGetFileRecordShm(path, &rec)) {
-        const clio::run::u64 published = rec.Exists() ? rec.size_ : 0;
-        // The published size is already correct unless something in flight
-        // reaches PAST the current end -- an overwrite cannot change a file's
-        // size, and overwrites are what a steady-state workload mostly does.
-        // Draining on any pending write instead (the obvious version of this
-        // check) left stat at ~264 us because it waited on writes that could
-        // not possibly have affected the answer.
-        if (DeferMaxPendingEnd(key) <= published) {
-          *exists = rec.Exists();
-          *size = published;
-          ShmStatHits().fetch_add(1, std::memory_order_relaxed);
-          return true;
-        }
+        *exists = rec.Exists();
+        *size = rec.Exists() ? rec.size_ : 0;
+        ShmStatHits().fetch_add(1, std::memory_order_relaxed);
+        return true;
       }
     }
     ShmStatMisses().fetch_add(1, std::memory_order_relaxed);
-    DeferAwaitKey(key);
     auto t = AsyncGetattr(path);
     t.Wait();
     if (t->GetReturnCode() != 0) {
@@ -862,7 +818,12 @@ class Client : public clio::cte::core::Client {
     return true;
   }
 
-  /** Logical size of `path` (0 when absent). See GetAttr for the drain. */
+  /**
+   * Logical size of `path` (0 when absent).
+   * @param path bare path
+   * @param size receives the size
+   * @return false when the query itself failed
+   */
   bool GetSize(const std::string &path, clio::run::u64 *size) {
     bool exists = false;
     if (!GetAttr(path, &exists, size)) {
@@ -874,22 +835,6 @@ class Client : public clio::cte::core::Client {
     return true;
   }
 
-  /**
-   * Zero-IPC read of COMMITTED bytes straight out of shared memory (issue
-   * #817). Resolves the path to its tag + logical size in this pool's SHM
-   * mirror, then copies each page blob out of the RAM bdev segment via the
-   * core's payload fast path.
-   *
-   * Distinct from the deferred-registry fast path in Read(), which serves
-   * bytes that have NOT been committed yet: the two cover disjoint cases and
-   * a read may need either.
-   *
-   * @return bytes read (possibly 0 at EOF), or -1 meaning "not
-   *         fast-pathable" — NOT an error. -1 covers every refusal: cache
-   *         absent, path not mirrored, pending appends, a hole, a page on a
-   *         file/remote/GPU tier, or placement moving mid-copy. The caller
-   *         must then use the RPC path, which is always correct.
-   */
   // =========================================================================
   // POSIX descriptor layer.
   //
@@ -901,8 +846,7 @@ class Client : public clio::cte::core::Client {
   // API into these calls and hold nothing.
   //
   // The table is process-wide and static rather than a member because
-  // clio::cte::core::Client is copyable by contract (see the deferred-write
-  // registry, which is static for the same reason); a mutex member would
+  // clio::cte::core::Client is copyable by contract; a mutex member would
   // silently break that.
   // =========================================================================
 
@@ -924,7 +868,13 @@ class Client : public clio::cte::core::Client {
 #ifdef O_DSYNC
     if (flags & O_DSYNC) return true;
 #endif
+#ifdef O_SYNC
     return (flags & O_SYNC) != 0;
+#else
+    /* MSVC defines neither, so no caller there can have requested it. */
+    (void)flags;
+    return false;
+#endif
   }
 
   /** Whether fd was issued by us (and is still open). */
@@ -967,20 +917,84 @@ class Client : public clio::cte::core::Client {
   /** Bind the filesystem pool on first tracked use. */
   static bool EnsureInit();
 
+  /**
+   * open(2) for a `clio::`-prefixed path (the interception adapters). With
+   * O_CREAT, missing parent directories are created first: the path mirrors
+   * a host path whose directories exist on the host.
+   * @param raw_path path, optionally with the `clio::` prefix
+   * @param flags open flags
+   * @param mode creation mode
+   * @return a descriptor, or -1 with errno set
+   */
   int OpenFd(const std::string &raw_path, int flags, int mode);
-  ssize_t ReadFd(int fd, void *buf, size_t count);
-  ssize_t WriteFd(int fd, const void *buf, size_t count);
-  ssize_t PreadFd(int fd, void *buf, size_t count, off_t offset);
-  ssize_t PwriteFd(int fd, const void *buf, size_t count, off_t offset);
-  off_t SeekFd(int fd, off_t offset, int whence);
-  off_t TellFd(int fd);
-  off_t SizeFd(int fd);
+  FsSsize ReadFd(int fd, void *buf, size_t count);
+  FsSsize WriteFd(int fd, const void *buf, size_t count);
+  FsSsize PreadFd(int fd, void *buf, size_t count, FsOff offset);
+  FsSsize PwriteFd(int fd, const void *buf, size_t count, FsOff offset);
+  FsOff SeekFd(int fd, FsOff offset, int whence);
+  FsOff TellFd(int fd);
+  FsOff SizeFd(int fd);
   int CloseFd(int fd);
-  /** fsync(2): drain this file's deferred writes, reporting a latched
-   *  failure exactly once. */
+  /** fsync(2): make the file durable (SyncDurable). Writes are synchronous,
+   *  so there is nothing to drain first. */
   int SyncFd(int fd);
-  int FtruncateFd(int fd, off_t length);
-  int TruncatePath(const std::string &raw_path, off_t length);
+
+  // ---- fsync(2) durability (shared by the interceptors and FUSE) ----
+
+  /**
+   * Whether CTE performance.fsync_mode is "deferred", as learned from the
+   * first SyncTag reply: fsync then skips the device sync and leaves
+   * durability to the periodic flushes.
+   * @return true once a reply said "deferred"
+   */
+  static bool FsyncDeferred();
+
+  /**
+   * Make one CTE tag durable: SyncTag, broadcast to every core container.
+   * @param tag the tag (null is a no-op)
+   * @param lost_node out (optional): a container's node was down
+   * @param liveness_change_ns out (optional): wall-clock ns of the last
+   *        liveness change the sync saw (SyncTagTask::liveness_change_ns_)
+   * @return 0, -ENOSPC when no persistent tier had room, or -EIO
+   */
+  static int SyncTagDurable(const clio::cte::core::TagId &tag,
+                            bool *lost_node = nullptr,
+                            clio::run::u64 *liveness_change_ns = nullptr);
+
+  /**
+   * fsync(2)'s size step: fsync the size log at the file's stream home.
+   * @param tag the file's tag (null, or an id without a home: nothing to do)
+   * @return 0 or -EIO
+   */
+  static int SyncFileSize(const clio::cte::core::TagId &tag);
+
+  /**
+   * The CTE tag of a file or directory (its id is its inode number).
+   * @param path the path
+   * @param want_dir true: only a directory resolves
+   * @return the tag, or null when the path does not resolve
+   */
+  clio::cte::core::TagId TagOfPath(const std::string &path, bool want_dir);
+
+  /**
+   * fsync(2)'s durability step: the file's blobs (pages and inode record),
+   * its size, then the directory blocks naming it, so the bytes, the size
+   * and the name all survive power loss.
+   * @param tag the file's tag (null: only the directory)
+   * @param dir the directory whose entries must be durable
+   * @return 0, -ENOSPC or -EIO
+   */
+  int SyncDurable(const clio::cte::core::TagId &tag, const std::string &dir);
+
+  /**
+   * fsync every filesystem container's directory journal and system
+   * records (SyncMeta, broadcast): the namespace half of fsync/fsyncdir.
+   * A container on a lost node does not fail it (its journal is its own).
+   * @return 0 or -EIO
+   */
+  int SyncMetaDurable();
+  int FtruncateFd(int fd, FsOff length);
+  int TruncatePath(const std::string &raw_path, FsOff length);
   int RemovePath(const std::string &raw_path);
   int RenamePath(const std::string &raw_src, const std::string &raw_dst);
   int ReaddirPath(const std::string &raw_path, std::vector<std::string> *out);
@@ -1001,10 +1015,21 @@ class Client : public clio::cte::core::Client {
     buf->st_nlink = 1;
     buf->st_uid = CTP_SYSTEM_INFO->uid_;
     buf->st_gid = CTP_SYSTEM_INFO->gid_;
-    buf->st_size = static_cast<off_t>(size);
-    buf->st_blksize = static_cast<blksize_t>(kCfsBlkSize);
-    // POSIX st_blocks counts 512-byte units; round up so non-empty != 0.
-    buf->st_blocks = static_cast<blkcnt_t>((size + 511) / 512);
+    // Cast to whatever the caller's own struct declares rather than to fixed
+    // POSIX types: this is a template instantiated with their stat struct.
+    buf->st_size = static_cast<decltype(buf->st_size)>(size);
+    // st_blksize/st_blocks are POSIX extensions that MSVC's struct stat simply
+    // does not have. Detected on the caller's struct rather than on _WIN32,
+    // because this is a template: a caller passing a struct that DOES declare
+    // them still gets them filled, whatever the platform.
+    if constexpr (requires { buf->st_blksize; }) {
+      buf->st_blksize = static_cast<decltype(buf->st_blksize)>(kCfsBlkSize);
+    }
+    if constexpr (requires { buf->st_blocks; }) {
+      // POSIX st_blocks counts 512-byte units; round up so non-empty != 0.
+      buf->st_blocks =
+          static_cast<decltype(buf->st_blocks)>((size + 511) / 512);
+    }
   }
 
   /** fstat(2): fill *buf from the fd's chimod metadata. */
@@ -1014,8 +1039,6 @@ class Client : public clio::cte::core::Client {
     if (!LookupFd(fd, &of)) {
       return -1;
     }
-    // GetSize drains this file's deferred writes: stat(2) must report the
-    // size a completed write(2) established (issue #817).
     clio::run::u64 size = 0;
     if (!GetSize(of.path, &size)) {
       errno = EBADF;
@@ -1028,6 +1051,13 @@ class Client : public clio::cte::core::Client {
   /** stat(2): fill *buf for a clio:: path; ENOENT if it does not exist. */
   template <typename StatT>
   int StatPath(const std::string &raw_path, StatT *buf) {
+    // A stat can be the first clio:: call a process makes (IOR stats its
+    // target before opening it), so it must bring the client up itself.
+    if (!EnsureInit()) {
+      std::memset(buf, 0, sizeof(StatT));
+      errno = EIO;
+      return -1;
+    }
     std::string path = StripClioPrefix(raw_path);
     clio::run::u64 size = 0;
     bool exists = false;
@@ -1051,87 +1081,85 @@ class Client : public clio::cte::core::Client {
     return v;
   }
 
-  ssize_t TryReadShm(const std::string &path, clio::run::u64 off, void *buf,
+  /**
+   * Read committed bytes from shared memory, refusing rather than inventing
+   * anything the shm cache does not hold (the HDF5 VFD's cache-over-file
+   * semantics). Same as TryReadShm: a page the cache does not hold is never
+   * zero-filled, because from this side "not cached" and "a hole" look alike.
+   * @param path bare path
+   * @param off file offset
+   * @param buf destination
+   * @param count bytes to read
+   * @return bytes read, or -1 meaning "not fast-pathable, use the
+   *         authoritative source"
+   */
+  FsSsize TryReadShmResident(const std::string &path, clio::run::u64 off,
+                             void *buf, size_t count) {
+    return TryReadShm(path, off, buf, count);
+  }
+
+  /**
+   * Zero-IPC read of committed bytes: resolves the path to its tag and
+   * logical size in this filesystem pool's shared-memory mirror, then copies
+   * each page out of the data client's shm cache segment
+   * (core::Client::TryGetCached).
+   *
+   * FsSsize, not ssize_t: MSVC has no ssize_t, and this layer's whole
+   * vocabulary was ported to FsSsize/FsOff so it builds on Windows.
+   *
+   * @param path bare path
+   * @param off file offset
+   * @param buf destination
+   * @param count bytes to read
+   * @return bytes read (possibly 0 at EOF), or -1 meaning "not
+   *         fast-pathable" -- NOT an error: mirror absent, path not mirrored,
+   *         pending appends, no shm cache connected, or a page the cache does
+   *         not hold. The caller then uses the task path, which is always
+   *         correct.
+   */
+  FsSsize TryReadShm(const std::string &path, clio::run::u64 off, void *buf,
                      size_t count) {
     if (!ShmReadFastPathEnabled()) {
       return -1;
     }
-    // Attach lazily, and RETRY when not yet attached, rather than latching
-    // the result of one attempt at init. A client can legitimately come up
-    // before its pool has been composed (or before the chimod has registered
-    // its cache root), and a one-shot attach would leave that process on the
-    // RPC path forever -- silently, since a disabled cache and a working one
-    // look identical from the outside. Retrying costs a scan of a <=32-entry
-    // directory, against an RPC that costs ~100 us.
+    // Attach lazily, and RETRY when not yet attached: a client can come up
+    // before its pool has been composed, and a one-shot attach would leave
+    // that process on the task path forever.
     if (!HasShmCache() && !AttachShmCache()) {
       ShmReadMisses().fetch_add(1, std::memory_order_relaxed);
       return -1;
     }
-    auto *cte = CLIO_CTE_CLIENT;
-    if (cte == nullptr || (!cte->HasShmCache() && !cte->AttachShmCache())) {
-      // Page payloads come from the core cache; both are required.
-      ShmReadMisses().fetch_add(1, std::memory_order_relaxed);
-      return -1;
-    }
-
+    auto *cte = Cte();
     ShmFileRecord rec;
-    if (!TryGetFileRecordShm(path, &rec) || !rec.IsFastPathable()) {
+    if (cte->pool_id_.IsNull() || !cte->HasCache() ||
+        !TryGetFileRecordShm(path, &rec) || !rec.IsFastPathable()) {
       ShmReadMisses().fetch_add(1, std::memory_order_relaxed);
       return -1;
     }
-
-    // Clamp to the LOGICAL size. This is the number the chimod owns and the
-    // one POSIX read() semantics are defined against; the tag's physical byte
-    // total would be wrong after a sparse write or an ftruncate-grow.
-    //
-    // Reading a stale (too small) size here cannot produce a short read for a
-    // properly ordered caller: the runtime publishes the new size at the end
-    // of the Write handler, so it lands before the write() that grew the file
-    // returns to its caller.
+    // Clamp to the LOGICAL size: the number the chimod owns and the one POSIX
+    // read() semantics are defined against. The runtime publishes a new size
+    // at the end of the Write handler, before the write() that grew the file
+    // returns, so a properly ordered reader never sees it too small.
     if (off >= rec.size_) {
       return 0;  // at or past EOF
     }
-    clio::run::u64 want = count;
-    if (off + want > rec.size_) {
-      want = rec.size_ - off;
-    }
-
+    const clio::run::u64 want = std::min<clio::run::u64>(count, rec.size_ - off);
     char *dst = static_cast<char *>(buf);
     clio::run::u64 done = 0;
-    clio::run::u64 cur = off;
     while (done < want) {
-      clio::run::u64 page_off = cur % kFsPageSize;
-      clio::run::u64 to_read = kFsPageSize - page_off;
-      if (to_read > want - done) {
-        to_read = want - done;
-      }
-      if (!cte->TryReadBlobShm(rec.tag_id_, PageName(cur), dst + done,
-                               static_cast<size_t>(to_read),
-                               static_cast<size_t>(page_off))) {
-        // Abandon the WHOLE request rather than mixing sources. A hole reads
-        // as zeros and a missing page is indistinguishable from an uncached
-        // one, so the only safe reading of a failure here is "let the runtime
-        // answer".
+      const clio::run::u64 cur = off + done;
+      const clio::run::u64 page_off = cur % kFsPageSize;
+      const clio::run::u64 to_read =
+          std::min<clio::run::u64>(kFsPageSize - page_off, want - done);
+      if (!cte->TryGetCached(rec.tag_id_, PageName(cur), page_off, to_read,
+                             dst + done)) {
         ShmReadMisses().fetch_add(1, std::memory_order_relaxed);
         return -1;
       }
       done += to_read;
-      cur += to_read;
     }
-    // Say so, once, the first time a read is actually served from shared
-    // memory. "The fast path is on" is otherwise unobservable from outside --
-    // a disabled cache and a working one differ only in latency -- and the
-    // failure this whole path was chasing was precisely a fast path that was
-    // silently off everywhere. Operators need something to grep for; the
-    // counters below are for anyone who needs the RATE rather than the fact.
-    static std::once_flag announced;
-    std::call_once(announced, [] {
-      HLOG(kInfo,
-           "clio-fs: serving reads from shared memory (zero-IPC fast path "
-           "active)");
-    });
     ShmReadHits().fetch_add(1, std::memory_order_relaxed);
-    return static_cast<ssize_t>(done);
+    return static_cast<FsSsize>(done);
   }
 
   // Zero-IPC read accounting. A silently-disabled fast path and a working one
@@ -1154,32 +1182,6 @@ class Client : public clio::cte::core::Client {
     return v;
   }
 
-  // ---- submit-path profile (CLIO_CFS_PROFILE_SUBMIT=1) --------------------
-  // A deferred write does not wait for completion, so single-thread write
-  // throughput IS one over the submit cost -- measured at ~12.6 us for 4 KiB,
-  // which is far more than the ~0.3 us the payload copy can explain. These
-  // counters attribute it. Off by default: five clock reads is ~125 ns, small
-  // against 12.6 us but not free.
-  struct SubmitProfile {
-    std::atomic<clio::run::u64> n{0};
-    std::atomic<clio::run::u64> stage_ns{0};   // acquire staging buffer
-    std::atomic<clio::run::u64> copy_ns{0};    // memcpy payload
-    std::atomic<clio::run::u64> send_ns{0};    // build + send the task
-    std::atomic<clio::run::u64> reg_ns{0};     // register in the registry
-    std::atomic<clio::run::u64> window_ns{0};  // enforce the in-flight window
-  };
-  static SubmitProfile &Profile() {
-    static SubmitProfile p;
-    return p;
-  }
-  static bool ProfileEnabled() {
-    static const bool v = [] {
-      const char *e = std::getenv("CLIO_CFS_PROFILE_SUBMIT");
-      return e != nullptr && std::string(e) != "0";
-    }();
-    return v;
-  }
-#endif  // !_WIN32
 #endif  // CTP_IS_HOST
 
 #if CTP_IS_HOST
@@ -1189,7 +1191,10 @@ class Client : public clio::cte::core::Client {
   // may drop the cache at any time, which is why every read is validated.
   ShmFsCacheRoot *shm_fs_root_ = nullptr;
 
-#if !defined(_WIN32)
+  // Bound by BindPools from the filesystem pool's own config.
+  clio::cte::core::Client data_cte_;
+  clio::cte::stream::Client stream_;
+
   // ---- POSIX descriptor table ----
   // Guarded by fd_mu_. Held only around map lookups and insertions -- never
   // across a task Wait, so a slow chimod call cannot block an unrelated
@@ -1197,7 +1202,6 @@ class Client : public clio::cte::core::Client {
   mutable std::mutex fd_mu_;
   std::unordered_map<int, OpenFile> fds_;
   int next_fd_ = kCfsFdBase;
-#endif  // !_WIN32
 #endif
 };
 
@@ -1208,7 +1212,12 @@ class Client : public clio::cte::core::Client {
 // filesystem_client.cc), exactly like core's g_cte_client.
 CLIO_CTE_FS_DEFINE_GLOBAL_PTR_VAR_H(clio::cte::filesystem::Client, g_fs_client);
 
-/** Initialize the filesystem client singleton (creates/binds the pool). */
+/**
+ * Initialize the filesystem client singleton: find the composed filesystem
+ * pool by name (CLIO_CFS_POOL, default kCfsPoolName; a "major.minor" value
+ * names the id directly) and bind the pools it is configured with. Creates
+ * nothing and assumes no pool id.
+ */
 bool CLIO_CFS_CLIENT_INIT(const std::string &config_path = "",
                           const clio::run::PoolQuery &pool_query =
                               clio::run::PoolQuery::Dynamic());

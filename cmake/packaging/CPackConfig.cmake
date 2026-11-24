@@ -92,7 +92,7 @@ if(CLIO_CORE_ENABLE_RPM_PACKAGE OR CLIO_CORE_ENABLE_CPACK)
     set(CPACK_GENERATORS_ENABLED ON)
 
     # RPM-specific settings
-    set(CPACK_RPM_PACKAGE_LICENSE "MIT")
+    set(CPACK_RPM_PACKAGE_LICENSE "BSD-3-Clause")  # see LICENSE (#1195)
     set(CPACK_RPM_PACKAGE_GROUP "System/Libraries")
     # External shared-library deps. AUTOREQ is off below (otherwise rpm
     # generates spurious Requires on our OWN internal libs and fails to

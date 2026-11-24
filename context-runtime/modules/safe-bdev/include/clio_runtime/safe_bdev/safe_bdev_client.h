@@ -68,7 +68,7 @@ class Client : public clio::run::ContainerClient {
       const clio::run::PoolQuery &pool_query, const std::string &pool_name,
       const clio::run::PoolId &custom_pool_id, clio::run::u32 max_failures,
       const std::vector<MemberBdevDesc> &members,
-      const std::string &alloc_log_path = "") {
+      const std::string &alloc_log_path = "", bool distributed = false) {
     auto *ipc_manager = CLIO_CPU_IPC;
 
     // CreateTask must always go through the admin pool, never pool_id_.
@@ -81,7 +81,7 @@ class Client : public clio::run::ContainerClient {
         custom_pool_id,                 // target pool ID to create
         this,                           // Client pointer for PostWait
         // CreateParams constructor arguments:
-        max_failures, members, alloc_log_path);
+        max_failures, members, alloc_log_path, distributed);
 
     return ipc_manager->Send(task);
   }

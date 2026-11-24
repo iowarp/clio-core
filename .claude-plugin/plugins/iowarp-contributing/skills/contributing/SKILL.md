@@ -115,7 +115,7 @@ Every C/C++ source file (.h, .hpp, .cc, .cpp) MUST have the BSD 3-Clause license
 
 1. **NEVER hardcode absolute paths in CMakeLists.txt files.**
 2. **NEVER build outside `/workspace/build`.** No in-source builds. No `/tmp/build_*`.
-3. **NEVER use raw GPU macros** (`__CUDACC__`, `__HIPCC__`, etc.) — use `CTP_IS_GPU`, `CTP_IS_HOST`, `CTP_IS_GPU_COMPILER`, etc. from `context-transport-primitives/include/clio_ctp/constants/macros.h`.
+3. **NEVER use raw GPU macros** (`__CUDACC__`, `__HIPCC__`, etc.) — use `CTP_IS_GPU`, `CTP_IS_HOST`, `CTP_IS_GPU_COMPILER`, etc. from `context-transport-primitives/constants/include/clio_ctp/constants/macros.h`.
 4. **NEVER write mock/stub code** unless explicitly requested. All implementations must be real and working.
 5. **NEVER use Catch2 with Clio runtime.** Use `simple_test.h` for unit tests.
 6. **NEVER use null pool queries.** Always use `local` if unsure.
@@ -146,22 +146,22 @@ clio-core/
 ├── context-transport-primitives/   # Shared memory data structures, IPC, GPU support
 │   ├── include/clio_ctp/         # Public headers (ctp:: namespace)
 │   ├── src/                        # Implementation
-│   └── docs/MODULE_DEVELOPMENT_GUIDE.md  # Module dev guide
+│   └── (module dev guide: https://core.iowarp.ai/develop/)
 │
 ├── context-runtime/                # Clio modular runtime (clio::run:: namespace)
-│   ├── include/clio_run/           # Runtime headers
+│   ├── include/clio_runtime/       # Runtime headers
 │   ├── src/scheduler/              # Worker, scheduler implementation
 │   ├── modules/                    # Built-in ChiMods (admin, bdev)
 │   ├── config/                     # Default YAML configs
 │   └── test/                       # Unit + integration tests
 │
-├── context-transfer-engine/        # I/O buffering engine (clio_cte:: namespace)
+├── context-transfer-engine/        # I/O buffering engine (clio::cte:: namespace)
 │   ├── core/                       # CTE Module
 │   ├── adapter/                    # I/O pathway adapters
 │   ├── compressor/                 # Compression Module
 │   └── config/                     # CTE configurations
 │
-├── context-assimilation-engine/    # Data ingestion (clio_cae:: namespace)
+├── context-assimilation-engine/    # Data ingestion (clio::cae:: namespace)
 │   ├── core/                       # CAE Module
 │   └── data/                       # OMNI format definitions
 │
@@ -175,7 +175,6 @@ clio-core/
 ├── cmake/                          # CMake helper modules
 ├── installers/                     # conda, pip, spack, vcpkg recipes
 ├── external/                       # Git submodules (hindsight, graphiti, jarvis-cd)
-├── AGENTS.md                       # Development guide and coding standards
 └── CMakePresets.json               # Build presets
 ```
 
@@ -212,17 +211,16 @@ Every component depends on the ones below it. Never create upward dependencies.
 | Repository | Purpose |
 |-----------|---------|
 | **clio-core** | Core platform — runtime, transport, engines |
-| **clio-kit** | Developer toolkit and examples |
+| **clio-kit** | Agent skills, MCP servers and plugins, including the CLIO Core skills |
 | **clio-agent** | Science agent for AI-driven data management |
-| **docs** | Documentation site (Docusaurus) |
 | **iowarp** | Platform installation scripts |
 | **iowarp-agents** | Collection of scientific AI agents |
 | **memorybench** | Memory/RAG benchmark suite |
 
 When making changes, consider cross-repo impact:
 - **clio-core API changes** affect clio-kit, clio-agent, and downstream users
-- **Config format changes** must update `docs/docs/deployment/configuration.md`
-- **Module interface changes** must update `MODULE_DEVELOPMENT_GUIDE.md`
+- **Config format changes** must update the comments in `context-runtime/config/clio_default.yaml` and the module's page under `site/pages/modules/`
+- **Module interface changes** must update the module development guide (https://core.iowarp.ai/develop/)
 
 ---
 

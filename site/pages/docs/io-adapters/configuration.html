@@ -1,0 +1,154 @@
+<!--
+title: Configuration reference
+heading: Adapter <em>configuration reference.</em>
+description: Every environment variable, connector string key, runtime pool and C entry point the CLIO Core I/O adapters read: the POSIX, STDIO and MPI-IO interceptors, the HDF5 VOL connector and VFD, and the ADIOS2 plugin engine, with defaults.
+eyebrow: Docs · I/O adapters
+lede: The adapters have no configuration file of their own. They are configured by the runtime's compose (which pools exist), by environment variables, by HDF5's connector strings and by a few C entry points. This page lists all of them with their defaults.
+facts: Adapter config file | None ; Runtime config | CLIO_SERVER_CONF ; HDF5 strings | key=value;key=value ; Install | Spack or a CMake source build
+-->
+<h2 id="pools">Pools the runtime must compose</h2>
+<table>
+  <tr><th>Adapter</th><th>Needs</th><th>How it finds it</th></tr>
+  <tr><td>POSIX, STDIO, MPI-IO</td><td>A <code>clio_cte_filesystem</code> pool, over a CTE chain</td><td>By pool name <code>clio_cte_filesystem</code>, or <code>CLIO_CFS_POOL</code> (a name, or an id such as <code>560.0</code>). The interceptors create no pool.</td></tr>
+  <tr><td>HDF5 VOL, ADIOS2</td><td>A <code>clio_cte_core</code> pool with at least one storage tier</td><td>By pool name <code>clio_cte_core</code>, or <code>CLIO_CTE_POOL=major.minor</code>.</td></tr>
+  <tr><td>HDF5 VFD</td><td>Nothing, unless the read tier is on; then both of the above</td><td>As above.</td></tr>
+</table>
+<p>The default configuration (<code>context-runtime/config/clio_default.yaml</code>, copied to <code>~/.clio/clio.yaml</code>) composes the filesystem pool at <code>560.0</code>, so the interceptors work with a plain <code>clio-run start</code>. Its CTE core pool is named <code>cte_main</code>, which the HDF5 connectors' lookup by name misses; rename it to <code>clio_cte_core</code>, or start from <code>context-transfer-engine/adapter/config/clio_hdf5_quickstart.yaml</code>, a small RAM-only configuration whose pool already has that name. The minimum for the HDF5 connectors and the ADIOS2 engine is the <code>compose</code> section of that file:</p>
+<pre data-label="yaml · clio-hdf5.yaml">
+compose:
+  - mod_name: clio_bdev
+    pool_name: "ram::chi_default_bdev"
+    pool_query: local
+    pool_id: "301.0"
+    bdev_type: ram
+    capacity: "256MB"
+  - mod_name: clio_cte_core
+    pool_name: clio_cte_core          # the name clients look up
+    pool_query: local
+    pool_id: "512.0"
+    storage:
+      - path: "ram::cte_ram_tier1"
+        bdev_type: "ram"
+        capacity_limit: "256MB"
+        score: 1.0
+    dpe:
+      dpe_type: "max_bw"
+</pre>
+<p>The filesystem pool's own keys are in the <a href="/docs/context-fs/api.html">Context FS reference</a>; the compose file format is in the <a href="/docs/runtime/api.html">runtime reference</a>.</p>
+
+<h2 id="common">Variables every adapter reads</h2>
+<table>
+  <tr><th>Variable</th><th>Default</th><th>Effect</th></tr>
+  <tr><td><code>CLIO_SERVER_CONF</code></td><td><code>~/.clio/clio.yaml</code></td><td>Runtime configuration. Clients read it too: set it to the file the runtime was started with. A missing or unparseable file aborts the client process.</td></tr>
+  <tr><td><code>CLIO_WITH_RUNTIME</code></td><td>unset (attach only)</td><td><code>1</code> makes the process try to become the runtime itself and attach if one already owns the port, as the adapters' tests do. <code>0</code> or unset attaches to a running <code>clio-run</code>.</td></tr>
+  <tr><td><code>CLIO_WAIT_SERVER</code></td><td>30</td><td>Seconds a client waits for a runtime at attach. <code>0</code> fails immediately, <code>-1</code> waits forever.</td></tr>
+  <tr><td><code>CLIO_X</code></td><td>TCP</td><td>Client transport to the runtime: <code>SHM</code>, <code>TCP</code> or <code>IPC</code>. See the <a href="/docs/runtime/index.html">runtime docs</a>.</td></tr>
+  <tr><td><code>CLIO_REQUIRE_RUNTIME</code></td><td>off</td><td>HDF5 connectors only. Any value other than empty, <code>0</code>, <code>off</code>, <code>false</code> or <code>no</code> makes an open fail when the CLIO tier cannot be reached, instead of falling back to native-only. It does not override a cache that was switched off on purpose.</td></tr>
+</table>
+
+<h2 id="interceptors">POSIX, STDIO and MPI-IO interceptors</h2>
+<table>
+  <tr><th>Variable</th><th>Default</th><th>Effect</th></tr>
+  <tr><td><code>LD_PRELOAD</code></td><td>none</td><td>Loads the interceptor: <code>libclio_cte_posix.so</code>, <code>libclio_cte_stdio.so</code>, <code>libclio_cte_mpiio.so</code> (space- or colon-separated for several). The MPI-IO library must load before <code>libmpi</code>.</td></tr>
+  <tr><td><code>CLIO_CFS_POOL</code></td><td><code>clio_cte_filesystem</code></td><td>The filesystem pool to bind: a pool name, or <code>major.minor</code> for an id.</td></tr>
+  <tr><td><code>CLIO_CFS_SHM_READ</code></td><td>on</td><td><code>0</code> turns off serving committed pages straight from shared memory; every read then goes to the filesystem module. For diagnosis.</td></tr>
+</table>
+<p>Paths are selected by the <code>clio::</code> marker, not by configuration: a path is intercepted when it starts with <code>clio::</code> or has a component starting with it, and the marker is removed to form the clio-fs path. Descriptors start at 8192. There is no other per-file setting.</p>
+
+<h2 id="vol">HDF5 VOL connector</h2>
+<h3>Selection</h3>
+<table>
+  <tr><th>Variable</th><th>Value</th></tr>
+  <tr><td><code>HDF5_PLUGIN_PATH</code></td><td>Directory containing <code>libclio_hdf5_vol.so</code></td></tr>
+  <tr><td><code>HDF5_VOL_CONNECTOR</code></td><td><code>clio</code>, optionally followed by a space and a config string: <code>clio cache=0;chunk_size=1048576</code></td></tr>
+</table>
+<p>Config string keys: <code>cache</code> (boolean: <code>1</code>/<code>on</code>/<code>true</code>/<code>yes</code> or <code>0</code>/<code>off</code>/<code>false</code>/<code>no</code>), <code>chunk_size</code> (plain decimal bytes, no unit suffix, greater than 0), <code>under_vol</code> and <code>under_info</code> (accepted, not applied: the connector always delegates to the native connector). Any other key fails the open.</p>
+<h3>Environment</h3>
+<table>
+  <tr><th>Variable</th><th>Default</th><th>Effect</th></tr>
+  <tr><td><code>CLIO_VOL_CACHE</code></td><td>on</td><td><code>0</code>/<code>off</code>/<code>false</code>/<code>no</code>: pure pass-through, no runtime needed.</td></tr>
+  <tr><td><code>CLIO_VOL_CHUNK_SIZE</code></td><td>65536</td><td>Blob size of cached dataset images, in bytes. Overrides <code>chunk_size</code> from the string or info struct. Part of the coherence stamp.</td></tr>
+  <tr><td><code>CLIO_VOL_ADMIT</code></td><td><code>read-miss</code></td><td>When to stage: <code>write</code>, <code>read-miss</code>, <code>second-access</code>. Default is <code>write</code> when <code>CLIO_STAMP_SETTLE_MAX_NS</code> is set.</td></tr>
+  <tr><td><code>CLIO_VOL_ADMIT_COST</code></td><td>on</td><td><code>0</code> disables the cost gate and stages every eligible transfer.</td></tr>
+  <tr><td><code>CLIO_VOL_TIER_FIXED_US</code></td><td>60</td><td>Cost-model seed: fixed microseconds per tier request.</td></tr>
+  <tr><td><code>CLIO_VOL_TIER_MBPS</code></td><td>1200</td><td>Cost-model seed: tier bandwidth in MB/s.</td></tr>
+  <tr><td><code>CLIO_VOL_MIN_STAGE_BYTES</code></td><td>0</td><td>Do not stage images smaller than this.</td></tr>
+  <tr><td><code>CLIO_VOL_MAX_SERVE_BYTES</code></td><td>1073741824</td><td>Larger datasets are not served from the cache for partial reads.</td></tr>
+  <tr><td><code>CLIO_VOL_TIER_RETRY_MS</code></td><td>5000</td><td>Back-off after the tier reports it is full, before staging is tried again.</td></tr>
+  <tr><td><code>CLIO_VOL_TRACE</code></td><td>unset</td><td>Directory for <code>&lt;file&gt;.&lt;pid&gt;.access.jsonl</code> and <code>&lt;file&gt;.&lt;pid&gt;.access.json</code> telemetry.</td></tr>
+</table>
+<h3>C API</h3>
+<p>Header <code>context-transfer-engine/adapter/hdf5_vol/clio_vol.h</code>:</p>
+<pre data-label="c">
+#define CLIO_VOL_CONNECTOR_NAME    "clio"
+#define CLIO_VOL_CONNECTOR_VALUE   600
+#define CLIO_VOL_DEFAULT_CHUNK_SIZE (64 * 1024)
+#define CLIO_VOL_CACHE_UNSET 0      /* environment decides */
+#define CLIO_VOL_CACHE_ON    1
+#define CLIO_VOL_CACHE_OFF   2
+
+typedef struct clio_vol_info_t {
+    hid_t  under_vol_id;    /* H5VL_NATIVE */
+    void  *under_vol_info;
+    size_t chunk_size;      /* 0 = default */
+    int    cache_enabled;   /* CLIO_VOL_CACHE_{UNSET,ON,OFF} */
+} clio_vol_info_t;
+
+hid_t H5VL_clio_register(void);
+</pre>
+<p>Zero-initialize <code>clio_vol_info_t</code> and pass it to <code>H5Pset_vol(fapl, H5VL_clio_register(), &amp;info)</code>.</p>
+
+<h2 id="vfd">HDF5 VFD</h2>
+<h3>Selection and driver string</h3>
+<table>
+  <tr><th>Variable or key</th><th>Default</th><th>Effect</th></tr>
+  <tr><td><code>HDF5_PLUGIN_PATH</code></td><td>none</td><td>Directory containing <code>libclio_vfd.so</code>.</td></tr>
+  <tr><td><code>HDF5_DRIVER</code></td><td>none</td><td><code>clio_vfd</code> selects the driver.</td></tr>
+  <tr><td><code>HDF5_DRIVER_CONFIG</code> <code>cache=</code></td><td>1</td><td><code>0</code>: native-only, no runtime.</td></tr>
+  <tr><td><code>HDF5_DRIVER_CONFIG</code> <code>fsync=</code></td><td>0</td><td><code>1</code>: <code>fsync</code> the native file in <code>H5Fflush</code> and <code>H5Fclose</code>.</td></tr>
+  <tr><td><code>HDF5_DRIVER_CONFIG</code> <code>sieve=</code></td><td>65536</td><td>Vector-I/O coalescing window in bytes, 0 to 1 GiB.</td></tr>
+</table>
+<h3>Environment</h3>
+<table>
+  <tr><th>Variable</th><th>Default</th><th>Effect</th></tr>
+  <tr><td><code>CLIO_VFD_CACHE</code></td><td>on</td><td><code>0</code>/<code>off</code>/<code>false</code>/<code>no</code>: native-only. Can switch off what the FAPL asked for, never on.</td></tr>
+  <tr><td><code>CLIO_VFD_READ_TIER</code></td><td>off</td><td>Any value other than empty or <code>0</code> enables the experimental read tier (populate and serve).</td></tr>
+  <tr><td><code>CLIO_VFD_FSYNC</code></td><td>off</td><td><code>1</code>/<code>on</code>/<code>true</code>/<code>yes</code>: the <code>fsync</code> barrier for every file in the process. Can switch on, never off.</td></tr>
+  <tr><td><code>CLIO_VFD_VECTOR_IO</code></td><td>off</td><td>Advertise the vector-I/O callbacks to HDF5 (and so use the sieve window).</td></tr>
+  <tr><td><code>CLIO_VFD_MAX_IO_BYTES</code></td><td>1073741824</td><td>Largest single <code>pread</code>/<code>pwrite</code>; larger transfers are split.</td></tr>
+  <tr><td><code>CLIO_VFD_TRACE</code></td><td>unset</td><td>Directory for byte-level access telemetry.</td></tr>
+  <tr><td><code>CLIO_VFD_DEBUG</code></td><td>unset</td><td>Print each read and write to stderr.</td></tr>
+</table>
+<h3>C API</h3>
+<p>Header <code>H5FDclio.h</code>, installed to <code>include/adapter/vfd/</code>:</p>
+<pre data-label="c">
+#define H5FD_CLIO_NAME  "clio_vfd"
+#define H5FD_CLIO_VALUE ((H5FD_class_value_t)(3200))
+
+herr_t H5Pset_fapl_clio(hid_t fapl_id, hbool_t cache_enabled);
+herr_t H5Pget_fapl_clio(hid_t fapl_id, hbool_t *cache_enabled /*out*/);
+</pre>
+
+<h2 id="stamps">Coherence stamps (both HDF5 connectors)</h2>
+<table>
+  <tr><th>Variable</th><th>Default</th><th>Effect</th></tr>
+  <tr><td><code>CLIO_STAMP_GRANULARITY_NS</code></td><td>10000000 (10 ms); 1 s on Windows</td><td>A stamp is withheld while the file's modification time is younger than this. Raise it on coarse-timestamp filesystems. <code>CLIO_VOL_STAMP_GRANULARITY_NS</code> is the older name and still read.</td></tr>
+  <tr><td><code>CLIO_STAMP_SETTLE_MAX_NS</code></td><td>0 (off)</td><td>Wait up to this long at close for the timestamp to settle, so the stamp is kept. Safe only for single-writer pipelines; about two granules enables it.</td></tr>
+</table>
+
+<h2 id="adios2">ADIOS2 engine</h2>
+<table>
+  <tr><th>Setting</th><th>Default</th><th>Effect</th></tr>
+  <tr><td><code>ADIOS2_PLUGIN_PATH</code></td><td>none</td><td>Directory containing <code>libiowarp_engine.so</code>.</td></tr>
+  <tr><td>Engine type / <code>PluginLibrary</code></td><td>none</td><td><code>Plugin</code> / <code>iowarp_engine</code>. <code>PluginName</code> is any label.</td></tr>
+  <tr><td><code>IOWARP_PPN</code></td><td>12</td><td>Ranks per node, used to stagger start-up by local rank.</td></tr>
+  <tr><td><code>CLIO_INIT_STAGGER_MS</code></td><td>250</td><td>Delay per local rank before connecting to the runtime.</td></tr>
+  <tr><td><code>CLIO_INIT_ATTEMPTS</code></td><td>60</td><td>Connection attempts before the engine throws.</td></tr>
+  <tr><td><code>CLIO_INIT_SLEEP_MS</code></td><td>3000</td><td>Mean pause between attempts; each pause is drawn from 0.5x to 1.5x of it.</td></tr>
+</table>
+
+<h2>Where to go next</h2>
+<ul>
+  <li><a href="/docs/io-adapters/index.html">I/O adapters overview</a> and the per-adapter walkthroughs.</li>
+  <li><a href="/docs/runtime/api.html">Runtime reference</a>: <code>clio-run</code> and the compose file.</li>
+</ul>

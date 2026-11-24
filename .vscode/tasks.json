@@ -8,10 +8,10 @@
             "args": [
                 "--preset=debug",
                 "-DCMAKE_BUILD_TYPE=Debug",
-                "-DWRP_CORE_ENABLE_RUNTIME=ON",
-                "-DWRP_CORE_ENABLE_CTE=ON",
-                "-DWRP_CORE_ENABLE_CAE=ON",
-                "-DWRP_CORE_ENABLE_CEE=ON"
+                "-DCLIO_CORE_ENABLE_RUNTIME=ON",
+                "-DCLIO_CORE_ENABLE_CTE=ON",
+                "-DCLIO_CORE_ENABLE_CAE=ON",
+                "-DCLIO_CORE_ENABLE_CEE=ON"
             ],
             "options": {
                 "cwd": "${workspaceFolder}"

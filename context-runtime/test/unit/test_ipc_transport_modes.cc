@@ -45,6 +45,8 @@
 
 #include <cstdlib>
 #include <string>
+#include <thread>
+#include <chrono>
 
 #include "clio_runtime/clio_runtime.h"
 #include "clio_runtime/ipc_manager.h"
@@ -133,6 +135,46 @@ void SubmitTasksForMode(const std::string &mode_name) {
   // Cleanup buffers
   CLIO_IPC->FreeBuffer(write_buffer);
   CLIO_IPC->FreeBuffer(read_buffer);
+}
+
+/**
+ * Submit a task to a pool the runtime has not created yet, then create that
+ * pool, and require the early task to complete (issue #1039).
+ *
+ * A client may connect while the runtime is still composing its pools (the
+ * coherence cluster starts its suite a fixed 5 s after the runtime, and a slow
+ * compose overran that). The runtime used to consume such a request off the
+ * client transport and drop it -- the SHM ingress silently -- so the client
+ * waited forever. The runtime must hold the request until the pool exists.
+ *
+ * @param mode_name Suffix that keeps the pool name unique per transport mode.
+ * @param pool_major Major id of the pool to create late; distinct per mode.
+ */
+void SubmitBeforePoolExists(const std::string &mode_name,
+                            clio::run::u32 pool_major) {
+  const clio::run::u64 kRamSize = 16 * 1024 * 1024;
+  const clio::run::u64 kBlockSize = 4096;
+  clio::run::PoolId pool_id(pool_major, 0);
+  clio::run::bdev::Client client(pool_id);
+
+  // The pool does not exist yet: this request reaches the runtime first.
+  auto early = client.AsyncAllocateBlocks(clio::run::PoolQuery::Local(),
+                                          kBlockSize);
+  // Give the runtime ample time to ingest (and, before the fix, drop) it.
+  std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+  REQUIRE_FALSE(early.IsComplete());
+
+  auto create_task = client.AsyncCreate(
+      clio::run::PoolQuery::Dynamic(), "late_pool_" + mode_name, pool_id,
+      clio::run::bdev::BdevType::kRam, kRamSize);
+  REQUIRE(create_task.Wait(60));
+  REQUIRE(create_task->return_code_ == 0);
+  REQUIRE(create_task->new_pool_id_ == pool_id);
+
+  // The early request must now run against the new pool, not hang.
+  REQUIRE(early.Wait(30));
+  REQUIRE(early->return_code_ == 0);
+  REQUIRE(early->blocks_.size() > 0);
 }
 
 // The runtime server is launched out-of-process via clio::run::test::RuntimeServer
@@ -241,6 +283,34 @@ TEST_CASE("IpcTransportMode - Default Auto-Selects SHM When Local",
   REQUIRE(ipc->IsInitialized());
   // Same-host server present -> SHM is available and preferred.
   REQUIRE(ipc->GetIpcMode() == IpcMode::kShm);
+}
+
+TEST_CASE("IpcTransportMode - SHM Task Before Pool Exists",
+          "[ipc_transport][shm][late_pool]") {
+  clio::run::test::RuntimeServer server;
+  REQUIRE(server.Start());
+  REQUIRE(server.WaitForReady());
+
+  clio::run::test::SetEnvVar("CLIO_IPC_MODE", "SHM");
+  clio::run::test::SetEnvVar("CLIO_WITH_RUNTIME", "0");
+  REQUIRE(CLIO_INIT(RuntimeMode::kClient, false));
+  REQUIRE(CLIO_IPC->GetIpcMode() == IpcMode::kShm);
+
+  SubmitBeforePoolExists("shm", 9101);
+}
+
+TEST_CASE("IpcTransportMode - TCP Task Before Pool Exists",
+          "[ipc_transport][tcp][late_pool]") {
+  clio::run::test::RuntimeServer server;
+  REQUIRE(server.Start());
+  REQUIRE(server.WaitForReady());
+
+  clio::run::test::SetEnvVar("CLIO_IPC_MODE", "TCP");
+  clio::run::test::SetEnvVar("CLIO_WITH_RUNTIME", "0");
+  REQUIRE(CLIO_INIT(RuntimeMode::kClient, false));
+  REQUIRE(CLIO_IPC->GetIpcMode() == IpcMode::kTcp);
+
+  SubmitBeforePoolExists("tcp", 9102);
 }
 
 SIMPLE_TEST_MAIN()

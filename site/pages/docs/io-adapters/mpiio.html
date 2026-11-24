@@ -1,0 +1,99 @@
+<!--
+title: MPI-IO interceptor
+heading: Intercept <em>MPI-IO.</em>
+description: How to use the CLIO Core MPI-IO interceptor: build it against OpenMPI or MPICH, preload libclio_cte_mpiio.so ahead of libmpi, open clio:: files with MPI_File_open, and what collective, shared-pointer, nonblocking and file-view calls do.
+eyebrow: Docs · I/O adapters
+lede: The MPI-IO interceptor takes over <code>MPI_File_*</code> calls on <code>clio::</code> files and stores the data in the CLIO filesystem module. It is a drop-in for MPI codes that do independent or explicit-offset I/O. It is not a parallel I/O library: collective calls run as independent I/O on each rank.
+facts: Library | libclio_cte_mpiio.so ; Build | CLIO_CTE_ENABLE_MPIIO_ADAPTER=ON CLIO_CORE_ENABLE_ELF=ON ; MPI | OpenMPI or MPICH ; Load | LD_PRELOAD, before libmpi ; Install | Source builds: Spack (+mpiio) or CMake
+-->
+<h2>How it works</h2>
+<p><code>MPI_File_open</code> on a filename with a <code>clio::</code> component opens the file in the <code>clio_cte_filesystem</code> module and returns an <code>MPI_File</code> that is an opaque token for that descriptor. Every later call on that handle is served by the interceptor and never reaches the MPI library. Other filenames go to the real MPI-IO. Each rank opens the file through its own descriptor; the communicator passed to <code>MPI_File_open</code> does not coordinate anything.</p>
+
+<h2>1. Build it</h2>
+<pre data-label="shell">
+$ cmake -S . -B build -DCLIO_CORE_ENABLE_ELF=ON \
+    -DCLIO_CTE_ENABLE_MPIIO_ADAPTER=ON -DCLIO_CORE_ENABLE_MPI=ON
+$ cmake --build build -j"$(nproc)"
+$ ls build/bin/libclio_cte_mpiio.so
+</pre>
+<p>Configure finds MPI with <code>find_package(MPI)</code> and asks <code>mpicc</code> whether it is OpenMPI or MPICH, because the interceptor fills implementation-specific <code>MPI_Status</code> fields. If it cannot tell, configure stops; pass <code>-DCLIO_CTE_OPENMPI=ON</code> or <code>-DCLIO_CTE_MPICH=ON</code>. Build with the same MPI your application uses. Source builds only; see <a href="/docs/io-adapters/install.html">Install</a>.</p>
+
+<h2>2. Start a runtime on every node</h2>
+<pre data-label="shell">
+$ build/bin/clio-run start &
+</pre>
+<p>Ranks attach to the runtime on their own node. Its configuration must compose a <code>clio_cte_filesystem</code> pool, as the default configuration does. For several nodes, start the runtime on each with a shared hostfile; see the <a href="/docs/runtime/index.html">Context Runtime docs</a>.</p>
+
+<h2>3. Run an MPI program under the interceptor</h2>
+<p>Each rank writes its own block at an explicit offset, syncs, and reads it back.</p>
+<pre data-label="c · hello_mpiio.c">
+#include <mpi.h>
+#include <stdio.h>
+
+#define N 1024
+
+int main(int argc, char **argv) {
+  MPI_Init(&argc, &argv);
+  int rank;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  const char *path = argc > 1 ? argv[1] : "clio::/demo/mpi.bin";
+
+  int out[N], in[N];
+  for (int i = 0; i < N; ++i) out[i] = rank * N + i;
+  MPI_Offset off = (MPI_Offset)rank * N * sizeof(int);
+
+  MPI_File fh;
+  MPI_File_open(MPI_COMM_WORLD, path, MPI_MODE_CREATE | MPI_MODE_RDWR,
+                MPI_INFO_NULL, &fh);
+  MPI_File_write_at(fh, off, out, N, MPI_INT, MPI_STATUS_IGNORE);
+  MPI_File_sync(fh);
+  MPI_File_read_at(fh, off, in, N, MPI_INT, MPI_STATUS_IGNORE);
+  MPI_File_close(&fh);
+
+  int ok = 1;
+  for (int i = 0; i < N; ++i) ok &= (in[i] == out[i]);
+  printf("rank %d: %s\n", rank, ok ? "ok" : "MISMATCH");
+  MPI_Finalize();
+  return ok ? 0 : 1;
+}
+</pre>
+<pre data-label="shell">
+$ mpicc -o hello_mpiio hello_mpiio.c
+$ mpirun -np 2 env LD_PRELOAD=$PWD/build/bin/libclio_cte_mpiio.so \
+    ./hello_mpiio clio::/demo/mpi.bin
+rank 0: ok
+rank 1: ok
+</pre>
+<p>Wrapping the program in <code>env</code> sets <code>LD_PRELOAD</code> in every rank, whatever launcher you use. The interceptor must be loaded before <code>libmpi</code>, or <code>libmpi</code>'s own <code>MPI_File_*</code> symbols win; <code>LD_PRELOAD</code> guarantees that.</p>
+
+<h2>What is intercepted</h2>
+<dl class="notes">
+<div><dt>Open and close</dt><dd><code>MPI_File_open</code>, <code>MPI_File_close</code>, <code>MPI_File_delete</code>. <code>MPI_MODE_CREATE</code>, <code>MPI_MODE_APPEND</code>, <code>MPI_MODE_EXCL</code> and the access modes map to <code>open</code> flags.</dd></div>
+<div><dt>Read and write</dt><dd>Independent (<code>MPI_File_read</code>, <code>_write</code>), collective (<code>_all</code>), explicit-offset (<code>_at</code>, <code>_at_all</code>), shared-pointer (<code>_shared</code>) and ordered (<code>_ordered</code>) variants, and the nonblocking <code>MPI_File_iread</code>, <code>_iwrite</code>, <code>_iread_at</code>, <code>_iwrite_at</code>, <code>_iread_shared</code>, <code>_iwrite_shared</code>.</dd></div>
+<div><dt>Position</dt><dd><code>MPI_File_seek</code>, <code>MPI_File_seek_shared</code>, <code>MPI_File_get_position</code>.</dd></div>
+<div><dt>Metadata</dt><dd><code>MPI_File_sync</code>, <code>MPI_File_get_size</code>, <code>MPI_File_set_size</code>, <code>MPI_File_get_info</code>, <code>MPI_File_set_info</code>, <code>MPI_File_get_amode</code>, <code>MPI_File_set_atomicity</code>, <code>MPI_File_get_atomicity</code>, <code>MPI_File_set_view</code>.</dd></div>
+</dl>
+<p><code>MPI_Init</code>, <code>MPI_Finalize</code>, <code>MPI_Wait</code> and <code>MPI_Waitall</code> are also defined by the library and pass straight through to MPI.</p>
+
+<h2>Semantics</h2>
+<ul>
+  <li><strong>Collectives are independent.</strong> <code>_all</code>, <code>_shared</code> and <code>_ordered</code> calls behave like their independent counterparts on each rank. There is no collective buffering or aggregation at this layer; the filesystem module decides placement.</li>
+  <li><strong>Shared and ordered file pointers are per process</strong>, not shared between ranks. Use explicit offsets when ranks write to one file.</li>
+  <li><strong>Nonblocking calls complete immediately.</strong> The <code>i</code> variants do the transfer before returning and hand back <code>MPI_REQUEST_NULL</code>.</li>
+  <li><strong>File views.</strong> <code>MPI_File_set_view</code> flattens the filetype into byte blocks, and the explicit-offset calls (<code>_at</code>, <code>_at_all</code>, <code>i..._at</code>) map data through it; derived memory datatypes are gathered and scattered the same way. This covers the non-contiguous views that parallel HDF5 sets for collective I/O. The file-pointer calls (no <code>_at</code>) need the default view and a contiguous memory datatype.</li>
+  <li><strong>Refused, not guessed.</strong> A datatype built with a constructor the interceptor does not decode (such as subarray or darray), a data representation other than <code>native</code>, or a file-pointer call under a non-default view returns <code>MPI_ERR_UNSUPPORTED_OPERATION</code> and logs the reason, instead of transferring the bytes as if they were contiguous.</li>
+  <li><strong>Errors are MPI error classes.</strong> Failures of the filesystem module are mapped from <code>errno</code> to an MPI error class and returned by the call. <code>MPI_File_sync</code> makes the file durable on a persistent device, like <code>fsync</code> in the <a href="/docs/io-adapters/posix.html">POSIX interceptor</a>, and reports any failure; so does a failing <code>MPI_File_close</code>.</li>
+</ul>
+
+<h2>Limits</h2>
+<ul>
+  <li>The project's own unit test (<code>clio_cte_mpiio_unit_tests</code>) runs as a single-rank program. Validate multi-rank access patterns on your system before relying on them.</li>
+  <li>Linux only, dynamically linked programs only, and only <code>clio::</code> filenames are redirected.</li>
+  <li>Data lives only in the CTE. Its durability is decided by the tiers the runtime composes.</li>
+</ul>
+
+<h2>Where to go next</h2>
+<ul>
+  <li><a href="/docs/io-adapters/hdf5-vol.html">HDF5 VOL connector</a>, if your MPI code does its I/O through HDF5.</li>
+  <li><a href="/docs/io-adapters/configuration.html">Configuration reference</a>.</li>
+</ul>

@@ -7,13 +7,34 @@ on:
     branches: [main, dev]
   pull_request:
     branches: [main, dev]
-  # Merge queue (issue #1013): same full-matrix-before-merge rationale as the
-  # other gates -- see ci-adapters.yml.
-  merge_group:
+  workflow_dispatch:
+
 jobs:
   cpplint:
+    # Skipped on dev -> main PRs: dev-to-main-gate.yml checks dev's full CI on the same commit instead.
+    if: ${{ !(github.event_name == 'pull_request' && github.head_ref == 'dev' && github.base_ref == 'main') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
     - uses: actions/checkout@v6
     - run: pipx run cpplint --recursive .
+    # Deliberately here and not in cluster-tests.yml. Cluster Tests is gated on
+    # `event_name != pull_request`, so a PR that introduces a colliding subnet
+    # would not be checked until after it merged -- which is the whole reason
+    # the 172.30.0.0/24 pile-up survived. cpplint runs on every PR, costs
+    # seconds, and needs no docker.
+    - name: Integration compose subnets are unique
+      run: bash CI/check_compose_subnets.sh
+    # Renamed build options must stay renamed (#363, #1195): CMake silently
+    # ignores an unknown -D flag, so an installer or doc still saying
+    # WRP_CORE_ENABLE_* quietly builds the wrong thing.
+    - name: Installer flags name real CMake options
+      run: node installers/check_flag_names.mjs
+    - name: No pre-rename WRP_*_ENABLE_* option names
+      run: |
+        if git grep -nE 'WRP_(CORE|CTE|CAE)_ENABLE_' -- . \
+             ':!BUGS_TRACKING.md' ':!installers/check_flag_names.mjs' \
+             ':!.github/workflows/cpplint.yml'; then
+          echo "::error::stale WRP_*_ENABLE_* option names (renamed to CLIO_*)"
+          exit 1
+        fi

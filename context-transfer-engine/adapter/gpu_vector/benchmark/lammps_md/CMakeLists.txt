@@ -1,11 +1,10 @@
 #------------------------------------------------------------------------------
-# lammps_md: the from-scratch LAMMPS-melt reimplementation, on five substrates.
+# lammps_md: the from-scratch LAMMPS-melt reimplementation, on four substrates.
 #
 #   paged    all state device-canonical on paged vectors (design: adapter/gpu_vector/eternia.md)
 #   nvshmem  symmetric heap, one-sided in-kernel RMA        (links nothing from clio)
 #   mpi      two-sided, host-staged halo exchange           (links nothing from clio)
 #   nccl     halo + migrants via ncclSend/Recv on device ptrs
-#   bam      capacity sibling: Verlet list behind BaM's GPU page cache
 #
 # The baselines are built by NVCC through custom rules rather than
 # add_cuda_executable(), and the reason is not style: NVSHMEM's device library
@@ -41,6 +40,13 @@ if(CLIO_CORE_ENABLE_CUDA)
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     )
     install(TARGETS clio_lammps_md_paged_bench RUNTIME DESTINATION bin)
+    # vector.Copy (the end-of-run checkpoint, bench_ckpt.h) creates the
+    # checkpoint chimod's pool, which the runtime LOADS rather than links:
+    # without this, building just this target leaves the chimod unbuilt and
+    # Copy throws "checkpoint pool create failed" at the end of the run.
+    if(TARGET clio_cte_checkpoint_runtime)
+      add_dependencies(clio_lammps_md_paged_bench clio_cte_checkpoint_runtime)
+    endif()
     # REGISTER CEILING for the coroutine kernels, MEASURED rather than typed.
     # See cmake/ClioCoroRegCap.cmake; clang's coroutine lowering allocates
     # ~138 registers regardless of body and these kernels are latency bound,
@@ -244,55 +250,6 @@ if(CLIO_CORE_ENABLE_CUDA)
     endif()
 endif()
 
-#------------------------------------------------------------------------------
-# BaM edition: the capacity sibling. Compiles BaM's sources ITSELF with nvcc
-# because external/bam passes --expt-relaxed-constexpr, which clang rejects.
-#------------------------------------------------------------------------------
-if(CLIO_CORE_ENABLE_CUDA AND EXISTS ${CMAKE_SOURCE_DIR}/external/bam/src/array.cu)
-    find_program(MD_BAM_NVCC nvcc
-        HINTS ${CUDAToolkit_BIN_DIR} ENV CUDA_HOME
-        PATH_SUFFIXES bin)
-    if(MD_BAM_NVCC)
-        set(_bam_arch_flags "")
-        foreach(_arch IN LISTS CMAKE_CUDA_ARCHITECTURES)
-            string(REGEX REPLACE "-(real|virtual)$" "" _arch "${_arch}")
-            list(APPEND _bam_arch_flags "-gencode=arch=compute_${_arch},code=sm_${_arch}")
-        endforeach()
-        if(NOT _bam_arch_flags)
-            list(APPEND _bam_arch_flags "-arch=sm_80")
-        endif()
-        set(_bam_out ${CMAKE_BINARY_DIR}/bin/clio_lammps_md_bam_bench)
-        set(_bam_src ${CMAKE_CURRENT_SOURCE_DIR}/clio_lammps_md_bam_bench.cc)
-        add_custom_command(
-            OUTPUT ${_bam_out}
-            COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/bin
-            COMMAND ${MD_BAM_NVCC}
-                -x cu -std=c++17 -O3 -rdc=true --expt-relaxed-constexpr
-                ${_bam_arch_flags}
-                -I${CMAKE_SOURCE_DIR}/external/bam/include
-                ${_bam_src}
-                ${CMAKE_SOURCE_DIR}/external/bam/src/array.cu
-                ${CMAKE_SOURCE_DIR}/external/bam/src/page_cache.cu
-                ${CMAKE_SOURCE_DIR}/external/bam/src/controller.cc
-                ${CMAKE_SOURCE_DIR}/external/bam/src/page_cache_host.cc
-                -o ${_bam_out}
-            DEPENDS ${_bam_src}
-                ${CMAKE_SOURCE_DIR}/external/bam/src/array.cu
-                ${CMAKE_SOURCE_DIR}/external/bam/src/page_cache.cu
-                ${CMAKE_SOURCE_DIR}/external/bam/src/controller.cc
-                ${CMAKE_SOURCE_DIR}/external/bam/src/page_cache_host.cc
-                ${CMAKE_SOURCE_DIR}/external/bam/include/bam/array.cuh
-                ${CMAKE_SOURCE_DIR}/external/bam/include/bam/page_cache.cuh
-                ${CMAKE_SOURCE_DIR}/external/bam/include/bam/types.h
-                ${CMAKE_SOURCE_DIR}/external/bam/include/bam/page_cache_host.h
-            COMMENT "Building clio_lammps_md_bam_bench (nvcc + BaM page cache)"
-            VERBATIM)
-        add_custom_target(clio_lammps_md_bam_bench ALL DEPENDS ${_bam_out})
-        install(PROGRAMS ${_bam_out} DESTINATION bin)
-        message(STATUS "lammps_md BaM baseline: ON")
-    endif()
-endif()
-
 
 #------------------------------------------------------------------------------
 # eternia-MD, Kokkos edition: the performance-portability baseline.
@@ -484,4 +441,87 @@ if(TARGET clio_lammps_md_nccl_bench AND MPIEXEC_EXECUTABLE)
     set_tests_properties(bench_lammps_md_nccl_2rank PROPERTIES
         TIMEOUT 900 LABELS "bench;gpu;nccl;distributed" RUN_SERIAL TRUE
         SKIP_RETURN_CODE 77)
+endif()
+
+#------------------------------------------------------------------------------
+# lammps_md paged bench, MACRO-form edition -- the one that reaches Intel GPUs.
+#
+# NOTE THE GUARD: no `NOT SYCL_TARGET MATCHES "spir64"`. clang cannot compile a
+# device coroutine for SPIR-V, so the coroutine target above is excluded there;
+# the macro mechanism needs no compiler coroutine support and builds for
+# spir64, which is what Aurora's Ponte Vecchio GPUs require.
+#------------------------------------------------------------------------------
+if(CLIO_CORE_ENABLE_SYCL)
+    set(_mdm_inc
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_SOURCE_DIR}/context-runtime/include
+        ${CMAKE_SOURCE_DIR}/context-runtime/modules/admin/include
+        ${CMAKE_SOURCE_DIR}/context-runtime/modules/bdev/include
+        ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
+        ${CMAKE_SOURCE_DIR}/context-transfer-engine/adapter/gpu_vector/include)
+
+    add_library(md_macros_sycl_launch SHARED sycl/md_macros_launch_sycl.cc)
+    wrp_core_apply_sycl_flags(md_macros_sycl_launch)
+    # ONE device image. g_yield_smem_dg (yield_stack.h) is a device_global
+    # carrying device_image_scope, and sycl-post-link refuses to place such a
+    # variable in more than one image:
+    #   "device_global variable '..g_yield_smem_dg' with property
+    #    'device_image_scope' is used in more than one device image"
+    # This TU holds sixteen kernels, which is enough for the default split to
+    # produce several. The other five workloads have few enough kernels that
+    # they never tripped it.
+    target_compile_options(md_macros_sycl_launch PRIVATE
+        -fsycl-device-code-split=off)
+    target_link_options(md_macros_sycl_launch PRIVATE
+        -fsycl-device-code-split=off)
+    set_target_properties(md_macros_sycl_launch PROPERTIES
+        POSITION_INDEPENDENT_CODE ON
+        LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    target_include_directories(md_macros_sycl_launch PUBLIC ${_mdm_inc})
+    target_link_libraries(md_macros_sycl_launch PUBLIC
+        clio_run_cxx clio_run_cxx_gpu clio_cte_core_client)
+
+    add_executable(clio_lammps_md_macros_bench_sycl clio_lammps_md_macros_bench.cc)
+    target_link_options(clio_lammps_md_macros_bench_sycl PRIVATE
+        -fsycl -fsycl-targets=${SYCL_TARGET})
+    target_include_directories(clio_lammps_md_macros_bench_sycl PRIVATE
+        ${CLIO_SYCL_INCLUDE_DIR} ${_mdm_inc})
+    target_link_libraries(clio_lammps_md_macros_bench_sycl PRIVATE
+        md_macros_sycl_launch
+        clio_run_cxx clio_run_cxx_gpu clio_admin_client clio_bdev_client
+        clio_cte_core_client clio_cte_core_runtime clio::cte::gpu_vector
+        ${CMAKE_THREAD_LIBS_INIT})
+    set_target_properties(clio_lammps_md_macros_bench_sycl PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    install(TARGETS clio_lammps_md_macros_bench_sycl RUNTIME DESTINATION bin)
+
+    # REGRESSION COVERAGE for the SYCL row. Without an entry here the row is
+    # only ever as correct as the last time someone ran it by hand.
+    # --blocks 8 is the SYCL backend's documented ceiling, not a taste.
+    add_test(NAME cte_gpu_vector_lammps_md_macros_sycl
+        COMMAND clio_lammps_md_macros_bench_sycl --md --lattice 20 --steps 20 --blocks 8
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    # Same eviction geometry as cte_gpu_vector_lammps_md_evict. This is the
+    # entry that puts the SYCL paging path under real pressure -- ~2900
+    # faults and ~2850 evictions -- rather than merely faulting.
+    add_test(NAME cte_gpu_vector_lammps_md_evict_macros_sycl
+        COMMAND clio_lammps_md_macros_bench_sycl --md --lattice 32 --steps 10
+                --blocks 8 --slots 32
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    set_tests_properties(cte_gpu_vector_lammps_md_evict_macros_sycl PROPERTIES
+        TIMEOUT 900
+        LABELS "cte;gpu;gpu_vector;sycl;macros"
+        FIXTURES_REQUIRED clio_test_cleanup_fixture
+        RUN_SERIAL TRUE
+    )
+
+    set_tests_properties(cte_gpu_vector_lammps_md_macros_sycl PROPERTIES
+        TIMEOUT 900
+        LABELS "cte;gpu;gpu_vector;sycl;macros"
+        FIXTURES_REQUIRED clio_test_cleanup_fixture
+        RUN_SERIAL TRUE
+    )
+    message(STATUS "lammps_md paged bench (SYCL, macro form): ON")
 endif()

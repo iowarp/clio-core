@@ -137,4 +137,4 @@ For enhanced CUDA debugging, install:
 ## Configuration Files
 
 - **Launch config**: `.vscode/launch.json` - "Debug GPU Malloc Test (CUDA-GDB)"
-- **Test file**: `context-transport-primitives/test/unit/gpu/cuda/test_gpu_malloc.cc`
+- **Test file**: `context-transport-primitives/base/test/gpu/test_gpu_malloc.cc`

@@ -145,9 +145,7 @@ struct GpuDeviceRing {
       const unsigned long long t =
           *const_cast<volatile unsigned long long *>(&tail_);
       if (slot - t < kGpuRingCapacity) break;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
-      __nanosleep(64);
-#endif
+      // Pure spin: the GPU waits by polling, on every backend.
     }
 
     entries_[idx] = e;

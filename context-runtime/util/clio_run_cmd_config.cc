@@ -31,7 +31,7 @@
 namespace {
 
 void PrintConfigUsage() {
-  HIPRINT("Usage: clio_run config <subcommand> [options]");
+  HIPRINT("Usage: clio-run config <subcommand> [options]");
   HIPRINT("  export --path <file>   Write the node's current effective");
   HIPRINT("                         configuration (live pools + safe-bdev");
   HIPRINT("                         members) as YAML to <file>.");

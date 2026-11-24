@@ -352,9 +352,12 @@ TEST_CASE("IoEmulation - Perf Stats Persisted By Runtime",
 
   // StatTargets (period 1000ms in this config) drives bdev GetStats, whose
   // first invocation persists a stats file per bdev (throttle starts
-  // expired). Wait a few periods, then look for at least one file.
+  // expired). Poll for at least one file under a long deadline (a slow
+  // runner may take many periods; a file that never appears still fails).
   bool found = false;
-  for (int attempt = 0; attempt < 20 && !found; ++attempt) {
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(60);
+  while (!found && std::chrono::steady_clock::now() < deadline) {
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
     std::error_code ec;
     if (fs::exists(g_fixture->bdev_stats_dir_, ec)) {

@@ -7,7 +7,7 @@
  */
 
 /**
- * 4-NODE CACHE COHERENCE SUITE (issue #886 distributed coherence).
+ * N-NODE CACHE COHERENCE SUITE (CTE_NUM_NODES, default 4) (issue #886 distributed coherence).
  *
  * Every node runs this binary against its own daemon (rank = NODE_ID-1),
  * clients bound to the chain top via CLIO_CTE_POOL. Node-to-node
@@ -43,16 +43,30 @@
 
 namespace {
 
-constexpr int kNumNodes = 4;
+/** Cluster size: CTE_NUM_NODES (the docker suite sets 4; HPC runs set the
+ *  allocation size). */
+int NumNodes() {
+  static const int n = [] {
+    const char *e = std::getenv("CTE_NUM_NODES");
+    const int v = (e != nullptr && *e) ? std::atoi(e) : 4;
+    return v > 0 ? v : 4;
+  }();
+  return n;
+}
+#define kNumNodes NumNodes()
 constexpr clio::run::u64 kPormSize = 1ULL * 1024 * 1024;
 constexpr clio::run::u64 kSegSize = 512ULL * 1024;  // per-rank segment
-constexpr clio::run::u64 kSharedSize = kSegSize * kNumNodes;
+#define kSharedSize (kSegSize * static_cast<clio::run::u64>(kNumNodes))
 constexpr int kRepeatRounds = 5;
 constexpr int kReadRounds = 10;
 
 int Rank() {
-  const char *env = std::getenv("NODE_ID");
-  return env ? std::atoi(env) - 1 : 0;
+  // NODE_ID (1-based, docker) or the MPI launcher's rank (PALS / PMI).
+  if (const char *env = std::getenv("NODE_ID")) return std::atoi(env) - 1;
+  for (const char *k : {"PALS_RANKID", "PMI_RANK", "OMPI_COMM_WORLD_RANK"}) {
+    if (const char *env = std::getenv(k)) return std::atoi(env);
+  }
+  return 0;
 }
 
 /** Deterministic pattern: byte i of (writer, round) — the header-free
@@ -127,6 +141,19 @@ bool Barrier(const clio::cte::core::TagId &tag_id) {
         break;
       }
       if (std::chrono::steady_clock::now() > deadline) {
+        // Name the blob we gave up on, and what the last probe actually saw.
+        // "Condition: Barrier(tag_id)" alone never said WHICH rank's blob
+        // never became visible, so every diagnosis so far has been guesswork.
+        auto last = Chain()->AsyncGetBlobSize(tag_id, name);
+        last.Wait();
+        fprintf(stderr,
+                "[BARRIER-TIMEOUT] rank=%d epoch=%d waiting_on='%s' "
+                "tag=(%u.%u) rc=%u size=%llu%c",
+                Rank(), epoch, name.c_str(),
+                (unsigned)tag_id.major_, (unsigned)tag_id.minor_,
+                (unsigned)last->GetReturnCode(),
+                (unsigned long long)last->size_, 10);
+        fflush(stderr);
         return false;
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -233,6 +260,21 @@ static void SegmentedRound(const clio::cte::core::TagId &tag_id,
   std::vector<char> got(kSharedSize);
   REQUIRE(ReadFull(tag_id, blob, got.data(), kSharedSize));
   for (int w = 0; w < kNumNodes; ++w) {
+    if (!MatchesPattern(got.data() + w * kSegSize, kSegSize, w, round)) {
+      // This assertion is the FIRST failure in the suite and the real bug;
+      // every Barrier() failure afterwards is a cascade (a rank that leaves a
+      // test early desynchronises the global epoch counter, after which ranks
+      // barrier under different tag ids and deadlock). DecodePattern already
+      // exists "for failure forensics" but nothing ever printed it, so the
+      // suite only ever reported that some byte was wrong -- never WHICH
+      // writer's segment, nor what it actually held.
+      fprintf(stderr,
+              "[SEG-MISMATCH] reader_rank=%d blob='%s' round=%d bad_seg=%d "
+              "expected='w%dr%d' actual='%s'%c",
+              rank, blob.c_str(), round, w, w, round,
+              DecodePattern(got.data() + w * kSegSize, kSegSize).c_str(), 10);
+      fflush(stderr);
+    }
     REQUIRE(MatchesPattern(got.data() + w * kSegSize, kSegSize, w, round));
   }
   REQUIRE(Barrier(tag_id));

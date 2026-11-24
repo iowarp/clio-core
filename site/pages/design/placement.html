@@ -1,0 +1,242 @@
+<!--
+title: Placement and tiering
+heading: Placement, tiering and eviction
+description: How the CTE core places data across tiers, reorganizes it, flushes it to persistent storage, and evicts it.
+eyebrow: Design
+lede: The core's tiering model rests on two numbers. A <strong>target score</strong> ranks each device. A <strong>blob score</strong> says how hot the data is. Placement matches the two. Reorganization changes a blob's score and then moves its bytes. Flushing moves bytes toward durable tiers, and eviction removes only data that is marked as a cache.
+-->
+<h2 id="dpe">The Data Placement Engine</h2>
+<p>When a blob grows, the core asks the Data Placement Engine (DPE) for an
+ordered list of targets. Three policies are available, selected once per
+pool with <code>dpe.dpe_type</code>:</p>
+<table>
+  <tr><th>Policy</th><th>Ordering</th></tr>
+  <tr><td><code>max_bw</code> (default)</td><td>Preferred targets sorted by configured score, highest first. Ties are broken by measured write bandwidth for writes of 32 KB or more, and by latency for smaller writes. Fallback targets are sorted by score, lowest first.</td></tr>
+  <tr><td><code>round_robin</code></td><td>Rotates through each bucket.</td></tr>
+  <tr><td><code>random</code></td><td>Shuffles each bucket.</td></tr>
+</table>
+<p>All three policies use the same two-bucket structure. First, any target
+that cannot hold the whole extension is dropped. The rest are split
+into:</p>
+<ul>
+  <li><strong>Preferred:</strong> targets whose score is at or below the
+  blob's score, meaning the matching tier or a colder one.</li>
+  <li><strong>Fallback:</strong> hotter tiers, used only when nothing
+  preferred has room. The least over-provisioned is tried first.</li>
+</ul>
+<p>After the DPE, the core applies filters of its own:</p>
+<ul>
+  <li>targets on dead nodes are removed;</li>
+  <li>a request's minimum persistence level excludes volatile tiers;</li>
+  <li>cache copies are capped away from durable tiers;</li>
+  <li>a device-health rule drops targets whose predicted remaining lifetime
+  is under a day, and, for long-term data, under a week.</li>
+</ul>
+<p>The core then walks the ordered list and allocates from each target in
+turn until the request is satisfied. A single extension can therefore span
+several devices and tiers.</p>
+
+<div class="callout">
+  <p><strong>Design decision: configured scores beat bandwidth
+  predictions.</strong> An earlier version let measured or predicted
+  bandwidth dominate placement. A mispredicted file tier then outranked
+  RAM, which put the primary copy of a "DRAM cache" on disk and left an HBM
+  tier permanently empty. Today the operator's score decides the tier, and
+  performance figures only break ties within it. The cost is that a wrong
+  score in the configuration is followed faithfully.</p>
+</div>
+
+<h3>What this means in practice</h3>
+<ul>
+  <li><strong>New data lands on the hottest tier.</strong> A new blob
+  defaults to score 1.0, so it goes to the highest-scored tier until that
+  tier is full, then spills downward through the fallback order.</li>
+  <li><strong>Scores mean something only relative to each other.</strong>
+  A blob at 0.5 never lands on a 1.0 tier unless nothing at or below 0.5
+  has room. A fast tier scored above every blob's score receives data only
+  through explicit promotion. The GPU paging work found exactly this: an
+  HBM tier scored 1.0 never received 0.5-scored pages.</li>
+  <li><strong>Placement is decided by the blob's owner</strong> using only
+  the targets that owner has registered: its own node's devices, plus its
+  neighbors' persistent devices when the neighborhood is larger than 1.</li>
+</ul>
+
+<h3>Capacity tracking</h3>
+<p>The data path debits and credits each block's physical footprint
+atomically. A periodic statistics task (every second by default) refreshes
+each target's free space, capacity, performance figures and predicted
+lifetime from its block device. It also recomputes automatic scores and
+evacuates targets predicted to fail soon. File-backed devices cap the free
+space they report at what the host filesystem actually has free.</p>
+<p>Node-local cache copies are reported as free space in capacity queries,
+the way Linux reports the page cache, because they can be reclaimed on
+demand.</p>
+
+<h2 id="reorganize">Reorganization: change the score, move the bytes</h2>
+<p>Reorganizing a blob means giving it a new score. If the score changes by
+more than a hysteresis threshold (0.05 by default), the core moves the
+bytes to match. A move does the following:</p>
+<ol>
+  <li>Takes the blob's write token and drains readers.</li>
+  <li>Reads the whole blob into a buffer.</li>
+  <li>Places and writes a complete new copy on the target tier.</li>
+  <li>Swaps the layout, bumps the placement generation (which invalidates
+  zero-IPC readers), and logs the new layout.</li>
+  <li>Frees the old extents, and only then.</li>
+</ol>
+
+<figure class="diagram">
+  <svg viewBox="0 0 860 170" role="img" aria-label="Place-before-free move sequence">
+    <defs><marker id="ah2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="arrowhead" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+    <rect class="box" x="10" y="40" width="140" height="70" rx="8"/>
+    <text class="title" x="24" y="68">1. Token</text>
+    <text class="muted" x="24" y="90">drain readers</text>
+    <rect class="box" x="180" y="40" width="140" height="70" rx="8"/>
+    <text class="title" x="194" y="68">2. Read</text>
+    <text class="muted" x="194" y="90">whole blob</text>
+    <rect class="box hl" x="350" y="40" width="150" height="70" rx="8"/>
+    <text class="title" x="364" y="68">3. Place + write</text>
+    <text class="muted" x="364" y="90">new copy (2× space)</text>
+    <rect class="box hl" x="530" y="40" width="150" height="70" rx="8"/>
+    <text class="title" x="544" y="68">4. Swap + log</text>
+    <text class="muted" x="544" y="90">new generation</text>
+    <rect class="box alt" x="710" y="40" width="140" height="70" rx="8"/>
+    <text class="title" x="724" y="68">5. Free old</text>
+    <text class="muted" x="724" y="90">only after log</text>
+    <path class="edge" d="M150,75 L178,75" marker-end="url(#ah2)"/>
+    <path class="edge" d="M320,75 L348,75" marker-end="url(#ah2)"/>
+    <path class="edge" d="M500,75 L528,75" marker-end="url(#ah2)"/>
+    <path class="edge" d="M680,75 L708,75" marker-end="url(#ah2)"/>
+    <text class="muted" x="350" y="140">A failure before step 4 leaves the original blob untouched.</text>
+  </svg>
+  <figcaption>Place-before-free. The cost is a transient doubling of
+  the blob's footprint. In exchange, no failed move can lose
+  data.</figcaption>
+</figure>
+
+<p>Four refinements keep moves cheap and safe:</p>
+<ul>
+  <li><strong>Drop instead of copy.</strong> If a primary is being demoted
+  below the score of a persistent replica that already holds the bytes,
+  the primary's blocks are simply released.</li>
+  <li><strong>Durability floor.</strong> A move never puts a blob on a less
+  durable tier than the one it currently occupies.</li>
+  <li><strong>No-room back-off.</strong> Scores are grouped into ten bands.
+  A move into a band that recently had no room fails fast for one second,
+  instead of repeatedly reading whole blobs only to be refused.</li>
+  <li><strong>Graceful shutdown.</strong> Moves in flight are counted, so
+  shutdown waits for them instead of tearing a blob in half.</li>
+</ul>
+
+<h2 id="organizer">The data organizer</h2>
+<p>The organizer is an optional background policy that rescores blobs
+automatically. It is <strong>off by default</strong>. When enabled, one or
+more periodic tasks each take a hash partition of all blobs and rescore
+them in turn, reorganizing those whose score changes. Five policies are
+built in:</p>
+<table>
+  <tr><th>Policy</th><th>Rule</th><th>Fits</th></tr>
+  <tr><td>frecency</td><td>Half recency (exponential decay with a 10-minute half-life), half frequency (saturating access count).</td><td>General-purpose caches</td></tr>
+  <tr><td>cyclic</td><td>Promote a stable prefix of page numbers that fits the fast tier. It only promotes, never demotes.</td><td>Iterative sweeps over the same data</td></tr>
+  <tr><td>hotset</td><td>Rank by access count.</td><td>Skewed reuse</td></tr>
+  <tr><td>scatter</td><td>Promote once reads begin, or when a "gather phase" hint arrives.</td><td>Write-then-read pipelines</td></tr>
+  <tr><td>grayscott</td><td>Demote checkpoint tags by name prefix.</td><td>Simulation checkpoint output</td></tr>
+</table>
+<p>Applications can also broadcast an opaque <em>phase hint</em> that
+policies interpret, such as "the gather phase starts now".</p>
+
+<div class="callout warn">
+  <p><strong>Measured tradeoff.</strong> Filling a fast tier costs on the
+  order of 270 µs per page moved. On a short GPU workload (a 45 ms run
+  with a 48 MB fast tier), every promoting policy made the run
+  <em>13–23% slower</em>. With the slow tier also in RAM, every policy was
+  within noise. The rule of thumb in the code: migration pays only when the
+  time saved by later reads is large compared with the cost of moving the
+  data, so short or one-pass workloads should leave the organizer off.</p>
+</div>
+<p>Each organizer round scans every blob in its partition, so the cost per
+round grows with the number of blobs. Access counts are not persisted
+across a restart. Score changes reach disk only through the periodic
+metadata snapshot, so up to about a minute of rescoring can be lost in a
+crash.</p>
+
+<h2 id="flush">Flushing to persistent tiers</h2>
+<p>Data written to a volatile tier becomes durable in three ways:</p>
+<ul>
+  <li><strong>Periodic flush</strong> (every 10 seconds by default). Blobs
+  with blocks below the configured persistence level are moved to
+  persistent tiers, using the same place-swap-log-free sequence as
+  reorganization, under the write token. The flush works against a
+  capacity budget computed up front and stops at the first "no room".</li>
+  <li><strong>Sync of a tag</strong> (the core of <code>fsync</code>). The
+  tag's blobs are moved up to persistent tiers, every device holding them
+  is synced in parallel, and then the metadata log is synced. If no
+  persistent tier exists, the sync succeeds with tmpfs semantics. A full
+  tier fails with "no space", and device errors fail with an I/O error.
+  <code>fsync_mode: deferred</code> turns this into a no-op that relies on
+  the periodic flushes.</li>
+  <li><strong>Graceful stop.</strong> A stop hook runs a flush within the
+  stop grace period, so RAM-tier data reaches disk on a clean
+  shutdown.</li>
+</ul>
+<div class="callout">
+  <p><strong>History.</strong> An earlier flush freed a blob's RAM blocks
+  and then re-put them to disk. Under concurrent writes this truncated or
+  zeroed data, losing hundreds of megabytes in large-scale runs. The flush
+  now moves data atomically under the write token, the same way
+  reorganization does.</p>
+</div>
+
+<h2 id="evict">Eviction</h2>
+<p>Eviction is deliberately narrow.</p>
+<ul>
+  <li><strong>Triggered only by a failed placement.</strong> A put that
+  cannot find room evicts on its own node, then retries once. There is no
+  background high-watermark eviction.</li>
+  <li><strong>Only droppable data is evicted to admit a write.</strong>
+  Authoritative data is never evicted to make room for another write. Two
+  kinds of data qualify: node-local cache copies, reclaimed first with
+  their slot metadata kept, and blobs created as droppable, deleted whole,
+  lowest score first.</li>
+  <li><strong>Blobs being written are skipped</strong>, because the holder
+  of the write token may be the very put that is waiting for room.</li>
+</ul>
+<p>An explicit eviction request (broadcast to every node, with a tier
+threshold and a byte budget) uses the same two phases.</p>
+<p>Each eviction pass scans and sorts all blobs on the node, because there
+is no index by score. A blob deleted to free space on one tier also loses
+whatever parts it had on other tiers, since eviction removes whole
+blobs.</p>
+
+<div class="callout warn">
+  <p><strong>Why eviction is narrow.</strong> A previous version put the
+  droppability check on the <em>incoming</em> put rather than on the
+  victims, which made authoritative data evictable. The current rule makes
+  "out of space" an honest error for authoritative writes. The layers that
+  need cache behavior (GPU page caches, HDF5 dataset images, node-local
+  cache copies) mark their data droppable explicitly.</p>
+</div>
+
+<h2 id="knobs">Configuration that matters</h2>
+<table>
+  <tr><th>Setting</th><th>Default</th><th>Effect</th></tr>
+  <tr><td><code>storage[]</code></td><td>RAM tier (score 1.0, 80% of DRAM) and a 10 GB file tier (score 0.2)</td><td>Defines the tiers: device type, capacity, score and persistence level.</td></tr>
+  <tr><td><code>dpe.dpe_type</code></td><td><code>max_bw</code></td><td>Placement policy.</td></tr>
+  <tr><td><code>targets.neighborhood</code></td><td>1 in the shipped config</td><td>How many nodes' persistent devices each owner can place on.</td></tr>
+  <tr><td><code>performance.score_difference_threshold</code></td><td>0.05</td><td>Reorganization hysteresis.</td></tr>
+  <tr><td><code>performance.flush_data_period_ms</code></td><td>10000</td><td>How often volatile data is moved to persistent tiers.</td></tr>
+  <tr><td><code>performance.flush_data_min_persistence</code></td><td>1</td><td>The persistence level flushes and syncs aim for.</td></tr>
+  <tr><td><code>performance.fsync_mode</code></td><td><code>durable</code></td><td><code>deferred</code> makes fsync return immediately.</td></tr>
+  <tr><td><code>performance.stat_targets_period_ms</code></td><td>1000</td><td>How fresh capacity and health figures are.</td></tr>
+  <tr><td><code>organizer</code>, <code>organizer_tasks</code>, <code>organizer_period_ms</code></td><td>none, 1, 5000</td><td>Background rescoring. These keys sit at the top level of the CTE pool entry.</td></tr>
+</table>
+
+<h2 id="tradeoffs">Tradeoffs at a glance</h2>
+<table class="tradeoffs">
+  <tr><th>Decision</th><th>Buys</th><th>Costs</th></tr>
+  <tr><td>Operator scores rank tiers</td><td class="good">Predictable placement. A misprediction cannot demote the cache tier.</td><td class="cost">A mis-scored tier is followed exactly as configured.</td></tr>
+  <tr><td>Copy-based moves under the write token</td><td class="good">Moves are atomic and failure-safe.</td><td class="cost">Readers of that blob wait during the move, and the blob briefly needs twice the space.</td></tr>
+  <tr><td>Organizer off by default</td><td class="good">No surprise migrations stealing bandwidth from short jobs.</td><td class="cost">Cold data stays on the fast tier unless something demotes it.</td></tr>
+  <tr><td>Eviction only of droppable data, only on demand</td><td class="good">Authoritative data is never silently discarded.</td><td class="cost">A full tier of authoritative data returns "no space" instead of spilling, and each pass is a full scan.</td></tr>
+  <tr><td>Periodic flush plus explicit sync</td><td class="good">Writes run at RAM speed, with durability on request.</td><td class="cost">Between flushes, data on volatile tiers exists only in memory.</td></tr>
+</table>

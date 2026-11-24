@@ -188,9 +188,14 @@ class ConfigManager : public ctp::BaseConfig {
     // that may never be spawned. Rescues are rare and replacements are
     // recycled, so a modest fixed ceiling is enough: the pool only ever needs
     // as many replacements as there are workers wedged AT ONCE.
-    static constexpr u32 kMaxElasticLanes = 8;
+    // 16, not 8: under tiering load every baseline worker was observed
+    // wedged at once (16 workers parked in fdatasync/fallocate), so 8
+    // replacements could not cover them and the pool refused to grow while
+    // the CPUs sat idle. Blocking device calls now run off the workers
+    // (bdev BlockingOffload); this is the margin for anything else.
+    static constexpr u32 kMaxElasticLanes = 16;
     int ncpu = ctp::SystemInfo::GetCpuCount();
-    u32 want = (ncpu > 0) ? static_cast<u32>(ncpu) : 8;
+    u32 want = (ncpu > 0) ? static_cast<u32>(ncpu) : kMaxElasticLanes;
     return want < kMaxElasticLanes ? want : kMaxElasticLanes;
   }
 
@@ -260,6 +265,15 @@ class ConfigManager : public ctp::BaseConfig {
   u32 GetNeighborhoodSize() const;
 
   /**
+   * Get the optional IPC namespace suffix for shared memory segment names.
+   * When set (via YAML `runtime: ipc_namespace` or CLIO_IPC_NAMESPACE env var),
+   * this suffix is appended to all segment names to allow multiple independent
+   * runtimes to coexist with the same ${USER} (issue #877).
+   * @return IPC namespace suffix, or empty string if not configured
+   */
+  std::string GetIpcNamespace() const { return ipc_namespace_; }
+
+  /**
    * Get shared memory segment names. The name is suffixed with the runtime port
    * so that multiple runtimes sharing one node + ${USER} (the fallback-runtime
    * topology) each own a distinct segment instead of colliding. Pass an explicit
@@ -320,6 +334,11 @@ class ConfigManager : public ctp::BaseConfig {
    */
   u32 GetFirstBusyWait() const { return first_busy_wait_; }
 
+  /** Seconds a client must be dead, idle and without in-flight tasks before
+   *  its shared-memory segments are reaped (0 = never reap while running;
+   *  ClearUserIpcs still cleans up at the next start). #1192. */
+  u32 GetClientReapGraceS() const { return client_reap_grace_s_; }
+
   /**
    * Get the task-progress validity-check interval in milliseconds.
    *
@@ -328,7 +347,7 @@ class ConfigManager : public ctp::BaseConfig {
    * each interval. This is the anti-hang mechanism that works even when a
    * task's ttl is infinite. 0 disables the periodic check.
    * Overridable via env CLIO_TASK_PROGRESS_INTERVAL_MS.
-   * @return Interval in ms (default: 0 = disabled)
+   * @return Interval in ms (default: 5000)
    */
   u32 GetTaskProgressIntervalMs() const { return task_progress_interval_ms_; }
 
@@ -440,7 +459,20 @@ class ConfigManager : public ctp::BaseConfig {
   void SetVizPort(u32 port) { viz_port_ = port; }
 
   /** Override the dashboard bind address (CLI `--viz-bind`). */
-  void SetVizBindAddr(const std::string &addr) { viz_bind_addr_ = addr; }
+  void SetVizBindAddr(const std::string &addr) {
+    viz_bind_addr_ = configured_viz_bind_addr_ = addr;
+  }
+
+  /** @return the bind address the runtime's own configuration chose (YAML,
+   *  environment or the daemon's `--viz-bind`), as opposed to one a
+   *  `viz_start` query picked for this run. */
+  std::string GetConfiguredVizBindAddr() const {
+    return configured_viz_bind_addr_;
+  }
+
+  /** Bind the dashboard to `addr` for this run only (a `viz_start` query),
+   *  leaving the configured address as it was. */
+  void UseVizBindAddr(const std::string &addr) { viz_bind_addr_ = addr; }
 
  private:
   /**
@@ -489,7 +521,12 @@ class ConfigManager : public ctp::BaseConfig {
   // CLIO_MAIN_SEGMENT_SIZE; LoadDefault() also installs 0, this initializer
   // just matches it.
   size_t main_segment_size_ = 0;
-  size_t client_data_segment_size_ = ctp::Unit<size_t>::Megabytes(256);
+  /** Default size of each client's first data segment (clio_<pid>_0). */
+  static constexpr size_t kDefaultClientDataSegmentSize =
+      static_cast<size_t>(512) * 1024 * 1024;
+  // issue #1359: settable via yaml `runtime: client_data_segment_size` or
+  // CLIO_CLIENT_DATA_SEGMENT_SIZE (both used to be silently ignored).
+  size_t client_data_segment_size_ = kDefaultClientDataSegmentSize;
   // issue #783: metadata segment. Deliberately huge and never pre-faulted --
   // shm_open + ftruncate + mmap is lazily populated, so the reservation
   // (default: the machine's RAM capacity, so metadata scales with the host)
@@ -517,6 +554,12 @@ class ConfigManager : public ctp::BaseConfig {
   std::string queue_segment_name_ = "chi_queue_segment_${USER}";
   std::string metadata_segment_name_ = "chi_metadata_segment_${USER}";
 
+  // Optional IPC namespace suffix appended to all shared memory segment names
+  // (issue #877). Allows multiple independent runtimes to coexist using the
+  // same ${USER}, configured via `runtime: ipc_namespace` in YAML or
+  // CLIO_IPC_NAMESPACE environment variable. Empty string means no suffix.
+  std::string ipc_namespace_ = "";
+
   // Networking configuration
   std::string hostfile_path_ = "";
 
@@ -529,6 +572,7 @@ class ConfigManager : public ctp::BaseConfig {
 
   // Worker sleep configuration (in microseconds)
   u32 first_busy_wait_ = 10000;              // Default: 10000us (10ms) busy wait
+  u32 client_reap_grace_s_ = 30;             // #1192: dead-client reap grace
   // #628 task-progress probe (0 = disabled). ON by default (issue #774): this
   // probe is the ONLY recovery for a cross-node task whose response was lost
   // (e.g. the SendOut retry queue timing out under sustained back-pressure) —
@@ -548,13 +592,28 @@ class ConfigManager : public ctp::BaseConfig {
   u32 gpu_queue_depth_ = 16;                 // Default: 16 tasks per queue
 
   // SWIM membership-detection configuration.
-  // Defaults match the prior hard-coded constants in admin_runtime.cc so
-  // existing deployments behave identically when these fields are absent
-  // from the YAML.
-  bool swim_enabled_ = true;
-  float swim_direct_probe_timeout_sec_ = 30.0f;
-  float swim_indirect_probe_timeout_sec_ = 15.0f;
-  float swim_suspicion_timeout_sec_ = 60.0f;
+  //
+  // DISABLED BY DEFAULT. SWIM decides a peer is dead from probe replies, and
+  // a wide collective -- a 256-node compose, a full-machine page flush --
+  // starves those replies for longer than the suspicion timeout while every
+  // node is healthy and busy. The detector then declares live nodes dead and
+  // recovery redistributes their containers, after which routing cannot find
+  // the containers and the job fails. Measured at 256 nodes: eight nodes,
+  // ids 0, 32, 64 ... 224, marked dead inside one run.
+  //
+  // Timeouts long enough to survive that are also long enough to be useless
+  // as a detector, so the honest default is off. A deployment that genuinely
+  // needs failure detection turns it on with `swim: enabled: true` and sizes
+  // the timeouts for its own collective width.
+  //
+  // The defaults below are sized for volatility, not detection speed: a node
+  // has to be unreachable for about an hour (5 min direct probe, 2.5 min
+  // indirect probe, 1 h suspicion) before recovery redistributes its
+  // containers. The old 30 s / 15 s / 60 s defaults fired inside healthy runs.
+  bool swim_enabled_ = false;
+  float swim_direct_probe_timeout_sec_ = 300.0f;
+  float swim_indirect_probe_timeout_sec_ = 150.0f;
+  float swim_suspicion_timeout_sec_ = 3600.0f;
 
   // Web dashboard (issue #990). viz_enabled_explicit_ records whether the YAML
   // or the environment stated a preference, so the daemon CLI can supply a
@@ -563,6 +622,7 @@ class ConfigManager : public ctp::BaseConfig {
   bool viz_enabled_explicit_ = false;
   u32 viz_port_ = 8080;
   std::string viz_bind_addr_ = "127.0.0.1";
+  std::string configured_viz_bind_addr_ = "127.0.0.1";
   u32 viz_max_threads_ = 16;
 
   // Compose configuration

@@ -59,6 +59,8 @@ class Client : public clio::run::ContainerClient {
    * unique identifier
    * @param custom_pool_id Explicit pool ID for the pool being created
    * @param perf_metrics Optional user-defined performance characteristics (uses defaults if not provided)
+   * @param ext_yaml YAML text of the bdev type's own settings block (the
+   *        `s3:` / `gcs:` keys, credentials included); empty for none
    */
   clio::run::Future<clio::run::bdev::CreateTask> AsyncCreate(
       const clio::run::PoolQuery& pool_query,
@@ -67,7 +69,8 @@ class Client : public clio::run::ContainerClient {
       clio::run::u32 io_depth = 32, clio::run::u32 alignment = 4096,
       const PerfMetrics* perf_metrics = nullptr,
       const std::string& alloc_log_path = "",
-      clio::run::u64 growth_unit = clio::run::u64(1) << 30) {
+      clio::run::u64 growth_unit = clio::run::u64(1) << 30,
+      int persistence_level = -1, const std::string& ext_yaml = "") {
     auto* ipc_manager = CLIO_CPU_IPC;
 
     // CreateTask should always use admin pool, never the client's pool_id_
@@ -88,7 +91,7 @@ class Client : public clio::run::ContainerClient {
         this,             // Client pointer for PostWait
         // CreateParams arguments (perf_metrics is optional, defaults used if nullptr):
         bdev_type, total_size, io_depth, safe_alignment, perf_metrics,
-        alloc_log_path, growth_unit);
+        alloc_log_path, growth_unit, persistence_level, ext_yaml);
 
     // Submit to runtime
     return ipc_manager->Send(task);
@@ -230,6 +233,21 @@ class Client : public clio::run::ContainerClient {
       task->SetFlags(TASK_PERIODIC);
     }
 
+    return ipc_manager->Send(task);
+  }
+
+  /**
+   * Make this bdev's written data and allocator state durable -
+   * asynchronous. Completes once an fdatasync of the backing file (file
+   * bdevs) has returned; rc != 0 means the device could not guarantee it.
+   * @param pool_query Routing to the container that owns the device (a
+   *                   block's target_query_)
+   * @return future for the SyncTask
+   */
+  clio::run::Future<SyncTask> AsyncSync(const clio::run::PoolQuery &pool_query) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    auto task = ipc_manager->NewTask<SyncTask>(clio::run::CreateTaskId(),
+                                               pool_id_, pool_query);
     return ipc_manager->Send(task);
   }
 

@@ -5,10 +5,29 @@
 # install, never the build or the test.
 #
 # Usage:
-#   pwsh CI/Retry.ps1 -- choco install winfsp -y --no-progress
-#   pwsh CI/Retry.ps1 -Attempts 5 -DelaySeconds 10 -- <command> [args...]
+#   pwsh CI/Retry.ps1 choco install winfsp -y --no-progress
+#   pwsh CI/Retry.ps1 -Attempts 5 -DelaySeconds 10 <command> [args...]
+#
+# Do NOT put a '--' separator before the command. Unlike the bash half, this
+# is an advanced function ([CmdletBinding()]), and PowerShell's parameter
+# binder reads '--' as a parameter whose name is empty -- so it fails with
+# "the parameter name '' is ambiguous" BEFORE a single line of this script
+# runs, and the wrapped command never executes at all. That took every
+# Windows wheel build red the day this helper landed: the WinFsp install
+# silently never ran, and the #1004 SDK assertion downstream was what
+# actually reported the failure.
+#
+# The command's own dashed flags need no protection -- ValueFromRemaining-
+# Arguments collects '-y' and '--no-progress' into $Command unharmed.
+#
+# PositionalBinding is off for a second, independent reason: without it the
+# first bare argument binds to -Attempts, so the two call sites that do not
+# pass -Attempts (build-pip test-wheels-windows, build-packages nsis) fail with
+#   Cannot convert value "choco" to type "System.Int32"
+# even after the '--' above is gone. Removing the separator and turning
+# positional binding off are both required; either alone still fails.
 
-[CmdletBinding()]
+[CmdletBinding(PositionalBinding = $false)]
 param(
     [int]$Attempts = 3,
     [int]$DelaySeconds = 5,
@@ -26,10 +45,6 @@ $ErrorActionPreference = 'Continue'
 # so this script -- and only this script -- decides what a non-zero exit means.
 $PSNativeCommandUseErrorActionPreference = $false
 
-# Strip the '--' separator if the caller used one.
-if ($Command.Count -gt 0 -and $Command[0] -eq '--') {
-    $Command = $Command[1..($Command.Count - 1)]
-}
 if ($Command.Count -eq 0) {
     Write-Error 'CI/Retry.ps1: no command given'
     exit 2

@@ -49,8 +49,11 @@ TEST_CASE("TransactionLog - Open Log Sync Size", "[cte][txnlog]") {
   log.Log(TxnType::kCreateNewBlob, txn);
   log.Sync();
 
-  // Record: 1 byte type + 4 byte size + payload(4+4+4+6+4)
-  REQUIRE(log.Size() == 1 + 4 + (4 + 4 + 4 + 6 + 4));
+  // File: 4 byte format magic, then one record of
+  // 1 byte type + 8 byte seq + 4 byte payload-size + payload: tag major,
+  // tag minor, name length, name, score, and the write's wall-clock stamp
+  // (8 bytes, #796).
+  REQUIRE(log.Size() == 4 + 1 + 8 + 4 + (4 + 4 + 4 + 6 + 4 + 8));
 
   log.Close();
   TxnRemove(path);
@@ -67,19 +70,21 @@ TEST_CASE("TransactionLog - CreateNewBlob roundtrip", "[cte][txnlog]") {
   txn.tag_minor_ = 9;
   txn.blob_name_ = "my_blob";
   txn.score_ = 0.75f;
+  txn.wall_ns_ = 1759800000123456789ULL;  // the write's time (#796)
   log.Log(TxnType::kCreateNewBlob, txn);
   log.Sync();
 
   auto entries = log.Load();
   REQUIRE(entries.size() == 1);
-  REQUIRE(entries[0].first == TxnType::kCreateNewBlob);
+  REQUIRE(entries[0].type_ == TxnType::kCreateNewBlob);
   TxnCreateNewBlob out =
-      TransactionLog::DeserializeCreateNewBlob(entries[0].second);
+      TransactionLog::DeserializeCreateNewBlob(entries[0].payload_);
   REQUIRE(out.tag_major_ == 7);
   REQUIRE(out.tag_minor_ == 9);
   REQUIRE(out.blob_name_ == "my_blob");
   REQUIRE(out.score_ > 0.74f);
   REQUIRE(out.score_ < 0.76f);
+  REQUIRE(out.wall_ns_ == 1759800000123456789ULL);
 
   log.Close();
   TxnRemove(path);
@@ -115,8 +120,8 @@ TEST_CASE("TransactionLog - ExtendBlob roundtrip with blocks", "[cte][txnlog]") 
 
   auto entries = log.Load();
   REQUIRE(entries.size() == 1);
-  REQUIRE(entries[0].first == TxnType::kExtendBlob);
-  TxnExtendBlob out = TransactionLog::DeserializeExtendBlob(entries[0].second);
+  REQUIRE(entries[0].type_ == TxnType::kExtendBlob);
+  TxnExtendBlob out = TransactionLog::DeserializeExtendBlob(entries[0].payload_);
   REQUIRE(out.tag_major_ == 3);
   REQUIRE(out.tag_minor_ == 4);
   REQUIRE(out.blob_name_ == "extended");
@@ -177,9 +182,9 @@ TEST_CASE("TransactionLog - ExtendReplica roundtrip", "[cte][txnlog]") {
 
   auto entries = log.Load();
   REQUIRE(entries.size() == 1);
-  REQUIRE(entries[0].first == TxnType::kExtendReplica);
+  REQUIRE(entries[0].type_ == TxnType::kExtendReplica);
   TxnExtendReplica out =
-      TransactionLog::DeserializeExtendReplica(entries[0].second);
+      TransactionLog::DeserializeExtendReplica(entries[0].payload_);
   REQUIRE(out.tag_major_ == 5);
   REQUIRE(out.tag_minor_ == 6);
   REQUIRE(out.blob_name_ == "replicated");
@@ -227,16 +232,16 @@ TEST_CASE("TransactionLog - ClearBlob DelBlob roundtrip", "[cte][txnlog]") {
 
   auto entries = log.Load();
   REQUIRE(entries.size() == 2);
-  REQUIRE(entries[0].first == TxnType::kClearBlob);
-  REQUIRE(entries[1].first == TxnType::kDelBlob);
+  REQUIRE(entries[0].type_ == TxnType::kClearBlob);
+  REQUIRE(entries[1].type_ == TxnType::kDelBlob);
 
   TxnClearBlob clear_out =
-      TransactionLog::DeserializeClearBlob(entries[0].second);
+      TransactionLog::DeserializeClearBlob(entries[0].payload_);
   REQUIRE(clear_out.tag_major_ == 11);
   REQUIRE(clear_out.tag_minor_ == 12);
   REQUIRE(clear_out.blob_name_ == "to_clear");
 
-  TxnDelBlob del_out = TransactionLog::DeserializeDelBlob(entries[1].second);
+  TxnDelBlob del_out = TransactionLog::DeserializeDelBlob(entries[1].payload_);
   REQUIRE(del_out.tag_major_ == 13);
   REQUIRE(del_out.tag_minor_ == 14);
   REQUIRE(del_out.blob_name_ == "to_delete");
@@ -264,10 +269,10 @@ TEST_CASE("TransactionLog - SetBlobTransform roundtrip", "[cte][txnlog]") {
 
   auto entries = log.Load();
   REQUIRE(entries.size() == 1);
-  REQUIRE(entries[0].first == TxnType::kSetBlobTransform);
+  REQUIRE(entries[0].type_ == TxnType::kSetBlobTransform);
 
   TxnSetBlobTransform out =
-      TransactionLog::DeserializeSetBlobTransform(entries[0].second);
+      TransactionLog::DeserializeSetBlobTransform(entries[0].payload_);
   REQUIRE(out.tag_major_ == 21);
   REQUIRE(out.tag_minor_ == 22);
   REQUIRE(out.blob_name_ == "compressed_blob");
@@ -299,19 +304,60 @@ TEST_CASE("TransactionLog - CreateTag DelTag roundtrip", "[cte][txnlog]") {
 
   auto entries = log.Load();
   REQUIRE(entries.size() == 2);
-  REQUIRE(entries[0].first == TxnType::kCreateTag);
-  REQUIRE(entries[1].first == TxnType::kDelTag);
+  REQUIRE(entries[0].type_ == TxnType::kCreateTag);
+  REQUIRE(entries[1].type_ == TxnType::kDelTag);
 
   TxnCreateTag create_out =
-      TransactionLog::DeserializeCreateTag(entries[0].second);
+      TransactionLog::DeserializeCreateTag(entries[0].payload_);
   REQUIRE(create_out.tag_name_ == "tag_one");
   REQUIRE(create_out.tag_major_ == 21);
   REQUIRE(create_out.tag_minor_ == 22);
 
-  TxnDelTag del_out = TransactionLog::DeserializeDelTag(entries[1].second);
+  TxnDelTag del_out = TransactionLog::DeserializeDelTag(entries[1].payload_);
   REQUIRE(del_out.tag_name_ == "tag_two");
   REQUIRE(del_out.tag_major_ == 23);
   REQUIRE(del_out.tag_minor_ == 24);
+
+  log.Close();
+  TxnRemove(path);
+}
+
+TEST_CASE("TransactionLog - TagXattr set and delete roundtrip",
+          "[cte][txnlog]") {
+  std::string path = TxnTempFile("txn_tag_xattr");
+  TxnRemove(path);
+
+  TransactionLog log;
+  log.Open(path, 4096);
+
+  TxnTagXattr set_txn;
+  set_txn.tag_major_ = 31;
+  set_txn.tag_minor_ = 32;
+  set_txn.key_ = "~i";
+  set_txn.value_ = std::string("a\0b", 3);  // values are binary
+  log.Log(TxnType::kSetTagXattr, set_txn);
+
+  TxnTagXattr del_txn;
+  del_txn.tag_major_ = 31;
+  del_txn.tag_minor_ = 32;
+  del_txn.key_ = "";  // the whole section
+  log.Log(TxnType::kDelTagXattr, del_txn);
+  log.Sync();
+
+  auto entries = log.Load();
+  REQUIRE(entries.size() == 2);
+  REQUIRE(entries[0].type_ == TxnType::kSetTagXattr);
+  REQUIRE(entries[1].type_ == TxnType::kDelTagXattr);
+
+  TxnTagXattr set_out = TransactionLog::DeserializeTagXattr(entries[0].payload_);
+  REQUIRE(set_out.tag_major_ == 31);
+  REQUIRE(set_out.tag_minor_ == 32);
+  REQUIRE(set_out.key_ == "~i");
+  REQUIRE(set_out.value_ == std::string("a\0b", 3));
+
+  TxnTagXattr del_out = TransactionLog::DeserializeTagXattr(entries[1].payload_);
+  REQUIRE(del_out.key_.empty());
+  REQUIRE(del_out.value_.empty());
 
   log.Close();
   TxnRemove(path);
@@ -347,7 +393,9 @@ TEST_CASE("TransactionLog - Truncate resets the file", "[cte][txnlog]") {
   REQUIRE(log.Size() > 0);
 
   log.Truncate();
-  REQUIRE(log.Size() == 0);
+  // Truncate rewrites the 4-byte format magic immediately, so the file is
+  // not literally empty -- but it carries no records.
+  REQUIRE(log.Size() == 4);
   REQUIRE(log.Load().empty());
 
   // The log remains usable in append mode after Truncate
@@ -355,7 +403,7 @@ TEST_CASE("TransactionLog - Truncate resets the file", "[cte][txnlog]") {
   log.Sync();
   auto entries = log.Load();
   REQUIRE(entries.size() == 1);
-  TxnCreateTag out = TransactionLog::DeserializeCreateTag(entries[0].second);
+  TxnCreateTag out = TransactionLog::DeserializeCreateTag(entries[0].payload_);
   REQUIRE(out.tag_name_ == "will_be_truncated");
 
   log.Close();
@@ -389,8 +437,8 @@ TEST_CASE("TransactionLog - Append across Open Close cycles", "[cte][txnlog]") {
 
     auto entries = log.Load();
     REQUIRE(entries.size() == 2);
-    REQUIRE(entries[0].first == TxnType::kCreateNewBlob);
-    REQUIRE(entries[1].first == TxnType::kDelBlob);
+    REQUIRE(entries[0].type_ == TxnType::kCreateNewBlob);
+    REQUIRE(entries[1].type_ == TxnType::kDelBlob);
     log.Close();
     // Close twice is safe
     log.Close();
@@ -427,7 +475,7 @@ TEST_CASE("TransactionLog - Truncated trailing record is skipped",
 
   auto entries = log.Load();
   REQUIRE(entries.size() == 1);
-  REQUIRE(entries[0].first == TxnType::kCreateTag);
+  REQUIRE(entries[0].type_ == TxnType::kCreateTag);
 
   log.Close();
   TxnRemove(path);

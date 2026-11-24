@@ -1,10 +1,10 @@
 ---
-description: "Set up, install, build, and debug the IOWarp Core development environment. Covers Docker devcontainers, native builds, IDE configuration, and troubleshooting."
+description: "Set up, install, build, and debug the CLIO Core development environment. Covers Docker devcontainers, native builds, IDE configuration, and troubleshooting."
 ---
 
-# IOWarp Core — Development Environment Setup
+# CLIO Core — Development Environment Setup
 
-You are helping a developer get IOWarp Core running locally. Follow the instructions below precisely. Adapt to the developer's OS and tooling, but always prefer the Docker devcontainer path unless they explicitly ask otherwise.
+You are helping a developer get CLIO Core running locally. Follow the instructions below precisely. Adapt to the developer's OS and tooling, but always prefer the Docker devcontainer path unless they explicitly ask otherwise.
 
 ## Decision Tree
 
@@ -63,7 +63,7 @@ docker run -it --privileged \
   iowarp/clio-core-devcontainer:latest
 ```
 
-#### 3. Build IOWarp Core
+#### 3. Build CLIO Core
 
 Inside the container:
 ```bash
@@ -96,7 +96,7 @@ ctest -R omni                # Context Assimilation Engine
 ```bash
 # Start runtime with default config
 export CLIO_X=/workspace/docker/clio_cte_bench/cte_config.yaml
-clio_run runtime start &
+clio-run runtime start &
 
 # After a moment, run a quick benchmark
 clio_run_thrpt_bench --test-case latency --threads 4 --duration 5
@@ -265,14 +265,14 @@ rm -rf /tmp/clio_$(whoami)/*
 
 Key CMake flags:
 ```
--DWRP_CORE_ENABLE_RUNTIME=ON    # Clio runtime
--DWRP_CORE_ENABLE_CTE=ON        # Context Transfer Engine
--DWRP_CORE_ENABLE_CAE=ON        # Context Assimilation Engine
--DWRP_CORE_ENABLE_CEE=ON        # Context Exploration Engine
--DWRP_CORE_ENABLE_TESTS=ON      # Enable test targets
--DWRP_CORE_ENABLE_COMPRESS=ON   # Compression support
--DWRP_CORE_ENABLE_PYTHON=ON     # Python bindings
--DWRP_CORE_ENABLE_ASAN=ON       # AddressSanitizer
+-DCLIO_CORE_ENABLE_RUNTIME=ON    # Clio runtime
+-DCLIO_CORE_ENABLE_CTE=ON        # Context Transfer Engine
+-DCLIO_CORE_ENABLE_CAE=ON        # Context Assimilation Engine
+-DCLIO_CORE_ENABLE_CEE=ON        # Context Exploration Engine
+-DCLIO_CORE_ENABLE_TESTS=ON      # Enable test targets
+-DCLIO_CTE_ENABLE_COMPRESS=ON   # Compression support
+-DCLIO_CORE_ENABLE_PYTHON=ON     # Python bindings
+-DCLIO_CORE_ENABLE_ASAN=ON       # AddressSanitizer
 ```
 
 ---
@@ -291,7 +291,7 @@ cd build && ctest -VV
 
 # Start runtime
 export CLIO_X=/workspace/docker/clio_cte_bench/cte_config.yaml
-clio_run runtime start
+clio-run runtime start
 
 # IPC transport modes
 export CLIO_X=SHM   # Shared memory (lowest latency, same machine)

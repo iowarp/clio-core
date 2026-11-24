@@ -57,10 +57,14 @@ static nb::dict results_to_dict(
 NB_MODULE(clio_runtime_ext, m) {
   m.doc() = "Python bindings for Clio runtime monitoring";
 
+  // Both can block for many seconds (connecting to, or tearing down the link
+  // to, the runtime) and touch no Python objects: release the GIL (#1096).
   m.def("clio_init", &py_clio_init, "mode"_a,
+        nb::call_guard<nb::gil_scoped_release>(),
         "Initialize the Clio runtime. mode: 0=kClient.");
 
   m.def("clio_finalize", &py_clio_finalize,
+        nb::call_guard<nb::gil_scoped_release>(),
         "Finalize the Clio runtime.");
 
   nb::class_<PyMonitorTask>(m, "MonitorTask")

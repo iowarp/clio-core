@@ -92,6 +92,14 @@ class Scheduler {
   virtual void LoadBalance() = 0;
 
   /**
+   * Add a worker to the routable pool. Called on the monitor thread when a
+   * mapper asked for one (WorkOrchestrator::RequestWorker): every worker it
+   * could place a task on was already holding a full share of work. Default:
+   * no-op, for schedulers with a fixed pool.
+   */
+  virtual void GrowPool() {}
+
+  /**
    * Telemetry hook (issue #781): called from Worker::EndTask with a completed
    * task's ACTUAL measured cpu/wall time (us). Implementations fold it into the
    * perf-bin PDF so the runtime can characterize its live workload (how many
@@ -101,8 +109,9 @@ class Scheduler {
    * @param cpu_us   measured CPU time (us)
    * @param wall_us  measured wall-clock time (us)
    */
-  virtual void RecordCompletion(u32 method, double cpu_us, double wall_us) {
-    (void)method; (void)cpu_us; (void)wall_us;
+  virtual void RecordCompletion(u32 pool_major, u32 method, double cpu_us,
+                                double wall_us) {
+    (void)pool_major; (void)method; (void)cpu_us; (void)wall_us;
   }
 
   /**

@@ -149,15 +149,16 @@ class Fixture {
     std::this_thread::sleep_for(200ms);
 
     if (!RegisterRamTarget()) return false;
-    // Best-effort: attach the SHM metadata cache so the zero-IPC read-back
-    // path can run where available.
-    (void)CLIO_CTE_CLIENT->AttachShmCache();
     return true;
   }
 
   /** Separate: compose a real daemon in its own process, attach as a client. */
   bool InitSeparate() {
-    const std::string work = "/tmp/clio_putblob_priv_test";
+    // Per user: another user's leftover directory at a fixed name cannot
+    // be removed or reused on a shared machine.
+    const char *user_env = std::getenv("USER");
+    const std::string work =
+        std::string("/tmp/clio_putblob_priv_test_") + (user_env != nullptr ? user_env : "user");
     std::filesystem::remove_all(work);
     std::filesystem::create_directories(work);
     const std::string yaml = work + "/compose.yaml";
@@ -202,7 +203,6 @@ class Fixture {
     if (!RegisterRamTarget()) {
       return false;
     }
-    (void)CLIO_CTE_CLIENT->AttachShmCache();
     return true;
   }
 };
@@ -381,7 +381,7 @@ TEST_CASE("Private PutBlob rejects degenerate requests", "[cte][830]") {
   p_zero.Wait();
 
   // Neither name may exist: a rejected request must not reach the runtime.
-  auto listed = cte->AsyncGetContainedBlobs(tag_id);
+  auto listed = cte->AsyncGetContainedBlobs(tag_id, clio::run::PoolQuery::Broadcast());
   listed.Wait();
   REQUIRE(listed->GetReturnCode() == 0);
   for (const std::string &name : listed->blob_names_) {

@@ -41,26 +41,47 @@ say "Using image: ${IOWARP_DOCKER_IMAGE}"
 cleanup() { docker compose down -v >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
-# run_phase <label> <blob_kb> <hard_timeout_sec>
+# shellcheck source=../../../../CI/compose_wait.sh
+source "$REPO_ROOT/CI/compose_wait.sh"
+
+# run_phase <label> <blob_kb> <phase_budget_sec>
 # Sets: PHASE_RC1 PHASE_RC2 (node exits; 124 = phase hard-timeout).
+#
+# ONE deadline covers the whole phase (readiness + both producers + the done
+# barrier). It used to be two sequential `timeout 420 docker wait`s -- 840 s
+# against a 900 s workflow step, so a hang killed the step before any log was
+# printed -- and the in-process watchdog (outputs * per-output timeout + 120 s
+# = 600 s) outlived the 420 s outer cap, so its STALL line never printed. Now
+# the watchdog is set from the phase budget and always fires first.
 run_phase() {
-    local label="$1" blob_kb="$2" hard_to="$3"
+    local label="$1" blob_kb="$2" budget="$3"
     export GS_BLOB_KB="$blob_kb"
     export GS_BLOBS="${GS_BLOBS:-64}"
     export GS_OUTPUTS="${GS_OUTPUTS:-3}"
     export GS_OUTPUT_TIMEOUT_SEC="${GS_OUTPUT_TIMEOUT_SEC:-240}"
 
-    say "=== Phase '$label': GS_BLOB_KB=$blob_kb GS_BLOBS=$GS_BLOBS GS_OUTPUTS=$GS_OUTPUTS (cap ${hard_to}s) ==="
     docker compose down -v >/dev/null 2>&1 || true
+    cw_init "$budget" gs-congest-node1 gs-congest-node2
+    # Watchdog 120 s inside the phase deadline: room for readiness, the STALL
+    # report, the done barrier and the host-side dump.
+    export GS_WATCHDOG_SEC=$(( $(cw_remaining) - 120 ))
+    say "=== Phase '$label': GS_BLOB_KB=$blob_kb GS_BLOBS=$GS_BLOBS GS_OUTPUTS=$GS_OUTPUTS (deadline $(cw_remaining)s, watchdog ${GS_WATCHDOG_SEC}s) ==="
+    cw_reset_sync "$REPO_ROOT/build/cluster_sync/grayscott_congestion"
     if ! docker compose up -d; then
         err "docker compose up failed"; docker compose logs || true
         PHASE_RC1=1; PHASE_RC2=1; return
     fi
+    if ! cw_wait_ready_files 2; then
+        PHASE_RC1=1; PHASE_RC2=1
+        docker compose down -v >/dev/null 2>&1 || true
+        return
+    fi
 
-    # Bounded wait on both producers; 124 marks a hard phase timeout (a node
-    # that never even reached its own per-output stall cutoff).
-    PHASE_RC1=$(timeout "$hard_to" docker wait gs-congest-node1 2>/dev/null || echo 124)
-    PHASE_RC2=$(timeout "$hard_to" docker wait gs-congest-node2 2>/dev/null || echo 124)
+    # Bounded wait on both producers against the phase deadline; 124 marks a
+    # hard phase timeout (cw_wait_containers has already dumped both nodes).
+    cw_wait_containers gs-congest-node1 gs-congest-node2 || true
+    PHASE_RC1="${CW_RC[gs-congest-node1]:-124}"
+    PHASE_RC2="${CW_RC[gs-congest-node2]:-124}"
 
     say "--- node1 output lines ---"
     # The containers' own lines are prefixed "gs-nodeN:", not "gs-congest"
@@ -92,7 +113,8 @@ small_ok=-1; large_verdict="not-run"
 # it). This phase must PASS on both nodes; it is wired into cluster-tests.yml
 # so the cross-node SHM client path can never silently regress again.
 if [ "$MODE" = "tiny" ]; then
-    GS_BLOBS=4 GS_OUTPUTS=2 run_phase "tiny cross-node SHM gate" 64 420
+    # 780 s phase budget < the 15 min workflow step.
+    GS_BLOBS=4 GS_OUTPUTS=2 run_phase "tiny cross-node SHM gate" 64 780
     if [ "$PHASE_RC1" = "0" ] && [ "$PHASE_RC2" = "0" ]; then
         ok "Cross-node SHM client gate PASSED (issue #774)"
         exit 0
@@ -103,7 +125,7 @@ if [ "$MODE" = "tiny" ]; then
 fi
 
 if [ "$MODE" = "small" ] || [ "$MODE" = "both" ]; then
-    run_phase "L=256 analog (small)" 512 600
+    run_phase "L=256 analog (small)" 512 780
     if [ "$PHASE_RC1" = "0" ] && [ "$PHASE_RC2" = "0" ]; then
         ok "Small analog completed on both nodes — harness is sane."
         small_ok=1

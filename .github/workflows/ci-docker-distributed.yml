@@ -19,11 +19,10 @@ name: Docker Distributed Stop Test
 # because it needs SLURM + apptainer on a real cluster.
 
 on:
-  push:
-    branches: [main, dev]
-  # Merge queue (issue #1013): same full-matrix-before-merge rationale as the
-  # other gates -- see ci-adapters.yml.
-  merge_group:
+  # Manual only. These docker-compose multi-node suites were too flaky to run
+  # on every push to main/dev (they were never required checks). Distributed
+  # coverage for main/dev now comes from the nightly Ares Slurm run in
+  # nightly-ares-distributed.yml. Run this by hand from the Actions tab.
   workflow_dispatch:
 
 concurrency:

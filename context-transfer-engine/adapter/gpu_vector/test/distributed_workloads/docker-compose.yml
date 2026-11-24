@@ -67,6 +67,7 @@ services:
       # Negative controls, passed through so the harness can prove an
       # exchange is load-bearing rather than incidentally correct.
       - GS_NO_HALO=${GS_NO_HALO:-}
+      - GNN_NO_REMOTE=${GNN_NO_REMOTE:-}
       - GS_PLANE_DUMP=${GS_PLANE_DUMP:-}
       - LB_REGION_DIFF=${LB_REGION_DIFF:-}
       - LB_TRACE=${LB_TRACE:-}
@@ -93,6 +94,7 @@ services:
       # Negative controls, passed through so the harness can prove an
       # exchange is load-bearing rather than incidentally correct.
       - GS_NO_HALO=${GS_NO_HALO:-}
+      - GNN_NO_REMOTE=${GNN_NO_REMOTE:-}
       - GS_PLANE_DUMP=${GS_PLANE_DUMP:-}
       - LB_REGION_DIFF=${LB_REGION_DIFF:-}
       - LB_TRACE=${LB_TRACE:-}
@@ -123,6 +125,7 @@ services:
       # Negative controls, passed through so the harness can prove an
       # exchange is load-bearing rather than incidentally correct.
       - GS_NO_HALO=${GS_NO_HALO:-}
+      - GNN_NO_REMOTE=${GNN_NO_REMOTE:-}
       - GS_PLANE_DUMP=${GS_PLANE_DUMP:-}
       - LB_REGION_DIFF=${LB_REGION_DIFF:-}
       - LB_TRACE=${LB_TRACE:-}
@@ -153,6 +156,7 @@ services:
       # Negative controls, passed through so the harness can prove an
       # exchange is load-bearing rather than incidentally correct.
       - GS_NO_HALO=${GS_NO_HALO:-}
+      - GNN_NO_REMOTE=${GNN_NO_REMOTE:-}
       - GS_PLANE_DUMP=${GS_PLANE_DUMP:-}
       - LB_REGION_DIFF=${LB_REGION_DIFF:-}
       - LB_TRACE=${LB_TRACE:-}

@@ -49,7 +49,16 @@ if(CLIO_CTE_ENABLE_COMPRESS)
     message(STATUS "CTE: Compression enabled - building compressor chimod")
     add_subdirectory(compressor)
 else()
-    message(STATUS "CTE: Compression disabled - skipping compressor chimod (use -DWRP_CTE_ENABLE_COMPRESS=ON to enable)")
+    message(STATUS "CTE: Compression disabled - skipping compressor chimod (use -DCLIO_CTE_ENABLE_COMPRESS=ON to enable)")
+endif()
+
+# Stream chimod -- byte-stream layer with deferred append pipeline
+option(CLIO_CTE_ENABLE_STREAM "Build the stream chimod" ON)
+if(CLIO_CTE_ENABLE_STREAM)
+    message(STATUS "CTE: building stream chimod")
+    add_subdirectory(stream)
+else()
+    message(STATUS "CTE: stream chimod disabled (use -DCLIO_CTE_ENABLE_STREAM=ON)")
 endif()
 
 # Add the filesystem ChiMod (a filesystem interface over the CTE; the I/O
@@ -68,6 +77,10 @@ if((CLIO_CTE_ENABLE_FUSE_ADAPTER OR CLIO_CTE_ENABLE_POSIX_ADAPTER OR
         "Build the filesystem chimod (WIP, #552)" FORCE)
 endif()
 if(CLIO_CTE_ENABLE_FILESYSTEM)
+    if(NOT TARGET clio_cte_stream_runtime)
+        message(FATAL_ERROR "The filesystem chimod requires the stream chimod "
+                            "(-DCLIO_CTE_ENABLE_STREAM=ON)")
+    endif()
     message(STATUS "CTE: building filesystem chimod")
     add_subdirectory(filesystem)
 else()
@@ -93,6 +106,29 @@ if(CLIO_CTE_ENABLE_CACHE)
     add_subdirectory(cache)
 else()
     message(STATUS "CTE: cache chimod disabled (use -DCLIO_CTE_ENABLE_CACHE=ON)")
+endif()
+
+# Shared-memory write-through cache: the top of the CTE chain. Clients write
+# and read blobs in its segment directly; it aggregates the logged ranges
+# into MultiPutBlob tasks down the chain (core_shm_cache_writethru/DESIGN.md).
+option(CLIO_CTE_ENABLE_SHM_WTC "Build the shm write-through cache chimod" ON)
+if(CLIO_CTE_ENABLE_SHM_WTC)
+    message(STATUS "CTE: building core_shm_cache_writethru chimod")
+    add_subdirectory(core_shm_cache_writethru)
+else()
+    message(STATUS "CTE: core_shm_cache_writethru chimod disabled")
+endif()
+
+# Policy-named caches over a volatile and a persistent CTE core.
+# Both share cache_base/.
+option(CLIO_CTE_ENABLE_POLICY_CACHES
+       "Build the write-through and write-back cache chimods" ON)
+if(CLIO_CTE_ENABLE_POLICY_CACHES)
+    message(STATUS "CTE: building core_persist_write_thru and core_persist_write_back chimods")
+    add_subdirectory(core_persist_write_thru)
+    add_subdirectory(core_persist_write_back)
+else()
+    message(STATUS "CTE: policy cache chimods disabled")
 endif()
 
 # Checkpoint chimod -- the fault handler behind vector.Copy's lazy copies.

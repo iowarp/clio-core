@@ -21,12 +21,23 @@
 #endif
 #include <clio_cte/gpu_vector/device_vector.h>
 #include <clio_cte/gpu_vector/page.h>
+#include <clio_cte/gpu_vector/prefetch.h>
 
+#if defined(_WIN32)
+#include <io.h>  // _write: the async-signal-safe stderr write below
+#else
+#include <unistd.h>
+#endif
+
+#include <cmath>
+#include <csignal>
+#include <cstdio>
 #include <cstring>
 #include <map>
 #include <memory>
 #include <new>
 #include <stdexcept>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -46,6 +57,32 @@ namespace clio::cte::gpu_vector {
  * implied by it).
  */
 
+/** A device-resident task region and its host snapshot (see
+ *  ResumeWhenComplete). One per vector device table; host-only. */
+struct TaskRegion {
+  char *base = nullptr;
+  std::vector<char> snap;
+  clio::run::u32 last_block = 0;
+  bool fresh = false;
+};
+inline std::vector<TaskRegion> &TaskRegions() {
+  static std::vector<TaskRegion> regions;
+  return regions;
+}
+inline void RegisterTaskRegion(char *base, size_t bytes) {
+  TaskRegion r;
+  r.base = base;
+  r.snap.resize(bytes);
+  TaskRegions().push_back(std::move(r));
+}
+inline TaskRegion *FindTaskRegion(clio::run::u64 tag) {
+  for (auto &r : TaskRegions()) {
+    const auto lo = reinterpret_cast<clio::run::u64>(r.base);
+    if (tag >= lo && tag + sizeof(unsigned int) <= lo + r.snap.size()) return &r;
+  }
+  return nullptr;
+}
+
 /**
  * Resume a parked block ONLY when the completion word its wait tag names has
  * flipped.
@@ -58,12 +95,33 @@ namespace clio::cte::gpu_vector {
  *
  * A wait tag of 0 means "no condition", so those blocks always resume.
  */
-inline bool ResumeWhenComplete(clio::run::u32 /*block*/, clio::run::u64 tag) {
+inline bool ResumeWhenComplete(clio::run::u32 block, clio::run::u64 tag) {
 #if CTP_ENABLE_GPU
+  // ONE COPY PER SPIN, NOT ONE PER BLOCK. The completion words live in the
+  // task sets, which are device memory (the kernel does device-scope atomics
+  // on them; PVC faults an atomic on host memory). Reading them one blocking
+  // 4-byte memcpy per parked block per spin of the driver was 867k Level Zero
+  // copies in a 4-step Gray-Scott run, ~50 us each: at 1024 parked blocks a
+  // single spin cost ~50 ms before anything relaunched. Instead the whole
+  // task region is snapshotted in one copy when a new spin starts (the driver
+  // walks pending blocks in increasing order, so a block index that does not
+  // increase marks a new spin) and every block's word is read from that.
   if (tag == 0) return true;
+  TaskRegion *r = FindTaskRegion(tag);
+  if (r == nullptr) {
+    unsigned int done = 0;
+    ctp::GpuApi::Memcpy(reinterpret_cast<char *>(&done),
+                        reinterpret_cast<const char *>(tag), sizeof(done));
+    return (done & 1u) != 0u;
+  }
+  if (!r->fresh || block <= r->last_block) {
+    ctp::GpuApi::Memcpy(r->snap.data(), r->base, r->snap.size());
+    r->fresh = true;
+  }
+  r->last_block = block;
   unsigned int done = 0;
-  ctp::GpuApi::Memcpy(reinterpret_cast<char *>(&done),
-                      reinterpret_cast<const char *>(tag), sizeof(done));
+  std::memcpy(&done, r->snap.data() + (tag - reinterpret_cast<clio::run::u64>(r->base)),
+              sizeof(done));
   return (done & 1u) != 0u;
 #else
   (void) tag;
@@ -93,9 +151,26 @@ inline bool ResumeWhenComplete(clio::run::u32 /*block*/, clio::run::u64 tag) {
 inline unsigned long long *FatalSlots() {
 #if CTP_ENABLE_GPU
   static unsigned long long *slots = [] {
+#if CTP_ENABLE_SYCL
+    // DEVICE memory under SYCL. The latch is an atomicCAS from device code,
+    // and on Aurora's Max 1550 a device atomic to malloc_host memory faults
+    // outright (usm_atomic_host_allocations=0), while one to malloc_shared
+    // faults whenever the page happens to be resident on the HOST at that
+    // moment -- an AtomicAccessViolation at PDE level, not a migration.
+    // Shared memory passed benchmark/usm_atomic_probe.cc only because that
+    // kernel's launch migrated the page first; here the host memsets the
+    // slots at start-up and the device first touches them seconds later,
+    // mid-run, and the trap's own report became the crash that hid it
+    // (weights, lbann). Device memory takes atomics unconditionally. The
+    // host reads the note from FatalMirror() instead.
+    auto *p = ctp::GpuApi::Malloc<unsigned long long>(
+        8 * sizeof(unsigned long long));
+    if (p != nullptr) ctp::GpuApi::Memset(p, 0, 8 * sizeof(unsigned long long));
+#else
     auto *p = ctp::GpuApi::MallocHost<unsigned long long>(
         8 * sizeof(unsigned long long));
     if (p != nullptr) std::memset(p, 0, 8 * sizeof(unsigned long long));
+#endif
     return p;
   }();
   return slots;
@@ -104,30 +179,111 @@ inline unsigned long long *FatalSlots() {
 #endif
 }
 
-/** Human-readable form of whatever the device latched, or "" if nothing. */
-inline std::string FatalReport() {
-  unsigned long long *f = FatalSlots();
-  if (f == nullptr || f[0] == kFatalNone) return std::string();
-  const char *what = "unknown";
-  switch (f[0]) {
-    case kFatalInitBlock:   what = "Init(block) beyond the task table"; break;
-    case kFatalNotResident: what = "HoldPage: page not resident"; break;
-    case kFatalNotCovered:  what = "HoldPage: range never fetched"; break;
-    case kFatalUnbound:     what = "vector used before Init()"; break;
-    case kFatalSetFull:     what = "AllocatePage: set full"; break;
-    case kFatalFlushSplit:  what = "flush range needs more records"; break;
+/** Name of a fatal code, for the report.
+ *  @param code slot 0 of the fatal channel
+ *  @return a short description, "unknown" for a code this build does not know */
+inline const char *FatalWhat(unsigned long long code) {
+  switch (code) {
+    case kFatalInitBlock:   return "Init(block) beyond the task table";
+    case kFatalNotResident: return "HoldPage: page not resident";
+    case kFatalNotCovered:  return "HoldPage: range never fetched";
+    case kFatalUnbound:     return "vector used before Init()";
+    case kFatalSetFull:     return "AllocatePage: set full";
+    case kFatalFlushSplit:  return "flush range needs more records";
     case kFatalGetFailed:
-      what = "fetch returned an error; its pages were left EMPTY "
+      return "fetch returned an error; its pages were left EMPTY "
              "(a generational get names a generation the writer has "
              "not published)";
-      break;
-    default: break;
+    default: return "unknown";
   }
-  char buf[256];
-  std::snprintf(buf, sizeof(buf),
-                "[gpu_vector] DEVICE FATAL %llu (%s): a1=%llu a2=%llu a3=%llu "
-                "block=%llu", f[0], what, f[1], f[2], f[3], f[4]);
-  return std::string(buf);
+}
+
+/** Format the eight fatal slots. Plain snprintf into the caller's buffer, so
+ *  the abort handler below can use it too.
+ *  @param f   the slots (host-readable)
+ *  @param buf output
+ *  @param n   bytes in buf
+ *  @return bytes written, 0 when nothing was latched */
+inline int FatalFormat(const unsigned long long *f, char *buf, size_t n) {
+  if (f == nullptr || f[0] == kFatalNone) return 0;
+  int w = std::snprintf(
+      buf, n, "[gpu_vector] DEVICE FATAL %llu (%s): a1=%llu a2=%llu a3=%llu "
+      "block=%llu\n", f[0], FatalWhat(f[0]), f[1], f[2], f[3], f[4]);
+  if (w > 0 && f[0] == kFatalSetFull && static_cast<size_t>(w) < n) {
+    // Slots 5-7 carry ReportSetFull's tallies, packed as documented there.
+    const unsigned long long t4 = f[5], t5 = f[6], t6 = f[7];
+    const int w2 = std::snprintf(
+        buf + w, n - static_cast<size_t>(w),
+        "[gpu_vector]   home set: %llu pinned, %llu in flight | all sets: "
+        "%llu resident, %llu pinned, %llu fetching, %llu flushing, %llu "
+        "empty | regions: %llu of %llu on free lists\n",
+        f[3], t4 & 0xFFFFull, t5 & 0xFFFFull, (t5 >> 16) & 0xFFFFull,
+        (t4 >> 16) & 0xFFFFull, (t4 >> 32) & 0xFFFFull, (t5 >> 32) & 0xFFFFull,
+        t6 & 0xFFFFFFFFull, t6 >> 32);
+    if (w2 > 0) w += w2;
+  }
+  return w < 0 ? 0 : (w > static_cast<int>(n) ? static_cast<int>(n) : w);
+}
+
+/**
+ * The HOST-READABLE copy of the fatal channel.
+ *
+ * Under SYCL the latch itself is device memory (see FatalSlots) and the
+ * device mirrors each note here with plain stores; elsewhere this IS the
+ * latch. On Level Zero a device trap does not return to the caller -- the
+ * driver aborts the process -- so the only way the note reaches a human is
+ * a SIGABRT handler that prints this buffer on the way down, installed on
+ * first use. Without it a trap reads as an unexplained AtomicAccessViolation
+ * or a "fault at 0x0", which is what every FATAL on Aurora looked like.
+ */
+inline unsigned long long *FatalMirror() {
+#if CTP_ENABLE_GPU
+  static unsigned long long *mirror = [] {
+#if CTP_ENABLE_SYCL
+    auto *p = ctp::GpuApi::MallocHost<unsigned long long>(
+        8 * sizeof(unsigned long long));
+    if (p != nullptr) std::memset(p, 0, 8 * sizeof(unsigned long long));
+#else
+    unsigned long long *p = FatalSlots();
+#endif
+    struct Reporter {
+      static void OnAbort(int sig) {
+        char buf[512];
+        const int w = FatalFormat(FatalMirror(), buf, sizeof(buf));
+        if (w > 0) {
+#if defined(_WIN32)
+          const int r = ::_write(2, buf, static_cast<unsigned>(w));
+#else
+          const ssize_t r = ::write(2, buf, static_cast<size_t>(w));
+#endif
+          (void)r;
+        }
+        std::signal(sig, SIG_DFL);
+        std::raise(sig);
+      }
+    };
+    // SIGABRT ONLY. The Level Zero driver owns SIGSEGV: a host access to a
+    // shared-USM page the device holds is a fault the driver's handler
+    // resolves by migrating the page back. Taking SIGSEGV here killed
+    // lammps_md three seconds in, on its fatal-channel poller's first read
+    // after a kernel had pulled the page to the device.
+    std::signal(SIGABRT, &Reporter::OnAbort);
+    return p;
+  }();
+  return mirror;
+#else
+  return nullptr;
+#endif
+}
+
+/** Human-readable form of whatever the device latched, or "" if nothing. */
+inline std::string FatalReport() {
+  char buf[512];
+  const int w = FatalFormat(FatalMirror(), buf, sizeof(buf));
+  if (w <= 0) return std::string();
+  std::string s(buf, static_cast<size_t>(w));
+  while (!s.empty() && s.back() == '\n') s.pop_back();
+  return s;
 }
 
 template <typename T>
@@ -144,6 +300,13 @@ class Vector {
     clio::run::u64 gen_busy = 0;     // generational demand: CAS lost to peer
     clio::run::u64 flush_skipped = 0;  // flush pages not resident: DROPPED
     clio::run::u64 put_errors = 0;   // writebacks that returned non-zero
+    clio::run::u64 alloc_waits = 0;  // page-cache backoff retries (FaultPage)
+    clio::run::u64 allocs = 0;       // pages Allocate claimed without a read
+    clio::run::u64 writebacks = 0;   // dirty frames written back so they could be evicted
+    // GV_COMM_TIMING only (zero otherwise): GPU cycles in the Fetch, Hold
+    // and Flush calls, a benchmark's busy segments, and the call counts.
+    clio::run::u64 fetch_cyc = 0, hold_cyc = 0, flush_cyc = 0, busy_cyc = 0;
+    clio::run::u64 fetch_calls = 0, hold_calls = 0, flush_calls = 0;
   };
 
   /**
@@ -172,14 +335,30 @@ class Vector {
    * correctness rule (invalidate after a resort, borrow a peer's frame,
    * publish before another block can read) existed to paper over that.
    */
+  /**
+   * Storage pool when the caller names none: CLIO_GV_STORAGE_POOL="maj.min"
+   * (e.g. "563.0", the CTE cache module, for tag-scoped node-local caching of
+   * remote-owned pages), else the CTE core.
+   */
+  static clio::run::PoolId DefaultStoragePool() {
+    const char *e = std::getenv("CLIO_GV_STORAGE_POOL");
+    if (e != nullptr && *e) {
+      unsigned maj = 0, min = 0;
+      if (std::sscanf(e, "%u.%u", &maj, &min) == 2) {
+        return clio::run::PoolId(maj, min);
+      }
+    }
+    return clio::cte::core::kCtePoolId;
+  }
+
   Vector(const std::string &tag_name, const std::vector<int> &gpu_ids,
          clio::run::u64 page_bytes, clio::run::u32 nblocks,
          clio::run::u32 set_size, clio::run::u64 num_elems,
          clio::run::PoolId storage_pool_id = clio::run::PoolId::GetNull(),
          int compress_lib = 0, int compress_preset = 1,
          clio::run::u32 nsets = 0, clio::run::u32 capacity_pages = 0)
-      : storage_pool_id_(storage_pool_id.IsNull() ? clio::cte::core::kCtePoolId
-                                                  : storage_pool_id),
+      : storage_pool_id_(!storage_pool_id.IsNull() ? storage_pool_id
+                                                   : DefaultStoragePool()),
         compress_lib_(compress_lib),
         compress_preset_(compress_preset),
         page_bytes_(page_bytes),
@@ -199,7 +378,9 @@ class Vector {
     if (page_bytes_ == 0 || nblocks_ == 0 || set_size_ == 0 || nsets_ == 0) {
       throw std::runtime_error("gpu_vector: zero page size / blocks / sets");
     }
-    clio::cte::core::Client cte(clio::cte::core::kCtePoolId);
+    // Through the storage pool: with the CTE cache module in front, the
+    // name is resolved from this node's tag cache when it already knows it.
+    clio::cte::core::Client cte(storage_pool_id_);
     auto tag = cte.AsyncGetOrCreateTag(tag_name);
     tag.Wait();
     if (tag->GetReturnCode() != 0) {
@@ -245,8 +426,19 @@ class Vector {
    * The returned handle is CTE-ONLY: it builds NO device views (those cost
    * a full page-cache allocation in VRAM). Host Download/Preload work; a
    * kernel that must read the snapshot binds its own Vector to `new_name`.
+   *
+   * @param new_name tag of the copy
+   * @param sync     false (default): lazy copy-on-write, as above. true:
+   *                 FULLY SYNCHRONOUS -- every page of the copy is
+   *                 materialised (MaterializeAll) before Copy returns, so the
+   *                 copy holds real bytes equal to the source at this call
+   *                 and later writes to the source cannot leak into it.
+   * @return the copy's handle
+   * @throws std::runtime_error if any step, including a sync
+   *         materialisation, fails
    */
-  std::unique_ptr<Vector<T>> Copy(const std::string &new_name) {
+  std::unique_ptr<Vector<T>> Copy(const std::string &new_name,
+                                  bool sync = false) {
     using clio::cte::core::Context;
     if (tag_name_.size() >= Context::kFaultParamsSize) {
       // The registration would be silently truncated at fault time and the
@@ -263,8 +455,10 @@ class Vector {
           clio::cte::checkpoint::kCheckpointPoolId, storage_pool_id_);
       clio::cte::checkpoint::CheckpointConfig params;
       params.next_pool_id_ = storage_pool_id_;
+      // Dynamic, not Local: a fault on a copy resolves on the container that
+      // owns the blob, so the checkpoint pool must exist on every node.
       auto cf = ckpt.AsyncCreateCheckpoint(
-          clio::run::PoolQuery::Local(),
+          clio::run::PoolQuery::Dynamic(),
           clio::cte::checkpoint::kCheckpointPoolName,
           clio::cte::checkpoint::kCheckpointPoolId, params);
       cf.Wait();
@@ -286,49 +480,208 @@ class Vector {
                                  new_name);
       }
     }
-    return std::unique_ptr<Vector<T>>(new Vector<T>(
+    std::unique_ptr<Vector<T>> out(new Vector<T>(
         new_name, std::vector<int>{}, page_bytes_, nblocks_, set_size_,
         num_elems_, storage_pool_id_, compress_lib_, compress_preset_,
         nsets_, capacity_pages_));
+    // MaterializeAll needs the SOURCE name: the fault it issues carries the
+    // source in fault_params_, exactly as the core's own internal fault does.
+    out->ckpt_src_ = tag_name_;
+    if (sync) {
+      const clio::run::u64 np = out->NumPages();
+      if (out->MaterializeAll() != np) {
+        throw std::runtime_error("gpu_vector: synchronous copy " + new_name +
+                                 " failed to materialise");
+      }
+    }
+    return out;
   }
 
   /**
-   * HOST-SIDE writeback of every resident frame's valid elements, on every
-   * GPU this vector has views for. There is no dirty bit (write-site publish
-   * is the kernel-side contract), so this publishes ALL resident valid
-   * ranges: for pages the kernels already flushed the put is byte-identical,
-   * and for anything they had not yet published this is what makes the CTE
-   * current. No-op with no device views or an empty cache.
+   * Force a lazy Copy() to become REAL BYTES, server-side.
+   *
+   * Copy() is copy-on-write: it registers a fault handler and duplicates
+   * nothing, so an untouched checkpoint occupies zero storage. That is the
+   * point of it -- and it makes an untouched checkpoint useless as a
+   * checkpoint, because the handler materialises from the SOURCE AT FAULT
+   * TIME. A workload that keeps mutating the source (Gray-Scott overwrites
+   * each region pair every second step) therefore has a window: materialise
+   * inside it and the snapshot is the state at Copy(); materialise after it
+   * and the snapshot silently holds LATER bytes.
+   *
+   * The mechanism is the put-side materialise-only fault: a put of size 0
+   * with a null pointer finds no blob under the copy tag, dispatches the
+   * fault, and the checkpoint chimod reads the whole source blob and writes
+   * it into the copy. NO BYTES CROSS TO THE HOST -- the copy happens entirely
+   * inside the runtime, which is why this is not simply "read the checkpoint
+   * back".
+   *
+   * Submitted in flights rather than one at a time: each materialisation is a
+   * whole-blob read plus a whole-blob write, and serialising a 1 GiB
+   * checkpoint's worth of them at ~1 ms each is minutes of nothing.
+   *
+   * @return pages materialised (0 on the first failure, which is reported).
    */
-  void FlushResidentToCte() {
+  clio::run::u64 MaterializeAll(clio::run::u32 inflight = 32) {
+    if (ckpt_src_.empty()) {
+      std::fprintf(stderr, "gpu_vector: MaterializeAll on '%s', which is not "
+                   "a Copy() -- there is no source to materialise from\n",
+                   tag_name_.c_str());
+      return 0;
+    }
+    // THE MATERIALISE-ONLY FAULT, ISSUED DIRECTLY.
+    //
+    // NOT a size-0 PutBlob: PutBlobImpl rejects size == 0 with rc=2 long
+    // before it reaches the fault dispatch, so the "put-side materialise-only
+    // fault" the chimod documents is generated INTERNALLY by the core and is
+    // not reachable from a client put. And not an ordinary Get either -- that
+    // materialises, but only by dragging every byte back to the host, which
+    // for a 32 GiB checkpoint stream is 32 GiB of pointless PCIe traffic.
+    //
+    // So we send the core's own fault task: a GetBlobTask addressed to the
+    // CHECKPOINT POOL with size 0 and a null destination, carrying the source
+    // tag in fault_params_. The handler reads the whole source blob and puts
+    // it into the copy, entirely inside the runtime.
+    auto *ipc = CLIO_CPU_IPC;
+    const clio::run::u64 np = NumPages();
+    std::vector<clio::run::Future<clio::cte::core::GetBlobTask>> futs;
+    futs.reserve(inflight);
+    clio::run::u64 done = 0;
+    auto reap = [&]() -> bool {
+      for (auto &f : futs) {
+        f.Wait();
+        if (f->GetReturnCode() != 0) {
+          std::fprintf(stderr,
+                       "gpu_vector: MaterializeAll page %llu rc=%d (tag '%s' "
+                       "src '%s')\n", (unsigned long long)done,
+                       f->GetReturnCode(), tag_name_.c_str(),
+                       ckpt_src_.c_str());
+          return false;
+        }
+        ++done;
+      }
+      futs.clear();
+      return true;
+    };
+    for (clio::run::u64 pg = 0; pg < np; ++pg) {
+      clio::cte::core::Context ctx = PageContext();
+      // The handler decodes fault_params_ as the source tag NAME.
+      std::snprintf(ctx.fault_params_,
+                    clio::cte::core::Context::kFaultParamsSize, "%s",
+                    ckpt_src_.c_str());
+      // The name goes on the wire decoded; the raw-int32 flag would make the
+      // handler decode a decimal name a second time.
+      ctx.op_flags_ &= ~clio::cte::core::Context::kBlobNameRawInt32;
+      auto sub = ipc->NewTask<clio::cte::core::GetBlobTask>(
+          clio::run::CreateTaskId(),
+          clio::cte::checkpoint::kCheckpointPoolId,
+          clio::run::PoolQuery::Local(), tag_id_, PageName(pg), 0, 0, 0,
+          ctp::ipc::ShmPtr<>::GetNull(), ctx);
+      futs.push_back(ipc->Send(sub));
+      if (futs.size() >= inflight && !reap()) return 0;
+    }
+    if (!reap()) return 0;
+    return done;
+  }
+
+  /**
+   * Score every page of this vector, for a caller draining a checkpoint out
+   * of the fast tier. Same batched rescore path as the prefetcher.
+   *
+   * A materialised checkpoint lands at blob score 1.0 (the fault handler puts
+   * at -1.0, which PutBlobImpl resolves to 1.0 for a new blob), so it
+   * outranks the live data on every tier and fills the fast one with bytes
+   * nobody will read again. Draining it is not an optimisation -- it is the
+   * difference between a fast tier holding the working set and a fast tier
+   * holding cold history.
+   */
+  void ScoreAllPages(float score) {
+    const clio::run::u64 np = NumPages();
+    std::vector<PrefetchHint> hints;
+    hints.reserve(static_cast<size_t>(np));
+    for (clio::run::u64 pg = 0; pg < np; ++pg) {
+      hints.push_back(PrefetchHint{pg, score});
+    }
+    PrefetchNow(hints);
+  }
+
+  /**
+   * HOST-SIDE writeback of the DIRTY resident frames' valid elements, on
+   * every GPU this vector has views for: frames a device write hold touched
+   * since they were filled or last covered by a flush (VecHeader::dirty_).
+   * Clean frames hold bytes the store already has and are skipped. No-op
+   * with no device views or an empty cache.
+   * @param inflight puts kept outstanding at once (one staging buffer each)
+   */
+  void FlushResidentToCte(clio::run::u32 inflight = 32) {
+    last_flush_pages_ = 0;
+    last_flush_bytes_ = 0;
 #if CTP_ENABLE_GPU
+    // ONLY DIRTY FRAMES. A frame no device write touched since it was filled
+    // holds bytes the store already has; rewriting it made the checkpoint's
+    // bytes and time scale with the cache size (a 16 GB cache of clean
+    // kmeans points was rewritten in full before every Copy).
+    // PIPELINED: `inflight` puts outstanding, one staging buffer each,
+    // instead of copy + put + wait per page.
     clio::cte::core::Client core(storage_pool_id_);
-    std::vector<char> buf(static_cast<size_t>(page_bytes_));
+    std::vector<std::vector<char>> bufs(
+        inflight, std::vector<char>(static_cast<size_t>(page_bytes_)));
+    std::vector<clio::run::Future<clio::cte::core::PutBlobTask>> futs;
+    futs.reserve(inflight);
+    auto reap = [&]() {
+      for (auto &f : futs) f.Wait();
+      futs.clear();
+    };
+    const clio::run::u64 nslots =
+        static_cast<clio::run::u64>(nsets_) * set_size_;
     for (auto &kv : devs_) {
       const std::vector<Page> tbl = ReadTable(kv.first);
-      for (const Page &p : tbl) {
+      std::vector<clio::run::u32> dirty(static_cast<size_t>(nslots), 1u);
+      if (kv.second.hdr.dirty_ != nullptr) {
+        ctp::GpuApi::Memcpy(reinterpret_cast<char *>(dirty.data()),
+                            reinterpret_cast<const char *>(kv.second.hdr.dirty_),
+                            static_cast<size_t>(nslots * sizeof(clio::run::u32)));
+      }
+      for (size_t i = 0; i < tbl.size(); ++i) {
+        const Page &p = tbl[i];
         if (p.page_num == kNoPage || p.data == nullptr) continue;
         if (p.valid_hi <= p.valid_lo) continue;
+        if (i < dirty.size() && dirty[i] == 0u) continue;
+        if (futs.size() == inflight) reap();
         const clio::run::u64 lo_b =
             static_cast<clio::run::u64>(p.valid_lo) * sizeof(T);
         const clio::run::u64 hi_b =
             static_cast<clio::run::u64>(p.valid_hi) * sizeof(T);
-        ctp::GpuApi::Memcpy(buf.data(),
-                            static_cast<const char *>(p.data) + lo_b,
+        char *buf = bufs[futs.size()].data();
+        ctp::GpuApi::Memcpy(buf, static_cast<const char *>(p.data) + lo_b,
                             static_cast<size_t>(hi_b - lo_b));
-        auto f = core.AsyncPutBlob(tag_id_, PageName(p.page_num), lo_b,
-                                   hi_b - lo_b, buf.data(), 0.5f,
-                                   PageContext(), 0u,
-                                   clio::run::PoolQuery::Dynamic());
-        f.Wait();
+        futs.push_back(core.AsyncPutBlob(tag_id_, PageName(p.page_num), lo_b,
+                                         hi_b - lo_b, buf, 0.5f,
+                                         PageContext(), 0u,
+                                         clio::run::PoolQuery::Dynamic()));
+        ++last_flush_pages_;
+        last_flush_bytes_ += hi_b - lo_b;
       }
+      reap();
     }
+#else
+    (void) inflight;
 #endif
   }
+
+  /** Frames written back by the last FlushResidentToCte (dirty ones only). */
+  clio::run::u64 LastFlushPages() const { return last_flush_pages_; }
+  /** Bytes written back by the last FlushResidentToCte. */
+  clio::run::u64 LastFlushBytes() const { return last_flush_bytes_; }
 
   clio::cte::core::TagId TagId() const { return tag_id_; }
   clio::run::u64 PageBytes() const { return page_bytes_; }
   clio::run::u64 ElemsPerPage() const { return page_bytes_ / sizeof(T); }
+  /** CUDA blocks the vector was built for: a kernel over its device view
+   *  launches exactly this many (block b uses block b's task set). */
+  clio::run::u32 NumBlocks() const { return nblocks_; }
+  /** Page-sized device frames the cache owns (what it costs in HBM). */
+  clio::run::u32 CapacityPages() const { return capacity_pages_; }
   clio::run::u64 NumPages() const {
     const clio::run::u64 epp = ElemsPerPage();
     return (num_elems_ + epp - 1) / epp;
@@ -338,7 +691,7 @@ class Vector {
 #if CTP_ENABLE_GPU
     for (auto &kv : devs_) {
       if (kv.second.stats != nullptr) continue;
-      const size_t bytes = 9 * sizeof(unsigned long long);
+      const size_t bytes = 19 * sizeof(unsigned long long);
       auto *c = reinterpret_cast<unsigned long long *>(
           ctp::GpuApi::Malloc<char>(bytes));
       if (c == nullptr) throw std::runtime_error("gpu_vector: stats alloc failed");
@@ -356,6 +709,10 @@ class Vector {
       kv.second.hdr.stat_gen_busy_ = c + 7;    // stale but CAS lost
       // Pages a flush could not FIND -- silently dropped writebacks.
       kv.second.hdr.stat_flush_skipped_ = c + 8;
+      kv.second.hdr.stat_alloc_waits_ = c + 9;
+      kv.second.hdr.stat_cyc_ = c + 10;        // 7 slots: see VecHeader
+      kv.second.hdr.stat_allocs_ = c + 17;     // after the timing slots
+      kv.second.hdr.stat_writebacks_ = c + 18;
       PublishHeader(kv.second);
     }
 #endif
@@ -428,6 +785,9 @@ class Vector {
     // lists as they were would strand the storage those slots held: the tags
     // say the cache is empty and the allocator says it has nothing to give.
     RebuildFreeLists(it->second, 0);
+    ctp::GpuApi::Memset(
+        reinterpret_cast<char *>(DirtyBase(it->second, nslots)), 0,
+        static_cast<size_t>(nslots * sizeof(clio::run::u32)));
 #else
     (void) gpu_id;
 #endif
@@ -496,6 +856,8 @@ class Vector {
     for (auto &kv : devs_) {
       if (kv.second.stats == nullptr) continue;
       ctp::GpuApi::Memset(kv.second.stats, 0, 5 * sizeof(unsigned long long));
+      // allocs (slot 17) pairs with faults: a read and a skipped read.
+      ctp::GpuApi::Memset(kv.second.stats + 17, 0, 2 * sizeof(unsigned long long));  // + writebacks (18)
     }
 #endif
   }
@@ -546,9 +908,17 @@ class Vector {
 #if CTP_ENABLE_GPU
     auto it = devs_.find(gpu_id);
     if (it == devs_.end() || it->second.stats == nullptr) return s;
-    unsigned long long h[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+    unsigned long long h[19] = {};
     ctp::GpuApi::Memcpy(h, it->second.stats, sizeof(h));
+    s.fetch_cyc = h[10];
+    s.hold_cyc = h[11];
+    s.flush_cyc = h[12];
+    s.busy_cyc = h[13];
+    s.fetch_calls = h[14];
+    s.hold_calls = h[15];
+    s.flush_calls = h[16];
     s.faults = h[0];
+    s.alloc_waits = h[9];
     s.puts = h[1];
     s.evicts = h[2];
     s.get_errors = h[3];
@@ -557,13 +927,308 @@ class Vector {
     s.gen_busy = h[7];
     s.flush_skipped = h[8];
     s.put_errors = h[4];
+    s.allocs = h[17];
+    s.writebacks = h[18];
 #else
     (void) gpu_id;
 #endif
     return s;
   }
 
+  // =====================================================================
+  // PREFETCHING -- see prefetch.h for what this is and is not.
+  //
+  // A prefetcher turns "where is this block in its computation" into "which
+  // pages should be hot"; this half turns those hints into CTE bulk rescores
+  // and keeps them off the driver's critical path. The two are separate
+  // because the first is workload knowledge and the second is plumbing that
+  // no workload should have to reimplement.
+  // =====================================================================
+
+  /**
+   * Attach a prefetcher. Several may be registered; their hints merge into
+   * one sink for the round and LAST WRITER WINS for a repeated page -- which
+   * is what lets a generic stride prefetcher run underneath a
+   * workload-specific one as a floor.
+   *
+   * EXPLICIT, NEVER AUTOMATIC. A prefetcher that fired by default would
+   * change the tier placement of every existing benchmark, including the ones
+   * whose published numbers assume the frecency organizer is the only thing
+   * moving blobs.
+   */
+  void RegisterPrefetcher(std::shared_ptr<Prefetcher> p) {
+    if (p != nullptr) prefetchers_.push_back(std::move(p));
+  }
+
+  void SetPrefetchPolicy(const PrefetchPolicy &p) { prefetch_policy_ = p; }
+  const PrefetchPolicy &GetPrefetchPolicy() const { return prefetch_policy_; }
+  bool HasPrefetchers() const { return !prefetchers_.empty(); }
+
+  /** Names of the registered prefetchers, for the report line. */
+  std::string PrefetcherNames() const {
+    std::string s;
+    for (const auto &p : prefetchers_) {
+      if (!s.empty()) s += "+";
+      s += p->Name();
+    }
+    return s.empty() ? std::string("none") : s;
+  }
+
+  PrefetchStats ReadPrefetchStats() const { return prefetch_stats_; }
+  void ResetPrefetchStats() { prefetch_stats_ = PrefetchStats(); }
+
+  /**
+   * Forget what has already been sent.
+   *
+   * CALL THIS PER RUN, NOT PER PHASE, and in particular NOT when the meaning
+   * of a page changes.
+   *
+   * `last_sent_` is a model of ONE thing: the score the CTE currently holds
+   * for a page. That model survives a change of meaning perfectly well -- a
+   * page's score is whatever was last set on it, whether the workload now
+   * thinks of it as an input or an output. Dedup suppresses a hint only when
+   * the DESIRED score equals the last one SENT, which is exactly the case
+   * where the CTE would compare the two and do nothing anyway.
+   *
+   * Clearing it per step (Gray-Scott's region swap) looked like the cautious
+   * choice and was a real defect: it threw away accurate state, so every page
+   * was re-sent its current score at the top of each step -- a rescore the
+   * CTE no-ops -- and the promotion/demotion tally was computed against an
+   * assumed prior instead of the known one. That is how a run reported
+   * promote=896 against demote=32512 while sending 66048 records.
+   *
+   * It exists for the start of a RUN, where the vector may have been rebuilt
+   * or the tiers reset underneath the map.
+   */
+  void ResetPrefetchHistory() { last_sent_.clear(); }
+
+  /** Tell every prefetcher a new kernel run is starting. */
+  void PrefetchRunBegin() {
+    for (auto &p : prefetchers_) p->OnRunBegin();
+  }
+
+  /**
+   * The observer to install on a yieldable driver:
+   *
+   *     drv.SetYieldObserver(vec.YieldObserver());
+   *
+   * Captures `this`; the vector must outlive the driver, which it does in
+   * every sane arrangement (the vector is what the kernel is paging against).
+   */
+  clio::run::gpu::YieldObserverFn YieldObserver() {
+    return [this](const clio::run::gpu::YieldBlockState *states,
+                  clio::run::u32 nblocks, clio::run::u32 round) {
+      OnYieldRound(states, nblocks, round);
+    };
+  }
+
+  /**
+   * Run every prefetcher over one round's block states and submit whatever
+   * survives dedup. Called from the driver's post-round gap: no kernel is
+   * resident, so the rescores this issues overlap the NEXT round's kernel.
+   */
+  void OnYieldRound(const clio::run::gpu::YieldBlockState *states,
+                    clio::run::u32 nblocks, clio::run::u32 round) {
+    if (prefetchers_.empty() || states == nullptr) return;
+    // Reap LAST round's submissions first. Never wait on them: a rescore that
+    // has not landed yet is still useful, and one that failed is counted, not
+    // retried. Waiting here would put tier migration back on the critical
+    // path, which is the whole thing this exists to take it off.
+    ReapPrefetchFutures(/*block=*/false);
+
+    sink_.Clear();
+    for (clio::run::u32 b = 0; b < nblocks; ++b) {
+      YieldEvent ev;
+      ev.block_ = b;
+      ev.round_ = round;
+      ev.status_ = states[b].status_;
+      ev.resume_point_ = states[b].resume_point_;
+      ev.wait_tag_ = states[b].wait_tag_;
+      ev.cursor_ = states[b].cursor_;
+      ev.cursor_aux_ = states[b].cursor_aux_;
+      for (auto &p : prefetchers_) p->OnYield(ev, sink_);
+    }
+    for (auto &p : prefetchers_) p->OnRoundEnd(round, sink_);
+
+    prefetch_stats_.hints_ += sink_.hints().size();
+    prefetch_stats_.dropped_ += sink_.dropped();
+    SubmitHints(sink_.hints());
+  }
+
+  /**
+   * Submit hints directly, without a Prefetcher or the yield observer.
+   *
+   * For an organizer that runs at a PHASE boundary rather than at a yield: a
+   * batch loop that knows the next batch's page set exactly, one batch ahead,
+   * has nothing to infer from the coroutine cursor and no reason to wait for a
+   * round to end. It just says what it wants moved.
+   *
+   * Same dedup, batching and non-blocking submission as the yield path, so a
+   * page already at the requested score costs a map lookup and nothing else.
+   */
+  void PrefetchNow(const std::vector<PrefetchHint> &hints) {
+    if (hints.empty()) return;
+    ReapPrefetchFutures(/*block=*/false);
+    prefetch_stats_.hints_ += hints.size();
+    SubmitHints(hints);
+  }
+
+  /** Wait for every outstanding rescore. For the end of a run, where the
+   *  question "did the prefetcher's work actually land" has to be answerable
+   *  before the tier occupancy is read. */
+  void DrainPrefetch() { ReapPrefetchFutures(/*block=*/true); }
+
  private:
+  /**
+   * Dedup, batch, submit.
+   *
+   * DEDUP IS NOT AN OPTIMIZATION HERE, it is what makes the whole thing
+   * affordable. A block parks several times inside one Gray-Scott
+   * z-iteration, so without it the same eight promotions are re-sent on every
+   * one of those rounds and the CTE pays a task submission to discover each
+   * time that the score has not moved. The threshold mirrors the CTE's own
+   * score_difference_threshold, which is what it would compare against
+   * anyway.
+   */
+  void SubmitHints(const std::vector<PrefetchHint> &hints) {
+    if (hints.empty()) return;
+    // Collapse duplicates WITHIN the round first -- several blocks hint the
+    // same halo plane, and last writer wins by construction.
+    round_merge_.clear();
+    for (const auto &h : hints) round_merge_[h.page_] = h.score_;
+
+    auto *core = PrefetchClient();
+    if (core == nullptr) return;
+    clio::run::shared_ptr<clio::cte::core::PodMultiScoreTask> batch;
+    clio::run::u32 in_batch = 0;
+    for (const auto &kv : round_merge_) {
+      const clio::run::u64 pg = kv.first;
+      const float score = kv.second;
+      auto seen = last_sent_.find(pg);
+      if (seen != last_sent_.end() &&
+          std::fabs(seen->second - score) < prefetch_policy_.epsilon_) {
+        ++prefetch_stats_.deduped_;
+        continue;
+      }
+      // A page nobody has hinted about yet sits at the score the vector WROTE
+      // it at -- kVectorBlobScore -- not at kDefaultScore, which is a frame's
+      // eviction rank inside the GPU cache and has nothing to do with the
+      // tier the blob is in. Using the latter made every first-time hot hint
+      // (1.0 against a phantom prior of 1.0) count as neither a promotion nor
+      // a demotion, and the run reported 224 promotions against 3968
+      // demotions while visibly filling the HBM tier from empty.
+      const float prev = (seen == last_sent_.end()) ? kVectorBlobScore
+                                                    : seen->second;
+      if (score > prev) {
+        ++prefetch_stats_.promotions_;
+      } else if (score < prev) {
+        ++prefetch_stats_.demotions_;
+      }
+      last_sent_[pg] = score;
+
+      if (!batch) {
+        // Dynamic routing: in a multi-node pool the blob's metadata lives on
+        // its hashed owner, and a hint about a neighbour's halo plane is a
+        // legitimate thing to emit. (PodMultiScore itself dispatches its
+        // per-record PodReorganizeBlob locally, so a cross-node hint is
+        // currently a no-op rather than a fault -- which is the right failure
+        // mode for a hint, and is why this is not gated on node count.)
+        // kCtePrefetchHint: this batch's completion latency is off everyone's
+        // critical path -- nothing waits on a rescore, by construction. The
+        // flag is what lets the runtime treat it as background work and keep
+        // a latency-critical demand fault from queueing behind it.
+        batch = core->template NewPodBatch<clio::cte::core::PodMultiScoreTask>(
+            tag_id_, PageContext(), clio::cte::core::kCtePrefetchHint,
+            clio::run::PoolQuery::Dynamic());
+        in_batch = 0;
+      }
+      // Only blob_name_ and score_ carry meaning for a rescore; size 0 and a
+      // null pointer are what the handler expects for the rest.
+      batch.get()->Add(PageName(pg).c_str(), 0, 0, ctp::ipc::ShmPtr<>(), score);
+      ++in_batch;
+      ++prefetch_stats_.sent_;
+      if (in_batch >= clio::cte::core::kPodMultiMax) {
+        pending_.push_back(core->AsyncPodBatch(batch));
+        ++prefetch_stats_.batches_;
+        batch = {};
+      }
+    }
+    if (batch && in_batch > 0) {
+      pending_.push_back(core->AsyncPodBatch(batch));
+      ++prefetch_stats_.batches_;
+    }
+  }
+
+  /** Retire completed rescore batches. Non-blocking unless asked. */
+  void ReapPrefetchFutures(bool block) {
+    size_t keep = 0;
+    for (size_t i = 0; i < pending_.size(); ++i) {
+      auto &f = pending_[i];
+      if (f.IsNull()) continue;
+      if (block) {
+        f.Wait();
+      } else if (!f.IsComplete()) {
+        // GUARDED, because keep == i on every element until the first one is
+        // dropped -- which is the common case, since most rounds retire
+        // nothing. `pending_[i] = std::move(pending_[i])` is a self-move, and
+        // whether that is harmless depends on Future's move-assignment
+        // rather than on anything visible here. Not worth relying on.
+        if (keep != i) pending_[keep] = std::move(f);
+        ++keep;
+        continue;
+      }
+      // PER-RECORD, and split by reason. A batch's return code is only its
+      // FIRST failure, and the failures are not all the same kind of event:
+      // rc 3 is "blob not found", which for a hint is entirely expected --
+      // the lookahead runs past the end of what has been written, and on the
+      // first step of Gray-Scott the two output regions have no blobs at all
+      // because the seed writes only u and v. Folding those into an error
+      // count made a healthy run report 1008 errors and look broken. A real
+      // refusal (a score out of range, a blob the CTE would not move) is a
+      // different thing and stays counted as one.
+      const clio::run::u32 n =
+          std::min(f->count_, clio::cte::core::kPodMultiMax);
+      for (clio::run::u32 r = 0; r < n; ++r) {
+        const clio::run::u32 rc = f->reqs_[r].rc_;
+        if (rc == 0) continue;
+        if (rc == 3) {
+          ++prefetch_stats_.not_found_;
+        } else {
+          ++prefetch_stats_.errors_;
+        }
+      }
+    }
+    pending_.resize(block ? 0 : keep);
+  }
+
+  /** One long-lived client for rescores, created on first use: the vector is
+   *  often constructed before a caller decides to prefetch at all. */
+  clio::cte::core::Client *PrefetchClient() {
+    if (!prefetch_core_) {
+      prefetch_core_ =
+          std::make_unique<clio::cte::core::Client>(storage_pool_id_);
+    }
+    return prefetch_core_.get();
+  }
+
+  std::vector<std::shared_ptr<Prefetcher>> prefetchers_;
+  PrefetchPolicy prefetch_policy_;
+  PrefetchStats prefetch_stats_;
+  PrefetchSink sink_;
+  /** page -> score last actually submitted. The dedup filter. */
+  std::map<clio::run::u64, float> last_sent_;
+  /** page -> score, within one round. Reused to avoid a per-round alloc. */
+  std::map<clio::run::u64, float> round_merge_;
+  std::vector<clio::run::Future<clio::cte::core::PodMultiScoreTask>> pending_;
+  std::unique_ptr<clio::cte::core::Client> prefetch_core_;
+  /** Source tag name when this Vector is a Copy(); empty otherwise. Only
+   *  MaterializeAll needs it, and only a copy can be materialised. */
+  std::string ckpt_src_;
+  /** What the last FlushResidentToCte wrote back (see LastFlushPages). */
+  clio::run::u64 last_flush_pages_ = 0;
+  clio::run::u64 last_flush_bytes_ = 0;
+
+
   struct DevState {
     int gpu_id = 0;
     DeviceVector<T> view;
@@ -606,12 +1271,15 @@ class Vector {
     st.pages_alloc = ipc->AllocateAndRegisterGpuBackend(
         gpu_id, clio::run::gpu::IpcManager::MemKind::kDeviceMem,
         static_cast<size_t>(nregions) * page_bytes_, &st.pages_base);
+    // The table and, right after it, one dirty word per frame
+    // (VecHeader::dirty_).
     st.table_alloc = ipc->AllocateAndRegisterGpuBackend(
         gpu_id, clio::run::gpu::IpcManager::MemKind::kDeviceMem,
-        nslots * sizeof(Page), &st.table_base);
+        nslots * (sizeof(Page) + sizeof(clio::run::u32)), &st.table_base);
     st.tasks_alloc = ipc->AllocateAndRegisterGpuBackend(
         gpu_id, clio::run::gpu::IpcManager::MemKind::kDeviceMem,
         nblocks_ * kTaskSetBytes, &st.tasks_base);
+    RegisterTaskRegion(st.tasks_base, nblocks_ * kTaskSetBytes);
     st.btbl_alloc = ipc->AllocateAndRegisterGpuBackend(
         gpu_id, clio::run::gpu::IpcManager::MemKind::kDeviceMem,
         nblocks_ * sizeof(BlockTasks), &st.btbl_base);
@@ -646,6 +1314,7 @@ class Vector {
     InitTasks(st);
 
     st.hdr.pages_ = reinterpret_cast<Page *>(st.table_base);
+    st.hdr.dirty_ = DirtyBase(st, nslots);
     st.hdr.tasks_ = reinterpret_cast<BlockTasks *>(st.btbl_base);
     st.hdr.page_bytes_ = page_bytes_;
     st.hdr.elems_per_page_ = page_bytes_ / sizeof(T);
@@ -680,7 +1349,12 @@ class Vector {
     st.hdr.stat_gen_busy_ = nullptr;
     st.hdr.stat_flush_skipped_ = nullptr;
     st.hdr.stat_put_errors_ = nullptr;
+    st.hdr.stat_alloc_waits_ = nullptr;
+    st.hdr.stat_allocs_ = nullptr;
+    st.hdr.stat_writebacks_ = nullptr;
+    st.hdr.stat_cyc_ = nullptr;
     st.hdr.fatal_ = FatalSlots();
+    st.hdr.fatal_mirror_ = FatalMirror();
     PublishHeader(st);
     devs_[gpu_id] = st;
   }
@@ -819,6 +1493,19 @@ class Vector {
       p.fetching = 0;
     }
     UploadBytes(tbl.data(), st.table_base, nslots * sizeof(Page));
+    ctp::GpuApi::Memset(reinterpret_cast<char *>(DirtyBase(st, nslots)), 0,
+                        static_cast<size_t>(nslots * sizeof(clio::run::u32)));
+  }
+
+  /**
+   * The per-frame dirty words, stored right after the Page table.
+   * @param st     the device state
+   * @param nslots frames in the table
+   * @return device pointer to nslots u32 words
+   */
+  static clio::run::u32 *DirtyBase(const DevState &st, clio::run::u64 nslots) {
+    return reinterpret_cast<clio::run::u32 *>(
+        st.table_base + static_cast<size_t>(nslots) * sizeof(Page));
   }
 
   /**

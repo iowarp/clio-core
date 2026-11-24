@@ -55,11 +55,10 @@ struct LMCacheStoreTestAccess;
  */
 class LMCacheStore {
  public:
-  // Async GET/size operations submitted before the window is drained; it also
-  // gives the runtime's task batching (CLIO_BATCH_LANE/CLIO_CTE_BATCHING) a
-  // burst deep enough to actually merge. Puts no longer use a store window:
-  // they go through the CTE client's deferred-put registry (issue #862),
-  // which flow-controls on real shared-memory capacity.
+  // Async GET/size and vectored record-put operations submitted before the
+  // window is drained; it also gives the runtime's task batching
+  // (CLIO_BATCH_LANE/CLIO_CTE_BATCHING) a burst deep enough to actually
+  // merge. Plain byte puts are synchronous (Client::PutBlob).
   static constexpr std::size_t kDefaultMaxInflight = 256;
 
   /**
@@ -110,41 +109,33 @@ class LMCacheStore {
   bool PutBytes(const std::string &blob_name, std::string_view data);
 
   /**
-   * Store multiple opaque byte blobs through the CTE deferred-put pipeline.
-   *
-   * Every put is submitted via AsyncPutBlobDefer (issue #862); the CTE
-   * client's registry owns the futures, stages its own copy of the payload at
-   * submit (so caller buffers are free on return in every mode), batches puts
-   * into MultiPutBlob tasks, and self-throttles on shared-memory capacity.
-   * Puts stay deferred past the call; reads through this store are
-   * read-after-write consistent (served from the pending puts when needed).
+   * Store multiple opaque byte blobs, one synchronous Client::PutBlob each.
+   * Every put has landed when the call returns, so caller buffers are free
+   * and reads through this store see the writes.
    *
    * @param blob_names CTE blob names.
    * @param payloads Blob bytes to write, one per blob name.
    * @param max_inflight Unused for puts; retained for API compatibility.
-   * @return Per-blob ACCEPTED status. Completion failures are counted by
-   *     clio::cte::core::Client::DeferErrorCount and leave the blob absent.
+   * @return Per-blob commit status.
    */
   std::vector<bool> PutMany(const std::vector<std::string> &blob_names,
                             const std::vector<std::string> &payloads,
                             std::size_t max_inflight = kDefaultMaxInflight);
 
   /**
-   * Store multiple LMCache records through the CTE deferred-put pipeline.
+   * Store multiple LMCache records.
    *
    * Each stored blob uses the stable CLIOKV1 record layout: fixed header,
-   * metadata JSON bytes, then payload bytes, submitted as one deferred
-   * vectored put (issues #830/#862): the record is assembled directly into
-   * the CTE's accumulating deferred batch at submit, caller buffers are free
-   * on return in every mode, and the puts stay deferred past the call.
+   * metadata JSON bytes, then payload bytes, submitted as one private-memory
+   * vectored put (issue #830). Up to max_inflight puts are in flight; all of
+   * them have landed when the call returns, so caller buffers are free.
    *
    * @param blob_names CTE blob names.
    * @param metadata_jsons Metadata JSON bytes, one per blob name.
    * @param payloads Caller-owned payload buffers, one per blob name.
    * @param payload_sizes Payload sizes in bytes.
-   * @param max_inflight Unused for puts; retained for API compatibility.
-   * @return Per-blob ACCEPTED status. Completion failures are counted by
-   *     clio::cte::core::Client::DeferErrorCount and leave the blob absent.
+   * @param max_inflight Maximum vectored puts in flight.
+   * @return Per-blob commit status.
    */
   std::vector<bool> PutManyRecords(
       const std::vector<std::string> &blob_names,

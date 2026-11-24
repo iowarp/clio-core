@@ -45,13 +45,65 @@
 #include <exception>
 #include <sstream>
 
-#ifdef CTP_ALLOC_TRACK_SIZE
+#include "clio_ctp/util/msan.h"
+
 #include <chrono>
 #include <thread>
+#ifdef CTP_ALLOC_TRACK_SIZE
 #include "clio_ctp/memory/allocator/malloc_allocator.h"
 #endif
 
+#ifdef CTP_ALLOC_TRACK_SIZE
+// The elastic-worker exemption below needs the runtime's worker count. It
+// used to come from #ifdef CLIO_WORK_ORCHESTRATOR, but most tests include
+// this header BEFORE the runtime headers, so the macro was undefined here,
+// the count was always 0 and the exemption was silently dead: every elastic
+// spawn failed whichever test it landed in (#1208, the ~147 KB "leaks" of
+// #942). Including the runtime header instead broke tests that see the
+// runtime's headers without linking it. So the runtime exports a plain C
+// function and this header references it WEAKLY: tests linked with the
+// runtime get the real count, the rest see a null function and 0.
+#if defined(__GNUC__) && !defined(_WIN32)
+extern "C" size_t clio_runtime_worker_count() __attribute__((weak));
+#define CLIO_SIMPLE_TEST_WEAK_WORKER_COUNT 1
+#else
+#define CLIO_SIMPLE_TEST_WEAK_WORKER_COUNT 0
+#endif
+#endif  // CTP_ALLOC_TRACK_SIZE
+
 namespace SimpleTest {
+
+/**
+ * Wait until a sampled quantity (e.g. heap bytes) is quiescent: unchanged
+ * for at least `quiet_ms` of wall time across consecutive samples. Server
+ * side frees can lag a client's Wait() by an unbounded amount on a slow
+ * runner, so two equal samples a few ms apart are not evidence of rest.
+ * @param sample   returns the current value
+ * @param quiet_ms how long the value must hold still (>= 500 ms)
+ * @param cap_ms   give up after this long and return the last sample
+ * @return the settled (or, at the cap, the last) value
+ */
+inline size_t WaitForQuiescentValue(const std::function<size_t()> &sample,
+                                    int quiet_ms = 500, int cap_ms = 30000) {
+  using Clock = std::chrono::steady_clock;
+  const auto start = Clock::now();
+  size_t prev = sample();
+  auto still_since = Clock::now();
+  while (Clock::now() - start < std::chrono::milliseconds(cap_ms)) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    const size_t cur = sample();
+    if (cur != prev) {
+      prev = cur;
+      still_since = Clock::now();
+    } else if (Clock::now() - still_since >=
+               std::chrono::milliseconds(quiet_ms)) {
+      return cur;
+    }
+  }
+  std::cout << "  [WaitForQuiescentValue] value still moving after " << cap_ms
+            << " ms; using the last sample" << std::endl;
+  return prev;
+}
 
 #ifdef CTP_ALLOC_TRACK_SIZE
 // Automatic per-test leak checking. Only compiled in leak-tracking builds
@@ -70,14 +122,17 @@ inline size_t RuntimeHeapBytes() {
   return CTP_MALLOC->GetCurrentlyAllocatedSize();
 }
 
-// Poll until the runtime private-heap usage stops changing (so async server-side
-// frees — which can lag the client's Wait() — have settled) or a short bound
-// elapses. Returns early once stable, so the common case costs ~20 ms.
+// StabilizeRuntimeHeap (below): poll until the runtime private-heap usage has
+// held still for 500 ms (async server-side frees can lag the client's Wait()
+// arbitrarily on a slow runner), capped at 30 s.
 // Number of workers the in-process runtime currently owns, or 0 if there is
 // no runtime. Used to tell a genuine leak apart from an elastic worker being
 // spawned mid-test -- see the leak check below.
 inline size_t RuntimeWorkerCount() {
-#ifdef CLIO_WORK_ORCHESTRATOR
+#if CLIO_SIMPLE_TEST_WEAK_WORKER_COUNT
+  return clio_runtime_worker_count != nullptr ? clio_runtime_worker_count()
+                                              : 0;
+#elif defined(CLIO_WORK_ORCHESTRATOR)
   auto *orch = CLIO_WORK_ORCHESTRATOR;
   return orch == nullptr ? 0 : static_cast<size_t>(orch->GetTotalWorkerCount());
 #else
@@ -89,15 +144,9 @@ inline size_t RuntimeWorkerCount() {
 #endif
 }
 
+/** @return runtime heap bytes once they have held still for 500 ms. */
 inline size_t StabilizeRuntimeHeap() {
-  size_t prev = RuntimeHeapBytes();
-  for (int i = 0; i < 50; ++i) {  // up to ~0.5 s
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    size_t cur = RuntimeHeapBytes();
-    if (cur == prev) return cur;
-    prev = cur;
-  }
-  return prev;
+  return WaitForQuiescentValue(RuntimeHeapBytes);
 }
 }  // namespace detail
 #endif  // CTP_ALLOC_TRACK_SIZE
@@ -109,6 +158,10 @@ struct TestStats {
     int failed_tests = 0;
     
     void print_summary() const {
+        // Formatting these counts runs libstdc++'s num_put on stack the tests
+        // just poisoned, and libstdc++.so is not instrumented -- same reason
+        // run_all_tests guards its opening line. Nothing under test runs here.
+        ctp::MsanInterceptorCheckGuard msan_guard;
         std::cout << "\n=== Test Summary ===" << std::endl;
         std::cout << "Total tests: " << total_tests << std::endl;
         std::cout << "Passed: " << passed_tests << std::endl;
@@ -130,7 +183,15 @@ static FinalizeFunc g_test_finalize = nullptr;
 // Test failure exception
 class TestFailure : public std::exception {
 public:
-    explicit TestFailure(const std::string& message) : message_(message) {}
+    explicit TestFailure(const std::string& message) : message_(message) {
+        // Every failure message is composed in a std::ostringstream, and
+        // basic_stringbuf::str() runs inside the uninstrumented libstdc++.so:
+        // the characters it hands back carry no MSan shadow, so PRINTING the
+        // explanation of a failure is itself reported -- twice, burying the
+        // one line that says what actually broke. Cleared once here rather
+        // than at each of the macros that build a message.
+        CTP_MSAN_UNPOISON_STRING(message_);
+    }
     const char* what() const noexcept override { return message_.c_str(); }
 private:
     std::string message_;
@@ -256,10 +317,27 @@ inline int run_all_tests(const std::string& filter = "") {
         }
     }
 
-    if (!filter.empty()) {
-        std::cout << "Running " << matching_tests << " test(s) matching filter '" << filter << "'..." << std::endl;
-    } else {
-        std::cout << "Running " << tests.size() << " test(s)..." << std::endl;
+    {
+        // First locale-dependent ostream write in the process, which is where
+        // libstdc++ lazily builds std::ctype's widen cache -- on a 256-byte
+        // stack buffer it then memcmps. That buffer lands on stack our
+        // instrumented frames already poisoned, and libstdc++.so is not
+        // instrumented, so MSan reports the memcmp. Nothing on our side owns
+        // that memory, so the interceptor check is the only thing we can turn
+        // off; the cache is built once, so this one scope covers the whole run.
+        // print_summary() below needs the same treatment for the same reason.
+        ctp::MsanInterceptorCheckGuard msan_guard;
+        // The stream buffer behind std::cout is libstdc++.so's, but our own
+        // instrumented copy of basic_streambuf::sputn reads its put-area
+        // pointers on every <<. Clearing the base sub-object once here covers
+        // the whole run, tests' own output included.
+        CTP_MSAN_UNPOISON(std::cout.rdbuf(), sizeof(std::streambuf));
+        CTP_MSAN_UNPOISON(std::cerr.rdbuf(), sizeof(std::streambuf));
+        if (!filter.empty()) {
+            std::cout << "Running " << matching_tests << " test(s) matching filter '" << filter << "'..." << std::endl;
+        } else {
+            std::cout << "Running " << tests.size() << " test(s)..." << std::endl;
+        }
     }
 
 #ifdef CTP_ALLOC_TRACK_SIZE
@@ -287,10 +365,16 @@ inline int run_all_tests(const std::string& filter = "") {
         const bool leak_check =
             executed_count > 0 &&
             test.first.find("[noleak]") == std::string::npos;
-        const size_t heap_before =
-            leak_check ? detail::StabilizeRuntimeHeap() : 0;
+        // Worker count FIRST, heap second. The monitor thread spawns elastic
+        // workers asynchronously (often on the previous test's load); one
+        // that landed while the heap was settling was in workers_before but
+        // not in heap_before, so the next test was charged its ~147 KB with
+        // no worker-count change to excuse it (#1208). Read in this order,
+        // any spawn from here on raises the count.
         const size_t workers_before =
             leak_check ? detail::RuntimeWorkerCount() : 0;
+        const size_t heap_before =
+            leak_check ? detail::StabilizeRuntimeHeap() : 0;
         ++executed_count;
 #endif
 
@@ -408,8 +492,36 @@ inline int run_all_tests(const std::string& filter = "") {
 #define SIMPLE_TEST_SETENV(k, v) setenv((k), (v), 1)
 #endif
 
+#ifdef _WIN32
+#include <crtdbg.h>
+#include <cstdlib>
+namespace SimpleTest {
+/**
+ * Route Debug-CRT assertion and error reports to stderr and make abort()
+ * silent. A Debug build reports a failed CRT or checked-STL assertion through
+ * a MODAL dialog; in an unattended ctest run nobody can dismiss it, so the
+ * test hangs until its timeout with no message instead of failing with the
+ * assertion text (cte_reorganize_all on the win-10 CDash runner). The
+ * _CrtSetReport* calls compile to no-ops in a release CRT.
+ */
+inline void DisableCrtDialogs() {
+  _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
+  _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
+  _CrtSetReportMode(_CRT_ERROR, _CRTDBG_MODE_FILE);
+  _CrtSetReportFile(_CRT_ERROR, _CRTDBG_FILE_STDERR);
+  _set_error_mode(_OUT_TO_STDERR);
+  _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+}
+}  // namespace SimpleTest
+#define SIMPLE_TEST_DISABLE_CRT_DIALOGS() SimpleTest::DisableCrtDialogs()
+#else
+#define SIMPLE_TEST_DISABLE_CRT_DIALOGS() ((void)0)
+#endif
+
 #define SIMPLE_TEST_MAIN() \
 int main(int argc, char* argv[]) { \
+    /* Never block an unattended run on a Debug-CRT dialog. */ \
+    SIMPLE_TEST_DISABLE_CRT_DIALOGS(); \
     /* Unit tests assert queue/scheduling semantics; mark the process so \
        CLIO_RUN_INLINE (run_inline.h) keeps the normal task path. */ \
     SIMPLE_TEST_SETENV("CLIO_UNIT_TEST", "1"); \

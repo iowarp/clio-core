@@ -234,7 +234,14 @@ TEST_CASE("CfsParallelStress - read/write/append/unlink/rmdir/list race on a "
             ctp::ipc::FullPtr<char> b = ipc->AllocateBuffer(sz);
             if (b.IsNull()) { failed.store(true); return; }
             std::memset(b.ptr_, static_cast<int>(i), sz);
-            cfs.AsyncAppend(o->handle_, sz, b.shm_.template Cast<void>()).Wait();
+            // O_APPEND: reserve the end at the file's home, write there.
+            auto r = cfs.AsyncReserveAppend(o->tag_packed_, sz);
+            r.Wait();
+            if (r->GetReturnCode() == 0) {
+              cfs.AsyncWrite(o->handle_, r->old_size_, sz,
+                             b.shm_.template Cast<void>())
+                  .Wait();
+            }
             ipc->FreeBuffer(b);
             cfs.AsyncClose(o->handle_).Wait();
           }

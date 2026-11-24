@@ -122,17 +122,46 @@ fi
 
 # Write what the sanitizer actually found into the GitHub step summary.
 #
-# These jobs are non-gating by construction: the ctest invocation is followed by
-# `|| true` and this script ends with `exit 0`, so a sanitizer finding can never
-# turn a job red. That is not obviously wrong -- ubsan currently flags 151 of
-# 259 tests, and flipping the jobs to gating today would simply pin CI red --
-# but it does mean the findings are invisible unless somebody opens the raw log
-# and knows what to grep for. Nobody does, so nothing gets triaged.
+# asan and ubsan GATE (issue #803): once their backlog was cleared (#1094)
+# both ran 330/330 tests with zero defects on dev, so any failed test or any
+# test reporting a defect now fails the job -- see sanitizer_gate_status().
+# msan stays a report: its remaining findings are largely uninstrumented
+# third-party code, so gating it would pin CI red without a code defect.
 #
 # This prints the ctest pass/fail line, the per-test defect counts, and a sample
 # of the actual sanitizer messages from the MemoryChecker output files, which
-# otherwise only reach CDash. Purely additive: no job changes colour. Issue #803
-# tracks triaging the backlog and then ratcheting these to gating.
+# otherwise only reach CDash.
+# Decide whether a sanitizer run fails the job (issue #803).
+# Arguments:
+#   $1  sanitizer mode (asan | ubsan | msan | sanitize)
+#   $2  path to the ctest -S log of that run
+# Returns 1 for a gating mode (asan, ubsan, sanitize) whose run had a failed
+# test or any test reporting a defect, else 0. msan always returns 0.
+sanitizer_gate_status() {
+    local MODE="$1"
+    local CTEST_LOG="$2"
+    [ "${MODE}" = "msan" ] && return 0
+    if grep -qE "Defects: [1-9]" "${CTEST_LOG}" 2>/dev/null; then
+        print_warning "${MODE}: tests reported sanitizer defects"
+        # ctest deletes each MemoryChecker.<test#>.log.<pid> file after parsing
+        # it, so the reports survive only in Testing/<tag>/DynamicAnalysis.xml
+        # (and on CDash). Print each defective test's report with its stack,
+        # so the log alone says what the defect was.
+        python3 "${SCRIPT_DIR}/memcheck_reports.py" "${BUILD_DIR}" stacks || true
+        return 1
+    fi
+    if grep -qE "[0-9]+% tests passed, [1-9][0-9]* tests? failed" \
+            "${CTEST_LOG}" 2>/dev/null; then
+        print_warning "${MODE}: tests failed"
+        return 1
+    fi
+    if ! grep -qE "[0-9]+% tests passed" "${CTEST_LOG}" 2>/dev/null; then
+        print_warning "${MODE}: no ctest summary line; the run did not complete"
+        return 1
+    fi
+    return 0
+}
+
 emit_findings_summary() {
     local MODE="$1"
     local CTEST_LOG="$2"
@@ -155,7 +184,11 @@ emit_findings_summary() {
         DEFECT_COUNT=$(grep -c "Defects: " "${CTEST_LOG}" || true)
         echo "Tests reporting defects: ${DEFECT_COUNT:-0}"
         echo ""
-        echo "> These jobs are non-gating: this is a report, not a gate (issue #803)."
+        if [ "${MODE}" = "msan" ]; then
+            echo "> msan is a report, not a gate (issue #803)."
+        else
+            echo "> ${MODE} gates: any failed test or reported defect fails the job (issue #803)."
+        fi
         echo ""
 
         if [ "${DEFECT_COUNT:-0}" != "0" ]; then
@@ -169,24 +202,17 @@ emit_findings_summary() {
             echo ""
         fi
 
-        # The per-defect detail lives in the MemoryChecker files, not stdout, so
-        # the console alone cannot tell you WHAT the undefined behaviour was.
-        # Surface a sample so a reader can judge real-vs-artifact without
-        # fetching anything from CDash.
-        local MEMCHECK_DIR="${BUILD_DIR}/Testing/Temporary"
-        if compgen -G "${MEMCHECK_DIR}/MemoryChecker.*.log" > /dev/null 2>&1; then
-            echo "<details><summary>Sample sanitizer messages</summary>"
-            echo ""
-            echo '```'
-            grep -hoE "(runtime error: .*|ERROR: [A-Za-z]+Sanitizer: .*|SUMMARY: [A-Za-z]+Sanitizer: .*)" \
-                 "${MEMCHECK_DIR}"/MemoryChecker.*.log 2>/dev/null \
-                 | sort | uniq -c | sort -rn | head -40 || true
-            echo '```'
-            echo ""
-            echo "</details>"
-        else
-            echo "_No MemoryChecker output files found under ${MEMCHECK_DIR}._"
-        fi
+        # The per-defect detail is not on stdout (ctest keeps it only in
+        # DynamicAnalysis.xml), so the console alone cannot tell you WHAT the
+        # defect was. Surface a sample so a reader can judge real-vs-artifact
+        # without fetching anything from CDash.
+        echo "<details><summary>Sample sanitizer messages</summary>"
+        echo ""
+        echo '```'
+        python3 "${SCRIPT_DIR}/memcheck_reports.py" "${BUILD_DIR}" messages || true
+        echo '```'
+        echo ""
+        echo "</details>"
     } >> "${GITHUB_STEP_SUMMARY}" 2>/dev/null || true
 
     return 0
@@ -300,15 +326,18 @@ EOFCMAKE
 
     cd "${BUILD_DIR}"
     local CTEST_LOG="${BUILD_DIR}/sanitizer-ctest-${MODE}.log"
-    # `|| true` keeps this non-gating -- see emit_findings_summary() for why
-    # that is deliberate for now, and issue #803 for the plan to change it.
+    # ctest -S's own exit status is not the verdict (CDash submission problems
+    # change it); sanitizer_gate_status() reads the log instead (issue #803).
     ctest -S "${DASHBOARD_SCRIPT}" -VV 2>&1 | tee "${CTEST_LOG}" || true
     cd "${REPO_ROOT}"
 
     emit_findings_summary "${MODE}" "${CTEST_LOG}"
 
+    local GATE=0
+    sanitizer_gate_status "${MODE}" "${CTEST_LOG}" || GATE=1
     print_success "Done: ${MODE}"
     echo ""
+    return ${GATE}
 }
 
 ################################################################################
@@ -363,11 +392,35 @@ if [ "$DO_MSAN" = true ]; then
         export MSAN_SYMBOLIZER_PATH="${LLVM_SYMBOLIZER}"
         print_info "Using symbolizer: ${LLVM_SYMBOLIZER}"
     fi
+    # poison_in_malloc / poison_in_free / poison_in_dtor are all off on
+    # purpose. MSan only clears a byte's shadow when INSTRUMENTED code writes
+    # it, and this build links an uninstrumented libstdc++, Poco, yaml-cpp, ZMQ
+    # and Catch2. Any heap block those libraries fill after we freed it, and any
+    # object of theirs laid over storage we destroyed, therefore reads back as
+    # "uninitialized" -- thousands of reports per test run that say nothing
+    # about our code. What those three flags buy is use-after-free and
+    # use-after-destroy detection, which the asan job already does properly, so
+    # turning them off costs no coverage. Stack poisoning stays ON: reading an
+    # uninitialized local is what this job is here to catch.
+    #
+    # intercept_memcmp=0 is off for one library: libzmq. Its routing-id and
+    # command buffers are built on stack frames our instrumented code poisoned
+    # and left behind, then compared with memcmp -- ~70 reports per run, every
+    # one of them MemcmpInterceptorCommon complaining about bytes that belong
+    # to a .so we do not compile. It cannot be scoped away at the call site the
+    # way the other boundaries were: libzmq runs its own I/O threads, and the
+    # reports arrive from frames that have no call of ours anywhere beneath
+    # them, where MsanInterceptorCheckGuard (a per-thread, per-scope switch)
+    # can never reach. The check this gives up is narrow -- comparing memory we
+    # never initialized THROUGH libc memcmp; reading it in our own code is
+    # still caught by instrumentation, which is the bulk of what MSan is for.
+    # Every report this job produced was either that class or a boundary that
+    # is now unpoisoned by name.
     run_sanitizer_mode \
         "msan" \
         "MemorySanitizer" \
-        "print_stacktrace=1:halt_on_error=0:poison_in_malloc=0" \
-        || OVERALL_STATUS=$?
+        "print_stacktrace=1:halt_on_error=0:poison_in_malloc=0:poison_in_free=0:poison_in_dtor=0:intercept_memcmp=0" \
+        || print_warning "msan did not complete cleanly (a report, not a gate)"
 fi
 
 if [ "$DO_SANITIZE" = true ]; then
@@ -383,7 +436,7 @@ print_header "Sanitizer Run Complete"
 if [ $OVERALL_STATUS -eq 0 ]; then
     print_success "All requested sanitizer modes completed"
 else
-    print_warning "One or more sanitizer modes reported defects (exit: ${OVERALL_STATUS})"
+    print_error "A gating sanitizer mode (asan/ubsan) failed (exit: ${OVERALL_STATUS})"
 fi
 
-exit 0
+exit ${OVERALL_STATUS}

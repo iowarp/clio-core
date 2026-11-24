@@ -1,0 +1,5 @@
+# OpenMPI hostfile: 4 slots per node so `mpirun -np 8` puts ranks 0-3 on node1
+# and ranks 4-7 on node2. The test derives its node index as rank/4, so this
+# slot count and kRanksPerNode in test_with_runtime_cache.cc must agree.
+iowarp-wr-node1 slots=4
+iowarp-wr-node2 slots=4

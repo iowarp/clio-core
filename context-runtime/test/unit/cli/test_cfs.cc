@@ -24,6 +24,8 @@
 
 #include <clio_runtime/clio_runtime.h>
 #include <clio_cte/filesystem/filesystem_client.h>
+#include <clio_cte/filesystem/fs_shard.h>
+#include <clio_cte/stream/stream_client.h>
 #include <clio_cte/core/core_client.h>
 
 #include "runtime_server.h"
@@ -105,7 +107,7 @@ TEST_CASE("Cfs - filesystem chimod open/write/getattr/read/truncate",
   cfs.Init(clio::run::PoolId(600, 0));
 
   constexpr clio::run::u64 kSize = 1024 * 1024;  // 1 MiB
-  const std::string path = "clio::/cfs_content.bin";
+  const std::string path = "/cfs_content.bin";  // raw chimod API: absolute paths
 
   // Open (create).
   auto open = cfs.AsyncOpen(path, O_CREAT | O_RDWR, 0644);
@@ -276,7 +278,11 @@ TEST_CASE("Cfs - filesystem chimod open/write/getattr/read/truncate",
   REQUIRE(gone->GetReturnCode() == 0);
   REQUIRE(!(gone->tag_id_ == orig_id));
 
-  // ---- Hierarchical tag names + O(1) directory move ----
+  // ---- Flat tag names: a path is one name; rename and delete touch only it --
+  // The core holds no hierarchy (flat tag names): "/a/b/c/d" is one opaque
+  // name, not a chain of parents, and clio-fs keeps directory structure
+  // itself. These checks pin that contract down: binding, renaming and
+  // deleting one name never reaches a tag whose name merely shares a prefix.
   using clio::cte::core::TagId;
   auto resolve = [&](const TagId &id) {
     auto g = core.AsyncGetTagName(id);
@@ -285,15 +291,20 @@ TEST_CASE("Cfs - filesystem chimod open/write/getattr/read/truncate",
     REQUIRE(g->found_ == 1);
     return g->tag_name_.str();
   };
+  auto exists = [&](const TagId &id) {
+    auto g = core.AsyncGetTagName(id);
+    g.Wait();
+    REQUIRE(g->GetReturnCode() == 0);
+    return g->found_ == 1;
+  };
 
-  // Creating "/a/b/c/d" builds the whole chain; the returned id is the leaf.
   auto deep = core.AsyncGetOrCreateTag(
       "/a/b/c/d", TagId::GetNull(), clio::run::PoolQuery::Local());
   deep.Wait();
   REQUIRE(deep->GetReturnCode() == 0);
   TagId d_id = deep->tag_id_;
 
-  // The intermediate "/a/b" already exists from the chain — same id, no dup.
+  // "/a/b" is its own name: creating it mints a separate tag.
   auto mid = core.AsyncGetOrCreateTag(
       "/a/b", TagId::GetNull(), clio::run::PoolQuery::Local());
   mid.Wait();
@@ -302,11 +313,10 @@ TEST_CASE("Cfs - filesystem chimod open/write/getattr/read/truncate",
   REQUIRE(!b_id.IsNull());
   REQUIRE(!(b_id == d_id));
 
-  // Names resolve to absolute paths.
   REQUIRE(resolve(d_id) == "/a/b/c/d");
   REQUIRE(resolve(b_id) == "/a/b");
 
-  // Write a blob under the deepest tag so we can prove data survives the move.
+  // Write a blob under the deep tag so we can prove data survives the rename.
   const char kDeepMsg[] = "deep-payload";
   constexpr clio::run::u64 kDeepN = sizeof(kDeepMsg);
   ctp::ipc::FullPtr<char> hpb = ipc->AllocateBuffer(kDeepN);
@@ -320,70 +330,56 @@ TEST_CASE("Cfs - filesystem chimod open/write/getattr/read/truncate",
   REQUIRE(hp->GetReturnCode() == 0);
   ipc->FreeBuffer(hpb);
 
-  // Move the mid-level directory "/a/b" -> "/x/y". This touches ONLY /a/b's
-  // own binding; "/a/b/c" and "/a/b/c/d" reference ids that do not change, so
-  // they must re-resolve under the new parent automatically (the O(1) win).
+  // Renaming "/a/b" -> "/x/y" moves that one binding. The tag keeps its id;
+  // "/a/b/c/d" is a different name and stays exactly where it was.
   auto mv = core.AsyncRenameTag("/a/b", "/x/y", b_id);
   mv.Wait();
   REQUIRE(mv->GetReturnCode() == 0);
-
+  REQUIRE(mv->tag_id_ == b_id);
   REQUIRE(resolve(b_id) == "/x/y");
-  REQUIRE(resolve(d_id) == "/x/y/c/d");  // deep child re-resolved, never moved
+  REQUIRE(resolve(d_id) == "/a/b/c/d");
 
-  // The blob under the (unmoved) deep id is still intact.
-  ctp::ipc::FullPtr<char> hgb = ipc->AllocateBuffer(kDeepN);
-  REQUIRE(!hgb.IsNull());
-  memset(hgb.ptr_, 0, kDeepN);
-  auto hg = core.AsyncGetBlob(d_id, "0", 0, kDeepN, 0u,
-                              hgb.shm_.template Cast<void>(),
-                              clio::run::PoolQuery::Local());
-  hg.Wait();
-  REQUIRE(hg->GetReturnCode() == 0);
-  REQUIRE(memcmp(hgb.ptr_, kDeepMsg, kDeepN) == 0);
-  ipc->FreeBuffer(hgb);
+  // The blob under the deep id is intact.
+  auto read_deep = [&]() {
+    ctp::ipc::FullPtr<char> buf = ipc->AllocateBuffer(kDeepN);
+    REQUIRE(!buf.IsNull());
+    memset(buf.ptr_, 0, kDeepN);
+    auto g = core.AsyncGetBlob(d_id, "0", 0, kDeepN, 0u,
+                               buf.shm_.template Cast<void>(),
+                               clio::run::PoolQuery::Local());
+    g.Wait();
+    const bool ok = g->GetReturnCode() == 0 &&
+                    memcmp(buf.ptr_, kDeepMsg, kDeepN) == 0;
+    ipc->FreeBuffer(buf);
+    return ok;
+  };
+  REQUIRE(read_deep());
 
-  // The old path "/a/b" is now free: re-creating it mints a NEW id (the old
-  // binding moved away), while "/a" itself still exists as a parent.
+  // The old name "/a/b" is free again: re-creating it mints a NEW id.
   auto recreate = core.AsyncGetOrCreateTag(
       "/a/b", TagId::GetNull(), clio::run::PoolQuery::Local());
   recreate.Wait();
   REQUIRE(recreate->GetReturnCode() == 0);
   REQUIRE(!(recreate->tag_id_ == b_id));
 
-  // ---- Recursive DelTag: deleting a directory deletes its whole subtree ----
-  // Current tree under the moved dir: "/x/y" (b_id) -> "/x/y/c" -> "/x/y/c/d"
-  // (d_id, holds a blob). Capture the intermediate id "/x/y/c" too.
-  auto cmid = core.AsyncGetOrCreateTag(
-      "/x/y/c", TagId::GetNull(), clio::run::PoolQuery::Local());
-  cmid.Wait();
-  REQUIRE(cmid->GetReturnCode() == 0);
-  TagId c_id = cmid->tag_id_;
+  // Deleting "/x/y" deletes that tag only -- no subtree to take with it.
+  auto del_xy = core.AsyncDelTag(std::string("/x/y"),
+                                 clio::run::PoolQuery::Local());
+  del_xy.Wait();
+  REQUIRE(del_xy->GetReturnCode() == 0);
+  REQUIRE(!exists(b_id));
+  REQUIRE(exists(d_id));
+  REQUIRE(read_deep());
 
-  auto rmrf = core.AsyncDelTag(std::string("/x/y"), clio::run::PoolQuery::Local());
-  rmrf.Wait();
-  REQUIRE(rmrf->GetReturnCode() == 0);
-
-  // Every tag in the subtree is gone (GetTagName reports not-found).
-  for (const TagId &gone_id : {b_id, c_id, d_id}) {
-    auto gn = core.AsyncGetTagName(gone_id);
-    gn.Wait();
-    REQUIRE(gn->GetReturnCode() == 0);
-    REQUIRE(gn->found_ == 0);
-  }
-
-  // The descendant's blob is gone too.
-  ctp::ipc::FullPtr<char> rdb = ipc->AllocateBuffer(kDeepN);
-  REQUIRE(!rdb.IsNull());
-  auto rdg = core.AsyncGetBlob(d_id, "0", 0, kDeepN, 0u,
-                               rdb.shm_.template Cast<void>(),
-                               clio::run::PoolQuery::Local());
-  rdg.Wait();
-  REQUIRE(rdg->GetReturnCode() != 0);
-  ipc->FreeBuffer(rdb);
-
-  // Re-creating the deepest path mints fresh ids (subtree fully removed).
+  // Deleting the deep name takes its tag and blob; re-creating mints a new id.
+  auto del_deep = core.AsyncDelTag(std::string("/a/b/c/d"),
+                                   clio::run::PoolQuery::Local());
+  del_deep.Wait();
+  REQUIRE(del_deep->GetReturnCode() == 0);
+  REQUIRE(!exists(d_id));
+  REQUIRE(!read_deep());
   auto reborn = core.AsyncGetOrCreateTag(
-      "/x/y/c/d", TagId::GetNull(), clio::run::PoolQuery::Local());
+      "/a/b/c/d", TagId::GetNull(), clio::run::PoolQuery::Local());
   reborn.Wait();
   REQUIRE(reborn->GetReturnCode() == 0);
   REQUIRE(!(reborn->tag_id_ == d_id));
@@ -527,15 +523,12 @@ TEST_CASE("Cfs - filesystem chimod open/write/getattr/read/truncate",
     REQUIRE(ex == 0);  // directory gone
   }
 
-  // ---- Deferred-append pipeline ----
-  // Fire many appends concurrently (without awaiting each), so they pile into
-  // the pending queue and the periodic AppendSequence drains them across
-  // SEVERAL ManyToOne AppendCollect batches. Each append is placed locally +
-  // queued; AppendCollect (sorted by UTC/logical) plans the merge against the
-  // file tail and AppendExecution writes it into the pages. Because at most one
-  // aggregate per tag runs at a time (BatchManager serialization), successive
-  // batches see a fully-settled tail, so the bytes land in submission order and
-  // span page boundaries cleanly. Verify the exact ordered concatenation.
+  // ---- Deferred appends (stream pool) ----
+  // Fire many appends concurrently (without awaiting each) through the stream
+  // pool the filesystem delegates file sizes and appends to. The file's
+  // stream home is its inode home. After a Flush every append is merged: the
+  // file is exactly kNum back-to-back kChunk regions, each one distinct
+  // marker, all present once (concurrent appends have no pinned order).
   {
     const std::string apath = "/append_test.bin";
     auto aop = cfs.AsyncOpen(apath, O_CREAT | O_RDWR, 0644);
@@ -543,55 +536,54 @@ TEST_CASE("Cfs - filesystem chimod open/write/getattr/read/truncate",
     REQUIRE(aop->GetReturnCode() == 0);
     clio::run::u64 ah = aop->handle_;
     REQUIRE(ah != 0);
+    const clio::run::u64 packed = aop->tag_packed_;
+    REQUIRE(clio::cte::filesystem::FsIdHasHome(packed));
+    const clio::run::u32 home = clio::cte::filesystem::FsIdHome(packed);
+    const clio::cte::core::TagId tag = clio::cte::filesystem::FsUnpack(packed);
+    // The stream pool this filesystem keeps sizes in (clients assume no
+    // pool id: ask the filesystem which one it uses).
+    clio::run::PoolId stream_pool;
+    REQUIRE(cfs.QueryPoolId("stream_pool", &stream_pool));
+    clio::cte::stream::Client stream(stream_pool);
 
     constexpr clio::run::u64 kChunk = 4096;
     constexpr int kNum = 16;  // concurrent stress (probe for corruption)
     std::vector<ctp::ipc::FullPtr<char>> abufs;
-    std::vector<clio::run::Future<clio::cte::filesystem::AppendTask>> afuts;
+    std::vector<clio::run::Future<clio::cte::stream::AppendTask>> afuts;
     for (int c = 0; c < kNum; ++c) {
       char mark = static_cast<char>('a' + c);
       ctp::ipc::FullPtr<char> ab = ipc->AllocateBuffer(kChunk);
       REQUIRE(!ab.IsNull());
       memset(ab.ptr_, mark, kChunk);
       abufs.push_back(ab);
-      afuts.push_back(cfs.AsyncAppend(ah, kChunk, ab.shm_.template Cast<void>()));
+      afuts.push_back(stream.AsyncAppend(tag, home,
+                                         ab.shm_.template Cast<void>(), kChunk));
     }
     for (auto &f : afuts) { f.Wait(); REQUIRE(f->GetReturnCode() == 0); }
     for (auto &ab : abufs) ipc->FreeBuffer(ab);
     const clio::run::u64 total = kChunk * kNum;
+    auto fl = stream.AsyncFlush(tag, home);
+    fl.Wait();
+    REQUIRE(fl->GetReturnCode() == 0);
+    REQUIRE(fl->size_ == total);
 
-    // Concurrent appends are ordered by (UTC, logical), not submission order, so
-    // we don't pin the order. The pipeline (periodic AppendSequence -> ManyToOne
-    // AppendCollect -> AppendPlan -> AppendExecution) must merge them with no
-    // overlap or corruption: poll-read until the file is exactly kNum back-to-
-    // back kChunk regions, each a single distinct marker, all present once.
-    bool matched = false;
-    for (int attempt = 0; attempt < 400 && !matched; ++attempt) {
-      ctp::ipc::FullPtr<char> rb = ipc->AllocateBuffer(total);
-      REQUIRE(!rb.IsNull());
-      memset(rb.ptr_, 0, total);
-      auto r = cfs.AsyncRead(ah, 0, total, rb.shm_.template Cast<void>());
-      r.Wait();
-      bool ok = (r->GetReturnCode() == 0 && r->bytes_read_ == total);
-      if (ok) {
-        std::set<char> seen;
-        for (int c = 0; c < kNum && ok; ++c) {
-          const char *region = rb.ptr_ + static_cast<size_t>(c) * kChunk;
-          char m = region[0];
-          for (clio::run::u64 i = 0; i < kChunk; ++i) {
-            if (region[i] != m) { ok = false; break; }
-          }
-          if (ok && m >= 'a' && m < 'a' + kNum) seen.insert(m);
-          else ok = false;
-        }
-        if (ok && seen.size() == static_cast<size_t>(kNum)) matched = true;
-      }
-      ipc->FreeBuffer(rb);
-      if (!matched) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(25));
-      }
+    ctp::ipc::FullPtr<char> rb = ipc->AllocateBuffer(total);
+    REQUIRE(!rb.IsNull());
+    memset(rb.ptr_, 0, total);
+    auto r = cfs.AsyncRead(ah, 0, total, rb.shm_.template Cast<void>());
+    r.Wait();
+    REQUIRE(r->GetReturnCode() == 0);
+    REQUIRE(r->bytes_read_ == total);
+    std::set<char> seen;
+    for (int c = 0; c < kNum; ++c) {
+      const char *region = rb.ptr_ + static_cast<size_t>(c) * kChunk;
+      const char m = region[0];
+      for (clio::run::u64 i = 0; i < kChunk; ++i) REQUIRE(region[i] == m);
+      REQUIRE((m >= 'a' && m < 'a' + kNum));
+      seen.insert(m);
     }
-    REQUIRE(matched);  // all appends merged intact into their own regions
+    REQUIRE(seen.size() == static_cast<size_t>(kNum));
+    ipc->FreeBuffer(rb);
 
     auto acl = cfs.AsyncClose(ah);
     acl.Wait();

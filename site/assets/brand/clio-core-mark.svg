@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="CLIO Core">
+  <title>CLIO Core</title>
+  <!-- A "C" built from three stacked storage tiers, with a copper block of data at its core. -->
+  <defs>
+    <mask id="cc-tiers" maskUnits="userSpaceOnUse" x="0" y="0" width="64" height="64">
+      <rect width="64" height="64" fill="#fff"/>
+      <rect x="0" y="21.2" width="64" height="3" fill="#000"/>
+      <rect x="0" y="39.8" width="64" height="3" fill="#000"/>
+    </mask>
+  </defs>
+  <path d="M50.39 16.57 A24 24 0 1 0 50.39 47.43" fill="none" stroke="#00d4db" stroke-width="10" mask="url(#cc-tiers)"/>
+  <rect x="26.5" y="26.5" width="11" height="11" rx="1.5" fill="#ee852f"/>
+</svg>
