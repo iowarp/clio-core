@@ -439,8 +439,9 @@ class Client : public clio::cte::core::Client {
   }
 
   /**
-   * Reserve where a sealed append generation goes (ManyToOne collective at
-   * the file's owner; see IdentifyRangeTask).
+   * Reserve where a sealed append generation goes (ManyToOne: batched on
+   * the neighborhood leader, which hands the batch to the file's owner;
+   * see IdentifyRangeTask).
    */
   clio::run::Future<IdentifyRangeTask> AsyncIdentifyRange(
       clio::run::u64 tag_packed, clio::run::u32 node, clio::run::u32 gen,

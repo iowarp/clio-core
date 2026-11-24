@@ -529,7 +529,9 @@ inline bool GetRangeRec(const std::string &s, size_t i, clio::run::u32 *a,
  * file (see SHM_CACHE_DESIGN.md "Appends"). Sent with
  * PoolQuery::ManyToOne(owner, batch_key = file id): every node's request
  * for the file in a window is folded into one aggregate (AggregateIn appends
- * the member to members_), which runs on the file's owner. The owner
+ * the member to members_) on the neighborhood leader -- ManyToOne runs
+ * there, not on the container it names -- and the leader's handler sends
+ * the aggregate to the file's owner (DirectId). The owner
  * reserves the batch's total at the file's end WITHOUT publishing a size and
  * returns every member's offset in offsets_ (broadcast to all members; each
  * takes its own (node, gen) entry).

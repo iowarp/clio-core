@@ -187,6 +187,11 @@ struct CfsHandle {
   // Deferred appends accepted through this handle and not yet flushed: a
   // read, fstat, fsync or close through it first waits for their merge.
   std::atomic<bool> appended{false};
+  // Appends accepted through this handle by the clio-fs client's append
+  // (FsAppend: staged and merged by the module on a multi-node volume) and
+  // not yet seen merged: a read, fstat, fsync or close through it first
+  // waits for the file's staged appends to merge.
+  std::atomic<bool> ns_appended{false};
   // Opened with O_NOATIME, or atime already touched by a read through it.
   std::atomic<bool> atime_done{false};
   // Bytes were written through this handle since its last flush: only such
@@ -3814,6 +3819,14 @@ static std::set<clio::run::u64> g_unmerged_appends;
  */
 static int FlushAppends(CfsHandle *handle, const std::string &hp) {
   (void)hp;
+  // Close-to-open: appends staged through the clio-fs client merge before
+  // a close (or read/fstat/fsync) through this handle returns. Without it a
+  // reader that opened the file after both writers closed saw the size the
+  // owner had published before the merge (0 bytes of a 6600-byte file).
+  if (handle->ns_appended.exchange(false) && !handle->tag.IsNull()) {
+    const int wrc = CLIO_CFS_CLIENT->WaitAppendsMerged(handle->tag);
+    if (wrc != 0) return -wrc;
+  }
   if (!handle->appended.exchange(false)) return 0;
   const clio::run::u64 packed = PackTag(handle->tag);
   const clio::run::u64 ra_mark = RaAppendMark(handle->tag);
@@ -4424,6 +4437,7 @@ int cte_fuse_write(const char *path, const char *buf, size_t size,
     const int arc = CLIO_CFS_CLIENT->FsAppend(handle->tag, hp, buf, size, &n);
     if (arc != clio::cte::filesystem::Client::kNsUnavailable) {
       if (arc != 0) return -arc;
+      handle->ns_appended.store(true);
       return static_cast<int>(n);
     }
   }

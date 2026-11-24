@@ -820,6 +820,28 @@ clio::run::TaskResume Runtime::IdentifyRange(
     if (members.empty()) {
       PutRangeRec(&members, task->node_, task->gen_, task->len_);
     }
+    // ManyToOne runs the aggregate on the neighborhood leader, not on the
+    // container it names (IpcManager::RouteManyToOne). The reservation and
+    // the size it later publishes belong to the file's owner: on any other
+    // container they landed in a table nobody reads, and on a multi-node
+    // volume every append to a file homed off the leader stayed invisible
+    // (stat 0 after both O_APPEND writers closed). Hand the batch to the
+    // owner.
+    const clio::run::u32 owner = FsIdHome(tag);
+    if (owner != container_id_) {
+      auto *ipc = CLIO_IPC;
+      auto fwd = ipc->NewTask<IdentifyRangeTask>(
+          clio::run::CreateTaskId(), pool_id_,
+          clio::run::PoolQuery::DirectId(owner), tag, task->node_,
+          task->gen_, task->len_);
+      fwd->members_ = clio::run::priv::string(CTP_MALLOC, members);
+      auto f = ipc->Send(fwd);
+      CLIO_CO_AWAIT(f);
+      task->base_ = f->base_;
+      task->offsets_ = f->offsets_;
+      task->return_code_ = f->GetReturnCode();
+      CLIO_CO_RETURN;
+    }
     // The file's size, when no reservation of it is open: reservations
     // start at the end every node can already see.
     bool need_size = false;
