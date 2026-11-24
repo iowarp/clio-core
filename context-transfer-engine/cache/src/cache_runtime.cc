@@ -444,6 +444,17 @@ clio::run::TaskResume Runtime::PutBlob(
       task->context_.replica_ = orig_ctx.replica_;
       task->context_.replica_flags_ = orig_ctx.replica_flags_;
       task->context_.origin_node_ = Context::kNoOriginNode;
+      // owner_copies: write-invalidate. The authoritative put has landed;
+      // drop the local raw copy so the next read repopulates current bytes.
+      if (OwnerCopies() &&
+          owner_copies_made_.load(std::memory_order_relaxed) > 0) {
+        const clio::run::u32 auth_rc = task->GetReturnCode();
+        auto del = GetLocalClient()->AsyncDelBlob(
+            task->tag_id_, blob_name, clio::run::PoolQuery::Local(),
+            clio::cte::core::kDelCacheCopyOnly);
+        CLIO_CO_AWAIT(del);  // "not found" (no copy) is the usual answer
+        task->SetReturnCode(auth_rc);
+      }
       CLIO_CO_RETURN;
     }
 
@@ -613,10 +624,14 @@ clio::run::TaskResume Runtime::GetBlob(
         CLIO_CO_AWAIT(del);  // "not found" (no copy) is the usual answer
       }
       // The primary is node-local: read it through the next pool inline (no
-      // new task, see PutBlob) and never populate a copy.
-      CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kGetBlob,
-                                  task.template Cast<clio::run::Task>()));
-      CLIO_CO_RETURN;
+      // new task, see PutBlob) and never populate a copy -- unless
+      // owner_copies asks for a fast-tier copy (single node), in which case
+      // fall through to the cache-copy read + populate below.
+      if (!OwnerCopies()) {
+        CLIO_CO_AWAIT(ForwardToCore(clio::cte::core::Method::kGetBlob,
+                                    task.template Cast<clio::run::Task>()));
+        CLIO_CO_RETURN;
+      }
     }
     {
       task->context_.replica_ = clio::cte::core::kCacheReplica;
@@ -667,7 +682,32 @@ clio::run::TaskResume Runtime::GetBlob(
     // fetched the WHOLE blob (the file-per-process page pattern), the
     // caller's buffer seeds the copy directly — no re-fetch.
     if (owner_local) {
-      CLIO_CO_RETURN;  // the primary IS this node's local copy
+      // owner_copies only (the default owner path returned above): seed the
+      // local raw copy from the caller's buffer when this read fetched the
+      // whole blob. Single node, so no owner registration is needed.
+      auto sz = next->AsyncGetBlobSize(task->tag_id_, blob_name);
+      CLIO_CO_AWAIT(sz);
+      if (sz->GetReturnCode() == 0 && sz->size_ > 0 && regions.size() == 1 &&
+          regions[0].blob_off_ == 0 && regions[0].size_ >= sz->size_ &&
+          task->context_.transform_flags_ == 0) {
+        auto *local = GetLocalClient();
+        Context put_ctx;
+        AimAtCacheReplica(&put_ctx);
+        owner_copies_made_.fetch_add(1, std::memory_order_relaxed);
+        auto put = local->AsyncPutBlob(task->tag_id_, blob_name, 0, sz->size_,
+                                       regions[0].data_, /*score=*/-1.0f,
+                                       put_ctx, /*flags=*/0,
+                                       clio::run::PoolQuery::Local());
+        CLIO_CO_AWAIT(put);
+        if (put->GetReturnCode() != 0) {
+          // A partial copy breaks the present => COMPLETE invariant (#1131).
+          auto del = local->AsyncDelBlob(task->tag_id_, blob_name,
+                                         clio::run::PoolQuery::Local(),
+                                         clio::cte::core::kDelCacheCopyOnly);
+          CLIO_CO_AWAIT(del);
+        }
+      }
+      CLIO_CO_RETURN;
     }
     {
       clio::run::u64 total = 0;

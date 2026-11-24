@@ -43,11 +43,21 @@ struct CacheConfig {
   /// reclaims one. Modest default keeps hot raw bytes resident without
   /// starving primaries of the fast tier.
   float min_score_ = 0.5f;
+  /// Single-node read cache for OWNER-LOCAL blobs (YAML owner_copies). By
+  /// default the owner keeps no copy (issue #894: its primary is already
+  /// node-local). With tiered storage that primary can sit on a slow tier,
+  /// so this keeps a raw copy on the temporary (fast) tiers: populated on a
+  /// read miss, deleted on every write through this pool (write-invalidate).
+  /// Only honoured when the runtime has ONE host, where there are no foreign
+  /// writers to leave the copy stale (the same argument as the MultiPutBlob
+  /// mirror). Off by default.
+  bool owner_copies_ = false;
 
   CacheConfig() : next_pool_id_(clio::run::PoolId::GetNull()) {}
   CacheConfig(const clio::run::PoolId &pool_id, const CacheConfig &other)
       : next_pool_id_(other.next_pool_id_),
-        min_score_(other.min_score_) {
+        min_score_(other.min_score_),
+        owner_copies_(other.owner_copies_) {
     (void)pool_id;
   }
 
@@ -56,7 +66,7 @@ struct CacheConfig {
     // EVERY field round-trips — the audit rule three silently-dropped-field
     // bugs on this branch bought us (replication copy-ctor, ReplicationConfig
     // period, CompressorConfig next_pool_id_).
-    ar(next_pool_id_, min_score_);
+    ar(next_pool_id_, min_score_, owner_copies_);
   }
 
   /** Load configuration from compose YAML. */
@@ -80,6 +90,9 @@ struct CacheConfig {
         }
         if (node["min_score"]) {
           min_score_ = node["min_score"].as<float>();
+        }
+        if (node["owner_copies"]) {
+          owner_copies_ = node["owner_copies"].as<bool>();
         }
       } catch (...) {
         // Config parsing is best-effort

@@ -5,6 +5,7 @@
 #ifndef CLIO_CTE_CACHE_CACHE_RUNTIME_H_
 #define CLIO_CTE_CACHE_CACHE_RUNTIME_H_
 
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -160,6 +161,12 @@ class Runtime : public clio::cte::core::CoreInterposer {
   clio::run::u32 NumCoreContainers();
 
   CacheConfig config_;
+  // owner_copies: how many owner-local copies were ever populated. While it
+  // is 0 (write-only phases) a write skips the copy delete entirely.
+  std::atomic<clio::run::u64> owner_copies_made_{0};
+  bool OwnerCopies() const {
+    return config_.owner_copies_ && CLIO_IPC->GetNumHosts() <= 1;
+  }
   std::unique_ptr<clio::cte::core::Client> next_client_;
   std::unique_ptr<clio::cte::core::Client> local_client_;
 };
