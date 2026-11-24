@@ -15,8 +15,8 @@ facts: Keys | Tag + blob name ; Values | Arbitrary bytes, partial put/get by off
 </ul>
 
 <ul class="headline-stats">
-  <li><strong>42.6k</strong><span>YCSB-B ops/s, against Redis 16.8k</span></li>
-  <li><strong>~2x</strong><span>Redis on read-heavy YCSB workloads</span></li>
+  <li><strong>1.67M</strong><span>YCSB-B ops/s at 16 threads, against Redis 161k</span></li>
+  <li><strong>3.4-13x</strong><span>the best Redis setup on every YCSB point</span></li>
   <li><strong>15-16 GB/s</strong><span>async GPU checkpoint into a RAM tier</span></li>
   <li><strong>2.0x</strong><span>the HDF5 async VOL on that checkpoint</span></li>
 </ul>
@@ -38,48 +38,73 @@ print(tag.GetContainedBlobs())               # list keys in the tag
 <p>The same operations exist in C++ (<code>clio::cte::core::Tag::PutBlob</code>, <code>GetBlob</code>), with asynchronous variants such as <code>AsyncPutBlob</code>, and on the client for whole-store queries (<code>TagQuery</code>, <code>BlobQuery</code>, <code>SemanticSearch</code>). The <a href="/docs/cte/python.html">Python API reference</a> lists them all.</p>
 
 <h2>Performance against Redis, RocksDB and DynamoDB</h2>
-<p>The repository's YCSB binding (<code>context-transfer-engine/benchmark/ycsb</code>) runs the standard workloads against CLIO Core and three other stores. Throughput in operations per second, higher is better:</p>
+<p>The repository's YCSB binding (<code>context-transfer-engine/benchmark/ycsb</code>) runs the standard core workloads against CLIO Core and against the best configuration we could find for each of three other stores. CLIO Core runs with the <a href="/modules/shm-cache.html">shared-memory cache</a> in front of the CTE core, so a YCSB client thread's reads and writes are copies between the JVM and a shared-memory segment, with no task and no round trip to the runtime. The cache writes every update through to the core in the background. Throughput in operations per second at 16 client threads, higher is better:</p>
 <div class="chart-grid">
-  <figure><figcaption>A: 50% read, 50% update, ops/s</figcaption>
-<ul class="bars" aria-label="A: 50% read, 50% update, ops/s">
-  <li class="ours"><span>CLIO Core</span><span class="bar"><i style="width:14%"></i></span><span class="val">6,952</span></li>
-  <li><span>Redis</span><span class="bar"><i style="width:44%"></i></span><span class="val">21,650</span></li>
-  <li><span>RocksDB (embedded)</span><span class="bar"><i style="width:100%"></i></span><span class="val">49,140</span></li>
-  <li><span>DynamoDB Local</span><span class="bar"><i style="width:3%"></i></span><span class="val">1,664</span></li>
+  <figure><figcaption>A: 50% read, 50% update, ops/s at 16 threads</figcaption>
+<ul class="bars" aria-label="A: 50% read, 50% update, ops/s at 16 threads">
+  <li class="ours"><span>CLIO Core</span><span class="bar"><i style="width:100%"></i></span><span class="val">557,346</span></li>
+  <li><span>Best Redis</span><span class="bar"><i style="width:30%"></i></span><span class="val">164,481</span></li>
+  <li><span>Best RocksDB</span><span class="bar"><i style="width:79%"></i></span><span class="val">438,955</span></li>
+  <li><span>DynamoDB Local</span><span class="bar"><i style="width:1%"></i></span><span class="val">4,860</span></li>
 </ul>
   </figure>
-  <figure><figcaption>B: 95% read, 5% update, ops/s</figcaption>
-<ul class="bars" aria-label="B: 95% read, 5% update, ops/s">
-  <li class="ours"><span>CLIO Core</span><span class="bar"><i style="width:66%"></i></span><span class="val">42,553</span></li>
-  <li><span>Redis</span><span class="bar"><i style="width:26%"></i></span><span class="val">16,787</span></li>
-  <li><span>RocksDB (embedded)</span><span class="bar"><i style="width:100%"></i></span><span class="val">64,809</span></li>
-  <li><span>DynamoDB Local</span><span class="bar"><i style="width:3%"></i></span><span class="val">1,867</span></li>
+  <figure><figcaption>B: 95% read, 5% update, ops/s at 16 threads</figcaption>
+<ul class="bars" aria-label="B: 95% read, 5% update, ops/s at 16 threads">
+  <li class="ours"><span>CLIO Core</span><span class="bar"><i style="width:100%"></i></span><span class="val">1,665,534</span></li>
+  <li><span>Best Redis</span><span class="bar"><i style="width:10%"></i></span><span class="val">160,635</span></li>
+  <li><span>Best RocksDB</span><span class="bar"><i style="width:44%"></i></span><span class="val">738,135</span></li>
+  <li><span>DynamoDB Local</span><span class="bar"><i style="width:1%"></i></span><span class="val">6,425</span></li>
 </ul>
   </figure>
-  <figure><figcaption>C: read only, ops/s</figcaption>
-<ul class="bars" aria-label="C: read only, ops/s">
-  <li class="ours"><span>CLIO Core</span><span class="bar"><i style="width:55%"></i></span><span class="val">34,566+</span></li>
-  <li><span>Redis</span><span class="bar"><i style="width:34%"></i></span><span class="val">21,044</span></li>
-  <li><span>RocksDB (embedded)</span><span class="bar"><i style="width:100%"></i></span><span class="val">62,383</span></li>
-  <li><span>DynamoDB Local</span><span class="bar"><i style="width:3%"></i></span><span class="val">1,915</span></li>
+  <figure><figcaption>C: read only, ops/s at 16 threads</figcaption>
+<ul class="bars" aria-label="C: read only, ops/s at 16 threads">
+  <li class="ours"><span>CLIO Core</span><span class="bar"><i style="width:100%"></i></span><span class="val">1,630,755</span></li>
+  <li><span>Best Redis</span><span class="bar"><i style="width:10%"></i></span><span class="val">158,796</span></li>
+  <li><span>Best RocksDB</span><span class="bar"><i style="width:50%"></i></span><span class="val">812,469</span></li>
+  <li><span>DynamoDB Local</span><span class="bar"><i style="width:1%"></i></span><span class="val">6,552</span></li>
 </ul>
   </figure>
-  <figure><figcaption>F: read-modify-write, ops/s</figcaption>
-<ul class="bars" aria-label="F: read-modify-write, ops/s">
-  <li class="ours"><span>CLIO Core</span><span class="bar"><i style="width:27%"></i></span><span class="val">7,637</span></li>
-  <li><span>Redis</span><span class="bar"><i style="width:53%"></i></span><span class="val">14,762</span></li>
-  <li><span>RocksDB (embedded)</span><span class="bar"><i style="width:100%"></i></span><span class="val">27,824</span></li>
-  <li><span>DynamoDB Local</span><span class="bar"><i style="width:5%"></i></span><span class="val">1,335</span></li>
+  <figure><figcaption>F: read-modify-write, ops/s at 16 threads</figcaption>
+<ul class="bars" aria-label="F: read-modify-write, ops/s at 16 threads">
+  <li class="ours"><span>CLIO Core</span><span class="bar"><i style="width:100%"></i></span><span class="val">1,107,663</span></li>
+  <li><span>Best Redis</span><span class="bar"><i style="width:10%"></i></span><span class="val">110,806</span></li>
+  <li><span>Best RocksDB</span><span class="bar"><i style="width:32%"></i></span><span class="val">349,779</span></li>
+  <li><span>DynamoDB Local</span><span class="bar"><i style="width:1%"></i></span><span class="val">3,937</span></li>
 </ul>
   </figure>
 </div>
-<p class="bars-caption">Higher is better. 100k records of about 1.1 KB, 100k operations, 4 threads, one WSL2 machine. CLIO Core measured 34,566-55,866 on workload C across runs; the bar shows the low end.</p>
+<p class="bars-caption">Median of 3 runs of 20 s each, 1M records of about 1.1 KB, zipfian keys. "Best Redis" and "Best RocksDB" are the fastest of their configurations at each point (the table names which).</p>
+<p>Every workload at 1, 4 and 16 client threads, median ops/s:</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Workload</th><th>Threads</th><th>CLIO Core</th><th>Best Redis</th><th>Best RocksDB</th><th>DynamoDB Local</th><th>vs Redis</th><th>vs RocksDB</th></tr></thead>
+<tbody>
+<tr><td>C</td><td>1</td><td>320,648</td><td>24,426 <small>(Redis)</small></td><td>58,396 <small>(RocksDB, stock binding)</small></td><td>364</td><td>13.1x</td><td>5.5x</td></tr>
+<tr><td>C</td><td>4</td><td>883,667</td><td>81,467 <small>(Redis Cluster, 4 masters)</small></td><td>223,238 <small>(RocksDB, tuned)</small></td><td>1,682</td><td>10.8x</td><td>4.0x</td></tr>
+<tr><td>C</td><td>16</td><td>1,630,755</td><td>158,796 <small>(Redis Cluster, 4 masters)</small></td><td>812,469 <small>(RocksDB, tuned, no WAL)</small></td><td>6,552</td><td>10.3x</td><td>2.0x</td></tr>
+<tr><td>B</td><td>1</td><td>259,494</td><td>23,323 <small>(Redis)</small></td><td>51,785 <small>(RocksDB, tuned, no WAL)</small></td><td>357</td><td>11.1x</td><td>5.0x</td></tr>
+<tr><td>B</td><td>4</td><td>874,634</td><td>80,850 <small>(Redis Cluster, 4 masters)</small></td><td>200,793 <small>(RocksDB, tuned, no WAL)</small></td><td>1,688</td><td>10.8x</td><td>4.4x</td></tr>
+<tr><td>B</td><td>16</td><td>1,665,534</td><td>160,635 <small>(Redis Cluster, 4 masters)</small></td><td>738,135 <small>(RocksDB, tuned, no WAL)</small></td><td>6,425</td><td>10.4x</td><td>2.3x</td></tr>
+<tr><td>A</td><td>1</td><td>176,478</td><td>24,705 <small>(Redis)</small></td><td>35,279 <small>(RocksDB, tuned, no WAL)</small></td><td>335</td><td>7.1x</td><td>5.0x</td></tr>
+<tr><td>A</td><td>4</td><td>638,757</td><td>78,814 <small>(Redis Cluster, 4 masters)</small></td><td>133,498 <small>(RocksDB, tuned, no WAL)</small></td><td>1,719</td><td>8.1x</td><td>4.8x</td></tr>
+<tr><td>A</td><td>16</td><td>557,346</td><td>164,481 <small>(Redis Cluster, 4 masters)</small></td><td>438,955 <small>(RocksDB, tuned, no WAL)</small></td><td>4,860</td><td>3.4x</td><td>1.3x</td></tr>
+<tr><td>F</td><td>1</td><td>140,988</td><td>16,264 <small>(Redis)</small></td><td>26,280 <small>(RocksDB, tuned, no WAL)</small></td><td>231</td><td>8.7x</td><td>5.4x</td></tr>
+<tr><td>F</td><td>4</td><td>481,101</td><td>54,934 <small>(Redis Cluster, 4 masters)</small></td><td>99,783 <small>(RocksDB, tuned, no WAL)</small></td><td>1,148</td><td>8.8x</td><td>4.8x</td></tr>
+<tr><td>F</td><td>16</td><td>1,107,663</td><td>110,806 <small>(Redis Cluster, 4 masters)</small></td><td>349,779 <small>(RocksDB, tuned, no WAL)</small></td><td>3,937</td><td>10.0x</td><td>3.2x</td></tr>
+</tbody>
+</table></div>
+<p>How it was run, on one Ares node (two Xeon Silver 4114, 40 cores, 46 GB of memory). Every store holds the whole dataset in memory, and none of them makes a write durable before acknowledging it:</p>
+<ul>
+  <li><strong>CLIO Core</strong>: release build of <code>dev</code> (7c6adbae7), the CTE core on a 4 GB RAM tier with the shared-memory write-through cache (<code>md_only: false</code>, 6 GB, 2M entries) in front, SHM transport, 8 runtime workers (<code>clio_ycsb_bench.yaml</code>). A put is acknowledged once it is in the shared-memory cache. Between runs, outside the timed window, the driver waits for the cache to write the run's updates through to the core (3 s after read-heavy runs, up to 16 s after 16-thread update-heavy runs), so no run inherits another's backlog.</li>
+  <li><strong>Redis</strong> 8.10.3 without persistence, best of: one server; one server with 4 I/O threads; Redis Cluster with 4 masters on the node. The stock YCSB Redis binding (Jedis) over loopback TCP.</li>
+  <li><strong>RocksDB</strong> on tmpfs, best of: the stock YCSB 0.17 binding (rocksdbjni 5.11.3); a tuned binding on rocksdbjni 11.8.1 with a 4 GB block cache, bloom filters, a hashed data-block index and no compression; the same with the write-ahead log disabled. Embedded in the YCSB process, so it has no inter-process hop at all.</li>
+  <li><strong>DynamoDB Local</strong> (the emulator, not the AWS service), in memory with an 8 GB heap.</li>
+  <li>Workloads D and E are not run: they scan, and the CLIO binding emulates scans with a client-side key index. All records sit in one tag, so scale-out across tags and nodes is not exercised here; the Redis Cluster comparison below covers several nodes.</li>
+</ul>
 <p>How to read it:</p>
 <ul>
-  <li>CLIO Core's shared-memory read path is about twice as fast as Redis on the read-heavy workloads, B and C.</li>
-  <li>The update-heavy workloads, A and F, are slower than Redis because the binding implements an update as a full-record read followed by a full-record rewrite, where Redis updates one hash field. A partial put at an offset is the planned fix.</li>
-  <li>Embedded RocksDB has no inter-process hop at all and leads every workload. CLIO Core is a separate runtime process that many clients and nodes share.</li>
-  <li>DynamoDB Local is the local emulator, not the AWS service. All records sit in one tag, so scale-out across tags is not exercised. These are single-node numbers on a development machine.</li>
+  <li>Reads never leave the client process: the cache is mapped into it. That is why CLIO Core leads at one thread, where per-operation latency decides throughput (about 2 µs per read, against 39 µs for Redis over loopback TCP and 16 µs for embedded RocksDB).</li>
+  <li>RocksDB is also in-process, and is CLIO Core's closest competitor on the update-heavy workloads at 16 threads. There, 16 writers on a few hot zipfian keys contend for the same cache stripes; A at 16 threads is the one point where CLIO Core is slower than at 4 threads.</li>
+  <li>An update in every binding is a whole-record read-modify-write except Redis's, which writes one hash field.</li>
 </ul>
 
 <h2>Against Redis and Redis Cluster on Ares</h2>

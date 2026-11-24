@@ -65,29 +65,44 @@ per workload; RocksDB is embedded (fresh temp dir per workload).
 
 ## Reference numbers
 
-First run on the WSL2 dev container (100k records / 100k ops / 4 threads /
-~1.1KB records; run-phase `[OVERALL] Throughput` in ops/sec — single-node
-noisy-box numbers, magnitudes not gospel):
+Ares, one node (2x Xeon Silver 4114, 46 GB), 2026-11-22, `dev` 7c6adbae7.
+1M records of ~1.1 KB, zipfian, median of 3 x 20 s runs, run-phase
+`[OVERALL] Throughput` in ops/sec at 16 client threads. "Best" = fastest
+configuration of that store at that point (`run_comparison.sh` variants):
 
-| Workload | clio (SHM) | redis | rocksdb (embedded) | dynamodb-local |
-|----------|-----------:|------:|-------------------:|---------------:|
-| A (50/50 read/update) | 6,952 | 21,650 | 49,140 | 1,664 |
-| B (95/5)              | 42,553 | 16,787 | 64,809 | 1,867 |
-| C (read-only)         | 34,566–55,866 | 21,044 | 62,383 | 1,915 |
-| F (read-modify-write) | 7,637 | 14,762 | 27,824 | 1,335 |
+| Workload | clio (shm cache) | best redis | best rocksdb | dynamodb-local |
+|----------|-----------------:|-----------:|-------------:|---------------:|
+| A (50/50 read/update) | 557,346 | 164,481 | 438,955 | 4,860 |
+| B (95/5)              | 1,665,534 | 160,635 | 738,135 | 6,425 |
+| C (read-only)         | 1,630,755 | 158,796 | 812,469 | 6,552 |
+| F (read-modify-write) | 1,107,663 | 110,806 | 349,779 | 3,937 |
 
-Reading: Clio's SHM read path beats Redis ~2x on the read-heavy workloads;
-update-heavy A/F pay double because the binding's `update` is a client-side
-full-record read + full-record rewrite (see Caveats) where redis writes a
-single hash field. Embedded RocksDB (no IPC at all) leads everywhere;
-DynamoDB Local's HTTP path trails by ~10-30x. Obvious next lever: a partial
-PutBlob-at-offset or server-side field merge for updates.
+The full 1/4/16-thread table and the method are on the site
+(`site/pages/technologies/context-transfer-engine.html`). CLIO beats the best
+Redis 3.4-13x and the best RocksDB 1.3-5.5x at every point.
+
+Harness traps that produced misleading CLIO numbers before (all fixed here):
+
+- The binding updated its scan-key index (one global mutex + `std::set`) on
+  every put; 16 writers serialized on it. Only inserts index keys now.
+- The index was seeded with a 1M-key `GetContainedBlobs` broadcast at init,
+  inside the timed window. It is now seeded on the first scan.
+- A client that connects while the runtime is still composing the shm cache
+  gets no cache keys and silently stays on the task path. The driver waits
+  for the compose to finish; any CLIO run whose client did not bind to the
+  cache is recorded as `NOCACHE`.
+- The cache writes updates through to the core in the background; a run that
+  starts behind that backlog waits for it. The driver runs
+  `ClioClient drain` (SyncTag) between runs, outside the timed window.
 
 ## Caveats
 
 - DynamoDB Local is not the DynamoDB service: numbers characterize the
   binding + local engine, not AWS-hosted performance.
 - The Clio binding's `update` is a client-side read-modify-write (like the
-  stock rocksdb binding); redis uses hash-field updates natively.
+  rocksdb bindings); redis uses hash-field updates natively.
+- `RocksDBTunedClient.java` is this repo's tuned RocksDB binding (compile it
+  against rocksdbjni 11.x into `$DIST/rocksdb-tuned/classes`, jar in
+  `$DIST/rocksdb-tuned/lib`).
 - One tag holds all records; blob metadata scale-out across tags is not
   exercised.

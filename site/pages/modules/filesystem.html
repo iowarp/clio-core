@@ -1,0 +1,379 @@
+<!--
+title: Filesystem module
+heading: Filesystem: <em>POSIX over tags.</em>
+description: The clio_cte_filesystem module behind Context FS: its pool, every verb in clio_mod.yaml, how paths, inodes, directory blocks and 1 MiB pages map onto CTE tags and blobs, its compose keys and defaults, restart and failover behavior, and limits.
+eyebrow: Modules · Transfer engine
+lede: The filesystem module turns the CTE's flat tags and blobs into a POSIX namespace. It owns directories, inode records, open handles, links and extended attributes, and stores all of it in the CTE chain beneath it. The FUSE daemon and the preloaded interceptors are its clients. This page is the module reference; the Context FS docs cover mounting and using it.
+facts: Library | clio_cte_filesystem ; Default pool | 560.0 ; Build option | CLIO_CTE_ENABLE_FILESYSTEM (forced ON by any I/O adapter) ; Source | context-transfer-engine/filesystem
+-->
+<h2>What it does</h2>
+<p>The CTE core stores blobs in tags and knows nothing about paths, sizes
+that differ from the bytes stored, directories or permissions. The
+filesystem module adds exactly that layer, in one place, so every entry
+point behaves the same: the libfuse daemon <code>clio_cte_fuse</code>, the
+POSIX, STDIO and MPI-IO interceptors and the HDF5 VFD all delegate to it.</p>
+<ul>
+  <li><strong>Namespace</strong>: names, directories, hard links, symbolic
+  links and rename, stored as directory blocks with no metadata server.</li>
+  <li><strong>Inodes</strong>: one record per file, directory or symlink with
+  type, mode, owner, times and link count.</li>
+  <li><strong>File data</strong>: offsets map to 1 MiB page blobs in the
+  file's own tag, written through the chain at <code>next_pool_id</code>.</li>
+  <li><strong>Logical size</strong>: delegated to the
+  <a href="/modules/stream.html">stream module</a>, which also merges
+  deferred <code>O_APPEND</code> writes from many nodes.</li>
+</ul>
+<p>For what Context FS is and how to mount it, start at the
+<a href="/docs/context-fs/index.html">Context FS overview</a>. The
+<a href="/design/filesystem.html">filesystem design page</a> walks through
+every operation and the consistency model step by step; this page lists the
+module's contract.</p>
+
+<h2>Where it sits</h2>
+<p>The filesystem is not an interposer. It speaks its own task interface
+(paths and handles, not tags and blobs) and is a <em>client</em> of the CTE
+pool named by <code>next_pool_id</code>, which should be the top of the
+interposition chain. In the default configuration that is the indexer:</p>
+<pre data-label="text">
+filesystem(560.0) --pages, blocks, records--> indexer(564.0) -> shm cache(568.0)
+    -> [compressor(562.0) ->] write-back(567.0) -> volatile core(540.0)
+                                                -> replication(561.0) -> core(512.0)
+filesystem(560.0) --sizes, appends--> stream(565.0)
+</pre>
+<ul>
+  <li><strong>Called by</strong>: the filesystem client library, shared by
+  <code>clio_cte_fuse</code> and the interceptors. Path operations are sent
+  to the <em>local</em> container; operations on an open handle go straight
+  to the container that issued it.</li>
+  <li><strong>Calls</strong>: the CTE pool at <code>next_pool_id</code> for
+  pages, directory blocks, inode records and xattrs; the stream pool for
+  sizes; and its own pool on other nodes for namespace state they own
+  (<code>ShardOp</code>).</li>
+  <li><strong>Data path bypass</strong>: clients that write pages themselves
+  (the FUSE adapter) ask the pool for its chain with the Monitor query
+  <code>next_pool</code> and write there directly, so their bytes still pass
+  through replication and the caches.</li>
+</ul>
+<p>Clients find the pool by name, not id: the client resolves
+<code>clio_cte_filesystem</code>, or the name in <code>CLIO_CFS_POOL</code>,
+which may also be a literal <code>"major.minor"</code> id. It then reads
+<code>next_pool</code>, <code>stream_pool</code> and <code>data_score</code>
+from the pool's Monitor. The client creates nothing; an adapter fails if the
+pool is not composed.</p>
+<div class="callout">
+  <p>The comment above this entry in <code>clio_default.yaml</code> calls
+  560.0 "clio::cte::filesystem::kCfsPoolId". No such constant exists in the
+  source; the module defines only the default pool name
+  (<code>kCfsPoolName</code>). 560.0 is the id the default configuration
+  gives it.</p>
+</div>
+
+<h2>Composing it</h2>
+<p>The entry shipped in <code>context-runtime/config/clio_default.yaml</code>,
+with its commented defaults. It must come after every chain pool it names and
+after the stream entry.</p>
+<pre data-label="yaml">
+compose:
+  # ... chain entries (core, replication, write-back, shm cache, indexer) ...
+  - mod_name: clio_cte_stream
+    pool_name: clio_cte_stream
+    pool_query: local
+    pool_id: "565.0"
+    next_pool_id: "564.0"
+    staging_pool_id: "561.0"
+
+  - mod_name: clio_cte_filesystem
+    pool_name: clio_cte_filesystem
+    pool_query: local
+    pool_id: "560.0"
+    next_pool_id: "564.0"               # required: the chain top
+    metadata_log_path: "${CLIO_STORAGE_ROOT}/cfs_namespace_log"
+    # dir_split_entries: 1024
+    # dir_log_compact_bytes: 256KB
+    # case_insensitive: false
+    # data_score: -1.0
+    # data_score_head_pages: 1
+    stream_pool_id: "565.0"
+</pre>
+<p>Pointing <code>next_pool_id</code> at <code>512.0</code> bypasses the
+chain and stores everything in the persistent core directly. Leaving out the
+stream entry and <code>stream_pool_id</code> is also valid: the filesystem
+then creates its own stream pool (see <a href="#configuration">Configuration</a>).</p>
+
+<h2>Operations</h2>
+<p>Every method in <code>filesystem/clio_mod.yaml</code>. Return codes are
+errno values. "Local" routing means the task runs on the submitting node's
+container, which resolves the path from its own cache of directory blocks;
+"handle" means it goes to the container whose id is encoded in the top 16
+bits of the handle, the inode's home.</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Id</th><th>Method</th><th>Routing</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td>0</td><td><code>kCreate</code></td><td>admin</td><td>Get-or-create the pool. Binds the CTE client, opens and replays the directory journal, creates or binds the stream pool, resolves the system tags, checks the volume's case setting and, on one node, creates the shared-memory attribute mirror.</td></tr>
+    <tr><td>1</td><td><code>kDestroy</code></td><td>admin</td><td>No-op teardown.</td></tr>
+    <tr><td>9</td><td><code>kMonitor</code></td><td>any</td><td>Answers the queries <code>next_pool</code>, <code>stream_pool</code> and <code>data_score</code> (the page-score rule, encoded as the float's bit pattern and the head-page count).</td></tr>
+    <tr><td>10</td><td><code>kOpen</code></td><td>local</td><td>Resolve a path (creating it with <code>O_CREAT</code>, truncating with <code>O_TRUNC</code>) and return a handle, the logical size, whether it was created, the packed tag id and, for a regular file, its attributes.</td></tr>
+    <tr><td>11</td><td><code>kClose</code></td><td>handle</td><td>Release a handle. <code>advance_size_</code> raises the size first; it is carried on close because the handle follows the file across a rename.</td></tr>
+    <tr><td>12</td><td><code>kRead</code></td><td>handle</td><td>Read <code>[offset, offset+size)</code> page by page, clamped to the logical size. Missing pages and holes read as zeros; any other page error fails the read with <code>EIO</code>.</td></tr>
+    <tr><td>13</td><td><code>kWrite</code></td><td>handle</td><td>Write page by page, then raise the size to the written end. Returns <code>ENOSPC</code> when the store is full, <code>EIO</code> otherwise.</td></tr>
+    <tr><td>14</td><td><code>kGetattr</code></td><td>local</td><td>Existence, type, size, inode number, times, owner, mode and link count of a path. A path of the form <code>"\x01id:&lt;n&gt;"</code> stats inode <code>n</code> directly, which is how <code>fstat</code> reaches a file whose name is gone.</td></tr>
+    <tr><td>15</td><td><code>kTruncate</code></td><td>local</td><td>Set the logical size and free pages past it. With <code>tag_packed_</code> set it is an <code>ftruncate</code> by inode and never recreates a removed name; <code>old_extent_</code> lets the caller name writes the module has not seen.</td></tr>
+    <tr><td>17</td><td><code>kReaddir</code></td><td>local</td><td>List every entry of a directory in one reply: full paths, inode numbers and types.</td></tr>
+    <tr><td>18</td><td><code>kMkdir</code></td><td>local</td><td>Create a directory: store its inode record and reserve its name as a pending row, create its table block 0 on that block's home, then make the row live (or roll back if another mkdir won the name).</td></tr>
+    <tr><td>19</td><td><code>kRmdir</code></td><td>local</td><td>Remove an empty directory by sealing its blocks, then dropping them.</td></tr>
+    <tr><td>20</td><td><code>kUnlink</code></td><td>local</td><td>Remove a name and drop a link from its inode. At zero links the inode is destroyed, or at its last close if still open.</td></tr>
+    <tr><td>21</td><td><code>kRename</code></td><td>local</td><td>Move a file or directory, including replace. Refuses to move a directory into its own subtree.</td></tr>
+    <tr><td>22</td><td><code>kStatSize</code></td><td>local</td><td>Existence and logical size of a path, without the rest of the attributes.</td></tr>
+    <tr><td>23</td><td><code>kLink</code></td><td>local</td><td>Hard link: a second row naming the same inode id.</td></tr>
+    <tr><td>28</td><td><code>kUtimens</code></td><td>local</td><td>Set atime and/or mtime (flag bits 0 and 1). Flag 16 marks a read, which moves atime by the relatime rule and leaves ctime; flag 32 adds strictatime.</td></tr>
+    <tr><td>29</td><td><code>kSymlink</code></td><td>local</td><td>Create a symbolic link. The target string is stored in the link's inode record.</td></tr>
+    <tr><td>30</td><td><code>kReadlink</code></td><td>local</td><td>Return a symlink's target.</td></tr>
+    <tr><td>31</td><td><code>kSetxattr</code></td><td>local</td><td>Set an extended attribute. Values may hold NUL bytes; flags carry <code>XATTR_CREATE</code> (1) and <code>XATTR_REPLACE</code> (2).</td></tr>
+    <tr><td>32</td><td><code>kGetxattr</code></td><td>local</td><td>Read one extended attribute.</td></tr>
+    <tr><td>33</td><td><code>kListxattr</code></td><td>local</td><td>List a file's extended attribute names.</td></tr>
+    <tr><td>34</td><td><code>kRemovexattr</code></td><td>local</td><td>Remove one extended attribute (<code>ENODATA</code> if absent).</td></tr>
+    <tr><td>35</td><td><code>kChown</code></td><td>local</td><td>Set uid, gid and mode; <code>0xFFFFFFFF</code> leaves a field unchanged. The client's <code>AsyncChmod</code> is this method with only the mode set.</td></tr>
+    <tr><td>36</td><td><code>kMultiCreate</code></td><td>local</td><td>Create a batch of files in one task, each with a client-minted inode id, mode and creation time. Returns the count created and every failure as (index, errno).</td></tr>
+    <tr><td>37</td><td><code>kAdvanceSize</code></td><td>local</td><td>Raise a file's size by inode id rather than path, so a size push that arrives after a rename cannot recreate the old name. With <code>reserve_</code> set it grows the file atomically and returns the old end: the <code>O_APPEND</code> offset for a writer that cannot know it.</td></tr>
+    <tr><td>38</td><td><code>kShardOp</code></td><td>internal</td><td>One operation on namespace state another container owns: row insert, remove, seal and respell; block fetch, push, install, drop and load; inode stat, open, link count, attributes, truncate, xattrs, create, discard and pushes; the periodic purge. The request and reply are two encoded byte strings.</td></tr>
+    <tr><td>39</td><td><code>kSyncMeta</code></td><td>broadcast</td><td>fsync each container's directory journal. Sent by <code>fsync</code> and <code>fsyncdir</code>; returns <code>EIO</code> if an fsync failed.</td></tr>
+    <tr><td>40</td><td><code>kReaddirRange</code></td><td>local</td><td>One chunk of a directory listing from a stable offset (<code>max_entries_</code>, 8192 unless the caller sets it). Each entry's offset derives from its name, so it is the same in every process and across opens; <code>next_off_</code> is the next chunk's start.</td></tr>
+  </tbody>
+</table></div>
+<p>Ids 16 and 24 to 27 are unused.</p>
+
+<h2>Data layout</h2>
+<p>Everything the module stores is ordinary tags and blobs in the pool at
+<code>next_pool_id</code>, so tiering, replication and durability apply to
+metadata and data alike. Verified in <code>fs_shard.h</code>,
+<code>fs_inode.h</code>, <code>fs_inode_table.h</code> and
+<code>filesystem_runtime.cc</code>:</p>
+<dl class="notes">
+  <dt>Inode ids</dt>
+  <dd>Every file, directory and symlink is one CTE tag, and its tag id packed
+  as <code>(major &lt;&lt; 32) | minor</code> is the inode number. A
+  container-minted id has major <code>0x40000000 | home</code> (plus the
+  minter in bits 16 to 28 for newer ids); a client-minted id from a batched
+  create has major <code>0x80000000 | node &lt;&lt; 16 | home</code>. The
+  root directory is the fixed id <code>0x3FFFFFFF.1</code>.</dd>
+  <dt>Inode home</dt>
+  <dd>The container encoded in the id. A new file's home is a hash of its own
+  path modulo the container count, so one directory's files spread over every
+  node instead of following the directory.</dd>
+  <dt>File data</dt>
+  <dd>Blobs named by decimal page index (<code>"0"</code>,
+  <code>"1"</code>, ...) of 1 MiB each, in the file's tag. Each page is placed
+  by the CTE core's own blob hash. A missing page within the logical size is
+  a hole.</dd>
+  <dt>Inode record</dt>
+  <dd>Key <code>~i</code> in the xattr section of the inode's own tag:
+  type, a size snapshot, link count, mode, uid, gid, times, flags (orphan,
+  has-xattrs, fresh), the symlink target, the writing container, a directory's
+  parent and name, and on the root the volume flags and case-fold table
+  version. Format tag <code>CFI2</code>; records of the earlier
+  <code>CFI1</code> format are refused.</dd>
+  <dt>Directory blocks</dt>
+  <dd>A directory's rows (canonical name to inode id, type, spelling, state)
+  are split into blocks by extendible hashing: block 0 holds every name at
+  first, and a block over <code>dir_split_entries</code> rows splits by the
+  next hash bit into block <code>k + 2^depth</code>, to a maximum depth of
+  24. Blocks never merge. Block <code>k</code> is blob <code>d.&lt;k&gt;</code>
+  in the directory's tag, and the container that owns that blob is the
+  block's home. With <code>metadata_log_path</code> set the home keeps it in
+  its node-local journal instead.</dd>
+  <dt>Row states</dt>
+  <dd>Live, pending (reserved but invisible) and leaving (visible but
+  frozen), so multi-step operations such as mkdir and rename can be finished
+  or undone after a crash.</dd>
+  <dt>Extended attributes</dt>
+  <dd>One blob per inode, named by its packed id in decimal, in the global
+  tag <code>_clio_xattr_store</code>. Kept out of the file's tag so they never
+  count toward its stored size.</dd>
+  <dt>System records</dt>
+  <dd>Tag <code>_clio_fs_sys</code>: each container's durable id reservation
+  and its list of inodes unlinked while open.</dd>
+  <dt>CTE tag names</dt>
+  <dd>Each link is published to the CTE as tag name
+  <code>&lt;leaf&gt;/&lt;inode number&gt;</code>, in batches after each
+  namespace operation, so <code>TagQuery</code> and the indexer see file
+  names. The names are flat and unique per inode; full paths exist only in the
+  directory blocks.</dd>
+  <dt>Sizes</dt>
+  <dd>The authoritative logical size is the stream pool's, at a stream home
+  equal to the inode home, so the home reads it in-process.</dd>
+</dl>
+
+<h2 id="configuration">Configuration</h2>
+<p>Keys read by <code>FilesystemConfig::LoadConfig</code>. Parsing is
+best-effort: a malformed value leaves the rest at their defaults without an
+error.</p>
+<dl class="notes">
+  <dt><code>next_pool_id</code></dt>
+  <dd>Required, no default. The CTE pool that stores pages, directory blocks,
+  inode records and xattrs. Without it the pool's create fails. Default
+  configuration: <code>"564.0"</code>, the indexer at the chain top.</dd>
+  <dt><code>metadata_log_path</code></dt>
+  <dd>Default unset. Base path of this node's on-disk metadata;
+  <code>~</code> and <code>${VARS}</code> expand. The directory journal is
+  <code>&lt;path&gt;.dirs.&lt;container id&gt;</code>: one small record per
+  change, fsynced by <code>kSyncMeta</code> and every 1 s, and compacted
+  at startup. When the filesystem creates its own
+  stream pool, that pool logs to <code>&lt;path&gt;.stream</code>. Unset,
+  directory blocks are written as CTE blobs, one blob write per change.</dd>
+  <dt><code>stream_pool_id</code></dt>
+  <dd>Default unset. The stream pool for sizes and appends. Unset, the
+  filesystem creates one named <code>&lt;pool_name&gt;_stream</code> at the id
+  one minor above its own (560.1 for a pool at 560.0), over the same
+  <code>next_pool_id</code>. The default configuration names
+  <code>"565.0"</code>, a stream pool composed just before it. A pool that already exists keeps its own
+  configuration: the filesystem's <code>.stream</code> log path applies only
+  to a stream pool it creates.</dd>
+  <dt><code>dir_split_entries</code></dt>
+  <dd>Default 1024. Rows a directory block holds before it splits. Values
+  below 16 are raised to 16.</dd>
+  <dt><code>dir_log_compact_bytes</code></dt>
+  <dd>Default <code>256KB</code> (a size string). Bytes of delta frames a
+  block's CTE blob may hold past its last full image before the next commit
+  rewrites it whole. 0 rewrites the block on every commit. Applies when blocks
+  are stored as blobs.</dd>
+  <dt><code>case_insensitive</code></dt>
+  <dd>Default false. Compare names by Unicode simple case folding while
+  keeping their spelling, as NTFS does: <code>Foo.TXT</code> and
+  <code>foo.txt</code> are one file, <code>Straße</code> and
+  <code>STRASSE</code> are not. Recorded in the root's record when the volume
+  is created; a runtime configured the other way refuses the volume with
+  <code>EINVAL</code>.</dd>
+  <dt><code>data_score</code></dt>
+  <dd>Default -1.0 (off). A value in (0, 1] places file data pages with that
+  score, leaving the highest-scored tier to directory blocks, records and the
+  first <code>data_score_head_pages</code> pages of each file. Any other value
+  is ignored with a warning. The stream pool and the FUSE adapter apply the
+  same rule to the pages they write.</dd>
+  <dt><code>data_score_head_pages</code></dt>
+  <dd>Default 1. Leading 1 MiB pages of each file that keep the default
+  score when <code>data_score</code> is set; 0 means every page uses
+  <code>data_score</code>.</dd>
+</dl>
+<p>Environment variables read by the runtime side of the module:</p>
+<ul>
+  <li><code>CLIO_CFS_SHM_FILE_CAPACITY</code>: file records in the
+  shared-memory attribute mirror. Default 262144.</li>
+  <li><code>CLIO_CFS_SHM_MIRROR_MULTINODE=1</code>: keep the mirror on a
+  multi-node deployment. Only safe when files are never shared across
+  nodes.</li>
+  <li><code>CLIO_CFS_PREALLOC</code>: a flat per-page preallocation in bytes
+  for <code>kWrite</code>. Unset, each put preallocates twice the written
+  extent of the page, at least 8 KiB and at most 64 KiB.</li>
+</ul>
+<p>The <code>CLIO_FUSE_*</code> variables belong to the mount daemon and are
+listed in the <a href="/docs/context-fs/api.html">Context FS API
+reference</a>.</p>
+
+<h2>Caches, homes and leases</h2>
+<ul>
+  <li><strong>One writer per object.</strong> A directory block's home is the
+  only container that changes it, and an inode's home the only one that
+  changes its record. Other containers cache copies and register with the
+  home.</li>
+  <li><strong>Push before acknowledge.</strong> The home pushes every change
+  to the registered holders before the operation returns, so a warm path walk
+  on any node needs no round trip.</li>
+  <li><strong>Leases.</strong> A cached block or inode is served without
+  asking for 10 s from when it was fetched. A home that cannot reach a holder
+  waits for that lease plus 2 s of slack before acknowledging, so a
+  partitioned node can delay a change but not serve a stale name.</li>
+  <li><strong>Shared-memory mirror.</strong> On a single node the container
+  publishes per-path records (logical size, inode, mode, owner, time
+  overrides) into a shared-memory segment that clients read without a task.
+  A directory created through the module is marked complete, so a miss under
+  it is an authoritative <code>ENOENT</code>. It is off on more than one node
+  unless forced.</li>
+</ul>
+<p>The <a href="/design/filesystem.html#consistency">consistency model</a>
+on the design page covers the client-side relaxations.</p>
+
+<h2>Failure and restart</h2>
+<ul>
+  <li><strong>Crash-safe order.</strong> The inode record is stored before its
+  name appears, and link counts rise before links do, so a crash leaks space
+  rather than leaving a name without an inode.</li>
+  <li><strong>Recovering start.</strong> A plain <code>clio-run start</code>
+  replays the directory journal before the container answers peers, reads
+  its id reservation and orphan list, destroys the orphans (handles do not
+  survive a restart), reconciles restored stream sizes with inode records and
+  republishes the tag names of every link it homes. <code>start
+  --fresh</code> compacts the journal to empty. See the
+  <a href="/docs/runtime/api.html">runtime reference</a>.</li>
+  <li><strong>Sizes after a restart.</strong> Loading an inode applies the
+  size in its record to the stream: as the size if another container wrote
+  the record while this one was away, otherwise as a floor, since the stream
+  may have merged appends after the record was written.</li>
+  <li><strong>Dead homes.</strong> While a home's node is dead its first live
+  successor serves its blocks and inodes, following the CTE's failover. Each
+  inode record is mirrored, best effort, on the home's first successor. A
+  returning home fetches newer copies of its blocks and records from that
+  stand-in, and a rejoin notice makes clean home blocks reload.</li>
+  <li><strong>Size pushes.</strong> An <code>AdvanceSize</code> whose inode
+  home died in flight is resent up to 10 times, 1 s apart, while the cluster
+  marks the node dead.</li>
+  <li><strong>Before Create.</strong> Peers can reach a container before its
+  create has bound the CTE client; such metadata I/O waits up to 120 s, then
+  fails with <code>EIO</code>.</li>
+</ul>
+
+<h2>Behaviors worth knowing</h2>
+<ul class="checks">
+  <li>Unlinked files' pages and xattrs are deleted in the background by a
+  periodic purge every 20 ms, not on the unlink path.</li>
+  <li><code>kWrite</code> updates the in-memory times and size at once; the
+  inode record is logged at close, and by <code>AdvanceSize</code> and
+  truncate before they reply.</li>
+  <li>A file with more than one name, and every symlink, is published to the
+  mirror with the fast path refused, so a second name never serves a stale
+  size.</li>
+  <li>The adapters only look the pool up; composing it is the deployment's
+  job. Remove the entry if no adapter or Context FS mount is used.</li>
+  <li><code>data_score</code> steers placement only; it does not reserve
+  space on the top tier. When that tier fills, metadata spills down like any
+  data.</li>
+</ul>
+
+<h2>Limits</h2>
+<ul>
+  <li>The directory journal is node-local. With
+  <code>metadata_log_path</code> set, a node that never returns takes the
+  directory blocks it was home for with it (issue #1263). Without it, blocks
+  are CTE blobs and inherit the chain's replication, at the cost of a blob
+  write per change.</li>
+  <li>Inode records are tag attributes, which the replication module does not
+  copy; their only redundancy is the best-effort mirror on the successor.</li>
+  <li><code>case_insensitive</code> cannot be changed on an existing
+  volume.</li>
+  <li>A directory splits to at most 2<sup>24</sup> blocks.</li>
+  <li><code>SHM_CACHE_DESIGN.md</code> in the module directory is a proposal
+  for a separate write-through shared-memory cache chimod. It is not built;
+  the mirror described above is what exists.</li>
+</ul>
+
+<h2>How it is tested</h2>
+<ul>
+  <li><code>context-transfer-engine/test/unit/test_fs_inode_table.cc</code>
+  (<code>cte_fs_inode_table</code>): block and record codecs, delta
+  application, the split tree, stable directory offsets and case folding,
+  without a runtime.</li>
+  <li><code>context-transfer-engine/test/unit/test_cfs_fsync_durable.cc</code>
+  (<code>cfs_fsync_durable</code>): fsync through the descriptor layer puts a
+  file's pages on the persistent tier behind a write-back cache.</li>
+  <li><code>context-transfer-engine/test/integration/cfs_distributed</code>:
+  a two-node Docker cluster where one node writes a file and the other must
+  read it.</li>
+  <li><code>context-transfer-engine/test/integration/clio_fs_suite</code>:
+  the black-box suite through FUSE on 1 to N nodes. POSIX semantics
+  (<code>tests_posix.py</code>), cross-node coherence and races
+  (<code>tests_dist.py</code>), directory storms and partitions
+  (<code>tests_dirs.py</code>), and crashes, node loss and restarts
+  (<code>tests_fault.py</code>).</li>
+  <li>The adapter tests under
+  <code>context-transfer-engine/test/unit/adapters</code> (libfuse, POSIX,
+  STDIO, MPI-IO, VFD) all run on this module.</li>
+</ul>
