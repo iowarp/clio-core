@@ -37,6 +37,9 @@
 
 #include <algorithm>
 #include <chrono>
+#if !defined(_WIN32)
+#include <unistd.h>  // getuid, getgid: the root directory's owner
+#endif
 
 namespace clio::cte::filesystem::ns {
 
@@ -116,6 +119,13 @@ inline bool View::Format(const std::string &name, const Limits &lim,
   Inode *r = InsertInodeLocked(root_id);
   r->type_ = kFsTypeDir;
   r->mode_ = 0755;
+  // Owned by the user running the runtime (the mounting user in every
+  // deployment), as the task path reports it. Left at 0 (root), a fresh
+  // volume refused every mkdir/create at its top to a non-root user (EACCES).
+#if !defined(_WIN32)
+  r->uid_ = static_cast<u32>(getuid());
+  r->gid_ = static_cast<u32>(getgid());
+#endif
   r->nlink_ = 2;
   r->first_child_ = kNoSlot;
   r->target_ = kNoSlot;
