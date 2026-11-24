@@ -3043,6 +3043,25 @@ clio::run::TaskResume Runtime::WriteReplicaData(
     rep->total_size_cache_ = 0;
     staging.RecomputeTotalSize();
   }
+  // Devices already holding another copy of this blob (the primary and the
+  // other replicas): a replica exists to survive losing a device, so it is
+  // placed on these only when no other device has room. A cache copy keeps
+  // plain score placement (it is a fast-tier copy, not a durable one).
+  std::vector<clio::run::PoolId> avoid_targets;
+  if (!cache_copy) {
+    const auto note = [&avoid_targets](const BlobBlock &b) {
+      const clio::run::PoolId &id = b.bdev_client_.pool_id_;
+      if (std::find(avoid_targets.begin(), avoid_targets.end(), id) ==
+          avoid_targets.end()) {
+        avoid_targets.push_back(id);
+      }
+    };
+    for (const auto &b : blob_info.blocks_) note(b);
+    for (size_t r = 0; r < blob_info.replicas_.size(); ++r) {
+      if (static_cast<int>(r) + 1 == replica_idx) continue;  // this copy
+      for (const auto &b : blob_info.replicas_[r].blocks_) note(b);
+    }
+  }
   {
     clio::run::u64 old_size = staging.GetTotalSize();
     clio::run::u32 step_result = 0;
@@ -3054,7 +3073,8 @@ clio::run::TaskResume Runtime::WriteReplicaData(
                    : -1;
     CLIO_CO_AWAIT(ExtendBlob(staging, offset, size, rep_score, step_result,
                         rep_min_pers,
-                        task->context_.preallocate_, nullptr, rep_max_pers));
+                        task->context_.preallocate_, nullptr, rep_max_pers,
+                        &avoid_targets));
     if (step_result != 0) {
       error_code = 10 + step_result;
     } else if (!task->context_.emulate_) {
@@ -9804,7 +9824,8 @@ clio::run::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, clio::run::u64 of
                                     int min_persistence_level,
                                     clio::run::u64 preallocate,
                                     clio::run::u64 *shortfall,
-                                    int max_persistence_level) {
+                                    int max_persistence_level,
+                                    const std::vector<clio::run::PoolId> *avoid_targets) {
 #ifdef CLIO_ENABLE_BOOST_COROUTINES
   clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
 #endif
@@ -9958,6 +9979,19 @@ clio::run::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, clio::run::u64 of
       std::remove_if(ordered_targets.begin(), ordered_targets.end(),
                      [](const TargetInfo &t) { return !TargetNodeAlive(t); }),
       ordered_targets.end());
+
+  // Device anti-affinity for replicas: the targets that already hold another
+  // copy of this blob go last (score order kept within each group), so a
+  // copy lands on a different device whenever one fits and falls back to
+  // the same device only when nothing else has room.
+  if (avoid_targets != nullptr && !avoid_targets->empty()) {
+    std::stable_partition(
+        ordered_targets.begin(), ordered_targets.end(),
+        [avoid_targets](const TargetInfo &t) {
+          return std::find(avoid_targets->begin(), avoid_targets->end(),
+                           t.bdev_client_.pool_id_) == avoid_targets->end();
+        });
+  }
 
   // Capped placement (#1140): a node-local CACHE copy is derivable and
   // evictable, so it must not take durable capacity -- spilled onto a
