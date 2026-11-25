@@ -98,6 +98,9 @@ runtime:
   queue_depth: 1024                    # Task queue depth per worker
   local_sched: "default"               # Local task scheduler algorithm
   first_busy_wait: 10000               # Microseconds to busy-wait before sleeping (10ms)
+  # max_sleep: 50000                   # Longest a parked worker sleeps before
+  #                                    # re-polling its lanes (us, default 50 ms):
+  #                                    # the bound on a missed wakeup.
   # Shared-memory segments of a client process that died are reclaimed once
   # it has no task in flight and has been dead and idle this many seconds
   # (#1192). 0 = never while the runtime runs; they are then cleaned up at

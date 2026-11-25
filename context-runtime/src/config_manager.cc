@@ -524,6 +524,11 @@ void ConfigManager::ParseYAML(YAML::Node &yaml_conf) {
     if (runtime["first_busy_wait"]) {
       first_busy_wait_ = runtime["first_busy_wait"].as<u32>();
     }
+    // Longest a parked worker sleeps before re-polling its lanes (us): the
+    // bound on a missed wakeup (see Worker::SuspendMe).
+    if (runtime["max_sleep"]) {
+      max_sleep_ = std::max<u32>(1, runtime["max_sleep"].as<u32>());
+    }
 
     // Periodic cross-node task-validity check interval (issue #628)
     if (runtime["task_progress_interval_ms"]) {
