@@ -42,13 +42,13 @@ def render(c, root, dram_gb=None, disk_gb=None):
     # score first), so the "other" tier still catches overflow like a real deployment
     dram_score, disk_score = (1.0, 0.2) if c["placement"] == "dram" else (0.2, 1.0)
     y = f"""networking:
-  port: 9413
+  port: {os.environ.get('SSC_PORT', '9413')}
 runtime:
   num_threads: 4
   queue_depth: 1024
 viz:
-  enabled: true
-  port: 8080
+  enabled: {os.environ.get('SSC_VIZ', 'true')}
+  port: {os.environ.get('SSC_VIZ_PORT', '8080')}
   bind: "127.0.0.1"
 compose:
   - mod_name: clio_cte_core

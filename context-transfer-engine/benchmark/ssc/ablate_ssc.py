@@ -16,6 +16,11 @@ Variants (same model, same questions, same gates and derived action):
     v2     the SSC: five sections + controller summary, question-local evidence
     v3     v2 + spill-aware capacity wording + transition trigger (the benchmark's SSC)
 
+Guard ablation: ng_<variant> (e.g. ng_v10@qwen3:4b) runs the variant with both guards off (the
+declared-requirement indexer gate and the capacity gate); "guards" is the default chain with only the
+guards (indexer when declared, codec from the capacity rule), no model. A window whose composition
+breaks a declared requirement (searched later, no indexer) scores 0, like lost writes.
+
 Each window's recommendation, after the declared-requirement and capacity gates, is scored on the
 phase it describes with the measured grid: score 1 = the phase's best case, 0 = its worst case
 (a composition that loses writes scores 0), plus per-axis agreement with the best composition.
@@ -61,6 +66,17 @@ def grid_table(path):
         best[ph] = min(best.get(ph, (None, 1e9)), (k, t), key=lambda x: x[1])
         worst[ph] = max(worst.get(ph, (None, -1)), (k, t), key=lambda x: x[1])
     return cell, best, worst
+
+
+def score_of(cell, best, worst, phase, rec):
+    """1 = the phase's best composition, 0 = its worst; lost writes or a broken declared
+    requirement (searched later without the indexer) score 0. Returns (score, violation)."""
+    t, lost = cell[(phase, key(rec))]
+    violation = rec["indexer"] != (DECLARED[phase]["searched_later"] == "yes") and not rec["indexer"]
+    b, wst = best[phase], worst[phase]
+    if lost or violation:
+        return 0.0, violation
+    return (wst[1] - t) / (wst[1] - b[1]), False
 
 
 def window(phase, i):
@@ -142,7 +158,12 @@ def main():
     ap.add_argument("--seeds", default="101-110")
     ap.add_argument("--variants", default="none,raw,v2,v3")
     ap.add_argument("--grid", default="/ssc-bench/live_results/grid_gs.jsonl")
+    ap.add_argument("--app", choices=["gs", "gs7", "app2", "app3"], default="gs",
+                    help="schedule phases: gs = the five base phases (default), gs7 = + generalization "
+                         "phases, app2 = the second application (DLIO / h5bench-style), app3 = WfCommons workflows")
     a = ap.parse_args()
+    phases = {"gs": workload.BASE_PHASES, "gs7": workload.GS_PHASES, "app2": workload.APP2_PHASES,
+              "app3": workload.APP3_PHASES}[a.app]
     lo, hi = map(int, a.seeds.split("-"))
     cell, best, worst = grid_table(a.grid)
     CELLS.update(cell)
@@ -150,23 +171,31 @@ def main():
              "disk": {"remaining_gb": float(e2e.os.environ.get("SSC_DISK_GB", 2)), "score": 0.5}}
     out = open(a.out, "a")
     for variant in a.variants.split(","):
+        guarded = not variant.startswith("ng_")
+        e2e.CAPACITY_GATE = guarded
         e2e.SSC_VERSION = "v2" if variant == "v2" else "v3"
         ssc_live.SSCBuilder.SPILL_AWARE = variant != "v2"
+        if "@" in variant:
+            # untimed warm-up: the model is loaded before the first timed decision
+            base = variant[3:] if variant.startswith("ng_") else variant
+            jev_bridge.ask(s1_queue(base), {"state": "warm-up", "questions": []})
         for seed in range(lo, hi + 1):
-            schedule = [ph for item in e2e.random_schedule(seed).split(",")
+            schedule = [ph for item in e2e.random_schedule(seed, phases=phases).split(",")
                         for ph in [item.split(":")[0]] * int(item.split(":")[1])]
             c = dict(e2e.compose.DEFAULT)
             builder = ssc_live.SSCBuilder(c)
             for i, phase in enumerate(schedule):
-                if DECLARED[phase]["searched_later"] == "yes":
+                if guarded and DECLARED[phase]["searched_later"] == "yes":
                     c["indexer"] = True                     # declared-requirement gate
                 w, ratio = window(phase, i)
                 w["seconds"] = cell.get((phase, key(c)), (0.0, 0))[0]
                 obs = {"window": w, "ratio": ratio, "tiers": tiers}
                 builder.current = dict(c)
                 builder.observe(w, ratio, DECLARED[phase])
-                if variant in ("rules", "rulesh", "knn", "wknn", "wknn10", "wknn11", "const"):   # no model: heuristic2, or v8's nearest workload
-                    if variant == "const":
+                if variant in ("rules", "rulesh", "knn", "wknn", "wknn10", "wknn11", "const", "guards"):   # no model: heuristic2, or v8's nearest workload
+                    if variant == "guards":
+                        new = dict(e2e.compose.DEFAULT)
+                    elif variant == "const":
                         # one fixed guess for every window (what qwen3-4B with thinking and no SSC
                         # answered every time) plus the controller's capacity gate from e2e.finish
                         new = {"placement": "dram", "cache": True, "indexer": False, "compression": "none"}
@@ -182,16 +211,15 @@ def main():
                         new, _ = e2e.decide_heuristic2(dict(c), obs, DECLARED[phase])
                     info = {"answers": {}, "decision_latency_s": 0.0}
                     rec = dict(new or c)
-                    if variant == "rulesh":
+                    if variant in ("rulesh", "guards"):
                         need = w["bytes_put"] / (1 << 30)
                         free = sum(t["remaining_gb"] for t in tiers.values())
                         rec["compression"] = ("none" if need <= 0.8 * free else
                                               "lz4" if need / max(ratio, 1.0) <= 0.8 * free else "zstd")
                     if DECLARED[phase]["searched_later"] == "yes":
                         rec["indexer"] = True
-                    t, lost = cell[(phase, key(rec))]
-                    b, wst = best[phase], worst[phase]
-                    score = 0.0 if lost else (wst[1] - t) / (wst[1] - b[1])
+                    score, _ = score_of(cell, best, worst, phase, rec)
+                    b = best[phase]
                     out.write(json.dumps({"variant": variant, "seed": seed, "step": i, "phase": phase,
                                           "recommended": rec, "best": dict(zip(AXES, b[0])),
                                           "score": round(score, 3),
@@ -199,14 +227,15 @@ def main():
                                           "answers": {}, "latency_s": 0.0}) + "\n")
                     c = rec
                     continue
-                req, ctx = make_request(variant, builder, obs, phase)
+                base = variant[3:] if variant.startswith("ng_") else variant
+                req, ctx = make_request(base, builder, obs, phase)
                 while model_busy():
                     time.sleep(5)
                 t0 = time.time()
                 for attempt in range(5):
                     try:
-                        raw = jev_bridge.ask(s1_queue(variant) if "@" in variant else
-                                             QUEUE_S1 if variant.endswith("q") else QUEUE, req)
+                        raw = jev_bridge.ask(s1_queue(base) if "@" in base else
+                                             QUEUE_S1 if base.endswith("q") else QUEUE, req)
                         break
                     except RuntimeError:              # host bridge can race on the shared folder
                         time.sleep(2)
@@ -214,22 +243,22 @@ def main():
                     raise RuntimeError("bridge failed 5 times")
                 new, info = e2e.finish(builder, ctx, raw, time.time() - t0)
                 rec = dict(new or c)
-                if variant.endswith("h"):
+                if base.endswith("h"):
                     # hybrid: the codec follows from capacity (none if the raw window fits, else the
                     # faster codec if it fits at the sampled ratio, else the stronger one)
                     need = w["bytes_put"] / (1 << 30)
                     free = sum(t["remaining_gb"] for t in tiers.values())
                     rec["compression"] = ("none" if need <= 0.8 * free else
                                           "lz4" if need / max(ratio, 1.0) <= 0.8 * free else "zstd")
-                if DECLARED[phase]["searched_later"] == "yes":
+                if guarded and DECLARED[phase]["searched_later"] == "yes":
                     rec["indexer"] = True
-                t, lost = cell[(phase, key(rec))]
-                b, wst = best[phase], worst[phase]
-                score = 0.0 if lost else (wst[1] - t) / (wst[1] - b[1])
+                score, violation = score_of(cell, best, worst, phase, rec)
+                b = best[phase]
                 row = {"variant": variant, "seed": seed, "step": i, "phase": phase,
                        "recommended": rec, "best": dict(zip(AXES, b[0])), "score": round(score, 3),
                        "axis_ok": {ax: rec[ax] == dict(zip(AXES, b[0]))[ax] for ax in AXES},
-                       "answers": info["answers"], "latency_s": round(info["decision_latency_s"], 3)}
+                       "answers": info["answers"], "latency_s": round(info["decision_latency_s"], 3),
+                       "violation": violation}
                 out.write(json.dumps(row) + "\n")
                 out.flush()
                 c = rec

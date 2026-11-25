@@ -47,6 +47,7 @@ from bench_shared import to_agentjev, norm_agentjev  # noqa: E402
 PLACE = {"dram": "dram", "ssd": "disk"}
 LOCAL_AXES = ("shift", "placement", "cache", "indexer")
 MIN_CONF = 0.6
+CAPACITY_GATE = True    # off only in the offline guard ablation (ablate_ssc.py ng_<variant>)
 DEFAULT_SCHEDULE = "gs_output:6,gs_analysis:6,gs_log:6,gs_products:6,gs_archive:6,gs_output:6"
 SSC_VERSION = "v2"
 
@@ -222,7 +223,7 @@ def finish(builder, ctx, raw, lat):
         prop[ax] = rec[ax]
     gated = False
     need_gb = obs["window"]["bytes_put"] / (1 << 30)
-    if prop["compression"] == "none" and need_gb > 0.8 * sum(t["remaining_gb"] for t in tiers.values()):
+    if CAPACITY_GATE and prop["compression"] == "none" and need_gb > 0.8 * sum(t["remaining_gb"] for t in tiers.values()):
         dist = ans["compression"].get("dist") or {}
         codecs = {k: float(v) for k, v in dist.items() if k != "none"} or {"lz4": 1.0}
         prop["compression"] = max(codecs, key=codecs.get)
@@ -344,11 +345,13 @@ def main():
     a = ap.parse_args()
     global SSC_VERSION, ENVELOPE
     SSC_VERSION, ENVELOPE = a.ssc, a.envelope
-    if a.schedule.startswith(("seed:", "gseed:")):
+    if a.schedule.startswith(("seed:", "gseed:", "dseed:", "wseed:")):
         kind, n = a.schedule.split(":")
         # gseed: the generalization phases join the draw (they were added after the design froze)
-        a.schedule = random_schedule(int(n), phases=tuple(workload.PHASES) if kind == "gseed" else
-                                     workload.BASE_PHASES)
+        # dseed: the second application's phases only
+        a.schedule = random_schedule(int(n), phases=workload.GS_PHASES if kind == "gseed" else
+                                     workload.APP2_PHASES if kind == "dseed" else
+                                     workload.APP3_PHASES if kind == "wseed" else workload.BASE_PHASES)
         print("schedule", a.schedule, flush=True)
     model = a.policy == "agentjev" or a.policy.startswith(("llm:", "s1:"))
     queue = QUEUE if a.policy == "agentjev" else QUEUE + "_" + a.policy.split(":", 1)[-1].replace(":", "_")

@@ -7,10 +7,12 @@ no SSC, thinking on.
 
 - [ ] Replication (0/1 copy) and the core data organizer (prefetching: none / frecency / cyclic /
       hotset) as decisions in the SSC, `compose.py` and `run_grid.py`
-- [ ] A second application (h5bench- or DLIO-style workload)
-- [ ] Slurm batch script and a short setup guide for Delta (build or Apptainer image, Ollama,
-      `SSC_ROOT` on local NVMe, `SSC_QUEUE_ROOT` node-local, bridges on the same node)
-- [ ] Run CLIO's own cache and replication unit tests (build with tests on)
+- [x] A second application (h5bench- or DLIO-style workload): `dl_samples`, `dl_ckpt`, `h5_particles`
+      (`workload.APP2_PHASES`, `--app app2`, `dseed:N`). Never in the SSC's memory (`MEMORY_PHASES` =
+      Gray-Scott only), so it tests cross-application transfer with v10 unchanged
+- [x] Slurm batch script and a short setup guide for Delta: `delta/` (README, env.sh, campaign1/2,
+      offline_lane + lanes/, smoke, build, tests)
+- [x] Run CLIO's own cache and replication unit tests: 17/17 pass (cache, replication, indexer, compressor)
 
 ## Runs on Delta (one GPU node with local NVMe; about 16-20 node-hours)
 
@@ -51,3 +53,27 @@ no SSC, thinking on.
 - [ ] Related work: WfCommons/workflow I/O; fill refs.bib; Limitations rewritten
 - [ ] Regenerate fig0-fig4 + new unseen-application and model-size/cold-start figures
 - [ ] Final name (DBLP check), ACM AI-use disclosure, use the remaining pages (6 of 11 now)
+## Status on Delta (2026-11-24)
+
+Workspace `ssc_work/` in the checkout (git-excluded): results, figures, logs, models.
+Figures + `summary.md`: `python3 paper_plots.py ssc_work/results ssc_work/figures` (host python).
+
+Added beyond the plan (reviewer-driven):
+- Guard ablation in `ablate_ssc.py` (`ng_<variant>`, `guards`); a broken declared requirement scores 0
+- Second metric: slowdown vs the best setup (geomean of window time / best), since the 0-1 score
+  saturates on this node; score clipped at 0; 95% bootstrap CIs over schedules
+- Strongest System 2 baseline: qwen3-14B thinking, no SSC
+- Noise sensitivity: every key arm rescored with each single grid repeat as ground truth
+
+Done: grids 1 GB / 4 GB (10 phases, 3 repeats), 0.5 GB (one cell being repaired); offline 1 GB and
+4 GB for gs and app2, model sweep (1 GB), guard ablation (1 GB).
+Running/queued: 0.5 GB + generalization-phase replays, remaining System 2 schedules (offline lanes
+a/b/c), live runs (campaign2).
+
+Findings so far (slowdown vs best, lower is better):
+- 1 GB gs: S1+SSC llama-8B 1.20x / qwen-4B 1.38x at ~1 s; S2 no SSC (4B think) 1.19x at ~47 s;
+  S2 no SSC 14B think 6.6x; S1 no SSC 5.6x; expert rules 1.08x
+- 1 GB app2: S1+SSC 1.03x; S2 no SSC ~1.36x; rules 1.62x; S1 no SSC 4.8x
+- SSC lifts every model size (1.7B-14B); guards never fire with the SSC (ablation identical)
+- Caveats to state in the paper: on gs the rules are as good as any model; on 4 GB app2 guards-only
+  (1.36x) beats S1+SSC (1.53-1.71x); differences within ~20% flip across grid repeats (report ties)

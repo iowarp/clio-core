@@ -44,6 +44,20 @@ DECLARED = {
                         "latency_critical": "no"},
     "gs_events": {"durability": "important (detected features)", "searched_later": "yes",
                   "latency_critical": "no"},
+    # second application (DLIO / h5bench-style)
+    "dl_samples": {"durability": "regenerable (copy of the training set)", "searched_later": "no",
+                   "latency_critical": "yes"},
+    "dl_ckpt": {"durability": "important (model checkpoint)", "searched_later": "no", "latency_critical": "no"},
+    "h5_particles": {"durability": "important (particle dump)", "searched_later": "yes",
+                     "latency_critical": "no"},
+    # third application (WfCommons workflows: Montage, Epigenomics, 1000Genome)
+    "mt_project": {"durability": "regenerable (reprojected images)", "searched_later": "no", "latency_critical": "no"},
+    "mt_fit": {"durability": "regenerable (fit parameters)", "searched_later": "no", "latency_critical": "no"},
+    "ep_fastq": {"durability": "regenerable (split reads)", "searched_later": "no", "latency_critical": "no"},
+    "ep_map": {"durability": "important (alignments)", "searched_later": "yes", "latency_critical": "no"},
+    "kg_vcf": {"durability": "important (input genotypes)", "searched_later": "no", "latency_critical": "no"},
+    "kg_indiv": {"durability": "regenerable (per-individual results)", "searched_later": "no",
+                 "latency_critical": "no"},
 }
 DEFAULT_SCHEDULE = "gs_output:3,gs_analysis:3,gs_log:3,gs_products:3,gs_archive:3,gs_output:2"
 PLACE = {"dram": "dram", "ssd": "disk"}

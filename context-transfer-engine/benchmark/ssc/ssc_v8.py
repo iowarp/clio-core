@@ -148,7 +148,7 @@ def build(w, ratio, declared, tiers, phase, cells, k=3, experience=True):
     global DRAM_GB
     DRAM_GB = tiers["dram"]["remaining_gb"]
     cur = {"blob": w["mean_put"], "n_put": w["n_put"], "n_get": w["n_get"], "ratio": ratio}
-    memory = {ph: phase_facts(ph) for ph in workload.PHASES if ph != phase}
+    memory = {ph: phase_facts(ph) for ph in workload.MEMORY_PHASES if ph != phase}
     nb = neighbours(cur, memory, k) if experience else []
     idx = declared["searched_later"] == "yes"
     fit, need, free = fits(w, ratio, tiers)
@@ -224,7 +224,7 @@ def build_v9(w, ratio, declared, tiers, phase, cells, k=3, experience=True):
     facts remain."""
     text, qs = build(w, ratio, declared, tiers, phase, cells, k, experience=experience)
     cur = {"blob": w["mean_put"], "n_put": w["n_put"], "n_get": w["n_get"], "ratio": ratio}
-    memory = {ph: phase_facts(ph) for ph in workload.PHASES if ph != phase}
+    memory = {ph: phase_facts(ph) for ph in workload.MEMORY_PHASES if ph != phase}
     nb = neighbours(cur, memory, k)
     idx = declared["searched_later"] == "yes"
     fit, need, _ = fits(w, ratio, tiers)
@@ -257,7 +257,7 @@ def wknn_decide(w, ratio, declared, tiers, phase, cells, k=3):
     global DRAM_GB
     DRAM_GB = tiers["dram"]["remaining_gb"]
     cur = {"blob": w["mean_put"], "n_put": w["n_put"], "n_get": w["n_get"], "ratio": ratio}
-    memory = {ph: phase_facts(ph) for ph in workload.PHASES if ph != phase}
+    memory = {ph: phase_facts(ph) for ph in workload.MEMORY_PHASES if ph != phase}
     nb = neighbours(cur, memory, k)
     idx = declared["searched_later"] == "yes"
     fit, _, _ = fits(w, ratio, tiers)
@@ -273,7 +273,7 @@ def knn_decide(w, ratio, declared, tiers, phase, cells):
     """No model: the nearest other workload's fastest option per axis, codecs restricted to those
     that fit (the same information v8 gives the model)."""
     cur = {"blob": w["mean_put"], "n_put": w["n_put"], "n_get": w["n_get"], "ratio": ratio}
-    memory = {ph: phase_facts(ph) for ph in workload.PHASES if ph != phase}
+    memory = {ph: phase_facts(ph) for ph in workload.MEMORY_PHASES if ph != phase}
     _, ph, _ = neighbours(cur, memory, 1)[0]
     idx = declared["searched_later"] == "yes"
     fit, _, _ = fits(w, ratio, tiers)

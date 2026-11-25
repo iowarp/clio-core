@@ -7,6 +7,7 @@ Host side:  python s1_bridge.py <queue_dir> <ollama model>     e.g. qwen3:8b
 """
 
 import json
+import os
 import sys
 import urllib.request
 
@@ -26,7 +27,8 @@ def options_of(q):
     return q.get("options") or q.get("criteria") or q.get("levels")
 
 
-def fast_answer(body, model, url="http://127.0.0.1:11434/api/chat"):
+def fast_answer(body, model, url=None):
+    url = url or os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434") + "/api/chat"
     think = model.endswith("+think")
     model = model.removesuffix("+think")
     qtext = []
@@ -36,7 +38,7 @@ def fast_answer(body, model, url="http://127.0.0.1:11434/api/chat"):
         qtext.append(f'- id "{q["id"]}" (choose one of {list(o)}): {q["question"]}\n  options: {opts}')
     req = {"model": model, "stream": False, "think": think,
            "messages": [{"role": "user", "content": PROMPT.format(state=body["state"], questions="\n".join(qtext))}],
-           "options": {"temperature": 0, "num_ctx": 16384 if think else 8192,
+           "options": {"temperature": 0, "num_ctx": 16384,     # one size: no reload between modes
                        "num_predict": 8192 if think else 200}}
     if not think:
         req["format"] = "json"      # constrained decoding would cut the thinking off
