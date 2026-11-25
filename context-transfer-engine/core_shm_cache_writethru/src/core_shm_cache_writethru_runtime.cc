@@ -400,15 +400,25 @@ clio::run::TaskResume Runtime::DeleteBarrier(const std::vector<TagId> &tags) {
     } else {
       {
         std::lock_guard<std::mutex> g(dead_mu_);
-        for (auto it = dead_tags_.begin(); it != dead_tags_.end();) {
-          it = view_.FlushedThrough(it->second) ? dead_tags_.erase(it)
-                                                 : std::next(it);
+        // Marks expire in deletion order (PushedNow only grows): drop the
+        // front while its ranges are all flushed. A tag deleted again keeps
+        // the newer mark (its older deque entry no longer matches).
+        while (!dead_order_.empty() &&
+               view_.FlushedThrough(dead_order_.front().first)) {
+          auto it = dead_tags_.find(dead_order_.front().second);
+          if (it != dead_tags_.end() &&
+              it->second == dead_order_.front().first) {
+            dead_tags_.erase(it);
+          }
+          dead_order_.pop_front();
         }
         const clio::run::u64 pushed = view_.PushedNow();
         for (const TagId &t : tags) {
           if (t.IsNull()) continue;
-          dead_tags_[(static_cast<clio::run::u64>(t.major_) << 32) |
-                     t.minor_] = pushed;
+          const clio::run::u64 k =
+              (static_cast<clio::run::u64>(t.major_) << 32) | t.minor_;
+          dead_tags_[k] = pushed;
+          dead_order_.emplace_back(pushed, k);
         }
       }
       // Ranges popped before the mark may be landing now; later pops skip.

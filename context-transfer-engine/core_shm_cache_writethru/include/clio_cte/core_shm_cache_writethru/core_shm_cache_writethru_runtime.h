@@ -382,6 +382,11 @@ class Runtime : public clio::cte::core::CoreInterposer {
    *  deletion; pruned once flushed_ passes it. */
   mutable std::mutex dead_mu_;
   std::unordered_map<clio::run::u64, clio::run::u64> dead_tags_;
+  /** (PushedNow at deletion, tag key) in deletion order (dead_mu_): the
+   *  expired front is pruned in O(1) per delete. Rescanning the whole map
+   *  on every delete was quadratic: during rm -rf behind a write-through
+   *  backlog the map held ~all deleted files (Linux tree rm 98 s -> 570 s). */
+  std::deque<std::pair<clio::run::u64, clio::run::u64>> dead_order_;
   /**
    * Resolve each record's key and home container.
    * @param recs   coalesced records (a record whose entry cannot be read is
