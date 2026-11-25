@@ -87,10 +87,17 @@ bool WtcTrace() {
   return v;
 }
 
-void Runtime::NoteLandedHomes(const std::vector<FlushRecord> &recs) {
+void Runtime::NoteLandedHomes(const std::vector<FlushRecord> &recs,
+                               const std::set<clio::run::u32> &failed) {
   std::lock_guard<std::mutex> g(sync_homes_mu_);
   for (const FlushRecord &fr : recs) {
     if (fr.size_ == 0 || fr.home_ == container_id_) continue;
+    // A home whose flush failed (down) did not take these ranges: RetryGroup
+    // replayed them down this node's own chain, which fails over and which
+    // SyncTag's forward covers. Syncing the dead home would answer node-lost
+    // and fail an fsync of writes made after it died (fsync EIO while a page
+    // owner was down, with every byte safe on a survivor).
+    if (failed.count(fr.home_) != 0) continue;
     clio::run::u64 k = (static_cast<clio::run::u64>(fr.key_.major_) << 32) |
                        fr.key_.minor_;
     sync_homes_[k].insert(fr.home_);
@@ -132,7 +139,13 @@ std::vector<FlushRecord> Runtime::PopAndCoalesce(
   while (rs.size() < kMaxRangesPerFlush && n < kMaxPopsPerFlush &&
          bytes < config_.flush_batch_bytes_ && log->Pop(r)) {
     ++n;
-    if (Superseded(r)) {
+    // Counted before the dead check: DeleteBarrier marks a tag dead, then
+    // waits for every range counted so far -- one counted later sees it.
+    popped_total_.fetch_add(1, std::memory_order_seq_cst);
+    clio::run::u32 tmaj = 0;
+    clio::run::u32 tmin = 0;
+    if (Superseded(r) ||
+        (view_.SlotTag(r.slot_, &tmaj, &tmin) && TagDead(tmaj, tmin))) {
       ++(*skipped)[r.slot_];
       continue;
     }
@@ -419,10 +432,12 @@ clio::run::TaskResume Runtime::LandGroups(
     const std::vector<FlushRecord> &recs,
     std::map<clio::run::u32, ctp::ipc::FullPtr<char>> &staging,
     const std::vector<clio::run::u32> &homes,
-    std::vector<clio::run::Future<MultiPutBlobTask>> &futs) {
+    std::vector<clio::run::Future<MultiPutBlobTask>> &futs,
+    std::set<clio::run::u32> *failed_out) {
   CLIO_TASK_BODY_BEGIN
   {
-    std::set<clio::run::u32> failed;
+    std::set<clio::run::u32> &failed = *failed_out;
+    failed.clear();
     std::set<clio::run::u32> seen;
     for (size_t i = 0; i < futs.size(); ++i) {
       CLIO_CO_AWAIT(futs[i]);
@@ -439,6 +454,24 @@ clio::run::TaskResume Runtime::LandGroups(
     for (clio::run::u32 home : failed) {
       // Replays every record of the home (puts are idempotent).
       CLIO_CO_AWAIT(RetryGroup(recs, home, staging[home]));
+    }
+    if (!failed.empty()) {
+      // A home that failed (down) never fanned these writes out to the
+      // nodes caching the blobs: tell every node directly, or a copy cached
+      // there stays stale through and after the outage.
+      std::vector<BlobKey> keys;
+      for (const FlushRecord &fr : recs) {
+        if (fr.size_ > 0 && failed.count(fr.home_) != 0) keys.push_back(fr.key_);
+      }
+      if (!keys.empty()) {
+        auto *ipc = CLIO_IPC;
+        auto t = ipc->NewTask<InvalidateTask>(
+            clio::run::CreateTaskId(), pool_id_,
+            clio::run::PoolQuery::Broadcast(), kInvalidateDrop, container_id_,
+            PackKeys(keys));
+        auto fut = ipc->Send(t);
+        CLIO_CO_AWAIT(fut);
+      }
     }
     if (seen.count(container_id_) != 0) {
       std::vector<BlobKey> keys;
@@ -498,7 +531,9 @@ clio::run::TaskResume Runtime::LandOldest() {
     InflightBatch b = std::move(inflight_.front());
     inflight_.pop_front();
     const unsigned long long ev_land0 = clio::run::evlat::Now();
-    CLIO_CO_AWAIT(LandGroups(b.recs_, b.staging_, b.homes_, b.futs_));
+    std::set<clio::run::u32> failed_homes;
+    CLIO_CO_AWAIT(LandGroups(b.recs_, b.staging_, b.homes_, b.futs_,
+                             &failed_homes));
     clio::run::evlat::Span(clio::run::evlat::kWtcLand, ev_land0,
                            clio::run::evlat::Now());
     if (b.pinned_) UnpinRecords(b.recs_);
@@ -515,7 +550,7 @@ clio::run::TaskResume Runtime::LandOldest() {
     }
     // Before flushed_ moves: a SyncTag that sees these ranges flushed must
     // also find their homes.
-    NoteLandedHomes(b.recs_);
+    NoteLandedHomes(b.recs_, failed_homes);
     // Skipped ranges retire only now: every older batch (including the one
     // that carried their bytes) has landed.
     clio::run::u64 nskipped = 0;
@@ -563,6 +598,38 @@ void Runtime::KickFlusher() {
   ipc->AwakenWorker(lane);  // skipped (no syscall) while the worker runs
 }
 
+void Runtime::SyncDeadHomes() {
+  auto *ipc = CLIO_IPC;
+  // A death advances LastLivenessChangeNs (acted on at once); a rejoin does
+  // not, so the states are also re-read every kHomesRecheckNs.
+  constexpr clio::run::u64 kHomesRecheckNs = 100ull * 1000 * 1000;
+  const clio::run::u64 change = ipc->LastLivenessChangeNs();
+  const clio::run::u64 now = static_cast<clio::run::u64>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count());
+  if (change == seen_liveness_ns_ && homes_published_ &&
+      now - homes_checked_ns_ < kHomesRecheckNs) {
+    return;
+  }
+  seen_liveness_ns_ = change;
+  homes_checked_ns_ = now;
+  homes_published_ = true;
+  auto *pool_manager = CLIO_POOL_MANAGER;
+  const clio::run::PoolInfo *info = pool_manager->GetPoolInfo(pool_id_);
+  const clio::run::u32 n = info == nullptr ? 0 : info->num_containers_;
+  clio::run::u64 dead = 0;
+  // Container id == node id (one container per node in every chain pool).
+  for (clio::run::u32 c = 0; c < n && c < 64; ++c) {
+    if (c != container_id_ && !ipc->IsAlive(c)) dead |= 1ull << c;
+  }
+  if (dead != view_.GetRoot()->dead_homes_.load()) {
+    HLOG(kInfo, "core_shm_cache_writethru {}: homes down mask {:#x} of {}; "
+         "their blobs bypass the cache until they return", pool_id_.ToString(),
+         dead, n);
+  }
+  view_.SetDeadHomes(n, dead);
+}
+
 clio::run::TaskResume Runtime::FlushLog(clio::run::shared_ptr<FlushLogTask> &task) {
   CLIO_TASK_BODY_BEGIN
   task->ranges_ = 0;
@@ -575,6 +642,7 @@ clio::run::TaskResume Runtime::FlushLog(clio::run::shared_ptr<FlushLogTask> &tas
       flusher_lane_.store(worker->GetLane(), std::memory_order_release);
     }
   }
+  if (view_.Ready()) SyncDeadHomes();
   if (!view_.Ready() || flush_running_.exchange(true)) {
     task->SetReturnCode(0);
     CLIO_CO_RETURN;

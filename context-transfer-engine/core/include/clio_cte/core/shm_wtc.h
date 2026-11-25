@@ -64,6 +64,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <functional>
 #include <string>
 #include <thread>
 #include <utility>
@@ -314,7 +315,7 @@ struct Stats {
 /** Segment root: the first allocation in the segment. */
 struct Root {
   static constexpr u64 kMagic = 0x3143544357534C43ull;  // "CLSWCTC1"
-  static constexpr u32 kVersion = 10;
+  static constexpr u32 kVersion = 11;
 
   u64 magic_;
   u32 version_;
@@ -345,6 +346,14 @@ struct Root {
    *  read-your-writes guard; remote writes invalidate through the home). */
   std::atomic<u64> local_write_seq_;
   std::atomic<u32> global_rc_;     /**< sticky rc for tags not in TagTable */
+  /** Containers (one per node) whose node is down, as a bitmap of container
+   *  ids < 64; written by the runtime on every liveness change. A blob whose
+   *  home is down is neither cached nor served here: remote writes
+   *  invalidate copies THROUGH the home, so while it is down a copy here
+   *  could go stale unseen (reads of old bytes during and after a failure). */
+  std::atomic<u64> dead_homes_;
+  std::atomic<u32> num_homes_;     /**< containers homes are hashed over */
+  u32 homes_pad_;
   u32 md_only_;                    /**< metadata only: no blob bytes */
   /** Extent mode (data_mode_ 1): blob bytes live in granules of extents
    *  leased from a node-local RAM bdev, not in this segment. */
@@ -653,6 +662,15 @@ class View {
    * pending, which keeps the slot's entry from being replaced).
    */
   u64 RangeGen(const DirtyRange &r) const;
+  /**
+   * The tag of the blob in `slot` (valid while the slot has pending ranges,
+   * which keeps its entry from being replaced).
+   * @param slot blob slot
+   * @param major OUT tag major
+   * @param minor OUT tag minor
+   * @return false if the slot holds no live entry
+   */
+  bool SlotTag(u32 slot, u32 *major, u32 *minor) const;
 
   /** Flusher completion: `n` ranges of `slot` landed. */
   void CompleteRanges(u32 slot, u32 n);
@@ -664,6 +682,26 @@ class View {
 
   /** Total slots in the blob table. */
   u32 NumSlots() const { return root_->slots_per_stripe_ * kStripes; }
+
+  /**
+   * Whether a blob's home container is marked down (see Root::dead_homes_).
+   * @param tag_major tag major
+   * @param tag_minor tag minor
+   * @param name blob name
+   * @param name_len its length
+   * @return true when the blob must bypass this cache
+   */
+  bool HomeDown(u32 tag_major, u32 tag_minor, const char *name,
+                size_t name_len) const;
+
+  /**
+   * Publish which homes are down (runtime only), then drop every cached
+   * copy homed on a node that just went down: no invalidation for it can
+   * arrive while its home is gone. Pending bytes still flush.
+   * @param num_homes containers homes hash over
+   * @param dead_mask bit i set = container i is down
+   */
+  void SetDeadHomes(u32 num_homes, u64 dead_mask);
 
  private:
   /** Entry pointer by global slot index. */

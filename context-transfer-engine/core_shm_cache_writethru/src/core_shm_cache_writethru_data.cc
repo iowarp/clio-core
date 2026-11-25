@@ -599,6 +599,14 @@ clio::run::TaskResume Runtime::RegisterSharer(const TagId &tag,
           container_id_, PackKeys({k}));
       auto fut = ipc->Send(reg);
       CLIO_CO_AWAIT(fut);
+      if (fut.get() == nullptr || fut->GetReturnCode() != 0) {
+        // The home did not record us (down, or restarting): no write's
+        // invalidation would reach this copy. Bump the entry's epoch so the
+        // fill the caller is about to make is voided and nothing is served.
+        if (view_.Ready()) {
+          view_.Invalidate(tag.major_, tag.minor_, name.c_str(), name.size());
+        }
+      }
     }
   }
   CLIO_CO_RETURN;

@@ -858,13 +858,57 @@ inline void View::ZeroRange(BlobEntry *e, u64 from, u64 to) {
   }
 }
 
+inline bool View::HomeDown(u32 tag_major, u32 tag_minor, const char *name,
+                           size_t name_len) const {
+  if (root_ == nullptr) return false;
+  const u64 dead = root_->dead_homes_.load(std::memory_order_acquire);
+  if (dead == 0) return false;
+  const u32 n = root_->num_homes_.load(std::memory_order_acquire);
+  if (n <= 1) return false;
+  // The core's owner hash (BlobHash) over the pool's containers.
+  std::hash<std::string> sh;
+  std::hash<u32> uh;
+  u32 h = static_cast<u32>(uh(tag_major));
+  h ^= static_cast<u32>(uh(tag_minor)) + 0x9e3779b9 + (h << 6) + (h >> 2);
+  h ^= static_cast<u32>(sh(std::string(name, name_len))) + 0x9e3779b9 +
+       (h << 6) + (h >> 2);
+  const u32 home = h % n;
+  return home < 64 && ((dead >> home) & 1u) != 0;
+}
+
+inline void View::SetDeadHomes(u32 num_homes, u64 dead_mask) {
+  if (root_ == nullptr) return;
+  const u64 was = root_->dead_homes_.load(std::memory_order_acquire);
+  root_->num_homes_.store(num_homes, std::memory_order_release);
+  root_->dead_homes_.store(dead_mask, std::memory_order_release);
+  const u64 newly = dead_mask & ~was;
+  if (newly == 0 || MdOnly()) return;
+  const u32 sps = root_->slots_per_stripe_;
+  for (u32 stripe = 0; stripe < kStripes; ++stripe) {
+    Guard g(root_->stripes_[stripe]);
+    for (u32 i = 0; i < sps; ++i) {
+      BlobEntry *e = Slot(stripe * sps + i);
+      if (e->state_ != kSlotLive ||
+          !HomeDown(e->tag_major_, e->tag_minor_, e->name_, e->name_len_)) {
+        continue;
+      }
+      e->flags_ &= ~(kComplete | kSizeKnown);
+      e->valid_lo_ = e->valid_hi_ = 0;  // pending bytes still flush
+      e->inval_epoch_.fetch_add(1, std::memory_order_acq_rel);
+      if (e->pending_.load() == 0) ReleaseIfUnpinnedLocked(e);
+      root_->stats_.invalidations_.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+}
+
 inline Status View::TryPut(u32 tag_major, u32 tag_minor, const char *name,
                            size_t name_len, u64 off, u64 size,
                            const char *src, u32 put_flags, bool may_block) {
   if (name_len > kMaxBlobName) {
     return Status::kTooLong;
   }
-  if (MdOnly() || (put_flags & ~kPerBlobPutFlags) != 0) {
+  if (MdOnly() || (put_flags & ~kPerBlobPutFlags) != 0 ||
+      HomeDown(tag_major, tag_minor, name, name_len)) {
     root_->stats_.put_miss_.fetch_add(1, std::memory_order_relaxed);
     return Status::kMiss;  // not expressible here: take the task path
   }
@@ -962,7 +1006,8 @@ inline Status View::TryGet(u32 tag_major, u32 tag_minor, const char *name,
   if (MdOnly()) {
     return Status::kMiss;  // no bytes cached in metadata-only mode
   }
-  if (name_len > kMaxBlobName || dst == nullptr) {
+  if (name_len > kMaxBlobName || dst == nullptr ||
+      HomeDown(tag_major, tag_minor, name, name_len)) {
     return Status::kMiss;
   }
   u64 h = KeyHash(tag_major, tag_minor, name, name_len);
@@ -1020,7 +1065,8 @@ inline Status View::TryGet(u32 tag_major, u32 tag_minor, const char *name,
 
 inline Status View::TryGetSize(u32 tag_major, u32 tag_minor, const char *name,
                                size_t name_len, u64 *out_size) {
-  if (name_len > kMaxBlobName) {
+  if (name_len > kMaxBlobName ||
+      HomeDown(tag_major, tag_minor, name, name_len)) {
     return Status::kMiss;
   }
   u64 h = KeyHash(tag_major, tag_minor, name, name_len);
@@ -1511,6 +1557,15 @@ inline const char *View::PinRange(u32 slot, u64 off, u64 *size,
 
 inline void View::UnpinRange(u32 slot) {
   Slot(slot)->pins_.fetch_sub(1, std::memory_order_acq_rel);
+}
+
+inline bool View::SlotTag(u32 slot, u32 *major, u32 *minor) const {
+  if (root_ == nullptr || slot >= NumSlots()) return false;
+  const BlobEntry *e = Slot(slot);
+  if (e->state_ != kSlotLive) return false;
+  *major = e->tag_major_;
+  *minor = e->tag_minor_;
+  return true;
 }
 
 inline u64 View::RangeGen(const DirtyRange &r) const {

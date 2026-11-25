@@ -394,15 +394,53 @@ clio::run::TaskResume Runtime::GetOrCreateTag(
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::DelTag(
-    clio::run::shared_ptr<clio::cte::core::DelTagTask> &task) {
+bool Runtime::TagDead(clio::run::u32 major, clio::run::u32 minor) const {
+  std::lock_guard<std::mutex> g(dead_mu_);
+  if (dead_tags_.empty()) return false;
+  return dead_tags_.count((static_cast<clio::run::u64>(major) << 32) | minor) !=
+         0;
+}
+
+clio::run::TaskResume Runtime::DeleteBarrier(const std::vector<TagId> &tags) {
   CLIO_TASK_BODY_BEGIN
   if (view_.Ready()) {
-    const clio::run::u64 target = view_.PushedNow();
+    clio::run::u64 target = 0;
+    if (view_.MdOnly() || tags.empty()) {
+      target = view_.PushedNow();  // nothing of the tags' bytes is logged
+    } else {
+      {
+        std::lock_guard<std::mutex> g(dead_mu_);
+        for (auto it = dead_tags_.begin(); it != dead_tags_.end();) {
+          it = view_.FlushedThrough(it->second) ? dead_tags_.erase(it)
+                                                 : std::next(it);
+        }
+        const clio::run::u64 pushed = view_.PushedNow();
+        for (const TagId &t : tags) {
+          if (t.IsNull()) continue;
+          dead_tags_[(static_cast<clio::run::u64>(t.major_) << 32) |
+                     t.minor_] = pushed;
+        }
+      }
+      // Ranges popped before the mark may be landing now; later pops skip.
+      target = popped_total_.load(std::memory_order_seq_cst);
+    }
     while (!view_.FlushedThrough(target)) {
       KickFlusher();
       CLIO_CO_AWAIT(clio::run::yield(kBarrierPollUs));
     }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::DelTag(
+    clio::run::shared_ptr<clio::cte::core::DelTagTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  {
+    std::vector<TagId> tags;
+    if (!task->tag_id_.IsNull()) tags.push_back(task->tag_id_);
+    // A delete by name has no id yet: the full drain (an empty list).
+    CLIO_CO_AWAIT(DeleteBarrier(tags));
   }
   CLIO_CO_AWAIT(BeginChainWriteAll());
   {
@@ -495,7 +533,11 @@ clio::run::TaskResume Runtime::SyncTag(
 clio::run::TaskResume Runtime::BarrierForward(
     clio::run::u32 method, clio::run::shared_ptr<clio::run::Task> task) {
   CLIO_TASK_BODY_BEGIN
-  if (view_.Ready()) {
+  if (method == clio::cte::core::Method::kMultiDelTag) {
+    std::vector<TagId> tags = clio::cte::core::DecodeMultiDelTags(
+        task.template Cast<clio::cte::core::MultiDelTagTask>()->tags_);
+    CLIO_CO_AWAIT(DeleteBarrier(tags));
+  } else if (view_.Ready()) {
     const clio::run::u64 target = view_.PushedNow();
     while (!view_.FlushedThrough(target)) {
       KickFlusher();

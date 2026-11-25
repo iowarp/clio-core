@@ -135,6 +135,19 @@ class Runtime : public clio::cte::core::CoreInterposer {
       clio::run::shared_ptr<clio::cte::core::SyncTagTask> &task);
   clio::run::TaskResume FlushLog(clio::run::shared_ptr<FlushLogTask> &task);
   /**
+   * Publish which homes are down to the segment on every liveness change
+   * (View::SetDeadHomes): their blobs bypass the cache while down, and the
+   * copies cached before are dropped, since no invalidation can reach this
+   * node through a down home. Runs at the top of every flusher tick.
+   */
+  void SyncDeadHomes();
+  /** LastLivenessChangeNs() when SyncDeadHomes last published. */
+  clio::run::u64 seen_liveness_ns_ = 0;
+  /** SyncDeadHomes published at least once (the first tick always does). */
+  bool homes_published_ = false;
+  /** Steady-clock ns of SyncDeadHomes' last full re-read of node states. */
+  clio::run::u64 homes_checked_ns_ = 0;
+  /**
    * Wake the worker that runs the flusher when it is parked and the dirty
    * log holds ranges. Cache-path writes push to the log without waking
    * anyone, and a parked worker polls its periodic tasks only every 1 to
@@ -159,6 +172,17 @@ class Runtime : public clio::cte::core::CoreInterposer {
   /** Any other core method: drain the local log, then forward verbatim. */
   clio::run::TaskResume BarrierForward(clio::run::u32 method,
                                        clio::run::shared_ptr<clio::run::Task> task);
+  /**
+   * Ordering barrier before deleting tags. Metadata-only: drain the log, as
+   * before. Data mode: mark the tags dead (the flusher drops their logged
+   * ranges instead of writing them) and wait only for the ranges already
+   * popped, which may be landing now -- not for the node's whole backlog.
+   * A delete during a checkout waited for gigabytes of write-through.
+   * @param tags the tags about to be deleted
+   */
+  clio::run::TaskResume DeleteBarrier(const std::vector<TagId> &tags);
+  /** True if `tag` was deleted while ranges of it were logged. */
+  bool TagDead(clio::run::u32 major, clio::run::u32 minor) const;
 
   /** Route data verbs submitter-local (the segment is per node). */
   clio::run::PoolQuery ScheduleTask(
@@ -341,6 +365,13 @@ class Runtime : public clio::cte::core::CoreInterposer {
       std::unordered_map<clio::run::u32, clio::run::u32> *skipped);
   /** True if an earlier flush copy already carried this logged range. */
   bool Superseded(const clio::cte::core::wtc::DirtyRange &r) const;
+  /** Ranges popped from the log since Format (in flushed_ units): the
+   *  flusher counts each pop before checking TagDead. */
+  std::atomic<clio::run::u64> popped_total_{0};
+  /** Deleted tags whose logged ranges are dropped, with PushedNow() at the
+   *  deletion; pruned once flushed_ passes it. */
+  mutable std::mutex dead_mu_;
+  std::unordered_map<clio::run::u64, clio::run::u64> dead_tags_;
   /**
    * Resolve each record's key and home container.
    * @param recs   coalesced records (a record whose entry cannot be read is
@@ -384,12 +415,15 @@ class Runtime : public clio::cte::core::CoreInterposer {
   /**
    * Await every sent group; replay a home whose shards reported a failure,
    * and invalidate other sharers of the local home's blobs once.
+   * @param failed receives the homes whose flush failed (replayed down this
+   *        node's chain instead), which SyncTag must not sync directly
    */
   clio::run::TaskResume LandGroups(
       const std::vector<FlushRecord> &recs,
       std::map<clio::run::u32, ctp::ipc::FullPtr<char>> &staging,
       const std::vector<clio::run::u32> &homes,
-      std::vector<clio::run::Future<clio::cte::core::MultiPutBlobTask>> &futs);
+      std::vector<clio::run::Future<clio::cte::core::MultiPutBlobTask>> &futs,
+      std::set<clio::run::u32> *failed);
   /**
    * Pop, coalesce, stage and send one batch, appending it to inflight_. If
    * any of its blobs is still landing in an older batch, those batches land
@@ -580,7 +614,8 @@ class Runtime : public clio::cte::core::CoreInterposer {
   std::unordered_map<clio::run::u64, std::set<clio::run::u32>> sync_homes_;
   std::mutex sync_homes_mu_;  ///< guards sync_homes_
   /** Note that a batch's records landed on their homes (before flushed_). */
-  void NoteLandedHomes(const std::vector<FlushRecord> &recs);
+  void NoteLandedHomes(const std::vector<FlushRecord> &recs,
+                       const std::set<clio::run::u32> &failed);
   /** Take (and clear) the remote homes of a tag. */
   std::set<clio::run::u32> TakeSyncHomes(const TagId &tag);
   std::unordered_map<std::string, int> blob_reads_;   ///< chain reads per blob
