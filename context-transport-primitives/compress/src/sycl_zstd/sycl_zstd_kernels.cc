@@ -99,7 +99,7 @@ inline void NormalizeFreqs(const u32 *freq, u32 total, u16 *freqN) {
     if (bs < 0) break; --freqN[bs]; --sum; }
 }
 inline u32 RansEncodeBuf(const u8 *lit, u32 n, u8 *dst, u32 dst_cap,
-                         u32 *freq, u16 *freqN, u32 *cumf) {
+                         u32 *freq, u16 *freqN, u32 *cumf, u32 *ercp, u32 *eshift) {
   if (n == 0) return 0;
   if (dst_cap < kFreqTableBytes + 8) return 0;
   for (int s = 0; s < 256; ++s) freq[s] = 0;
@@ -107,12 +107,22 @@ inline u32 RansEncodeBuf(const u8 *lit, u32 n, u8 *dst, u32 dst_cap,
   NormalizeFreqs(freq, n, freqN);
   cumf[0] = 0; for (int s = 0; s < 256; ++s) cumf[s + 1] = cumf[s] + freqN[s];
   for (int s = 0; s < 256; ++s) { dst[2*s] = (u8)(freqN[s] & 0xFF); dst[2*s+1] = (u8)(freqN[s] >> 8); }
+  // Per-symbol reciprocal (ryg_rans): the per-symbol x/freq below becomes a
+  // 64-bit multiply-high. bias/cmpl/x_max stay inline (no divide, cheap).
+  for (int s = 0; s < 256; ++s) {
+    u32 fr = freqN[s];
+    if (fr < 2) { ercp[s] = ~0u; eshift[s] = 0; }
+    else { u32 sh = 0; while (fr > (1u << sh)) ++sh;
+           ercp[s] = (u32)(((1ull << (sh + 31)) + fr - 1) / fr); eshift[s] = sh - 1; }
+  }
   u32 x = kRansL, wp = dst_cap;
   for (u32 i = n; i-- > 0;) {
     u8 s = lit[i]; u32 fr = freqN[s], st = cumf[s];
     u32 x_max = ((kRansL >> kProbBits) << 8) * fr;
     while (x >= x_max) { if (wp <= kFreqTableBytes) return 0; dst[--wp] = (u8)(x & 0xFF); x >>= 8; }
-    x = ((x / fr) << kProbBits) + (x % fr) + st;
+    u32 q = (u32)(((u64)x * ercp[s]) >> 32) >> eshift[s];
+    u32 bias = (fr < 2) ? (st + kProbScale - 1) : st;
+    x = x + bias + q * (kProbScale - fr);
   }
   if (wp < kFreqTableBytes + 4) return 0;
   wp -= 4;
@@ -144,7 +154,8 @@ inline u32 RansDecodeBuf(const u8 *src, u32 n, u8 *lit, u32 dlen,
 // are per-chunk scratch. Returns size, 0 on overflow.
 inline u32 ZstdCompressChunk(const u8 *src, u32 n, u8 *dst, u32 dst_cap,
                              u8 *litbuf, u8 *seqbuf, u32 seq_cap, u16 *hash,
-                             u32 *freq, u16 *freqN, u32 *cumf) {
+                             u32 *freq, u16 *freqN, u32 *cumf, u32 *ercp,
+                             u32 *eshift) {
   for (u32 i = 0; i < kHashSize; ++i) hash[i] = kHashNull;
   auto load32 = [&](u32 p) -> u32 {
     return (u32)src[p] | ((u32)src[p+1]<<8) | ((u32)src[p+2]<<16) | ((u32)src[p+3]<<24);
@@ -173,10 +184,10 @@ inline u32 ZstdCompressChunk(const u8 *src, u32 n, u8 *dst, u32 dst_cap,
   u32 seq_raw = sp;
   if (dst_cap < kHdr) return 0;
   // rANS both streams, sequences first.
-  u32 seq_comp = RansEncodeBuf(seqbuf, seq_raw, dst + kHdr, dst_cap - kHdr, freq, freqN, cumf);
+  u32 seq_comp = RansEncodeBuf(seqbuf, seq_raw, dst + kHdr, dst_cap - kHdr, freq, freqN, cumf, ercp, eshift);
   if (seq_raw > 0 && seq_comp == 0) return 0;
   u32 lit_comp = RansEncodeBuf(litbuf, lit_count, dst + kHdr + seq_comp,
-                               dst_cap - kHdr - seq_comp, freq, freqN, cumf);
+                               dst_cap - kHdr - seq_comp, freq, freqN, cumf, ercp, eshift);
   if (lit_count > 0 && lit_comp == 0) return 0;
   u32 hv[5] = {n_seq, lit_count, seq_raw, seq_comp, lit_comp};
   for (int i = 0; i < 5; ++i) {
@@ -283,6 +294,8 @@ int clio_sycl_zstd_compress(void *qbv, const void *src, size_t src_size,
        sycl::local_accessor<u32, 1> s_freq(sycl::range<1>(256), h);
        sycl::local_accessor<u16, 1> s_freqN(sycl::range<1>(256), h);
        sycl::local_accessor<u32, 1> s_cumf(sycl::range<1>(257), h);
+       sycl::local_accessor<u32, 1> s_rcp(sycl::range<1>(256), h);
+       sycl::local_accessor<u32, 1> s_shift(sycl::range<1>(256), h);
        h.parallel_for(
            sycl::nd_range<1>(sycl::range<1>((size_t)(nc ? nc : 1) * kGroup),
                              sycl::range<1>(kGroup)),
@@ -299,7 +312,8 @@ int clio_sycl_zstd_compress(void *qbv, const void *src, size_t src_size,
                u8 *sb = d_seq + (size_t)c * 2 * chunk_c;
                u32 z = ZstdCompressChunk(d_src + off, len, cdst, bound_c, lb, sb,
                                          2 * chunk_c, &s_hash[0], &s_freq[0],
-                                         &s_freqN[0], &s_cumf[0]);
+                                         &s_freqN[0], &s_cumf[0], &s_rcp[0],
+                                         &s_shift[0]);
                if (z == 0 || z >= len) {  // incompressible -> store raw
                  for (u32 k = 0; k < len; ++k) cdst[k] = d_src[off + k];
                  d_csize[c] = len | kStoredFlag;
@@ -334,14 +348,26 @@ int clio_sycl_zstd_compress(void *qbv, const void *src, size_t src_size,
     if (nc) q.memcpy(d_coff, coff32.data(), (size_t)nc * sizeof(u32)).wait();
 
     const u32 bound_k = bound, chunk_k = chunk_size;
+    (void)chunk_k;
     u8 *payload_base = d_out + hdr;
-    q.parallel_for(sycl::range<1>(nc ? nc : 1), [=](sycl::id<1> idx) {
-       u32 c = (u32)idx[0];
-       if (c >= nc) return;
-       u32 raw = d_csize[c] & ~kStoredFlag;
-       const u8 *csrc = d_scratch + (size_t)c * bound_k;
-       u8 *cdst = payload_base + d_coff[c];
-       for (u32 k = 0; k < raw; ++k) cdst[k] = csrc[k];
+    // One WORK-GROUP per chunk, lanes copying consecutive bytes (coalesced). The
+    // earlier one-work-item-per-chunk gather read d_scratch at bound-sized
+    // strides, so every byte was an uncoalesced transaction -- the real compress
+    // bottleneck, not the encode.
+    constexpr u32 kGatherW = 128;
+    q.submit([&](sycl::handler &h) {
+       h.parallel_for(
+           sycl::nd_range<1>(sycl::range<1>((size_t)(nc ? nc : 1) * kGatherW),
+                             sycl::range<1>(kGatherW)),
+           [=](sycl::nd_item<1> it) {
+             u32 c = (u32)it.get_group(0);
+             if (c >= nc) return;
+             u32 lid = (u32)it.get_local_id(0);
+             u32 raw = d_csize[c] & ~kStoredFlag;
+             const u8 *csrc = d_scratch + (size_t)c * bound_k;
+             u8 *cdst = payload_base + d_coff[c];
+             for (u32 k = lid; k < raw; k += kGatherW) cdst[k] = csrc[k];
+           });
      }).wait();
 
     // Write the header + size table into d_out[0..hdr).

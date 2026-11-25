@@ -322,14 +322,26 @@ int clio_sycl_snappy_compress(void *qbv, const void *src, size_t src_size,
     if (nc) q.memcpy(d_coff, coff32.data(), (size_t)nc * sizeof(u32)).wait();
 
     const u32 bound_k = bound, chunk_k = chunk_size;
+    (void)chunk_k;
     u8 *payload_base = d_out + hdr;
-    q.parallel_for(sycl::range<1>(nc ? nc : 1), [=](sycl::id<1> idx) {
-       u32 c = (u32)idx[0];
-       if (c >= nc) return;
-       u32 raw = d_csize[c] & ~kStoredFlag;
-       const u8 *csrc = d_scratch + (size_t)c * bound_k;
-       u8 *cdst = payload_base + d_coff[c];
-       for (u32 k = 0; k < raw; ++k) cdst[k] = csrc[k];
+    // One WORK-GROUP per chunk, lanes copying consecutive bytes (coalesced). The
+    // earlier one-work-item-per-chunk gather read d_scratch at bound-sized
+    // strides, so every byte was an uncoalesced transaction -- the real compress
+    // bottleneck, not the encode.
+    constexpr u32 kGatherW = 128;
+    q.submit([&](sycl::handler &h) {
+       h.parallel_for(
+           sycl::nd_range<1>(sycl::range<1>((size_t)(nc ? nc : 1) * kGatherW),
+                             sycl::range<1>(kGatherW)),
+           [=](sycl::nd_item<1> it) {
+             u32 c = (u32)it.get_group(0);
+             if (c >= nc) return;
+             u32 lid = (u32)it.get_local_id(0);
+             u32 raw = d_csize[c] & ~kStoredFlag;
+             const u8 *csrc = d_scratch + (size_t)c * bound_k;
+             u8 *cdst = payload_base + d_coff[c];
+             for (u32 k = lid; k < raw; k += kGatherW) cdst[k] = csrc[k];
+           });
      }).wait();
 
     // Write the header + size table into d_out[0..hdr).
