@@ -29,3 +29,25 @@ no SSC, thinking on.
 - [ ] Replace every red TODO with Delta numbers
 - [ ] Fill authors/venues in refs.bib
 - [ ] Final system name (current macro: Agora)
+
+## WfCommons on Delta (unseen real applications)
+
+- [ ] Converter: WfCommons workflow instances (tasks, files, sizes, dependencies) -> harness phases
+      (one window per workflow stage); decide which outputs are "searched later" (e.g. final outputs)
+- [ ] Fix the workflow set before any results (e.g. Montage, 1000Genome or Epigenomics, BLAST or Seismology)
+- [ ] Runs: workflow grid (3 repeats); SSC with Gray-Scott-only experience on workflows; leave-one-workflow-out;
+      live makespan (SSC / no SSC / rules / fixed / thinking) with error bars; mixed workflow runs;
+      cold start on a new workflow
+- [ ] Optional: one live run of real WfBench through the CLIO filesystem interface
+
+## Paper changes after Delta (papers/ssc/paper/main.tex; figure scripts in papers/ssc/scripts)
+
+- [ ] Abstract/intro: Delta numbers; add WfCommons; frame as "no rewriting when node or app changes"
+- [ ] Section 2: heatmap + best-setup table from the Delta grid, with WfCommons stages as rows
+- [ ] Sections 3-4: decision and swap times from Delta; async decisions and cold start if built; grid cost
+- [ ] Section 5: unit tests done; replication/prefetch as decisions if added
+- [ ] Section 6: Delta setup + error bars; workflows; new "unseen applications" subsection; makespan;
+      SSC-parts and guard ablations; model-size sweep; cold-start curve; drop or redo the Claude check
+- [ ] Related work: WfCommons/workflow I/O; fill refs.bib; Limitations rewritten
+- [ ] Regenerate fig0-fig4 + new unseen-application and model-size/cold-start figures
+- [ ] Final name (DBLP check), ACM AI-use disclosure, use the remaining pages (6 of 11 now)
