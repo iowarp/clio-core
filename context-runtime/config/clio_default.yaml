@@ -830,6 +830,12 @@ compose:
     # Data mode is a distributed cache: on every node it caches bytes,
     # coherent through each blob's home (sharer invalidation) and correct
     # across node failures (blobs homed on a down node bypass the cache).
+    # sharer_log_path: "${CLIO_STORAGE_ROOT}/cte_wtc_sharers"
+    #   Write-ahead log of each blob home's sharer directory (which nodes
+    #   cache the blob); the container appends ".<container id>". Replayed on
+    #   a warm restart, so a home that restarts still invalidates copies
+    #   cached before it went down. Unset: the directory is memory only and
+    #   such copies can stay stale after a home restart.
     # Writes send no invalidation of their own: the write-back cache below
     # lands each flushed range through this pool on the blob's home, which
     # invalidates its sharers then. Only with a write-back cache below whose

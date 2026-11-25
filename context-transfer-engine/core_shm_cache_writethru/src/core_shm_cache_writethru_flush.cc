@@ -681,6 +681,68 @@ clio::run::TaskResume Runtime::FlushLog(clio::run::shared_ptr<FlushLogTask> &tas
 // Coherence
 // ===========================================================================
 
+void Runtime::OpenSharerLog() {
+  if (config_.sharer_log_path_.empty()) return;
+  const std::string path =
+      config_.sharer_log_path_ + "." + std::to_string(container_id_);
+  if (!sharer_log_.Open(path)) {
+    HLOG(kError, "core_shm_cache_writethru: cannot open sharer log {}; copies "
+         "cached elsewhere will not be invalidated after a restart", path);
+    return;
+  }
+  std::lock_guard<std::mutex> lk(sharers_mtx_);
+  if (!is_restart_) {
+    sharer_log_.Rewrite({});  // a fresh start: no copy survives anywhere
+    return;
+  }
+  const size_t n = sharer_log_.Replay(
+      [this](clio::run::u32 type, const std::string &p) {
+        if (p.size() < sizeof(clio::run::u32)) return;
+        clio::run::u32 node = 0;
+        std::memcpy(&node, p.data(), sizeof(node));
+        SharerSet &s = sharers_[p.substr(sizeof(node))];
+        if (type == kSharerRecWriter) {
+          s.writers_.insert(node);
+        } else {
+          s.nodes_.insert(node);
+        }
+      });
+  CompactSharerLogLocked();
+  HLOG(kInfo, "core_shm_cache_writethru {}: replayed {} sharer records ({} "
+       "blobs cached elsewhere)", pool_id_.ToString(), n, sharers_.size());
+}
+
+void Runtime::LogSharerLocked(const std::string &key, clio::run::u32 node,
+                              clio::run::u32 type) {
+  if (!sharer_log_.IsOpen()) return;
+  std::string p(sizeof(node), '\0');
+  std::memcpy(&p[0], &node, sizeof(node));
+  p += key;
+  if (!sharer_log_.Append(type, p)) {
+    HLOG(kError, "core_shm_cache_writethru: sharer log append failed");
+  }
+  if (sharer_log_.BytesSinceCompact() > kSharerLogCompactBytes) {
+    CompactSharerLogLocked();
+  }
+}
+
+void Runtime::CompactSharerLogLocked() {
+  if (!sharer_log_.IsOpen()) return;
+  std::vector<std::pair<clio::run::u32, std::string>> recs;
+  for (const auto &kv : sharers_) {
+    auto add = [&](clio::run::u32 type, clio::run::u32 node) {
+      std::string p(sizeof(node), '\0');
+      std::memcpy(&p[0], &node, sizeof(node));
+      recs.emplace_back(type, p + kv.first);
+    };
+    for (clio::run::u32 n : kv.second.nodes_) add(kSharerRecNode, n);
+    for (clio::run::u32 w : kv.second.writers_) add(kSharerRecWriter, w);
+  }
+  if (!sharer_log_.Rewrite(recs)) {
+    HLOG(kError, "core_shm_cache_writethru: sharer log compaction failed");
+  }
+}
+
 std::map<clio::run::u32, std::vector<BlobKey>> Runtime::HomeApply(
     const std::vector<BlobKey> &keys, clio::run::u32 writer) {
   std::map<clio::run::u32, std::vector<BlobKey>> by_node;
@@ -710,6 +772,12 @@ std::map<clio::run::u32, std::vector<BlobKey>> Runtime::HomeApply(
       if (it != sharers_.end()) sharers_.erase(it);
     } else {
       SharerSet &s = sharers_[sk];
+      // Log only a membership the directory did not hold: the log keeps a
+      // superset, so a repeat writer costs nothing.
+      if (s.nodes_.count(writer) == 0) LogSharerLocked(sk, writer, kSharerRecNode);
+      if (s.writers_.count(writer) == 0) {
+        LogSharerLocked(sk, writer, kSharerRecWriter);
+      }
       s.nodes_.clear();
       s.writers_.clear();
       s.nodes_.insert(writer);
@@ -830,7 +898,12 @@ clio::run::TaskResume Runtime::Invalidate(
     } else if (task->mode_ == kInvalidateRegister) {
       std::lock_guard<std::mutex> lk(sharers_mtx_);
       for (const BlobKey &k : keys) {
-        sharers_[SharerKey(k.major_, k.minor_, k.name_)].nodes_.insert(sender);
+        const std::string sk = SharerKey(k.major_, k.minor_, k.name_);
+        // Logged before the registration is acknowledged: a restart of this
+        // home still invalidates the copy the sender is about to cache.
+        if (sharers_[sk].nodes_.insert(sender).second) {
+          LogSharerLocked(sk, sender, kSharerRecNode);
+        }
       }
     } else if (task->mode_ == kInvalidateFanout) {
       std::lock_guard<std::mutex> lk(sharers_mtx_);

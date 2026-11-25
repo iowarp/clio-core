@@ -70,6 +70,13 @@ static constexpr double kBarrierPollUs = 10.0;
 // Lifecycle
 // ===========================================================================
 
+void Runtime::Restart(const clio::run::PoolId &pool_id,
+                      const std::string &pool_name,
+                      clio::run::u32 container_id) {
+  is_restart_ = true;
+  Init(pool_id, pool_name, container_id);
+}
+
 clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   CLIO_TASK_BODY_BEGIN
   // The task is NOT a CreateTask, whatever the parameter says: compose hands
@@ -79,6 +86,7 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   // through `task` is undefined behaviour, which UBSan reports.
   auto &fields = task.template Cast<clio::run::admin::CreatePoolFields>();
   config_ = fields->GetParamsAs<WtcConfig>();
+  OpenSharerLog();
   interposer_next_pool_ = config_.next_pool_id_;
   next_client_ = std::make_unique<clio::cte::core::Client>(CorePoolId());
   if (!config_.data_pool_.IsNull() && !config_.md_only_ &&

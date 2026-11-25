@@ -49,6 +49,7 @@
 #include <clio_runtime/clio_runtime.h>
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/core/core_interposer.h>
+#include <clio_cte/core/record_log.h>
 #include <clio_cte/core/shm_wtc.h>
 #include <clio_cte/core_shm_cache_writethru/core_shm_cache_writethru_client.h>
 #include <clio_cte/core_shm_cache_writethru/core_shm_cache_writethru_tasks.h>
@@ -114,6 +115,15 @@ class Runtime : public clio::cte::core::CoreInterposer {
 
   // ---- Method handlers ----
   clio::run::TaskResume Create(clio::run::shared_ptr<CreateTask> &task);
+  /**
+   * Warm restart on the same node: Create then replays the sharer WAL
+   * instead of discarding it.
+   * @param pool_id the pool
+   * @param pool_name its name
+   * @param container_id this container
+   */
+  void Restart(const clio::run::PoolId &pool_id, const std::string &pool_name,
+               clio::run::u32 container_id) override;
   clio::run::TaskResume Destroy(clio::run::shared_ptr<DestroyTask> &task);
   clio::run::TaskResume Monitor(clio::run::shared_ptr<MonitorTask> &task);
   clio::run::TaskResume GetOrCreateTag(
@@ -631,6 +641,34 @@ class Runtime : public clio::cte::core::CoreInterposer {
   std::mutex inv_mtx_;  ///< guards inv_lanes_
   std::unordered_map<clio::run::u32, InvLane> inv_lanes_;  ///< by home node
   std::map<std::string, SharerSet> sharers_;
+
+  // ---- sharer-directory WAL (sharers_ survives a restart of this home) ----
+  /** Record types: a container that may cache the blob / whose write
+   *  landed. Only additions are logged; replay yields a superset of the
+   *  directory (extra invalidations, never a missed one), and compaction
+   *  rewrites the exact in-memory directory. */
+  static constexpr clio::run::u32 kSharerRecNode = 1;
+  static constexpr clio::run::u32 kSharerRecWriter = 2;
+  /** Compact once this many bytes were appended since the last rewrite. */
+  static constexpr clio::run::u64 kSharerLogCompactBytes = 8ull << 20;
+  clio::cte::core::RecordLog sharer_log_;
+  bool is_restart_ = false;  ///< Restart (not a fresh start) built us
+  /** Open the WAL; a restart replays it into sharers_, a fresh start
+   *  empties it. */
+  void OpenSharerLog();
+  /**
+   * Log that `node` joined a blob's sharer set (sharers_mtx_ held). Written
+   * (not fsynced) before the registration is acknowledged: it survives this
+   * process crashing.
+   * @param key the blob's SharerKey
+   * @param node the container
+   * @param type kSharerRecNode or kSharerRecWriter
+   */
+  void LogSharerLocked(const std::string &key, clio::run::u32 node,
+                       clio::run::u32 type);
+  /** Rewrite the WAL from sharers_ when it grew past the threshold
+   *  (sharers_mtx_ held). */
+  void CompactSharerLogLocked();
 };
 
 /** Sharer-map key of a blob. */

@@ -528,7 +528,8 @@ class Cluster:
                    '    md_only: false\n'
                    '    capacity: "'
                    f'{os.environ.get("CLIO_FS_SUITE_SHM_CACHE_GB", "8")}G"\n'
-                   '    max_blobs: 1048576\n')
+                   '    max_blobs: 1048576\n'
+                   f'    sharer_log_path: "{lr}/data/cte_wtc_sharers"\n')
       top_id = '568.0'
     else:
       shm_cache = ''
