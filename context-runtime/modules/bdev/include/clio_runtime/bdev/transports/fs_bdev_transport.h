@@ -105,6 +105,15 @@ class FsBdevTransport : public BdevTransport {
   clio::run::u64 gc_done_ = 0;
   clio::run::u64 gc_ok_through_ = 0;
   bool gc_running_ = false;
+  /// Changes to the backing files (completed writes, growth): a Sync with
+  /// none since the last successful fdatasync started has nothing to flush.
+  /// One client fsync syncs the device several times (the file, its
+  /// directory, the namespace), each a full fdatasync of a multi-GB file.
+  std::atomic<clio::run::u64> mutations_{0};
+  /// mutations_ as read when the last successful fdatasync started (gc_mu_).
+  clio::run::u64 synced_mutations_ = 0;
+  /** Record a completed change to the backing files. */
+  void NoteMutation() { mutations_.fetch_add(1, std::memory_order_acq_rel); }
   std::condition_variable sync_cv_;
   bool sync_stop_ = false;
 
