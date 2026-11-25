@@ -477,7 +477,7 @@ int main(int argc, char **argv) {
   u64 mb = 32, page_kb = 64, gs_n = 128;
   u32 gs_dev_steps = 2000, md_lattice = 48;
   int reps = 3, page_reps = 1;
-  std::string only, codecs;
+  std::string only, codecs, dump;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&] { return std::strtoull(argv[++i], nullptr, 10); };
@@ -490,6 +490,7 @@ int main(int argc, char **argv) {
     else if (a == "--page-reps") page_reps = (int)next();
     else if (a == "--only") only = argv[++i];
     else if (a == "--codecs") codecs = argv[++i];
+    else if (a == "--dump") dump = argv[++i];
   }
   const u64 page = page_kb << 10;
   const char *rk = std::getenv("PALS_RANKID");
@@ -517,6 +518,22 @@ int main(int argc, char **argv) {
   if (want(only, "lammps_md"))
     for (auto &d : LammpsMd(md_lattice)) ds.push_back(std::move(d));
   if (want(only, "gnn")) ds.push_back(Gnn(mb << 20));
+
+  // Dump each dataset's exact bytes so an external codec (e.g. nvcomp, which
+  // is CUDA-only and cannot link here) compresses the SAME data the SYCL
+  // codecs see. These are the vector's page bytes, verbatim.
+  if (!dump.empty()) {
+    for (const auto &d : ds) {
+      std::string path = dump + "/" + d.name + ".bin";
+      std::FILE *f = std::fopen(path.c_str(), "wb");
+      if (!f) { std::printf("FAIL: cannot open %s\n", path.c_str()); return 1; }
+      std::fwrite(d.bytes.data(), 1, d.bytes.size(), f);
+      std::fclose(f);
+      std::printf("DUMP,%s,%llu\n", path.c_str(),
+                  (unsigned long long)d.bytes.size());
+    }
+    std::fflush(stdout);
+  }
 
   std::vector<Row> rows;
   bool all = true;
