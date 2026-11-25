@@ -28,6 +28,13 @@ def env_for(c):
 
 def start(c, fresh=True, wait_s=60):
     os.makedirs(ROOT, exist_ok=True)
+    tier_dir = os.environ.get("SSC_DISK_DIR")
+    if fresh and tier_dir:
+        # the second tier lives outside ROOT (e.g. on the parallel FS): a fresh start must not
+        # inherit the previous runtime's tier file or allocation log
+        import glob
+        for f in glob.glob(os.path.join(tier_dir, "cte_disk_tier.dat*")):
+            os.remove(f)
     with open(os.path.join(ROOT, "clio.yaml"), "w") as f:
         f.write(compose.render(c, ROOT))
     log = open(os.path.join(ROOT, "runtime.log"), "a")

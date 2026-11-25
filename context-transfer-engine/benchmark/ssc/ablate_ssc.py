@@ -164,7 +164,7 @@ def main():
     a = ap.parse_args()
     phases = {"gs": workload.BASE_PHASES, "gs7": workload.GS_PHASES, "app2": workload.APP2_PHASES,
               "app3": workload.APP3_PHASES}[a.app]
-    lo, hi = map(int, a.seeds.split("-"))
+    lo, hi = (map(int, a.seeds.split("-")) if "-" in a.seeds else (int(a.seeds), int(a.seeds)))
     cell, best, worst = grid_table(a.grid)
     CELLS.update(cell)
     tiers = {"dram": {"remaining_gb": float(e2e.os.environ.get("SSC_DRAM_GB", 1)), "score": 1.0},

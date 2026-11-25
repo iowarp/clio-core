@@ -6,6 +6,9 @@ A composition is the set of choices the live controller can make on a single nod
     indexer      bool                  clio_cte_indexer in the chain
     compression  "none" | codec name   clio_cte_compressor with default_compress
 
+SSC_DISK_DIR puts the second tier's file elsewhere (default: next to the runtime, on the node's
+local NVMe), e.g. on the parallel file system for the "DRAM + PFS" node setup.
+
 The SSD tier is long_term (a durable device; cache copies may only use temporary tiers, so they
 stay in DRAM) and the cache keeps owner-local copies (owner_copies, single node): without both the
 cache ChiMod is a pass-through on one node. SSC_DISK_PERSISTENCE / SSC_CACHE_OWNER_COPIES restore
@@ -60,7 +63,7 @@ compose:
         bdev_type: "ram"
         capacity_limit: "{dram_gb}g"
         score: {dram_score}
-      - path: "{root}/cte_disk_tier.dat"
+      - path: "{os.environ.get('SSC_DISK_DIR', root)}/cte_disk_tier.dat"
         bdev_type: "file"
         capacity_limit: "{disk_gb}GB"
         score: {disk_score}

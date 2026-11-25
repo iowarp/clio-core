@@ -39,15 +39,20 @@ ARMS = {
     "none@qwen3:4b+think": ("S2, no SSC (qwen3-4B think)", ORANGE, "s2"),
     "none@qwen3:14b+think": ("S2, no SSC (qwen3-14B think)", RED, "s2"),
     "v10@qwen3:4b+think": ("S2 + SSC (qwen3-4B think)", YELLOW, "s2ssc"),
-    "rulesh": ("Expert rules", GRAY, "nomodel"),
+    "rules": ("Expert rules", GRAY, "nomodel"),
+    "rulesh": ("Expert rules + capacity codec", "#a8a7a2", "nomodel"),
     "wknn10": ("SSC lookup, no model", GREEN, "nomodel"),
     "const": ("Fixed guess", "#b5b4ae", "nomodel"),
     "guards": ("Guards only", "#5f5e5a", "nomodel"),
 }
-MAIN = ["const", "guards", "rulesh", "wknn10", "none@qwen3:4b", "none@llama3.1:8b",
+MAIN = ["const", "guards", "rules", "wknn10", "none@qwen3:4b", "none@llama3.1:8b",
         "none@qwen3:4b+think", "none@qwen3:14b+think", "v10@qwen3:4b+think",
         "v10@llama3.1:8b", "v10@qwen3:4b"]
-NODES = {"05g": "0.5 GB DRAM", "1g": "1 GB DRAM", "4g": "4 GB DRAM"}
+NODES = {"05g": "0.5 GB DRAM", "1g": "1 GB DRAM", "4g": "4 GB DRAM",
+         "05gp": "0.5 GB DRAM + parallel FS",
+         # live result directories (node_app)
+         "1g_app3": "WfCommons, 1 GB DRAM node", "1g_app2": "DL/HDF5, 1 GB DRAM node",
+         "05g_app3": "WfCommons, 0.5 GB DRAM node"}
 
 plt.rcParams.update({
     "font.size": 8, "axes.titlesize": 8.5, "axes.labelsize": 8, "legend.fontsize": 7,
@@ -325,7 +330,8 @@ ACC_WITHIN = 1.25    # a decision is "accurate" if its window time is within 25%
                      # (measurement noise between repeats is ~10% median, so 10% would mostly score noise)
 SCENARIOS = [(("1g", "gs"), "Gray-Scott\n1 GB node"), (("05g", "gs"), "Gray-Scott\n0.5 GB node"),
              (("4g", "gs"), "Gray-Scott\n4 GB node"), (("1g", "app2"), "DL / HDF5 app\n1 GB node"),
-             (("1g", "app3"), "WfCommons\n1 GB node")]
+             (("1g", "app3"), "WfCommons\n1 GB node"), (("05g", "app3"), "WfCommons\n0.5 GB node"),
+             (("05gp", "app3"), "WfCommons\n0.5 GB + PFS")]
 MAIN_ARMS = [("v10@qwen3:4b", "S1 + SSC (qwen3-4B, thinking off)", BLUE, False),
              ("v10@llama3.1:8b", "S1 + SSC (llama3.1-8B, thinking off)", VIOLET, False),
              ("none@qwen3:4b+think", "S2, no SSC (qwen3-4B, thinking on)", ORANGE, False),
