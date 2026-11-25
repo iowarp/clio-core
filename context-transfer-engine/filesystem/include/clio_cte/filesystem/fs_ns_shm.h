@@ -488,6 +488,18 @@ class View {
                u64 *old_size, u64 *seq);
 
   /**
+   * ftruncate(2) through an open descriptor: by inode, never by name. The
+   * name may be gone (unlinked while open) and must not be resolved.
+   * @param id the open file's id
+   * @param size new size
+   * @param now change time (ns)
+   * @param old_size receives its size before the call
+   * @param seq receives the op's log seq (WaitApplied)
+   * @return 0, EISDIR, EINVAL (not a file), or kMiss (inode not in the table)
+   */
+  int TruncateId(u64 id, u64 size, u64 now, u64 *old_size, u64 *seq);
+
+  /**
    * Wait until the module has applied the log through `seq` (a wait on the
    * background drain, never a task).
    * @param seq a seq a mutation returned, or PushedSeq()

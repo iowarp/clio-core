@@ -611,6 +611,23 @@ int Runtime::InodeSetAttr(const FsReq &req, FsResp &resp) {
   return 0;
 }
 
+/**
+ * Context for a page write the module itself makes (a truncate's zero fill,
+ * an append merge). It bypasses this node's shared-memory write-through
+ * cache: absorbed there, it would land on the store asynchronously, AFTER a
+ * client's later write of the same page from another node had landed, and
+ * overwrite it (a 1-byte file rewritten with O_TRUNC then read 0x00 on every
+ * node: the truncate's zero fill of the old tail landed last). Bypassed, the
+ * cache drains its buffered ranges of the page, drops its copy and the write
+ * is on the chain below before the module answers.
+ * @return a default context with Context::kBypassShmCache set
+ */
+static clio::cte::core::Context ModuleWriteContext() {
+  clio::cte::core::Context ctx;
+  ctx.op_flags_ |= clio::cte::core::Context::kBypassShmCache;
+  return ctx;
+}
+
 clio::run::TaskResume Runtime::InodeTruncate(const FsReq &req, FsResp &resp) {
   CLIO_TASK_BODY_BEGIN
   resp.rc_ = 0;
@@ -676,7 +693,7 @@ clio::run::TaskResume Runtime::InodeTruncate(const FsReq &req, FsResp &resp) {
     auto zp = cte_.AsyncPutBlob(tag, std::to_string(boundary_page), zoff, zlen,
                                 zbuf.shm_.template Cast<void>(),
                                 page_score_.ScoreOf(boundary_page),
-                                clio::cte::core::Context(), 0u,
+                                ModuleWriteContext(), 0u,
                                 clio::run::PoolQuery::Dynamic());
     CLIO_CO_AWAIT(zp);
     ipc->FreeBuffer(zbuf);
@@ -995,7 +1012,7 @@ clio::run::TaskResume Runtime::MergeAppends(clio::run::u64 id) {
           const clio::run::u64 k = std::min(kFsPageSize - page_off, n - put);
           auto p = cte_.AsyncPutBlob(tag, PageName(cur), page_off, k,
                                      buf.data() + put, -1.0f,
-                                     clio::cte::core::Context(), 0u,
+                                     ModuleWriteContext(), 0u,
                                      clio::run::PoolQuery::Dynamic());
           CLIO_CO_AWAIT(p);
           put += k;

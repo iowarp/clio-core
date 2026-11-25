@@ -944,6 +944,16 @@ class Client : public clio::cte::core::Client {
    * regrows, and a grow's zero-fill must not land after later writes.
    */
   int FsTruncate(const std::string &path, clio::run::u64 size);
+
+  /**
+   * ftruncate through an open descriptor on the shared-memory namespace:
+   * by the file's tag, so a file unlinked while open still truncates.
+   * @param tag the open file's tag
+   * @param size new size
+   * @return 0, an errno, or kNsUnavailable (no namespace, or the inode is
+   *         not in the table: the caller falls back to the path)
+   */
+  int FsTruncateTag(const clio::cte::core::TagId &tag, clio::run::u64 size);
   /** fallocate(2) mode bits (the Linux values). */
   static constexpr clio::run::u32 kFallocKeepSize = 0x01;
   static constexpr clio::run::u32 kFallocZeroRange = 0x10;

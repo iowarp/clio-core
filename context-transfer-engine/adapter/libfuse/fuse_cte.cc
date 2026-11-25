@@ -4003,6 +4003,10 @@ int cte_fuse_flush(const char *path, struct fuse_file_info *fi) {
   // and bytes are already in shared memory.
   if (handle != nullptr && handle->fh == 0 && HiwaterFor(p) == 0 &&
       !handle->appended.load()) {
+    // The kernel still caches each NAME separately: its hard links' cached
+    // attrs and pages would keep the old size and bytes (write via b, then
+    // stat/read via a saw the old file) until their TTL ran out.
+    for (const auto &sib : LinkGroupSiblings(p)) InvalidatePath(sib);
     return 0;
   }
   // A file with hard links takes the awaited path: its size and pages are
@@ -4520,8 +4524,16 @@ int cte_fuse_truncate(const char *path_in, cte_off_t size,
   const char *path = path_s.c_str();
   auto *cfs = CLIO_CFS_CLIENT;
   if (NsOn()) {
-    const int nrc =
-        cfs->FsTruncate(path_s, static_cast<clio::run::u64>(size));
+    // ftruncate: by the handle's inode, so a file unlinked while open (the
+    // temp-file pattern) still truncates; its name no longer resolves.
+    int nrc = clio::cte::filesystem::Client::kNsUnavailable;
+    auto *fh = fi != nullptr ? GetHandle(fi) : nullptr;
+    if (fh != nullptr && !fh->tag.IsNull()) {
+      nrc = cfs->FsTruncateTag(fh->tag, static_cast<clio::run::u64>(size));
+    }
+    if (nrc == clio::cte::filesystem::Client::kNsUnavailable) {
+      nrc = cfs->FsTruncate(path_s, static_cast<clio::run::u64>(size));
+    }
     if (nrc == 0) HiwaterClamp(path_s, static_cast<clio::run::u64>(size));
     return -nrc;
   }

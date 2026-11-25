@@ -943,6 +943,23 @@ inline int View::Truncate(const std::string &path, u64 size, u64 now,
   });
 }
 
+inline int View::TruncateId(u64 id, u64 size, u64 now, u64 *old_size,
+                            u64 *seq) {
+  return Mutate(0, 0, [&]() -> int {
+    Inode *ino = FindInodeLocked(id);
+    if (ino == nullptr) return kMiss;
+    if (ino->type_ == kFsTypeDir) return EISDIR;
+    if (ino->type_ != kFsTypeFile) return EINVAL;
+    *old_size = ino->size_;
+    ino->size_ = size;
+    ino->mtime_ = ino->ctime_ = now;
+    // No path: the module applies a truncate with an id by inode.
+    *seq = PushOpLocked(kOpTruncate, std::string(), std::string(), id, size,
+                        now, 0, 0, 0, 0, 0);
+    return 0;
+  });
+}
+
 #undef CLIO_NS_SETATTR
 
 inline int View::Readdir(const std::string &path, std::vector<DirEnt> *out) {

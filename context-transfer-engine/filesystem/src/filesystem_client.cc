@@ -839,6 +839,25 @@ int Client::FsTruncate(const std::string &path, clio::run::u64 size) {
   return 0;
 }
 
+int Client::FsTruncateTag(const clio::cte::core::TagId &tag,
+                          clio::run::u64 size) {
+  ns::View *v = Ns();
+  if (v == nullptr || tag.IsNull()) return kNsUnavailable;
+  int rc = WaitAppendsMerged(tag);  // the cut applies after them
+  if (rc != 0) return rc;
+  rc = WaitSizeDrained(tag);
+  if (rc != 0) return rc;
+  clio::run::u64 old_size = 0;
+  clio::run::u64 seq = 0;
+  rc = v->TruncateId(PackTag(tag), size, NowNs(), &old_size, &seq);
+  if (rc == ns::kMiss) return kNsUnavailable;
+  if (rc != 0) return rc;
+  (void)old_size;
+  // Applied before return, as FsTruncate: a shrink cuts cached pages.
+  if (!v->WaitApplied(seq, kNsDrainWaitMs)) return EIO;
+  return 0;
+}
+
 int Client::FsFallocate(const clio::cte::core::TagId &tag,
                         const std::string &path, clio::run::u32 mode,
                         clio::run::u64 off, clio::run::u64 len) {
