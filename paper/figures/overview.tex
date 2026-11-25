@@ -1,0 +1,31 @@
+% System overview (TikZ). \input from main.tex.
+\begin{tikzpicture}[
+  font=\scriptsize, >=stealth, node distance=4mm,
+  box/.style={draw, rounded corners=2pt, align=center, inner sep=3pt, minimum height=7mm},
+  data/.style={box, fill=blue!6}, model/.style={box, fill=orange!12}, det/.style={box, fill=gray!12},
+  mod/.style={draw, fill=white, minimum width=11mm, minimum height=5mm, inner sep=1pt}]
+  % CLIO chain
+  \node[mod] (cache) {cache};
+  \node[mod, right=1.5mm of cache] (idx) {indexer};
+  \node[mod, right=1.5mm of idx] (cmp) {compressor};
+  \node[mod, right=1.5mm of cmp] (core) {core};
+  \node[mod, below=1.5mm of core, xshift=-6mm, minimum width=8mm] (dram) {DRAM};
+  \node[mod, below=1.5mm of core, xshift=6mm, minimum width=8mm] (ssd) {SSD/PFS};
+  \draw[->] (cache) -- (idx); \draw[->] (idx) -- (cmp); \draw[->] (cmp) -- (core);
+  \draw[->] (core) -- (dram); \draw[->] (core) -- (ssd);
+  \node[draw, dashed, rounded corners, fit=(cache)(core)(dram)(ssd), inner sep=3pt,
+        label={[font=\scriptsize\bfseries]above:CLIO chain (live)}] (chain) {};
+  \node[data, left=6mm of chain] (app) {application\\windows};
+  \draw[->, thick] (app) -- (chain);
+  % loop
+  \node[data, below=7mm of app, xshift=6mm] (obs) {1. observe\\client trace,\\compressibility,\\tier fill};
+  \node[data, right=of obs] (ssc) {2. build SSC\\window facts +\\$k$=3 similar\\other workloads};
+  \node[model, right=of ssc] (llm) {3. ask fast\\model (S1,\\thinking off)\\$\approx$1\,s};
+  \node[det, right=of llm] (guard) {4. guards\\declared indexer,\\capacity reflex};
+  \node[det, above=of guard, yshift=-1mm] (act) {5. apply at next\\window boundary\\(compose start/rm)};
+  \node[data, below=4mm of ssc] (grid) {node experience: measured grid\\(phases $\times$ 24 compositions, once per node)};
+  \draw[->] (chain.south west) ++(2mm,0) |- (obs.north);
+  \draw[->] (obs) -- (ssc); \draw[->] (ssc) -- (llm); \draw[->] (llm) -- (guard); \draw[->] (guard) -- (act);
+  \draw[->] (act.north) |- (chain.east);
+  \draw[->] (grid) -- (ssc);
+\end{tikzpicture}

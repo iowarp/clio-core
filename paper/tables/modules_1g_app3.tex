@@ -1,0 +1,12 @@
+\begin{tabular}{lllll}
+\toprule
+Phase & best (place/cache/codec) & S1 + SSC & S2, no SSC & S1, no SSC \\
+\midrule
+Montage mProject images & DRAM/--/none & DRAM/cache/lz4 (100\%) & DRAM/cache/lz4 (100\%) & SSD/cache/lz4/idx (0\%) \\
+Montage mDiffFit fits & DRAM/--/none & DRAM/--/none (100\%) & DRAM/cache/lz4 (0\%) & SSD/cache/lz4/idx (0\%) \\
+Epigenomics FASTQ & DRAM/--/none & DRAM/--/none (100\%) & DRAM/cache/lz4 (0\%) & SSD/cache/lz4/idx (0\%) \\
+Epigenomics map (searched) & DRAM/cache/none/idx & DRAM/cache/none/idx (100\%) & DRAM/cache/lz4/idx (17\%) & SSD/cache/lz4/idx (0\%) \\
+1000Genome VCF & DRAM/--/none & DRAM/cache/none (100\%) & DRAM/cache/lz4 (4\%) & SSD/cache/lz4/idx (0\%) \\
+1000Genome individuals & DRAM/--/none & DRAM/--/none (100\%) & DRAM/cache/lz4 (0\%) & SSD/cache/lz4/idx (0\%) \\
+\bottomrule
+\end{tabular}

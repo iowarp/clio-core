@@ -1,0 +1,11 @@
+\begin{tabular}{lllll}
+\toprule
+Phase & best (place/cache/codec) & S1 + SSC & S2, no SSC & S1, no SSC \\
+\midrule
+GS snapshot output & DRAM/--/none & DRAM/cache/none (57\%) & DRAM/cache/none/idx (100\%) & SSD/cache/lz4/idx (0\%) \\
+GS analysis re-read & DRAM/cache/lz4 & DRAM/cache/none (40\%) & DRAM/cache/none/idx (0\%) & SSD/cache/lz4/idx (0\%) \\
+GS data products & DRAM/--/none & DRAM/cache/none (100\%) & DRAM/cache/none/idx (100\%) & SSD/cache/lz4/idx (0\%) \\
+GS logs (searched) & DRAM/--/none/idx & DRAM/cache/lz4/idx (12\%) & DRAM/cache/none/idx (100\%) & SSD/cache/lz4/idx (0\%) \\
+GS log archive & DRAM/--/lz4 & DRAM/--/lz4 (100\%) & DRAM/cache/lz4/idx (100\%) & SSD/cache/lz4/idx (0\%) \\
+\bottomrule
+\end{tabular}

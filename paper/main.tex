@@ -1,0 +1,532 @@
+\documentclass[sigconf,review,anonymous]{acmart}
+% Agora / SSC paper draft for ICS. Tables in tables/*.tex and figures in figures/*.pdf are generated
+% from the Delta results by context-transfer-engine/benchmark/ssc/paper_tables.py; do not edit them
+% by hand. \pending{} marks numbers that are still being measured.
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{tikz}
+\usetikzlibrary{positioning,fit}
+\newcommand{\pending}[1]{\textcolor{red}{[#1]}}
+\newcommand{\sys}{Agora}
+\lstset{basicstyle=\ttfamily\scriptsize,breaklines=true,columns=fullflexible,frame=single,framerule=0.3pt}
+\settopmatter{printacmref=false}
+\setcopyright{none}
+
+\begin{document}
+
+\title{\sys: Fast, Context-Grounded Composition Decisions for Composable HPC Storage}
+
+\begin{abstract}
+Composable storage systems let an HPC node assemble its I/O path from modules such as caches,
+compressors and indexers, and change that path while an application runs. The mechanism exists; the
+policy does not. Today a person decides which modules belong in the chain, and the right answer
+changes with the workload phase and with the node. Large language models with step-by-step
+reasoning (``System~2'') can make such choices, but take tens of seconds per decision, longer than
+the I/O phases they control. Fast models without reasoning (``System~1'') answer in about a second
+but, given only the options, make choices that are worse than any fixed configuration.
+
+We present \sys{}, in which a fast model chooses the module composition for each workload window from
+a \emph{Storage System Context} (SSC). The SSC is built automatically from measurements on the node
+itself: for every option it states whether the window fits and how that option performed on the
+most similar \emph{other} workloads measured on the same node. It contains no hand-written module
+descriptions. We evaluate \sys{} on the CLIO composable storage runtime on an NCSA Delta node with
+three applications: a Gray-Scott simulation campaign, a DLIO/h5bench-style workload, and stages of
+three WfCommons workflows (Montage, Epigenomics, 1000Genome) derived from real execution traces.
+With the SSC, the same 4B model goes from 0\% to 65--100\% of decisions within 25\% of the best
+measured composition, and matches or exceeds a reasoning model without the SSC while deciding
+about 40$\times$ faster (1.0\,s vs.\ 43--45\,s). On live CLIO runs of WfCommons schedules, \sys{}
+with asynchronous decisions finishes within 14\% of the best fixed composition and 12$\times$ faster
+than the reasoning model, whose decisions alone take ten times the run's I/O time. Without its
+node-measured experience, the SSC is no better than no context at all. \pending{0.5 GB / PFS
+portability numbers.}
+\end{abstract}
+
+\maketitle
+
+\section{Introduction}
+HPC storage is becoming composable. Frameworks such as Mochi/Bedrock~\cite{mochi}, ADIOS2
+operators~\cite{adios2}, HDF5 VOL connectors~\cite{hdf5vol} and IOWarp/CLIO~\cite{iowarp} assemble
+the I/O path from modules, and several of them can change that path while an application runs.
+What none of them provides is the \emph{chooser}: the policy that decides which modules belong in
+the chain for the data that is being written now. In every framework we surveyed that policy is
+written by a person~\cite{crystal,ioflow}.
+
+The choice is neither obvious nor static (\S\ref{sec:motivation}). Across 16 workload phases from
+three applications, the worst valid composition is 1.9--35$\times$ slower than the best one; the
+best composition differs between phases of the same application; and it moves when the node
+changes. Whether compression pays off, for example, depends on whether the uncompressed window
+fits in the node's fast tier, which is a property of the node, not of the codec.
+
+Recent work uses large language models to tune storage systems~\cite{stellar,elmotune,storagextuner}.
+These tuners reason well but work offline, rerun benchmarks, and take seconds to minutes per
+decision. A composition decision must be made at every workload change, and in our workloads a
+window lasts one to a few seconds. Small, fast models fit that budget, but prior work found that
+they fail at configuration tasks~\cite{elmotune}, and so did we: given only the list of options, a
+4B model puts every window on the SSD with every module enabled, 5--8$\times$ slower than the best
+composition.
+
+\paragraph{Insight.} The fast model does not lack reasoning; it lacks \emph{node-specific}
+knowledge. General storage knowledge (``lz4 is fast'', ``compress compressible data'') is often wrong
+on a particular node: on our Delta node the 21$\times$-compressible VCF data of 1000Genome is
+fastest \emph{uncompressed}, because it fits in DRAM. A reasoning model can recover some of this by
+thinking, but at 40$\times$ the latency, and a larger reasoning model without node knowledge does
+worse, not better (\S\ref{sec:main}). What makes fast models effective is a context that states, for
+each option, what this node actually measured.
+
+\paragraph{Contributions.}
+\begin{itemize}
+\item The \textbf{Storage System Context (SSC)}, an automatically built, node-grounded context for
+  composition decisions: per-option evidence from the most similar other workloads measured on the
+  same node (leave-workload-out), feasibility stated as typed facts, and no hand-written module
+  prose (\S\ref{sec:ssc}).
+\item \textbf{\sys{}}, a decision loop that asks a fast model (thinking off) typed questions per
+  workload window and recomposes a live CLIO chain, with two deterministic guards and an
+  asynchronous mode that hides decision time behind I/O (\S\ref{sec:design}).
+\item Fixes that make single-node composition meaningful in CLIO: a single-node read cache and
+  device anti-affinity for same-node replicas (\S\ref{sec:clio}).
+\item An evaluation on a Delta A100 node with three applications, three node setups, five model
+  sizes, live end-to-end runs and offline replays on measured ground truth, including ablations of
+  every SSC component and of the guards, a cold-start (no experience) node, and a measurement-noise
+  sensitivity analysis (\S\ref{sec:eval}).
+\end{itemize}
+
+\section{Background and Motivation}\label{sec:motivation}
+\paragraph{Composable storage in CLIO.} CLIO's transfer engine (CTE) stores blobs in tags on
+tiered targets. Interceptor modules (ChiMods) form an ordered chain in front of the core:
+cache $\rightarrow$ indexer $\rightarrow$ compressor $\rightarrow$ core. A composition decision has
+four parts: placement (DRAM-first or SSD-first), cache (on/off), indexer (on/off) and compression
+(none, lz4, zstd): $2\times2\times2\times3=24$ compositions. Cache, indexer and compressor are
+separate pools that are added to or removed from a running runtime; a placement change restarts it.
+
+\paragraph{No single composition wins.} We measured every workload phase under every composition on
+the evaluation node (median of 3 repeats from empty tiers; \S\ref{sec:setup}). Figure~\ref{fig:motivation}
+and Table~\ref{tab:best} show the WfCommons phases; the Gray-Scott and DL/HDF5 phases behave alike.
+\begin{enumerate}
+\item \emph{The composition matters a lot.} For every phase the worst valid composition is
+  2.9--35$\times$ slower than the best (Epigenomics alignments: 35$\times$).
+\item \emph{The right composition depends on the phase.} The alignments, which are searched later,
+  want the cache in front of the indexer; the other WfCommons phases want plain DRAM; the
+  Gray-Scott log archive needs lz4 to fit at all.
+\item \emph{It depends on the node.} With half the DRAM, the Montage images and the 1000Genome
+  individuals move from no compression to lz4 (Table~\ref{tab:best}), while the alignments drop the
+  cache; on fast local NVMe the remaining differences stay small, because spilling is cheap.
+  \pending{DRAM+PFS column: which phases change when the second tier is the parallel file system.}
+\end{enumerate}
+A workflow moves through such phases in seconds, so the composition must follow the workload while
+it runs, and the mapping must be relearned for each node.
+
+\paragraph{Why not rules?} An expert can write rules for the four decisions. Our expert rules,
+written once before any run (DRAM first; cache for re-read data; indexer when declared searchable;
+lz4 for compressible data unless latency-critical; zstd when a window would not fit), encode
+general storage knowledge, and on this node that knowledge is wrong: compressing compressible data
+is slower when the window fits in DRAM. They are 1.61--2.15$\times$ slower than the best composition
+across our applications (\S\ref{sec:main}). A variant that compresses \emph{only} when a window does
+not fit captures the single fact that matters on this node and is strong where it holds
+(1.01--1.08$\times$), but it still fails on the DL/HDF5 application (1.62$\times$), and it hard-codes a
+policy that the node, not the rule writer, should decide.
+
+\paragraph{Why not a reasoning model?} A 4B model with thinking on makes reasonable choices without
+any context, but spends 43--45\,s per decision; a window lasts 1--5\,s. The decision arrives many
+windows late, or stalls the application for its duration.
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=\textwidth]{figures/fig_motivation.pdf}
+\caption{Time of each valid composition relative to the best one for each WfCommons phase (median
+of 3 runs). Columns: placement (D = DRAM-first, S = SSD-first), +c = cache, codec; the indexer is
+set as each phase requires. ``lost'' = writes refused because the window did not fit.}
+\label{fig:motivation}
+\end{figure*}
+
+\begin{table}[t]
+\caption{Best composition per WfCommons phase (placement/cache/codec) and how much slower the worst
+valid composition is.}
+\label{tab:best}
+\small\resizebox{\columnwidth}{!}{\input{tables/best_app3.tex}}
+\end{table}
+
+\section{The Storage System Context}\label{sec:ssc}
+The SSC is the text the model reads before each decision. Its design follows five rules, fixed
+before any evaluation run and motivated by known failure modes of small models (they copy what
+they see, ignore negation, and are weak with raw numbers):
+\begin{enumerate}
+\item \textbf{No module prose.} Options appear only as answer choices; nothing describes what a
+  module ``usually'' costs. Prose encodes general knowledge, which is what is wrong on a given node.
+\item \textbf{Positive, typed facts.} Feasibility is a fact per option (``lz4: fits in the free
+  space''), never a negation or advice.
+\item \textbf{Digested numbers.} Measured costs are turned into words: \emph{fastest}, \emph{a
+  little slower}, \emph{about $N\times$ slower}.
+\item \textbf{Experience from this node only.} For each option, the evidence is a
+  similarity-weighted summary over the $k=3$ most similar \emph{other} workloads measured on this
+  node. The current workload is never in its own memory, so the context cannot contain the answer.
+  Similarity uses block size, writes and reads per window, and compressibility.
+\item \textbf{Speed and feasibility are separate.} A neighbour on which an option lost writes
+  (because it did not fit) is left out of that option's speed estimate; feasibility for the current
+  window is stated separately.
+\end{enumerate}
+
+Figure~\ref{fig:ssc} shows the SSC for one Epigenomics alignment window, generated from the
+measured grid of the evaluation node. The window declares that it is searched later, so the
+indexer question states that it is required. The three most similar other workloads measured on
+the node say that DRAM is fastest (SSD about 5$\times$ slower), that the cache helps (about
+2$\times$), and that no compression is fastest. The best measured composition for this phase is
+exactly DRAM, cache, indexer, no compression.
+
+The same evidence protects against general knowledge. For a 1000Genome VCF window (compressibility
+21$\times$), the compression question states that all three options fit and that, on similar
+workloads on this node, no compression is fastest and lz4 about 2$\times$ slower. Without the SSC,
+the model compresses it (\S\ref{sec:modules}).
+
+\begin{figure}[t]
+\begin{lstlisting}
+## NODE EXPERIENCE (other workloads measured on this node)
+workload A (similarity: low): 256 blobs of 4 MB, write-only, 1.4x
+workload B (similarity: low): 256 blobs of 4 MB, write-only, 1.0x
+workload C (similarity: low): 1024 blobs of 4 MB, write-only, 6.4x
+## CURRENT WINDOW
+writes: 660 blobs of 512 KB; 660 reads (1 per blob); 2.0x
+data written per window: 0.32 GB; free space: 3.0 GB
+searched later: yes; latency critical: no
+
+Which storage tier should the data be placed on?
+- dram: on similar workloads on this node: fastest
+- ssd:  on similar workloads on this node: about 5x slower
+Should the cache be in the chain?
+- enable:  on similar workloads on this node: fastest
+- disable: on similar workloads on this node: about 2x slower
+Which compression setting should the chain use?
+- none: fits; on similar workloads on this node: fastest
+- lz4:  fits; on similar workloads on this node: about 2x slower
+- zstd: fits; on similar workloads on this node: about 6x slower
+Should the indexer track the window?
+- enable:  required: the data is searched later
+- disable: the data is not searchable later
+\end{lstlisting}
+\caption{The SSC for an Epigenomics alignment window on the 1\,GB node (abridged; generated from the
+measured grid). The model answers DRAM, cache, indexer, no compression: the measured best.}
+\label{fig:ssc}
+\end{figure}
+
+\section{\sys{} Design}\label{sec:design}
+\paragraph{Default chain.} No module is on by default. A chain starts as the core alone (DRAM-first,
+no cache, no indexer, no compression); modules are added only when a decision asks for them.
+
+\begin{figure*}[t]
+\centering
+\resizebox{0.95\textwidth}{!}{\input{figures/overview.tex}}
+\caption{\sys{} overview. Once per workload window, the client trace and the node's measured
+experience become the SSC; a fast model answers four typed questions; two deterministic guards
+check the answer; the new chain is applied to the live CLIO runtime at the next window boundary.}
+\label{fig:overview}
+\end{figure*}
+
+\paragraph{The decision loop.} \sys{} runs while the workload runs, once per window
+(Figure~\ref{fig:overview}):
+\begin{enumerate}
+\item \textbf{Observe.} When a window ends, summarize its client trace (writes and reads, block
+  size, reads per write), sample the compressibility of one blob, and read the tier fill levels.
+\item \textbf{Build the SSC.} Find the three most similar other workloads in the node's experience
+  and write one evidence line per option (Figure~\ref{fig:ssc}). Building the SSC takes milliseconds.
+\item \textbf{Ask.} Send four typed questions (placement, cache, indexer, compression) to the fast
+  model with thinking off; it returns one JSON object with one option per question (constrained
+  decoding, temperature 0).
+\item \textbf{Guard.} Two deterministic guards wrap the model: a \emph{declared-requirement gate}
+  (data declared as searched later always gets the indexer) and a \emph{capacity reflex} (a window
+  that would not fit uncompressed is compressed; during a window, a watermark at 40\% free space
+  adds the strongest codec live). Every controller in the evaluation, including the rules, runs
+  with the same guards.
+\item \textbf{Apply.} The new chain takes effect at the next window boundary. Module changes add or
+  remove pools on the running runtime (\texttt{clio\_run compose start/rm}, median 0.2\,s); a
+  placement change restarts it. A canary put/get verifies every new chain.
+\end{enumerate}
+
+\paragraph{Asynchronous decisions.} In blocking mode the workload waits for the answer. In
+asynchronous mode the workload keeps running and the answer is applied at the first window
+boundary after it arrives. A 1\,s answer is then hidden behind the next window's I/O; a 45\,s answer
+from a reasoning model arrives many windows late and acts on stale context.
+
+\paragraph{Node experience.} The per-option evidence comes from a measured grid: every workload
+phase in the node's memory under every composition. On the evaluation node this took about one hour
+per node setup (24 compositions $\times$ 7 phases $\times$ 3 repeats). It is measured once per node,
+before the workload runs; everything else happens online. \S\ref{sec:ablation} measures what a node
+with no experience (a cold start) loses.
+
+\section{Making Single-Node Composition Meaningful in CLIO}\label{sec:clio}
+\paragraph{Cache.} CLIO's cache is a cross-node read cache: the node that owns a blob keeps no copy.
+On one node every blob is owner-local, so the cache was a pass-through and its on/off decision was
+noise. We added an opt-in single-node mode (populate on read miss, delete on write; coherent because
+a single node has no foreign writers) and mark the SSD tier durable so cache copies stay in DRAM.
+
+\paragraph{Replication.} Same-node replicas were placed by score only, so with two equal disks the
+copy landed on the same disk as the original. We added device anti-affinity: devices that already
+hold a copy are tried last.
+
+Both changes pass CLIO's own cache, replication, indexer and compressor test suites (17 of 17 tests).
+
+\section{Evaluation}\label{sec:eval}
+\subsection{Setup}\label{sec:setup}
+\paragraph{Platform.} One NCSA Delta node (AMD EPYC 7763, 64 cores, 256 GB RAM, local NVMe, 4
+NVIDIA A100-40GB), allocated exclusively so no other job shares it. CLIO and the workload run on
+cores 0--31; each model runs in its own Ollama server on one A100, pinned to cores 32--63. Three
+node setups: \emph{1\,GB}: 1\,GB DRAM tier + 2\,GB NVMe tier; \emph{0.5\,GB}: 0.5\,GB DRAM + 1.5\,GB
+NVMe; \emph{DRAM+PFS}: 0.5\,GB DRAM + a 2\,GB tier on the Lustre parallel file system, about
+4$\times$ slower than the NVMe tier for spilled data.
+
+\paragraph{Applications.} (1) \emph{Gray-Scott}: seven phases derived from a real Gray-Scott
+reaction-diffusion campaign (snapshot output, analysis re-read, data products, logs searched later,
+log archive, field re-read, events). (2) \emph{DL/HDF5}: a DLIO-style training set read for three
+shuffled epochs, a model checkpoint, and h5bench-style particle dumps searched later. (3)
+\emph{WfCommons}~\cite{wfcommons}: the two dominant I/O stages of each of three workflows from the
+WfInstances traces (Pegasus on Chameleon): Montage mProject images (4\,MB, 10.4 readers per file)
+and mDiffFit fits (1\,KB), Epigenomics split FASTQ (6\,MB) and alignments (512\,KB, searched later),
+1000Genome chromosome VCF (2\,GB per window, 21$\times$ compressible) and per-individual results
+(28\,KB, already compressed). File sizes and reuse are the traces'; counts are scaled so a window
+is a meaningful amount of I/O; the contents are synthesized in each format (FITS, FASTQ, alignment
+text, VCF) since the traces record sizes only. Only the Gray-Scott phases are ever in the SSC's node
+experience; DL/HDF5 and WfCommons test whether that experience transfers to applications the
+SSC has never seen.
+
+\paragraph{Controllers.} S1: qwen3-4B and llama3.1-8B with thinking off (plus 1.7B, 8B and 14B
+for the size sweep), each with and without the SSC (``without'' = only the option list). S2:
+qwen3-4B and qwen3-14B with thinking on and no SSC, and qwen3-4B with thinking on and the SSC. No
+model: hand-written expert rules (written once, before any run), an SSC lookup that picks the option
+with the best evidence without a model, guards only (default chain plus guards), a fixed guess,
+the best fixed composition for the whole run (chosen with the grid), and an oracle that knows each
+window's best composition in advance.
+
+\paragraph{Metrics.} \emph{Accuracy}: the share of decisions whose composition is within 25\% of
+the best measured one for that window (the median repeat-to-repeat spread of the grid is 4--10\%).
+\emph{Slowdown}: geometric mean over windows of the chosen composition's time over the best one's.
+Lost writes or a broken declared requirement count as the worst valid composition. \emph{Decision
+time}: model latency per window. \emph{End-to-end time} (live): I/O + recomposition + blocking
+decision time. Confidence intervals resample whole schedules (seeds), since windows of one schedule
+are not independent.
+
+\paragraph{Protocol.} The SSC design (v10) was fixed on practice schedules 1--3 before any run on
+the evaluation node. Offline replays use 10 unseen schedules per scenario (seeds 101--110,
+36--41 windows each); live runs use schedules 201--203. Every grid cell is the median of 3 repeats,
+each starting from empty tiers.
+
+\subsection{Main result: accuracy and decision time}\label{sec:main}
+Figure~\ref{fig:main} and Table~\ref{tab:main} compare S1 with the SSC against S2 without it.
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.9\textwidth]{figures/fig_main_accuracy_speed.pdf}
+\caption{Decision accuracy (share of decisions within 25\% of the best measured composition; 95\% CI
+over schedules) and decision time per window. All bars use the same base model family; S1 =
+thinking off, S2 = thinking on.}
+\label{fig:main}
+\end{figure*}
+
+\begin{table*}[t]
+\caption{Offline replay on 10 unseen schedules per scenario: accuracy (\% of decisions within 25\%
+of the best), slowdown vs.\ the best composition (geometric mean), and median decision time.
+$^\dagger$ fewer than 10 schedules so far.}
+\label{tab:main}
+\small\resizebox{\textwidth}{!}{\input{tables/main.tex}}
+\end{table*}
+
+\textbf{The SSC is what makes a fast model usable.} Without it, every fast model we tried answers
+the same composition for every window (SSD, cache, lz4, indexer) and scores 0\% accuracy,
+4.8--8.1$\times$ slower than the best. With it, qwen3-4B reaches 65--69\% on Gray-Scott and 100\% on
+DL/HDF5, and llama3.1-8B 76--100\%.
+
+\textbf{S1 + SSC matches S2 without the SSC at 40$\times$ lower decision time.} On Gray-Scott,
+llama3.1-8B with the SSC ties the reasoning model (76\% vs.\ 76\%, 1.20$\times$ vs.\ 1.19$\times$); on
+DL/HDF5, both S1 models beat it (100\% vs.\ 59\%). A larger reasoning model without the SSC does not
+help: qwen3-14B with thinking scores 0\% and is 6.6$\times$ slower than the best, because without
+node evidence it reasons its way to compression and SSD placement. Giving the reasoning model the
+SSC brings it to 1.09$\times$, the best of all model arms, but at 81\,s per decision.
+On WfCommons, which neither the SSC nor the rules were designed on, the gap is widest: S1 + SSC is
+100\% accurate (1.006$\times$) at 0.4\,s per decision, while the reasoning model without the SSC is
+22\% accurate (95\% CI 17--27\%) and 2.33$\times$ slower than the best composition (CI
+2.08--2.63$\times$) at 15\,s per decision, over all 10 schedules. Without node evidence it settles on
+DRAM, cache and lz4 for nearly every window, the general-knowledge answer, which costs time on this
+node.
+
+\textbf{Rules and lookups.} The expert rules are 1.61--2.15$\times$ slower than the best composition
+in every scenario (34--62\% accuracy), because they compress compressible data even when it fits in
+DRAM. With the codec chosen by capacity instead, the rules reach 1.01--1.08$\times$ on Gray-Scott and
+WfCommons at 1\,GB, but remain 1.62$\times$ on DL/HDF5, where S1 + SSC is 1.03$\times$. A model-free
+lookup over the same SSC evidence is a strong baseline where the evidence is unambiguous, but it is
+brittle when it is not: on the 4\,GB Gray-Scott node it drops to 57\% accuracy while S1 + SSC stays at
+69--81\% (\S\ref{sec:modules}).
+
+\subsection{Live end-to-end on CLIO}\label{sec:live}
+\begin{table}[t]
+\caption{Live CLIO runs, WfCommons, 1\,GB node: mean per schedule. \pending{all schedules, async
+and S2 arms.}}
+\label{tab:live}
+\small\resizebox{\columnwidth}{!}{\input{tables/live_1g_app3.tex}}
+\end{table}
+
+Table~\ref{tab:live} and Figure~\ref{fig:live} show live runs, in which each controller drives a
+real CLIO runtime through a WfCommons schedule. With the SSC, qwen3-4B's compositions are within 4\%
+of the oracle's I/O time (117\,s vs.\ 112\,s on schedule 201) and 18\% faster than the rules'; the same
+model without the SSC spends 72\% more time on I/O (202\,s). In blocking mode its 41 decisions add
+50\,s. In asynchronous mode that stall disappears: each answer arrives within the next window and
+the run takes 130\,s, 9\% faster than the rules and within 14\% of the best fixed composition, which
+was chosen with knowledge of the whole grid.
+
+The reasoning model cannot follow the workload either way. Blocking, its 41 decisions take
+1,457\,s (median 34\,s each), ten times the schedule's entire I/O, and the run takes 1,598\,s:
+12.3$\times$ slower than S1 + SSC in asynchronous mode and 9.4$\times$ slower than S1 + SSC even when
+S1 blocks. Its compositions are not better either (141\,s of I/O against 117--127\,s).
+Asynchronous, only 4 of its 41 answers arrive in time to be applied, each 10 windows after the window
+it describes; for most of the run the chain stays on a stale composition (cache, lz4, indexer) and
+the run takes 140\,s, slower than S1 + SSC. \pending{All three schedules.}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{figures/fig_live_1g_app3.pdf}
+\caption{Live CLIO, WfCommons, 1\,GB node: time per schedule split into I/O, recomposition and
+blocking decision time.}
+\label{fig:live}
+\end{figure}
+
+\subsection{Which modules are used, and why}\label{sec:modules}
+Table~\ref{tab:modules} lists, per phase, the measured best chain and the chain each controller
+chose most often (with its accuracy in that phase). It shows how \sys{} uses modules selectively:
+\begin{itemize}
+\item \emph{Placement} is DRAM-first for every phase where the window fits, because the evidence
+  states SSD as 1.5--5$\times$ slower on similar workloads.
+\item The \emph{cache} goes on where data is re-read after being written to a path the cache
+  accelerates (Epigenomics alignments, 2$\times$ in the evidence), and stays off where DRAM already
+  serves the reads.
+\item The \emph{indexer} is on exactly for the phases declared as searched later; the model chooses
+  it from the evidence line and the gate never had to intervene (\S\ref{sec:ablation}).
+\item \emph{Compression} is chosen where it is needed or free, never where it costs: lz4 for the
+  Gray-Scott archive, which does not fit uncompressed (and lz4 rather than the stronger but slower
+  zstd); lz4 for the Montage images, where it ties no compression (5.85\,s vs.\ 5.84\,s, the phase is
+  dominated by 1,872 reads) while zstd would cost 2.6$\times$ \pending{and on the DRAM+PFS node, where
+  spilling is expensive}. The 21$\times$-compressible VCF stays uncompressed on the 1\,GB node,
+  because it fits and the evidence says compression is 2$\times$ slower there.
+\end{itemize}
+Without the SSC, the same model enables every module for every phase.
+
+\paragraph{Does the model just copy the evidence?} The SSC ranks the options per question; a
+model-free lookup that always takes the top-ranked option is therefore the natural point of
+comparison. Table~\ref{tab:agreement} shows where the model follows that ranking and who is right
+when it does not. Placement follows the evidence in every window, and compression in 70--100\%.
+The model and the evidence part ways mainly on the cache, where the evidence is often a tie (both
+options ``fastest'' on similar workloads) and the model breaks the tie its own way. These
+overrides are right more often than the lookup on the 4\,GB Gray-Scott node, where the lookup's
+accuracy falls to 57\%, but wrong more often on the 4\,GB DL/HDF5 node. The SSC thus carries the
+decisions, and the model contributes robustness where the evidence ranking is misleading; a hybrid
+that follows decisive evidence and asks the model only on near-ties is a natural refinement, which
+we leave to future work because the SSC design was frozen before these runs.
+
+\begin{table}[t]
+\caption{Agreement of S1 + SSC (qwen3-4B) with the model-free lookup of the same evidence, per
+question, and, over the windows where they differ, how many of each are within 25\% of the best.}
+\label{tab:agreement}
+\small\resizebox{\columnwidth}{!}{\input{tables/agreement.tex}}
+\end{table}
+
+\begin{table}[t]
+\caption{Per WfCommons phase: measured best chain and the most frequent chain each controller chose
+(share of its decisions within 25\% of the best), 1\,GB node.}
+\label{tab:modules}
+\small\resizebox{\columnwidth}{!}{\IfFileExists{tables/modules_1g_app3.tex}{\input{tables/modules_1g_app3.tex}}{\input{tables/modules_1g_gs.tex}}}
+\end{table}
+
+\subsection{What each part contributes}\label{sec:ablation}
+\begin{table*}[t]
+\caption{Ablation (qwen3-4B, thinking off): accuracy and slowdown with parts of the SSC and the
+guards removed.}
+\label{tab:ablation}
+\small\resizebox{\textwidth}{!}{\input{tables/ablation.tex}}
+\end{table*}
+
+Table~\ref{tab:ablation} removes one part at a time.
+\emph{Option list only}: 0\% accuracy everywhere.
+\emph{SSC without node experience} (a new node with nothing measured yet; only the window's own
+facts): on WfCommons at 1\,GB it is no better than no SSC at all, 0\% accuracy and 2.87$\times$ the best
+(no SSC: 3.62$\times$). The window facts do change the decisions they are decisive for (the model
+drops the cache and enables the indexer only for the alignments, which are searched later), but for
+placement and compression it falls back on general knowledge and chooses the SSD with lz4 for every
+phase; both are wrong on this node. The node's measured experience is what makes the decisions
+right (100\%, 1.006$\times$). The same holds with half the DRAM: without experience 0\% and
+2.94$\times$, with it 85\% and 1.10$\times$. \pending{DRAM+PFS.}
+\emph{Full SSC, guards off}: identical to guards on, on every schedule; with the SSC the model never
+broke a declared requirement or chose a composition that does not fit, so the guards are a safety
+net, not the source of the accuracy. \emph{Guards only}: the default chain plus the guards is a
+strong baseline where the default is right (1.04$\times$ on Gray-Scott) and a weak one where it is not
+(1.53$\times$ on DL/HDF5).
+
+\subsection{Model size}
+\begin{table}[t]
+\caption{Model size, Gray-Scott, 1\,GB node (thinking off).}
+\label{tab:sweep}
+\small\resizebox{\columnwidth}{!}{\input{tables/sweep.tex}}
+\end{table}
+Table~\ref{tab:sweep} varies the model. The SSC lifts every size from 1.7B to 14B; without it,
+the 4B and 8B models answer a constant composition and score 0\%. Gains are not monotonic in size:
+qwen3-1.7B with the SSC (1.22$\times$) is as good as llama3.1-8B (1.20$\times$) and better than
+qwen3-8B (1.56$\times$), all at about 1\,s per decision. The SSC, not model scale, carries the
+decision quality.
+
+\subsection{Portability across node setups}
+For each node setup, the node experience is re-measured and the same SSC code rebuilds the
+context; the expert rules stay as written.
+
+\paragraph{Less DRAM, fast NVMe (0.5\,GB).} Halving DRAM changes less than one might expect on this
+node, because spilling to the local NVMe is cheap: the default composition is still within 11\% of
+the best for every WfCommons phase. S1 + SSC, the capacity-codec rules, the lookup and guards alone
+all reach 85\% accuracy (1.09--1.10$\times$), while the expert rules (38\%, 2.08$\times$) and the fixed
+guess (36\%, 1.57$\times$) do not. The reasoning model without the SSC is right in 0.6\% of the windows
+(2.48$\times$) and needs 44.6\,s per decision, 144$\times$ the 0.31\,s of S1 + SSC; without node
+experience the SSC again does not help (0\%, 2.94$\times$). The 15\% all guarded controllers miss is a single phase: the 2\,GB
+VCF window exceeds the capacity reflex's 80\% headroom, so lz4 is forced, which is 1.43$\times$ slower
+than spilling it uncompressed to the NVMe. With the guards off, S1 + SSC makes the same choice
+(85\%, identical decisions): the SSC states feasibility with the same 80\% headroom (``none: does not
+fit''), and the model follows it. The conservatism is therefore one tunable margin shared by the
+context and the reflex, not a model error; on fast local storage a smaller margin would recover this
+window.
+
+\paragraph{DRAM in front of the parallel file system.} \pending{DRAM+PFS: accuracy and slowdown of
+S1 + SSC, rules, lookup and S2; which phases now want compression; cold start on this setup.}
+
+\subsection{Sensitivity to measurement noise}
+The grid is the ground truth, so we rescored every key arm with each single repeat of the grid in
+place of the median. The main conclusions hold under every repeat: the SSC always lifts the fast
+model (4.5--11.7$\times$ without it, 1.0--1.75$\times$ with it), and S1 + SSC with llama3.1-8B ties
+or beats S2 without the SSC on both 1\,GB scenarios. Differences of less than about 20\% between
+good controllers do change with the repeat, so we report them as ties.
+
+\section{Related Work}
+\paragraph{LLM storage tuning.} STELLAR~\cite{stellar}, ELMo-Tune-V2~\cite{elmotune} and
+StorageXTuner~\cite{storagextuner} tune parameters of one system offline with large models and
+benchmark reruns. \sys{} chooses compositions online, once per window, with a small model.
+\paragraph{Classical autotuning.} H5Tuner~\cite{h5tuner}, CAPES~\cite{capes} and Bayesian
+optimization of I/O stacks~\cite{bayesio} tune numeric knobs of a fixed stack over many runs.
+\paragraph{Learned placement and compression.} Sibyl~\cite{sibyl}, Harmonia~\cite{harmonia} and
+HCompress~\cite{hcompress} make one kind of decision each; \sys{} decides several together.
+\paragraph{Composable storage.} Mochi~\cite{mochi}, ADIOS2~\cite{adios2}, HDF5 VOL~\cite{hdf5vol},
+IOFlow~\cite{ioflow} and Crystal~\cite{crystal} provide composition mechanisms with human-written
+policies.
+\paragraph{Fast and slow models.} Dual-process systems~\cite{sofai,fastslow} and model
+cascades~\cite{frugalgpt,routellm} route between fast and slow models; NetLLM~\cite{netllm} shows
+single-pass models meet control-loop latency.
+\paragraph{Workflow benchmarks.} WfCommons~\cite{wfcommons} provides execution traces and
+generators of scientific workflows; we use its traces to derive realistic I/O phases.
+
+\section{Limitations}
+One node type and single-node composition; four decisions (replication and prefetching are not yet
+decisions); the DL/HDF5 and WfCommons contents are synthesized in the real formats; the SSC needs a
+measured grid per node setup (about one hour), and on a node with no measurements yet the SSC is no
+better than no context (0\% accuracy, 2.9$\times$ the best on WfCommons) until its experience is
+measured; recording each observed window as new experience would shorten that cold start.
+
+\section{Conclusion}
+A fast model cannot choose a storage composition well from the options alone, and a reasoning model
+is too slow to act at phase granularity. Context grounded in the node's own measurements closes
+that gap: with the SSC, 1.7B--8B models with thinking off make composition decisions as good as a
+reasoning model's or better, at about one second per decision, on applications and nodes the SSC
+was never designed on.
+
+\bibliographystyle{ACM-Reference-Format}
+\bibliography{refs}
+\end{document}

@@ -1,0 +1,15 @@
+\begin{tabular}{lrrrrr}
+\toprule
+Controller & sched. & I/O (s) & recomp. (s) & decision (s) & total (s) \\
+\midrule
+Oracle (knows the future) & 1 & 112 & 0.4 & 0 & 113 \\
+Best fixed setup & 1 & 114 & 0.0 & 0 & 114 \\
+Expert rules & 1 & 142 & 0.8 & 0 & 143 \\
+S1 + SSC (qwen3-4B) & 1 & 117 & 2.3 & 50 & 170 \\
+S1 + SSC, async & 1 & 127 & 2.9 & 0 & 130 \\
+S1 + SSC (llama3.1-8B) & 1 & 134 & 2.2 & 47 & 183 \\
+S1, no SSC (qwen3-4B) & 1 & 202 & 2.2 & 52 & 256 \\
+S2, no SSC (qwen3-4B think) & 1 & 141 & 0.1 & 1457 & 1598 \\
+S2, no SSC, async & 1 & 140 & 0.2 & 0 & 140 \\
+\bottomrule
+\end{tabular}
