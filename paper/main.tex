@@ -509,6 +509,21 @@ model (4.5--11.7$\times$ without it, 1.0--1.75$\times$ with it), and S1 + SSC wi
 or beats S2 without the SSC on both 1\,GB scenarios. Differences of less than about 20\% between
 good controllers do change with the repeat, so we report them as ties.
 
+\paragraph{Sensitivity to the accuracy threshold.} The 25\% threshold was introduced after the
+original 0--1 score saturated on this node, so we check that no conclusion depends on it. On
+WfCommons (both node sizes) and DL/HDF5, S1 + SSC is ahead of the reasoning model without the SSC
+at every threshold we tried (within 10\%, 25\%, 50\% and 2$\times$ of the best) and on the original
+score: on WfCommons at 0.5\,GB, for example, 67--100\% against 1--53\% across thresholds. On
+Gray-Scott the order between qwen3-4B + SSC and the reasoning model flips with the threshold
+(32\% vs.\ 22\% within 10\%, 65\% vs.\ 76\% within 25\%; scores 0.95 vs.\ 0.97), so we report
+Gray-Scott, the one application the SSC was designed on, as a tie.
+
+\paragraph{What is fixed by design.} The SSC has a small number of constants, all set before any
+evaluation run and never tuned on test schedules: the 80\% free-space margin of the feasibility facts
+and the capacity reflex, the word bins of the evidence (fastest up to 1.15$\times$, a little slower up
+to 1.6$\times$), and $k=3$ similar workloads. \S\ref{sec:portability} shows where the margin is
+conservative; the word bins explain qwen3-4B's losses on Gray-Scott (\S\ref{sec:main}).
+
 \section{Related Work}
 \paragraph{LLM storage tuning.} STELLAR~\cite{stellar}, ELMo-Tune-V2~\cite{elmotune} and
 StorageXTuner~\cite{storagextuner} tune parameters of one system offline with large models and
