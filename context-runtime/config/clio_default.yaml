@@ -827,9 +827,9 @@ compose:
     next_pool_id: "567.0"               # write-back cache (562.0 with compressor)
     # entry_pool_id: "564.0"            # with the indexer composed above
     md_only: false                      # cache blob bytes (clio-fs page writes)
-    # Data mode is single-node only: on a volume of more than one node the
-    # module caches metadata only (cross-node coherence and failover of
-    # cached bytes are not there yet). CLIO_WTC_MULTINODE_DATA=1 overrides.
+    # Data mode is a distributed cache: on every node it caches bytes,
+    # coherent through each blob's home (sharer invalidation) and correct
+    # across node failures (blobs homed on a down node bypass the cache).
     # Writes send no invalidation of their own: the write-back cache below
     # lands each flushed range through this pool on the blob's home, which
     # invalidates its sharers then. Only with a write-back cache below whose
