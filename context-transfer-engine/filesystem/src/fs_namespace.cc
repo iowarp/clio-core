@@ -1183,14 +1183,65 @@ clio::run::TaskResume Runtime::NsDrain() {
           ns_view_.PopOp();
           more = ns_view_.PeekOp(&rec, &path, &path2);
         }
-        auto f = self_.AsyncMultiCreate(EncodeMultiCreate(ents));
-        CLIO_CO_AWAIT(f);
-        if (f->first_rc_ != 0 || f->GetReturnCode() != 0) {
-          HLOG(kWarning, "filesystem: namespace drain: {} of {} creates "
-               "failed (first rc={})", ents.size() - f->num_ok_,
-               ents.size(), f->first_rc_);
+        // The entries are distinct new files whose parents exist (a mkdir
+        // ends the run): apply the batch as kCreateShards sub-batches at
+        // once. One MultiCreate applies its entries one after another
+        // (inode record, CTE tag, directory row: 1-15 ms each), and the
+        // drain fell behind a git checkout: the op log was 69% full when
+        // it ended and every later op (rm -rf's unlinks) waited for room.
+        constexpr size_t kCreateShards = 8;
+        const size_t per = (ents.size() + kCreateShards - 1) / kCreateShards;
+        std::vector<clio::run::Future<MultiCreateTask>> cfuts;
+        std::vector<size_t> sizes;
+        for (size_t off = 0; off < ents.size(); off += per) {
+          std::vector<MultiCreateEnt> part(
+              ents.begin() + off,
+              ents.begin() + std::min(ents.size(), off + per));
+          sizes.push_back(part.size());
+          cfuts.push_back(self_.AsyncMultiCreate(EncodeMultiCreate(part)));
+        }
+        for (size_t i = 0; i < cfuts.size(); ++i) {
+          CLIO_CO_AWAIT(cfuts[i]);
+          auto &f = cfuts[i];
+          if (f->first_rc_ != 0 || f->GetReturnCode() != 0) {
+            HLOG(kWarning, "filesystem: namespace drain: {} of {} creates "
+                 "failed (first rc={})", sizes[i] - f->num_ok_, sizes[i],
+                 f->first_rc_);
+          }
         }
         // Landed: only now may waiters (fsync, xattrs) see them as applied.
+        ns_view_.MarkApplied(last_seq);
+        if (!more) break;
+        continue;
+      }
+      if (rec.type_ == ns::kOpUnlink) {
+        // Consecutive unlinks name distinct live files: apply a run of them
+        // concurrently. One at a time the module applied ~800/s, the op log
+        // filled during rm -rf and every client unlink waited for room (a
+        // Linux tree: 38 s instead of a few). Any other op ends the run, so
+        // an rmdir still follows its children's unlinks.
+        constexpr size_t kUnlinkBatch = 256;
+        std::vector<std::string> paths;
+        std::vector<clio::run::Future<UnlinkTask>> futs;
+        clio::run::u64 last_seq = 0;
+        bool more = true;
+        while (more && futs.size() < kUnlinkBatch &&
+               rec.type_ == ns::kOpUnlink) {
+          paths.push_back(path);
+          futs.push_back(self_.AsyncUnlink(path));
+          last_seq = rec.seq_;
+          ns_view_.PopOp();
+          more = ns_view_.PeekOp(&rec, &path, &path2);
+        }
+        for (size_t i = 0; i < futs.size(); ++i) {
+          CLIO_CO_AWAIT(futs[i]);
+          const clio::run::u32 urc = futs[i]->GetReturnCode();
+          if (urc != 0) {
+            HLOG(kWarning, "filesystem: namespace drain: op {} on '{}' failed "
+                 "(rc={})", static_cast<clio::run::u32>(ns::kOpUnlink),
+                 paths[i], urc);
+          }
+        }
         ns_view_.MarkApplied(last_seq);
         if (!more) break;
         continue;
