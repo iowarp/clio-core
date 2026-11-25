@@ -91,11 +91,13 @@ def make_request(variant, builder, obs, phase):
     variant = variant.split("@", 1)[0]
     variant = variant[:-1] if variant.endswith("h") else variant
     variant = variant[:-1] if variant.endswith("q") else variant     # q: same SSC, fast LLM (s1_bridge.py)
-    if variant in ("v9", "v10", "v11"):
-        ssc_v8.SPEED_ONLY = variant in ("v10", "v11")
-        ssc_v8.FIT_AWARE = variant == "v11"
+    if variant in ("v9", "v10", "v11", "v10x", "v11x"):
+        # v10x / v11x: cold start, the same SSC without node experience (fit facts only)
+        ssc_v8.SPEED_ONLY = variant in ("v10", "v11", "v10x", "v11x")
+        ssc_v8.FIT_AWARE = variant in ("v11", "v11x")
         st = builder.state(obs["tiers"])
-        text, qs = ssc_v8.build_v9(obs["window"], obs["ratio"], DECLARED[phase], obs["tiers"], phase, CELLS)
+        text, qs = ssc_v8.build_v9(obs["window"], obs["ratio"], DECLARED[phase], obs["tiers"], phase, CELLS,
+                                   experience=not variant.endswith("x"))
         moved = len(builder.history) > 1 and builder.history[-2][0] != builder.history[-1][0]
         return to_agentjev({"state_text": text, "questions": qs}), {"st": st, "qs": qs, "moved": moved, "obs": obs}
     if variant in ("v8", "v8n"):

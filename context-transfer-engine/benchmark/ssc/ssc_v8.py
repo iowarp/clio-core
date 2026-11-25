@@ -216,10 +216,13 @@ def digest(nb, cells, axis, idx):
     return {o: math.exp(acc[o] / wsum[o]) if wsum[o] else 10.0 for o in acc}
 
 
-def build_v9(w, ratio, declared, tiers, phase, cells, k=3):
+def build_v9(w, ratio, declared, tiers, phase, cells, k=3, experience=True):
     """v9: v8's context, but each question's evidence is one line per option (fixed order, same
-    keys) with its feasibility and its merged measured cost on similar workloads of this node."""
-    text, qs = build(w, ratio, declared, tiers, phase, cells, k)
+    keys) with its feasibility and its merged measured cost on similar workloads of this node.
+    experience=False is the cold start (a node with no measurements yet): the same context with the
+    node-experience block and every "on similar workloads" line left out; only the window's own
+    facts remain."""
+    text, qs = build(w, ratio, declared, tiers, phase, cells, k, experience=experience)
     cur = {"blob": w["mean_put"], "n_put": w["n_put"], "n_get": w["n_get"], "ratio": ratio}
     memory = {ph: phase_facts(ph) for ph in workload.PHASES if ph != phase}
     nb = neighbours(cur, memory, k)
@@ -237,8 +240,9 @@ def build_v9(w, ratio, declared, tiers, phase, cells, k=3):
                 parts.append("fits in the free space" if fit[o] else "does not fit in the free space")
             elif axis == "placement" and FIT_AWARE and o == "dram":
                 parts.append("uncompressed window " + tier_fit(need, tiers))
-            parts.append(f"on similar workloads on this node: {relative(rel[o] * 1.0, best)}")
-            lines.append(f"{WORD[axis][o]}: " + "; ".join(parts))
+            if experience:
+                parts.append(f"on similar workloads on this node: {relative(rel[o] * 1.0, best)}")
+            lines.append(f"{WORD[axis][o]}: " + ("; ".join(parts) if parts else "no measurements on this node yet"))
         qs[axis]["instructions"] = (PREAMBLE + QTEXT[axis] + "\nEvidence for each option:\n"
                                     + "\n".join(f"- {e}" for e in lines))
     qs["indexer"]["instructions"] = (PREAMBLE + QTEXT["indexer"] + "\nEvidence for each option:\n"
