@@ -38,6 +38,7 @@
 #include "clio_ctp/memory/allocator/buddy_allocator.h"
 #include "clio_ctp/data_structures/ipc/slist_pre.h"
 #include "clio_ctp/thread/lock/mutex.h"
+#include "clio_ctp/thread/lock/timed_mutex.h"
 #include "clio_ctp/thread/thread_model_manager.h"
 #ifndef _WIN32
 #include <sys/types.h>
@@ -125,7 +126,10 @@ class PcThreadBlock : public pre::slist_node {
 class _ProducerConsumerAllocator : public Allocator {
  public:
   int tid_count_;               /**< Number of thread blocks allocated */
-  ctp::Mutex lock_;            /**< Mutex protecting global allocator */
+  /** Protects the global allocator. Holder-identified, never broken: a
+   *  waiter that finds the holder dead abandons a free instead (the dead
+   *  process's segment is reaped whole). */
+  ctp::TimedMutex lock_;
   ThreadLocalKey tblock_key_;   /**< TLS key for PcThreadBlock* */
   size_t thread_unit_;          /**< Default PcThreadBlock expansion size */
   /** Outstanding (allocated-but-not-freed) user bytes. Only updated under
@@ -226,7 +230,7 @@ class _ProducerConsumerAllocator : public Allocator {
     // Allocate from global allocator
     FullPtr<PcThreadBlock> tblock_ptr;
     {
-      ScopedMutex scoped_lock(lock_, 0);
+      HeldLock scoped_lock(lock_);
       tblock_ptr = alloc_.AllocateRegion<PcThreadBlock>(thread_unit_);
     }
     if (tblock_ptr.IsNull()) {
@@ -289,6 +293,59 @@ class _ProducerConsumerAllocator : public Allocator {
    * @param size Size in bytes to allocate
    * @return Offset pointer to allocated memory, or null on failure
    */
+  /** RAII hold of lock_; waits as long as it takes, never breaks it. */
+  class HeldLock {
+   public:
+    explicit HeldLock(TimedMutex &m) : m_(m), id_(0) {
+      for (u32 spin = 0; (id_ = m_.TryLock()) == 0; ++spin) {
+        Backoff(spin);
+      }
+    }
+    ~HeldLock() { m_.Unlock(id_); }
+    HeldLock(const HeldLock &) = delete;
+    HeldLock &operator=(const HeldLock &) = delete;
+
+   private:
+    TimedMutex &m_;
+    u64 id_;
+  };
+
+  /** Spin, then yield, then sleep while waiting for lock_. */
+  static void Backoff(u32 spin) {
+    if (spin < 64) {
+      CTP_THREAD_MODEL->Yield();
+    } else {
+      usleep(50);
+    }
+  }
+
+  /**
+   * Free unless lock_'s holder is a dead process (checked while waiting):
+   * then the free is abandoned, since the free lists may be half-updated
+   * and the segment belongs to a process that is gone.
+   * @param p the offset to free
+   * @return false when abandoned
+   */
+  bool FreeOffsetUnlessHolderDead(OffsetPtr<> p) {
+    u64 id = 0;
+    for (u32 spin = 0; (id = lock_.TryLock()) == 0; ++spin) {
+      Backoff(spin);
+      if (spin % 256 == 255) {
+        const u32 pid = TimedMutex::IdPid(lock_.State());
+        if (pid != 0 && pid != TimedMutex::MyPid() &&
+            !TimedMutex::IsProcessAlive(pid, lock_.OwnerStart())) {
+          return false;
+        }
+      }
+    }
+#ifdef CTP_ALLOC_TRACK_SIZE
+    SubSize(PageSizeOf(p));
+#endif
+    alloc_.FreeOffset(p);
+    lock_.Unlock(id);
+    return true;
+  }
+
   OffsetPtr<> AllocateOffset(size_t size) {
     // Per-thread PcThreadBlock fast path is unsafe for cross-process
     // alloc/free: producer (client) allocates from its tblock; consumer
@@ -299,7 +356,7 @@ class _ProducerConsumerAllocator : public Allocator {
     // FUSE adapter threads parked in Future.Wait.
     // Route all alloc/free through the global buddy allocator under
     // lock_ so alloc and free hit the same data structure.
-    ScopedMutex scoped_lock(lock_, 0);
+    HeldLock scoped_lock(lock_);
     OffsetPtr<> ret = alloc_.AllocateOffset(size);
 #ifdef CTP_ALLOC_TRACK_SIZE
     if (!ret.IsNull()) {
@@ -334,7 +391,7 @@ class _ProducerConsumerAllocator : public Allocator {
   void FreeOffsetNoNullCheck(OffsetPtr<> p) {
     // Route to the global allocator under lock_ — see AllocateOffset for
     // the cross-process per-tblock corruption that this avoids.
-    ScopedMutex scoped_lock(lock_, 0);
+    HeldLock scoped_lock(lock_);
 #ifdef CTP_ALLOC_TRACK_SIZE
     // Read the page size before freeing — the page may be coalesced/reused
     // by FreeOffset. Uses the same BuddyPage size AddSize recorded, so a
@@ -419,7 +476,7 @@ class _ProducerConsumerAllocator : public Allocator {
 
     OffsetPtr<> expand_ptr;
     {
-      ScopedMutex scoped_lock(lock_, 0);
+      HeldLock scoped_lock(lock_);
       expand_ptr = alloc_.AllocateOffset(expand_size);
     }
     if (expand_ptr.IsNull()) {

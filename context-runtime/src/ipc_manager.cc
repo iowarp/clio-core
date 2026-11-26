@@ -2946,7 +2946,15 @@ void IpcManager::FreeBuffer(FullPtr<char> buffer_ptr) {
     allocator_map_lock_.ReadUnlock();
   }
   if (resolved_alloc != nullptr) {
-    resolved_alloc->Free(buffer_ptr);
+    // A process that died holding its segment's allocator lock would hold
+    // this thread forever: the free is abandoned instead (the reaper
+    // unmaps the dead process's segments whole).
+    if (!resolved_alloc->FreeOffsetUnlessHolderDead(
+            ctp::ipc::OffsetPtr<>(buffer_ptr.shm_.off_.load()))) {
+      HLOG(kDebug, "FreeBuffer: allocator {}.{} held by a dead process; "
+           "free abandoned", buffer_ptr.shm_.alloc_id_.major_,
+           buffer_ptr.shm_.alloc_id_.minor_);
+    }
     return;
   }
 
