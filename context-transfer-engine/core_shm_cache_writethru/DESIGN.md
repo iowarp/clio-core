@@ -105,6 +105,82 @@ write that leaves a gap, or touches 4 KB of a 1 MB blob, logs only that
 range. Nothing is ever flushed per blob, and holes in a buffer never leave
 the cache.
 
+## Crash recovery (a client dies mid-operation)
+
+The segment belongs to the runtime and outlives every client. A client
+(FUSE, an application using the CTE client) may be SIGKILLed at any
+instruction, including while it holds a segment lock or between two
+updates of shared state. Requirements:
+
+- nothing ever hangs because a client died;
+- one client's crash never loses or corrupts ANOTHER client's data (a
+  security boundary as much as a reliability one);
+- the dead client's own unfinished, never-acknowledged write may be lost
+  or partially applied (POSIX permits either for a write in progress);
+- clients never repair anything: only the runtime does.
+
+### Granules, not an allocator
+
+Blob bytes live in 4 KiB granules tracked by a free bitmap, either in a
+leased RAM bdev (`data_pool`) or carved from this segment by the runtime at
+format time. A client never calls the segment allocator, whose free lists
+could not be repaired after a client died inside it. The bitmap can always
+be rebuilt from the entries' run lists.
+
+### Locks
+
+Every segment lock is a `ctp::TimedMutex`: the holder's pid and process
+start time are recorded. Clients wait on a held lock; they never break one.
+The runtime breaks a lock only after its holder is provably dead, and only
+after repairing what the lock guards (below); the release is a CAS on the
+dead holder's acquisition id.
+
+### Per-thread journal
+
+Each client thread claims a journal slot (pid, start time, tid) on first
+use. Before touching shared state it records the operation and its phase;
+the phase is stored after the state it describes is visible elsewhere, so
+the journal can be BEHIND the truth but never ahead of it. Under a stripe
+lock it records the slot it is about to change and the entry's `wbegin_`
+before changing it: as only the lock holder advances `wbegin_`, comparing it
+afterwards says exactly whether the dead client's increment happened.
+
+### Attribution: drain the living, the rest is the dead's
+
+Shared counters (`pins_`, `pending_`, `wend_`) are modified by many
+processes, so one increment cannot be attributed by itself. The repairer
+instead takes the stripe lock (so nothing new starts under it), waits for
+every LIVE client's bounded unlocked step on that entry (a copy in or out)
+to finish, as their journals show, and then attributes what is left over to
+the dead client. Runtime pins are counted apart (`rt_pins_`) because a
+flush pin is held until a remote home acks.
+
+### Roll forward, never back
+
+A dead writer whose copy started is rolled forward: the repairer closes the
+seqlock (`wend_`) and publishes its range, as if the write had completed
+with whatever bytes it copied. Cache and backing store then agree, and the
+entry stays servable. A dead writer that died under the stripe lock before
+its increments (seen by `wbegin_`) changed nothing that needs undoing
+except a half-made insert or growth:
+
+- an insert marks the slot live LAST, so a partial one is never findable;
+- a partial growth (runs appended, `cap_` not yet raised, or a zero-fill
+  cut short) is trimmed to `cap_` or zero-filled again (both idempotent);
+- a partial eviction of a clean victim is completed (idempotent);
+- with `data_lock_` held, the bitmap and owner map are rebuilt from every
+  entry's runs (runs only change under `data_lock_`, which the repairer
+  holds).
+
+### Per-thread dirty queues
+
+Each journal slot owns a single-producer queue of DirtyRange: the client
+writes a record, then publishes it with one store of its tail. A dead client
+therefore never leaves a reserved but unfilled record (the hazard of a
+shared MPSC ring, whose consumer cannot skip a slot it cannot attribute).
+The runtime's flusher drains every queue; the barrier (PushedNow /
+FlushedThrough) counts ranges the flusher popped.
+
 ## Background flusher
 
 One continuous task on the chimod (`FlushLog`; yields when the log is

@@ -43,23 +43,190 @@
 #include <bit>
 #include <cmath>
 
+#include <csignal>
+#include <cstdlib>
+#include <mutex>
+#include <set>
+
 #include <clio_ctp/introspect/system_info.h>
+#if defined(__linux__)
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 #include <clio_ctp/util/config_parse.h>
 #include <clio_runtime/bdev/transports/mem_bdev_transport.h>
 
 namespace clio::cte::core::wtc {
 
-/** RAII stripe/tag lock. */
+/** RAII stripe/tag/data lock (View::LockSegment). */
 class Guard {
  public:
-  explicit Guard(ctp::Mutex &m) : m_(m) { m_.Lock(0); }
-  ~Guard() { m_.Unlock(); }
+  Guard(View *v, ctp::TimedMutex &m) : m_(m), id_(v->LockSegment(m)) {}
+  ~Guard() { m_.Unlock(id_); }
   Guard(const Guard &) = delete;
   Guard &operator=(const Guard &) = delete;
 
  private:
-  ctp::Mutex &m_;
+  ctp::TimedMutex &m_;
+  u64 id_;
 };
+
+namespace detail {
+
+/** Fault injection (CLIO_WTC_CRASH_AT=<point>[:<n>]): SIGKILL the calling
+ *  process the n-th time (default 1st) it reaches <point>, to test crash
+ *  repair. Read once per process; costs one branch when unset. */
+enum CrashPoint : int {
+  kCpNone = 0,
+  kCpPutLocked,     /**< TryPut: entry journaled, nothing committed */
+  kCpPutCommitted,  /**< TryPut: wbegin_ raised, lock still held */
+  kCpPutCopy,       /**< TryPut: lock released, half the bytes copied */
+  kCpPutCopied,     /**< TryPut: bytes copied, seqlock closed, unpublished */
+  kCpPutPublished,  /**< TryPut: published, journal not yet idle */
+  kCpGetPinned,     /**< TryGet: pinned, lock held */
+  kCpGetCopy,       /**< TryGet: copying out */
+  kCpGrow,          /**< growth: runs leased, zero-fill not done */
+  kCpAlloc,         /**< AllocRunsLocked: data lock held, runs half-taken */
+};
+
+struct CrashCfg {
+  int point_ = kCpNone;
+  std::atomic<u64> left_{0};
+};
+
+inline CrashCfg &Crash() {
+  static CrashCfg *cfg = []() {
+    auto *c = new CrashCfg();
+    const char *env = std::getenv("CLIO_WTC_CRASH_AT");
+    if (env == nullptr || *env == '\0') return c;
+    static const char *kNames[] = {"",          "put_locked", "put_committed",
+                                   "put_copy",  "put_copied", "put_published",
+                                   "get_pinned", "get_copy",  "grow", "alloc"};
+    std::string v(env);
+    const size_t colon = v.find(':');
+    const std::string name = v.substr(0, colon);
+    for (int i = 1; i < static_cast<int>(sizeof(kNames) / sizeof(kNames[0]));
+         ++i) {
+      if (name == kNames[i]) c->point_ = i;
+    }
+    c->left_.store(colon == std::string::npos
+                       ? 1
+                       : std::strtoull(v.c_str() + colon + 1, nullptr, 10));
+    return c;
+  }();
+  return *cfg;
+}
+
+/** Die here if CLIO_WTC_CRASH_AT names this point and its count runs out. */
+inline void CrashPointHit(int point) {
+  CrashCfg &c = Crash();
+  if (c.point_ != point) return;
+  if (c.left_.fetch_sub(1) == 1) ::raise(SIGKILL);
+}
+
+/** Segments mapped in this process (by root address): a thread retiring
+ *  its slots at exit touches only segments still mapped. */
+inline std::mutex &MappedMu() {
+  static std::mutex mu;
+  return mu;
+}
+inline std::set<const Root *> &Mapped() {
+  static std::set<const Root *> *roots = new std::set<const Root *>();
+  return *roots;  // leaked: thread exits may follow static destruction
+}
+
+/** This thread's slot in each segment it wrote to (a few at most). */
+struct SlotCache {
+  struct Entry {
+    const Root *root_ = nullptr;
+    u64 format_id_ = 0;
+    ThreadSlot *slot_ = nullptr;
+    unsigned gen_ = 0;
+  };
+  static constexpr int kEntries = 4;
+  Entry e_[kEntries];
+  /** Retire this thread's slots: the runtime frees each once drained. */
+  ~SlotCache() {
+    std::lock_guard<std::mutex> g(MappedMu());
+    const unsigned gen = ctp::detail::ProcIdentityGen();
+    for (Entry &x : e_) {
+      if (x.slot_ != nullptr && x.gen_ == gen && Mapped().count(x.root_) &&
+          x.root_->format_id_ == x.format_id_) {
+        u32 owned = kThreadOwned;
+        x.slot_->state_.compare_exchange_strong(owned, kThreadRetiring);
+      }
+    }
+  }
+};
+
+inline SlotCache &MySlotCache() {
+  static thread_local SlotCache cache;
+  return cache;
+}
+
+/** The journal of the operation this thread has in progress (or null). */
+inline ThreadSlot *&CurJournal() {
+  static thread_local ThreadSlot *cur = nullptr;
+  return cur;
+}
+
+/** Kernel thread id of the caller (0 where unavailable). */
+inline u64 ThreadId() {
+#if defined(__linux__)
+  return static_cast<u64>(::syscall(SYS_gettid));
+#else
+  return 0;
+#endif
+}
+
+}  // namespace detail
+
+/**
+ * Journal one operation of the calling thread for its whole scope: opens it
+ * (fields cleared, then op_ published) and closes it (op_ idle) on exit.
+ * A null slot (the runtime without one) journals nothing.
+ */
+class JournalScope {
+ public:
+  JournalScope(ThreadSlot *t, u32 kind, u32 op, u32 stripe) : t_(t) {
+    if (t_ == nullptr) return;
+    t_->jslot_.store(kJNone, std::memory_order_relaxed);
+    t_->jvictim_.store(kJNone, std::memory_order_relaxed);
+    t_->jkind_.store(kind, std::memory_order_relaxed);
+    t_->jstripe_.store(stripe, std::memory_order_relaxed);
+    t_->op_.store(op, std::memory_order_release);
+    detail::CurJournal() = t_;
+  }
+  ~JournalScope() {
+    if (t_ == nullptr) return;
+    t_->op_.store(kJIdle, std::memory_order_release);
+    detail::CurJournal() = nullptr;
+  }
+  JournalScope(const JournalScope &) = delete;
+  JournalScope &operator=(const JournalScope &) = delete;
+
+ private:
+  ThreadSlot *t_;
+};
+
+/**
+ * Journal the entry an operation is about to change or pin (its stripe lock
+ * held): its wbegin_ first, then the slot, so a recorded slot always has
+ * its "before" value.
+ */
+inline void JotSlot(const BlobEntry *e, u32 slot) {
+  ThreadSlot *t = detail::CurJournal();
+  if (t == nullptr) return;
+  t->jwbegin_.store(e->wbegin_.load(std::memory_order_acquire),
+                    std::memory_order_relaxed);
+  t->jslot_.store(slot, std::memory_order_release);
+}
+
+/** Journal the entry an eviction is about to release (its lock held). */
+inline void JotVictim(u32 slot) {
+  ThreadSlot *t = detail::CurJournal();
+  if (t != nullptr) t->jvictim_.store(slot, std::memory_order_release);
+}
 
 /** Round up to a multiple of kMinBuffer. */
 inline u64 RoundBuffer(u64 n) {
@@ -110,7 +277,21 @@ inline bool View::Format(const std::string &name,
   auto t = alloc_->AllocateOffset(tag_bytes);
   size_t name_bytes = sizeof(NameSlot) * root_->max_tags_ * 2;
   auto nm = alloc_->AllocateOffset(name_bytes);
-  auto l = alloc_->AllocateOffset(sizeof(DirtyLog));
+  // Queues take at most 1/8 of the segment: fewer, shallower ones in a
+  // small cache (a full queue only sends that thread's puts to the task
+  // path until the flusher drains it).
+  u32 nthreads = lim.threads_ == 0 ? 1 : lim.threads_;
+  u32 qdepth = std::max<u32>(kMinQueueDepth, lim.log_depth_ / nthreads);
+  const u64 qbudget = seg_size_ / 8;
+  while (static_cast<u64>(nthreads) * qdepth * sizeof(DirtyRange) > qbudget &&
+         (qdepth > kFloorQueueDepth || nthreads > kFloorThreads)) {
+    if (qdepth > kFloorQueueDepth) {
+      qdepth /= 2;
+    } else {
+      nthreads /= 2;
+    }
+  }
+  auto l = alloc_->AllocateOffset(sizeof(ThreadSlot) * nthreads);
   root_->owner_count_ = seg_size_ / kMinBuffer + 1;
   size_t owner_bytes = sizeof(std::atomic<u32>) * root_->owner_count_;
   auto ow = alloc_->AllocateOffset(owner_bytes);
@@ -125,68 +306,119 @@ inline bool View::Format(const std::string &name,
   std::memset(static_cast<void *>(owners_), 0, owner_bytes);
   root_->blobs_off_ = b.load();
   root_->tags_off_ = t.load();
-  root_->log_off_ = l.load();
+  root_->threads_off_ = l.load();
+  root_->threads_ = nthreads;
+  root_->qdepth_ = qdepth;
   blobs_ = reinterpret_cast<BlobEntry *>(Ptr(root_->blobs_off_));
   tags_ = reinterpret_cast<TagEntry *>(Ptr(root_->tags_off_));
   std::memset(static_cast<void *>(blobs_), 0, blob_bytes);
   std::memset(static_cast<void *>(tags_), 0, tag_bytes);
-  log_ = new (Ptr(root_->log_off_)) DirtyLog(alloc_, lim.log_depth_);
-  if (!lim.extents_.empty() && !lim.md_only_) {
-    // Extent mode: index every leased granule, in lease order, and mark
-    // where one leased block ends and a non-adjacent one begins (a run may
-    // never cross that point, so a run's bytes are contiguous).
-    u64 gcount = 0;
-    for (const auto &x : lim.extents_) gcount += x.second / kGranule;
-    if (gcount == 0 || gcount > 0xFFFFFFFFull) return false;
-    const u64 words = (gcount + 63) / 64;
-    auto go = alloc_->AllocateOffset(sizeof(u64) * gcount);
-    auto fb = alloc_->AllocateOffset(sizeof(u64) * words);
-    auto bb = alloc_->AllocateOffset(sizeof(u64) * words);
-    auto rs = alloc_->AllocateOffset(sizeof(RunSet) * NumSlots());
-    auto ow = alloc_->AllocateOffset(sizeof(std::atomic<u32>) * gcount);
-    if (go.IsNull() || fb.IsNull() || bb.IsNull() || rs.IsNull() ||
-        ow.IsNull()) {
-      return false;
-    }
-    root_->gran_owner_off_ = ow.load();
-    gran_owner_ = reinterpret_cast<std::atomic<u32> *>(Ptr(root_->gran_owner_off_));
-    std::memset(static_cast<void *>(gran_owner_), 0,
-                sizeof(std::atomic<u32>) * gcount);
-    root_->runsets_off_ = rs.load();
-    runsets_ = reinterpret_cast<RunSet *>(Ptr(root_->runsets_off_));
-    std::memset(static_cast<void *>(runsets_), 0, sizeof(RunSet) * NumSlots());
-    root_->gran_off_off_ = go.load();
-    root_->free_bits_off_ = fb.load();
-    root_->brk_bits_off_ = bb.load();
-    gran_off_ = reinterpret_cast<u64 *>(Ptr(root_->gran_off_off_));
-    free_bits_ = reinterpret_cast<u64 *>(Ptr(root_->free_bits_off_));
-    brk_bits_ = reinterpret_cast<u64 *>(Ptr(root_->brk_bits_off_));
-    std::memset(free_bits_, 0, sizeof(u64) * words);
-    std::memset(brk_bits_, 0, sizeof(u64) * words);
-    u64 g = 0;
-    for (const auto &x : lim.extents_) {
-      for (u64 k = 0; k < x.second / kGranule; ++k, ++g) {
-        gran_off_[g] = x.first + k * kGranule;
-        free_bits_[g / 64] |= 1ull << (g % 64);
-        if (g == 0 || gran_off_[g] != gran_off_[g - 1] + kGranule) {
-          brk_bits_[g / 64] |= 1ull << (g % 64);
-        }
-      }
-    }
-    root_->granules_ = gcount;
-    root_->free_granules_.store(gcount);
-    root_->data_cursor_ = 0;
-    root_->data_lock_.Init();
-    root_->data_pid_ = lim.data_pid_;
-    root_->data_pool_major_ = lim.data_pool_major_;
-    root_->data_pool_minor_ = lim.data_pool_minor_;
-    root_->data_mode_ = 1;
-    if (!AttachData()) return false;
+  std::memset(static_cast<void *>(Slots()), 0, sizeof(ThreadSlot) * nthreads);
+  // One allocation for every ring: many small ones would each come from
+  // the allocator's small-page arenas, which carve the heap in large steps.
+  auto rings = alloc_->AllocateOffset(sizeof(DirtyRange) * qdepth * nthreads);
+  if (rings.IsNull()) return false;
+  for (u32 i = 0; i < nthreads; ++i) {
+    Slots()[i].ring_off_ =
+        rings.load() + static_cast<u64>(i) * qdepth * sizeof(DirtyRange);
+  }
+  if (!lim.md_only_ && !FormatGranules(lim)) {
+    return false;
   }
   root_->magic_ = Root::kMagic;
   root_->version_ = Root::kVersion;
+  root_->format_id_ = NowNs() ^ (static_cast<u64>(backend_id.minor_) << 32);
   root_->ready_.store(1, std::memory_order_release);
+  NoteMapped();
   return true;
+}
+
+inline bool View::FormatGranules(const Limits &lim) {
+  // Granules come from leased RAM-bdev extents, or (no data pool) from the
+  // rest of this segment, carved once here by the runtime. Either way a
+  // client never calls the segment allocator: its free lists could not be
+  // repaired after a client died inside it, where the granule bitmap can be
+  // rebuilt from the entries' runs.
+  const bool self = lim.extents_.empty();
+  u64 gmax = 0;
+  if (self) {
+    gmax = seg_size_ / kGranule;  // bound: the region is smaller
+  } else {
+    for (const auto &x : lim.extents_) gmax += x.second / kGranule;
+  }
+  if (gmax == 0 || gmax > 0xFFFFFFFFull) return false;
+  const u64 words = (gmax + 63) / 64;
+  auto go = alloc_->AllocateOffset(sizeof(u64) * gmax);
+  auto fb = alloc_->AllocateOffset(sizeof(u64) * words);
+  auto bb = alloc_->AllocateOffset(sizeof(u64) * words);
+  auto rs = alloc_->AllocateOffset(sizeof(RunSet) * NumSlots());
+  auto ow = alloc_->AllocateOffset(sizeof(std::atomic<u32>) * gmax);
+  if (go.IsNull() || fb.IsNull() || bb.IsNull() || rs.IsNull() ||
+      ow.IsNull()) {
+    return false;
+  }
+  std::vector<std::pair<u64, u64>> extents = lim.extents_;
+  if (self) {
+    // The largest region the heap still holds (large allocations are
+    // carved in order, so what is left starts past the last table),
+    // granule aligned.
+    const u64 used = ow.load() + sizeof(std::atomic<u32>) * gmax;
+    const u64 slack = std::min<u64>(kSelfSlack, seg_size_ / 64);
+    u64 want = seg_size_ > used + slack ? seg_size_ - used - slack : 0;
+    ctp::ipc::OffsetPtr<> region = ctp::ipc::OffsetPtr<>::GetNull();
+    while (want >= 2 * kGranule) {
+      region = alloc_->AllocateOffset(want);
+      if (!region.IsNull()) break;
+      want -= std::max<u64>(want / 64, kGranule);
+    }
+    if (region.IsNull()) return false;
+    const u64 first = RoundBuffer(region.load());
+    const u64 bytes = (region.load() + want - first) / kGranule * kGranule;
+    if (bytes / kGranule > gmax) return false;
+    extents.assign(1, {first, bytes});
+    root_->data_mode_ = kDataSelf;
+  } else {
+    root_->data_pid_ = lim.data_pid_;
+    root_->data_pool_major_ = lim.data_pool_major_;
+    root_->data_pool_minor_ = lim.data_pool_minor_;
+    root_->data_mode_ = kDataBdev;
+  }
+  u64 gcount = 0;
+  for (const auto &x : extents) gcount += x.second / kGranule;
+  if (gcount == 0) return false;
+  root_->gran_owner_off_ = ow.load();
+  gran_owner_ = reinterpret_cast<std::atomic<u32> *>(Ptr(root_->gran_owner_off_));
+  std::memset(static_cast<void *>(gran_owner_), 0,
+              sizeof(std::atomic<u32>) * gcount);
+  root_->runsets_off_ = rs.load();
+  runsets_ = reinterpret_cast<RunSet *>(Ptr(root_->runsets_off_));
+  std::memset(static_cast<void *>(runsets_), 0, sizeof(RunSet) * NumSlots());
+  root_->gran_off_off_ = go.load();
+  root_->free_bits_off_ = fb.load();
+  root_->brk_bits_off_ = bb.load();
+  gran_off_ = reinterpret_cast<u64 *>(Ptr(root_->gran_off_off_));
+  free_bits_ = reinterpret_cast<u64 *>(Ptr(root_->free_bits_off_));
+  brk_bits_ = reinterpret_cast<u64 *>(Ptr(root_->brk_bits_off_));
+  std::memset(free_bits_, 0, sizeof(u64) * words);
+  std::memset(brk_bits_, 0, sizeof(u64) * words);
+  // Index every granule in order, and mark where one block ends and a
+  // non-adjacent one begins (a run never crosses it, so its bytes are
+  // contiguous).
+  u64 g = 0;
+  for (const auto &x : extents) {
+    for (u64 k = 0; k < x.second / kGranule; ++k, ++g) {
+      gran_off_[g] = x.first + k * kGranule;
+      free_bits_[g / 64] |= 1ull << (g % 64);
+      if (g == 0 || gran_off_[g] != gran_off_[g - 1] + kGranule) {
+        brk_bits_[g / 64] |= 1ull << (g % 64);
+      }
+    }
+  }
+  root_->granules_ = gcount;
+  root_->free_granules_.store(gcount);
+  root_->data_cursor_ = 0;
+  root_->data_lock_.Init();
+  return AttachData();
 }
 
 inline bool View::Attach(const std::string &name, u64 root_off) {
@@ -209,7 +441,6 @@ inline bool View::Attach(const std::string &name, u64 root_off) {
   }
   blobs_ = reinterpret_cast<BlobEntry *>(Ptr(root_->blobs_off_));
   tags_ = reinterpret_cast<TagEntry *>(Ptr(root_->tags_off_));
-  log_ = reinterpret_cast<DirtyLog *>(Ptr(root_->log_off_));
   owners_ = reinterpret_cast<std::atomic<u32> *>(Ptr(root_->owners_off_));
   names_ = reinterpret_cast<NameSlot *>(Ptr(root_->names_off_));
   if (root_->data_mode_ != 0) {
@@ -225,6 +456,7 @@ inline bool View::Attach(const std::string &name, u64 root_off) {
     }
     PrefaultData();
   }
+  NoteMapped();
   return true;
 }
 
@@ -253,6 +485,10 @@ inline void View::PrefaultData() {
 
 inline bool View::AttachData() {
   if (data_mapped_) return true;
+  if (root_->data_mode_ == kDataSelf) {
+    data_base_ = base_;  // granules are offsets into this segment
+    return true;
+  }
   const clio::run::PoolId pool(root_->data_pool_major_, root_->data_pool_minor_);
   const std::string name = clio::run::bdev::MemBdevTransport::ShmSegmentName(
       root_->data_pid_, pool);
@@ -272,9 +508,18 @@ inline bool View::AttachData() {
   return true;
 }
 
+inline void View::NoteMapped() {
+  std::lock_guard<std::mutex> g(detail::MappedMu());
+  detail::Mapped().insert(root_);
+}
+
 inline void View::Detach() {
   if (!mapped_) {
     return;
+  }
+  if (root_ != nullptr) {
+    std::lock_guard<std::mutex> g(detail::MappedMu());
+    detail::Mapped().erase(root_);
   }
   if (owner_) {
     if (root_ != nullptr) {
@@ -301,7 +546,6 @@ inline void View::Detach() {
   root_ = nullptr;
   blobs_ = nullptr;
   tags_ = nullptr;
-  log_ = nullptr;
   owners_ = nullptr;
   names_ = nullptr;
 }
@@ -309,7 +553,7 @@ inline void View::Detach() {
 inline bool View::ReleaseIfUnpinnedLocked(BlobEntry *e) {
   // Pins are only ever added under the entry's stripe lock (TryPut, TryGet,
   // ReadRange, PinRange), which the caller holds: zero here stays zero.
-  if (e->pins_.load(std::memory_order_acquire) != 0) {
+  if (Pinned(e)) {
     return false;
   }
   ReleaseBufferLocked(e);
@@ -362,6 +606,7 @@ inline long View::FindOrInsertLocked(u64 h, u32 major, u32 minor,
   *inserted = false;
   long found = FindLocked(h, major, minor, name, len);
   if (found >= 0) {
+    JotSlot(Slot(static_cast<u32>(found)), static_cast<u32>(found));
     return found;
   }
   u32 sps = root_->slots_per_stripe_;
@@ -374,7 +619,8 @@ inline long View::FindOrInsertLocked(u64 h, u32 major, u32 minor,
     if (e->state_ == kSlotLive) {
       continue;
     }
-    e->state_ = kSlotLive;
+    JotSlot(e, slot);
+    // Live LAST: an insert cut short is never findable.
     e->flags_ = 0;
     e->tag_major_ = major;
     e->tag_minor_ = minor;
@@ -394,6 +640,7 @@ inline long View::FindOrInsertLocked(u64 h, u32 major, u32 minor,
     e->inval_epoch_.store(now, std::memory_order_relaxed);
     e->hits_.store(0, std::memory_order_relaxed);
     e->last_access_ns_.store(now, std::memory_order_relaxed);
+    e->state_ = kSlotLive;
     *inserted = true;
     return static_cast<long>(slot);
   }
@@ -419,8 +666,7 @@ inline bool View::ReclaimSlotLocked(u32 stripe) {
   double best_f = 0.0;
   for (u32 i = 0; i < sps; ++i) {
     BlobEntry *e = Slot(stripe * sps + i);
-    if (e->state_ != kSlotLive || e->pending_.load() != 0 ||
-        e->pins_.load() != 0) {
+    if (e->state_ != kSlotLive || PendingOf(e) != 0 || Pinned(e)) {
       continue;
     }
     double f = Frecency(e, now);
@@ -432,6 +678,7 @@ inline bool View::ReclaimSlotLocked(u32 stripe) {
   if (best == nullptr) {
     return false;
   }
+  JotVictim(static_cast<u32>(best - blobs_));
   ReleaseBufferLocked(best);
   best->state_ = kSlotTomb;
   return true;
@@ -474,7 +721,7 @@ inline long View::PickVictim(u64 want_bytes) {
     u32 slot = static_cast<u32>((cursor + k) % n);
     BlobEntry *e = Slot(slot);
     if (e->state_ != kSlotLive || !(e->flags_ & kResident) ||
-        e->pending_.load() != 0 || e->pins_.load() != 0) {
+        PendingOf(e) != 0 || Pinned(e)) {
       continue;
     }
     double f = Frecency(e, now);
@@ -495,22 +742,26 @@ inline long View::PickVictim(u64 want_bytes) {
 
 inline bool View::EvictSlot(u32 held_stripe, u32 slot, u64 granule) {
   u32 stripe = slot / root_->slots_per_stripe_;
-  ctp::Mutex &m = root_->stripes_[stripe];
+  ctp::TimedMutex &m = root_->stripes_[stripe];
   bool own = stripe == held_stripe;
-  if (!own && !m.TryLock(0)) {
+  // Journaled before locking: a victim stripe a dead thread holds is found
+  // by its lock, and this names the entry inside it.
+  JotVictim(slot);
+  const u64 id = own ? 0 : m.TryLock();
+  if (!own && id == 0) {
     return false;  // contended: no progress
   }
   BlobEntry *e = Slot(slot);
   bool evicted = false;
   if (e->state_ == kSlotLive && (e->flags_ & kResident) &&
-      e->pending_.load() == 0 && e->pins_.load() == 0 &&
+      PendingOf(e) == 0 && !Pinned(e) &&
       (granule == kAnyGranule || e->buf_off_ / kMinBuffer == granule)) {
     ReleaseBufferLocked(e);
     root_->stats_.evictions_.fetch_add(1, std::memory_order_relaxed);
     evicted = true;
   }
   if (!own) {
-    m.Unlock();
+    m.Unlock(id);
   }
   return evicted;
 }
@@ -613,12 +864,13 @@ inline Status View::EnsureCapacityLocked(BlobEntry *e, u64 need,
   // only after the blob's home acks, and the home acks only after an
   // Invalidate on this node takes this stripe lock (a distributed
   // deadlock). Refuse untouched; the caller retries without the lock.
-  if (e->pins_.load(std::memory_order_acquire) != 0) {
+  if (Pinned(e)) {
     return Status::kBusy;
   }
   if (Extents()) {
     // Grow by appending runs: the bytes already held never move.
     if (!(e->flags_ & kResident)) {
+      if (RS(e)->n_ != 0) FreeRuns(e);  // leftovers: never leak them
       RS(e)->n_ = 0;
       e->cap_ = 0;
     }
@@ -632,6 +884,7 @@ inline Status View::EnsureCapacityLocked(BlobEntry *e, u64 need,
     if (!ok) {
       return Status::kNoSpace;
     }
+    detail::CrashPointHit(detail::kCpGrow);
     // Holes read as zeros, exactly what the chain returns for unwritten bytes.
     ZeroRange(e, have, e->cap_);
     e->flags_ |= kResident;
@@ -727,6 +980,7 @@ inline bool View::AllocRunsLocked(BlobEntry *e, u64 add) {
       break;  // out of run slots
     }
     mark(g, len, false);
+    detail::CrashPointHit(detail::kCpAlloc);
     taken[ntaken++] = {g, len};
     need -= len;
     cursor = (g + len) % n;
@@ -747,7 +1001,7 @@ inline bool View::AllocRunsEvicting(BlobEntry *e, u64 add, u32 stripe) {
   const u64 want = add * kGranule;
   for (u32 round = 0; round < 4 * kAllocRounds; ++round) {
     {
-      Guard g(root_->data_lock_);
+      Guard g(this, root_->data_lock_);
       if (AllocRunsLocked(e, add)) return true;
     }
     // The entry itself is pinned, so it is never its own victim.
@@ -777,13 +1031,13 @@ inline void View::EvictGranWindow(u32 held_stripe, u64 span) {
     last = o;
     EvictSlot(held_stripe, o - 1, kAnyGranule);  // re-verified under its lock
   }
-  Guard g(root_->data_lock_);
+  Guard g(this, root_->data_lock_);
   root_->data_cursor_ = start;  // next fit starts at the freed window
 }
 
 inline void View::FreeRuns(BlobEntry *e) {
   if (RS(e)->n_ != 0) {
-    Guard g(root_->data_lock_);
+    Guard g(this, root_->data_lock_);
     u64 freed = 0;
     for (u32 r = 0; r < RS(e)->n_; ++r) {
       for (u64 k = 0; k < RS(e)->r_[r].n_; ++k) {
@@ -885,7 +1139,7 @@ inline void View::SetDeadHomes(u32 num_homes, u64 dead_mask) {
   if (newly == 0 || MdOnly()) return;
   const u32 sps = root_->slots_per_stripe_;
   for (u32 stripe = 0; stripe < kStripes; ++stripe) {
-    Guard g(root_->stripes_[stripe]);
+    Guard g(this, root_->stripes_[stripe]);
     for (u32 i = 0; i < sps; ++i) {
       BlobEntry *e = Slot(stripe * sps + i);
       if (e->state_ != kSlotLive ||
@@ -895,10 +1149,37 @@ inline void View::SetDeadHomes(u32 num_homes, u64 dead_mask) {
       e->flags_ &= ~(kComplete | kSizeKnown);
       e->valid_lo_ = e->valid_hi_ = 0;  // pending bytes still flush
       e->inval_epoch_.fetch_add(1, std::memory_order_acq_rel);
-      if (e->pending_.load() == 0) ReleaseIfUnpinnedLocked(e);
+      if (PendingOf(e) == 0) ReleaseIfUnpinnedLocked(e);
       root_->stats_.invalidations_.fetch_add(1, std::memory_order_relaxed);
     }
   }
+}
+
+inline void View::InvalidateAll() {
+  if (root_ == nullptr) return;
+  {
+    Guard g(this, root_->tag_lock_);
+    root_->tag_inval_seq_.fetch_add(1, std::memory_order_acq_rel);
+    for (u32 i = 0; i < root_->max_tags_; ++i) {
+      TagEntry *t = tags_ + i;
+      if (t->state_ != kSlotLive) continue;
+      UnindexNameLocked(t);
+      t->flags_ &= ~kTagAttrValid;
+    }
+  }
+  const u32 sps = root_->slots_per_stripe_;
+  for (u32 stripe = 0; stripe < kStripes; ++stripe) {
+    Guard g(this, root_->stripes_[stripe]);
+    for (u32 i = 0; i < sps; ++i) {
+      BlobEntry *e = Slot(stripe * sps + i);
+      if (e->state_ != kSlotLive) continue;
+      e->flags_ &= ~(kComplete | kSizeKnown);
+      e->valid_lo_ = e->valid_hi_ = 0;  // pending bytes still flush
+      e->inval_epoch_.fetch_add(1, std::memory_order_acq_rel);
+      if (PendingOf(e) == 0) ReleaseIfUnpinnedLocked(e);
+    }
+  }
+  root_->stats_.invalidations_.fetch_add(1, std::memory_order_relaxed);
 }
 
 inline Status View::TryPut(u32 tag_major, u32 tag_minor, const char *name,
@@ -912,21 +1193,30 @@ inline Status View::TryPut(u32 tag_major, u32 tag_minor, const char *name,
     root_->stats_.put_miss_.fetch_add(1, std::memory_order_relaxed);
     return Status::kMiss;  // not expressible here: take the task path
   }
-  if (!may_block) {
-    const u64 cap = log_->Capacity();
-    const u64 room = kLogHeadroom < cap / 4 ? kLogHeadroom : cap / 4;
-    if (log_->Size() + room >= cap) {
+  ThreadSlot *me = MySlot();
+  if (me == nullptr) {
+    root_->stats_.put_miss_.fetch_add(1, std::memory_order_relaxed);
+    return Status::kMiss;  // every thread slot taken: the task path
+  }
+  // Only this thread publishes into its queue, so room checked now is room
+  // at the publish below.
+  while (me->tail_.load(std::memory_order_relaxed) -
+             me->head_.load(std::memory_order_acquire) >=
+         root_->qdepth_) {
+    if (!may_block) {
       root_->stats_.put_full_log_.fetch_add(1, std::memory_order_relaxed);
       return Status::kNoSpace;  // nothing touched; caller yields and retries
     }
+    std::this_thread::sleep_for(std::chrono::microseconds(50));
   }
   u64 h = KeyHash(tag_major, tag_minor, name, name_len);
   u32 stripe = StripeOf(h);
   u32 slot = 0;
   BlobEntry *dst_e = nullptr;
   u64 gen = 0;
+  JournalScope js(me, kJKPut, kJStripe, stripe);
   {
-    Guard g(root_->stripes_[stripe]);
+    Guard g(this, root_->stripes_[stripe]);
     bool inserted = false;
     long s = FindOrInsertLocked(h, tag_major, tag_minor, name, name_len,
                                 &inserted);
@@ -940,10 +1230,11 @@ inline Status View::TryPut(u32 tag_major, u32 tag_minor, const char *name,
     }
     slot = static_cast<u32>(s);
     BlobEntry *e = Slot(slot);
+    detail::CrashPointHit(detail::kCpPutLocked);
     if (inserted) {
       e->put_flags_ = put_flags;
     } else if (e->put_flags_ != put_flags) {
-      if (e->pending_.load() != 0 || (e->flags_ & kResident)) {
+      if (PendingOf(e) != 0 || (e->flags_ & kResident)) {
         return Status::kMiss;  // let the chain judge the conflicting flags
       }
       e->put_flags_ = put_flags;  // metadata-only entry: adopt
@@ -975,27 +1266,34 @@ inline Status View::TryPut(u32 tag_major, u32 tag_minor, const char *name,
       e->valid_lo_ = off;
       e->valid_hi_ = need;
     }
-    e->pins_.fetch_add(1, std::memory_order_acq_rel);
-    e->pending_.fetch_add(1, std::memory_order_acq_rel);
     gen = e->write_gen_.fetch_add(1, std::memory_order_acq_rel) + 1;
+    // The commit: one atomic step makes this write pending (wbegin_ -
+    // retired_) and opens the seqlock. Crash repair compares it with the
+    // journal's jwbegin_ to know whether it happened.
     e->wbegin_.fetch_add(1, std::memory_order_acq_rel);
+    detail::CrashPointHit(detail::kCpPutCommitted);
     e->hits_.fetch_add(1, std::memory_order_relaxed);
     e->last_access_ns_.store(NowNs(), std::memory_order_relaxed);
     dst_e = e;
+    // Still under the lock: from here a crash is a write in copy.
+    me->jtail_.store(me->tail_.load(std::memory_order_relaxed),
+                     std::memory_order_relaxed);
+    me->op_.store(kJCopyIn, std::memory_order_release);
   }
-  CopyIn(dst_e, off, src, size);
+  // No pin: the write is pending (wbegin_ - retired_), which already keeps
+  // the entry from release and eviction, and its runs never move.
+  if (detail::Crash().point_ == detail::kCpPutCopy) {
+    CopyIn(dst_e, off, src, size / 2);
+    detail::CrashPointHit(detail::kCpPutCopy);
+    CopyIn(dst_e, off + size / 2, src + size / 2, size - size / 2);
+  } else {
+    CopyIn(dst_e, off, src, size);
+  }
   Slot(slot)->wend_.fetch_add(1, std::memory_order_release);
-  // Unpin BEFORE the (possibly blocking) push: a full log waits on the
-  // flusher, which must be free to take this stripe and read the entry.
-  Slot(slot)->pins_.fetch_sub(1, std::memory_order_acq_rel);
-  DirtyRange r{slot, static_cast<u32>(gen), off, size};
-  // Count the range BEFORE it enters the log. A barrier's target
-  // (PushedNow) then covers every range already in the log or about to be:
-  // a writer counted after its push could leave pushed_ short of an earlier
-  // writer's slot, and a later SyncTag would stop before its own range.
-  root_->pushed_.fetch_add(1, std::memory_order_acq_rel);
+  detail::CrashPointHit(detail::kCpPutCopied);
   NoteLocalWrite();
-  log_->Push(r);
+  Publish(me, DirtyRange{slot, static_cast<u32>(gen), off, size});
+  detail::CrashPointHit(detail::kCpPutPublished);
   root_->stats_.puts_.fetch_add(1, std::memory_order_relaxed);
   root_->stats_.put_bytes_.fetch_add(size, std::memory_order_relaxed);
   return Status::kOk;
@@ -1010,6 +1308,10 @@ inline Status View::TryGet(u32 tag_major, u32 tag_minor, const char *name,
       HomeDown(tag_major, tag_minor, name, name_len)) {
     return Status::kMiss;
   }
+  ThreadSlot *me = MySlot();
+  if (me == nullptr && !owner_) {
+    return Status::kMiss;  // no journal: a client must not pin unrecorded
+  }
   u64 h = KeyHash(tag_major, tag_minor, name, name_len);
   u32 stripe = StripeOf(h);
   std::atomic<u64> *why = &root_->stats_.miss_busy_;
@@ -1018,8 +1320,9 @@ inline Status View::TryGet(u32 tag_major, u32 tag_minor, const char *name,
     BlobEntry *e = nullptr;
     u64 seq = 0;
     bool busy = false;
+    JournalScope js(me, kJKRead, kJStripe, stripe);
     {
-      Guard g(root_->stripes_[stripe]);
+      Guard g(this, root_->stripes_[stripe]);
       long s = FindLocked(h, tag_major, tag_minor, name, name_len);
       why = &root_->stats_.miss_absent_;
       if (s >= 0) {
@@ -1033,7 +1336,12 @@ inline Status View::TryGet(u32 tag_major, u32 tag_minor, const char *name,
           seq = e->wbegin_.load(std::memory_order_acquire);
           busy = e->wend_.load(std::memory_order_acquire) != seq;
           if (!busy) {
+            JotSlot(e, static_cast<u32>(s));
             e->pins_.fetch_add(1, std::memory_order_acq_rel);
+            detail::CrashPointHit(detail::kCpGetPinned);
+            if (me != nullptr) {
+              me->op_.store(kJCopyOut, std::memory_order_release);
+            }
             e->hits_.fetch_add(1, std::memory_order_relaxed);
             e->last_access_ns_.store(NowNs(), std::memory_order_relaxed);
             src = e;
@@ -1050,6 +1358,7 @@ inline Status View::TryGet(u32 tag_major, u32 tag_minor, const char *name,
       break;
     }
     CopyOut(src, off, dst, size);
+    detail::CrashPointHit(detail::kCpGetCopy);
     std::atomic_thread_fence(std::memory_order_acquire);
     const bool torn = e->wbegin_.load(std::memory_order_relaxed) != seq;
     e->pins_.fetch_sub(1, std::memory_order_acq_rel);
@@ -1069,8 +1378,13 @@ inline Status View::TryGetSize(u32 tag_major, u32 tag_minor, const char *name,
       HomeDown(tag_major, tag_minor, name, name_len)) {
     return Status::kMiss;
   }
+  ThreadSlot *me = MySlot();
+  if (me == nullptr && !owner_) {
+    return Status::kMiss;  // no journal: a client takes no lock unrecorded
+  }
   u64 h = KeyHash(tag_major, tag_minor, name, name_len);
-  Guard g(root_->stripes_[StripeOf(h)]);
+  JournalScope js(me, kJKRead, kJStripe, StripeOf(h));
+  Guard g(this, root_->stripes_[StripeOf(h)]);
   long s = FindLocked(h, tag_major, tag_minor, name, name_len);
   if (s < 0) {
     return Status::kMiss;
@@ -1089,9 +1403,9 @@ inline u32 View::BlobPending(u32 tag_major, u32 tag_minor, const char *name,
     return 0;
   }
   u64 h = KeyHash(tag_major, tag_minor, name, name_len);
-  Guard g(root_->stripes_[StripeOf(h)]);
+  Guard g(this, root_->stripes_[StripeOf(h)]);
   long s = FindLocked(h, tag_major, tag_minor, name, name_len);
-  return s < 0 ? 0 : Slot(static_cast<u32>(s))->pending_.load();
+  return s < 0 ? 0 : PendingOf(Slot(static_cast<u32>(s)));
 }
 
 inline TagEntry *View::FindTagLocked(u32 major, u32 minor, bool insert) {
@@ -1125,7 +1439,7 @@ inline TagEntry *View::FindTagLocked(u32 major, u32 minor, bool insert) {
 }
 
 inline void View::NoteTagCreated(u32 major, u32 minor) {
-  Guard g(root_->tag_lock_);
+  Guard g(this, root_->tag_lock_);
   TagEntry *t = FindTagLocked(major, minor, true);
   if (t != nullptr) {
     t->flags_ |= kTagCreated;
@@ -1133,13 +1447,13 @@ inline void View::NoteTagCreated(u32 major, u32 minor) {
 }
 
 inline bool View::TagCreated(u32 major, u32 minor) {
-  Guard g(root_->tag_lock_);
+  Guard g(this, root_->tag_lock_);
   TagEntry *t = FindTagLocked(major, minor, false);
   return t != nullptr && (t->flags_ & kTagCreated);
 }
 
 inline void View::SetTagError(u32 major, u32 minor, u32 rc) {
-  Guard g(root_->tag_lock_);
+  Guard g(this, root_->tag_lock_);
   TagEntry *t = FindTagLocked(major, minor, true);
   std::atomic<u32> &slot = t != nullptr ? t->sticky_rc_ : root_->global_rc_;
   u32 expected = 0;
@@ -1147,7 +1461,7 @@ inline void View::SetTagError(u32 major, u32 minor, u32 rc) {
 }
 
 inline u32 View::TakeTagError(u32 major, u32 minor) {
-  Guard g(root_->tag_lock_);
+  Guard g(this, root_->tag_lock_);
   TagEntry *t = FindTagLocked(major, minor, false);
   u32 rc = t != nullptr ? t->sticky_rc_.exchange(0) : 0;
   if (rc == 0) {
@@ -1158,7 +1472,7 @@ inline u32 View::TakeTagError(u32 major, u32 minor) {
 
 inline void View::DropTag(u32 major, u32 minor) {
   if (root_ == nullptr) return;  // no segment: nothing cached
-  Guard g(root_->tag_lock_);
+  Guard g(this, root_->tag_lock_);
   root_->tag_inval_seq_.fetch_add(1, std::memory_order_acq_rel);
   TagEntry *t = FindTagLocked(major, minor, false);
   if (t != nullptr) {
@@ -1222,7 +1536,7 @@ inline bool View::FillTagName(u32 major, u32 minor, const char *name,
   if (len == 0 || len > kMaxTagName) {
     return false;
   }
-  Guard g(root_->tag_lock_);
+  Guard g(this, root_->tag_lock_);
   if (root_->tag_inval_seq_.load(std::memory_order_acquire) != seq) {
     return false;  // a drop raced the fetch: the name may be stale
   }
@@ -1258,7 +1572,7 @@ inline bool View::LookupTagByName(const char *name, size_t len, u32 *major,
   if (len == 0 || len > kMaxTagName) {
     return false;
   }
-  Guard g(root_->tag_lock_);
+  Guard g(this, root_->tag_lock_);
   NameSlot *ns = FindNameLocked(KeyHash(0, 0, name, len), name, len, false);
   if (ns == nullptr) {
     return false;
@@ -1270,7 +1584,7 @@ inline bool View::LookupTagByName(const char *name, size_t len, u32 *major,
 }
 
 inline bool View::LookupTagName(u32 major, u32 minor, std::string *name) {
-  Guard g(root_->tag_lock_);
+  Guard g(this, root_->tag_lock_);
   TagEntry *t = FindTagLocked(major, minor, false);
   if (t == nullptr || !(t->flags_ & kTagNameValid)) {
     return false;
@@ -1282,7 +1596,7 @@ inline bool View::LookupTagName(u32 major, u32 minor, std::string *name) {
 
 inline void View::DropTagMeta(u32 major, u32 minor) {
   if (root_ == nullptr) return;  // no segment: nothing cached
-  Guard g(root_->tag_lock_);
+  Guard g(this, root_->tag_lock_);
   root_->tag_inval_seq_.fetch_add(1, std::memory_order_acq_rel);
   TagEntry *t = FindTagLocked(major, minor, false);
   if (t != nullptr) {
@@ -1293,7 +1607,7 @@ inline void View::DropTagMeta(u32 major, u32 minor) {
 
 inline bool View::FillTagAttrs(u32 major, u32 minor, const TagAttrs &a,
                                u64 seq, u64 write_seq) {
-  Guard g(root_->tag_lock_);
+  Guard g(this, root_->tag_lock_);
   if (root_->tag_inval_seq_.load(std::memory_order_acquire) != seq ||
       root_->local_write_seq_.load(std::memory_order_acquire) != write_seq) {
     return false;  // a drop or a local write raced the fetch
@@ -1313,7 +1627,7 @@ inline bool View::FillTagAttrs(u32 major, u32 minor, const TagAttrs &a,
 }
 
 inline bool View::LookupTagAttrs(u32 major, u32 minor, TagAttrs *a) {
-  Guard g(root_->tag_lock_);
+  Guard g(this, root_->tag_lock_);
   TagEntry *t = FindTagLocked(major, minor, false);
   if (t == nullptr || !(t->flags_ & kTagAttrValid)) {
     return false;
@@ -1339,7 +1653,7 @@ inline bool View::SnapshotGens(u32 tag_major, u32 tag_minor, const char *name,
   }
   u64 h = KeyHash(tag_major, tag_minor, name, name_len);
   u32 stripe = StripeOf(h);
-  Guard g(root_->stripes_[stripe]);
+  Guard g(this, root_->stripes_[stripe]);
   bool inserted = false;
   long s = FindOrInsertLocked(h, tag_major, tag_minor, name, name_len,
                               &inserted);
@@ -1363,17 +1677,17 @@ inline bool View::Fill(u32 tag_major, u32 tag_minor, const char *name,
   }
   u64 h = KeyHash(tag_major, tag_minor, name, name_len);
   u32 stripe = StripeOf(h);
-  Guard g(root_->stripes_[stripe]);
+  Guard g(this, root_->stripes_[stripe]);
   long s = FindLocked(h, tag_major, tag_minor, name, name_len);
   if (s < 0) {
     return false;
   }
   BlobEntry *e = Slot(static_cast<u32>(s));
   if (e->write_gen_.load() != write_gen ||
-      e->inval_epoch_.load() != inval_epoch || e->pending_.load() != 0) {
+      e->inval_epoch_.load() != inval_epoch || PendingOf(e) != 0) {
     return false;  // a local write or an invalidation raced the fetch
   }
-  if (e->pins_.load(std::memory_order_acquire) != 0) {
+  if (Pinned(e)) {
     return false;  // a reader is mid-copy: skip this optional fill, never
                    // wait for a pin under the stripe lock
   }
@@ -1402,14 +1716,14 @@ inline bool View::FillSize(u32 tag_major, u32 tag_minor, const char *name,
     return false;
   }
   u64 h = KeyHash(tag_major, tag_minor, name, name_len);
-  Guard g(root_->stripes_[StripeOf(h)]);
+  Guard g(this, root_->stripes_[StripeOf(h)]);
   long s = FindLocked(h, tag_major, tag_minor, name, name_len);
   if (s < 0) {
     return false;
   }
   BlobEntry *e = Slot(static_cast<u32>(s));
   if (e->write_gen_.load() != write_gen ||
-      e->inval_epoch_.load() != inval_epoch || e->pending_.load() != 0) {
+      e->inval_epoch_.load() != inval_epoch || PendingOf(e) != 0) {
     return false;  // a local write or an invalidation raced the fetch
   }
   if (!(e->flags_ & kComplete)) {
@@ -1432,7 +1746,7 @@ inline void View::Invalidate(u32 tag_major, u32 tag_minor, const char *name,
     return;
   }
   u64 h = KeyHash(tag_major, tag_minor, name, name_len);
-  Guard g(root_->stripes_[StripeOf(h)]);
+  Guard g(this, root_->stripes_[StripeOf(h)]);
   long s = FindLocked(h, tag_major, tag_minor, name, name_len);
   if (s < 0) {
     return;
@@ -1441,7 +1755,7 @@ inline void View::Invalidate(u32 tag_major, u32 tag_minor, const char *name,
   e->flags_ &= ~(kComplete | kSizeKnown);
   e->valid_lo_ = e->valid_hi_ = 0;  // pending bytes still flush, never serve
   e->inval_epoch_.fetch_add(1, std::memory_order_acq_rel);
-  if (e->pending_.load() == 0) {
+  if (PendingOf(e) == 0) {
     // A pinned buffer is left to eviction: it is unservable already, and
     // waiting for the pin under this lock is what deadlocks.
     ReleaseIfUnpinnedLocked(e);
@@ -1456,7 +1770,7 @@ inline void View::DropBlob(u32 tag_major, u32 tag_minor, const char *name,
     return;
   }
   u64 h = KeyHash(tag_major, tag_minor, name, name_len);
-  Guard g(root_->stripes_[StripeOf(h)]);
+  Guard g(this, root_->stripes_[StripeOf(h)]);
   long s = FindLocked(h, tag_major, tag_minor, name, name_len);
   if (s < 0) {
     return;
@@ -1465,7 +1779,7 @@ inline void View::DropBlob(u32 tag_major, u32 tag_minor, const char *name,
   e->inval_epoch_.fetch_add(1, std::memory_order_acq_rel);
   e->flags_ &= ~kComplete;
   e->valid_lo_ = e->valid_hi_ = 0;
-  if (e->pending_.load() != 0) {
+  if (PendingOf(e) != 0) {
     return;  // a racing write logged after the caller's barrier keeps it
   }
   DropUnpendingLocked(e);
@@ -1475,7 +1789,7 @@ inline void View::DropTagBlobs(u32 major, u32 minor) {
   if (root_ == nullptr) return;  // no segment: nothing cached
   u32 sps = root_->slots_per_stripe_;
   for (u32 stripe = 0; stripe < kStripes; ++stripe) {
-    Guard g(root_->stripes_[stripe]);
+    Guard g(this, root_->stripes_[stripe]);
     for (u32 i = 0; i < sps; ++i) {
       BlobEntry *e = Slot(stripe * sps + i);
       if (e->state_ != kSlotLive || e->tag_major_ != major ||
@@ -1485,7 +1799,7 @@ inline void View::DropTagBlobs(u32 major, u32 minor) {
       e->inval_epoch_.fetch_add(1, std::memory_order_acq_rel);
       e->flags_ &= ~kComplete;
       e->valid_lo_ = e->valid_hi_ = 0;
-      if (e->pending_.load() != 0) {
+      if (PendingOf(e) != 0) {
         continue;
       }
       DropUnpendingLocked(e);
@@ -1503,7 +1817,7 @@ inline bool View::ReadRange(u32 slot, u64 off, u64 *size, char *dst,
   u32 stripe = slot / root_->slots_per_stripe_;
   BlobEntry *e = Slot(slot);
   {
-    Guard g(root_->stripes_[stripe]);
+    Guard g(this, root_->stripes_[stripe]);
     if (e->state_ != kSlotLive || !(e->flags_ & kResident)) {
       return false;
     }
@@ -1523,23 +1837,23 @@ inline bool View::ReadRange(u32 slot, u64 off, u64 *size, char *dst,
                    e->wend_.load(std::memory_order_acquire);
       *copied_gen = quiet ? e->write_gen_.load(std::memory_order_acquire) : 0;
     }
-    e->pins_.fetch_add(1, std::memory_order_acq_rel);
+    e->rt_pins_.fetch_add(1, std::memory_order_acq_rel);
   }
   if (*size > 0) {
     CopyOut(e, off, dst, *size);
   }
-  e->pins_.fetch_sub(1, std::memory_order_acq_rel);
+  e->rt_pins_.fetch_sub(1, std::memory_order_acq_rel);
   return true;
 }
 
 inline const char *View::PinRange(u32 slot, u64 off, u64 *size,
                                   u64 *copied_gen) {
-  if (Extents() || slot >= NumSlots()) {
+  if (slot >= NumSlots()) {
     return nullptr;
   }
   u32 stripe = slot / root_->slots_per_stripe_;
   BlobEntry *e = Slot(slot);
-  Guard g(root_->stripes_[stripe]);
+  Guard g(this, root_->stripes_[stripe]);
   if (e->state_ != kSlotLive || !(e->flags_ & kResident)) {
     return nullptr;
   }
@@ -1548,15 +1862,32 @@ inline const char *View::PinRange(u32 slot, u64 off, u64 *size,
     end = e->cap_;
   }
   *size = end > off ? end - off : 0;
+  const char *p = Extents() ? RunPtr(e, off, *size) : base_ + e->buf_off_ + off;
+  if (p == nullptr) {
+    return nullptr;  // spans two runs: the caller copies it out instead
+  }
   bool quiet = e->wbegin_.load(std::memory_order_acquire) ==
                e->wend_.load(std::memory_order_acquire);
   *copied_gen = quiet ? e->write_gen_.load(std::memory_order_acquire) : 0;
-  e->pins_.fetch_add(1, std::memory_order_acq_rel);
-  return base_ + e->buf_off_ + off;
+  e->rt_pins_.fetch_add(1, std::memory_order_acq_rel);
+  return p;
+}
+
+inline const char *View::RunPtr(const BlobEntry *e, u64 off, u64 n) const {
+  u64 pos = 0;
+  for (u32 r = 0; r < RS(e)->n_; ++r) {
+    const u64 rb = static_cast<u64>(RS(e)->r_[r].n_) * kGranule;
+    if (off < pos + rb) {
+      return off + n <= pos + rb ? GranPtr(RS(e)->r_[r].g_) + (off - pos)
+                                 : nullptr;
+    }
+    pos += rb;
+  }
+  return nullptr;
 }
 
 inline void View::UnpinRange(u32 slot) {
-  Slot(slot)->pins_.fetch_sub(1, std::memory_order_acq_rel);
+  Slot(slot)->rt_pins_.fetch_sub(1, std::memory_order_acq_rel);
 }
 
 inline bool View::SlotTag(u32 slot, u32 *major, u32 *minor) const {
@@ -1579,7 +1910,375 @@ inline u64 View::RangeGen(const DirtyRange &r) const {
 
 inline void View::CompleteRanges(u32 slot, u32 n) {
   if (slot < NumSlots()) {
-    Slot(slot)->pending_.fetch_sub(n, std::memory_order_acq_rel);
+    Slot(slot)->retired_.fetch_add(n, std::memory_order_acq_rel);
+  }
+}
+
+inline ThreadSlot *View::MySlot() {
+  detail::SlotCache &c = detail::MySlotCache();
+  const unsigned gen = ctp::detail::ProcIdentityGen();
+  detail::SlotCache::Entry *spare = nullptr;
+  for (detail::SlotCache::Entry &x : c.e_) {
+    if (x.root_ == root_ && x.format_id_ == root_->format_id_ &&
+        x.gen_ == gen && x.slot_ != nullptr) {
+      return x.slot_;
+    }
+    if (spare == nullptr && (x.root_ == nullptr || x.gen_ != gen)) spare = &x;
+  }
+  ThreadSlot *t = ClaimSlot();
+  if (t == nullptr) return nullptr;
+  if (spare == nullptr) spare = &c.e_[0];  // evicts an entry; it stays owned
+  spare->root_ = root_;
+  spare->format_id_ = root_->format_id_;
+  spare->slot_ = t;
+  spare->gen_ = gen;
+  return t;
+}
+
+inline ThreadSlot *View::ClaimSlot() {
+  const u32 pid = static_cast<u32>(ctp::SystemInfo::GetPid());
+  const u64 start = ctp::TimedMutex::GetProcessStartTime(pid);
+  const u64 tid = detail::ThreadId();
+  ThreadSlot *slots = Slots();
+  for (u32 i = 0; i < root_->threads_; ++i) {
+    ThreadSlot *t = &slots[i];
+    u32 expect = kThreadFree;
+    if (!t->state_.compare_exchange_strong(expect, kThreadClaiming)) continue;
+    t->pid_ = pid;
+    t->start_ = start;
+    t->tid_ = tid;
+    t->state_.store(kThreadOwned, std::memory_order_release);
+    u32 hw = root_->threads_hw_.load();
+    while (hw < i + 1 && !root_->threads_hw_.compare_exchange_weak(hw, i + 1)) {
+    }
+    return t;
+  }
+  return nullptr;
+}
+
+inline void View::Publish(ThreadSlot *t, const DirtyRange &r) {
+  const u64 tail = t->tail_.load(std::memory_order_relaxed);
+  Ring(t)[tail % root_->qdepth_] = r;
+  t->tail_.store(tail + 1, std::memory_order_release);  // the publish
+  root_->published_.fetch_add(1, std::memory_order_acq_rel);
+}
+
+inline size_t View::Drain(std::vector<DirtyRange> *out, size_t max,
+                          bool force) {
+  if (!force && QueuesEmpty()) return 0;  // nothing new: skip the scan
+  const u32 hw = root_->threads_hw_.load(std::memory_order_acquire);
+  ThreadSlot *slots = Slots();
+  size_t taken = 0;
+  // Rotate the starting slot so one busy thread cannot starve the others.
+  const u32 first = hw == 0 ? 0 : drain_cursor_++ % hw;
+  for (u32 k = 0; k < hw && taken < max; ++k) {
+    ThreadSlot *t = &slots[(first + k) % hw];
+    u64 head = t->head_.load(std::memory_order_relaxed);
+    const u64 tail = t->tail_.load(std::memory_order_acquire);
+    while (head < tail && taken < max) {
+      out->push_back(Ring(t)[head % root_->qdepth_]);
+      ++head;
+      ++taken;
+    }
+    t->head_.store(head, std::memory_order_release);
+    if (head == tail && t->state_.load() == kThreadRetiring) {
+      u32 expect = kThreadRetiring;
+      t->state_.compare_exchange_strong(expect, kThreadFree);
+    }
+  }
+  drained_ += taken;
+  return taken;
+}
+
+inline u32 View::ReapDeadSlots() { return RepairDead(0); }
+
+
+inline bool View::VerifyGranules() const {
+  if (!Extents()) return true;
+  const u64 n = root_->granules_;
+  std::vector<u32> owner(n, 0);
+  u64 used = 0;
+  for (u32 slot = 0; slot < NumSlots(); ++slot) {
+    const BlobEntry *e = Slot(slot);
+    const RunSet *rs = RS(e);
+    if (e->state_ != kSlotLive || rs->n_ == 0) continue;
+    u64 have = 0;
+    for (u32 r = 0; r < rs->n_; ++r) {
+      for (u64 g = rs->r_[r].g_; g < static_cast<u64>(rs->r_[r].g_) + rs->r_[r].n_;
+           ++g) {
+        if (g >= n || owner[g] != 0) return false;  // out of range / shared
+        owner[g] = slot + 1;
+        ++have;
+      }
+    }
+    if (have * kGranule != e->cap_) return false;
+    used += have;
+  }
+  for (u64 g = 0; g < n; ++g) {
+    const bool is_free = (free_bits_[g / 64] >> (g % 64)) & 1ull;
+    if (is_free != (owner[g] == 0)) return false;
+    if (gran_owner_[g].load() != owner[g]) return false;
+  }
+  return root_->free_granules_.load() == n - used;
+}
+
+inline u64 View::LockSegment(ctp::TimedMutex &m) {
+  static thread_local bool in_repair = false;
+  for (u32 spin = 0;; ++spin) {
+    const u64 id = m.TryLock();
+    if (id != 0) return id;
+    if (spin < 64) {
+      ctp::CpuRelax();
+      continue;
+    }
+    if (spin < 1024) {
+      std::this_thread::yield();
+      continue;
+    }
+    std::this_thread::sleep_for(std::chrono::microseconds(50));
+    // The runtime (never a client) repairs what a dead holder left: a
+    // runtime thread blocked here would otherwise wait for the background
+    // sweep, which may need this very thread's worker.
+    if (!owner_ || in_repair || spin % kRepairCheckSpins != 0) continue;
+    const u64 held = m.State();
+    const u32 pid = ctp::TimedMutex::IdPid(held);
+    if (pid == 0 || ctp::TimedMutex::IsProcessAlive(pid, m.OwnerStart())) {
+      continue;
+    }
+    in_repair = true;
+    RepairDead(pid);
+    in_repair = false;
+  }
+}
+
+inline bool View::HolderDead(const ctp::TimedMutex &m,
+                             const std::set<u32> &dead, u64 *id) const {
+  *id = m.State();
+  return *id != 0 && dead.count(ctp::TimedMutex::IdPid(*id)) != 0;
+}
+
+inline u32 View::RepairDead(u32 suspect_pid) {
+  std::unique_lock<std::mutex> g(repair_mu_, std::try_to_lock);
+  if (!g.owns_lock()) return 0;  // another thread is repairing
+  std::set<u32> dead;
+  std::vector<ThreadSlot *> dslots;
+  CollectDead(suspect_pid, &dead, &dslots);
+  if (dead.empty()) return 0;
+  // Order: what live threads may be waiting on first (a live stripe holder
+  // can wait on the data or tag lock, never the other way round).
+  RepairDataLock(dead);
+  u64 tid = 0;
+  if (HolderDead(root_->tag_lock_, dead, &tid)) {
+    root_->tag_lock_.Unlock(tid);  // clients only read under it
+  }
+  // Each stripe once: stolen ones first (live threads may wait on them),
+  // then those only a dead thread's copy touched.
+  bool done[kStripes] = {};
+  for (u32 stripe = 0; stripe < kStripes; ++stripe) {
+    u64 id = 0;
+    if (HolderDead(root_->stripes_[stripe], dead, &id)) {
+      RepairStripe(stripe, id, dead, dslots);
+      done[stripe] = true;
+    }
+  }
+  for (u32 stripe = 0; stripe < kStripes; ++stripe) {
+    if (!done[stripe] && HasCopyRecord(stripe, dslots)) {
+      RepairStripe(stripe, 0, dead, dslots);
+    }
+  }
+  for (ThreadSlot *t : dslots) {
+    t->op_.store(kJIdle, std::memory_order_release);
+    u32 owned = kThreadOwned;
+    t->state_.compare_exchange_strong(owned, kThreadRetiring);
+  }
+  root_->stats_.repairs_.fetch_add(1, std::memory_order_relaxed);
+  return static_cast<u32>(dslots.size());
+}
+
+inline void View::CollectDead(u32 suspect_pid, std::set<u32> *dead,
+                              std::vector<ThreadSlot *> *dslots) {
+  const u32 self = static_cast<u32>(ctp::SystemInfo::GetPid());
+  std::set<u32> alive;
+  auto is_dead = [&](u32 pid, u64 start) {
+    if (pid == 0 || pid == self || alive.count(pid)) return false;
+    if (dead->count(pid)) return true;
+    if (ctp::TimedMutex::IsProcessAlive(pid, start)) {
+      alive.insert(pid);
+      return false;
+    }
+    dead->insert(pid);
+    return true;
+  };
+  if (suspect_pid != 0) is_dead(suspect_pid, 0);
+  const u32 hw = root_->threads_hw_.load(std::memory_order_acquire);
+  for (u32 i = 0; i < hw; ++i) {
+    ThreadSlot *t = &Slots()[i];
+    if (t->state_.load(std::memory_order_acquire) == kThreadOwned &&
+        is_dead(t->pid_, t->start_)) {
+      dslots->push_back(t);
+    }
+  }
+}
+
+inline bool View::HasCopyRecord(u32 stripe,
+                                const std::vector<ThreadSlot *> &dslots) const {
+  for (const ThreadSlot *t : dslots) {
+    const u32 op = t->op_.load(std::memory_order_acquire);
+    const u32 x = t->jslot_.load(std::memory_order_acquire);
+    if ((op == kJCopyIn || op == kJCopyOut) && x != kJNone &&
+        x / root_->slots_per_stripe_ == stripe) {
+      return true;
+    }
+  }
+  return false;
+}
+
+inline void View::RepairDataLock(const std::set<u32> &dead) {
+  u64 id = 0;
+  if (!Extents() || !HolderDead(root_->data_lock_, dead, &id)) return;
+  // Held by a dead thread: nothing else changes runs or the bitmap until
+  // this releases it. Rebuild both from the entries' runs.
+  const u64 n = root_->granules_;
+  const u64 words = (n + 63) / 64;
+  for (u64 w = 0; w < words; ++w) free_bits_[w] = ~0ull;
+  if (n % 64 != 0) free_bits_[words - 1] = (1ull << (n % 64)) - 1;
+  for (u64 g = 0; g < n; ++g) gran_owner_[g].store(0, std::memory_order_relaxed);
+  u64 used = 0;
+  for (u32 slot = 0; slot < NumSlots(); ++slot) {
+    used += ClaimRunsLocked(Slot(slot));
+  }
+  root_->free_granules_.store(n - used);
+  root_->data_lock_.Unlock(id);
+}
+
+inline u64 View::ClaimRunsLocked(BlobEntry *e) {
+  RunSet *rs = RS(e);
+  if (rs->n_ == 0) return 0;
+  if (e->state_ != kSlotLive || rs->n_ > kInlineRuns) {
+    rs->n_ = 0;  // runs of a freed slot: given back
+    e->cap_ = 0;
+    return 0;
+  }
+  // Trim runs past cap_: a growth cut short appended them before raising it.
+  const u64 n = root_->granules_;
+  const u64 want = e->cap_ / kGranule;
+  u64 have = 0;
+  u32 k = 0;
+  for (; k < rs->n_ && have < want; ++k) {
+    Run &r = rs->r_[k];
+    if (static_cast<u64>(r.g_) + r.n_ > n) break;  // corrupt: stop here
+    if (have + r.n_ > want) r.n_ = static_cast<u32>(want - have);
+    have += r.n_;
+  }
+  rs->n_ = k;
+  e->cap_ = have * kGranule;
+  const u32 owner = static_cast<u32>(e - blobs_) + 1;
+  for (u32 r = 0; r < rs->n_; ++r) {
+    for (u64 x = rs->r_[r].g_; x < static_cast<u64>(rs->r_[r].g_) + rs->r_[r].n_;
+         ++x) {
+      free_bits_[x / 64] &= ~(1ull << (x % 64));
+      gran_owner_[x].store(owner, std::memory_order_relaxed);
+    }
+  }
+  return have;
+}
+
+inline void View::RepairStripe(u32 stripe, u64 stolen,
+                               const std::set<u32> &dead,
+                               const std::vector<ThreadSlot *> &dslots) {
+  const u32 holder = ctp::TimedMutex::IdPid(stolen);
+  // Entries the dead touched in this stripe, and what each record means.
+  std::vector<std::pair<u32, const ThreadSlot *>> recs;
+  auto in_stripe = [&](u32 x) {
+    return x != kJNone && x / root_->slots_per_stripe_ == stripe;
+  };
+  for (const ThreadSlot *t : dslots) {
+    const u32 op = t->op_.load(std::memory_order_acquire);
+    const u32 x = t->jslot_.load(std::memory_order_acquire);
+    const u32 v = t->jvictim_.load(std::memory_order_acquire);
+    const bool held = stolen != 0 && t->pid_ == holder;
+    if (op == kJStripe && held && t->jstripe_.load() == stripe && in_stripe(x)) {
+      recs.emplace_back(x, t);
+    } else if ((op == kJCopyIn || op == kJCopyOut) && in_stripe(x)) {
+      recs.emplace_back(x, t);
+    }
+    if (held && in_stripe(v)) recs.emplace_back(v, nullptr);  // a victim
+  }
+  const u64 id = stolen != 0 ? stolen : LockSegment(root_->stripes_[stripe]);
+  std::set<u32> touched;
+  for (const auto &r : recs) touched.insert(r.first);
+  WaitLiveCopies(touched, dead);
+  for (const auto &r : recs) {
+    if (r.second != nullptr) RollBack(Slot(r.first), *r.second);
+  }
+  for (u32 x : touched) {
+    BlobEntry *e = Slot(x);
+    // Every live copier of e finished, and every dead one is accounted:
+    // close the seqlock and drop pins nobody holds any more.
+    e->wend_.store(e->wbegin_.load(std::memory_order_acquire),
+                   std::memory_order_release);
+    e->pins_.store(0, std::memory_order_release);
+    SanitizeLocked(e);
+  }
+  root_->stripes_[stripe].Unlock(id);
+}
+
+inline void View::WaitLiveCopies(const std::set<u32> &touched,
+                                 const std::set<u32> &dead) {
+  if (touched.empty()) return;
+  const u32 hw = root_->threads_hw_.load(std::memory_order_acquire);
+  for (;;) {
+    bool busy = false;
+    for (u32 i = 0; i < hw && !busy; ++i) {
+      const ThreadSlot *t = &Slots()[i];
+      if (t->state_.load(std::memory_order_acquire) != kThreadOwned ||
+          dead.count(t->pid_)) {
+        continue;
+      }
+      const u32 op = t->op_.load(std::memory_order_acquire);
+      busy = (op == kJCopyIn || op == kJCopyOut) &&
+             touched.count(t->jslot_.load(std::memory_order_acquire)) != 0;
+    }
+    if (!busy) return;
+    std::this_thread::sleep_for(std::chrono::microseconds(50));
+  }
+}
+
+inline void View::RollBack(BlobEntry *e, const ThreadSlot &t) {
+  if (t.jkind_.load() != kJKPut) return;  // a reader: its pin is dropped
+  const u32 op = t.op_.load(std::memory_order_acquire);
+  bool committed = false;  // the write raised wbegin_ (it is pending)
+  if (op == kJStripe) {
+    committed = e->wbegin_.load() != t.jwbegin_.load();
+  } else if (op == kJCopyIn) {
+    // Published: the flusher retires it, and its bytes were all copied.
+    if (t.tail_.load(std::memory_order_acquire) > t.jtail_.load()) return;
+    committed = true;
+  }
+  if (committed) {
+    // Never published, so never landed: retire it here.
+    e->retired_.fetch_add(1, std::memory_order_acq_rel);
+  }
+  // Its bytes (or metadata) may be half-written: serve none of the entry's
+  // cached bytes again. Other writes' pending bytes still flush.
+  e->flags_ &= ~(kComplete | kSizeKnown);
+  e->valid_lo_ = e->valid_hi_ = 0;
+  e->inval_epoch_.fetch_add(1, std::memory_order_acq_rel);
+  root_->stats_.invalidations_.fetch_add(1, std::memory_order_relaxed);
+}
+
+inline void View::SanitizeLocked(BlobEntry *e) {
+  if (!Extents()) return;
+  const bool live = e->state_ == kSlotLive;
+  const bool resident = live && (e->flags_ & kResident) != 0;
+  if (resident && (RS(e)->n_ == 0 || e->cap_ == 0)) {
+    // Released part-way: its runs are gone, so it holds no bytes.
+    e->flags_ &= ~(kResident | kComplete);
+    e->valid_lo_ = e->valid_hi_ = 0;
+    e->cap_ = 0;
+    RS(e)->n_ = 0;
+  } else if (!resident && RS(e)->n_ != 0 && PendingOf(e) == 0) {
+    FreeRuns(e);  // runs leased by a growth cut short, or a release
   }
 }
 

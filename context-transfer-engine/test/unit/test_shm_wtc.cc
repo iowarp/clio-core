@@ -52,6 +52,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -66,7 +67,8 @@
 #include <process.h>  // _getpid
 #define getpid _getpid
 #else
-#include <unistd.h>  // getpid
+#include <sys/wait.h>  // waitpid
+#include <unistd.h>  // getpid, fork
 #endif
 
 #include "simple_test.h"
@@ -346,20 +348,20 @@ static constexpr double kFlushDeadlineMs = 120000.0;
  * Wait (bounded by kFlushDeadlineMs) until the cache has flushed every range
  * pushed so far. Prints both counters when the deadline passes.
  * @param io client connected to the cache
- * @return true once flushed_ reaches pushed_; false on the deadline
+ * @return true once flushed_ reaches PushedNow(); false on the deadline
  */
 static bool WaitFlushed(clio::cte::core::Client &io) {
   wtc::View *view = TestView(io.CacheKeys());
   if (view == nullptr) return false;
   const wtc::Root *root = view->GetRoot();
   const auto t0 = std::chrono::steady_clock::now();
-  while (root->flushed_.load() < root->pushed_.load()) {
+  while (root->flushed_.load() < view->PushedNow()) {
     const double ms = std::chrono::duration<double, std::milli>(
                           std::chrono::steady_clock::now() - t0)
                           .count();
     if (ms >= kFlushDeadlineMs) {
       std::cout << "  WaitFlushed: gave up after " << ms << " ms: pushed "
-                << root->pushed_.load() << ", flushed "
+                << view->PushedNow() << ", flushed "
                 << root->flushed_.load() << std::endl;
       return false;
     }
@@ -1128,6 +1130,7 @@ static void FormatPrivateView(wtc::View &view, const std::string &tag) {
   lim.seg_size_ = 16ull << 20;
   lim.max_blobs_ = 1024;
   lim.log_depth_ = 1024;
+  lim.threads_ = 8;
   const std::string name = "clio_wtc_viewtest_" + tag + "_" +
                            std::to_string(pid);
   const ctp::ipc::MemoryBackendId id(pid, 0x57550000u);
@@ -1136,7 +1139,7 @@ static void FormatPrivateView(wtc::View &view, const std::string &tag) {
 }
 
 /**
- * Write a blob through a View and take its slot off the dirty log, as the
+ * Write a blob through a View and drain its range from the queues, as the
  * flusher does (the range stays pending until CompleteRanges).
  * @return the blob's slot
  */
@@ -1145,9 +1148,9 @@ static clio::run::u32 PutAndPopSlot(wtc::View &view, const std::string &blob,
   REQUIRE(view.TryPut(1, 1, blob.data(), blob.size(), 0, bytes.size(),
                       bytes.data(), 0, /*may_block=*/false) ==
           wtc::Status::kOk);
-  wtc::DirtyRange r{};
-  REQUIRE(view.Log()->Pop(r));
-  return r.slot_;
+  std::vector<wtc::DirtyRange> rs;
+  REQUIRE(view.Drain(&rs, 1) == 1);
+  return rs[0].slot_;
 }
 
 /** Milliseconds since `t0`. */
@@ -1730,5 +1733,115 @@ TEST_CASE("ShmWtc - stress: leased extents stay exact under concurrent puts, "
   REQUIRE(sh.bad_.load() == 0);
   REQUIRE(st->evictions_.load() > 0);
 }
+
+#if !defined(_WIN32)
+/**
+ * Run `op` in a forked child that is SIGKILLed at crash point `point` (the
+ * first time it is reached), and reap it.
+ * @param point a wtc::detail::CrashPoint
+ * @param op what the child does through the shared View
+ * @return true when the child died by SIGKILL (the point was reached)
+ */
+static bool RunAndDie(int point, const std::function<void()> &op) {
+  const pid_t pid = fork();
+  if (pid == 0) {
+    auto &c = wtc::detail::Crash();
+    c.point_ = point;
+    c.left_.store(1);
+    op();
+    _exit(3);  // the crash point was never reached
+  }
+  int status = 0;
+  waitpid(pid, &status, 0);
+  return WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL;
+}
+
+/**
+ * Crash-repair scenario: blob "A" holds another writer's unflushed bytes,
+ * blob "B" clean cached bytes. A child dies at `point` while writing B
+ * (growing it when `grow`) or reading it; the runtime's repair must free
+ * every lock, keep A's pending bytes exact, account B's write exactly once
+ * or not at all, and leave B writable and readable.
+ */
+static void CrashScenario(const std::string &tag, int point, bool read,
+                          bool grow) {
+  wtc::View view;
+  FormatPrivateView(view, "crash_" + tag);
+  const std::string a = Payload(8192, 'a');
+  const std::string b0 = Payload(64 * 1024, 'b');
+  REQUIRE(view.TryPut(1, 1, "A", 1, 0, a.size(), a.data(), 0, false) ==
+          wtc::Status::kOk);
+  REQUIRE(view.TryPut(1, 1, "B", 1, 0, b0.size(), b0.data(), 0, false) ==
+          wtc::Status::kOk);
+  std::vector<wtc::DirtyRange> rs;
+  REQUIRE(view.Drain(&rs, ~static_cast<size_t>(0)) == 2);
+  const clio::run::u32 slot_a = rs[0].slot_;
+  const clio::run::u32 slot_b = rs[1].slot_;
+  view.CompleteRanges(slot_b, 1);  // B clean; A stays pending
+  const clio::run::u64 off = grow ? b0.size() : 4096;
+  const std::string z = Payload(64 * 1024, 'z');
+  const bool died = RunAndDie(point, [&] {
+    if (read) {
+      std::string out(b0.size(), '\0');
+      view.TryGet(1, 1, "B", 1, 0, out.size(), out.data());
+    } else {
+      view.TryPut(1, 1, "B", 1, off, z.size(), z.data(), 0, false);
+    }
+  });
+  REQUIRE(died);
+  REQUIRE(view.RepairDead(0) >= 1);
+  const wtc::Root *root = view.GetRoot();
+  for (clio::run::u32 i = 0; i < wtc::kStripes; ++i) {
+    REQUIRE(root->stripes_[i].State() == 0);
+  }
+  REQUIRE(root->tag_lock_.State() == 0);
+  REQUIRE(root->data_lock_.State() == 0);
+  REQUIRE(view.VerifyGranules());
+  // The other writer's bytes: still pending, intact.
+  REQUIRE(view.Pending(slot_a) == 1);
+  std::string got(a.size(), '\0');
+  clio::run::u64 n = a.size();
+  clio::run::u32 maj = 0, mnr = 0, pf = 0;
+  std::string nm;
+  REQUIRE(view.ReadRange(slot_a, 0, &n, got.data(), &maj, &mnr, &nm, &pf));
+  REQUIRE(got == a);
+  // B's write: published (and flushed later) or rolled back, never both.
+  std::vector<wtc::DirtyRange> rs2;
+  view.Drain(&rs2, ~static_cast<size_t>(0));
+  const bool published = point == wtc::detail::kCpPutPublished;
+  REQUIRE(rs2.size() == (published ? 1u : 0u));
+  REQUIRE(view.Pending(slot_b) == (published ? 1u : 0u));
+  if (published) {
+    std::string zb(z.size(), '\0');
+    clio::run::u64 zn = z.size();
+    REQUIRE(view.ReadRange(slot_b, off, &zn, zb.data(), &maj, &mnr, &nm, &pf));
+    REQUIRE(zb == z);
+    view.CompleteRanges(slot_b, 1);
+  }
+  // B still works: a new write is cached and read back.
+  const std::string y = Payload(96 * 1024, 'y');
+  REQUIRE(view.TryPut(1, 1, "B", 1, 0, y.size(), y.data(), 0, false) ==
+          wtc::Status::kOk);
+  std::string yb(y.size(), '\0');
+  REQUIRE(view.TryGet(1, 1, "B", 1, 0, yb.size(), yb.data()) ==
+          wtc::Status::kOk);
+  REQUIRE(yb == y);
+  REQUIRE(view.VerifyGranules());
+}
+
+TEST_CASE("ShmWtc - a client killed at any step of a put or get is repaired",
+          "[cte][shm_wtc][crash]") {
+  using wtc::detail::CrashPoint;
+  CrashScenario("plock", wtc::detail::kCpPutLocked, false, false);
+  CrashScenario("pcommit", wtc::detail::kCpPutCommitted, false, false);
+  CrashScenario("pcopy", wtc::detail::kCpPutCopy, false, false);
+  CrashScenario("pcopied", wtc::detail::kCpPutCopied, false, false);
+  CrashScenario("ppub", wtc::detail::kCpPutPublished, false, false);
+  CrashScenario("grow", wtc::detail::kCpGrow, false, true);
+  CrashScenario("alloc", wtc::detail::kCpAlloc, false, true);
+  CrashScenario("gpin", wtc::detail::kCpGetPinned, true, false);
+  CrashScenario("gcopy", wtc::detail::kCpGetCopy, true, false);
+}
+#endif
 
 SIMPLE_TEST_MAIN()

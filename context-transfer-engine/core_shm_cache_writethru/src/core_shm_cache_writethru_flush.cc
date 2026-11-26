@@ -132,12 +132,15 @@ std::vector<FlushRecord> Runtime::PopAndCoalesce(
   clio::run::u64 bytes = 0;
   clio::run::u64 n = 0;
   wtc::DirtyRange r{};
-  wtc::DirtyLog *log = view_.Log();
+  DrainToStage();
+  std::unique_lock<std::mutex> stage_lock(stage_mu_);
   // Overwrites: a range whose bytes an earlier flush copy already carried
   // (older generation, covered range) is retired with this batch instead of
   // being resent, and does not count against the batch budget.
   while (rs.size() < kMaxRangesPerFlush && n < kMaxPopsPerFlush &&
-         bytes < config_.flush_batch_bytes_ && log->Pop(r)) {
+         bytes < config_.flush_batch_bytes_ && !stage_.empty()) {
+    r = stage_.front();
+    stage_.pop_front();
     ++n;
     // Counted before the dead check: DeleteBarrier marks a tag dead, then
     // waits for every range counted so far -- one counted later sees it.
@@ -152,6 +155,7 @@ std::vector<FlushRecord> Runtime::PopAndCoalesce(
     rs.push_back(r);
     bytes += r.size_;
   }
+  stage_lock.unlock();
   *popped = n;
   std::sort(rs.begin(), rs.end(),
             [](const wtc::DirtyRange &a, const wtc::DirtyRange &b) {
@@ -591,9 +595,31 @@ clio::run::TaskResume Runtime::LandOldest() {
   CLIO_TASK_BODY_END
 }
 
+void Runtime::DrainToStage(bool force) {
+  if (!force && view_.QueuesEmpty()) return;  // no lock, no scan
+  std::vector<wtc::DirtyRange> got;
+  std::lock_guard<std::mutex> g(stage_mu_);
+  // Everything published now: each queue holds at most qdepth_ ranges.
+  view_.Drain(&got, ~static_cast<size_t>(0), force);
+  for (const wtc::DirtyRange &x : got) stage_.push_back(x);
+  staged_total_.fetch_add(got.size(), std::memory_order_seq_cst);
+}
+
+clio::run::u64 Runtime::BarrierTarget() {
+  DrainToStage();
+  return staged_total_.load(std::memory_order_seq_cst);
+}
+
+bool Runtime::NothingToFlush() const {
+  // Lock-free: every staged range is popped exactly once (popped_total_).
+  return view_.QueuesEmpty() &&
+         popped_total_.load(std::memory_order_acquire) >=
+             staged_total_.load(std::memory_order_acquire);
+}
+
 void Runtime::KickFlusher() {
   clio::run::TaskLane *lane = flusher_lane_.load(std::memory_order_acquire);
-  if (lane == nullptr || !view_.Ready() || view_.Log()->Empty()) return;
+  if (lane == nullptr || !view_.Ready() || NothingToFlush()) return;
   auto *ipc = CLIO_IPC;
   ipc->AwakenWorker(lane);  // skipped (no syscall) while the worker runs
 }
@@ -642,7 +668,38 @@ clio::run::TaskResume Runtime::FlushLog(clio::run::shared_ptr<FlushLogTask> &tas
       flusher_lane_.store(worker->GetLane(), std::memory_order_release);
     }
   }
-  if (view_.Ready()) SyncDeadHomes();
+  if (view_.Ready()) {
+    SyncDeadHomes();
+    {
+      // A peer held this node dead (rejoin notice): invalidations meant for
+      // it were lost and writes went through stand-in homes meanwhile, so
+      // nothing cached here can be trusted (clio_fs_suite
+      // cache_holder_partitioned_misses_overwrite).
+      const clio::run::u64 hd = CLIO_IPC->HeldDeadSeq();
+      if (hd != seen_held_dead_) {
+        if (seen_held_dead_ != kNoHeldDeadSeq) {
+          view_.InvalidateAll();
+          HLOG(kWarning, "core_shm_cache_writethru {}: a peer held this node "
+               "dead; dropped every cached copy (they may be stale)",
+               pool_id_.ToString());
+        }
+        seen_held_dead_ = hd;
+      }
+    }
+    DrainToStage(/*force=*/true);  // ranges a dead producer never counted
+    // Thread slots of dead clients retire (and free once drained), so
+    // restarts never exhaust them.
+    constexpr clio::run::u64 kReapSlotsNs = 1000ull * 1000 * 1000;
+    const clio::run::u64 now = wtc::NowNs();
+    if (now - slots_reaped_ns_ >= kReapSlotsNs) {
+      slots_reaped_ns_ = now;
+      const clio::run::u32 n = view_.ReapDeadSlots();
+      if (n != 0) {
+        HLOG(kInfo, "core_shm_cache_writethru {}: retired {} thread slot(s) "
+             "of exited processes", pool_id_.ToString(), n);
+      }
+    }
+  }
   if (!view_.Ready() || flush_running_.exchange(true)) {
     task->SetReturnCode(0);
     CLIO_CO_RETURN;
@@ -652,7 +709,7 @@ clio::run::TaskResume Runtime::FlushLog(clio::run::shared_ptr<FlushLogTask> &tas
   // chain read is in progress or waiting, so the fence can open.
   while (true) {
     while (inflight_.size() < std::max<clio::run::u32>(1, config_.flush_depth_) &&
-           !view_.Log()->Empty() && reads_waiting_.load() == 0) {
+           !NothingToFlush() && reads_waiting_.load() == 0) {
       // seq_cst pairs with BeginChainRead (increment, then check the other).
       flush_active_.fetch_add(1);
       if (chain_reads_.load() != 0) {

@@ -139,14 +139,14 @@ void Runtime::LogStats() {
        "buf={} busy={} miss={} waits={} flush_batches={} flush_ranges={} "
        "flush_MiB={} flush_skipped={} fills={} md_fills={} get_hits={} "
        "get_misses={} (absent={} nonres={} range={} busy={}) "
-       "invalidations={} evictions={}",
+       "invalidations={} evictions={} crash_repairs={}",
        container_id_, v(st.puts_), v(st.put_bytes_) >> 20,
        v(st.put_full_log_), v(st.put_full_slot_), v(st.put_full_buf_),
        v(st.put_busy_), v(st.put_miss_), v(st.waits_), v(st.flush_batches_),
        v(st.flush_ranges_), v(st.flush_bytes_) >> 20, v(st.flush_skipped_),
        v(st.fills_), v(st.md_fills_), v(st.get_hits_), v(st.get_misses_),
        v(st.miss_absent_), v(st.miss_nonres_), v(st.miss_range_),
-       v(st.miss_busy_), v(st.invalidations_), v(st.evictions_));
+       v(st.miss_busy_), v(st.invalidations_), v(st.evictions_), v(st.repairs_));
 }
 
 bool Runtime::OpenSegment() {
@@ -396,11 +396,11 @@ clio::run::TaskResume Runtime::DeleteBarrier(const std::vector<TagId> &tags) {
   if (view_.Ready()) {
     clio::run::u64 target = 0;
     if (view_.MdOnly() || tags.empty()) {
-      target = view_.PushedNow();  // nothing of the tags' bytes is logged
+      target = BarrierTarget();  // nothing of the tags' bytes is logged
     } else {
       {
         std::lock_guard<std::mutex> g(dead_mu_);
-        // Marks expire in deletion order (PushedNow only grows): drop the
+        // Marks expire in deletion order (the target only grows): drop the
         // front while its ranges are all flushed. A tag deleted again keeps
         // the newer mark (its older deque entry no longer matches).
         while (!dead_order_.empty() &&
@@ -412,7 +412,7 @@ clio::run::TaskResume Runtime::DeleteBarrier(const std::vector<TagId> &tags) {
           }
           dead_order_.pop_front();
         }
-        const clio::run::u64 pushed = view_.PushedNow();
+        const clio::run::u64 pushed = BarrierTarget();
         for (const TagId &t : tags) {
           if (t.IsNull()) continue;
           const clio::run::u64 k =
@@ -481,7 +481,7 @@ clio::run::TaskResume Runtime::SyncTag(
   clio::run::u32 sticky = 0;
   std::set<clio::run::u32> homes;
   if (view_.Ready()) {
-    const clio::run::u64 target = view_.PushedNow();
+    const clio::run::u64 target = BarrierTarget();
     while (!view_.FlushedThrough(target)) {
       KickFlusher();
       CLIO_CO_AWAIT(clio::run::yield(kBarrierPollUs));
@@ -538,7 +538,7 @@ clio::run::TaskResume Runtime::BarrierForward(
         task.template Cast<clio::cte::core::MultiDelTagTask>()->tags_);
     CLIO_CO_AWAIT(DeleteBarrier(tags));
   } else if (view_.Ready()) {
-    const clio::run::u64 target = view_.PushedNow();
+    const clio::run::u64 target = BarrierTarget();
     while (!view_.FlushedThrough(target)) {
       KickFlusher();
       CLIO_CO_AWAIT(clio::run::yield(kBarrierPollUs));
@@ -587,7 +587,7 @@ clio::run::TaskResume Runtime::FetchTagAttrs(const TagId &tag,
     const clio::run::u64 seq = view_.Ready() ? view_.TagInvalSeq() : 0;
     const clio::run::u64 wseq = view_.Ready() ? view_.LocalWriteSeq() : 0;
     if (view_.Ready()) {
-      const clio::run::u64 target = view_.PushedNow();
+      const clio::run::u64 target = BarrierTarget();
       while (!view_.FlushedThrough(target)) {
         KickFlusher();
         CLIO_CO_AWAIT(clio::run::yield(kBarrierPollUs));

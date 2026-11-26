@@ -65,6 +65,8 @@
 #include <chrono>
 #include <cstring>
 #include <functional>
+#include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <utility>
@@ -73,6 +75,7 @@
 #include <clio_ctp/data_structures/ipc/ring_buffer.h>
 #include <clio_ctp/memory/backend/posix_shm_mmap.h>
 #include <clio_ctp/thread/lock/mutex.h>
+#include <clio_ctp/thread/lock/timed_mutex.h>
 
 #include "clio_runtime/clio_runtime.h"
 #include "clio_runtime/types.h"
@@ -117,13 +120,25 @@ static constexpr u32 kMergesPerAlloc = 2;
  *  allocations of the request's size, since each merge sorts every free
  *  page. */
 static constexpr u64 kWindowBytes = 8ull << 20;
-/** Free log entries a non-blocking (runtime) put leaves for concurrent
- *  producers, so its Push does not spin on a worker. */
-static constexpr u64 kLogHeadroom = 1024;
+/** Default thread slots (journal + dirty queue each) in a segment. */
+static constexpr u32 kDefaultThreads = 256;
+/** Fewest entries in one thread's dirty queue (segment size permitting). */
+static constexpr u32 kMinQueueDepth = 1024;
+/** LockSegment: a runtime waiter checks the holder's liveness every this
+ *  many sleeps (~10 ms). */
+static constexpr u32 kRepairCheckSpins = 200;
+/** Queue depth and thread slots a small segment may shrink to. */
+static constexpr u32 kFloorQueueDepth = 64;
+static constexpr u32 kFloorThreads = 16;
 /** Smallest buffer allocated for a blob. */
 static constexpr u64 kMinBuffer = 4096;
 /** Extent mode: bytes per granule of a leased RAM-bdev extent. */
 static constexpr u64 kGranule = 4096;
+/** Root::data_mode_: where blob bytes live (0 = metadata only). */
+static constexpr u32 kDataBdev = 1;  /**< granules of a leased RAM bdev */
+static constexpr u32 kDataSelf = 2;  /**< granules carved from this segment */
+/** Heap bytes left to the segment allocator after the granule region. */
+static constexpr u64 kSelfSlack = 4ull << 20;
 /** Extent mode: runs of granules one entry can hold (no overflow list). */
 static constexpr u32 kInlineRuns = 8;
 
@@ -220,8 +235,16 @@ struct BlobEntry {
   u64 buf_off_;                    /**< buffer offset (kResident) */
   u64 cap_;                        /**< buffer capacity */
   u64 size_;                       /**< logical size known to this cache */
-  std::atomic<u32> pins_;          /**< in-flight memcpys (no free/move) */
-  std::atomic<u32> pending_;       /**< logged ranges not yet flushed */
+  std::atomic<u32> pins_;          /**< thread copies out (no free/move) */
+  std::atomic<u32> rt_pins_;       /**< runtime pins (flusher reads, held
+                                        until a home acks): counted apart so
+                                        crash repair can zero pins_ */
+  u32 entry_pad_;
+  /** Writes retired: their range landed (flusher) or was rolled back (crash
+   *  repair). wbegin_ - retired_ is the writes not yet landed ("pending"):
+   *  each write raises wbegin_ exactly once, in ONE atomic step, so a write
+   *  is pending exactly when its owner got that far. */
+  std::atomic<u64> retired_;
   std::atomic<u64> write_gen_;     /**< bumped by every logged write */
   std::atomic<u64> inval_epoch_;   /**< bumped by every invalidation */
   std::atomic<u64> hits_;          /**< frecency: access count */
@@ -281,7 +304,69 @@ struct DirtyRange {
   u64 size_;
 };
 
-using DirtyLog = ctp::ipc::mpsc_ring_buffer<DirtyRange, WtcAlloc>;
+/** ThreadSlot::state_. */
+enum ThreadSlotState : u32 {
+  kThreadFree = 0,      /**< unowned, queue drained */
+  kThreadClaiming = 1,  /**< a thread is stamping its identity */
+  kThreadOwned = 2,     /**< a live thread writes through it */
+  kThreadRetiring = 3,  /**< owner gone: freed once its queue drains */
+};
+
+/** ThreadSlot::op_: what the owner is doing to shared state. */
+enum JournalOp : u32 {
+  kJIdle = 0,     /**< nothing */
+  kJStripe = 1,   /**< locking or holding stripe jstripe_ (changing jslot_) */
+  kJCopyIn = 2,   /**< lock released; copying a write into jslot_, whose
+                       range publishes at tail_ index jtail_ */
+  kJCopyOut = 3,  /**< lock released; copying out of jslot_ (pinned) */
+  kJTag = 4,      /**< locking or holding the tag lock (read only) */
+};
+
+/** ThreadSlot::jkind_: the operation a journal entry belongs to. */
+enum JournalKind : u32 {
+  kJKPut = 1,   /**< TryPut: changes jslot_ */
+  kJKRead = 2,  /**< TryGet / TryGetSize: pins jslot_ at most */
+};
+
+/** No slot / stripe recorded in a journal field. */
+static constexpr u32 kJNone = 0xFFFFFFFFu;
+
+/**
+ * One client or runtime thread's place in the segment: its identity, its
+ * journal and its dirty queue.
+ *
+ * The journal tells the runtime, after the owner died, what the owner was
+ * doing (see DESIGN.md, crash recovery). Each field is stored after the
+ * state it describes exists, so the journal is never ahead of the truth:
+ * jwbegin_ before jslot_, jslot_ before any change to that entry, op_
+ * kJCopyIn only once the entry's counters are raised.
+ *
+ * The queue A single-producer ring: the owner writes a record, then
+ * publishes it with ONE store of tail_, so a thread that dies leaves no
+ * reserved-but-unfilled record; the runtime drains it (head_).
+ */
+struct ThreadSlot {
+  std::atomic<u32> state_;  /**< ThreadSlotState */
+  u32 pid_;                 /**< owner process */
+  u64 start_;               /**< owner process start time (pid reuse) */
+  u64 tid_;                 /**< owner thread (gettid) */
+  u64 ring_off_;            /**< DirtyRange[Root::qdepth_] */
+  char pad0_[24];           /**< owner's fields start a new 64 B line
+                                 (padding, not alignas: the segment
+                                 allocator does not align to 64) */
+  std::atomic<u32> op_;     /**< JournalOp */
+  std::atomic<u32> jkind_;   /**< JournalKind */
+  std::atomic<u32> jstripe_; /**< stripe the op locks or holds (kJNone) */
+  std::atomic<u32> jslot_;   /**< entry the op changes or pins (kJNone) */
+  std::atomic<u32> jvictim_; /**< entry an eviction is releasing (kJNone) */
+  u32 jpad_;
+  std::atomic<u64> jwbegin_; /**< jslot_'s wbegin_ before the op */
+  std::atomic<u64> jtail_;   /**< tail_ index the op's range publishes at */
+  std::atomic<u64> tail_;    /**< ranges published (owner) */
+  char pad1_[16];
+  std::atomic<u64> head_;   /**< ranges drained (runtime) */
+  char pad2_[56];
+};
 
 /** Counters exported for tests and benchmarks. */
 struct Stats {
@@ -310,16 +395,20 @@ struct Stats {
   std::atomic<u64> put_miss_;       /**< put refused: md_only / put flags */
   std::atomic<u64> put_busy_;       /**< put refused: entry pinned, needed to
                                          grow its buffer (kBusy) */
+  std::atomic<u64> repairs_;        /**< crash repairs of dead clients */
 };
 
 /** Segment root: the first allocation in the segment. */
 struct Root {
   static constexpr u64 kMagic = 0x3143544357534C43ull;  // "CLSWCTC1"
-  static constexpr u32 kVersion = 11;
+  static constexpr u32 kVersion = 13;
 
   u64 magic_;
   u32 version_;
   std::atomic<u32> ready_;
+  u64 format_id_;    /**< unique per Format: a thread's cached slot of an
+                          earlier segment mapped at the same address is
+                          never taken for one in this segment */
   u32 node_id_;
   u32 slots_per_stripe_;
   u32 max_tags_;
@@ -327,14 +416,26 @@ struct Root {
   u64 blobs_off_;
   u64 tags_off_;
   u64 names_off_;    /**< NameSlot[max_tags_ * 2] */
-  u64 log_off_;
+  u64 threads_off_;  /**< ThreadSlot[threads_] */
+  u32 threads_;      /**< thread slots */
+  u32 qdepth_;       /**< entries in each thread's dirty queue */
+  std::atomic<u32> threads_hw_;  /**< slots ever claimed (drain bound) */
+  /** Ranges published, counted by each producer AFTER its tail store: a
+   *  hint that lets the runtime skip scanning every queue when nothing is
+   *  new (it lags by at most the ranges of a producer that died between the
+   *  two stores; a forced drain still finds those). */
+  char published_pad_[64];  /**< own cache line (no alignas: the segment
+                                 allocator does not align to 64) */
+  std::atomic<u64> published_;
+  char published_pad2_[56];
+  u32 threads_pad_;
   u64 owners_off_;   /**< u32 per kMinBuffer granule: slot+1 of the buffer
                           whose data starts there (0 = none) */
   u64 owner_count_;  /**< granules covered by owners_off_ */
   u64 max_fill_;
   u64 half_life_ns_;
-  std::atomic<u64> pushed_;        /**< ranges counted before entering the log */
-  std::atomic<u64> flushed_;       /**< ranges the flusher completed */
+  std::atomic<u64> flushed_;       /**< ranges the flusher completed, in the
+                                        order it drained them */
   std::atomic<u64> evict_cursor_;
   std::atomic<u64> coalesce_after_ns_;  /**< no merge-and-retry before this */
   std::atomic<u32> merge_fails_;        /**< consecutive failed merges */
@@ -355,7 +456,7 @@ struct Root {
   std::atomic<u32> num_homes_;     /**< containers homes are hashed over */
   u32 homes_pad_;
   u32 md_only_;                    /**< metadata only: no blob bytes */
-  /** Extent mode (data_mode_ 1): blob bytes live in granules of extents
+  /** Granule mode (kDataBdev / kDataSelf): blob bytes live in granules of extents
    *  leased from a node-local RAM bdev, not in this segment. */
   u32 data_mode_;
   u32 data_pid_;                   /**< runtime pid owning the RAM bdev */
@@ -370,10 +471,10 @@ struct Root {
   u64 brk_bits_off_;               /**< bit set = granule starts a new block */
   u64 data_cursor_;                /**< next-fit start (data_lock_) */
   std::atomic<u64> free_granules_;
-  ctp::Mutex data_lock_;           /**< guards the bitmaps and cursor */
+  ctp::TimedMutex data_lock_;      /**< guards the bitmaps and cursor */
   Stats stats_;
-  ctp::Mutex tag_lock_;
-  ctp::Mutex stripes_[kStripes];
+  ctp::TimedMutex tag_lock_;
+  ctp::TimedMutex stripes_[kStripes];
 };
 
 /**
@@ -426,7 +527,8 @@ struct Limits {
   u64 seg_size_ = 256ull << 20;
   u32 max_blobs_ = 65536;
   u32 max_tags_ = 4096;
-  u32 log_depth_ = 65536;
+  u32 log_depth_ = 65536;  ///< dirty-queue entries over all thread slots
+  u32 threads_ = kDefaultThreads;  ///< thread slots
   u32 evict_sample_ = 16;
   u64 max_fill_ = 16ull << 20;
   u64 half_life_ns_ = 10ull * 1000 * 1000 * 1000;
@@ -486,8 +588,62 @@ class View {
   bool MdOnly() const { return root_ != nullptr && root_->md_only_ != 0; }
   /** Root accessor (counters, seqs). */
   Root *GetRoot() const { return root_; }
-  /** The dirty log. */
-  DirtyLog *Log() const { return log_; }
+  // ---- Dirty queues (the runtime drains them) -------------------------------
+
+  /**
+   * Move up to `max` published ranges from the thread queues into `out`, in
+   * a fair rotation over the slots, and free retiring slots whose queue is
+   * empty. Runtime only, one caller at a time.
+   * @param out ranges appended here
+   * @param max most ranges to take
+   * @param force scan every queue even when the published count shows
+   *        nothing new (periodic: catches a producer that died between its
+   *        publish and its count)
+   * @return ranges taken
+   */
+  size_t Drain(std::vector<DirtyRange> *out, size_t max, bool force = true);
+  /** True when no thread queue holds an undrained range (by the published
+   *  count; a dead producer's uncounted range is found by a forced Drain). */
+  bool QueuesEmpty() const {
+    return root_->published_.load(std::memory_order_acquire) <= drained_;
+  }
+  /**
+   * Repair what threads of dead processes left half-done, then retire their
+   * thread slots (runtime only; see RepairDead). Their queues still drain;
+   * each slot is freed once empty.
+   * @return slots retired
+   */
+  u32 ReapDeadSlots();
+
+  // ---- Crash repair (runtime only; DESIGN.md "Crash recovery") -------------
+
+  /**
+   * Repair the segment after client processes died: rebuild the granule
+   * bitmap if a dead thread held the data lock, roll back each dead write
+   * (retire it, stop serving the entry's cached bytes), drop dead readers'
+   * pins, release every lock a dead thread held, and retire the dead
+   * threads' slots. Waits for live threads' in-progress copies on the
+   * entries involved; never breaks a live holder's lock.
+   * @param suspect_pid a lock holder found dead by a waiter (0 = none)
+   * @return thread slots retired (0 also when another thread is repairing)
+   */
+  u32 RepairDead(u32 suspect_pid = 0);
+
+  /**
+   * Diagnostics for a quiescent segment: every granule is free exactly when
+   * no live entry's runs hold it, owners match, and the free count agrees.
+   * @return true when consistent
+   */
+  bool VerifyGranules() const;
+
+  /**
+   * Acquire a segment lock, waiting as long as it takes. Clients never
+   * break a lock; a runtime thread that finds the holder dead repairs
+   * (RepairDead), which releases it.
+   * @param m the lock
+   * @return the acquisition id (pass it to Unlock)
+   */
+  u64 LockSegment(ctp::TimedMutex &m);
 
   // ---- Data path (client or runtime) ---------------------------------------
 
@@ -499,10 +655,10 @@ class View {
    * @param src bytes to write
    * @param put_flags put flags (only kCtePutDroppable-style per-blob flags;
    *        a write whose flags differ from the blob's returns kMiss)
-   * @param may_block true (clients): a full log blocks in Push until the
-   *        flusher drains it. false (runtime workers, which must never spin:
-   *        the flusher needs a worker to drain the log): return kNoSpace
-   *        instead when the log is within kLogHeadroom of full.
+   * @param may_block true: a full queue waits for the flusher to drain it.
+   *        false (runtime workers, which must never spin: the flusher needs
+   *        a worker): return kNoSpace instead when the calling thread's
+   *        queue is full.
    * @return kOk, kMiss (use the task path), kTooLong, kNoSpace (nothing
    *         written; caller waits) or kBusy (nothing written: the entry is
    *         pinned and its buffer must grow; caller backs off without
@@ -532,13 +688,18 @@ class View {
   u32 BlobPending(u32 tag_major, u32 tag_minor, const char *name,
                   size_t name_len);
 
-  /** True when every range pushed up to `target` has been flushed. */
+  /** True when the flusher has completed at least `target` ranges. */
   bool FlushedThrough(u64 target) const {
     return root_->flushed_.load(std::memory_order_acquire) >= target;
   }
-  /** Current pushed count (barrier target). */
+  /**
+   * Ranges published so far by every thread. A COUNT: FlushedThrough of it
+   * means as many ranges landed, not these ones (queues drain in rotation),
+   * which is enough to wait for room. An exact barrier is the runtime's
+   * (drain, then wait for the drained count).
+   */
   u64 PushedNow() const {
-    return root_->pushed_.load(std::memory_order_acquire);
+    return root_->published_.load(std::memory_order_acquire);
   }
 
   // ---- Tag table -------------------------------------------------------------
@@ -677,7 +838,17 @@ class View {
 
   /** Ranges of `slot` logged and not yet completed. */
   u32 Pending(u32 slot) const {
-    return slot < NumSlots() ? Slot(slot)->pending_.load() : 0;
+    return slot < NumSlots() ? PendingOf(Slot(slot)) : 0;
+  }
+  /** Writes of an entry not yet landed (see BlobEntry::retired_). */
+  static u32 PendingOf(const BlobEntry *e) {
+    const u64 done = e->retired_.load(std::memory_order_acquire);
+    return static_cast<u32>(e->wbegin_.load(std::memory_order_acquire) - done);
+  }
+  /** True when any thread or the runtime pins an entry's buffer. */
+  static bool Pinned(const BlobEntry *e) {
+    return e->pins_.load(std::memory_order_acquire) != 0 ||
+           e->rt_pins_.load(std::memory_order_acquire) != 0;
   }
 
   /** Total slots in the blob table. */
@@ -702,6 +873,14 @@ class View {
    * @param dead_mask bit i set = container i is down
    */
   void SetDeadHomes(u32 num_homes, u64 dead_mask);
+
+  /**
+   * Stop serving every cached copy and every cached tag attribute (runtime
+   * only): after peers held this node dead, invalidations for it went
+   * nowhere and writes went through stand-in homes, so any copy here may be
+   * stale. Pending bytes still flush; copies refill (and re-register) on use.
+   */
+  void InvalidateAll();
 
  private:
   /** Entry pointer by global slot index. */
@@ -770,6 +949,55 @@ class View {
    *         changed) or kNoSpace (no buffer could be made)
    */
   Status EnsureCapacityLocked(BlobEntry *e, u64 need, u32 stripe);
+  /** Thread slots. */
+  ThreadSlot *Slots() const {
+    return reinterpret_cast<ThreadSlot *>(Ptr(root_->threads_off_));
+  }
+  /** A slot's ring. */
+  DirtyRange *Ring(const ThreadSlot *t) const {
+    return reinterpret_cast<DirtyRange *>(Ptr(t->ring_off_));
+  }
+  /**
+   * The calling thread's slot, claimed on first use (cached per thread and
+   * per segment; re-claimed after a fork).
+   * @return the slot, or nullptr when every slot is taken
+   */
+  ThreadSlot *MySlot();
+  /** Claim a free slot for the calling thread; nullptr if none. */
+  ThreadSlot *ClaimSlot();
+  /**
+   * Publish one range in the calling thread's queue.
+   * @param t the caller's slot (room already checked)
+   */
+  void Publish(ThreadSlot *t, const DirtyRange &r);
+  /** True when `m` is held by a pid in `dead`; *id = its acquisition. */
+  bool HolderDead(const ctp::TimedMutex &m, const std::set<u32> &dead,
+                  u64 *id) const;
+  /** Pids of dead slot owners (and suspect_pid if dead), and their slots. */
+  void CollectDead(u32 suspect_pid, std::set<u32> *dead,
+                   std::vector<ThreadSlot *> *dslots);
+  /** True when a dead slot was copying into or out of an entry of stripe. */
+  bool HasCopyRecord(u32 stripe, const std::vector<ThreadSlot *> &dslots) const;
+  /** Rebuild the bitmap and owner map if a dead thread held data_lock_. */
+  void RepairDataLock(const std::set<u32> &dead);
+  /** Mark an entry's runs used (data_lock_ held), trimming runs past cap_
+   *  and dropping a freed slot's runs. @return granules claimed */
+  u64 ClaimRunsLocked(BlobEntry *e);
+  /**
+   * Repair the entries dead threads touched in one stripe.
+   * @param stripe the stripe
+   * @param stolen acquisition id of the dead holder (0: lock it normally)
+   */
+  void RepairStripe(u32 stripe, u64 stolen, const std::set<u32> &dead,
+                    const std::vector<ThreadSlot *> &dslots);
+  /** Wait until no live thread copies into or out of any `touched` entry. */
+  void WaitLiveCopies(const std::set<u32> &touched, const std::set<u32> &dead);
+  /** Undo one dead thread's write on an entry (stripe lock held). */
+  void RollBack(BlobEntry *e, const ThreadSlot &t);
+  /** Make an entry's residency agree with its runs (stripe lock held). */
+  void SanitizeLocked(BlobEntry *e);
+  /** Record this mapping in the process-wide set of mapped segments. */
+  void NoteMapped();
   /** Frecency of an entry. */
   double Frecency(const BlobEntry *e, u64 now) const;
   /** Pointer into the segment. */
@@ -800,6 +1028,13 @@ class View {
   // ---- extent mode (blob bytes in leased RAM-bdev granules) ----
   /** True when blob bytes live in leased RAM-bdev extents. */
   bool Extents() const { return root_ != nullptr && root_->data_mode_ != 0; }
+  /**
+   * Carve the granule tables and index the granules (runtime, Format):
+   * leased RAM-bdev extents, or the rest of this segment when none.
+   * @param lim limits; extents_ empty selects the segment's own bytes
+   * @return true when the granules are ready
+   */
+  bool FormatGranules(const Limits &lim);
   /** Map the extent tables and the RAM bdev's memory (both sides). */
   bool AttachData();
   /** CLIO_PREFAULT in a client: map every leased extent's pages into this
@@ -824,6 +1059,12 @@ class View {
    *  entry is pinned or its stripe lock held, so its runs cannot change). */
   void CopyIn(BlobEntry *e, u64 off, const char *src, u64 n);
   void CopyOut(const BlobEntry *e, u64 off, char *dst, u64 n) const;
+  /**
+   * Address of [off, off + n) of an entry's buffer when it lies inside one
+   * run (granule mode), so it can be read in place.
+   * @return the address, or nullptr if the range spans runs
+   */
+  const char *RunPtr(const BlobEntry *e, u64 off, u64 n) const;
   /** Zero [from, to) of an entry's buffer. */
   void ZeroRange(BlobEntry *e, u64 from, u64 to);
 
@@ -847,10 +1088,12 @@ class View {
   BlobEntry *blobs_ = nullptr;
   TagEntry *tags_ = nullptr;
   NameSlot *names_ = nullptr;
-  DirtyLog *log_ = nullptr;
   std::atomic<u32> *owners_ = nullptr;
   u64 root_off_ = 0;
   u64 seg_size_ = 0;
+  u32 drain_cursor_ = 0;  /**< Drain's rotating start slot (runtime) */
+  u64 drained_ = 0;       /**< ranges Drain has taken (runtime) */
+  std::mutex repair_mu_;  /**< one RepairDead at a time (runtime) */
 };
 
 }  // namespace clio::cte::core::wtc

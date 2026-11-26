@@ -375,14 +375,43 @@ class Runtime : public clio::cte::core::CoreInterposer {
       std::unordered_map<clio::run::u32, clio::run::u32> *skipped);
   /** True if an earlier flush copy already carried this logged range. */
   bool Superseded(const clio::cte::core::wtc::DirtyRange &r) const;
-  /** Ranges popped from the log since Format (in flushed_ units): the
+  /** Ranges popped from the stage since Format (in flushed_ units): the
    *  flusher counts each pop before checking TagDead. */
   std::atomic<clio::run::u64> popped_total_{0};
-  /** Deleted tags whose logged ranges are dropped, with PushedNow() at the
-   *  deletion; pruned once flushed_ passes it. */
+  /**
+   * Move every range published so far from the thread queues to the stage,
+   * the single FIFO the flusher pops in order. Any task may call it.
+   * @param force scan every queue even if the published count shows
+   *        nothing new (the flusher's periodic tick)
+   */
+  void DrainToStage(bool force = false);
+  /**
+   * Exact barrier target: drain, then the count staged. Every range
+   * published before the call is staged at a position below it, and
+   * flushed_ advances as a prefix of the stage order, so FlushedThrough of
+   * it means every one of them landed.
+   * @return the target for FlushedThrough
+   */
+  clio::run::u64 BarrierTarget();
+  /** True when neither the thread queues nor the stage hold a range. */
+  bool NothingToFlush() const;
+  /** Guards stage_ and the thread-queue consumer side. */
+  mutable std::mutex stage_mu_;
+  /** Drained ranges in drain order, not yet popped by the flusher. */
+  std::deque<clio::cte::core::wtc::DirtyRange> stage_;
+  /** Ranges ever staged (stage_mu_ writes; read lock-free). */
+  std::atomic<clio::run::u64> staged_total_{0};
+  /** No HeldDeadSeq seen yet (the first tick only records it). */
+  static constexpr clio::run::u64 kNoHeldDeadSeq = ~0ull;
+  /** CLIO_IPC->HeldDeadSeq() when FlushLog last looked (rejoin notices). */
+  clio::run::u64 seen_held_dead_ = kNoHeldDeadSeq;
+  /** Steady-clock ns of the last dead-thread-slot sweep. */
+  clio::run::u64 slots_reaped_ns_ = 0;
+  /** Deleted tags whose logged ranges are dropped, with the barrier target
+   *  at the deletion; pruned once flushed_ passes it. */
   mutable std::mutex dead_mu_;
   std::unordered_map<clio::run::u64, clio::run::u64> dead_tags_;
-  /** (PushedNow at deletion, tag key) in deletion order (dead_mu_): the
+  /** (barrier target at deletion, tag key) in deletion order (dead_mu_): the
    *  expired front is pruned in O(1) per delete. Rescanning the whole map
    *  on every delete was quadratic: during rm -rf behind a write-through
    *  backlog the map held ~all deleted files (Linux tree rm 98 s -> 570 s). */
