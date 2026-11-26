@@ -601,9 +601,31 @@ void Runtime::DropHomeBlocksAfterFailover() {
       ++dropped;
     }
   }
+  // Inode attributes likewise: a stand-in served the inodes homed here and
+  // stored their records (a chmod during a partition), while this copy
+  // kept the old mode forever (clio_fs_suite partitioned_cache_not_stale on
+  // 3 nodes). Drop every clean, unopened one; the next use reloads its
+  // record, which LoadInode already reconciles with a stand-in's writes.
+  size_t ino_dropped = 0, ino_kept = 0;
+  {
+    const clio::run::u64 root = FsPack(FsRootId());
+    std::lock_guard<std::mutex> g(meta_mu_);
+    for (auto it = inodes_.begin(); it != inodes_.end();) {
+      const InodeState &fi = *it->second;
+      if (it->first == root || fi.open_count_ != 0 || fi.dirty_ ||
+          inode_dirty_.count(it->first) != 0) {
+        ++ino_kept;
+        ++it;
+        continue;
+      }
+      it = inodes_.erase(it);
+      ++ino_dropped;
+    }
+  }
   HLOG(kWarning, "filesystem: a peer held this node dead (rejoin notice); "
-       "dropped {} home directory block(s) to reload them, kept {} with "
-       "changes in flight", dropped, kept);
+       "dropped {} home directory block(s) and {} inode(s) to reload them, "
+       "kept {} block(s) and {} inode(s) with changes in flight or open",
+       dropped, ino_dropped, kept, ino_kept);
 }
 
 bool Runtime::FindCachedBlock(const TableBlockKey &key, clio::run::u32 home,
