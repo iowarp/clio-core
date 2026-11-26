@@ -63,6 +63,8 @@ constexpr clio::run::u32 kMakeRoomMax = 64;
  *  the wait between them while the cluster marks it dead (us). */
 constexpr int kOwnerRetries = 10;
 constexpr double kOwnerRetryUs = 1000000.0;
+/** Poll period while another task drops clean copies after a rejoin (us). */
+constexpr double kRejoinPollUs = 500.0;
 /** How long "volatile is full" is trusted before a put probes it again
  *  (ns): every path that frees space clears it at once, this bounds the
  *  cost of one that does not. */
@@ -133,6 +135,7 @@ void CacheBase::InitCache(const PolicyCacheParams &params,
                           const clio::run::PoolId &self_pool) {
   params_ = params;
   SetTargets(params.volatile_pool_, params.persistent_pool_);
+  seen_held_dead_.store(CLIO_IPC->HeldDeadSeq());
   vol_client_.Init(params.volatile_pool_);
   pers_client_.Init(CorePoolId());
   self_client_.Init(self_pool);
@@ -753,6 +756,57 @@ clio::run::TaskResume CacheBase::Drop(std::string key, bool flush,
     UnindexDirty(key);
     entries_.erase(key);
     NoteSpaceFreed();
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume CacheBase::DropCleanIfHeldDead() {
+  CLIO_TASK_BODY_BEGIN
+  {
+    const clio::run::u64 hd = CLIO_IPC->HeldDeadSeq();
+    clio::run::u64 seen = seen_held_dead_.load(std::memory_order_acquire);
+    if (hd == seen) {
+      while (rejoin_dropping_.load(std::memory_order_acquire)) {
+        CLIO_CO_AWAIT(clio::run::yield(kRejoinPollUs));
+      }
+      CLIO_CO_RETURN;
+    }
+    if (!seen_held_dead_.compare_exchange_strong(seen, hd)) CLIO_CO_RETURN;
+    rejoin_dropping_.store(true, std::memory_order_release);
+    std::vector<std::pair<TagId, std::string>> clean;
+    {
+      std::lock_guard<std::mutex> g(mu_);
+      for (const auto &e : entries_) {
+        if (e.second.dirty_.empty()) {
+          clean.emplace_back(e.second.tag_, e.second.name_);
+        }
+      }
+    }
+    size_t dropped = 0;
+    for (const auto &c : clean) {
+      const std::string key = Key(c.first, c.second);
+      CLIO_CO_AWAIT(Lock(key));
+      bool still_clean = false;
+      {
+        std::lock_guard<std::mutex> g(mu_);
+        auto it = entries_.find(key);
+        still_clean = it != entries_.end() && it->second.dirty_.empty();
+      }
+      if (still_clean) {
+        CLIO_CO_AWAIT(DropVolatile(c.first, c.second));
+        ++dropped;
+      }
+      Unlock(key);
+    }
+    {
+      std::lock_guard<std::mutex> g(mu_);
+      NoteSpaceFreed();
+    }
+    rejoin_dropping_.store(false, std::memory_order_release);
+    HLOG(kWarning, "policy cache: a peer held this node dead; dropped {} "
+         "clean volatile copies (failover may have changed them elsewhere)",
+         dropped);
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -1603,6 +1657,7 @@ clio::run::TaskResume CacheBase::PutBlob(
     const std::string name = task->blob_name_.str();
     const clio::run::u32 owner = OwnerOf(task->tag_id_, name);
     const bool here = owner == container_id_;
+    if (here) CLIO_CO_AWAIT(DropCleanIfHeldDead());
     const std::string key = Key(task->tag_id_, name);
     const bool special = IsSpecial(task->flags_, task->context_);
     if (!here && (!slot.Admitted() || AtOwner(task->flags_, task->context_))) {
@@ -1810,6 +1865,7 @@ clio::run::TaskResume CacheBase::MultiPutAbsorbRecords(
 clio::run::TaskResume CacheBase::MultiPutBlob(
     clio::run::shared_ptr<core::MultiPutBlobTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  CLIO_CO_AWAIT(DropCleanIfHeldDead());
   {
     core::MultiPutBatchView batch;
     const bool attached = core::MultiPutBatchView::Attach(*task, &batch);
@@ -1944,6 +2000,7 @@ clio::run::TaskResume CacheBase::GetBlob(
       CLIO_CO_AWAIT(GetAtOwner(task, owner));
       CLIO_CO_RETURN;
     }
+    CLIO_CO_AWAIT(DropCleanIfHeldDead());
     const std::string key = Key(task->tag_id_, name);
     CLIO_CO_AWAIT(Lock(key));
     clio::run::u32 rc = 1;
