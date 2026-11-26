@@ -133,6 +133,8 @@ std::vector<FlushRecord> Runtime::PopAndCoalesce(
   clio::run::u64 n = 0;
   wtc::DirtyRange r{};
   DrainToStage();
+  // Lock order: stage_mu_ -> dead_mu_ (TagDead below). Nothing may wait for
+  // stage_mu_ while holding dead_mu_ (DeleteBarrier drains first).
   std::unique_lock<std::mutex> stage_lock(stage_mu_);
   // Overwrites: a range whose bytes an earlier flush copy already carried
   // (older generation, covered range) is retired with this batch instead of
@@ -942,15 +944,18 @@ clio::run::TaskResume Runtime::Invalidate(
         }
         view_.Invalidate(k.major_, k.minor_, k.name_.c_str(), k.name_.size());
       }
-    } else if (task->mode_ == kInvalidateDropTagData && view_.Ready()) {
+    } else if ((task->mode_ == kInvalidateDropTagData ||
+                task->mode_ == kInvalidateDropTag) &&
+               view_.Ready()) {
+      std::vector<TagId> tags;
+      for (const BlobKey &k : keys) tags.push_back(TagId(k.major_, k.minor_));
+      CLIO_CO_AWAIT(DropTagsBlobs(tags));
       for (const BlobKey &k : keys) {
-        view_.DropTagBlobs(k.major_, k.minor_);
-        view_.DropTagMeta(k.major_, k.minor_);
-      }
-    } else if (task->mode_ == kInvalidateDropTag && view_.Ready()) {
-      for (const BlobKey &k : keys) {
-        view_.DropTagBlobs(k.major_, k.minor_);
-        view_.DropTag(k.major_, k.minor_);
+        if (task->mode_ == kInvalidateDropTag) {
+          view_.DropTag(k.major_, k.minor_);
+        } else {
+          view_.DropTagMeta(k.major_, k.minor_);
+        }
       }
     } else if (task->mode_ == kInvalidateRegister) {
       std::lock_guard<std::mutex> lk(sharers_mtx_);

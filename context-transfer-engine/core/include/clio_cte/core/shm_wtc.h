@@ -105,21 +105,9 @@ static constexpr u32 kMaxProbe = 64;
 static constexpr u32 kTornRetries = 256;
 /** Most blob-table slots one eviction attempt examines. */
 static constexpr u32 kEvictScanMax = 4096;
-/** Eviction rounds one buffer allocation makes before the caller writes
+/** Eviction rounds a granule allocation makes before the caller writes
  *  around the cache. */
-static constexpr u32 kAllocRounds = 8;
-/** After kMergeFailsForBackoff merge-and-retry allocations fail in a row,
- *  skip further ones (each sorts every free page under the allocator lock)
- *  for this long. */
-static constexpr u64 kCoalesceBackoffNs = 2ull * 1000 * 1000;
-static constexpr u32 kMergeFailsForBackoff = 4;
-/** Window evictions (each followed by one merge) per buffer allocation. */
-static constexpr u32 kMergesPerAlloc = 2;
-/** Bytes a window eviction frees (at most 1/8 of the segment, at least two
- *  requests with their page headers): one merge then serves many
- *  allocations of the request's size, since each merge sorts every free
- *  page. */
-static constexpr u64 kWindowBytes = 8ull << 20;
+static constexpr u32 kAllocRounds = 32;
 /** Default thread slots (journal + dirty queue each) in a segment. */
 static constexpr u32 kDefaultThreads = 256;
 /** Fewest entries in one thread's dirty queue (segment size permitting). */
@@ -130,20 +118,18 @@ static constexpr u32 kRepairCheckSpins = 200;
 /** Queue depth and thread slots a small segment may shrink to. */
 static constexpr u32 kFloorQueueDepth = 64;
 static constexpr u32 kFloorThreads = 16;
-/** Smallest buffer allocated for a blob. */
-static constexpr u64 kMinBuffer = 4096;
-/** Extent mode: bytes per granule of a leased RAM-bdev extent. */
+/** Bytes per granule (the unit blob bytes are stored in). */
 static constexpr u64 kGranule = 4096;
 /** Root::data_mode_: where blob bytes live (0 = metadata only). */
 static constexpr u32 kDataBdev = 1;  /**< granules of a leased RAM bdev */
 static constexpr u32 kDataSelf = 2;  /**< granules carved from this segment */
 /** Heap bytes left to the segment allocator after the granule region. */
 static constexpr u64 kSelfSlack = 4ull << 20;
-/** Extent mode: runs of granules one entry can hold (no overflow list). */
+/** Runs of granules one entry can hold (no overflow list). */
 static constexpr u32 kInlineRuns = 8;
 
 /**
- * Extent mode: a run of consecutive granules, contiguous in the RAM bdev
+ * A run of consecutive granules, contiguous in memory
  * (a run never crosses the boundary between two leased blocks).
  */
 struct Run {
@@ -152,9 +138,9 @@ struct Run {
 };
 
 /**
- * Extent mode: an entry's buffer as runs of RAM-bdev granules (cap_ = their
- * bytes; buf_off_ unused). One per blob slot, in a side table allocated only
- * in extent mode, so the default layout is unchanged. Entry's stripe lock.
+ * An entry's buffer as runs of granules (cap_ = their bytes). One per blob
+ * slot, in a side table allocated unless the cache is metadata only.
+ * Entry's stripe lock (changes also under data_lock_).
  */
 struct RunSet {
   u32 n_;
@@ -167,7 +153,7 @@ enum SlotState : u32 { kSlotEmpty = 0, kSlotLive = 1, kSlotTomb = 2 };
 
 /** Blob entry flags. */
 enum BlobFlags : u32 {
-  /** buf_off_ holds a buffer of cap_ bytes. */
+  /** The entry's runs hold a buffer of cap_ bytes. */
   kResident = 1u << 0,
   /** The buffer holds the WHOLE blob (size_ bytes) and may serve reads. */
   kComplete = 1u << 1,
@@ -232,7 +218,6 @@ struct BlobEntry {
   u32 name_len_;
   u32 put_flags_;                  /**< put flags every write agreed on */
   u64 hash_;                       /**< full key hash (probe filter) */
-  u64 buf_off_;                    /**< buffer offset (kResident) */
   u64 cap_;                        /**< buffer capacity */
   u64 size_;                       /**< logical size known to this cache */
   std::atomic<u32> pins_;          /**< thread copies out (no free/move) */
@@ -401,7 +386,7 @@ struct Stats {
 /** Segment root: the first allocation in the segment. */
 struct Root {
   static constexpr u64 kMagic = 0x3143544357534C43ull;  // "CLSWCTC1"
-  static constexpr u32 kVersion = 13;
+  static constexpr u32 kVersion = 14;
 
   u64 magic_;
   u32 version_;
@@ -429,16 +414,11 @@ struct Root {
   std::atomic<u64> published_;
   char published_pad2_[56];
   u32 threads_pad_;
-  u64 owners_off_;   /**< u32 per kMinBuffer granule: slot+1 of the buffer
-                          whose data starts there (0 = none) */
-  u64 owner_count_;  /**< granules covered by owners_off_ */
   u64 max_fill_;
   u64 half_life_ns_;
   std::atomic<u64> flushed_;       /**< ranges the flusher completed, in the
                                         order it drained them */
   std::atomic<u64> evict_cursor_;
-  std::atomic<u64> coalesce_after_ns_;  /**< no merge-and-retry before this */
-  std::atomic<u32> merge_fails_;        /**< consecutive failed merges */
   /** Bumped by every tag-metadata drop: a fill fetched before the bump
    *  might carry a name the drop invalidated, so it is not installed. */
   std::atomic<u64> tag_inval_seq_;
@@ -533,8 +513,8 @@ struct Limits {
   u64 max_fill_ = 16ull << 20;
   u64 half_life_ns_ = 10ull * 1000 * 1000 * 1000;
   bool md_only_ = false;  ///< cache metadata only (see WtcConfig::md_only_)
-  /** Extent mode: (bdev offset, bytes) of each extent leased from the RAM
-   *  bdev below; empty = bytes live in this segment (buddy allocator). */
+  /** (bdev offset, bytes) of each extent leased from the RAM bdev below;
+   *  empty = granules are carved from this segment at format. */
   std::vector<std::pair<u64, u64>> extents_;
   u32 data_pid_ = 0;
   u32 data_pool_major_ = 0;
@@ -786,17 +766,26 @@ class View {
 
   /** Remove every blob of a tag that has nothing pending. */
   void DropTagBlobs(u32 major, u32 minor);
+  /**
+   * DropTagBlobs for many tags over ONE stripe: a deletion of N tags walks
+   * the blob table once, not N times, and a caller can yield between
+   * stripes (the table holds max_blobs entries; a full walk per tag held a
+   * worker for seconds when git deleted many files at once).
+   * @param stripe the stripe to walk
+   * @param tag_keys (major << 32 | minor) of the tags, sorted
+   */
+  void DropTagsBlobsStripe(u32 stripe, const std::vector<u64> &tag_keys);
 
   /**
    * Zero-copy flusher read of a logged range: the address of the CURRENT
    * bytes of [off, off+size) of the blob in `slot`, pinned (the buffer is
    * neither freed nor moved) until UnpinRange. Writes may still change the
    * bytes while pinned; a later flush of the newer range lands after this
-   * one. Segment mode only.
+   * one.
    * @param size in/out: clamped to the bytes the buffer holds
    * @param copied_gen out: as ReadRange's
-   * @return the address, or nullptr in extent mode or when the slot holds
-   *         no live resident entry (then nothing is pinned)
+   * @return the address, or nullptr when the range spans two runs or the
+   *         slot holds no live resident entry (then nothing is pinned)
    */
   const char *PinRange(u32 slot, u64 off, u64 *size, u64 *copied_gen);
 
@@ -895,16 +884,6 @@ class View {
   /** Reclaim a metadata-only entry in a full stripe (stripe lock held). */
   bool ReclaimSlotLocked(u32 stripe);
   /**
-   * Allocate a buffer for slot `owner`, evicting clean buffers if needed.
-   * @param bytes       buffer size
-   * @param held_stripe stripe the caller already holds (no relock)
-   * @param owner       slot the buffer is for (recorded in the owner map)
-   * @return the buffer's offset, or 0 (the caller writes around the cache)
-   */
-  u64 AllocBuffer(u64 bytes, u32 held_stripe, u32 owner);
-  /** Free a buffer (clears its owner-map granule first). */
-  void FreeBuffer(u64 off);
-  /**
    * Pick an eviction candidate from a bounded sample of clean entries: the
    * lowest-frecency one whose capacity covers want_bytes, else the
    * lowest-frecency overall. Unlocked hint; EvictSlot re-verifies.
@@ -916,26 +895,9 @@ class View {
    * Evict one slot's buffer if it is still clean, resident and unpinned.
    * @param held_stripe stripe the caller already holds (no relock)
    * @param slot        the slot
-   * @param granule     owner-map granule its buffer must start in, or
-   *                    kAnyGranule
    * @return true only if a buffer was actually freed
    */
-  bool EvictSlot(u32 held_stripe, u32 slot, u64 granule);
-  /**
-   * Evict every clean buffer that starts in [start, start + span), shifted
-   * back to stay inside the heap: the free pages left behind are
-   * contiguous, so one merge yields pages larger than any buffer evicted
-   * even when the cache is full of small buffers.
-   * @param held_stripe stripe the caller already holds (no relock)
-   * @param start       data offset of the window's first buffer
-   * @param span        window length in bytes (see WindowSpan)
-   * @return true if anything was evicted
-   */
-  bool EvictWindow(u32 held_stripe, u64 start, u64 span);
-  /** Window length a window eviction for a `bytes` allocation uses. */
-  u64 WindowSpan(u64 bytes) const;
-  /** EvictSlot: accept a buffer starting in any granule. */
-  static constexpr u64 kAnyGranule = ~0ull;
+  bool EvictSlot(u32 held_stripe, u32 slot);
   /** Release an entry's buffer (lock held, unpinned, nothing pending). */
   void ReleaseBufferLocked(BlobEntry *e);
   /**
@@ -1025,8 +987,8 @@ class View {
    */
   void DropUnpendingLocked(BlobEntry *e);
 
-  // ---- extent mode (blob bytes in leased RAM-bdev granules) ----
-  /** True when blob bytes live in leased RAM-bdev extents. */
+  // ---- granules (blob bytes: a leased RAM bdev or this segment) ----
+  /** True when the cache holds blob bytes (not metadata only). */
   bool Extents() const { return root_ != nullptr && root_->data_mode_ != 0; }
   /**
    * Carve the granule tables and index the granules (runtime, Format):
@@ -1076,7 +1038,7 @@ class View {
   u64 *brk_bits_ = nullptr;
   RunSet *runsets_ = nullptr;
   std::atomic<u32> *gran_owner_ = nullptr;
-  /** An entry's runs (extent mode only). */
+  /** An entry's runs (not in metadata-only mode). */
   RunSet *RS(const BlobEntry *e) const { return &runsets_[e - blobs_]; }
 
   ctp::ipc::PosixShmMmap backend_;
@@ -1088,7 +1050,6 @@ class View {
   BlobEntry *blobs_ = nullptr;
   TagEntry *tags_ = nullptr;
   NameSlot *names_ = nullptr;
-  std::atomic<u32> *owners_ = nullptr;
   u64 root_off_ = 0;
   u64 seg_size_ = 0;
   u32 drain_cursor_ = 0;  /**< Drain's rotating start slot (runtime) */

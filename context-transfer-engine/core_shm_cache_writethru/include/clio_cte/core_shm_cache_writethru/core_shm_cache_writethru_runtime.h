@@ -550,6 +550,16 @@ class Runtime : public clio::cte::core::CoreInterposer {
    * @param keys the written keys (duplicates bound for one home are merged)
    */
   clio::run::TaskResume FanoutBatched(std::vector<BlobKey> keys);
+  /**
+   * Drop the cached blobs of `tags` here: ONE walk of the blob table for
+   * all of them, yielding every kDropStripesPerYield stripes.
+   * @param tags the tags (null ids skipped)
+   */
+  clio::run::TaskResume DropTagsBlobs(const std::vector<TagId> &tags);
+  /** Stripes DropTagsBlobs walks between yields. */
+  static constexpr clio::run::u32 kDropStripesPerYield = 4;
+  /** DropTagsBlobs' yield between stripes (us): a plain yield, not a park. */
+  static constexpr double kDropYieldUs = 1.0;
   /** Drop every node's cached blobs and metadata of these tags. */
   clio::run::TaskResume DropTagDataEverywhere(const std::vector<TagId> &tags);
   clio::run::TaskResume FanoutInvalidate(const TagId &tag,

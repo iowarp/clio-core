@@ -398,6 +398,10 @@ clio::run::TaskResume Runtime::DeleteBarrier(const std::vector<TagId> &tags) {
     if (view_.MdOnly() || tags.empty()) {
       target = BarrierTarget();  // nothing of the tags' bytes is logged
     } else {
+      // Drained BEFORE dead_mu_: the flusher pops under stage_mu_ and must
+      // never meet a task holding dead_mu_ while it waits for stage_mu_
+      // (an ABBA deadlock: rm -rf hung a delete and the flusher forever).
+      const clio::run::u64 pushed = BarrierTarget();
       {
         std::lock_guard<std::mutex> g(dead_mu_);
         // Marks expire in deletion order (the target only grows): drop the
@@ -412,7 +416,6 @@ clio::run::TaskResume Runtime::DeleteBarrier(const std::vector<TagId> &tags) {
           }
           dead_order_.pop_front();
         }
-        const clio::run::u64 pushed = BarrierTarget();
         for (const TagId &t : tags) {
           if (t.IsNull()) continue;
           const clio::run::u64 k =
@@ -467,7 +470,8 @@ clio::run::TaskResume Runtime::DelTag(
       auto fut = ipc->Send(inv);
       CLIO_CO_AWAIT(fut);
     } else if (view_.Ready()) {
-      view_.DropTagBlobs(k.major_, k.minor_);
+      const std::vector<TagId> one{task->tag_id_};
+      CLIO_CO_AWAIT(DropTagsBlobs(one));
       view_.DropTag(k.major_, k.minor_);
     }
   }
@@ -676,15 +680,41 @@ clio::run::TaskResume Runtime::NoteTagsWritten(const std::vector<TagId> &tags,
   CLIO_TASK_BODY_END
 }
 
+clio::run::TaskResume Runtime::DropTagsBlobs(const std::vector<TagId> &tags) {
+  CLIO_TASK_BODY_BEGIN
+  if (view_.Ready()) {
+    std::vector<clio::run::u64> keys;
+    for (const TagId &t : tags) {
+      if (!t.IsNull()) {
+        keys.push_back((static_cast<clio::run::u64>(t.major_) << 32) | t.minor_);
+      }
+    }
+    std::sort(keys.begin(), keys.end());
+    keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+    for (clio::run::u32 stripe = 0; !keys.empty() && stripe < wtc::kStripes;
+         ++stripe) {
+      view_.DropTagsBlobsStripe(stripe, keys);
+      // Each stripe is one lock and a slice of the table: let the worker's
+      // other tasks (an fsync's barrier, the flusher) run between them.
+      if (stripe % kDropStripesPerYield == kDropStripesPerYield - 1) {
+        // > 0: yield(0) parks the task until a Future wakes it (none will).
+        CLIO_CO_AWAIT(clio::run::yield(kDropYieldUs));
+      }
+    }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 clio::run::TaskResume Runtime::DropTagDataEverywhere(
     const std::vector<TagId> &tags) {
   CLIO_TASK_BODY_BEGIN
   if (!tags.empty() && view_.Ready()) {
     std::vector<BlobKey> keys;
+    CLIO_CO_AWAIT(DropTagsBlobs(tags));
     for (const TagId &t : tags) {
       if (t.IsNull()) continue;
       keys.push_back(BlobKey{t.major_, t.minor_, std::string()});
-      view_.DropTagBlobs(t.major_, t.minor_);
       view_.DropTagMeta(t.major_, t.minor_);
     }
     auto *ipc = CLIO_IPC;

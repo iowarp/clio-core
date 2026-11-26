@@ -73,13 +73,15 @@ ShmWtcRoot     version, ready, node_id, limits, counters,
 TagTable       open-addressed; key = TagId; value = flags (kCreated),
                sticky_rc (first failed flush of this tag)
 BlobTable      open-addressed; key = (TagId, blob name); value =
-               buffer (ShmPtr), cap, size, pending, write_gen, seqlock,
+               runs (granules), cap, size, wbegin/wend/retired, write_gen,
                hits, last_access_ns, score, inval_epoch,
                flags (kComplete, ...)
 Sharers        open-addressed; one entry per blob HOMED on this node that
                some node caches: set of caching nodes
-DirtyLog       ctp::ipc::mpsc_ring_buffer<DirtyRange>   (THE write log)
-blob buffers   from the segment allocator, one contiguous buffer per blob
+ThreadSlots    per thread: identity, journal, single-producer DirtyRange
+               queue (the write log, drained by the runtime)
+granules       4 KiB units: a leased RAM bdev, or the rest of this segment
+               carved at format; free bitmap + owner map (data lock)
 ```
 
 Limits are config: `capacity` (segment bytes), `log_depth`, `max_tags`,
@@ -91,13 +93,12 @@ Limits are config: `capacity` (segment bytes), `log_depth`, `max_tags`,
 ```
 PutBlob(tag, blob, off, size, src):
   lock;   entry = find-or-insert(tag, blob)
-          grow entry buffer to >= off+size (alloc new, copy, free old)
-          entry.pending++;  entry.write_gen++
+          grow entry buffer to >= off+size (append granule runs)
+          entry.write_gen++;  entry.wbegin++   (pending = wbegin - retired)
           entry.size = max(entry.size, off+size)
   unlock
-  memcpy(entry.buffer + off, src, size)           // entry seqlock odd/even
-  log.Push(DirtyRange{entry slot, off, size})     // waits if the log is full
-  log_pushed_seq++
+  memcpy(entry.runs + off, src, size)             // seqlock: wend++ after
+  publish DirtyRange{entry slot, off, size} in this thread's queue
 ```
 
 The client returns after the push. Exactly the bytes written are logged: a
@@ -236,8 +237,9 @@ When an allocation fails (buffer for a write or a fill):
 1. sample up to `evict_sample` clean, resident entries starting at a
    rotating cursor in BlobTable (approximate, Redis-style; no global
    ordered structure to keep consistent across processes);
-2. free the buffer of the lowest-frecency sample; repeat until the
-   allocation fits or `evict_max_rounds` is reached;
+2. free the runs of the lowest-frecency sample (or, against
+   fragmentation, the clean owners of one granule window); repeat until
+   the allocation fits or the rounds run out;
 3. still no room (everything resident is dirty): wait on the flusher, then
    retry. Never fall back to a task write; a direct task write could reach
    the chain before an older logged write of the same bytes and then be
@@ -526,7 +528,7 @@ Where the code settled details the sections above left open.
 - **Locking.** The blob table is 64 stripes; a key probes only inside its
   stripe, so one stripe lock covers it. Payload memcpys hold a pin, never a
   lock. Eviction takes other stripes with TryLock only. Lock order is
-  stripe -> tag table -> allocator.
+  stripe -> tag table -> data lock (granule bitmap).
 - **Discovery.** The chimod publishes a `Locator` in the runtime metadata
   segment under its pool id; the segment name is derived from the runtime
   pid and pool id. The CTE core's Create (and a get-or-create of an
