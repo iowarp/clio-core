@@ -220,6 +220,35 @@ mapping (inode records and inode-table blocks each have a home container):
   the home; that node's unflushed ops are lost exactly as a crashed local
   page cache's would be (fsync is the durability point).
 
+## Crash recovery
+
+The segment belongs to the module and outlives every client. A client may be
+SIGKILLed at any instruction, including while it holds the segment's lock.
+Nothing may hang because of that, no other client's change may be lost, and
+clients never repair anything: the module does, from NsFastTick
+(`View::RepairDead`, every 500 ms), or inline when one of its own threads is
+stuck on a dead holder.
+
+- **Lock (`NsLock`).** The writer word carries the writer's pid. Readers
+  hold one bit each, the bit of their registered thread (`NsThread`), so a
+  dead reader's hold is exactly its own bit; a reader *count* could not be
+  attributed. A dead reader's bit is cleared and its registration freed.
+- **Dead writer.** Its table edits may be half-done, and they were never
+  logged (a record is pushed last, and only a pushed record is visible to
+  the drain). The module freezes the lock out of its hands (`kFrozen`):
+  clients wait; the module's own calls skip the tables (`ModuleGuard`).
+  The drain keeps applying what WAS logged, so no acknowledged change is
+  lost. Once the log is empty the module rebuilds the tables empty (root
+  incomplete), so every name refills from the module, and unfreezes.
+  Appends, the id block and the log are kept.
+- **Appends.** A file's append lock holds its holder's pid (freed when it
+  dies). An append in flight is recorded in the appending thread's
+  `NsThread` (per-generation count), not in a shared count, so a dead
+  appender's record is dropped exactly and its generation can merge.
+- **Size table.** Each stripe lock holds its holder's pid. A dead holder's
+  stripe is released after its dirty count is recounted (the held section
+  edits one slot, which stands as written).
+
 ## Relationship to the CTE cache
 
 clio-fs data lives only in this segment's PageTable. The module's flusher

@@ -39,11 +39,16 @@
  */
 
 #include <atomic>
+#include <csignal>
+#include <functional>
 #include <chrono>
 #include <set>
 #include <thread>
 #include <string>
 #include <vector>
+
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include "../../../context-runtime/test/simple_test.h"
 #include <clio_ctp/introspect/system_info.h>
@@ -424,5 +429,72 @@ TEST_CASE("ns shm - xattrs set get list remove, fill, too big", "[fs][ns]") {
                                 ns::kOpSetxattr, ns::kOpSetxattr,
                                 ns::kOpRemovexattr, ns::kOpUnlink}));
 }
+
+#if !defined(_WIN32)
+namespace {
+/** Run `op` in a forked child that then dies by SIGKILL (if `op` did not
+ *  already); reap it. @return true when it died by SIGKILL */
+bool ChildDies(const std::function<void()> &op) {
+  const pid_t pid = fork();
+  if (pid == 0) {
+    op();
+    ::raise(SIGKILL);
+    _exit(3);
+  }
+  int status = 0;
+  waitpid(pid, &status, 0);
+  return WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL;
+}
+}  // namespace
+
+TEST_CASE("ns shm - a reader that died is cleared by the module", "[fs][ns][crash]") {
+  Seg s("crash_rd", true);
+  REQUIRE(ChildDies([&] { s.client.GetRoot()->lock_.ReadLock(); }));
+  REQUIRE(s.module.RepairDead() >= 1);
+  // A writer now gets the lock (it would wait on the dead reader forever).
+  REQUIRE(s.client.Mkdir("/d", 0755, 0, 0, 1) == 0);
+}
+
+TEST_CASE("ns shm - a writer that died mid-create is rolled back", "[fs][ns][crash]") {
+  Seg s("crash_wr", true);
+  REQUIRE(s.client.Mkdir("/d", 0755, 0, 0, 1) == 0);
+  ns::Attr a;
+  bool c = false;
+  REQUIRE(s.client.Create("/d/a", 0644, 0, 0, true, 2, &a, &c) == 0);
+  REQUIRE(ChildDies([&] {
+    ns::detail::NsCrash().point_ = ns::detail::kNsCpCreateLinked;
+    ns::detail::NsCrash().left_ = 1;
+    s.client.Create("/d/x", 0644, 0, 0, true, 3, &a, &c);
+  }));
+  s.module.RepairDead();
+  REQUIRE(s.module.Frozen());  // clients locked out until the log drains
+  std::vector<std::string> paths;
+  Drain(&s.module, &paths);  // the module applies what was logged
+  REQUIRE((paths == std::vector<std::string>{"/d", "/d/a"}));
+  s.module.RepairDead();     // drained: tables rebuilt, unfrozen
+  REQUIRE_FALSE(s.module.Frozen());
+  // The unlogged create is gone; logged names refill from the module.
+  REQUIRE(s.client.Lookup("/d/x", &a) == ns::kMiss);
+  REQUIRE(s.client.Lookup("/d/a", &a) == ns::kMiss);
+  REQUIRE(s.client.PushedSeq() == s.client.GetRoot()->applied_seq_.load());
+}
+
+TEST_CASE("ns shm - an append lock or append of a dead client is released",
+          "[fs][ns][crash]") {
+  Seg s("crash_app", true);
+  const ns::u64 id = 0x4000000000000044ull;
+  REQUIRE(ChildDies([&] { REQUIRE(s.client.AppendLock(id) == 0); }));
+  ns::u32 gen = 0;
+  ns::u64 off = 0;
+  REQUIRE(ChildDies([&] { s.client.AppendStage(id, 10, &gen, &off); }));
+  ns::u64 len = 0;
+  REQUIRE(s.module.AppendSeal(id, &gen));
+  REQUIRE(s.module.AppendInflight(id, gen, &len));  // the dead copy
+  s.module.RepairDead();
+  REQUIRE_FALSE(s.module.AppendInflight(id, gen, &len));
+  REQUIRE(s.module.AppendLock(id) == 0);  // the dead holder's lock is gone
+  s.module.AppendUnlock(id);
+}
+#endif
 
 SIMPLE_TEST_MAIN()

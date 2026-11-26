@@ -1270,10 +1270,36 @@ clio::run::TaskResume Runtime::NsDrain() {
 
 clio::run::TaskResume Runtime::NsFastTick() {
   CLIO_TASK_BODY_BEGIN
+  {
+    // Size-table stripes a dead client left locked (cheap: one load each).
+    ShmSizeTable::RuntimeSide() = true;
+    ShmFsCacheRoot *froot = shm_fs_cache_.root();
+    if (froot != nullptr && froot->sizes_.RepairDead() != 0) {
+      HLOG(kInfo, "filesystem: released size-table stripes held by exited "
+           "processes");
+    }
+  }
   if (!ns_view_.Ready()) CLIO_CO_RETURN;
   CLIO_CO_AWAIT(RefillNsIds());
   // Namespace first: a size advance needs its file's create applied.
   if (!ns_view_.LogEmpty()) CLIO_CO_AWAIT(NsDrain());
+  {
+    // Clients that died holding the segment's locks or mid-change: repaired
+    // here (after the drain, which a frozen segment waits for).
+    constexpr clio::run::u64 kNsRepairNs = 500ull * 1000 * 1000;
+    const clio::run::u64 now = static_cast<clio::run::u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+    if (now - ns_repaired_ns_ >= kNsRepairNs || ns_view_.Frozen()) {
+      ns_repaired_ns_ = now;
+      const clio::run::u32 n = ns_view_.RepairDead();
+      if (n != 0) {
+        HLOG(kInfo, "filesystem: freed {} namespace thread registration(s) "
+             "of exited processes", n);
+      }
+    }
+  }
   if (ns_view_.Urgent()) CLIO_CO_AWAIT(SizeDrain());
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END

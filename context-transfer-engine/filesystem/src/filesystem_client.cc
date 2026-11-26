@@ -573,7 +573,9 @@ int Client::FsAppend(const clio::cte::core::TagId &tag,
   // then log it; the module merges it at the file's end in the background.
   clio::run::u32 gen = 0;
   clio::run::u64 off = 0;
-  if (v->AppendStage(id, count, &gen, &off) != 0) return ENOSPC;
+  const int src_rc = v->AppendStage(id, count, &gen, &off);
+  if (src_rc == EBUSY) return kNsUnavailable;  // not recordable: stream path
+  if (src_rc != 0) return ENOSPC;
   const std::string blob =
       "app." + std::to_string(v->NodeId()) + "." + std::to_string(gen);
   const char *src = static_cast<const char *>(buf);

@@ -69,7 +69,11 @@
 #include <utility>
 #include <vector>
 
+#include <mutex>
+#include <set>
+
 #include <clio_ctp/data_structures/ipc/ring_buffer.h>
+#include <clio_ctp/thread/lock/timed_mutex.h>
 #include <clio_ctp/memory/backend/posix_shm_mmap.h>
 #include <clio_cte/filesystem/fs_canonical.h>
 #include <clio_cte/filesystem/fs_shard.h>
@@ -128,41 +132,73 @@ enum : u32 {
   kOpWrap = 0xFFFFFFFFu,  ///< filler at the end of the ring
 };
 
-/** Writer-preferring reader/writer spin lock in shared memory. */
-struct RwSpin {
-  std::atomic<u32> state_;    ///< readers, or kWriter
-  std::atomic<u32> waiting_;  ///< writers waiting for the lock
-  static constexpr u32 kWriter = 0x80000000u;
+/**
+ * One client or module thread registered with the namespace lock: its
+ * identity, its read-lock nesting and its journal (an append it is copying,
+ * so the module knows the append is in flight while the thread lives).
+ */
+struct NsThread {
+  std::atomic<u32> pid_;     ///< owner process; 0 = free
+  u32 nest_;                 ///< read-lock nesting (owner only)
+  u64 start_;                ///< owner process start time (pid reuse)
+  std::atomic<u64> app_id_;  ///< file whose appends it copies (0 = none)
+  std::atomic<u32> app_n_[2];  ///< its appends copying, by generation parity
+};
 
-  void Init() {
-    state_.store(0);
-    waiting_.store(0);
+/**
+ * Writer-preferring reader/writer lock in shared memory whose holders are
+ * all identifiable, so the runtime can recover from a holder that died:
+ *  - the writer word holds the writer's pid in its high half;
+ *  - each reader holds one bit, its registered thread's, so a dead reader's
+ *    hold is exactly its own bit (a reader COUNT could not be attributed).
+ * Clients never break the lock; the module repairs (View::RepairDead).
+ */
+struct NsLock {
+  static constexpr u32 kThreads = 1024;
+  static constexpr u32 kWords = kThreads / 64;
+  /** Writer word flag: the runtime holds the lock to repair a dead writer's
+   *  half-done change (clients wait; the module works around it). */
+  static constexpr u64 kFrozen = 1ull << 31;
+
+  std::atomic<u64> writer_;   ///< 0, or (pid << 32) | count [| kFrozen]
+  std::atomic<u64> wcount_;   ///< source of the writer word's low half
+  u64 format_id_;             ///< unique per Format (thread caches)
+  std::atomic<u32> hw_;       ///< threads ever registered (scan bound)
+  u32 pad_;
+  std::atomic<u64> readers_[kWords];  ///< bit i: thread i holds a read lock
+  NsThread threads_[kThreads];
+
+  /** Initialize (Format). @param format_id unique per Format */
+  void Init(u64 format_id);
+  /** Take the lock shared; nests within one thread. */
+  void ReadLock();
+  /** Release one level of ReadLock. */
+  void ReadUnlock();
+  /** Take the lock exclusively (not while holding it shared). */
+  void WriteLock();
+  /** Release WriteLock. */
+  void WriteUnlock();
+  /** A fresh writer word for the calling process. */
+  u64 NewWriterId();
+  /**
+   * Wait until no thread holds a read lock.
+   * @param stalled called every kStallSpins waits (the module clears dead
+   *        readers' holds from it); may be empty
+   */
+  void WaitReaders(const std::function<void()> &stalled = nullptr);
+  /** Waits between stall checks (~10 ms of backoff). */
+  static constexpr u32 kStallSpins = 1200;
+  /** True while the runtime repairs a dead writer's change. */
+  bool Frozen() const {
+    return (writer_.load(std::memory_order_acquire) & kFrozen) != 0;
   }
-  void ReadLock() {
-    for (;;) {
-      u32 s = state_.load(std::memory_order_relaxed);
-      if ((s & kWriter) == 0 &&
-          waiting_.load(std::memory_order_relaxed) == 0 &&
-          state_.compare_exchange_weak(s, s + 1, std::memory_order_acquire)) {
-        return;
-      }
-      std::this_thread::yield();
-    }
-  }
-  void ReadUnlock() { state_.fetch_sub(1, std::memory_order_release); }
-  void WriteLock() {
-    waiting_.fetch_add(1, std::memory_order_relaxed);
-    for (;;) {
-      u32 expect = 0;
-      if (state_.compare_exchange_weak(expect, kWriter,
-                                       std::memory_order_acquire)) {
-        break;
-      }
-      std::this_thread::yield();
-    }
-    waiting_.fetch_sub(1, std::memory_order_relaxed);
-  }
-  void WriteUnlock() { state_.store(0, std::memory_order_release); }
+  /** The calling thread's registration (claimed on first use; null if all
+   *  kThreads are taken). */
+  NsThread *Me();
+
+ private:
+  /** Claim a free NsThread for the calling thread. */
+  NsThread *Claim();
 };
 
 /** One inode. id 0 = empty slot, ~0 = freed slot. */
@@ -225,9 +261,9 @@ struct XattrSlot {
 struct AppendSlot {
   u64 id_;
   u32 gen_;       ///< generation new appends stage into
-  u32 locked_;    ///< one-node append path: the file's append lock
+  u32 locked_;    ///< one-node append path: the holder's pid (0 = free)
   u64 bytes_[2];  ///< bytes staged per generation (by parity)
-  u32 inflight_[2];  ///< appends copying into a generation right now
+  u32 unused_[2];  ///< was inflight_; now per-thread (NsThread::app_id_)
 };
 
 /** Header of one op log record; path bytes follow. */
@@ -282,13 +318,13 @@ struct Limits {
 /** Segment root. */
 struct Root {
   static constexpr u64 kMagic = 0x3153534E53464C43ull;  // "CLFSNSS1"
-  static constexpr u32 kVersion = 4;
+  static constexpr u32 kVersion = 5;
   u64 magic_;
   u32 version_;
   std::atomic<u32> ready_;
   u32 case_insensitive_;
   u32 node_id_;  ///< the node this segment belongs to
-  RwSpin lock_;
+  NsLock lock_;
   u64 root_id_;
   // Id block handed out by the module (durably reserved).
   u32 id_major_;
@@ -524,6 +560,17 @@ class View {
   }
 
   /** @return the seq of the last op pushed */
+  /**
+   * Repair after client processes died (the module, periodically): free
+   * dead threads' registrations and read holds, release dead holders'
+   * append locks, freeze out a dead writer and, once the log has drained,
+   * rebuild the tables (ResetTables). Clients never repair.
+   * @return thread registrations freed
+   */
+  u32 RepairDead();
+  /** True while a dead writer's change is being repaired. */
+  bool Frozen() const { return root_->lock_.Frozen(); }
+
   u64 PushedSeq() const {
     return root_->pushed_seq_.load(std::memory_order_acquire);
   }
@@ -776,6 +823,54 @@ class View {
   AppendSlot *AppendSlotLocked(u64 id, bool insert);
   /** Free an idle append slot; lock held. */
   void MaybeFreeAppendLocked(AppendSlot *a);
+  /**
+   * Whether a live-registered thread is copying an append of file `id`
+   * (in generation parity `parity`, or any when negative).
+   */
+  bool Appending(u64 id, int parity) const;
+
+  /**
+   * The module's exclusive access to the segment: its write lock or, while
+   * frozen (the runtime repairing a dead writer; clients locked out), the
+   * module's own mutex. Tables() is false while frozen: only the appends
+   * table and the id block may be touched then.
+   */
+  class ModuleGuard {
+   public:
+    explicit ModuleGuard(View *v);
+    ~ModuleGuard();
+    ModuleGuard(const ModuleGuard &) = delete;
+    ModuleGuard &operator=(const ModuleGuard &) = delete;
+    /** True when the inode/dentry tables may be used. */
+    bool Tables() const { return write_; }
+
+   private:
+    View *v_;
+    bool write_ = false;
+    std::unique_lock<std::mutex> frozen_;
+  };
+  /** RepairDead's quick part for a module thread stuck on a dead holder:
+   *  clear dead threads' holds and freeze out a dead writer. */
+  void RepairDeadInline();
+  /**
+   * Freeze the lock out of a dead writer's hands (clients then wait until
+   * ResetTables).
+   * @param dead pids already known dead
+   * @return true when frozen now
+   */
+  bool FreezeDeadWriter(const std::set<u32> &dead);
+  /** Free the registrations of dead threads, clearing their read holds and
+   *  append records. @param dead receives their pids @return freed */
+  u32 ReapDeadThreads(std::set<u32> *dead);
+  /** Release append locks whose holder pid died. */
+  void FreeDeadAppendLocks(const std::set<u32> &dead);
+  /** Frozen and drained: rebuild the tables empty (root incomplete; all
+   *  else refills from the module) and unfreeze. */
+  void ResetTables();
+  /** Insert the root inode (Format, ResetTables). */
+  void InitRootInodeLocked(bool complete);
+  /** Record this mapping for the threads' exit cleanup. */
+  void NoteMapped();
 
   /**
    * Resolve a directory path to its inode.
@@ -817,6 +912,8 @@ class View {
   ctp::ipc::PosixShmMmap backend_;
   bool mapped_ = false;
   bool owner_ = false;
+  std::mutex repair_mu_;  ///< one repair at a time (module)
+  std::mutex frozen_mu_;  ///< module threads while frozen (ModuleGuard)
   char *base_ = nullptr;
   Root *root_ = nullptr;
 };

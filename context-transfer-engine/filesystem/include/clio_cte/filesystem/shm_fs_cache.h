@@ -5,6 +5,7 @@
 #ifndef CLIO_CTE_FILESYSTEM_SHM_FS_CACHE_H_
 #define CLIO_CTE_FILESYSTEM_SHM_FS_CACHE_H_
 
+#include <clio_ctp/thread/lock/timed_mutex.h>
 #include <clio_cte/core/shm_metadata_cache.h>
 #include <clio_cte/filesystem/fs_canonical.h>
 
@@ -143,7 +144,7 @@ struct ShmSizeSlot {
 
 /** One lock stripe of the size table. */
 struct ShmSizeStripe {
-  std::atomic<clio::run::u32> lock_;   ///< 0 free, 1 held
+  std::atomic<clio::run::u32> lock_;   ///< 0 free, else the holder's pid
   std::atomic<clio::run::u32> dirty_;  ///< entries present (drain hint)
 };
 
@@ -188,6 +189,29 @@ class ShmSizeTable {
    */
   clio::run::u64 RetireSeq() const {
     return retire_seq_.load(std::memory_order_acquire);
+  }
+
+  /**
+   * True in the runtime process (set once by the filesystem module): only
+   * it repairs stripes left locked by dead clients.
+   */
+  static bool &RuntimeSide() {
+    static bool runtime = false;
+    return runtime;
+  }
+
+  /**
+   * Repair every stripe a dead process holds (the runtime, periodically).
+   * @return stripes repaired
+   */
+  clio::run::u32 RepairDead() {
+    if (!Valid()) return 0;
+    clio::run::u32 n = 0;
+    for (clio::run::u32 s = 0; s < kStripes; ++s) {
+      const clio::run::u32 h = stripes_[s].lock_.load(std::memory_order_acquire);
+      if (h != 0 && RepairStripe(s, h)) ++n;
+    }
+    return n;
   }
 
   /**
@@ -277,17 +301,48 @@ class ShmSizeTable {
 
   void Lock(clio::run::u32 s) {
     auto &l = stripes_[s].lock_;
-    for (;;) {
+    const clio::run::u32 me = ctp::TimedMutex::MyPid();
+    for (clio::run::u32 spin = 1;; ++spin) {
       clio::run::u32 expect = 0;
-      if (l.compare_exchange_weak(expect, 1, std::memory_order_acquire)) {
+      if (l.compare_exchange_weak(expect, me, std::memory_order_acquire)) {
         return;
       }
       std::this_thread::yield();
+      // The runtime (never a client) recovers a stripe whose holder died:
+      // it may be the very thread the periodic repair needs.
+      if (RuntimeSide() && spin % kStallSpins == 0) RepairStripe(s, expect);
     }
   }
 
   void Unlock(clio::run::u32 s) {
     stripes_[s].lock_.store(0, std::memory_order_release);
+  }
+
+  /** Yields between a runtime waiter's liveness checks of a holder. */
+  static constexpr clio::run::u32 kStallSpins = 4096;
+
+  /**
+   * Recover stripe `s` if `holder` (its lock word) is a dead process: the
+   * held section only edits one slot, so the slot stands as written; the
+   * dirty count is recounted (the dead raise may have inserted without
+   * counting), then the lock is released.
+   * @return true when repaired
+   */
+  bool RepairStripe(clio::run::u32 s, clio::run::u32 holder) {
+    if (holder == 0 || holder == ctp::TimedMutex::MyPid() ||
+        ctp::TimedMutex::IsProcessAlive(holder, 0)) {
+      return false;
+    }
+    auto &l = stripes_[s].lock_;
+    if (l.load(std::memory_order_acquire) != holder) return false;
+    ShmSizeSlot *base = Slots() + s * slots_per_stripe_;
+    clio::run::u32 live = 0;
+    for (clio::run::u32 i = 0; i < slots_per_stripe_; ++i) {
+      if (base[i].key_ != 0 && base[i].key_ != kTomb) ++live;
+    }
+    stripes_[s].dirty_.store(live, std::memory_order_release);
+    clio::run::u32 expect = holder;
+    return l.compare_exchange_strong(expect, 0, std::memory_order_release);
   }
 
   /**

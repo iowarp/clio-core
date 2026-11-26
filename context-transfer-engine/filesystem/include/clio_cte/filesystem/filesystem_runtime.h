@@ -414,6 +414,9 @@ class Runtime : public clio::run::Container {
   std::mutex meta_mu_;  ///< guards handles_, inodes_ and InodeState fields
   std::unordered_map<clio::run::u64, std::shared_ptr<InodeState>> handles_;
   std::unordered_map<clio::run::u64, std::shared_ptr<InodeState>> inodes_;
+  /** Stand-in records already reconciled with this container's stream, by
+   *  inode (a hash of the record): reloading one only floors the size. */
+  std::unordered_map<clio::run::u64, clio::run::u64> reconciled_recs_;  ///< meta_mu_
   std::atomic<clio::run::u64> next_handle_{1};
 
   // ---- inode-table blocks (fs_inode_table.cc) ----
@@ -1887,6 +1890,8 @@ class Runtime : public clio::run::Container {
   ShmFsCache shm_fs_cache_;
   /** The shared-memory namespace clients operate on (fs_ns_shm.h). */
   ns::View ns_view_;
+  /** Steady-clock ns of the last ns_view_.RepairDead (NsFastTick). */
+  clio::run::u64 ns_repaired_ns_ = 0;
 
   /** One reserved append range of a file this container owns. */
   struct AppendRange {

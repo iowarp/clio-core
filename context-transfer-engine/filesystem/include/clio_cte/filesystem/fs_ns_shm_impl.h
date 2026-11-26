@@ -37,6 +37,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <csignal>
+#include <mutex>
 #if !defined(_WIN32)
 #include <unistd.h>  // getuid, getgid: the root directory's owner
 #endif
@@ -63,6 +65,189 @@ inline u64 Mix(u64 x) {
 }
 constexpr u64 kFreedId = ~0ull;
 }  // namespace detail
+
+// ---------------------------------------------------------------------------
+// NsLock
+// ---------------------------------------------------------------------------
+
+namespace detail {
+
+/** Fault injection for crash-repair tests: SIGKILL this process the n-th
+ *  time it reaches the point (set from a forked test child). */
+enum NsCrashPoint : int {
+  kNsCpNone = 0,
+  kNsCpCreateLinked,  ///< Create: entries inserted and linked, op unlogged
+};
+struct NsCrashCfg {
+  int point_ = kNsCpNone;
+  u64 left_ = 0;
+};
+inline NsCrashCfg &NsCrash() {
+  static NsCrashCfg cfg;
+  return cfg;
+}
+inline void NsCrashHit(int point) {
+  NsCrashCfg &c = NsCrash();
+  if (c.point_ == point && c.left_ != 0 && --c.left_ == 0) ::raise(SIGKILL);
+}
+
+/** Back off while waiting on the namespace lock (spin, yield, then sleep). */
+inline void NsBackoff(u32 spin) {
+  if (spin < 64) {
+    ctp::CpuRelax();
+  } else if (spin < 1024) {
+    std::this_thread::yield();
+  } else {
+    std::this_thread::sleep_for(std::chrono::microseconds(50));
+  }
+}
+
+/** Locks mapped in this process (by address): a thread unregisters at exit
+ *  only from locks still mapped. */
+inline std::mutex &NsMappedMu() {
+  static std::mutex mu;
+  return mu;
+}
+inline std::set<const NsLock *> &NsMapped() {
+  static auto *s = new std::set<const NsLock *>();
+  return *s;  // leaked: thread exits may follow static destruction
+}
+
+/** This thread's registration in each namespace lock it used. */
+struct NsThreadCache {
+  struct Entry {
+    const NsLock *lock_ = nullptr;
+    u64 format_id_ = 0;
+    NsThread *t_ = nullptr;
+    unsigned gen_ = 0;
+  };
+  Entry e_[4];
+  ~NsThreadCache() {
+    std::lock_guard<std::mutex> g(NsMappedMu());
+    const unsigned gen = ctp::detail::ProcIdentityGen();
+    for (Entry &x : e_) {
+      if (x.t_ != nullptr && x.gen_ == gen && NsMapped().count(x.lock_) &&
+          x.lock_->format_id_ == x.format_id_ && x.t_->nest_ == 0) {
+        x.t_->app_n_[0].store(0);
+        x.t_->app_n_[1].store(0);
+        x.t_->app_id_.store(0);
+        x.t_->pid_.store(0, std::memory_order_release);  // free
+      }
+    }
+  }
+};
+
+inline NsThreadCache &MyNsThreads() {
+  static thread_local NsThreadCache cache;
+  return cache;
+}
+
+}  // namespace detail
+
+inline void NsLock::Init(u64 format_id) {
+  writer_.store(0);
+  wcount_.store(0);
+  format_id_ = format_id;
+  hw_.store(0);
+  for (auto &w : readers_) w.store(0);
+  std::memset(static_cast<void *>(threads_), 0, sizeof(threads_));
+}
+
+inline NsThread *NsLock::Me() {
+  detail::NsThreadCache &c = detail::MyNsThreads();
+  const unsigned gen = ctp::detail::ProcIdentityGen();
+  detail::NsThreadCache::Entry *spare = nullptr;
+  for (auto &x : c.e_) {
+    if (x.lock_ == this && x.format_id_ == format_id_ && x.gen_ == gen &&
+        x.t_ != nullptr) {
+      return x.t_;
+    }
+    if (spare == nullptr && (x.t_ == nullptr || x.gen_ != gen)) spare = &x;
+  }
+  NsThread *t = Claim();
+  if (t == nullptr) return nullptr;
+  if (spare == nullptr) spare = &c.e_[0];
+  *spare = {this, format_id_, t, gen};
+  return t;
+}
+
+inline NsThread *NsLock::Claim() {
+  const u32 pid = static_cast<u32>(ctp::SystemInfo::GetPid());
+  const u64 start = ctp::TimedMutex::GetProcessStartTime(pid);
+  for (u32 i = 0; i < kThreads; ++i) {
+    u32 expect = 0;
+    if (!threads_[i].pid_.compare_exchange_strong(expect, pid)) continue;
+    threads_[i].start_ = start;
+    threads_[i].nest_ = 0;
+    threads_[i].app_id_.store(0);
+    threads_[i].app_n_[0].store(0);
+    threads_[i].app_n_[1].store(0);
+    u32 hw = hw_.load();
+    while (hw < i + 1 && !hw_.compare_exchange_weak(hw, i + 1)) {
+    }
+    return &threads_[i];
+  }
+  return nullptr;
+}
+
+inline void NsLock::ReadLock() {
+  NsThread *t = nullptr;
+  for (u32 spin = 0; (t = Me()) == nullptr; ++spin) {
+    detail::NsBackoff(spin);  // every thread slot taken: wait for one
+  }
+  if (t->nest_++ > 0) return;
+  const u32 i = static_cast<u32>(t - threads_);
+  const u64 bit = 1ull << (i % 64);
+  std::atomic<u64> &w = readers_[i / 64];
+  for (u32 spin = 0;; ++spin) {
+    w.fetch_or(bit, std::memory_order_seq_cst);
+    if (writer_.load(std::memory_order_seq_cst) == 0) return;
+    w.fetch_and(~bit, std::memory_order_seq_cst);  // a writer: step aside
+    while (writer_.load(std::memory_order_acquire) != 0) {
+      detail::NsBackoff(spin++);
+    }
+  }
+}
+
+inline void NsLock::ReadUnlock() {
+  NsThread *t = Me();
+  if (t == nullptr || t->nest_ == 0 || --t->nest_ > 0) return;
+  const u32 i = static_cast<u32>(t - threads_);
+  readers_[i / 64].fetch_and(~(1ull << (i % 64)), std::memory_order_release);
+}
+
+inline void NsLock::WaitReaders(const std::function<void()> &stalled) {
+  for (u32 spin = 0;; ++spin) {
+    bool any = false;
+    for (u32 w = 0; w < kWords && !any; ++w) {
+      any = readers_[w].load(std::memory_order_seq_cst) != 0;
+    }
+    if (!any) return;
+    detail::NsBackoff(spin);
+    if (stalled && spin % kStallSpins == kStallSpins - 1) stalled();
+  }
+}
+
+inline u64 NsLock::NewWriterId() {
+  return (static_cast<u64>(ctp::TimedMutex::MyPid()) << 32) |
+         ((wcount_.fetch_add(1) + 1) & 0x7FFFFFFFull);
+}
+
+inline void NsLock::WriteLock() {
+  const u64 me = NewWriterId();
+  for (u32 spin = 0;; ++spin) {
+    u64 expect = 0;
+    if (writer_.compare_exchange_weak(expect, me, std::memory_order_seq_cst)) {
+      break;
+    }
+    detail::NsBackoff(spin);
+  }
+  WaitReaders();  // new readers step aside once the writer word is set
+}
+
+inline void NsLock::WriteUnlock() {
+  writer_.store(0, std::memory_order_release);
+}
 
 // ---------------------------------------------------------------------------
 // Segment
@@ -102,7 +287,8 @@ inline bool View::Format(const std::string &name, const Limits &lim,
   root_->case_insensitive_ = case_insensitive ? 1u : 0u;
   root_->node_id_ = node_id;
   root_->namespace_on_ = namespace_on ? 1u : 0u;
-  root_->lock_.Init();
+  root_->lock_.Init(static_cast<u64>(
+      std::chrono::steady_clock::now().time_since_epoch().count()));
   root_->root_id_ = root_id;
   root_->n_inodes_ = ni;
   root_->n_dentries_ = nd;
@@ -116,7 +302,14 @@ inline bool View::Format(const std::string &name, const Limits &lim,
   root_->n_appends_ = na;
   root_->log_off_ = log_off;
   root_->log_bytes_ = lb;
-  Inode *r = InsertInodeLocked(root_id);
+  InitRootInodeLocked(root_complete);
+  NoteMapped();
+  root_->ready_.store(1, std::memory_order_release);
+  return true;
+}
+
+inline void View::InitRootInodeLocked(bool complete) {
+  Inode *r = InsertInodeLocked(root_->root_id_);
   r->type_ = kFsTypeDir;
   r->mode_ = 0755;
   // Owned by the user running the runtime (the mounting user in every
@@ -129,10 +322,13 @@ inline bool View::Format(const std::string &name, const Limits &lim,
   r->nlink_ = 2;
   r->first_child_ = kNoSlot;
   r->target_ = kNoSlot;
-  r->flags_ = root_complete ? kInodeComplete : 0u;
-  r->flags_ |= root_complete ? kInodeXattrsKnown : 0u;
-  root_->ready_.store(1, std::memory_order_release);
-  return true;
+  r->flags_ = complete ? kInodeComplete : 0u;
+  r->flags_ |= complete ? kInodeXattrsKnown : 0u;
+}
+
+inline void View::NoteMapped() {
+  std::lock_guard<std::mutex> g(detail::NsMappedMu());
+  detail::NsMapped().insert(&root_->lock_);
 }
 
 inline bool View::Attach(const std::string &name) {
@@ -146,11 +342,16 @@ inline bool View::Attach(const std::string &name) {
     Detach();
     return false;
   }
+  NoteMapped();
   return true;
 }
 
 inline void View::Detach() {
   if (!mapped_) return;
+  if (root_ != nullptr) {
+    std::lock_guard<std::mutex> g(detail::NsMappedMu());
+    detail::NsMapped().erase(&root_->lock_);
+  }
   if (owner_) {
     backend_.shm_destroy();
   } else {
@@ -462,11 +663,10 @@ inline bool View::MintIdLocked(u64 *id) {
 }
 
 inline void View::SetIdBlock(u32 major, u64 first, u64 count) {
-  root_->lock_.WriteLock();
+  ModuleGuard g(this);
   root_->id_major_ = major;
   root_->id_next_.store(first, std::memory_order_relaxed);
   root_->id_limit_.store(first + count, std::memory_order_relaxed);
-  root_->lock_.WriteUnlock();
 }
 
 inline u64 View::IdsLeft() const {
@@ -554,6 +754,7 @@ inline int View::Create(const std::string &path, u32 mode, u32 uid, u32 gid,
     d->type_ = kFsTypeFile;
     d->state_ = kDentLive;
     parent->mtime_ = parent->ctime_ = now;
+    detail::NsCrashHit(detail::kNsCpCreateLinked);
     d->seq_ = PushOpLocked(kOpCreate, path, std::string(), id, 0, now, 0,
                            mode & 07777u, uid, gid, 0);
     FillAttr(*ino, out);
@@ -989,13 +1190,15 @@ inline int View::Readdir(const std::string &path, std::vector<DirEnt> *out) {
 }
 
 inline void View::RaiseSize(u64 id, u64 end, u64 mtime) {
-  root_->lock_.WriteLock();
+  ModuleGuard g(this);
+  // Frozen: the tables are about to be rebuilt from the module, which
+  // holds this size already.
+  if (!g.Tables()) return;
   if (Inode *ino = FindInodeLocked(id)) {
     if (end > ino->size_) ino->size_ = end;
     if (mtime > ino->mtime_) ino->mtime_ = mtime;
     if (mtime > ino->ctime_) ino->ctime_ = mtime;
   }
-  root_->lock_.WriteUnlock();
 }
 
 inline bool View::StatId(u64 id, Attr *out) {
@@ -1007,10 +1210,9 @@ inline bool View::StatId(u64 id, Attr *out) {
 }
 
 inline bool View::HasInode(u64 id) {
-  root_->lock_.ReadLock();
-  const bool has = FindInodeLocked(id) != nullptr;
-  root_->lock_.ReadUnlock();
-  return has;
+  ModuleGuard g(this);
+  if (!g.Tables()) return true;  // frozen: assume so (keeps the size)
+  return FindInodeLocked(id) != nullptr;
 }
 
 inline int View::FillEntry(const std::string &parent_path,
@@ -1187,9 +1389,25 @@ inline AppendSlot *View::AppendSlotLocked(u64 id, bool insert) {
   return free_slot;
 }
 
+inline bool View::Appending(u64 id, int parity) const {
+  const NsLock &l = root_->lock_;
+  const u32 hw = l.hw_.load(std::memory_order_acquire);
+  for (u32 i = 0; i < hw; ++i) {
+    const NsThread &t = l.threads_[i];
+    if (t.pid_.load(std::memory_order_acquire) == 0 ||
+        t.app_id_.load(std::memory_order_acquire) != id) {
+      continue;
+    }
+    const u32 n0 = t.app_n_[0].load(std::memory_order_acquire);
+    const u32 n1 = t.app_n_[1].load(std::memory_order_acquire);
+    if (parity < 0 ? n0 + n1 != 0 : (parity == 0 ? n0 : n1) != 0) return true;
+  }
+  return false;
+}
+
 inline void View::MaybeFreeAppendLocked(AppendSlot *a) {
   if (a->locked_ == 0 && a->bytes_[0] == 0 && a->bytes_[1] == 0 &&
-      a->inflight_[0] == 0 && a->inflight_[1] == 0) {
+      !Appending(a->id_, -1)) {
     a->id_ = detail::kFreedId;
   }
 }
@@ -1203,7 +1421,8 @@ inline int View::AppendLock(u64 id) {
       return ENOSPC;
     }
     if (a->locked_ == 0) {
-      a->locked_ = 1;
+      // The holder's pid: the module frees it if the holder dies.
+      a->locked_ = static_cast<u32>(ctp::TimedMutex::MyPid());
       root_->lock_.WriteUnlock();
       return 0;
     }
@@ -1229,20 +1448,37 @@ inline int View::AppendStage(u64 id, u64 len, u32 *gen, u64 *off) {
     return ENOSPC;
   }
   const u32 p = a->gen_ & 1u;
+  NsThread *me = root_->lock_.Me();
+  if (me == nullptr ||
+      (me->app_id_.load() != id && me->app_id_.load() != 0 &&
+       me->app_n_[0].load() + me->app_n_[1].load() != 0)) {
+    root_->lock_.WriteUnlock();
+    return EBUSY;  // unrecordable here: the caller takes the task path
+  }
   *gen = a->gen_;
   *off = a->bytes_[p];
   a->bytes_[p] += len;
-  a->inflight_[p]++;
+  // In flight while this thread's journal counts it (an exact, per-thread
+  // record: the module clears a dead thread's, where a shared count could
+  // not be attributed).
+  me->app_n_[p].fetch_add(1, std::memory_order_relaxed);
+  me->app_id_.store(id, std::memory_order_release);
   root_->lock_.WriteUnlock();
   return 0;
 }
 
 inline int View::AppendStaged(const std::string &path, u64 id, u32 gen) {
   return Mutate(path.size(), 0, [&]() -> int {
-    if (AppendSlot *a = AppendSlotLocked(id, false)) {
-      a->inflight_[gen & 1u]--;
-    }
     PushOpLocked(kOpAppend, path, std::string(), id, 0, gen, 0, 0, 0, 0, 0);
+    // After the push: the module may merge it now.
+    NsThread *me = root_->lock_.Me();
+    if (me != nullptr && me->app_id_.load() == id &&
+        me->app_n_[gen & 1u].load() != 0) {
+      me->app_n_[gen & 1u].fetch_sub(1, std::memory_order_release);
+      if (me->app_n_[0].load() + me->app_n_[1].load() == 0) {
+        me->app_id_.store(0, std::memory_order_release);
+      }
+    }
     return 0;
   });
 }
@@ -1252,13 +1488,13 @@ inline bool View::AppendIdle(u64 id) {
   const AppendSlot *a = AppendSlotLocked(id, false);
   const bool idle = a == nullptr ||
                     (a->bytes_[0] == 0 && a->bytes_[1] == 0 &&
-                     a->inflight_[0] == 0 && a->inflight_[1] == 0);
+                     !Appending(id, -1));
   root_->lock_.ReadUnlock();
   return idle;
 }
 
 inline bool View::AppendSeal(u64 id, u32 *gen) {
-  root_->lock_.WriteLock();
+  ModuleGuard g(this);  // appends survive a repair: usable while frozen
   AppendSlot *a = AppendSlotLocked(id, false);
   bool sealed = false;
   if (a != nullptr && a->bytes_[a->gen_ & 1u] != 0) {
@@ -1266,30 +1502,27 @@ inline bool View::AppendSeal(u64 id, u32 *gen) {
     a->gen_++;  // new appends stage into the next generation
     sealed = true;
   }
-  root_->lock_.WriteUnlock();
   return sealed;
 }
 
 inline bool View::AppendInflight(u64 id, u32 gen, u64 *len) {
-  root_->lock_.ReadLock();
+  ModuleGuard g(this);
   const AppendSlot *a = AppendSlotLocked(id, false);
   bool busy = false;
   *len = 0;
   if (a != nullptr) {
-    busy = a->inflight_[gen & 1u] != 0;
+    busy = Appending(id, static_cast<int>(gen & 1u));
     *len = a->bytes_[gen & 1u];
   }
-  root_->lock_.ReadUnlock();
   return busy;
 }
 
 inline void View::AppendMerged(u64 id, u32 gen) {
-  root_->lock_.WriteLock();
+  ModuleGuard g(this);
   if (AppendSlot *a = AppendSlotLocked(id, false)) {
     a->bytes_[gen & 1u] = 0;
     MaybeFreeAppendLocked(a);
   }
-  root_->lock_.WriteUnlock();
 }
 
 // ---------------------------------------------------------------------------
@@ -1471,6 +1704,163 @@ inline int View::ForgetXattrs(const std::string &path) {
   return rc;
 }
 
+
+// ---------------------------------------------------------------------------
+// Crash repair (the module; SHM_CACHE_DESIGN.md "Crash recovery")
+// ---------------------------------------------------------------------------
+
+inline View::ModuleGuard::ModuleGuard(View *v) : v_(v) {
+  NsLock &l = v_->root_->lock_;
+  const u64 me = l.NewWriterId();
+  for (u32 spin = 0;; ++spin) {
+    u64 expect = 0;
+    if (l.writer_.compare_exchange_weak(expect, me,
+                                        std::memory_order_seq_cst)) {
+      // A dead reader's bit would hold this module thread (maybe the one
+      // the periodic repair needs): clear dead holds inline.
+      l.WaitReaders([this] { v_->RepairDeadInline(); });
+      write_ = true;
+      return;
+    }
+    if (expect & NsLock::kFrozen) {
+      frozen_ = std::unique_lock<std::mutex>(v_->frozen_mu_);
+      return;
+    }
+    detail::NsBackoff(spin);
+    if (spin % NsLock::kStallSpins == NsLock::kStallSpins - 1) {
+      v_->RepairDeadInline();  // a dead writer is frozen out
+    }
+  }
+}
+
+inline View::ModuleGuard::~ModuleGuard() {
+  if (write_) v_->root_->lock_.WriteUnlock();
+}
+
+inline void View::RepairDeadInline() {
+  std::unique_lock<std::mutex> g(repair_mu_, std::try_to_lock);
+  if (!g.owns_lock()) return;
+  std::set<u32> dead;
+  ReapDeadThreads(&dead);
+  FreezeDeadWriter(dead);
+}
+
+inline bool View::FreezeDeadWriter(const std::set<u32> &dead) {
+  NsLock &l = root_->lock_;
+  const u64 w = l.writer_.load(std::memory_order_acquire);
+  const u32 wpid = static_cast<u32>(w >> 32);
+  const u32 self = static_cast<u32>(ctp::SystemInfo::GetPid());
+  if (w == 0 || (w & NsLock::kFrozen) != 0 || wpid == self ||
+      (!dead.count(wpid) && ctp::TimedMutex::IsProcessAlive(wpid, 0))) {
+    return false;
+  }
+  // A writer died mid-change: its table edits may be half-done and were
+  // never logged. Lock clients out (frozen) until the log drains, then
+  // rebuild the tables from the module (ResetTables).
+  const u64 frozen = (static_cast<u64>(self) << 32) | NsLock::kFrozen;
+  u64 expect = w;
+  return l.writer_.compare_exchange_strong(expect, frozen);
+}
+
+inline u32 View::RepairDead() {
+  std::lock_guard<std::mutex> g(repair_mu_);
+  std::set<u32> dead;
+  const u32 freed = ReapDeadThreads(&dead);
+  NsLock &l = root_->lock_;
+  const u32 self = static_cast<u32>(ctp::SystemInfo::GetPid());
+  const u32 wpid = static_cast<u32>(l.writer_.load() >> 32);
+  if (FreezeDeadWriter(dead)) dead.insert(wpid);
+  FreeDeadAppendLocks(dead);
+  if (l.Frozen() && static_cast<u32>(l.writer_.load() >> 32) == self &&
+      root_->log_head_.load(std::memory_order_acquire) ==
+          root_->log_tail_.load(std::memory_order_acquire)) {
+    ResetTables();
+  }
+  return freed;
+}
+
+inline u32 View::ReapDeadThreads(std::set<u32> *dead) {
+  NsLock &l = root_->lock_;
+  const u32 self = static_cast<u32>(ctp::SystemInfo::GetPid());
+  const u32 hw = l.hw_.load(std::memory_order_acquire);
+  std::set<u32> alive;
+  u32 freed = 0;
+  for (u32 i = 0; i < hw; ++i) {
+    NsThread &t = l.threads_[i];
+    const u32 pid = t.pid_.load(std::memory_order_acquire);
+    if (pid == 0 || pid == self || alive.count(pid)) continue;
+    if (!dead->count(pid)) {
+      if (ctp::TimedMutex::IsProcessAlive(pid, t.start_)) {
+        alive.insert(pid);
+        continue;
+      }
+      dead->insert(pid);
+    }
+    // Its read hold (exactly its bit) and its append record go; then the
+    // slot is free for another thread.
+    l.readers_[i / 64].fetch_and(~(1ull << (i % 64)), std::memory_order_acq_rel);
+    t.app_n_[0].store(0);
+    t.app_n_[1].store(0);
+    t.app_id_.store(0, std::memory_order_release);
+    t.nest_ = 0;
+    t.pid_.store(0, std::memory_order_release);
+    ++freed;
+  }
+  return freed;
+}
+
+inline void View::FreeDeadAppendLocks(const std::set<u32> &dead) {
+  // The holder of an append lock need not be a registered thread (writers
+  // are not): check each holder's liveness, once per pid.
+  AppendSlot *a = Appends();
+  std::set<u32> gone(dead);
+  std::set<u32> alive;
+  bool any = false;
+  for (u32 i = 0; i < root_->n_appends_; ++i) {
+    const u32 h = a[i].locked_;
+    if (h == 0 || a[i].id_ == 0 || a[i].id_ == detail::kFreedId ||
+        alive.count(h) || gone.count(h)) {
+      any = any || gone.count(h) != 0;
+      continue;
+    }
+    if (ctp::TimedMutex::IsProcessAlive(h, 0)) {
+      alive.insert(h);
+    } else {
+      gone.insert(h);
+      any = true;
+    }
+  }
+  if (!any) return;
+  ModuleGuard g(this);
+  for (u32 i = 0; i < root_->n_appends_; ++i) {
+    if (a[i].id_ != 0 && a[i].id_ != detail::kFreedId && a[i].locked_ != 0 &&
+        gone.count(a[i].locked_)) {
+      a[i].locked_ = 0;
+      MaybeFreeAppendLocked(&a[i]);
+    }
+  }
+}
+
+inline void View::ResetTables() {
+  std::lock_guard<std::mutex> g(frozen_mu_);  // module threads stay out
+  std::memset(static_cast<void *>(Inodes()), 0,
+              sizeof(Inode) * root_->n_inodes_);
+  std::memset(static_cast<void *>(Dentries()), 0,
+              sizeof(Dentry) * root_->n_dentries_);
+  std::memset(static_cast<void *>(Targets()), 0,
+              sizeof(Target) * root_->n_targets_);
+  std::memset(static_cast<void *>(Xattrs()), 0,
+              sizeof(XattrSlot) * root_->n_xattrs_);
+  root_->used_inodes_.store(0);
+  root_->used_dentries_.store(0);
+  // Nothing remains to apply (the log is empty): a seq the dead writer
+  // took without publishing its record must not keep waiters waiting.
+  root_->applied_seq_.store(root_->pushed_seq_.load(),
+                            std::memory_order_release);
+  // Everything below the root is filled from the module again.
+  InitRootInodeLocked(false);
+  root_->lock_.writer_.store(0, std::memory_order_release);
+}
 
 }  // namespace clio::cte::filesystem::ns
 
