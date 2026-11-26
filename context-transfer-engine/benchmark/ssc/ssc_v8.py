@@ -87,34 +87,41 @@ def option_times(cells, phase, axis, idx):
     return out
 
 
+# v12 switches (defaults = the frozen v10 behaviour)
+SHOW_RATIO = False  # v12: every cost word carries the measured ratio, e.g. "a little slower (1.4x)"
+CAPACITY = 0.8      # share of the free space counted as usable; v12: 1.0, the physical capacity
+
+
 def relative(t, best):
     if t is None:
         return "lost writes (did not fit)"
     r = t / best
     if r <= 1.15:
-        return "fastest"
-    if r <= 1.6:
-        return "a little slower"
-    return f"about {r:.0f}x slower" if r < 10 else "more than 10x slower"
+        word = "fastest"
+    elif r <= 1.6:
+        word = "a little slower"
+    else:
+        word = f"about {r:.0f}x slower" if r < 10 else "more than 10x slower"
+    return f"{word} ({r:.1f}x)" if SHOW_RATIO else word
 
 
 # ---------------------------------------------------------------- window facts
 def fits(w, ratio, tiers):
     need = w["bytes_put"] / GB
     free = sum(t["remaining_gb"] for t in tiers.values())
-    raw = need <= 0.8 * free
-    comp = need / max(ratio, 1.0) <= 0.8 * free
+    raw = need <= CAPACITY * free
+    comp = need / max(ratio, 1.0) <= CAPACITY * free
     return {"none": raw, "lz4": comp, "zstd": comp}, need, free
 
 
 def tier_fit(size_gb, tiers):
     """Where one window of `size_gb` lands on this node: DRAM first, overflow to the SSD."""
     dram, total = tiers["dram"]["remaining_gb"], sum(t["remaining_gb"] for t in tiers.values())
-    if size_gb > 0.8 * total:
+    if size_gb > CAPACITY * total:
         return "does not fit in the free space"
-    if size_gb <= 0.8 * dram:
+    if size_gb <= CAPACITY * dram:
         return f"fits in DRAM ({size_gb:.2f} GB)"
-    return f"fills DRAM, about {size_gb - 0.8 * dram:.1f} GB spills to the SSD"
+    return f"fills DRAM, about {size_gb - CAPACITY * dram:.1f} GB spills to the second tier"
 
 
 def size_text(blob):
@@ -285,3 +292,26 @@ def knn_decide(w, ratio, declared, tiers, phase, cells):
             cand = {"zstd": 0.0}
         rec[axis] = min(cand, key=cand.get)
     return rec
+
+
+def decisive(w, ratio, declared, tiers, phase, cells, k=3):
+    """v12d: per axis, the option the node experience ranks best when the evidence is decisive, i.e.
+    every other option is outside the "fastest" bin (more than 1.15x slower); codecs restricted to
+    those that fit. Axes where the evidence is a near-tie are left to the model (absent)."""
+    global DRAM_GB
+    DRAM_GB = tiers["dram"]["remaining_gb"]
+    cur = {"blob": w["mean_put"], "n_put": w["n_put"], "n_get": w["n_get"], "ratio": ratio}
+    memory = {ph: phase_facts(ph) for ph in workload.MEMORY_PHASES if ph != phase}
+    nb = neighbours(cur, memory, k)
+    idx = declared["searched_later"] == "yes"
+    fit, _, _ = fits(w, ratio, tiers)
+    out = {}
+    for axis in ("placement", "cache", "compression"):
+        rel = digest(nb, cells, axis, idx)
+        cand = {o: r for o, r in rel.items() if axis != "compression" or fit[o]}
+        if len(cand) < 2:
+            continue
+        best = min(cand, key=cand.get)
+        if all(r / cand[best] > 1.15 for o, r in cand.items() if o != best):
+            out[axis] = best
+    return out

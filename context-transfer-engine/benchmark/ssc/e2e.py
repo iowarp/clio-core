@@ -48,6 +48,7 @@ PLACE = {"dram": "dram", "ssd": "disk"}
 LOCAL_AXES = ("shift", "placement", "cache", "indexer")
 MIN_CONF = 0.6
 CAPACITY_GATE = True    # off only in the offline guard ablation (ablate_ssc.py ng_<variant>)
+CAPACITY_FRACTION = 0.8  # share of free space the capacity gate counts as usable (v12: 1.0)
 DEFAULT_SCHEDULE = "gs_output:6,gs_analysis:6,gs_log:6,gs_products:6,gs_archive:6,gs_output:6"
 SSC_VERSION = "v2"
 
@@ -223,7 +224,7 @@ def finish(builder, ctx, raw, lat):
         prop[ax] = rec[ax]
     gated = False
     need_gb = obs["window"]["bytes_put"] / (1 << 30)
-    if CAPACITY_GATE and prop["compression"] == "none" and need_gb > 0.8 * sum(t["remaining_gb"] for t in tiers.values()):
+    if CAPACITY_GATE and prop["compression"] == "none" and need_gb > CAPACITY_FRACTION * sum(t["remaining_gb"] for t in tiers.values()):
         dist = ans["compression"].get("dist") or {}
         codecs = {k: float(v) for k, v in dist.items() if k != "none"} or {"lz4": 1.0}
         prop["compression"] = max(codecs, key=codecs.get)

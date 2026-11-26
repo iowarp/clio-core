@@ -107,6 +107,21 @@ def make_request(variant, builder, obs, phase):
     variant = variant.split("@", 1)[0]
     variant = variant[:-1] if variant.endswith("h") else variant
     variant = variant[:-1] if variant.endswith("q") else variant     # q: same SSC, fast LLM (s1_bridge.py)
+    # v12 switches default to the frozen v10 behaviour for every other variant
+    ssc_v8.SHOW_RATIO, ssc_v8.CAPACITY, e2e.CAPACITY_FRACTION = False, 0.8, 0.8
+    if variant in ("v12", "v12r", "v12f", "v12d"):
+        # v12 (revised after error analysis, chosen on practice schedules): v12r = measured ratios
+        # next to the cost words; v12f = where the window lands + physical capacity (no 80% margin);
+        # v12 = both; v12d = v12 + decisive evidence overrides the model (applied in main)
+        ssc_v8.SHOW_RATIO = variant in ("v12", "v12r", "v12d")
+        cap = 0.8 if variant == "v12r" else 1.0
+        ssc_v8.CAPACITY, e2e.CAPACITY_FRACTION = cap, cap
+        ssc_v8.SPEED_ONLY = True
+        ssc_v8.FIT_AWARE = variant != "v12r"
+        st = builder.state(obs["tiers"])
+        text, qs = ssc_v8.build_v9(obs["window"], obs["ratio"], DECLARED[phase], obs["tiers"], phase, CELLS)
+        moved = len(builder.history) > 1 and builder.history[-2][0] != builder.history[-1][0]
+        return to_agentjev({"state_text": text, "questions": qs}), {"st": st, "qs": qs, "moved": moved, "obs": obs}
     if variant in ("v9", "v10", "v11", "v10x", "v11x"):
         # v10x / v11x: cold start, the same SSC without node experience (fit facts only)
         ssc_v8.SPEED_ONLY = variant in ("v10", "v11", "v10x", "v11x")
@@ -250,6 +265,9 @@ def main():
                     free = sum(t["remaining_gb"] for t in tiers.values())
                     rec["compression"] = ("none" if need <= 0.8 * free else
                                           "lz4" if need / max(ratio, 1.0) <= 0.8 * free else "zstd")
+                if base.startswith("v12d"):
+                    # decisive evidence overrides the model; near-ties stay with the model
+                    rec.update(ssc_v8.decisive(w, ratio, DECLARED[phase], tiers, phase, cell))
                 if guarded and DECLARED[phase]["searched_later"] == "yes":
                     rec["indexer"] = True
                 score, violation = score_of(cell, best, worst, phase, rec)
