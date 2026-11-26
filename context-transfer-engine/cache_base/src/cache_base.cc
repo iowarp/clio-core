@@ -812,6 +812,50 @@ clio::run::TaskResume CacheBase::DropCleanIfHeldDead() {
   CLIO_TASK_BODY_END
 }
 
+clio::run::TaskResume CacheBase::DropOrphans() {
+  CLIO_TASK_BODY_BEGIN
+  if (core::PoolContainers(pool_id_) > 1 && !orphan_scan_.exchange(true)) {
+    std::vector<std::pair<TagId, std::string>> orphans;
+    {
+      std::lock_guard<std::mutex> g(mu_);
+      for (const auto &e : entries_) {
+        if (e.second.dirty_.empty() &&
+            OwnerOf(e.second.tag_, e.second.name_) != container_id_) {
+          orphans.emplace_back(e.second.tag_, e.second.name_);
+        }
+      }
+    }
+    size_t dropped = 0;
+    for (const auto &o : orphans) {
+      const std::string key = Key(o.first, o.second);
+      CLIO_CO_AWAIT(Lock(key));
+      bool still = false;
+      {
+        std::lock_guard<std::mutex> g(mu_);
+        auto it = entries_.find(key);
+        still = it != entries_.end() && it->second.dirty_.empty() &&
+                OwnerOf(o.first, o.second) != container_id_;
+      }
+      if (still) {
+        CLIO_CO_AWAIT(DropVolatile(o.first, o.second));
+        ++dropped;
+      }
+      Unlock(key);
+    }
+    if (dropped != 0) {
+      std::lock_guard<std::mutex> g(mu_);
+      NoteSpaceFreed();
+    }
+    if (dropped != 0) {
+      HLOG(kInfo, "policy cache: dropped {} copies of blobs this container "
+           "no longer owns (served while their owner was down)", dropped);
+    }
+    orphan_scan_.store(false);
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 clio::run::TaskResume CacheBase::DropVolatile(TagId tag, std::string name) {
   CLIO_TASK_BODY_BEGIN
   {
@@ -2260,6 +2304,7 @@ clio::run::TaskResume CacheBase::FlushData(
     FlushStats stats;
     CLIO_CO_AWAIT(FlushEverythingShared(&rc, &stats));
     fill_flush_pending_.store(false, std::memory_order_relaxed);
+    CLIO_CO_AWAIT(DropOrphans());
     task->blobs_flushed_ = stats.blobs_;
     task->bytes_flushed_ = stats.bytes_;
     task->SetReturnCode(rc);
