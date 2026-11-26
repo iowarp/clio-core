@@ -4,18 +4,18 @@ heading: Using the <em>Context Exploration Engine.</em>
 description: How to use the Context Exploration Engine from Python and C++: connecting to the runtime, bundling sources, the regex, keyword and temporal query modes, retrieving packed data, working with Context FS files, composing the runtime for search, and running the MCP server.
 eyebrow: Docs · Context Exploration Engine
 lede: This page is task-oriented. It starts with the two environment variables that matter, then walks through import, query, retrieve and delete in Python, with the C++ equivalents, and ends with the storage composition that search depends on. Exact signatures and defaults are on the API reference page.
-facts: Python | import clio_cee ; C++ | iowarp::ContextInterface ; Search pool | CLIO_CTE_POOL=564.0 ; Needs | A running runtime
+facts: Python | import clio_cee ; C++ | iowarp::ContextInterface ; Search pool | CLIO_CTE_POOL=564.0 (indexer, opt-in) ; Needs | A running runtime
 -->
 <h2>Connecting to the runtime</h2>
 <p>Constructing a <code>ContextInterface</code> does nothing. The first method call initializes the runtime client, then the CAE client, which initializes the CTE client. If the runtime is not running the call logs an error and returns a failure value: 1 for bundle and destroy, an empty list for query and retrieve. A failed initialization is remembered for the life of the process, so start the runtime before the first call.</p>
 <p>Two environment variables matter, and both are read when the client initializes, so set them before the first call. In Python, set them before the import to be safe.</p>
 <ul>
-  <li><code>CLIO_CTE_POOL</code> selects the CTE pool the client talks to, as <code>major.minor</code>. Keyword search is answered by the indexer module, so set it to <code>564.0</code>, the indexer at the top of the default chain. Without it, a client that can map the runtime's shared memory still binds to the indexer through the shm cache, but a TCP client stays on the bare core at 512.0, where semantic queries return nothing. Regex and temporal queries work either way.</li>
+  <li><code>CLIO_CTE_POOL</code> selects the CTE pool the client talks to, as <code>major.minor</code>. Keyword search is answered by the indexer module, which is not in the default compose: compose it as described under <a href="#composing-storage-for-search">composing storage for search</a>, then set this to <code>564.0</code>. Without it, a client that can map the runtime's shared memory binds to the shm cache's entry pool (the indexer, once you set the shm cache's <code>entry_pool_id</code> to 564.0), but a TCP client stays on the bare core at 512.0, where semantic queries return nothing. Regex and temporal queries work either way.</li>
   <li><code>CLIO_WITH_RUNTIME</code> is not needed. CEE initializes the client with the attach-only default. Setting it to <code>1</code> makes the process try to start a runtime itself and attach to the existing one if the port is taken.</li>
 </ul>
 <pre data-label="python">
 import os
-os.environ["CLIO_CTE_POOL"] = "564.0"
+os.environ["CLIO_CTE_POOL"] = "564.0"   # with the indexer composed
 
 import clio_cee as cee
 ctx = cee.ContextInterface()
@@ -105,23 +105,29 @@ ctx.ContextDestroy({"run42"});
 <ul>
   <li>Each file is a tag named by its path inside the mount.</li>
   <li>File data is split into 1 MiB pages, one blob per page, named by page index (<code>0</code>, <code>1</code>, ...). Each file also has a small attribute blob named <code>~i</code>.</li>
-  <li>The filesystem pool (560.0) writes through the chain top, the indexer at 564.0, so pages pass the indexer and are keyword-searchable when they are text.</li>
+  <li>The filesystem pool (560.0) writes through the chain top, the shm cache at 568.0 by default. With the indexer composed and the filesystem's <code>next_pool_id</code> pointed at 564.0, pages pass the indexer and are keyword-searchable when they are text.</li>
 </ul>
 <p>So <code>ctx.context_query(".*notes/.*", "[0-9]+", prompt="sea ice")</code> ranks the pages of files under <code>notes/</code>. The blob pattern <code>[0-9]+</code> keeps the <code>~i</code> blob out. The limitation is that <code>context_query</code> returns blob names only, which for files are page numbers with no file name attached. When the file name matters use <code>clio_cte_core_ext</code> directly: its <code>BlobQuery</code> returns (tag name, blob name) pairs and its search results carry the tag id. The <a href="/tutorials/python-semantic-query.html">query files from Python</a> tutorial shows that path. <code>context_retrieve</code> does work on files and returns the matched pages concatenated.</p>
 
 <h2>Composing storage for search</h2>
-<p>CEE has no configuration of its own. What it can find and how fast it can read depends on the chain composed in the runtime's YAML. The default <code>context-runtime/config/clio_default.yaml</code> already composes a working layout; the points below are what to keep when writing your own.</p>
+<p>CEE has no configuration of its own. What it can find and how fast it can read depends on the chain composed in the runtime's YAML. The default <code>context-runtime/config/clio_default.yaml</code> composes everything except the indexer, which is opt-in because indexing every written byte costs CPU, memory and write throughput. The points below are what to add or keep.</p>
 <ul class="checks">
-  <li><strong>Keep the indexer in the chain</strong>, and route every writer through it. The default order is indexer (564.0), shm cache (568.0), optional compressor (562.0), write-back cache (567.0), which lands data in the volatile core (540.0) and flushes it through replication (561.0) to the persistent core (512.0). The CAE core (400.0), the filesystem (560.0) and the stream pool (565.0) all set <code>next_pool_id: "564.0"</code>, so imports and files are indexed. A writer pointed at 512.0 bypasses the index. Scope the index with the indexer's <code>tag_re</code> and <code>blob_re</code> keys so binary data is not tokenized, and set <code>index_log_path</code> so the index survives a restart.</li>
+  <li><strong>Compose the indexer</strong>, and route every writer through it. The default chain is shm cache (568.0), optional compressor (562.0), write-back cache (567.0), which lands data in the volatile core (540.0) and flushes it through replication (561.0) to the persistent core (512.0). Uncomment the <code>clio_cte_indexer</code> entry (564.0, forwarding to 568.0), set the shm cache's <code>entry_pool_id</code> to <code>"564.0"</code>, and set <code>next_pool_id: "564.0"</code> on the CAE core (400.0), the filesystem (560.0) and the stream pool (565.0), so imports and files are indexed. A writer pointed at 512.0 bypasses the index. Scope the index with the indexer's <code>tag_re</code> and <code>blob_re</code> keys so binary data is not tokenized, and set <code>index_log_path</code> so the index survives a restart.</li>
   <li><strong>Add the summarizer for content labels.</strong> <code>clio_cae_summarizer</code> at 401.0 runs a prompt over each put that matches a rule and stores the reply as a sibling blob <code>&lt;blob&gt;_label</code> in the same tag. Give it <code>next_pool_id: "564.0"</code> so the label passes through the indexer, then point the CAE core's <code>next_pool_id</code> at <code>"401.0"</code>. A BM25 prompt then matches the model's description as well as the raw text, and <code>blob_re=".*_label"</code> restricts a query to labels. The <a href="/docs/cae/usage.html#describing-content-in-the-i-o-path">CAE usage page</a> has the full block.</li>
   <li><strong>Give retrieval a fast tier.</strong> <code>context_retrieve</code> is a <code>GetBlob</code> per blob. Writes land in the volatile RAM core through the write-back cache, and a read miss is copied back into it after repeated hits (<code>fill: on_hit_count:2</code>). Promote a working set with the CTE client's <code>ReorganizeBlob</code> before a large retrieve.</li>
   <li><strong>Bound the result.</strong> <code>max_context_size</code> is allocated in shared memory in full, so size it to what you will read rather than leaving the 256 MiB default for small queries.</li>
 </ul>
-<p>Excerpt of a chain that satisfies all of the above. The cores, replication, write-back cache and shm cache entries are as in the default file; only the indexer, summarizer and CAE entries are shown:</p>
+<p>Excerpt of a chain that satisfies all of the above. The cores, replication and write-back cache entries are as in the default file; the shm cache, indexer, summarizer and CAE entries are shown, and the stream and filesystem entries change only their <code>next_pool_id</code> to <code>"564.0"</code>:</p>
 <pre data-label="yaml">
 compose:
-  # ... cores (540.0, 512.0), replication (561.0), write-back cache (567.0)
-  # and shm cache (568.0) as in the default file ...
+  # ... cores (540.0, 512.0), replication (561.0) and write-back cache
+  # (567.0) as in the default file ...
+
+  - mod_name: clio_cte_core_shm_cache_writethru
+    # ... other keys as in the default file ...
+    pool_id: "568.0"
+    next_pool_id: "567.0"
+    entry_pool_id: "564.0"         # clients bind to the indexer
 
   - mod_name: clio_cte_indexer
     pool_name: clio_cte_indexer

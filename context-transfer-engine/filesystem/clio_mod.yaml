@@ -41,3 +41,7 @@ kAdvanceSize: 37
 kShardOp: 38
 kSyncMeta: 39        # fsync the namespace log (broadcast; fsync/fsyncdir)
 kReaddirRange: 40    # one chunk of a directory listing, by stable offset
+# Appends (SHM_CACHE_DESIGN.md): reserve a sealed generation's range at the
+# file's owner (ManyToOne collective), then commit it once written.
+kIdentifyRange: 41
+kCommitRange: 42

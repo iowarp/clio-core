@@ -246,7 +246,13 @@ clio::run::TaskResume Runtime::ShardOp(clio::run::shared_ptr<ShardOpTask> &task)
   CLIO_TASK_BODY_BEGIN
   FsReq req;
   FsResp resp;
-  if (task->op_ == kShardPurgeDrain) {
+  if (task->op_ == kShardNsDrain) {
+    CLIO_CO_AWAIT(NsFastTick());
+  } else if (task->op_ == kShardNsIds) {
+    CLIO_CO_AWAIT(RefillNsIds());
+  } else if (task->op_ == kShardPurgeDrain) {
+    CLIO_CO_AWAIT(SizeDrain());
+    CLIO_CO_AWAIT(ExpireAppendRanges());
     CLIO_CO_AWAIT(PurgeDrain());
   } else if (!DecReq(task->req_.str(), &req)) {
     resp.rc_ = EINVAL;
@@ -605,6 +611,23 @@ int Runtime::InodeSetAttr(const FsReq &req, FsResp &resp) {
   return 0;
 }
 
+/**
+ * Context for a page write the module itself makes (a truncate's zero fill,
+ * an append merge). It bypasses this node's shared-memory write-through
+ * cache: absorbed there, it would land on the store asynchronously, AFTER a
+ * client's later write of the same page from another node had landed, and
+ * overwrite it (a 1-byte file rewritten with O_TRUNC then read 0x00 on every
+ * node: the truncate's zero fill of the old tail landed last). Bypassed, the
+ * cache drains its buffered ranges of the page, drops its copy and the write
+ * is on the chain below before the module answers.
+ * @return a default context with Context::kBypassShmCache set
+ */
+static clio::cte::core::Context ModuleWriteContext() {
+  clio::cte::core::Context ctx;
+  ctx.op_flags_ |= clio::cte::core::Context::kBypassShmCache;
+  return ctx;
+}
+
 clio::run::TaskResume Runtime::InodeTruncate(const FsReq &req, FsResp &resp) {
   CLIO_TASK_BODY_BEGIN
   resp.rc_ = 0;
@@ -670,7 +693,7 @@ clio::run::TaskResume Runtime::InodeTruncate(const FsReq &req, FsResp &resp) {
     auto zp = cte_.AsyncPutBlob(tag, std::to_string(boundary_page), zoff, zlen,
                                 zbuf.shm_.template Cast<void>(),
                                 page_score_.ScoreOf(boundary_page),
-                                clio::cte::core::Context(), 0u,
+                                ModuleWriteContext(), 0u,
                                 clio::run::PoolQuery::Dynamic());
     CLIO_CO_AWAIT(zp);
     ipc->FreeBuffer(zbuf);
@@ -702,6 +725,584 @@ void Runtime::QueuePurge(const PurgeItem &item) {
   if (!item.data_ && !item.xattr_) return;
   std::lock_guard<std::mutex> g(purge_mu_);
   purge_pending_.push_back(item);
+}
+
+clio::run::TaskResume Runtime::SizeDrain() {
+  CLIO_TASK_BODY_BEGIN
+  ShmFsCacheRoot *root = shm_fs_cache_.root();
+  if (root == nullptr || !root->sizes_.Valid()) CLIO_CO_RETURN;
+  std::vector<ShmSizeTable::Entry> pending;
+  root->sizes_.Snapshot(&pending);
+  // One size advance per file, all in flight together; each goes to its
+  // inode's home (AdvanceSize forwards).
+  constexpr size_t kSizeBatch = 256;
+  for (size_t i = 0; i < pending.size(); i += kSizeBatch) {
+    const size_t end = std::min(pending.size(), i + kSizeBatch);
+    std::vector<clio::run::Future<AdvanceSizeTask>> futs;
+    futs.reserve(end - i);
+    for (size_t j = i; j < end; ++j) {
+      futs.push_back(self_.AsyncAdvanceSize(pending[j].key, pending[j].end,
+                                            pending[j].wtime));
+    }
+    for (size_t j = i; j < end; ++j) {
+      auto &f = futs[j - i];
+      CLIO_CO_AWAIT(f);
+      const clio::run::u32 rc = f->GetReturnCode();
+      // ENOENT for a file the shared-memory namespace still holds is its
+      // create not applied yet: keep the size for the next period. For a
+      // removed file the size has nowhere to go.
+      const bool not_yet = rc == ENOENT && ns_view_.Ready() &&
+                           ns_view_.HasInode(pending[j].key);
+      if (rc == 0 || (rc == ENOENT && !not_yet)) {
+        root->sizes_.Retire(pending[j].key, pending[j].end);
+      } else if (!not_yet) {
+        HLOG(kWarning, "filesystem: size drain of inode {} to {} failed "
+             "(rc={}); retrying next period", pending[j].key, pending[j].end,
+             rc);
+      }
+    }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+// ===========================================================================
+// Appends: IdentifyRange / CommitRange at the owner, the merge at the origin
+// (SHM_CACHE_DESIGN.md "Appends")
+// ===========================================================================
+
+namespace {
+/** A reserved range whose origin never commits becomes a hole after this. */
+constexpr clio::run::u64 kAppendCommitTimeoutMs = 30000;
+/** Bytes of a staged generation moved per read/write slice. */
+constexpr clio::run::u64 kAppendSliceBytes = 16ull << 20;
+/** Poll interval while appends still copy into a sealed generation (us). */
+constexpr double kAppendInflightPollUs = 50.0;
+
+/** @return the staging blob of generation `gen` of node `node` */
+std::string AppendBlobName(clio::run::u32 node, clio::run::u32 gen) {
+  return "app." + std::to_string(node) + "." + std::to_string(gen);
+}
+}  // namespace
+
+bool Runtime::AdvanceAppendFrontierLocked(AppendRanges &r,
+                                          clio::run::u64 now_ms,
+                                          clio::run::u64 *frontier) {
+  bool advanced = false;
+  while (!r.ranges_.empty()) {
+    auto it = r.ranges_.begin();
+    const bool expired = now_ms - it->second.reserved_ms_ >=
+                         kAppendCommitTimeoutMs;
+    if (!it->second.committed_ && !expired) break;
+    if (!it->second.committed_) {
+      HLOG(kWarning, "filesystem: append range [{}, +{}) was never "
+           "committed; publishing it as a hole", it->first,
+           it->second.len_);
+    }
+    *frontier = it->first + it->second.len_;
+    r.ranges_.erase(it);
+    advanced = true;
+  }
+  return advanced;
+}
+
+clio::run::TaskResume Runtime::PublishAppendSize(clio::run::u64 tag_packed,
+                                                 clio::run::u64 size,
+                                                 clio::run::u64 mtime_ns) {
+  CLIO_TASK_BODY_BEGIN
+  {
+    // This container is the file's home: the ordinary size advance there
+    // (stream size, inode record, mirror).
+    auto f = self_.AsyncAdvanceSizeAt(
+        clio::run::PoolQuery::DirectId(
+            static_cast<clio::run::ContainerId>(container_id_)),
+        tag_packed, size, 0u, mtime_ns);
+    CLIO_CO_AWAIT(f);
+    if (f->GetReturnCode() != 0) {
+      HLOG(kWarning, "filesystem: publishing appended size {} of inode {} "
+           "failed (rc={})", size, tag_packed, f->GetReturnCode());
+    }
+    if (ns_view_.Ready()) ns_view_.RaiseSize(tag_packed, size, mtime_ns);
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::IdentifyRange(
+    clio::run::shared_ptr<IdentifyRangeTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  {
+    const clio::run::u64 tag = task->tag_packed_;
+    std::string members = task->members_.str();
+    if (members.empty()) {
+      PutRangeRec(&members, task->node_, task->gen_, task->len_);
+    }
+    // ManyToOne runs the aggregate on the neighborhood leader, not on the
+    // container it names (IpcManager::RouteManyToOne). The reservation and
+    // the size it later publishes belong to the file's owner: on any other
+    // container they landed in a table nobody reads, and on a multi-node
+    // volume every append to a file homed off the leader stayed invisible
+    // (stat 0 after both O_APPEND writers closed). Hand the batch to the
+    // owner.
+    const clio::run::u32 owner = FsIdHome(tag);
+    if (owner != container_id_) {
+      auto *ipc = CLIO_IPC;
+      auto fwd = ipc->NewTask<IdentifyRangeTask>(
+          clio::run::CreateTaskId(), pool_id_,
+          clio::run::PoolQuery::DirectId(owner), tag, task->node_,
+          task->gen_, task->len_);
+      fwd->members_ = clio::run::priv::string(CTP_MALLOC, members);
+      auto f = ipc->Send(fwd);
+      CLIO_CO_AWAIT(f);
+      task->base_ = f->base_;
+      task->offsets_ = f->offsets_;
+      task->return_code_ = f->GetReturnCode();
+      CLIO_CO_RETURN;
+    }
+    // The file's size, when no reservation of it is open: reservations
+    // start at the end every node can already see.
+    bool need_size = false;
+    {
+      std::lock_guard<std::mutex> g(append_mu_);
+      need_size = append_ranges_[tag].ranges_.empty();
+    }
+    clio::run::u64 cur = 0;
+    if (need_size) {
+      clio::run::u32 rc = 0;
+      CLIO_CO_AWAIT(FileSizeOp(FsUnpack(tag),
+                               clio::cte::stream::StreamSizeOp::kGet, 0,
+                               nullptr, &cur, &rc));
+      if (rc != 0) {
+        task->return_code_ = EIO;
+        CLIO_CO_RETURN;
+      }
+    }
+    std::string offsets;
+    {
+      std::lock_guard<std::mutex> g(append_mu_);
+      AppendRanges &r = append_ranges_[tag];
+      if (need_size && r.ranges_.empty()) r.end_ = cur;
+      const clio::run::u64 now_ms = SteadyMs();
+      task->base_ = r.end_;
+      clio::run::u32 node = 0;
+      clio::run::u32 gen = 0;
+      clio::run::u64 len = 0;
+      for (size_t i = 0; GetRangeRec(members, i, &node, &gen, &len); ++i) {
+        if (len == 0) continue;
+        AppendRange &ar = r.ranges_[r.end_];
+        ar.len_ = len;
+        ar.committed_ = false;
+        ar.reserved_ms_ = now_ms;
+        PutRangeRec(&offsets, node, gen, r.end_);
+        r.end_ += len;
+      }
+    }
+    task->offsets_ = clio::run::priv::string(CTP_MALLOC, offsets);
+    task->return_code_ = 0;
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::CommitRange(
+    clio::run::shared_ptr<CommitRangeTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  {
+    clio::run::u64 frontier = 0;
+    bool advanced = false;
+    {
+      std::lock_guard<std::mutex> g(append_mu_);
+      auto it = append_ranges_.find(task->tag_packed_);
+      if (it != append_ranges_.end()) {
+        auto rit = it->second.ranges_.find(task->offset_);
+        if (rit != it->second.ranges_.end()) rit->second.committed_ = true;
+        advanced =
+            AdvanceAppendFrontierLocked(it->second, SteadyMs(), &frontier);
+      }
+    }
+    if (advanced) {
+      CLIO_CO_AWAIT(
+          PublishAppendSize(task->tag_packed_, frontier, task->mtime_ns_));
+    }
+    task->return_code_ = 0;
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::ExpireAppendRanges() {
+  CLIO_TASK_BODY_BEGIN
+  {
+    std::vector<std::pair<clio::run::u64, clio::run::u64>> publish;
+    {
+      std::lock_guard<std::mutex> g(append_mu_);
+      const clio::run::u64 now_ms = SteadyMs();
+      for (auto it = append_ranges_.begin(); it != append_ranges_.end();) {
+        clio::run::u64 frontier = 0;
+        if (AdvanceAppendFrontierLocked(it->second, now_ms, &frontier)) {
+          publish.emplace_back(it->first, frontier);
+        }
+        it = it->second.ranges_.empty() ? append_ranges_.erase(it)
+                                        : std::next(it);
+      }
+    }
+    for (size_t i = 0; i < publish.size(); ++i) {
+      CLIO_CO_AWAIT(PublishAppendSize(publish[i].first, publish[i].second,
+                                      0));
+    }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::MergeAppends(clio::run::u64 id) {
+  CLIO_TASK_BODY_BEGIN
+  {
+    clio::run::u32 gen = 0;
+    if (!ns_view_.AppendSeal(id, &gen)) CLIO_CO_RETURN;
+    // Appends that took their offset before the seal finish copying.
+    clio::run::u64 len = 0;
+    while (ns_view_.AppendInflight(id, gen, &len)) {
+      CLIO_CO_AWAIT(clio::run::yield(kAppendInflightPollUs));
+    }
+    const clio::cte::core::TagId tag = FsUnpack(id);
+    const clio::run::u32 node = ns_view_.NodeId();
+    const std::string blob = AppendBlobName(node, gen);
+    clio::run::u64 off = 0;
+    bool have = false;
+    if (len != 0) {
+      auto f = self_.AsyncIdentifyRange(id, node, gen, len);
+      CLIO_CO_AWAIT(f);
+      const std::string offsets = f->offsets_.str();
+      clio::run::u32 n = 0;
+      clio::run::u32 g = 0;
+      clio::run::u64 o = 0;
+      for (size_t i = 0; GetRangeRec(offsets, i, &n, &g, &o); ++i) {
+        if (n == node && g == gen) {
+          off = o;
+          have = true;
+          break;
+        }
+      }
+      if (f->GetReturnCode() != 0 || !have) {
+        HLOG(kError, "filesystem: no range for {} appended bytes of inode "
+             "{} (rc={}); they are dropped", len, id, f->GetReturnCode());
+      }
+    }
+    if (have) {
+      // The bytes move once: from this node's staging blob into the file's
+      // pages at the reserved offset.
+      std::vector<char> buf(
+          static_cast<size_t>(std::min(len, kAppendSliceBytes)));
+      clio::run::u64 done = 0;
+      while (done < len) {
+        const clio::run::u64 n = std::min(len - done, kAppendSliceBytes);
+        auto g = cte_.AsyncGetBlob(tag, blob, done, n, 0u, buf.data(),
+                                   clio::run::PoolQuery::Dynamic());
+        CLIO_CO_AWAIT(g);
+        if (g->GetReturnCode() != 0) {
+          HLOG(kError, "filesystem: reading staged appends {} of inode {} "
+               "failed (rc={})", blob, id, g->GetReturnCode());
+          break;
+        }
+        clio::run::u64 put = 0;
+        while (put < n) {
+          const clio::run::u64 cur = off + done + put;
+          const clio::run::u64 page_off = cur % kFsPageSize;
+          const clio::run::u64 k = std::min(kFsPageSize - page_off, n - put);
+          auto p = cte_.AsyncPutBlob(tag, PageName(cur), page_off, k,
+                                     buf.data() + put, -1.0f,
+                                     ModuleWriteContext(), 0u,
+                                     clio::run::PoolQuery::Dynamic());
+          CLIO_CO_AWAIT(p);
+          put += k;
+        }
+        done += n;
+      }
+      auto c = self_.AsyncCommitRange(
+          id, off, len,
+          static_cast<clio::run::u64>(clio::cte::core::GetWallTimeNs()));
+      CLIO_CO_AWAIT(c);
+    }
+    if (len != 0) {
+      auto d = cte_.AsyncDelBlob(tag, blob);
+      CLIO_CO_AWAIT(d);
+    }
+    ns_view_.AppendMerged(id, gen);
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::RefillNsIds() {
+  CLIO_TASK_BODY_BEGIN
+  // Top the block up while half of it is left, so clients never wait. A
+  // checkout creates ~700 files/s: half a block is ~23 s of slack.
+  constexpr clio::run::u32 kNsIdBlock = 32768;
+  if (!ns_view_.Ready() || ns_view_.IdsLeft() >= kNsIdBlock / 2) {
+    CLIO_CO_RETURN;
+  }
+  // One refill at a time: a second would replace the first's fresh block.
+  if (ns_refilling_.exchange(true, std::memory_order_acq_rel)) {
+    CLIO_CO_RETURN;
+  }
+  bool ok = false;
+  const auto t_reserve = std::chrono::steady_clock::now();
+  CLIO_CO_AWAIT(EnsureIdReserve(kNsIdBlock, ok));
+  {
+    const double ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - t_reserve)
+                          .count();
+    if (ms > 1000.0) {
+      HLOG(kWarning, "filesystem: reserving inode ids took {:.0f} ms ({} "
+           "left in the clients' block, ok={})", ms, ns_view_.IdsLeft(), ok);
+    }
+  }
+  if (!ok) {
+    ns_refilling_.store(false, std::memory_order_release);
+    CLIO_CO_RETURN;  // retried next period
+  }
+  {
+    clio::run::u32 major = 0;
+    clio::run::u64 first = 0;
+    bool have = false;
+    {
+      std::lock_guard<std::mutex> g(meta_mu_);
+      if (next_minor_ + kNsIdBlock <= minted_hi_) {
+        first = next_minor_;
+        next_minor_ += kNsIdBlock;
+        // Home 0: the namespace segment exists on single-node volumes only.
+        major = kFsIdFlag | kFsIdMinterFlag |
+                ((container_id_ & kFsIdMinterMask) << kFsIdMinterShift);
+        have = true;
+      }
+    }
+    if (have) ns_view_.SetIdBlock(major, first, kNsIdBlock);
+  }
+  ns_refilling_.store(false, std::memory_order_release);
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::NsApplyOne(const ns::OpRec &rec,
+                                          const std::string &path,
+                                          const std::string &path2,
+                                          clio::run::u32 &rc) {
+  CLIO_TASK_BODY_BEGIN
+  rc = 0;
+  if (rec.type_ == ns::kOpMkdir) {
+    auto f = self_.AsyncMkdir(path);
+    CLIO_CO_AWAIT(f);
+    rc = f->GetReturnCode();
+    if (rc == 0 && rec.mode_ != 0755u) {
+      auto c = self_.AsyncChmod(path, rec.mode_);
+      CLIO_CO_AWAIT(c);
+      rc = c->GetReturnCode();
+    }
+  } else if (rec.type_ == ns::kOpUnlink) {
+    auto f = self_.AsyncUnlink(path);
+    CLIO_CO_AWAIT(f);
+    rc = f->GetReturnCode();
+  } else if (rec.type_ == ns::kOpRmdir) {
+    auto f = self_.AsyncRmdir(path);
+    CLIO_CO_AWAIT(f);
+    rc = f->GetReturnCode();
+  } else if (rec.type_ == ns::kOpRename) {
+    auto f = self_.AsyncRename(path, path2);
+    CLIO_CO_AWAIT(f);
+    rc = f->GetReturnCode();
+  } else if (rec.type_ == ns::kOpLink) {
+    auto f = self_.AsyncLink(path, path2);
+    CLIO_CO_AWAIT(f);
+    rc = f->GetReturnCode();
+  } else if (rec.type_ == ns::kOpSymlink) {
+    auto f = self_.AsyncSymlink(path2, path);
+    CLIO_CO_AWAIT(f);
+    rc = f->GetReturnCode();
+  } else if (rec.type_ == ns::kOpChmod) {
+    auto f = self_.AsyncChmod(path, rec.mode_);
+    CLIO_CO_AWAIT(f);
+    rc = f->GetReturnCode();
+  } else if (rec.type_ == ns::kOpChown) {
+    auto f = self_.AsyncChown(path, rec.uid_, rec.gid_);
+    CLIO_CO_AWAIT(f);
+    rc = f->GetReturnCode();
+  } else if (rec.type_ == ns::kOpUtimens) {
+    const clio::run::u32 flags =
+        (rec.t1_ != 0 ? 1u : 0u) | (rec.t2_ != 0 ? 2u : 0u);
+    auto f = self_.AsyncUtimens(path, rec.t1_, rec.t2_, flags);
+    CLIO_CO_AWAIT(f);
+    rc = f->GetReturnCode();
+  } else if (rec.type_ == ns::kOpSetxattr) {
+    const size_t nul = path2.find('\0');
+    const std::string name = path2.substr(0, nul);
+    const std::string value =
+        nul == std::string::npos ? std::string() : path2.substr(nul + 1);
+    auto f = self_.AsyncSetxattr(path, name, value, rec.flags_);
+    CLIO_CO_AWAIT(f);
+    rc = f->GetReturnCode();
+  } else if (rec.type_ == ns::kOpRemovexattr) {
+    auto f = self_.AsyncRemovexattr(path, path2);
+    CLIO_CO_AWAIT(f);
+    rc = f->GetReturnCode();
+  } else if (rec.type_ == ns::kOpTruncate) {
+    auto f = self_.AsyncTruncate(path, rec.size_, rec.id_);
+    CLIO_CO_AWAIT(f);
+    rc = f->GetReturnCode();
+  } else {
+    rc = EINVAL;
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::NsDrain() {
+  CLIO_TASK_BODY_BEGIN
+  if (!ns_view_.Ready()) CLIO_CO_RETURN;
+  CLIO_CO_AWAIT(RefillNsIds());
+  {
+    constexpr size_t kCreateBatch = 256;
+    ns::OpRec rec;
+    std::string path;
+    std::string path2;
+    while (ns_view_.PeekOp(&rec, &path, &path2)) {
+      if (rec.type_ == ns::kOpCreate) {
+        // Consecutive creates go as one batch; the client minted each id.
+        std::vector<MultiCreateEnt> ents;
+        clio::run::u64 last_seq = 0;
+        bool more = true;
+        while (more && ents.size() < kCreateBatch &&
+               rec.type_ == ns::kOpCreate) {
+          MultiCreateEnt e;
+          e.path_ = path;
+          e.tag_packed_ = rec.id_;
+          e.mode_ = rec.mode_;
+          e.ctime_ns_ = rec.t1_;
+          ents.push_back(std::move(e));
+          last_seq = rec.seq_;
+          ns_view_.PopOp();
+          more = ns_view_.PeekOp(&rec, &path, &path2);
+        }
+        // The entries are distinct new files whose parents exist (a mkdir
+        // ends the run): apply the batch as kCreateShards sub-batches at
+        // once. One MultiCreate applies its entries one after another
+        // (inode record, CTE tag, directory row: 1-15 ms each), and the
+        // drain fell behind a git checkout: the op log was 69% full when
+        // it ended and every later op (rm -rf's unlinks) waited for room.
+        constexpr size_t kCreateShards = 8;
+        const size_t per = (ents.size() + kCreateShards - 1) / kCreateShards;
+        std::vector<clio::run::Future<MultiCreateTask>> cfuts;
+        std::vector<size_t> sizes;
+        for (size_t off = 0; off < ents.size(); off += per) {
+          std::vector<MultiCreateEnt> part(
+              ents.begin() + off,
+              ents.begin() + std::min(ents.size(), off + per));
+          sizes.push_back(part.size());
+          cfuts.push_back(self_.AsyncMultiCreate(EncodeMultiCreate(part)));
+        }
+        for (size_t i = 0; i < cfuts.size(); ++i) {
+          CLIO_CO_AWAIT(cfuts[i]);
+          auto &f = cfuts[i];
+          if (f->first_rc_ != 0 || f->GetReturnCode() != 0) {
+            HLOG(kWarning, "filesystem: namespace drain: {} of {} creates "
+                 "failed (first rc={})", sizes[i] - f->num_ok_, sizes[i],
+                 f->first_rc_);
+          }
+        }
+        // Landed: only now may waiters (fsync, xattrs) see them as applied.
+        ns_view_.MarkApplied(last_seq);
+        if (!more) break;
+        continue;
+      }
+      if (rec.type_ == ns::kOpUnlink) {
+        // Consecutive unlinks name distinct live files: apply a run of them
+        // concurrently. One at a time the module applied ~800/s, the op log
+        // filled during rm -rf and every client unlink waited for room (a
+        // Linux tree: 38 s instead of a few). Any other op ends the run, so
+        // an rmdir still follows its children's unlinks.
+        constexpr size_t kUnlinkBatch = 256;
+        std::vector<std::string> paths;
+        std::vector<clio::run::Future<UnlinkTask>> futs;
+        clio::run::u64 last_seq = 0;
+        bool more = true;
+        while (more && futs.size() < kUnlinkBatch &&
+               rec.type_ == ns::kOpUnlink) {
+          paths.push_back(path);
+          futs.push_back(self_.AsyncUnlink(path));
+          last_seq = rec.seq_;
+          ns_view_.PopOp();
+          more = ns_view_.PeekOp(&rec, &path, &path2);
+        }
+        for (size_t i = 0; i < futs.size(); ++i) {
+          CLIO_CO_AWAIT(futs[i]);
+          const clio::run::u32 urc = futs[i]->GetReturnCode();
+          if (urc != 0) {
+            HLOG(kWarning, "filesystem: namespace drain: op {} on '{}' failed "
+                 "(rc={})", static_cast<clio::run::u32>(ns::kOpUnlink),
+                 paths[i], urc);
+          }
+        }
+        ns_view_.MarkApplied(last_seq);
+        if (!more) break;
+        continue;
+      }
+      if (rec.type_ == ns::kOpAppend) {
+        // Everything staged for the file up to now merges in one pass.
+        CLIO_CO_AWAIT(MergeAppends(rec.id_));
+        ns_view_.PopOp();
+        ns_view_.MarkApplied(rec.seq_);
+        continue;
+      }
+      clio::run::u32 rc = 0;
+      CLIO_CO_AWAIT(NsApplyOne(rec, path, path2, rc));
+      if (rc != 0) {
+        HLOG(kWarning, "filesystem: namespace drain: op {} on '{}' failed "
+             "(rc={})", rec.type_, path, rc);
+      }
+      ns_view_.PopOp();
+      ns_view_.MarkApplied(rec.seq_);
+    }
+  }
+  CLIO_CO_AWAIT(RefillNsIds());
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::NsFastTick() {
+  CLIO_TASK_BODY_BEGIN
+  {
+    // Size-table stripes a dead client left locked (cheap: one load each).
+    ShmSizeTable::RuntimeSide() = true;
+    ShmFsCacheRoot *froot = shm_fs_cache_.root();
+    if (froot != nullptr && froot->sizes_.RepairDead() != 0) {
+      HLOG(kInfo, "filesystem: released size-table stripes held by exited "
+           "processes");
+    }
+  }
+  if (!ns_view_.Ready()) CLIO_CO_RETURN;
+  CLIO_CO_AWAIT(RefillNsIds());
+  // Namespace first: a size advance needs its file's create applied.
+  if (!ns_view_.LogEmpty()) CLIO_CO_AWAIT(NsDrain());
+  {
+    // Clients that died holding the segment's locks or mid-change: repaired
+    // here (after the drain, which a frozen segment waits for).
+    constexpr clio::run::u64 kNsRepairNs = 500ull * 1000 * 1000;
+    const clio::run::u64 now = static_cast<clio::run::u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+    if (now - ns_repaired_ns_ >= kNsRepairNs || ns_view_.Frozen()) {
+      ns_repaired_ns_ = now;
+      const clio::run::u32 n = ns_view_.RepairDead();
+      if (n != 0) {
+        HLOG(kInfo, "filesystem: freed {} namespace thread registration(s) "
+             "of exited processes", n);
+      }
+    }
+  }
+  if (ns_view_.Urgent()) CLIO_CO_AWAIT(SizeDrain());
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
 }
 
 clio::run::TaskResume Runtime::PurgeDrain() {

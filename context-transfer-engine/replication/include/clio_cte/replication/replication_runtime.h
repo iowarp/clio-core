@@ -412,6 +412,9 @@ class Runtime : public clio::cte::core::CoreInterposer {
    *  at once, and the stand-in's older copy must not land over them. */
   std::unordered_map<std::string, clio::run::u64> owner_write_ns_;
   std::mutex owner_write_mu_;
+  /** Size of owner_write_ns_ at which the next prune pass runs
+   *  (owner_write_mu_). Doubles past the live set after each pass. */
+  size_t owner_write_prune_at_ = 65536;
   /** Last HandoffEntry::seq_ handed out (handoff_mu_). */
   clio::run::u64 handoff_seq_ = 0;
   /** Owners a PushHandoff is running for (handoff_mu_): the sweep and an

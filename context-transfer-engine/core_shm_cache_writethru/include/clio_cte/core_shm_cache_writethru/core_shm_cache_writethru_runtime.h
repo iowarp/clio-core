@@ -49,6 +49,7 @@
 #include <clio_runtime/clio_runtime.h>
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/core/core_interposer.h>
+#include <clio_cte/core/record_log.h>
 #include <clio_cte/core/shm_wtc.h>
 #include <clio_cte/core_shm_cache_writethru/core_shm_cache_writethru_client.h>
 #include <clio_cte/core_shm_cache_writethru/core_shm_cache_writethru_tasks.h>
@@ -114,6 +115,15 @@ class Runtime : public clio::cte::core::CoreInterposer {
 
   // ---- Method handlers ----
   clio::run::TaskResume Create(clio::run::shared_ptr<CreateTask> &task);
+  /**
+   * Warm restart on the same node: Create then replays the sharer WAL
+   * instead of discarding it.
+   * @param pool_id the pool
+   * @param pool_name its name
+   * @param container_id this container
+   */
+  void Restart(const clio::run::PoolId &pool_id, const std::string &pool_name,
+               clio::run::u32 container_id) override;
   clio::run::TaskResume Destroy(clio::run::shared_ptr<DestroyTask> &task);
   clio::run::TaskResume Monitor(clio::run::shared_ptr<MonitorTask> &task);
   clio::run::TaskResume GetOrCreateTag(
@@ -134,6 +144,19 @@ class Runtime : public clio::cte::core::CoreInterposer {
   clio::run::TaskResume SyncTag(
       clio::run::shared_ptr<clio::cte::core::SyncTagTask> &task);
   clio::run::TaskResume FlushLog(clio::run::shared_ptr<FlushLogTask> &task);
+  /**
+   * Publish which homes are down to the segment on every liveness change
+   * (View::SetDeadHomes): their blobs bypass the cache while down, and the
+   * copies cached before are dropped, since no invalidation can reach this
+   * node through a down home. Runs at the top of every flusher tick.
+   */
+  void SyncDeadHomes();
+  /** LastLivenessChangeNs() when SyncDeadHomes last published. */
+  clio::run::u64 seen_liveness_ns_ = 0;
+  /** SyncDeadHomes published at least once (the first tick always does). */
+  bool homes_published_ = false;
+  /** Steady-clock ns of SyncDeadHomes' last full re-read of node states. */
+  clio::run::u64 homes_checked_ns_ = 0;
   /**
    * Wake the worker that runs the flusher when it is parked and the dirty
    * log holds ranges. Cache-path writes push to the log without waking
@@ -159,6 +182,17 @@ class Runtime : public clio::cte::core::CoreInterposer {
   /** Any other core method: drain the local log, then forward verbatim. */
   clio::run::TaskResume BarrierForward(clio::run::u32 method,
                                        clio::run::shared_ptr<clio::run::Task> task);
+  /**
+   * Ordering barrier before deleting tags. Metadata-only: drain the log, as
+   * before. Data mode: mark the tags dead (the flusher drops their logged
+   * ranges instead of writing them) and wait only for the ranges already
+   * popped, which may be landing now -- not for the node's whole backlog.
+   * A delete during a checkout waited for gigabytes of write-through.
+   * @param tags the tags about to be deleted
+   */
+  clio::run::TaskResume DeleteBarrier(const std::vector<TagId> &tags);
+  /** True if `tag` was deleted while ranges of it were logged. */
+  bool TagDead(clio::run::u32 major, clio::run::u32 minor) const;
 
   /** Route data verbs submitter-local (the segment is per node). */
   clio::run::PoolQuery ScheduleTask(
@@ -341,6 +375,47 @@ class Runtime : public clio::cte::core::CoreInterposer {
       std::unordered_map<clio::run::u32, clio::run::u32> *skipped);
   /** True if an earlier flush copy already carried this logged range. */
   bool Superseded(const clio::cte::core::wtc::DirtyRange &r) const;
+  /** Ranges popped from the stage since Format (in flushed_ units): the
+   *  flusher counts each pop before checking TagDead. */
+  std::atomic<clio::run::u64> popped_total_{0};
+  /**
+   * Move every range published so far from the thread queues to the stage,
+   * the single FIFO the flusher pops in order. Any task may call it.
+   * @param force scan every queue even if the published count shows
+   *        nothing new (the flusher's periodic tick)
+   */
+  void DrainToStage(bool force = false);
+  /**
+   * Exact barrier target: drain, then the count staged. Every range
+   * published before the call is staged at a position below it, and
+   * flushed_ advances as a prefix of the stage order, so FlushedThrough of
+   * it means every one of them landed.
+   * @return the target for FlushedThrough
+   */
+  clio::run::u64 BarrierTarget();
+  /** True when neither the thread queues nor the stage hold a range. */
+  bool NothingToFlush() const;
+  /** Guards stage_ and the thread-queue consumer side. */
+  mutable std::mutex stage_mu_;
+  /** Drained ranges in drain order, not yet popped by the flusher. */
+  std::deque<clio::cte::core::wtc::DirtyRange> stage_;
+  /** Ranges ever staged (stage_mu_ writes; read lock-free). */
+  std::atomic<clio::run::u64> staged_total_{0};
+  /** No HeldDeadSeq seen yet (the first tick only records it). */
+  static constexpr clio::run::u64 kNoHeldDeadSeq = ~0ull;
+  /** CLIO_IPC->HeldDeadSeq() when FlushLog last looked (rejoin notices). */
+  clio::run::u64 seen_held_dead_ = kNoHeldDeadSeq;
+  /** Steady-clock ns of the last dead-thread-slot sweep. */
+  clio::run::u64 slots_reaped_ns_ = 0;
+  /** Deleted tags whose logged ranges are dropped, with the barrier target
+   *  at the deletion; pruned once flushed_ passes it. */
+  mutable std::mutex dead_mu_;
+  std::unordered_map<clio::run::u64, clio::run::u64> dead_tags_;
+  /** (barrier target at deletion, tag key) in deletion order (dead_mu_): the
+   *  expired front is pruned in O(1) per delete. Rescanning the whole map
+   *  on every delete was quadratic: during rm -rf behind a write-through
+   *  backlog the map held ~all deleted files (Linux tree rm 98 s -> 570 s). */
+  std::deque<std::pair<clio::run::u64, clio::run::u64>> dead_order_;
   /**
    * Resolve each record's key and home container.
    * @param recs   coalesced records (a record whose entry cannot be read is
@@ -384,12 +459,15 @@ class Runtime : public clio::cte::core::CoreInterposer {
   /**
    * Await every sent group; replay a home whose shards reported a failure,
    * and invalidate other sharers of the local home's blobs once.
+   * @param failed receives the homes whose flush failed (replayed down this
+   *        node's chain instead), which SyncTag must not sync directly
    */
   clio::run::TaskResume LandGroups(
       const std::vector<FlushRecord> &recs,
       std::map<clio::run::u32, ctp::ipc::FullPtr<char>> &staging,
       const std::vector<clio::run::u32> &homes,
-      std::vector<clio::run::Future<clio::cte::core::MultiPutBlobTask>> &futs);
+      std::vector<clio::run::Future<clio::cte::core::MultiPutBlobTask>> &futs,
+      std::set<clio::run::u32> *failed);
   /**
    * Pop, coalesce, stage and send one batch, appending it to inflight_. If
    * any of its blobs is still landing in an older batch, those batches land
@@ -472,6 +550,16 @@ class Runtime : public clio::cte::core::CoreInterposer {
    * @param keys the written keys (duplicates bound for one home are merged)
    */
   clio::run::TaskResume FanoutBatched(std::vector<BlobKey> keys);
+  /**
+   * Drop the cached blobs of `tags` here: ONE walk of the blob table for
+   * all of them, yielding every kDropStripesPerYield stripes.
+   * @param tags the tags (null ids skipped)
+   */
+  clio::run::TaskResume DropTagsBlobs(const std::vector<TagId> &tags);
+  /** Stripes DropTagsBlobs walks between yields. */
+  static constexpr clio::run::u32 kDropStripesPerYield = 4;
+  /** DropTagsBlobs' yield between stripes (us): a plain yield, not a park. */
+  static constexpr double kDropYieldUs = 1.0;
   /** Drop every node's cached blobs and metadata of these tags. */
   clio::run::TaskResume DropTagDataEverywhere(const std::vector<TagId> &tags);
   clio::run::TaskResume FanoutInvalidate(const TagId &tag,
@@ -580,7 +668,8 @@ class Runtime : public clio::cte::core::CoreInterposer {
   std::unordered_map<clio::run::u64, std::set<clio::run::u32>> sync_homes_;
   std::mutex sync_homes_mu_;  ///< guards sync_homes_
   /** Note that a batch's records landed on their homes (before flushed_). */
-  void NoteLandedHomes(const std::vector<FlushRecord> &recs);
+  void NoteLandedHomes(const std::vector<FlushRecord> &recs,
+                       const std::set<clio::run::u32> &failed);
   /** Take (and clear) the remote homes of a tag. */
   std::set<clio::run::u32> TakeSyncHomes(const TagId &tag);
   std::unordered_map<std::string, int> blob_reads_;   ///< chain reads per blob
@@ -596,6 +685,34 @@ class Runtime : public clio::cte::core::CoreInterposer {
   std::mutex inv_mtx_;  ///< guards inv_lanes_
   std::unordered_map<clio::run::u32, InvLane> inv_lanes_;  ///< by home node
   std::map<std::string, SharerSet> sharers_;
+
+  // ---- sharer-directory WAL (sharers_ survives a restart of this home) ----
+  /** Record types: a container that may cache the blob / whose write
+   *  landed. Only additions are logged; replay yields a superset of the
+   *  directory (extra invalidations, never a missed one), and compaction
+   *  rewrites the exact in-memory directory. */
+  static constexpr clio::run::u32 kSharerRecNode = 1;
+  static constexpr clio::run::u32 kSharerRecWriter = 2;
+  /** Compact once this many bytes were appended since the last rewrite. */
+  static constexpr clio::run::u64 kSharerLogCompactBytes = 8ull << 20;
+  clio::cte::core::RecordLog sharer_log_;
+  bool is_restart_ = false;  ///< Restart (not a fresh start) built us
+  /** Open the WAL; a restart replays it into sharers_, a fresh start
+   *  empties it. */
+  void OpenSharerLog();
+  /**
+   * Log that `node` joined a blob's sharer set (sharers_mtx_ held). Written
+   * (not fsynced) before the registration is acknowledged: it survives this
+   * process crashing.
+   * @param key the blob's SharerKey
+   * @param node the container
+   * @param type kSharerRecNode or kSharerRecWriter
+   */
+  void LogSharerLocked(const std::string &key, clio::run::u32 node,
+                       clio::run::u32 type);
+  /** Rewrite the WAL from sharers_ when it grew past the threshold
+   *  (sharers_mtx_ held). */
+  void CompactSharerLogLocked();
 };
 
 /** Sharer-map key of a blob. */

@@ -87,10 +87,17 @@ bool WtcTrace() {
   return v;
 }
 
-void Runtime::NoteLandedHomes(const std::vector<FlushRecord> &recs) {
+void Runtime::NoteLandedHomes(const std::vector<FlushRecord> &recs,
+                               const std::set<clio::run::u32> &failed) {
   std::lock_guard<std::mutex> g(sync_homes_mu_);
   for (const FlushRecord &fr : recs) {
     if (fr.size_ == 0 || fr.home_ == container_id_) continue;
+    // A home whose flush failed (down) did not take these ranges: RetryGroup
+    // replayed them down this node's own chain, which fails over and which
+    // SyncTag's forward covers. Syncing the dead home would answer node-lost
+    // and fail an fsync of writes made after it died (fsync EIO while a page
+    // owner was down, with every byte safe on a survivor).
+    if (failed.count(fr.home_) != 0) continue;
     clio::run::u64 k = (static_cast<clio::run::u64>(fr.key_.major_) << 32) |
                        fr.key_.minor_;
     sync_homes_[k].insert(fr.home_);
@@ -125,20 +132,32 @@ std::vector<FlushRecord> Runtime::PopAndCoalesce(
   clio::run::u64 bytes = 0;
   clio::run::u64 n = 0;
   wtc::DirtyRange r{};
-  wtc::DirtyLog *log = view_.Log();
+  DrainToStage();
+  // Lock order: stage_mu_ -> dead_mu_ (TagDead below). Nothing may wait for
+  // stage_mu_ while holding dead_mu_ (DeleteBarrier drains first).
+  std::unique_lock<std::mutex> stage_lock(stage_mu_);
   // Overwrites: a range whose bytes an earlier flush copy already carried
   // (older generation, covered range) is retired with this batch instead of
   // being resent, and does not count against the batch budget.
   while (rs.size() < kMaxRangesPerFlush && n < kMaxPopsPerFlush &&
-         bytes < config_.flush_batch_bytes_ && log->Pop(r)) {
+         bytes < config_.flush_batch_bytes_ && !stage_.empty()) {
+    r = stage_.front();
+    stage_.pop_front();
     ++n;
-    if (Superseded(r)) {
+    // Counted before the dead check: DeleteBarrier marks a tag dead, then
+    // waits for every range counted so far -- one counted later sees it.
+    popped_total_.fetch_add(1, std::memory_order_seq_cst);
+    clio::run::u32 tmaj = 0;
+    clio::run::u32 tmin = 0;
+    if (Superseded(r) ||
+        (view_.SlotTag(r.slot_, &tmaj, &tmin) && TagDead(tmaj, tmin))) {
       ++(*skipped)[r.slot_];
       continue;
     }
     rs.push_back(r);
     bytes += r.size_;
   }
+  stage_lock.unlock();
   *popped = n;
   std::sort(rs.begin(), rs.end(),
             [](const wtc::DirtyRange &a, const wtc::DirtyRange &b) {
@@ -419,10 +438,12 @@ clio::run::TaskResume Runtime::LandGroups(
     const std::vector<FlushRecord> &recs,
     std::map<clio::run::u32, ctp::ipc::FullPtr<char>> &staging,
     const std::vector<clio::run::u32> &homes,
-    std::vector<clio::run::Future<MultiPutBlobTask>> &futs) {
+    std::vector<clio::run::Future<MultiPutBlobTask>> &futs,
+    std::set<clio::run::u32> *failed_out) {
   CLIO_TASK_BODY_BEGIN
   {
-    std::set<clio::run::u32> failed;
+    std::set<clio::run::u32> &failed = *failed_out;
+    failed.clear();
     std::set<clio::run::u32> seen;
     for (size_t i = 0; i < futs.size(); ++i) {
       CLIO_CO_AWAIT(futs[i]);
@@ -439,6 +460,24 @@ clio::run::TaskResume Runtime::LandGroups(
     for (clio::run::u32 home : failed) {
       // Replays every record of the home (puts are idempotent).
       CLIO_CO_AWAIT(RetryGroup(recs, home, staging[home]));
+    }
+    if (!failed.empty()) {
+      // A home that failed (down) never fanned these writes out to the
+      // nodes caching the blobs: tell every node directly, or a copy cached
+      // there stays stale through and after the outage.
+      std::vector<BlobKey> keys;
+      for (const FlushRecord &fr : recs) {
+        if (fr.size_ > 0 && failed.count(fr.home_) != 0) keys.push_back(fr.key_);
+      }
+      if (!keys.empty()) {
+        auto *ipc = CLIO_IPC;
+        auto t = ipc->NewTask<InvalidateTask>(
+            clio::run::CreateTaskId(), pool_id_,
+            clio::run::PoolQuery::Broadcast(), kInvalidateDrop, container_id_,
+            PackKeys(keys));
+        auto fut = ipc->Send(t);
+        CLIO_CO_AWAIT(fut);
+      }
     }
     if (seen.count(container_id_) != 0) {
       std::vector<BlobKey> keys;
@@ -498,7 +537,9 @@ clio::run::TaskResume Runtime::LandOldest() {
     InflightBatch b = std::move(inflight_.front());
     inflight_.pop_front();
     const unsigned long long ev_land0 = clio::run::evlat::Now();
-    CLIO_CO_AWAIT(LandGroups(b.recs_, b.staging_, b.homes_, b.futs_));
+    std::set<clio::run::u32> failed_homes;
+    CLIO_CO_AWAIT(LandGroups(b.recs_, b.staging_, b.homes_, b.futs_,
+                             &failed_homes));
     clio::run::evlat::Span(clio::run::evlat::kWtcLand, ev_land0,
                            clio::run::evlat::Now());
     if (b.pinned_) UnpinRecords(b.recs_);
@@ -515,7 +556,7 @@ clio::run::TaskResume Runtime::LandOldest() {
     }
     // Before flushed_ moves: a SyncTag that sees these ranges flushed must
     // also find their homes.
-    NoteLandedHomes(b.recs_);
+    NoteLandedHomes(b.recs_, failed_homes);
     // Skipped ranges retire only now: every older batch (including the one
     // that carried their bytes) has landed.
     clio::run::u64 nskipped = 0;
@@ -556,11 +597,65 @@ clio::run::TaskResume Runtime::LandOldest() {
   CLIO_TASK_BODY_END
 }
 
+void Runtime::DrainToStage(bool force) {
+  if (!force && view_.QueuesEmpty()) return;  // no lock, no scan
+  std::vector<wtc::DirtyRange> got;
+  std::lock_guard<std::mutex> g(stage_mu_);
+  // Everything published now: each queue holds at most qdepth_ ranges.
+  view_.Drain(&got, ~static_cast<size_t>(0), force);
+  for (const wtc::DirtyRange &x : got) stage_.push_back(x);
+  staged_total_.fetch_add(got.size(), std::memory_order_seq_cst);
+}
+
+clio::run::u64 Runtime::BarrierTarget() {
+  DrainToStage();
+  return staged_total_.load(std::memory_order_seq_cst);
+}
+
+bool Runtime::NothingToFlush() const {
+  // Lock-free: every staged range is popped exactly once (popped_total_).
+  return view_.QueuesEmpty() &&
+         popped_total_.load(std::memory_order_acquire) >=
+             staged_total_.load(std::memory_order_acquire);
+}
+
 void Runtime::KickFlusher() {
   clio::run::TaskLane *lane = flusher_lane_.load(std::memory_order_acquire);
-  if (lane == nullptr || !view_.Ready() || view_.Log()->Empty()) return;
+  if (lane == nullptr || !view_.Ready() || NothingToFlush()) return;
   auto *ipc = CLIO_IPC;
   ipc->AwakenWorker(lane);  // skipped (no syscall) while the worker runs
+}
+
+void Runtime::SyncDeadHomes() {
+  auto *ipc = CLIO_IPC;
+  // A death advances LastLivenessChangeNs (acted on at once); a rejoin does
+  // not, so the states are also re-read every kHomesRecheckNs.
+  constexpr clio::run::u64 kHomesRecheckNs = 100ull * 1000 * 1000;
+  const clio::run::u64 change = ipc->LastLivenessChangeNs();
+  const clio::run::u64 now = static_cast<clio::run::u64>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count());
+  if (change == seen_liveness_ns_ && homes_published_ &&
+      now - homes_checked_ns_ < kHomesRecheckNs) {
+    return;
+  }
+  seen_liveness_ns_ = change;
+  homes_checked_ns_ = now;
+  homes_published_ = true;
+  auto *pool_manager = CLIO_POOL_MANAGER;
+  const clio::run::PoolInfo *info = pool_manager->GetPoolInfo(pool_id_);
+  const clio::run::u32 n = info == nullptr ? 0 : info->num_containers_;
+  clio::run::u64 dead = 0;
+  // Container id == node id (one container per node in every chain pool).
+  for (clio::run::u32 c = 0; c < n && c < 64; ++c) {
+    if (c != container_id_ && !ipc->IsAlive(c)) dead |= 1ull << c;
+  }
+  if (dead != view_.GetRoot()->dead_homes_.load()) {
+    HLOG(kInfo, "core_shm_cache_writethru {}: homes down mask {:#x} of {}; "
+         "their blobs bypass the cache until they return", pool_id_.ToString(),
+         dead, n);
+  }
+  view_.SetDeadHomes(n, dead);
 }
 
 clio::run::TaskResume Runtime::FlushLog(clio::run::shared_ptr<FlushLogTask> &task) {
@@ -575,6 +670,38 @@ clio::run::TaskResume Runtime::FlushLog(clio::run::shared_ptr<FlushLogTask> &tas
       flusher_lane_.store(worker->GetLane(), std::memory_order_release);
     }
   }
+  if (view_.Ready()) {
+    SyncDeadHomes();
+    {
+      // A peer held this node dead (rejoin notice): invalidations meant for
+      // it were lost and writes went through stand-in homes meanwhile, so
+      // nothing cached here can be trusted (clio_fs_suite
+      // cache_holder_partitioned_misses_overwrite).
+      const clio::run::u64 hd = CLIO_IPC->HeldDeadSeq();
+      if (hd != seen_held_dead_) {
+        if (seen_held_dead_ != kNoHeldDeadSeq) {
+          view_.InvalidateAll();
+          HLOG(kWarning, "core_shm_cache_writethru {}: a peer held this node "
+               "dead; dropped every cached copy (they may be stale)",
+               pool_id_.ToString());
+        }
+        seen_held_dead_ = hd;
+      }
+    }
+    DrainToStage(/*force=*/true);  // ranges a dead producer never counted
+    // Thread slots of dead clients retire (and free once drained), so
+    // restarts never exhaust them.
+    constexpr clio::run::u64 kReapSlotsNs = 1000ull * 1000 * 1000;
+    const clio::run::u64 now = wtc::NowNs();
+    if (now - slots_reaped_ns_ >= kReapSlotsNs) {
+      slots_reaped_ns_ = now;
+      const clio::run::u32 n = view_.ReapDeadSlots();
+      if (n != 0) {
+        HLOG(kInfo, "core_shm_cache_writethru {}: retired {} thread slot(s) "
+             "of exited processes", pool_id_.ToString(), n);
+      }
+    }
+  }
   if (!view_.Ready() || flush_running_.exchange(true)) {
     task->SetReturnCode(0);
     CLIO_CO_RETURN;
@@ -584,7 +711,7 @@ clio::run::TaskResume Runtime::FlushLog(clio::run::shared_ptr<FlushLogTask> &tas
   // chain read is in progress or waiting, so the fence can open.
   while (true) {
     while (inflight_.size() < std::max<clio::run::u32>(1, config_.flush_depth_) &&
-           !view_.Log()->Empty() && reads_waiting_.load() == 0) {
+           !NothingToFlush() && reads_waiting_.load() == 0) {
       // seq_cst pairs with BeginChainRead (increment, then check the other).
       flush_active_.fetch_add(1);
       if (chain_reads_.load() != 0) {
@@ -612,6 +739,68 @@ clio::run::TaskResume Runtime::FlushLog(clio::run::shared_ptr<FlushLogTask> &tas
 // ===========================================================================
 // Coherence
 // ===========================================================================
+
+void Runtime::OpenSharerLog() {
+  if (config_.sharer_log_path_.empty()) return;
+  const std::string path =
+      config_.sharer_log_path_ + "." + std::to_string(container_id_);
+  if (!sharer_log_.Open(path)) {
+    HLOG(kError, "core_shm_cache_writethru: cannot open sharer log {}; copies "
+         "cached elsewhere will not be invalidated after a restart", path);
+    return;
+  }
+  std::lock_guard<std::mutex> lk(sharers_mtx_);
+  if (!is_restart_) {
+    sharer_log_.Rewrite({});  // a fresh start: no copy survives anywhere
+    return;
+  }
+  const size_t n = sharer_log_.Replay(
+      [this](clio::run::u32 type, const std::string &p) {
+        if (p.size() < sizeof(clio::run::u32)) return;
+        clio::run::u32 node = 0;
+        std::memcpy(&node, p.data(), sizeof(node));
+        SharerSet &s = sharers_[p.substr(sizeof(node))];
+        if (type == kSharerRecWriter) {
+          s.writers_.insert(node);
+        } else {
+          s.nodes_.insert(node);
+        }
+      });
+  CompactSharerLogLocked();
+  HLOG(kInfo, "core_shm_cache_writethru {}: replayed {} sharer records ({} "
+       "blobs cached elsewhere)", pool_id_.ToString(), n, sharers_.size());
+}
+
+void Runtime::LogSharerLocked(const std::string &key, clio::run::u32 node,
+                              clio::run::u32 type) {
+  if (!sharer_log_.IsOpen()) return;
+  std::string p(sizeof(node), '\0');
+  std::memcpy(&p[0], &node, sizeof(node));
+  p += key;
+  if (!sharer_log_.Append(type, p)) {
+    HLOG(kError, "core_shm_cache_writethru: sharer log append failed");
+  }
+  if (sharer_log_.BytesSinceCompact() > kSharerLogCompactBytes) {
+    CompactSharerLogLocked();
+  }
+}
+
+void Runtime::CompactSharerLogLocked() {
+  if (!sharer_log_.IsOpen()) return;
+  std::vector<std::pair<clio::run::u32, std::string>> recs;
+  for (const auto &kv : sharers_) {
+    auto add = [&](clio::run::u32 type, clio::run::u32 node) {
+      std::string p(sizeof(node), '\0');
+      std::memcpy(&p[0], &node, sizeof(node));
+      recs.emplace_back(type, p + kv.first);
+    };
+    for (clio::run::u32 n : kv.second.nodes_) add(kSharerRecNode, n);
+    for (clio::run::u32 w : kv.second.writers_) add(kSharerRecWriter, w);
+  }
+  if (!sharer_log_.Rewrite(recs)) {
+    HLOG(kError, "core_shm_cache_writethru: sharer log compaction failed");
+  }
+}
 
 std::map<clio::run::u32, std::vector<BlobKey>> Runtime::HomeApply(
     const std::vector<BlobKey> &keys, clio::run::u32 writer) {
@@ -642,6 +831,12 @@ std::map<clio::run::u32, std::vector<BlobKey>> Runtime::HomeApply(
       if (it != sharers_.end()) sharers_.erase(it);
     } else {
       SharerSet &s = sharers_[sk];
+      // Log only a membership the directory did not hold: the log keeps a
+      // superset, so a repeat writer costs nothing.
+      if (s.nodes_.count(writer) == 0) LogSharerLocked(sk, writer, kSharerRecNode);
+      if (s.writers_.count(writer) == 0) {
+        LogSharerLocked(sk, writer, kSharerRecWriter);
+      }
       s.nodes_.clear();
       s.writers_.clear();
       s.nodes_.insert(writer);
@@ -749,20 +944,28 @@ clio::run::TaskResume Runtime::Invalidate(
         }
         view_.Invalidate(k.major_, k.minor_, k.name_.c_str(), k.name_.size());
       }
-    } else if (task->mode_ == kInvalidateDropTagData && view_.Ready()) {
+    } else if ((task->mode_ == kInvalidateDropTagData ||
+                task->mode_ == kInvalidateDropTag) &&
+               view_.Ready()) {
+      std::vector<TagId> tags;
+      for (const BlobKey &k : keys) tags.push_back(TagId(k.major_, k.minor_));
+      CLIO_CO_AWAIT(DropTagsBlobs(tags));
       for (const BlobKey &k : keys) {
-        view_.DropTagBlobs(k.major_, k.minor_);
-        view_.DropTagMeta(k.major_, k.minor_);
-      }
-    } else if (task->mode_ == kInvalidateDropTag && view_.Ready()) {
-      for (const BlobKey &k : keys) {
-        view_.DropTagBlobs(k.major_, k.minor_);
-        view_.DropTag(k.major_, k.minor_);
+        if (task->mode_ == kInvalidateDropTag) {
+          view_.DropTag(k.major_, k.minor_);
+        } else {
+          view_.DropTagMeta(k.major_, k.minor_);
+        }
       }
     } else if (task->mode_ == kInvalidateRegister) {
       std::lock_guard<std::mutex> lk(sharers_mtx_);
       for (const BlobKey &k : keys) {
-        sharers_[SharerKey(k.major_, k.minor_, k.name_)].nodes_.insert(sender);
+        const std::string sk = SharerKey(k.major_, k.minor_, k.name_);
+        // Logged before the registration is acknowledged: a restart of this
+        // home still invalidates the copy the sender is about to cache.
+        if (sharers_[sk].nodes_.insert(sender).second) {
+          LogSharerLocked(sk, sender, kSharerRecNode);
+        }
       }
     } else if (task->mode_ == kInvalidateFanout) {
       std::lock_guard<std::mutex> lk(sharers_mtx_);

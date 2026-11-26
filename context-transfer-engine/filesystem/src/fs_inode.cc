@@ -748,8 +748,20 @@ clio::run::TaskResume Runtime::EnsureInode(clio::run::u64 packed, int *err) {
   // this home: the next change goes to every container. A record written at
   // create (fresh) was never cached anywhere and has no stream to reconcile.
   fi->holders_unknown_ = NumContainers() > 1 && !fresh;
-  const bool served_elsewhere =
-      writer != kNoRecWriter && writer != container_id_;
+  // A record another container wrote is reconciled with this container's
+  // stream ONCE (kSet). A later reload of the same record (a rejoin notice
+  // drops clean inodes) must not set the size again: appends merged here
+  // since then would be cut off (clio_fs_suite truncate_during_failover).
+  const clio::run::u64 rec_hash = std::hash<std::string>{}(rec);
+  bool served_elsewhere = writer != kNoRecWriter && writer != container_id_;
+  if (served_elsewhere) {
+    std::lock_guard<std::mutex> lk(meta_mu_);
+    auto [it, inserted] = reconciled_recs_.emplace(packed, rec_hash);
+    if (!inserted) {
+      if (it->second == rec_hash) served_elsewhere = false;  // done before
+      it->second = rec_hash;
+    }
+  }
   if (fi->type_ == kFsTypeFile && !fresh) {
     // Another container stored the latest record: it served the inode while
     // this one was away (a failover), so this container's stream state is

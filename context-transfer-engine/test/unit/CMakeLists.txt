@@ -2409,6 +2409,47 @@ set_tests_properties(cfs_fsync_durable PROPERTIES
     LABELS "unit;cte;cfs;msan_skip")
 endif()  # UNIX
 
+# Persistent clio-fs configuration: files survive a graceful stop, and
+# fsynced files survive a killed runtime, across a recovering restart. The
+# write and verify phases run as children of the test binary. Portable: the
+# daemon and the children are spawned through ctp::SystemInfo.
+add_executable(test_cfs_persistence
+    test_cfs_persistence.cc
+)
+target_include_directories(test_cfs_persistence PRIVATE
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+)
+target_compile_definitions(test_cfs_persistence PRIVATE
+    CLIO_RUN_EXE="$<TARGET_FILE:clio_run>"
+    CFS_PERSIST_TEST_EXE="$<TARGET_FILE:test_cfs_persistence>")
+target_link_libraries(test_cfs_persistence
+    clio_cte_filesystem_client
+    clio_cte_core_client
+    clio_cte_core_runtime
+    clio::run::admin_client
+    clio::run::bdev_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+add_dependencies(test_cfs_persistence
+    clio_run
+    clio_cte_core_runtime
+    clio_cte_replication_runtime
+    clio_cte_core_persist_write_back_runtime
+    clio_cte_core_shm_cache_writethru_runtime
+    clio_cte_stream_runtime
+    clio_cte_filesystem_runtime
+    clio_bdev_runtime
+    clio_admin_runtime)
+add_test(NAME cfs_persistence
+    COMMAND test_cfs_persistence "[persist]"
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+set_tests_properties(cfs_persistence PROPERTIES
+    RESOURCE_LOCK "clio_runtime"
+    TIMEOUT 600
+    ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1"
+    LABELS "unit;cte;cfs;persist;msan_skip")
+
 #------------------------------------------------------------------------------
 # core_shm_cache_writethru: client SHM path + chimod flusher (DESIGN.md)
 #------------------------------------------------------------------------------
@@ -2437,3 +2478,17 @@ if(CLIO_CTE_ENABLE_SHM_WTC)
       ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
   )
 endif()
+
+add_executable(test_fs_ns_shm test_fs_ns_shm.cc)
+target_include_directories(test_fs_ns_shm PRIVATE
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+    ${CMAKE_SOURCE_DIR}/context-transfer-engine/filesystem/include)
+target_link_libraries(test_fs_ns_shm
+    clio_cte_core_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT})
+add_test(NAME cte_fs_ns_shm COMMAND test_fs_ns_shm)
+set_tests_properties(cte_fs_ns_shm PROPERTIES
+    TIMEOUT 120
+    LABELS "unit;cte"
+    ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}")

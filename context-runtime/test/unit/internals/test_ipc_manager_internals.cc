@@ -558,4 +558,51 @@ TEST_CASE("IpcInternals - MigrateContainers refuses a container hosted "
   REQUIRE(pool_manager->HasContainer(clio::run::kAdminPoolId, local_id));
 }
 
+// Two compose entries with one pool_id put two containers behind one id; the
+// config is refused rather than composed. The shipped default must pass.
+TEST_CASE("ConfigManager - compose pool ids must be unique",
+          "[config][compose]") {
+  namespace fs = std::filesystem;
+  fs::path dup = fs::temp_directory_path() / "clio_test_dup_pool_id.yaml";
+  {
+    std::ofstream f(dup);
+    f << "compose:\n"
+         "  - mod_name: clio_bdev\n"
+         "    pool_name: first\n"
+         "    pool_query: local\n"
+         "    pool_id: \"601.0\"\n"
+         "  - mod_name: clio_bdev\n"
+         "    pool_name: second\n"
+         "    pool_query: local\n"
+         "    pool_id: \"601.0\"\n";
+  }
+  clio::run::ConfigManager bad;
+  REQUIRE_FALSE(bad.LoadYaml(dup.string()));
+  REQUIRE(bad.GetComposeConfig().pools_.empty());
+
+  fs::path ok = fs::temp_directory_path() / "clio_test_unique_pool_id.yaml";
+  {
+    std::ofstream f(ok);
+    f << "compose:\n"
+         "  - mod_name: clio_bdev\n"
+         "    pool_name: first\n"
+         "    pool_query: local\n"
+         "    pool_id: \"601.0\"\n"
+         "  - mod_name: clio_bdev\n"
+         "    pool_name: second\n"
+         "    pool_query: local\n"
+         "    pool_id: \"602.0\"\n";
+  }
+  clio::run::ConfigManager good;
+  REQUIRE(good.LoadYaml(ok.string()));
+  REQUIRE(good.GetComposeConfig().pools_.size() == 2);
+  fs::remove(dup);
+  fs::remove(ok);
+
+  SECTION("the shipped default config");
+  clio::run::ConfigManager shipped;
+  REQUIRE(shipped.LoadYaml(CLIO_DEFAULT_CONFIG_PATH));
+  REQUIRE_FALSE(shipped.GetComposeConfig().pools_.empty());
+}
+
 SIMPLE_TEST_MAIN()

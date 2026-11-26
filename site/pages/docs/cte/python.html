@@ -4,14 +4,14 @@ heading: The <em>clio_cte_core_ext</em> module.
 description: Call-by-call reference for the clio_cte_core_ext Python module: setup, the Tag class, the blocking and asynchronous Client methods, futures, deferred and conditional puts, and the supporting types.
 eyebrow: Docs · Context Transfer Engine
 lede: <code>clio_cte_core_ext</code> is the Python binding of the CTE client. It ships in the <code>iowarp-core</code> wheel and is built with nanobind from <code>context-transfer-engine/wrapper/python/core_bindings.cc</code>. Payloads are <code>bytes</code>. Every blocking call releases the GIL. The higher-level <code>clio_cee</code> module is documented in the <a href="/docs/cee/api.html">Context Exploration Engine reference</a>.
-facts: Installed by | pip install iowarp-core ; Attach with | CLIO_WITH_RUNTIME=0 ; Keyword search needs | CLIO_CTE_POOL=564.0
+facts: Installed by | pip install iowarp-core ; Attach with | CLIO_WITH_RUNTIME=0 ; Keyword search needs | the indexer composed, CLIO_CTE_POOL=564.0
 -->
 <h2>Connecting</h2>
 <p>Set environment variables before the import; the client reads them once when it connects.</p>
 <pre data-label="python">
 import os
 os.environ["CLIO_WITH_RUNTIME"] = "0"    # attach to a running clio-run
-os.environ["CLIO_CTE_POOL"] = "564.0"    # only needed for SemanticSearch
+os.environ["CLIO_CTE_POOL"] = "564.0"    # only for SemanticSearch, with the indexer composed
 
 import clio_cte_core_ext as cte
 cte.clio_init(cte.RuntimeMode.kClient, False)

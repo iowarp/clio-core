@@ -1,0 +1,135 @@
+<!--
+title: Quickstart
+heading: Start with the <em>default stack.</em>
+description: What CLIO Core's default configuration composes, the assumptions it makes about your machine, and how to start it and mount the filesystem it provides on Linux, macOS and Windows.
+eyebrow: Tutorial · Start here
+lede: One command starts a complete single-node storage stack: a RAM tier and a disk tier, caches and a POSIX filesystem. It is a temporary filesystem, meant for scratch and working data. This page explains what that stack is, what it assumes about your machine, and how to mount it.
+facts: Time | 10 minutes ; Needs | An install with <code>clio_cte_fuse</code> and a FUSE driver ; Works in | Linux, macOS, Windows
+-->
+<h2>1. Where the default configuration comes from</h2>
+<p><code>clio-run start</code> reads one YAML file. The first of these that exists wins:</p>
+<ol>
+  <li>The file named by <code>CLIO_SERVER_CONF</code>, if you set it before starting.</li>
+  <li><code>~/.clio/clio.yaml</code>. A source or package install copies the default configuration there the first time, and never overwrites a file that already exists.</li>
+  <li>The default configuration bundled in the pip wheel, <code>clio_default.yaml</code>.</li>
+</ol>
+<p>So a fresh install runs the default stack with no configuration step. If you installed an earlier release, your <code>~/.clio/clio.yaml</code> is that release's default, not the one described here: compare it with the <code>clio_default.yaml</code> of your install, or move it aside to fall back to the bundled default.</p>
+
+<h2>2. What it composes</h2>
+<p>The <code>compose</code> section creates these pools, one container of each on this machine. Data written through the filesystem enters at the shm cache and flows down the table; the write-back cache acknowledges it once it is in RAM and flushes it to disk later:</p>
+<div class="table-wrap"><table>
+  <thead><tr><th>Pool</th><th>Module</th><th>Role</th></tr></thead>
+  <tbody>
+    <tr><td>560.0</td><td><code>clio_cte_filesystem</code></td><td>The filesystem. Maps paths to tags and file offsets to 1 MiB page blobs; journals its directory tables to <code>~/.clio/cfs_namespace_log</code>.</td></tr>
+    <tr><td>565.0</td><td><code>clio_cte_stream</code></td><td>Each file's logical size, and appends from several writers. It has no size log in the default file.</td></tr>
+    <tr><td>568.0</td><td><code>clio_cte_core_shm_cache_writethru</code></td><td>The top of the chain, where clients, the filesystem, the stream pool and the CAE enter. Caches tag and blob metadata in a shared-memory segment (256 MB) that programs on this machine map (<code>md_only: true</code>: no blob bytes).</td></tr>
+    <tr><td>567.0</td><td><code>clio_cte_core_persist_write_back</code></td><td>Write-back cache. Lands each write in the volatile core and acknowledges it; flushes dirty data every 10 s through replication to the persistent core, and on <code>fsync</code>.</td></tr>
+    <tr><td>540.0</td><td><code>clio_cte_core</code> (volatile)</td><td>The RAM tier, up to 80% of system memory. Empty after every start.</td></tr>
+    <tr><td>561.0</td><td><code>clio_cte_replication</code></td><td>The flush path to the persistent core; one copy of every blob (<code>replication_factor: 1</code>).</td></tr>
+    <tr><td>512.0</td><td><code>clio_cte_core</code> (persistent)</td><td>A 10 GB file tier at <code>~/.clio/cte_disk_tier.dat</code> with <code>persistence_level: temporary</code>, plus a metadata log at <code>~/.clio/cte_metadata_log</code>.</td></tr>
+    <tr><td>400.0</td><td><code>clio_cae_core</code></td><td>Imports external data (HDF5, cloud buckets) into the chain top. Not on the file path.</td></tr>
+    <tr><td>301.0</td><td><code>clio_bdev</code></td><td>The RAM block device behind the runtime's shared-memory allocator.</td></tr>
+  </tbody>
+</table></div>
+<p>The indexer (keyword search, 564.0), the compressor (562.0) and the summarizer (401.0) are in the file but commented out. To enable the indexer, uncomment it, set the shm cache's <code>entry_pool_id</code> to <code>"564.0"</code>, and point the CAE, stream and filesystem entries' <code>next_pool_id</code> at <code>"564.0"</code>; <a href="/tutorials/python-semantic-query.html">Query files from Python</a> walks through it. Every pool needs its own <code>pool_id</code>: a compose that reuses one is refused at startup.</p>
+
+<h2>3. What it assumes</h2>
+<ul class="checks">
+  <li><strong>One machine.</strong> There is no hostfile, and every pool is local. For a cluster, add a hostfile; see <a href="/docs/context-fs/usage.html">Context FS usage</a>.</li>
+  <li><strong>Memory to spare.</strong> The RAM tier may grow to 80% of system memory. It fills lazily, so it costs nothing until you write data. On a shared or busy machine, set a smaller <code>capacity_limit</code> on the volatile core's RAM tier (see <a href="/tutorials/compose.html">Compose local tiers</a>).</li>
+  <li><strong>Disk under your home directory.</strong> The disk tier is a file at <code>~/.clio/cte_disk_tier.dat</code>, capped at 10 GB, and the write-back cache flushes everything you write to it. Files larger in total than that need a bigger tier. <code>clio-run start --disk &lt;dir&gt;</code> moves the storage root, and with it all on-disk state, to another directory.</li>
+  <li><strong>Temporary storage.</strong> The only disk tier's <code>persistence_level</code> is <code>temporary</code>, no tier is <code>long_term</code>, and the stream pool has no <code>log_path</code>, so file sizes are not kept across a restart. This is a scratch filesystem, not a place to keep data. There is one copy, on this machine. To keep data, copy it out, or build a <a href="/tutorials/persistent-fs.html">persistent local filesystem</a>.</li>
+  <li><strong>Free ports.</strong> The runtime uses the base port 9413 and the ports just above it, and refuses to start if one it binds is taken; set <code>CLIO_PORT</code> to move the whole range.</li>
+  <li><strong>A local listener.</strong> On a single machine, set <code>CLIO_BIND_ADDR=127.0.0.1</code> before starting the runtime and the mount, as below; on Windows this also avoids a firewall prompt.</li>
+  <li><strong>Case-sensitive names.</strong> <code>a.txt</code> and <code>A.txt</code> are different files, on Windows too. For NTFS-like matching set <code>case_insensitive: true</code> on the filesystem entry before the volume is first created.</li>
+  <li><strong>Writes acknowledged in RAM.</strong> The write-back cache holds the bytes; the shm cache holds metadata only. Data not yet flushed lives only in RAM until the next 10 s flush or an <code>fsync</code>. A program can keep a single put out of the shm cache segment with <code>Context::kBypassShmCache</code> in the context's <code>op_flags_</code>; the client then sends a task instead.</li>
+  <li><strong>No keyword search.</strong> The indexer is opt-in (see above). Name and time queries work without it.</li>
+</ul>
+
+<h2>4. Start the runtime and mount</h2>
+<p>Start the runtime, then mount in a second terminal. <code>CLIO_WITH_RUNTIME=0</code> attaches the FUSE daemon to the runtime you started instead of starting a private one, so other programs see the same files.</p>
+<div class="tabs" data-label="Platform">
+  <section class="tab-panel" data-tab="Linux"><p class="tab-title">Linux</p>
+<pre data-label="shell · terminal 1">
+$ export CLIO_BIND_ADDR=127.0.0.1
+$ clio-run start
+</pre>
+<pre data-label="shell · terminal 2">
+$ export CLIO_BIND_ADDR=127.0.0.1
+$ mkdir -p ~/clio-mnt
+$ CLIO_WITH_RUNTIME=0 clio_cte_fuse ~/clio-mnt -f
+</pre>
+  <p>Needs the system FUSE 3 package; see <a href="/tutorials/fuse-linux.html">FUSE on Linux</a>.</p></section>
+  <section class="tab-panel" data-tab="macOS"><p class="tab-title">macOS</p>
+<pre data-label="shell · terminal 1">
+$ export CLIO_BIND_ADDR=127.0.0.1
+$ clio-run start
+</pre>
+<pre data-label="shell · terminal 2">
+$ export CLIO_BIND_ADDR=127.0.0.1
+$ mkdir -p ~/clio-mnt
+$ CLIO_WITH_RUNTIME=0 clio_cte_fuse ~/clio-mnt -f
+</pre>
+  <p>Needs macFUSE and a source build of the daemon; see <a href="/tutorials/fuse-macos.html">FUSE on macOS</a>.</p></section>
+  <section class="tab-panel" data-tab="Windows"><p class="tab-title">Windows</p>
+<pre data-label="powershell · window 1">
+PS> $env:CLIO_BIND_ADDR = "127.0.0.1"
+PS> clio-run start
+</pre>
+<pre data-label="powershell · window 2">
+PS> $env:CLIO_BIND_ADDR = "127.0.0.1"
+PS> $env:CLIO_WITH_RUNTIME = "0"
+PS> clio_cte_fuse Z: -f -o uid=-1,gid=-1
+</pre>
+  <p>Needs WinFsp; see <a href="/tutorials/fuse-windows.html">FUSE on Windows</a>. <code>-o uid=-1,gid=-1</code> makes the files belong to you, which tools such as git check.</p></section>
+</div>
+<p><code>-f</code> keeps the daemon in the foreground; leave both terminals running.</p>
+
+<h2>5. Use it</h2>
+<p>The mount is an ordinary directory:</p>
+<div class="tabs" data-label="Platform">
+  <section class="tab-panel" data-tab="Linux, macOS"><p class="tab-title">Linux, macOS</p>
+<pre data-label="shell">
+$ echo "hello" &gt; ~/clio-mnt/hello.txt
+$ cat ~/clio-mnt/hello.txt
+hello
+$ clio-run status
+RUNNING
+</pre></section>
+  <section class="tab-panel" data-tab="Windows"><p class="tab-title">Windows</p>
+<pre data-label="powershell">
+PS> Set-Content Z:\hello.txt "hello"
+PS> Get-Content Z:\hello.txt
+hello
+PS> clio-run status
+RUNNING
+</pre></section>
+</div>
+
+<h2>6. Unmount and stop</h2>
+<div class="tabs" data-label="Platform">
+  <section class="tab-panel" data-tab="Linux"><p class="tab-title">Linux</p>
+<pre data-label="shell">
+$ fusermount3 -u ~/clio-mnt
+$ clio-run stop
+</pre></section>
+  <section class="tab-panel" data-tab="macOS"><p class="tab-title">macOS</p>
+<pre data-label="shell">
+$ umount ~/clio-mnt
+$ clio-run stop
+</pre></section>
+  <section class="tab-panel" data-tab="Windows"><p class="tab-title">Windows</p>
+<pre data-label="powershell">
+PS> Stop-Process -Name clio_cte_fuse -Force
+PS> clio-run stop
+</pre></section>
+</div>
+<p>Unmount first: the daemon ignores Ctrl+C. This is temporary storage: copy out anything you want to keep before you stop it. <code>clio-run start --fresh</code> always starts from an empty store.</p>
+
+<h2>Next</h2>
+<div class="card-list">
+  <a href="/tutorials/persistent-fs.html"><h3>Persistent local filesystem</h3><p>Make the filesystem keep your files across restarts.</p></a>
+  <a href="/tutorials/compose.html"><h3>Compose local tiers</h3><p>Replace the default RAM and disk tiers with your own hierarchy.</p></a>
+  <a href="/tutorials/operators.html"><h3>Compose data operators</h3><p>Add compression, an erasure-coded array and more replication to the chain.</p></a>
+  <a href="/docs/context-fs/quickstart.html"><h3>Basic usage</h3><p>Copy data in and find it again from Python.</p></a>
+</div>

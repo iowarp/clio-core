@@ -485,6 +485,17 @@ class ConfigManager : public ctp::BaseConfig {
    */
   void ParseYAML(YAML::Node& yaml_conf) override;
 
+  /**
+   * Reject a compose section in which two pools share a pool_id. Two
+   * containers behind one id route each other's tasks, so the whole compose
+   * is refused: this parse's pools are dropped and compose_invalid_ is set.
+   * Pools without an explicit id are not compared.
+   * @param first index of the first pool this parse added; earlier entries
+   *        (from a previous load into the same object) are not checked
+   * @return true when every explicit pool_id is unique
+   */
+  bool ValidateComposePoolIds(size_t first);
+
  public:
   /**
    * Apply environment-variable overrides (CLIO_PORT, CLIO_SERVER_ADDR, etc.).
@@ -627,6 +638,9 @@ class ConfigManager : public ctp::BaseConfig {
 
   // Compose configuration
   ComposeConfig compose_config_;
+  /** Set when the compose section reuses a pool_id; the pool list is then
+   *  cleared and LoadYaml reports failure. */
+  bool compose_invalid_ = false;
 
   // Configuration directory for persistent runtime config
   std::string conf_dir_ = "/tmp/clio";

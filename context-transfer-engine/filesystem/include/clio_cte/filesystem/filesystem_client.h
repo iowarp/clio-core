@@ -24,10 +24,12 @@
 #include <cerrno>
 #include <unordered_map>
 #include <vector>
+#include <memory>
 #include <mutex>
 #include <clio_cte/filesystem/filesystem_tasks.h>
 #include <clio_cte/stream/stream_client.h>
 #include <clio_cte/filesystem/fs_shard.h>
+#include <clio_cte/filesystem/fs_ns_shm.h>
 #include <clio_cte/filesystem/shm_fs_cache.h>
 
 namespace clio::cte::filesystem {
@@ -108,6 +110,9 @@ class Client : public clio::cte::core::Client {
     shm_fs_root_ = other.shm_fs_root_;
     fds_ = other.fds_;
     next_fd_ = other.next_fd_;
+    ns_view_ = other.ns_view_;
+    page_score_ = other.page_score_;
+    page_score_loaded_ = other.page_score_loaded_;
   }
 
   Client &operator=(const Client &other) {
@@ -129,6 +134,9 @@ class Client : public clio::cte::core::Client {
     shm_fs_root_ = other.shm_fs_root_;
     fds_ = other.fds_;
     next_fd_ = other.next_fd_;
+    ns_view_ = other.ns_view_;
+    page_score_ = other.page_score_;
+    page_score_loaded_ = other.page_score_loaded_;
     return *this;
   }
 #endif
@@ -178,6 +186,9 @@ class Client : public clio::cte::core::Client {
     return true;
   }
 
+  /** Map the namespace segment its Locator names, once it is formatted. */
+  void AttachNs();
+
   bool HasShmCache() const { return shm_fs_root_ != nullptr; }
 
   /**
@@ -208,6 +219,8 @@ class Client : public clio::cte::core::Client {
       return false;
     }
     const std::string key = shm_fs_root_->Key(path);
+    // Taken before the record: see the pending-size merge below.
+    const clio::run::u64 retire_seq0 = shm_fs_root_->sizes_.RetireSeq();
     if (!shm_fs_root_->path_to_file_.TryGetBytes(key.data(), key.size(),
                                                  out, 16, absent)) {
       return false;
@@ -227,6 +240,26 @@ class Client : public clio::cte::core::Client {
         return false;
       }
       out->flags_ &= ~kShmDirComplete;
+    }
+    // A file's size includes what page writes raised in the size table and
+    // the module has not drained to the home yet.
+    if (!(out->flags_ & kShmFileIsDir) && !out->tag_id_.IsNull()) {
+      const clio::run::u64 pending = shm_fs_root_->sizes_.Get(
+          (static_cast<clio::run::u64>(out->tag_id_.major_) << 32) |
+          static_cast<clio::run::u64>(out->tag_id_.minor_));
+      if (pending > out->size_) {
+        out->size_ = pending;
+      } else if (shm_fs_root_->sizes_.RetireSeq() != retire_seq0) {
+        // An entry was retired while this lookup ran: the drain may have
+        // landed this file's size AFTER the record above was read. The home
+        // republished the record before retiring, so a re-read has it.
+        ShmFileRecord again;
+        if (shm_fs_root_->path_to_file_.TryGetBytes(key.data(), key.size(),
+                                                    &again, 16, nullptr) &&
+            again.tag_id_ == out->tag_id_ && again.size_ > out->size_) {
+          out->size_ = again.size_;
+        }
+      }
     }
     return true;
   }
@@ -403,6 +436,36 @@ class Client : public clio::cte::core::Client {
       clio::run::u64 tag_packed, clio::run::u64 len) {
     return AsyncAdvanceSizeAt(clio::run::PoolQuery::Local(), tag_packed, len,
                               1u);
+  }
+
+  /**
+   * Reserve where a sealed append generation goes (ManyToOne: batched on
+   * the neighborhood leader, which hands the batch to the file's owner;
+   * see IdentifyRangeTask).
+   */
+  clio::run::Future<IdentifyRangeTask> AsyncIdentifyRange(
+      clio::run::u64 tag_packed, clio::run::u32 node, clio::run::u32 gen,
+      clio::run::u64 len) {
+    auto *ipc = CLIO_CPU_IPC;
+    auto task = ipc->NewTask<IdentifyRangeTask>(
+        clio::run::CreateTaskId(), pool_id_,
+        clio::run::PoolQuery::ManyToOne(FsIdHome(tag_packed),
+                                        /*batch_key=*/tag_packed),
+        tag_packed, node, gen, len);
+    return ipc->Send(task);
+  }
+
+  /** An append range is written (to the file's owner). */
+  clio::run::Future<CommitRangeTask> AsyncCommitRange(
+      clio::run::u64 tag_packed, clio::run::u64 offset, clio::run::u64 len,
+      clio::run::u64 mtime_ns) {
+    auto *ipc = CLIO_CPU_IPC;
+    auto task = ipc->NewTask<CommitRangeTask>(
+        clio::run::CreateTaskId(), pool_id_,
+        clio::run::PoolQuery::DirectId(
+            static_cast<clio::run::ContainerId>(FsIdHome(tag_packed))),
+        tag_packed, offset, len, mtime_ns);
+    return ipc->Send(task);
   }
 
   /** Batched sieve-flushed creation (see MultiCreateTask). */
@@ -783,6 +846,294 @@ class Client : public clio::cte::core::Client {
     return ret;
   }
 
+  // ---- Namespace: the shared-memory namespace (fs_ns_shm.h) ----
+  //
+  // Every namespace operation of the native API and the FUSE adapter is one
+  // of these. With the namespace segment attached each runs in this process
+  // against shared memory -- no task; names this node has never seen are
+  // filled from the module once (a cold miss). Without it (TCP client,
+  // multi-node volume) each returns kNsUnavailable and the caller uses its
+  // task path. Other returns: 0 or a positive errno.
+
+  /** Returned by the Fs* namespace calls when no segment is attached. */
+  static constexpr int kNsUnavailable = -2;
+
+  /** @return the attached namespace view when it runs the namespace, or
+   *  nullptr */
+  ns::View *Ns();
+
+  /** @return the attached segment (namespace or appends only), or nullptr */
+  ns::View *NsSegment();
+
+  /**
+   * append(2) of `count` bytes (O_APPEND). One node: under the file's
+   * append lock, at its current size (shared-memory page writes). Otherwise
+   * (or CLIO_CFS_APPEND_MERGE=1): staged in this node's append blob and
+   * merged by the module in the background (SHM_CACHE_DESIGN.md "Appends").
+   * @param tag the file's tag
+   * @param path its path
+   * @param buf source
+   * @param count bytes
+   * @param written receives the bytes accepted
+   * @return 0, an errno, or kNsUnavailable (no segment: use the task path)
+   */
+  int FsAppend(const clio::cte::core::TagId &tag, const std::string &path,
+               const void *buf, size_t count, FsSsize *written);
+
+  /**
+   * Wait until a file's staged appends have merged (truncate, unlink).
+   * @param tag the file's tag
+   * @return 0, or EIO when the merge does not come
+   */
+  int WaitAppendsMerged(const clio::cte::core::TagId &tag);
+
+  /**
+   * stat(2): the name's attributes; a file's size includes its pending
+   * (not yet drained) size.
+   * @param path bare path
+   * @param a receives the attributes
+   */
+  int FsStat(const std::string &path, ns::Attr *a);
+
+  /**
+   * Attributes of an open file by its id (fstat of a descriptor whose name
+   * has moved or gone).
+   * @param id the file's packed id
+   * @param a receives the attributes
+   * @return 0, ENOENT, or kNsUnavailable
+   */
+  int FsStatId(clio::run::u64 id, ns::Attr *a);
+
+  /**
+   * open(2)/creat(2) of a regular file. O_CREAT creates, O_EXCL is
+   * exclusive, O_TRUNC empties an existing file (FsTruncate).
+   * @param path bare path
+   * @param flags open flags
+   * @param mode permission bits for a new file
+   * @param a receives the file's attributes
+   * @param created set true when this call created the file
+   */
+  int FsOpen(const std::string &path, int flags, clio::run::u32 mode,
+             ns::Attr *a, bool *created);
+
+  /** mkdir(2). */
+  int FsMkdir(const std::string &path, clio::run::u32 mode);
+  /** rmdir(2). */
+  int FsRmdir(const std::string &path);
+  /** unlink(2). */
+  int FsUnlink(const std::string &path);
+  /** rename(2); noreplace = RENAME_NOREPLACE. */
+  int FsRename(const std::string &src, const std::string &dst,
+               bool noreplace);
+  /** link(2): dst becomes another name of src. */
+  int FsLink(const std::string &src, const std::string &dst);
+  /** symlink(2): path names a new link to target. */
+  int FsSymlink(const std::string &target, const std::string &path);
+  /** readlink(2). */
+  int FsReadlink(const std::string &path, std::string *target);
+  /** chmod(2). */
+  int FsChmod(const std::string &path, clio::run::u32 mode);
+  /** chown(2); 0xFFFFFFFF leaves a field alone. */
+  int FsChown(const std::string &path, clio::run::u32 uid, clio::run::u32 gid);
+  /** utimens(2); 0 leaves a time alone. */
+  int FsUtimens(const std::string &path, clio::run::u64 atime_ns,
+                clio::run::u64 mtime_ns);
+  /**
+   * truncate(2). Waits for the module to apply it (a wait on the background
+   * drain, not a task): a shrink's page cut must precede later writes and
+   * regrows, and a grow's zero-fill must not land after later writes.
+   */
+  int FsTruncate(const std::string &path, clio::run::u64 size);
+
+  /**
+   * ftruncate through an open descriptor on the shared-memory namespace:
+   * by the file's tag, so a file unlinked while open still truncates.
+   * @param tag the open file's tag
+   * @param size new size
+   * @return 0, an errno, or kNsUnavailable (no namespace, or the inode is
+   *         not in the table: the caller falls back to the path)
+   */
+  int FsTruncateTag(const clio::cte::core::TagId &tag, clio::run::u64 size);
+  /** fallocate(2) mode bits (the Linux values). */
+  static constexpr clio::run::u32 kFallocKeepSize = 0x01;
+  static constexpr clio::run::u32 kFallocZeroRange = 0x10;
+
+  /**
+   * fallocate(2). Page blobs are created on write and holes read as zeros,
+   * so nothing is reserved ahead of time:
+   *  - mode 0: grow the file to off + len (never shrinks);
+   *  - kFallocKeepSize: no size change;
+   *  - kFallocZeroRange: [off, off + len) reads as zeros afterwards (written
+   *    as zeros; with kFallocKeepSize the size is restored if it grew).
+   * A request larger than the store's remaining capacity fails with ENOSPC
+   * now, as on ext4. Layout-changing modes (punch, collapse, insert) are
+   * EOPNOTSUPP.
+   * @param tag the file's tag
+   * @param path the file's path
+   * @param mode fallocate mode bits
+   * @param off offset
+   * @param len length
+   * @return 0, an errno, or kNsUnavailable
+   */
+  int FsFallocate(const clio::cte::core::TagId &tag, const std::string &path,
+                  clio::run::u32 mode, clio::run::u64 off, clio::run::u64 len);
+
+  /** readdir(2): every entry of a directory. */
+  int FsReaddir(const std::string &path, std::vector<ns::DirEnt> *out);
+  /**
+   * setxattr(2) through the namespace. A value too large to hold inline is
+   * set through the module (after this node's changes land) and the file's
+   * xattrs are refilled on next access.
+   * @param path bare path
+   * @param name attribute name
+   * @param value attribute value
+   * @param flags XATTR_CREATE (1) / XATTR_REPLACE (2)
+   * @return 0, an errno, or kNsUnavailable
+   */
+  int FsSetxattr(const std::string &path, const std::string &name,
+                 const std::string &value, clio::run::u32 flags);
+  /** getxattr(2); 0, ENODATA, an errno, or kNsUnavailable. */
+  int FsGetxattr(const std::string &path, const std::string &name,
+                 std::string *value);
+  /** listxattr(2): names, each NUL-terminated. */
+  int FsListxattr(const std::string &path, std::string *names);
+  /** removexattr(2). */
+  int FsRemovexattr(const std::string &path, const std::string &name);
+  /**
+   * Fill a file's xattrs from the module (a cold miss).
+   * @return 0, ns::kTooBig (a value the segment cannot hold), or an errno
+   */
+  int NsFillXattrs(const std::string &path);
+
+  /**
+   * Wait until everything this node changed in the namespace so far has
+   * been applied at the homes (fsync's namespace half).
+   * @return 0, or EIO when it does not happen within the drain timeout
+   */
+  int FsWaitApplied();
+
+  /**
+   * Fill a path's missing components from the module, top down (a cold
+   * miss: a name this node has never seen).
+   * @param path bare path
+   * @return 0, or an errno
+   */
+  int NsFill(const std::string &path);
+
+  /**
+   * Fill a directory's whole listing and mark it complete.
+   * @param path bare directory path
+   * @return 0, or an errno
+   */
+  int NsFillDir(const std::string &path);
+
+  /**
+   * Open a file's unsynced-write window (issue #1133) if it is not open:
+   * the first write after an fsync. SyncDurable then fails with EIO when a
+   * node that may have held those bytes died since the window opened.
+   * @param tag the file's tag (null: nothing to track)
+   */
+  static void UnsyncedNote(const clio::cte::core::TagId &tag);
+
+  /**
+   * Make one tag durable (SyncTagDurable) and apply its unsynced-write
+   * window (see UnsyncedNote).
+   * @param tag the tag (null is a no-op)
+   * @return 0, -ENOSPC when no persistent tier had room, or -EIO
+   */
+  int SyncTagWindow(const clio::cte::core::TagId &tag);
+
+  /** Longest wait for the background namespace drain (ms). */
+  static constexpr double kNsDrainWaitMs = 60000.0;
+
+  // ---- Shared-memory data path (native API and FUSE share it) ----
+
+  /**
+   * Write a file range as page blobs through the CTE client: each page slice
+   * is Client::PutBlob, a copy into the CTE shm cache (no task). A write
+   * that extends the file raises its size in the shared-memory size table
+   * (no task); the filesystem module drains it to the home in the
+   * background.
+   * @param tag the file's tag
+   * @param off file offset
+   * @param buf source bytes
+   * @param count bytes to write
+   * @param size_recorded set false when the size table could not take the
+   *        new size (no table attached / full): the caller must publish it
+   * @return bytes written, or a negative errno (-ENOSPC full store, -ENOMEM,
+   *         else -EIO); bytes stored before a failing page are reported
+   */
+  FsSsize WritePages(const clio::cte::core::TagId &tag, clio::run::u64 off,
+                     const void *buf, size_t count, bool *size_recorded);
+
+  /**
+   * Read one page range through the CTE client: the shm cache when it holds
+   * the range, else a GetBlob task (the fill). Retries the transient answers
+   * of a page whose owner was just declared dead.
+   * @param tag the file's tag
+   * @param cur file offset of the range (inside one page)
+   * @param n bytes to read
+   * @param dst destination
+   * @return 0 read, 1 the page does not exist (a hole: dst untouched), else
+   *         an error code
+   */
+  int ReadPage(const clio::cte::core::TagId &tag, clio::run::u64 cur,
+               clio::run::u64 n, char *dst);
+
+  /**
+   * Read a file range: clamp to the logical size, zero holes, pages through
+   * ReadPage.
+   * @param tag the file's tag
+   * @param path bare path (for the size lookup)
+   * @param off file offset
+   * @param buf destination
+   * @param count bytes requested
+   * @return bytes read (0 at EOF), or a negative errno
+   */
+  FsSsize ReadPages(const clio::cte::core::TagId &tag, const std::string &path,
+                    clio::run::u64 off, void *buf, size_t count);
+
+  /**
+   * Logical size of a file: the shared-memory record (which includes pending
+   * sizes) when it has the file, else a StatSize task raised by the pending
+   * size.
+   * @param tag the file's tag
+   * @param path bare path
+   * @param size receives the size
+   * @return 0, or a negative errno
+   */
+  int FileSizeOf(const clio::cte::core::TagId &tag, const std::string &path,
+                 clio::run::u64 *size);
+
+  /**
+   * @param tag a file's tag
+   * @return the size its page writes raised and the module has not drained
+   *         to the home yet (0 when none, or no table attached)
+   */
+  clio::run::u64 PendingSize(const clio::cte::core::TagId &tag);
+
+  /**
+   * Pending size of the file a path names, through its shared-memory record
+   * (0 when the path has no record or nothing is pending). Read BEFORE a
+   * size request, it is a floor the reply cannot undercut: an entry retired
+   * after this read had already landed at the home.
+   * @param path bare path
+   * @return the pending size, or 0
+   */
+  clio::run::u64 PendingSizeOfPath(const std::string &path);
+
+  /**
+   * Wait until the home holds a file's pending size (fsync, truncate): the
+   * background drain retires the entry; a drain that does not come within
+   * kSizeDrainWaitMs is done here.
+   * @param tag the file's tag
+   * @return 0, or an errno
+   */
+  int WaitSizeDrained(const clio::cte::core::TagId &tag);
+
+  /** Longest wait for the background size drain before publishing here. */
+  static constexpr double kSizeDrainWaitMs = 1000.0;
+
   /**
    * stat(2)-shaped query: existence and logical size.
    *
@@ -793,6 +1144,20 @@ class Client : public clio::cte::core::Client {
    *         whether the file is there.
    */
   bool GetAttr(const std::string &path, bool *exists, clio::run::u64 *size) {
+    {
+      ns::Attr a;
+      const int nrc = FsStat(path, &a);
+      if (nrc != kNsUnavailable) {
+        if (nrc == 0) {
+          *exists = true;
+          *size = a.size;
+          return true;
+        }
+        *exists = false;
+        *size = 0;
+        return nrc == ENOENT || nrc == ENOTDIR;
+      }
+    }
     // Serve from the filesystem's shared-memory mirror when it has the path:
     // stat(2) is the most frequent metadata call a filesystem sees, and the
     // record the runtime publishes carries both answers. Writes are
@@ -855,6 +1220,8 @@ class Client : public clio::cte::core::Client {
     std::string path;           ///< bare (stripped) path == CTE tag name
     clio::run::u64 off = 0;     ///< current seek offset
     int flags = 0;              ///< open() flags
+    /** The file's CTE tag (from the open reply); null = use the tasks. */
+    clio::cte::core::TagId tag = clio::cte::core::TagId::GetNull();
   };
 
   /** A path is intercepted iff it carries the clio:: marker. */
@@ -1131,8 +1498,23 @@ class Client : public clio::cte::core::Client {
     }
     auto *cte = Cte();
     ShmFileRecord rec;
-    if (cte->pool_id_.IsNull() || !cte->HasCache() ||
-        !TryGetFileRecordShm(path, &rec) || !rec.IsFastPathable()) {
+    bool have = false;
+    if (ns::View *v = Ns()) {
+      // The namespace holds every file this node made, including ones whose
+      // create has not reached the module (and its mirror) yet.
+      ns::Attr a;
+      if (v->Lookup(path, &a) == 0 && a.type == kFsTypeFile) {
+        const clio::cte::core::TagId t = FsUnpack(a.id);
+        rec.tag_id_ = clio::run::UniqueId(t.major_, t.minor_);
+        rec.size_ = std::max(a.size, PendingSize(t));
+        rec.flags_ = kShmFileExists;
+        have = true;
+      }
+    }
+    if (!have) {
+      have = TryGetFileRecordShm(path, &rec) && rec.IsFastPathable();
+    }
+    if (cte->pool_id_.IsNull() || !cte->HasCache() || !have) {
       ShmReadMisses().fetch_add(1, std::memory_order_relaxed);
       return -1;
     }
@@ -1202,6 +1584,13 @@ class Client : public clio::cte::core::Client {
   mutable std::mutex fd_mu_;
   std::unordered_map<int, OpenFile> fds_;
   int next_fd_ = kCfsFdBase;
+  /** The namespace segment, attached with the mirror (shared by copies
+   *  of this client). */
+  std::shared_ptr<ns::View> ns_view_;
+  /** Data-score rule for page writes (this filesystem's yaml), loaded on
+   *  first write; guarded by fd_mu_. */
+  clio::cte::core::PageScorePolicy page_score_;
+  bool page_score_loaded_ = false;
 #endif
 };
 

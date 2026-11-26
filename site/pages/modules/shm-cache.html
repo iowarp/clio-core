@@ -33,11 +33,12 @@ clients) see the same view. Anything it does not serve itself is forwarded
 after the writes buffered on this node have landed.</p>
 
 <h2>Where it sits</h2>
-<p>The default configuration composes the cache below the indexer and above
-the data transformations and data caches
-(<code>context-runtime/config/clio_default.yaml</code>):</p>
+<p>The default configuration composes the cache at the top of the chain,
+above the data transformations and data caches
+(<code>context-runtime/config/clio_default.yaml</code>). The opt-in indexer,
+when composed, goes above it:</p>
 <pre data-label="text">
-indexer(564.0) -> shm cache(568.0) -> [compressor(562.0) ->]
+[indexer(564.0) ->] shm cache(568.0) -> [compressor(562.0) ->]
   core_persist_write_back(567.0)
   -> volatile core(540.0)
   -> replication(561.0) -> persistent core(512.0)
@@ -57,15 +58,15 @@ stack.</p>
 
 <h2>Composing it</h2>
 <p>The default entry, trimmed of comments. Each compose entry must come
-after every pool it names, and the indexer that names 568.0 as its
-<code>next_pool_id</code> comes after it.</p>
+after every pool it names; the opt-in indexer, which names 568.0 as its
+<code>next_pool_id</code>, comes after it when composed.</p>
 <pre data-label="yaml">
 - mod_name: clio_cte_core_shm_cache_writethru
   pool_name: clio_cte_core_shm_cache_writethru
   pool_query: local
   pool_id: "568.0"
   next_pool_id: "567.0"         # write-back cache (562.0 with compressor)
-  entry_pool_id: "564.0"        # clients bind to the indexer above
+  # entry_pool_id: "564.0"      # with the opt-in indexer composed above
   md_only: true                 # bytes are cached by the write-back cache
   invalidate_on_flush: true
   capacity: "256M"
@@ -360,8 +361,8 @@ remaining keys at their defaults without an error.</p>
   to the core pool 512.0. The default configuration uses 567.0.</dd>
   <dt><code>entry_pool_id</code></dt>
   <dd>Pool clients bind to so their tasks pass every module above the cache.
-  Unset means the cache pool itself. The default configuration uses 564.0,
-  the indexer.</dd>
+  Unset means the cache pool itself, as in the default configuration. Set
+  it to 564.0 when the opt-in indexer is composed above the cache.</dd>
   <dt><code>md_only</code></dt>
   <dd>Cache tag and blob metadata only; blob bytes go down the chain.
   Default false; the default configuration sets true.</dd>
@@ -483,7 +484,10 @@ warning level:</p>
   <li>A connected client's synchronous <code>PutBlob</code> tries the segment
   whatever its score and context arguments; the cache does not carry them.
   A put that must carry a score or a context should use
-  <code>AsyncPutBlob</code>, which is always the task path. The
+  <code>AsyncPutBlob</code>, which is always the task path. To keep one put
+  out of the segment, set <code>Context::kBypassShmCache</code> (bit
+  <code>1u &lt;&lt; 11</code> of <code>op_flags_</code>) in the context
+  passed to <code>PutBlob</code>: the client sends a task instead. The
   <code>Async*</code> methods never consult the segment.</li>
   <li>An acknowledged put in data mode is in the segment, not the chain. It
   is durable, and visible to task callers on other nodes, once the flusher

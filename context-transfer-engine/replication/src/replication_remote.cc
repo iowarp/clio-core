@@ -125,11 +125,18 @@ void Runtime::NoteOwnerWrite(const TagId &tag, const std::string &name) {
                           std::to_string(tag.minor_) + "." + name;
   std::lock_guard<std::mutex> g(owner_write_mu_);
   owner_write_ns_[key] = now;
-  if (owner_write_ns_.size() > 65536) {
+  // Prune expired entries only when the map has doubled since the last pass.
+  // Pruning whenever it held more than 65536 rescanned the whole map on EVERY
+  // write once that many blobs had been written within kOwnerWriteKeepNs
+  // (nothing expired, so it never shrank): O(n) per record under this mutex,
+  // and a git checkout's batches held a worker for seconds each.
+  if (owner_write_ns_.size() > owner_write_prune_at_) {
     for (auto it = owner_write_ns_.begin(); it != owner_write_ns_.end();) {
       it = now - it->second > kOwnerWriteKeepNs ? owner_write_ns_.erase(it)
                                                 : std::next(it);
     }
+    owner_write_prune_at_ =
+        std::max<size_t>(65536, owner_write_ns_.size() * 2);
   }
 }
 

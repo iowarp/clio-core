@@ -26,12 +26,12 @@ lede: A complete introduction to CLIO Core: what each piece of the stack is, how
     <rect class="box hl" x="572" y="208" width="268" height="46" rx="8"/><text class="title" x="584" y="230">Stream</text><text class="muted" x="584" y="246">file sizes, ordered appends</text>
 
     <text class="muted" x="20" y="284">CHIMOD CHAIN (optional data operators; add your own anywhere)</text>
-    <rect class="box hl" x="20" y="294" width="152" height="44" rx="8"/><text class="title" x="32" y="321">Indexer</text>
+    <rect class="box" x="20" y="294" width="152" height="44" rx="8" stroke-dasharray="5 4"/><text class="title" x="32" y="321">Indexer</text>
     <rect class="box hl" x="192" y="294" width="152" height="44" rx="8"/><text class="title" x="204" y="321">Shm cache</text>
     <rect class="box" x="364" y="294" width="152" height="44" rx="8" stroke-dasharray="5 4"/><text class="title" x="376" y="321">Compressor</text>
     <rect class="box hl" x="536" y="294" width="152" height="44" rx="8"/><text class="title" x="548" y="321">Write-back</text>
     <rect class="box hl" x="708" y="294" width="132" height="44" rx="8"/><text class="title" x="720" y="321">Replication</text>
-    <path class="edge hl" d="M172,316 L190,316" marker-end="url(#ah0)"/>
+    <path class="edge" d="M172,316 L190,316" marker-end="url(#ah0)"/>
     <path class="edge hl" d="M344,316 L362,316" marker-end="url(#ah0)"/>
     <path class="edge hl" d="M516,316 L534,316" marker-end="url(#ah0)"/>
     <path class="edge hl" d="M688,316 L706,316" marker-end="url(#ah0)"/>
@@ -131,7 +131,8 @@ the link to the next pool is the module's <code>next_pool_id</code>.</p>
   <li><strong>Cache</strong> keeps a copy of hot blobs on the node that
   reads them, so repeat reads skip the network.</li>
   <li><strong>Indexer</strong> keeps term counts for what is written, so
-  blobs can later be searched by their contents.</li>
+  blobs can later be searched by their contents. It is not in the default
+  compose; enable it when you will search.</li>
   <li><strong>Compressor</strong> encodes blobs on the way down and
   decodes them on the way up.</li>
   <li><strong>Replication</strong> keeps extra copies on other nodes or a
@@ -254,8 +255,8 @@ other Design pages follows from one of them.</p>
   <li><strong>Put.</strong> The daemon writes the bytes into the file's
   1 MiB page blob with one put to the top of the filesystem's chain and
   waits for it. Writes are synchronous; there is no write buffer.</li>
-  <li><strong>Chain.</strong> The indexer notes the write and forwards it.
-  The shm cache keeps the blob's metadata in shared memory. The write-back
+  <li><strong>Chain.</strong> The shm cache, the top of the default chain,
+  keeps the blob's metadata in shared memory. The write-back
   cache lands the bytes in the volatile RAM core and acknowledges. The
   write returns.</li>
   <li><strong><code>fsync</code>.</strong> The daemon publishes the file's

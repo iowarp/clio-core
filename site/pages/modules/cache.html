@@ -26,7 +26,7 @@ blob data verbs and forwards everything else to <code>next_pool_id</code>.
 It is <strong>not</strong> in the default chain. The default chain in
 <code>context-runtime/config/clio_default.yaml</code> is:</p>
 <pre data-label="yaml">
-indexer(564.0) -> shm cache(568.0) -> [compressor(562.0) ->] write-back(567.0)
+shm cache(568.0) -> [compressor(562.0) ->] write-back(567.0)
 </pre>
 <p>There, the shm cache (<code>clio_cte_core_shm_cache_writethru</code>)
 answers metadata from shared memory and the write-back cache

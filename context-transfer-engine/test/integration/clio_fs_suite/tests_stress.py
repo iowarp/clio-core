@@ -511,7 +511,48 @@ def _node_of(writer):
   return (writer - 1) // 10
 
 
-def _buffered_problem(ob, node, by_block):
+class _BlockIndex:
+  """Per-block lookups for the buffered shared stress, built once: a read is
+  then checked in O(log n) instead of rescanning every write to its block
+  (with the data cache the writers made ~10x more writes, and the quadratic
+  scan ran for over an hour after the I/O was done)."""
+
+  def __init__(self, writes):
+    import bisect
+    self._bisect = bisect
+    self.by_id = {}
+    for x in writes:
+      self.by_id.setdefault((x[0], x[1]), x)
+    self.node = {}  # node -> (issue times sorted, suffix-min ack, min ack)
+    per = {}
+    for x in writes:
+      if x[3] is not None:
+        per.setdefault(_node_of(x[0]), []).append(x)
+    for nd, xs in per.items():
+      xs.sort(key=lambda x: x[2])
+      issue = [x[2] for x in xs]
+      suf = [0.0] * len(xs)
+      m = float('inf')
+      for k in range(len(xs) - 1, -1, -1):
+        m = min(m, xs[k][3])
+        suf[k] = m
+      self.node[nd] = (issue, suf, m)
+
+  def acked_before(self, node, t):
+    """A write from `node`, acked, before time t."""
+    e = self.node.get(node)
+    return e is not None and e[2] < t
+
+  def newer_acked_before(self, node, after, t):
+    """A write from `node` issued after `after` and acked before t."""
+    e = self.node.get(node)
+    if e is None:
+      return False
+    k = self._bisect.bisect_right(e[0], after)
+    return k < len(e[0]) and e[1][k] < t
+
+
+def _buffered_problem(ob, node, idx):
   """Check one read of the buffered (no fsync) shared stress; None if ok.
 
   Writes from the reader's own node are visible once write(2) returned,
@@ -519,29 +560,26 @@ def _buffered_problem(ob, node, by_block):
   acked, nor a hole after one. A version from another node may be read at
   any time: without fsync its bytes can land later than this node's own
   write (close-to-open), so it is never "older" in a checkable sense.
+  @param idx the block's _BlockIndex
   """
   b, w, g, t_open, t_done = ob
-  writes = by_block.get(b, [])
   if w in (CORRUPT, FOREIGN):
     return f'block {b}: read {KIND[w]} data'
-  same = [x for x in writes if _node_of(x[0]) == node and x[3] is not None]
   if w == ZERO:
-    if any(x[3] < t_open for x in same):
+    if idx.acked_before(node, t_open):
       return f'block {b}: read a hole after this node wrote it'
     return None
-  mine = [x for x in writes if x[0] == w and x[1] == g]
-  if not mine:
+  mine = idx.by_id.get((w, g))
+  if mine is None:
     return f'block {b}: read ({w},{g}) which was never written there'
-  _, _, ti, ta = mine[0]
+  _, _, ti, ta = mine
   if ti > t_done + SKEW_S:
     return f'block {b}: read ({w},{g}) before it was written'
   if _node_of(w) != node:
     return None
-  for x in same:
-    newer = x[2] > (ta if ta is not None else ti)
-    if newer and x[3] < t_open:
-      return (f'block {b}: read ({w},{g}) after this node wrote '
-              f'({x[0]},{x[1]}) over it')
+  if idx.newer_acked_before(node, ta if ta is not None else ti, t_open):
+    return (f'block {b}: read ({w},{g}) after this node wrote a newer '
+            f'version over it')
   return None
 
 
@@ -550,11 +588,14 @@ def _buffered_candidates(writes):
   node's last write to the block (a node's own writes stay ordered)."""
   if not writes:
     return {(ZERO, 0)}
+  last_issue = {}
+  for w, _, ti, _ in writes:
+    nd = _node_of(w)
+    last_issue[nd] = max(last_issue.get(nd, ti), ti)
   out = set()
   for w, g, ti, ta in writes:
     done = ta if ta is not None else ti
-    node = _node_of(w)
-    if not any(_node_of(x[0]) == node and x[2] > done for x in writes):
+    if not last_issue[_node_of(w)] > done:
       out.add((w, g))
   return out
 
@@ -605,9 +646,12 @@ def t_shared_buffered(ctx):
   results, by_block, finals, nb = _shared_run(ctx, 'shbuf', 90, False,
                                                False)
   problems = []
+  idx_by_block = {}
   for i, r in enumerate(results):
     for ob in r['obs']:
-      pr = _buffered_problem(ob, i, by_block)
+      if ob[0] not in idx_by_block:
+        idx_by_block[ob[0]] = _BlockIndex(by_block.get(ob[0], []))
+      pr = _buffered_problem(ob, i, idx_by_block[ob[0]])
       if pr:
         problems.append(pr)
   diverge, final_bad = [], []

@@ -5,10 +5,16 @@
 #ifndef CLIO_CTE_FILESYSTEM_SHM_FS_CACHE_H_
 #define CLIO_CTE_FILESYSTEM_SHM_FS_CACHE_H_
 
+#include <clio_ctp/thread/lock/timed_mutex.h>
 #include <clio_cte/core/shm_metadata_cache.h>
 #include <clio_cte/filesystem/fs_canonical.h>
 
+#include <atomic>
+#include <cstddef>
+#include <cstring>
 #include <string>
+#include <thread>
+#include <vector>
 
 namespace clio::cte::filesystem {
 
@@ -121,6 +127,264 @@ using ShmFsFileMap =
     ctp::ipc::unordered_map<ShmCacheString, ShmFileRecord, ShmCacheAlloc>;
 
 /**
+ * Pending logical sizes, written by CLIENTS.
+ *
+ * A page write that extends a file raises the file's entry here (an atomic
+ * max under a stripe lock, no task); readers and stat take
+ * max(record size, pending size); the filesystem module drains the entries
+ * to each inode's home in the background (Runtime::SizeDrain) and removes an
+ * entry once the home holds its size. Keyed by the packed tag id.
+ */
+struct ShmSizeSlot {
+  clio::run::u64 key_;    ///< packed tag id; 0 = empty, kTomb = deleted
+  clio::run::u64 end_;    ///< highest byte written + 1
+  clio::run::u64 wtime_;  ///< wall ns of the last write (the new mtime)
+  clio::run::u64 pad_;
+};
+
+/** One lock stripe of the size table. */
+struct ShmSizeStripe {
+  std::atomic<clio::run::u32> lock_;   ///< 0 free, else the holder's pid
+  std::atomic<clio::run::u32> dirty_;  ///< entries present (drain hint)
+};
+
+class ShmSizeTable {
+ public:
+  static constexpr clio::run::u32 kStripes = 64;
+  static constexpr clio::run::u64 kTomb = ~0ull;
+
+  /** A drained entry: the size the home must reach. */
+  struct Entry {
+    clio::run::u64 key;
+    clio::run::u64 end;
+    clio::run::u64 wtime;
+  };
+
+  ShmSizeTable() : retire_seq_(0), slots_per_stripe_(0), slots_rel_(0) {
+    for (auto &s : stripes_) {
+      s.lock_.store(0);
+      s.dirty_.store(0);
+    }
+  }
+
+  /**
+   * Bind the slot array (runtime, once, before ready_).
+   * @param slots the zeroed slot array, in the same segment as this table
+   * @param slots_per_stripe slots in each stripe
+   */
+  void Init(ShmSizeSlot *slots, clio::run::u32 slots_per_stripe) {
+    slots_per_stripe_ = slots_per_stripe;
+    slots_rel_ = reinterpret_cast<char *>(slots) -
+                 reinterpret_cast<char *>(this);
+  }
+
+  /** @return true once Init bound a slot array */
+  bool Valid() const { return slots_per_stripe_ != 0; }
+
+  /**
+   * Count of retirements so far. A reader that found no pending size must
+   * re-read the home's size if this moved during its lookup: the entry may
+   * have been retired after it read the (older) home size.
+   * @return the current retirement count
+   */
+  clio::run::u64 RetireSeq() const {
+    return retire_seq_.load(std::memory_order_acquire);
+  }
+
+  /**
+   * True in the runtime process (set once by the filesystem module): only
+   * it repairs stripes left locked by dead clients.
+   */
+  static bool &RuntimeSide() {
+    static bool runtime = false;
+    return runtime;
+  }
+
+  /**
+   * Repair every stripe a dead process holds (the runtime, periodically).
+   * @return stripes repaired
+   */
+  clio::run::u32 RepairDead() {
+    if (!Valid()) return 0;
+    clio::run::u32 n = 0;
+    for (clio::run::u32 s = 0; s < kStripes; ++s) {
+      const clio::run::u32 h = stripes_[s].lock_.load(std::memory_order_acquire);
+      if (h != 0 && RepairStripe(s, h)) ++n;
+    }
+    return n;
+  }
+
+  /**
+   * Raise a file's pending size.
+   * @param key packed tag id (nonzero)
+   * @param end highest byte written + 1
+   * @param wtime wall ns of the write
+   * @return false when the key's stripe is full (caller publishes itself)
+   */
+  bool Raise(clio::run::u64 key, clio::run::u64 end, clio::run::u64 wtime) {
+    if (!Valid() || key == 0 || key == kTomb) return false;
+    const clio::run::u32 s = StripeOf(key);
+    Lock(s);
+    ShmSizeSlot *slot = FindLocked(s, key, /*insert=*/true);
+    if (slot != nullptr) {
+      if (end > slot->end_) slot->end_ = end;
+      if (wtime > slot->wtime_) slot->wtime_ = wtime;
+    }
+    Unlock(s);
+    return slot != nullptr;
+  }
+
+  /**
+   * @param key packed tag id
+   * @return the file's pending size, 0 when none
+   */
+  clio::run::u64 Get(clio::run::u64 key) {
+    if (!Valid() || key == 0 || key == kTomb) return 0;
+    const clio::run::u32 s = StripeOf(key);
+    if (stripes_[s].dirty_.load(std::memory_order_acquire) == 0) return 0;
+    Lock(s);
+    ShmSizeSlot *slot = FindLocked(s, key, /*insert=*/false);
+    const clio::run::u64 end = slot != nullptr ? slot->end_ : 0;
+    Unlock(s);
+    return end;
+  }
+
+  /**
+   * Copy every pending entry out (the drain's view).
+   * @param out receives the entries
+   */
+  void Snapshot(std::vector<Entry> *out) {
+    if (!Valid()) return;
+    for (clio::run::u32 s = 0; s < kStripes; ++s) {
+      if (stripes_[s].dirty_.load(std::memory_order_acquire) == 0) continue;
+      Lock(s);
+      ShmSizeSlot *base = Slots() + s * slots_per_stripe_;
+      for (clio::run::u32 i = 0; i < slots_per_stripe_; ++i) {
+        if (base[i].key_ != 0 && base[i].key_ != kTomb) {
+          out->push_back(Entry{base[i].key_, base[i].end_, base[i].wtime_});
+        }
+      }
+      Unlock(s);
+    }
+  }
+
+  /**
+   * Remove an entry the home now covers -- only if no write raised it since
+   * the drain read it (a raise stays for the next drain).
+   * @param key packed tag id
+   * @param end the size the home reached
+   */
+  void Retire(clio::run::u64 key, clio::run::u64 end) {
+    if (!Valid()) return;
+    const clio::run::u32 s = StripeOf(key);
+    Lock(s);
+    ShmSizeSlot *slot = FindLocked(s, key, /*insert=*/false);
+    if (slot != nullptr && slot->end_ <= end) {
+      slot->key_ = kTomb;
+      slot->end_ = 0;
+      slot->wtime_ = 0;
+      stripes_[s].dirty_.fetch_sub(1, std::memory_order_acq_rel);
+      retire_seq_.fetch_add(1, std::memory_order_acq_rel);
+    }
+    Unlock(s);
+  }
+
+ private:
+  static clio::run::u32 StripeOf(clio::run::u64 key) {
+    return static_cast<clio::run::u32>((key * 0x9E3779B97F4A7C15ull) >> 58);
+  }
+
+  ShmSizeSlot *Slots() {
+    return reinterpret_cast<ShmSizeSlot *>(reinterpret_cast<char *>(this) +
+                                           slots_rel_);
+  }
+
+  void Lock(clio::run::u32 s) {
+    auto &l = stripes_[s].lock_;
+    const clio::run::u32 me = ctp::TimedMutex::MyPid();
+    for (clio::run::u32 spin = 1;; ++spin) {
+      clio::run::u32 expect = 0;
+      if (l.compare_exchange_weak(expect, me, std::memory_order_acquire)) {
+        return;
+      }
+      std::this_thread::yield();
+      // The runtime (never a client) recovers a stripe whose holder died:
+      // it may be the very thread the periodic repair needs.
+      if (RuntimeSide() && spin % kStallSpins == 0) RepairStripe(s, expect);
+    }
+  }
+
+  void Unlock(clio::run::u32 s) {
+    stripes_[s].lock_.store(0, std::memory_order_release);
+  }
+
+  /** Yields between a runtime waiter's liveness checks of a holder. */
+  static constexpr clio::run::u32 kStallSpins = 4096;
+
+  /**
+   * Recover stripe `s` if `holder` (its lock word) is a dead process: the
+   * held section only edits one slot, so the slot stands as written; the
+   * dirty count is recounted (the dead raise may have inserted without
+   * counting), then the lock is released.
+   * @return true when repaired
+   */
+  bool RepairStripe(clio::run::u32 s, clio::run::u32 holder) {
+    if (holder == 0 || holder == ctp::TimedMutex::MyPid() ||
+        ctp::TimedMutex::IsProcessAlive(holder, 0)) {
+      return false;
+    }
+    auto &l = stripes_[s].lock_;
+    if (l.load(std::memory_order_acquire) != holder) return false;
+    ShmSizeSlot *base = Slots() + s * slots_per_stripe_;
+    clio::run::u32 live = 0;
+    for (clio::run::u32 i = 0; i < slots_per_stripe_; ++i) {
+      if (base[i].key_ != 0 && base[i].key_ != kTomb) ++live;
+    }
+    stripes_[s].dirty_.store(live, std::memory_order_release);
+    clio::run::u32 expect = holder;
+    return l.compare_exchange_strong(expect, 0, std::memory_order_release);
+  }
+
+  /**
+   * Find (or insert) a key inside its stripe; the stripe lock is held.
+   * @param s stripe
+   * @param key packed tag id
+   * @param insert insert when absent
+   * @return the slot, or nullptr (absent, or stripe full on insert)
+   */
+  ShmSizeSlot *FindLocked(clio::run::u32 s, clio::run::u64 key, bool insert) {
+    ShmSizeSlot *base = Slots() + s * slots_per_stripe_;
+    const clio::run::u32 start = static_cast<clio::run::u32>(
+        (key ^ (key >> 29)) % slots_per_stripe_);
+    ShmSizeSlot *tomb = nullptr;
+    for (clio::run::u32 i = 0; i < slots_per_stripe_; ++i) {
+      ShmSizeSlot *slot = base + (start + i) % slots_per_stripe_;
+      if (slot->key_ == key) return slot;
+      if (slot->key_ == kTomb) {
+        if (tomb == nullptr) tomb = slot;
+        continue;
+      }
+      if (slot->key_ == 0) {
+        if (!insert) return nullptr;
+        if (tomb == nullptr) tomb = slot;
+        break;
+      }
+    }
+    if (!insert || tomb == nullptr) return nullptr;
+    tomb->key_ = key;
+    tomb->end_ = 0;
+    tomb->wtime_ = 0;
+    stripes_[s].dirty_.fetch_add(1, std::memory_order_acq_rel);
+    return tomb;
+  }
+
+  ShmSizeStripe stripes_[kStripes];
+  std::atomic<clio::run::u64> retire_seq_;  ///< bumped by every Retire
+  clio::run::u32 slots_per_stripe_;
+  std::ptrdiff_t slots_rel_;  ///< slot array, relative to this table
+};
+
+/**
  * Root of the filesystem chimod's shared-memory cache (issue #817).
  *
  * Written only by the runtime, attached read-mostly by clients, never
@@ -129,7 +393,7 @@ using ShmFsFileMap =
  * modules' roots rather than competing for one slot.
  */
 struct ShmFsCacheRoot {
-  static constexpr clio::run::u32 kLayoutVersion = 4;
+  static constexpr clio::run::u32 kLayoutVersion = 7;
 
   clio::run::u32 version_;
   clio::run::u32 ready_;  /**< 0 until fully constructed; clients must check */
@@ -147,6 +411,8 @@ struct ShmFsCacheRoot {
    *  FsCanonicalPath, which every reader and writer applies (Key). */
   clio::run::u32 case_insensitive_;
   ShmFsFileMap path_to_file_;
+  /** Pending sizes raised by clients' page writes (see ShmSizeTable). */
+  ShmSizeTable sizes_;
 
   ShmFsCacheRoot()
       : version_(0), ready_(0), overflow_(0), nsgen_(0),
@@ -171,6 +437,9 @@ struct ShmFsCacheRoot {
  */
 class ShmFsCache {
  public:
+  /** Pending-size slots (32 B each): files written and not yet drained. */
+  static constexpr size_t kSizeSlots = 64 * 1024;
+
   ShmFsCache() = default;
 
   /**
@@ -213,6 +482,15 @@ class ShmFsCache {
         root_ = nullptr;
         alloc_ = nullptr;
         return false;
+      }
+      // The size table: kSizeSlots slots over the stripes. Without it page
+      // writes publish sizes themselves (a task), so failing it is not fatal.
+      const size_t size_bytes = sizeof(ShmSizeSlot) * kSizeSlots;
+      auto sp = alloc_->template Allocate<char>(size_bytes);
+      if (!sp.IsNull()) {
+        std::memset(sp.ptr_, 0, size_bytes);
+        root_->sizes_.Init(reinterpret_cast<ShmSizeSlot *>(sp.ptr_),
+                           kSizeSlots / ShmSizeTable::kStripes);
       }
       root_->version_ = ShmFsCacheRoot::kLayoutVersion;
       // ready_ before publication, for the same ordering reason as the core

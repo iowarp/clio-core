@@ -98,6 +98,9 @@ runtime:
   queue_depth: 1024                    # Task queue depth per worker
   local_sched: "default"               # Local task scheduler algorithm
   first_busy_wait: 10000               # Microseconds to busy-wait before sleeping (10ms)
+  # max_sleep: 50000                   # Longest a parked worker sleeps before
+  #                                    # re-polling its lanes (us, default 50 ms):
+  #                                    # the bound on a missed wakeup.
   # Shared-memory segments of a client process that died are reclaimed once
   # it has no task in flight and has been dead and idle this many seconds
   # (#1192). 0 = never while the runtime runs; they are then cleaned up at
@@ -415,7 +418,7 @@ compose:
   #   pool_name: clio_cae_summarizer
   #   pool_query: local
   #   pool_id: "401.0"
-  #   next_pool_id: "564.0"             # chain top (indexer), as CAE uses
+  #   next_pool_id: "568.0"             # chain top (shm cache), as CAE uses
   #   label_endpoint: "http://127.0.0.1:11434"   # inference server base URL
   #   label_api: ollama                 # ollama (default): POST
   #                                     #   {label_endpoint}/api/generate
@@ -627,14 +630,17 @@ compose:
   # and stack via next_pool_id, separating RELIABILITY (replication) from
   # LOCALITY (cache) from ENCODING (compression). The canonical full chain:
   #
-  #   indexer(564.0) -> shm cache(568.0) -> [compressor(562.0) ->]
+  #   [indexer(564.0) ->] shm cache(568.0) -> [compressor(562.0) ->]
   #     core_persist_write_back(567.0)
   #     -> volatile core(540.0)
-  #     -> replication(561.0) -> persistent core(512.0)
+  #     -> [replication(561.0) ->] persistent core(512.0)
+  #
+  # The default compose omits the layers in brackets; the shm cache is the
+  # top of the chain.
   #
   # Point any clio::cte::core::Client (or the filesystem chimod below) at
-  # the TOP pool and the whole chain is transparent: the indexer notes the
-  # write, the optional compressor encodes it, and the write-back cache
+  # the TOP pool and the whole chain is transparent: the indexer (when
+  # composed) notes the write, the optional compressor encodes it, and the write-back cache
   # lands it in the volatile core and acks; the cache later flushes it
   # through replication to the persistent core. A read is served from the
   # volatile copy when there is one, else from persistent. Order in this
@@ -651,14 +657,19 @@ compose:
   #     readable and writable while its owner is down, and changes made
   #     meanwhile are handed back when it returns.
   # Every other core op is forwarded to next_pool_id untouched.
-  - mod_name: clio_cte_replication
-    pool_name: clio_cte_replication
-    pool_query: local
-    pool_id: "561.0"
-    next_pool_id: "512.0"               # CTE core pool — see entry above
-    replication_factor: 1               # total durable copies (default 1)
-    cache_score: 1.0                    # DRAM re-cache placement score
-    replica_score: 0.2                  # disk copies' score = drop threshold
+  #
+  # NOT in the default compose: on one machine replication_factor 1 keeps no
+  # extra copy, so the layer only adds per-write bookkeeping. Enable it for a
+  # multi-node deployment: uncomment this entry and point the write-back
+  # cache's next_persistent and the stream's staging_pool_id at "561.0".
+  # - mod_name: clio_cte_replication
+  #   pool_name: clio_cte_replication
+  #   pool_query: local
+  #   pool_id: "561.0"
+  #   next_pool_id: "512.0"             # CTE core pool — see entry above
+  #   replication_factor: 1             # total durable copies (default 1)
+  #   cache_score: 1.0                  # DRAM re-cache placement score
+  #   replica_score: 0.2                # disk copies' score = drop threshold
     # ADVANCED overrides of what replication_factor sets:
     # remote_copies: copies on the next containers by hash (other nodes).
     #   Default: replication_factor - 1.
@@ -725,7 +736,7 @@ compose:
     pool_query: local
     pool_id: "567.0"
     next_volatile: "540.0"              # volatile core (required)
-    next_persistent: "561.0"            # replication -> persistent core;
+    next_persistent: "512.0"            # persistent core (561.0 with replication);
                                         #   omit for a volatile-only cache
     fill: on_hit_count:2                # on_hit_count:N | on_read_miss | none
     evict: lru                          # lru | lfu
@@ -803,25 +814,37 @@ compose:
   # there (and, unless md_only, blob bytes): a hit completes in the client
   # with no task; a miss fetches from the owner and caches the answer. Each
   # entry's home tracks which nodes cache it and invalidates them when it
-  # changes. md_only: true here because the write-back cache below already
-  # holds the bytes. The CTE core's Create returns this cache's segment keys
+  # changes. It holds blob bytes too (md_only: false): that is the clio-fs
+  # client-side data cache -- a page write is a memcpy into the segment, not
+  # a task -- and md_only: true would send every page write to the runtime.
+  # The CTE core's Create returns this cache's segment keys
   # (pid, pool, root offset, entry pool) for the core at the bottom of its
-  # chain; CLIO_CTE_CLIENT_INIT then binds the process to entry_pool_id (the
-  # indexer) and maps the segment. A process that cannot map it (TCP client,
+  # chain; CLIO_CTE_CLIENT_INIT then binds the process to entry_pool_id (this
+  # pool unless set; the indexer's 564.0 when it is composed above) and maps
+  # the segment. A process that cannot map it (TCP client,
   # remote node) stays on the task path.
   - mod_name: clio_cte_core_shm_cache_writethru
     pool_name: clio_cte_core_shm_cache_writethru
     pool_query: local
     pool_id: "568.0"
     next_pool_id: "567.0"               # write-back cache (562.0 with compressor)
-    entry_pool_id: "564.0"              # clients bind to the indexer above
-    md_only: true                       # bytes are cached by the write-back cache
+    # entry_pool_id: "564.0"            # with the indexer composed above
+    md_only: false                      # cache blob bytes (clio-fs page writes)
+    # Data mode is a distributed cache: on every node it caches bytes,
+    # coherent through each blob's home (sharer invalidation) and correct
+    # across node failures (blobs homed on a down node bypass the cache).
+    # sharer_log_path: "${CLIO_STORAGE_ROOT}/cte_wtc_sharers"
+    #   Write-ahead log of each blob home's sharer directory (which nodes
+    #   cache the blob); the container appends ".<container id>". Replayed on
+    #   a warm restart, so a home that restarts still invalidates copies
+    #   cached before it went down. Unset: the directory is memory only and
+    #   such copies can stay stale after a home restart.
     # Writes send no invalidation of their own: the write-back cache below
     # lands each flushed range through this pool on the blob's home, which
     # invalidates its sharers then. Only with a write-back cache below whose
     # flush_pool is this pool; false (default) invalidates on every write.
     invalidate_on_flush: true
-    capacity: "256M"                    # segment bytes: buffers + tables + log
+    capacity: "2G"                      # segment bytes: buffers + tables + log
     # Extent mode (only with md_only: false): keep blob bytes in a node-local
     # RAM bdev instead of this cache's own segment. The cache leases
     # data_capacity bytes of data_pool and stores each blob as up to 8 runs
@@ -837,7 +860,7 @@ compose:
     flush_shards: 8                     # parallel MultiPutBlob tasks for this node's own blobs
     flush_depth: 4                      # flush batches in flight (staging overlaps landing)
     max_tags: 4096                      # tags tracked (new-tag completeness)
-    max_blobs: 65536                    # blob entries (metadata + buffers)
+    max_blobs: 262144                   # blob entries (a kernel checkout is ~97k files)
     max_fill: "16M"                     # larger blobs are read, not cached
     evict_sample: 16                    # clean entries sampled per eviction
     half_life_ms: 10000                 # frecency decay half-life
@@ -848,12 +871,17 @@ compose:
     # flusher for fewer write-arounds.
     nospace_wait_ms: 250
 
-  - mod_name: clio_cte_indexer
-    pool_name: clio_cte_indexer
-    pool_query: local
-    pool_id: "564.0"
-    next_pool_id: "568.0"               # shm cache below the indexer (see entry above)
-    index_log_path: "${CLIO_STORAGE_ROOT}/cte_indexer_index"
+  # NOT in the default compose: indexing every written byte costs CPU,
+  # memory and write throughput, so enable it deliberately and scope it with
+  # tag_re/blob_re. To enable: uncomment this entry, set the shm cache's
+  # entry_pool_id to "564.0", and point the CAE, stream and filesystem
+  # entries' next_pool_id at "564.0".
+  # - mod_name: clio_cte_indexer
+  #   pool_name: clio_cte_indexer
+  #   pool_query: local
+  #   pool_id: "564.0"
+  #   next_pool_id: "568.0"             # shm cache below the indexer (see entry above)
+  #   index_log_path: "${CLIO_STORAGE_ROOT}/cte_indexer_index"
     # index_sweep_period_ms: 100        # async drain cadence (0 = lazy)
     # index_wal_compact_bytes: "8MB"    # WAL size that triggers compaction
     # tag_re: ".*"                      # index scope: only matching tags...
@@ -863,14 +891,15 @@ compose:
   # Assimilation / discovery entrypoint at its own pool 400.0
   # (clio::cae::core::kCaePoolId). CEE calls ParseOmni here; CAE forwards
   # the data-path tasks it owns to next_pool_id. It points at the top of the
-  # operator chain (the indexer, 564.0), not a bare core, so imported data
-  # passes through the indexer and is keyword-searchable (#1242); it is
-  # composed here, after the chain it forwards to exists.
+  # operator chain (the shm cache, 568.0), not a bare core, so imported data
+  # passes through every layer of the chain -- including the indexer when it
+  # is enabled, which makes it keyword-searchable (#1242); it is composed
+  # here, after the chain it forwards to exists.
   - mod_name: clio_cae_core
     pool_name: cae_main
     pool_query: local
     pool_id: "400.0"
-    next_pool_id: "564.0"               # chain top (indexer) — see entry above
+    next_pool_id: "568.0"               # chain top (shm cache) — see entry above
     # Local paths CAE may read (file:: and hdf5:: sources) and write
     # (ExportData). Clients choose these paths and the runtime does not
     # authenticate clients, so list the data directories here. Unset: any
@@ -893,11 +922,11 @@ compose:
     pool_name: clio_cte_stream
     pool_query: local
     pool_id: "565.0"
-    next_pool_id: "564.0"               # data path: the chain top (indexer)
+    next_pool_id: "568.0"               # data path: the chain top (shm cache)
     # Where staged (not yet merged) appends are written. They are written
     # once and read at most once, after a restart, so skip the cache.
     # Default: next_pool_id.
-    staging_pool_id: "561.0"            # replication (durable, uncached)
+    staging_pool_id: "512.0"            # persistent core (durable, uncached)
     # Node-local log of the sizes, merge plans and merged-append names of
     # the streams this node homes (the container id is appended). Without it
     # file sizes do not survive a stop and `clio_run start`. Default: unset.
@@ -953,7 +982,7 @@ compose:
     # REQUIRED: the pool its pages go through (no default). Clients find
     # this filesystem by pool_name (CLIO_CFS_POOL overrides) and learn this
     # chain and the stream pool from it.
-    next_pool_id: "564.0"               # chain top (indexer) — see entries above
+    next_pool_id: "568.0"               # chain top (shm cache) — see entries above
     # No metadata server. Names live in the inode table: each directory's
     # rows (name -> inode) are split into table blocks, each block has one
     # home container that holds it in memory, and every node caches what it

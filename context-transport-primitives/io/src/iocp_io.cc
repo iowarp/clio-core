@@ -281,10 +281,17 @@ bool IocpAsyncIO::Open(const std::string &path, int flags, mode_t mode) {
   // the old eager behaviour.
   MarkSparse(impl_->regular_fd);
 
+  // Unbuffered, like Linux's O_DIRECT fd -- but NOT write-through. With
+  // FILE_FLAG_WRITE_THROUGH every 4 KiB metadata write (directory blocks,
+  // inode records) waited for the drive to commit it to stable media
+  // (~100-200 us on NVMe each), which made a file create cost ~0.6 ms.
+  // Durability does not depend on it: fsync, the periodic flush and a
+  // graceful stop all call SyncFileData (_commit -> FlushFileBuffers), which
+  // flushes the file and the drive's cache, the same contract as fdatasync
+  // over an O_DIRECT fd on Linux.
   impl_->direct_fd = ::CreateFileA(
       path.c_str(), access, share, nullptr, OPEN_EXISTING,
-      FILE_FLAG_OVERLAPPED | FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH,
-      nullptr);
+      FILE_FLAG_OVERLAPPED | FILE_FLAG_NO_BUFFERING, nullptr);
   // direct_fd may be INVALID_HANDLE_VALUE; that's fine, we fall back to
   // the regular (buffered) handle for every op.
 

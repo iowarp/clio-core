@@ -44,7 +44,7 @@ interface:</p>
 <h2>Where it sits</h2>
 <p>It takes the write-back cache's place in the chain:</p>
 <pre data-label="text">
-indexer(564.0) -> shm cache(568.0) -> [compressor(562.0) ->]
+[indexer(564.0) ->] shm cache(568.0) -> [compressor(562.0) ->]
   core_persist_write_thru
   -> volatile core(540.0)
   -> replication(561.0) -> persistent core(512.0)

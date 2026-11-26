@@ -36,7 +36,7 @@ data = ctx.context_retrieve("run42.*", ".*", max_results=5,
 <p>The engine stores nothing of its own. Files written through a Context FS mount, objects put through the Context Transfer Engine and data imported by the assimilation engine are all tags and blobs, so they are all queryable the moment they are written. <code>context_bundle</code> imports new sources through the assimilation engine in the same call style.</p>
 
 <h2>Composed for search</h2>
-<p>What the engine can find depends on the stack you compose: keep the indexer in the chain so every writer is indexed, add the summarizer for content labels, and give retrieval a fast tier. The defaults already do the first; the <a href="/docs/cee/usage.html#composing-storage-for-search">docs</a> show the rest.</p>
+<p>What the engine can find depends on the stack you compose: compose the indexer and route every writer through it, add the summarizer for content labels, and give retrieval a fast tier. The indexer is opt-in and not in the default compose; the <a href="/docs/cee/usage.html#composing-storage-for-search">docs</a> show the rest.</p>
 
 <h2 id="source-build">Build from source</h2>
 <p>A source build has many settings and configurations to optimize the installation for your specific system. We keep an <a href="https://github.com/iowarp/clio-core/blob/main/INSTALL.md"><code>INSTALL.md</code></a> in the root of the repository, written to help AI agents install CLIO Core. Build from source to tune the Context Exploration Engine for your machine or to build its Python bindings against your own interpreter. To have a coding agent do it, give it a prompt like this:</p>

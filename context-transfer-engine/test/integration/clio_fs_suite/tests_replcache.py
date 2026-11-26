@@ -303,6 +303,33 @@ def t_cache_holder_crash(ctx):
                         f'overwrite)')
 
 
+@test('cache_home_restart_invalidates', 'repl', min_nodes=3,
+      redeploy_after=True, timeout=1800)
+def t_cache_home_restart(ctx):
+  """A reader caches copies of a file's pages; every OTHER node but the
+  writer (the homes of most of those pages) crashes and restarts, then node0
+  overwrites the file with fsync. A blob's home invalidates the nodes that
+  registered a copy with it; a restarted home must still know them (its
+  sharer directory is logged), or the reader keeps serving the old bytes."""
+  n = len(ctx.hosts)
+  path, reader, seed = _cache_setup(ctx, 'hr')
+  homes = [i for i in range(n) if i not in (0, reader)]
+  if not homes:
+    raise TestUnsupported('no node besides the writer and the reader')
+  for i in homes:
+    _stop_node(ctx, i)
+  for i in homes:
+    _start_node(ctx, i)
+  ctx.ok(0, 'write_file', path=path, size=SIZE, seed=seed + 11, fsync=True,
+         timeout=600)
+  st = _verify(ctx, reader, path, SIZE, seed + 11)
+  ctx.metrics['reader_after_home_restart'] = st
+  if st != 'ok':
+    _diagnose_first_wrong(ctx)
+  ctx.check(st == 'ok', f'node{reader} after its homes {homes} restarted: '
+                        f'{st} (wanted the overwrite)')
+
+
 @test('cache_holder_partitioned_misses_overwrite', 'repl', min_nodes=3,
       redeploy_after=True, timeout=1800)
 def t_cache_holder_partitioned(ctx):

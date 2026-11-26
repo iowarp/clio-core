@@ -309,6 +309,11 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
            "(files={})", capacity);
     }
   }
+  // The namespace segment: namespace and appends on one node, appends only
+  // on a multi-node volume (its namespace stays with the module).
+  FormatNsSegment(fields->new_pool_id_, shm_fs_cache_.IsEnabled());
+  // The clients' first block of inode ids, before any of them can create.
+  CLIO_CO_AWAIT(RefillNsIds());
   HLOG(kInfo, "filesystem: container {} over CTE pool {} (namespace hash "
        "sharded across {} containers)", container_id_,
        next_pool_id_.ToString(), NumContainers());
@@ -389,6 +394,70 @@ void Runtime::EnsurePurgeDrain() {
   // path. A periodic task never completes, so the future is dropped.
   self_.AsyncShardOp(kShardPurgeDrain, std::string(),
                      clio::run::PoolQuery::Local(), 20000.0);
+  // Periodic (100 us): the shared-memory namespace's log, applied promptly
+  // (see NsFastTick). The only caller of NsDrain, so one drainer pops it.
+  if (ns_view_.Ready()) {
+    self_.AsyncShardOp(kShardNsDrain, std::string(),
+                       clio::run::PoolQuery::Local(), 100.0);
+    // Periodic (1 ms): the clients' inode-id block, refilled on its own. The
+    // drain also refills, but only between log ops: one op stuck behind a
+    // slow chain call (a delete waiting on the shm cache's flush) left the
+    // clients without ids, and every create failed EIO after 10 s.
+    self_.AsyncShardOp(kShardNsIds, std::string(),
+                       clio::run::PoolQuery::Local(), 1000.0);
+  }
+}
+
+void Runtime::FormatNsSegment(const clio::run::PoolId &pool,
+                              bool namespace_on) {
+  const char *off = clio::run::env::GetCompat("CFS_SHM_NAMESPACE");
+  if (off != nullptr && *off == '0') {
+    HLOG(kInfo, "filesystem: shared-memory namespace disabled "
+         "(CLIO_CFS_SHM_NAMESPACE=0)");
+    return;
+  }
+  auto *ipc = CLIO_IPC;
+  auto *alloc = ipc != nullptr ? ipc->GetMetadataAllocator() : nullptr;
+  auto *dir = ipc != nullptr ? ipc->GetMetadataDirectory() : nullptr;
+  if (alloc == nullptr || dir == nullptr) return;  // no metadata segment
+  ns::Limits lim;
+  if (const char *e = clio::run::env::GetCompat("CFS_SHM_NS_ENTRIES")) {
+    const unsigned long long v = std::strtoull(e, nullptr, 10);
+    if (v > 0) {
+      lim.max_inodes_ = static_cast<clio::run::u32>(v);
+      lim.max_dentries_ = static_cast<clio::run::u32>(v);
+    }
+  }
+  const clio::run::u32 pid =
+      static_cast<clio::run::u32>(ctp::SystemInfo::GetPid());
+  const std::string name = ns::SegmentName(pid, pool.ToU64());
+  // A fresh volume has nothing the table lacks: its root starts complete.
+  // After a restart the volume's names are filled in on first touch.
+  if (!ns_view_.Format(name, lim, case_insensitive_, FsPack(FsRootId()),
+                       /*root_complete=*/!is_restart_,
+                       static_cast<clio::run::u32>(container_id_),
+                       namespace_on)) {
+    HLOG(kWarning, "filesystem: could not create the shared-memory "
+         "namespace segment {}; clients use namespace tasks", name);
+    return;
+  }
+  auto loc = alloc->template Allocate<ns::Locator>(sizeof(ns::Locator));
+  if (loc.IsNull()) {
+    HLOG(kWarning, "filesystem: no room for the namespace locator; clients "
+         "use namespace tasks");
+    return;
+  }
+  ns::Locator *l = loc.ptr_;
+  l->magic_ = ns::Locator::kMagic;
+  l->pid_ = pid;
+  l->ready_.store(1, std::memory_order_release);
+  dir->RegisterRoot(ns::LocatorKey(pool.ToU64()),
+                    static_cast<clio::run::u64>(
+                        reinterpret_cast<char *>(l) -
+                        reinterpret_cast<char *>(alloc)));
+  HLOG(kInfo, "filesystem: shared-memory {} {} (inodes={}, entries={}, "
+       "log={} B)", namespace_on ? "namespace" : "append segment", name,
+       lim.max_inodes_, lim.max_dentries_, lim.log_bytes_);
 }
 
 // ===========================================================================

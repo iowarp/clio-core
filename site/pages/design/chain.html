@@ -23,46 +23,53 @@ copy, where, and when.</p>
     <rect class="box alt" x="20" y="20" width="200" height="56" rx="8"/><text class="title" x="36" y="44">Filesystem (clio-fs)</text><text class="muted" x="36" y="62">namespace, inodes</text>
     <rect class="box alt" x="20" y="100" width="200" height="56" rx="8"/><text class="title" x="36" y="124">Stream</text><text class="muted" x="36" y="142">file sizes, ordered appends</text>
     <rect class="box alt" x="20" y="180" width="200" height="56" rx="8"/><text class="title" x="36" y="204">Applications / adapters</text><text class="muted" x="36" y="222">core client API</text>
-    <rect class="box hl" x="330" y="20" width="240" height="56" rx="8"/><text class="title" x="346" y="44">Indexer (564)</text><text class="muted" x="346" y="62">BM25 semantic search; chain top</text>
-    <rect class="box hl" x="330" y="100" width="240" height="56" rx="8"/><text class="title" x="346" y="124">Shm cache (568)</text><text class="muted" x="346" y="142">metadata in shared memory</text>
+    <rect class="box" x="330" y="20" width="240" height="56" rx="8" stroke-dasharray="5 4"/><text class="title" x="346" y="44">Indexer (564, optional)</text><text class="muted" x="346" y="62">BM25 search; opt-in</text>
+    <rect class="box hl" x="330" y="100" width="240" height="56" rx="8"/><text class="title" x="346" y="124">Shm cache (568)</text><text class="muted" x="346" y="142">chain top; metadata in shm</text>
     <rect class="box" x="330" y="180" width="240" height="56" rx="8" stroke-dasharray="5 4"/><text class="title" x="346" y="204">Compressor (562, optional)</text><text class="muted" x="346" y="222">encode down, decode up</text>
     <rect class="box hl" x="330" y="260" width="240" height="56" rx="8"/><text class="title" x="346" y="284">Write-back cache (567)</text><text class="muted" x="346" y="302">ack in RAM, flush later</text>
     <rect class="box hl" x="330" y="340" width="240" height="50" rx="8"/><text class="title" x="346" y="370">Volatile CTE core (540)</text>
     <rect class="box hl" x="640" y="180" width="200" height="56" rx="8"/><text class="title" x="656" y="204">Replication (561)</text><text class="muted" x="656" y="222">remote copies, failover</text>
     <rect class="box hl" x="640" y="260" width="200" height="56" rx="8"/><text class="title" x="656" y="284">Persistent CTE core</text><text class="muted" x="656" y="302">512, with the metadata log</text>
-    <path class="edge hl" d="M450,76 L450,98" marker-end="url(#ah4)"/>
+    <path class="edge" d="M450,76 L450,98" marker-end="url(#ah4)" stroke-dasharray="5 4"/>
     <path class="edge hl" d="M450,156 L450,178" marker-end="url(#ah4)"/>
     <path class="edge hl" d="M450,236 L450,258" marker-end="url(#ah4)"/>
     <path class="edge hl" d="M450,316 L450,338" marker-end="url(#ah4)"/>
     <path class="edge hl" d="M570,288 L605,288 L605,208 L638,208" marker-end="url(#ah4)"/>
     <text class="muted" x="578" y="250">flush</text>
     <path class="edge hl" d="M740,236 L740,258" marker-end="url(#ah4)"/>
-    <path class="edge" d="M220,48 L328,48" marker-end="url(#ah4)"/>
-    <path class="edge" d="M220,128 L270,128 L270,56 L328,56" marker-end="url(#ah4)"/>
-    <path class="edge" d="M220,208 L290,208 L290,64 L328,64" marker-end="url(#ah4)"/>
+    <path class="edge" d="M220,48 L270,48 L270,116 L328,116" marker-end="url(#ah4)"/>
+    <path class="edge" d="M220,128 L328,128" marker-end="url(#ah4)"/>
+    <path class="edge" d="M220,208 L290,208 L290,140 L328,140" marker-end="url(#ah4)"/>
     <path class="edge" d="M20,140 L8,140 L8,404 L620,404 L620,226 L638,226" marker-end="url(#ah4)"/>
     <text class="muted" x="128" y="398">stream: staged appends</text>
     <rect class="box" x="640" y="20" width="200" height="56" rx="8" stroke-dasharray="5 4"/><text class="title" x="656" y="44">Checkpoint</text><text class="muted" x="656" y="62">fault handler, on demand</text>
     <path class="edge" d="M840,48 L852,48 L852,288 L842,288" marker-end="url(#ah4)"/>
     <text class="muted" x="740" y="140">lazy-copy reads</text>
   </svg>
-  <figcaption>The default composition. The indexer sits on top and above
-  the compressor, so it sees logical bytes. The shm cache answers metadata
-  from shared memory in the client's process. The write-back cache
+  <figcaption>The default composition. The shm cache is the top of the
+  chain and answers metadata from shared memory in the client's process.
+  The indexer is not composed by default; when you enable it, it sits on
+  top, above the compressor, so it sees logical bytes. The write-back cache
   acknowledges a write once it is in the volatile core, and flushes it
   through replication to the persistent core. The compressor entry is
-  shipped commented out, and checkpoint pools are created on demand. The
+  shipped commented out, as is the indexer, and checkpoint pools are
+  created on demand. The
   cache module described below (563.0) is optional and not composed by
   default.</figcaption>
 </figure>
 
 <h3>Why this order</h3>
 <ul>
-  <li><strong>Indexer on top.</strong> Every writer (the filesystem, the
-  stream module, the CAE) forwards to 564.0, so everything written is
-  indexed. The indexer re-reads blobs to tokenize them, and needs the
-  logical, uncompressed bytes, so it sits above the compressor.</li>
-  <li><strong>Shm cache below the indexer.</strong> Client processes map
+  <li><strong>Indexer on top, when composed.</strong> It is opt-in: the
+  default compose leaves it commented out, because indexing every written
+  byte costs CPU, memory and write throughput. To enable it, uncomment its
+  entry, set the shm cache's <code>entry_pool_id</code> to 564.0, and point
+  the filesystem, stream and CAE entries' <code>next_pool_id</code> at
+  564.0, so everything they write is indexed. The indexer re-reads blobs to
+  tokenize them, and needs the logical, uncompressed bytes, so it sits
+  above the compressor.</li>
+  <li><strong>Shm cache at the top by default.</strong> The filesystem,
+  stream module and CAE forward to 568.0. Client processes map
   its segment and answer metadata lookups with no task. It is
   <code>md_only</code> because the write-back cache holds the bytes.</li>
   <li><strong>Write-back cache at the bottom.</strong> It owns every
@@ -202,7 +209,10 @@ are the first thing reclaimed.</p>
 
 <h2 id="indexer">Indexer: semantic search</h2>
 <p>The indexer owns the core's semantic-search operation. Before it
-existed, every search re-read and re-tokenized every candidate blob.</p>
+existed, every search re-read and re-tokenized every candidate blob. It is
+not in the default compose, so search needs it composed (see
+<a href="#pattern">why this order</a>); scope it with <code>tag_re</code>
+and <code>blob_re</code> so only the data you will search is tokenized.</p>
 <ul>
   <li><strong>A forward index.</strong> Each container keeps, for each
   blob it owns, a map of term frequencies and a document length. It is not

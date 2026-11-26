@@ -24,7 +24,7 @@ $ clio-run start --disk /scratch/$USER/clio   # keep persistent state on scratch
 </pre>
 <div class="callout">
   <span class="callout-title">What the default configuration gives you</span>
-  <p>A RAM tier sized to 80% of system memory, a 10 GB persistent disk tier under <code>~/.clio</code>, a metadata log, the replication, index and cache layers, the stream pool and the filesystem pool. That is enough for this whole page.</p>
+  <p>A RAM tier sized to 80% of system memory, a 10 GB disk tier under <code>~/.clio</code> (persistence level <code>temporary</code>), a metadata log, the replication and cache layers, the stream pool and the filesystem pool. The keyword index is opt-in; step 4 shows how to enable it. Everything else on this page works as shipped.</p>
 </div>
 
 <h2>2. Mount the filesystem</h2>
@@ -42,11 +42,11 @@ $ cp report-2024.md field-log.txt ~/clio-mnt/notes/
 $ ls -l ~/clio-mnt/notes
 $ grep -i "sea ice" ~/clio-mnt/notes/*
 </pre>
-<p>Writes go through to the runtime as they happen, so file sizes are exact as soon as <code>write()</code> returns. Each file is stored as 1 MiB pages placed on the fastest tier with room. A copy goes to the persistent disk tier, and the index picks up the text.</p>
+<p>Writes go through to the runtime as they happen, so file sizes are exact as soon as <code>write()</code> returns. Each file is stored as 1 MiB pages placed on the fastest tier with room. The write-back cache later flushes a copy to the disk tier, and, if you composed the indexer, the index picks up the text.</p>
 <p>Open <a href="http://127.0.0.1:8080">http://127.0.0.1:8080</a> and look at <strong>Pools → clio_cte_core</strong>. The tier roster shows the bytes you just wrote. The <a href="/tutorials/dashboard.html">dashboard tutorial</a> walks through every page.</p>
 
 <h2>4. Find files from Python</h2>
-<p>Keyword search is served by the indexer pool (<code>564.0</code>). Point the client at it, then search the files you copied in:</p>
+<p>Keyword search is served by the indexer pool (<code>564.0</code>), which the default configuration does not compose. To enable it, edit <code>~/.clio/clio.yaml</code>: uncomment the <code>clio_cte_indexer</code> entry, set the shm cache's <code>entry_pool_id</code> to <code>"564.0"</code>, and point the CAE, stream and filesystem entries' <code>next_pool_id</code> at <code>"564.0"</code>. Then restart the runtime and the mount, and copy the files in again. Point the client at the indexer, then search the files you copied in:</p>
 <pre data-label="python">
 import os
 os.environ["CLIO_WITH_RUNTIME"] = "0"     # attach to the running runtime
@@ -84,6 +84,6 @@ $ clio-run stop
   <li><strong><code>clio_cte_fuse</code> binary not found on macOS.</strong> The macOS wheel has no FUSE binary. Build with the <code>release-mac-fuse</code> preset (see <a href="/docs/context-fs/install.html">Install</a>).</li>
   <li><strong><code>fuse: device not found</code> on Linux.</strong> Install the FUSE 3 package: <code>sudo apt install fuse3 libfuse3-3</code>.</li>
   <li><strong>No <code>Viz:</code> line, or nothing on port 8080.</strong> Another process holds the port (the runtime still starts), or the build lacks Poco. Try <code>clio-run start --viz-port 9000</code>.</li>
-  <li><strong><code>SemanticSearch</code> returns nothing.</strong> The client is bound to the core pool. Set <code>CLIO_CTE_POOL=564.0</code> before importing the module.</li>
+  <li><strong><code>SemanticSearch</code> returns nothing.</strong> The indexer is not composed (it is opt-in; see step 4), or the client is bound to the core pool. Set <code>CLIO_CTE_POOL=564.0</code> before importing the module.</li>
 </ul>
 <p>Next: <a href="/docs/context-fs/usage.html">Usage</a> for the other platforms, the default composition and changing tiers.</p>

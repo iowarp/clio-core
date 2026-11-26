@@ -70,6 +70,13 @@ static constexpr double kBarrierPollUs = 10.0;
 // Lifecycle
 // ===========================================================================
 
+void Runtime::Restart(const clio::run::PoolId &pool_id,
+                      const std::string &pool_name,
+                      clio::run::u32 container_id) {
+  is_restart_ = true;
+  Init(pool_id, pool_name, container_id);
+}
+
 clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   CLIO_TASK_BODY_BEGIN
   // The task is NOT a CreateTask, whatever the parameter says: compose hands
@@ -79,6 +86,7 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   // through `task` is undefined behaviour, which UBSan reports.
   auto &fields = task.template Cast<clio::run::admin::CreatePoolFields>();
   config_ = fields->GetParamsAs<WtcConfig>();
+  OpenSharerLog();
   interposer_next_pool_ = config_.next_pool_id_;
   next_client_ = std::make_unique<clio::cte::core::Client>(CorePoolId());
   if (!config_.data_pool_.IsNull() && !config_.md_only_ &&
@@ -131,14 +139,14 @@ void Runtime::LogStats() {
        "buf={} busy={} miss={} waits={} flush_batches={} flush_ranges={} "
        "flush_MiB={} flush_skipped={} fills={} md_fills={} get_hits={} "
        "get_misses={} (absent={} nonres={} range={} busy={}) "
-       "invalidations={} evictions={}",
+       "invalidations={} evictions={} crash_repairs={}",
        container_id_, v(st.puts_), v(st.put_bytes_) >> 20,
        v(st.put_full_log_), v(st.put_full_slot_), v(st.put_full_buf_),
        v(st.put_busy_), v(st.put_miss_), v(st.waits_), v(st.flush_batches_),
        v(st.flush_ranges_), v(st.flush_bytes_) >> 20, v(st.flush_skipped_),
        v(st.fills_), v(st.md_fills_), v(st.get_hits_), v(st.get_misses_),
        v(st.miss_absent_), v(st.miss_nonres_), v(st.miss_range_),
-       v(st.miss_busy_), v(st.invalidations_), v(st.evictions_));
+       v(st.miss_busy_), v(st.invalidations_), v(st.evictions_), v(st.repairs_));
 }
 
 bool Runtime::OpenSegment() {
@@ -376,15 +384,66 @@ clio::run::TaskResume Runtime::GetOrCreateTag(
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::DelTag(
-    clio::run::shared_ptr<clio::cte::core::DelTagTask> &task) {
+bool Runtime::TagDead(clio::run::u32 major, clio::run::u32 minor) const {
+  std::lock_guard<std::mutex> g(dead_mu_);
+  if (dead_tags_.empty()) return false;
+  return dead_tags_.count((static_cast<clio::run::u64>(major) << 32) | minor) !=
+         0;
+}
+
+clio::run::TaskResume Runtime::DeleteBarrier(const std::vector<TagId> &tags) {
   CLIO_TASK_BODY_BEGIN
   if (view_.Ready()) {
-    const clio::run::u64 target = view_.PushedNow();
+    clio::run::u64 target = 0;
+    if (view_.MdOnly() || tags.empty()) {
+      target = BarrierTarget();  // nothing of the tags' bytes is logged
+    } else {
+      // Drained BEFORE dead_mu_: the flusher pops under stage_mu_ and must
+      // never meet a task holding dead_mu_ while it waits for stage_mu_
+      // (an ABBA deadlock: rm -rf hung a delete and the flusher forever).
+      const clio::run::u64 pushed = BarrierTarget();
+      {
+        std::lock_guard<std::mutex> g(dead_mu_);
+        // Marks expire in deletion order (the target only grows): drop the
+        // front while its ranges are all flushed. A tag deleted again keeps
+        // the newer mark (its older deque entry no longer matches).
+        while (!dead_order_.empty() &&
+               view_.FlushedThrough(dead_order_.front().first)) {
+          auto it = dead_tags_.find(dead_order_.front().second);
+          if (it != dead_tags_.end() &&
+              it->second == dead_order_.front().first) {
+            dead_tags_.erase(it);
+          }
+          dead_order_.pop_front();
+        }
+        for (const TagId &t : tags) {
+          if (t.IsNull()) continue;
+          const clio::run::u64 k =
+              (static_cast<clio::run::u64>(t.major_) << 32) | t.minor_;
+          dead_tags_[k] = pushed;
+          dead_order_.emplace_back(pushed, k);
+        }
+      }
+      // Ranges popped before the mark may be landing now; later pops skip.
+      target = popped_total_.load(std::memory_order_seq_cst);
+    }
     while (!view_.FlushedThrough(target)) {
       KickFlusher();
       CLIO_CO_AWAIT(clio::run::yield(kBarrierPollUs));
     }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+clio::run::TaskResume Runtime::DelTag(
+    clio::run::shared_ptr<clio::cte::core::DelTagTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  {
+    std::vector<TagId> tags;
+    if (!task->tag_id_.IsNull()) tags.push_back(task->tag_id_);
+    // A delete by name has no id yet: the full drain (an empty list).
+    CLIO_CO_AWAIT(DeleteBarrier(tags));
   }
   CLIO_CO_AWAIT(BeginChainWriteAll());
   {
@@ -411,7 +470,8 @@ clio::run::TaskResume Runtime::DelTag(
       auto fut = ipc->Send(inv);
       CLIO_CO_AWAIT(fut);
     } else if (view_.Ready()) {
-      view_.DropTagBlobs(k.major_, k.minor_);
+      const std::vector<TagId> one{task->tag_id_};
+      CLIO_CO_AWAIT(DropTagsBlobs(one));
       view_.DropTag(k.major_, k.minor_);
     }
   }
@@ -425,7 +485,7 @@ clio::run::TaskResume Runtime::SyncTag(
   clio::run::u32 sticky = 0;
   std::set<clio::run::u32> homes;
   if (view_.Ready()) {
-    const clio::run::u64 target = view_.PushedNow();
+    const clio::run::u64 target = BarrierTarget();
     while (!view_.FlushedThrough(target)) {
       KickFlusher();
       CLIO_CO_AWAIT(clio::run::yield(kBarrierPollUs));
@@ -477,8 +537,12 @@ clio::run::TaskResume Runtime::SyncTag(
 clio::run::TaskResume Runtime::BarrierForward(
     clio::run::u32 method, clio::run::shared_ptr<clio::run::Task> task) {
   CLIO_TASK_BODY_BEGIN
-  if (view_.Ready()) {
-    const clio::run::u64 target = view_.PushedNow();
+  if (method == clio::cte::core::Method::kMultiDelTag) {
+    std::vector<TagId> tags = clio::cte::core::DecodeMultiDelTags(
+        task.template Cast<clio::cte::core::MultiDelTagTask>()->tags_);
+    CLIO_CO_AWAIT(DeleteBarrier(tags));
+  } else if (view_.Ready()) {
+    const clio::run::u64 target = BarrierTarget();
     while (!view_.FlushedThrough(target)) {
       KickFlusher();
       CLIO_CO_AWAIT(clio::run::yield(kBarrierPollUs));
@@ -527,7 +591,7 @@ clio::run::TaskResume Runtime::FetchTagAttrs(const TagId &tag,
     const clio::run::u64 seq = view_.Ready() ? view_.TagInvalSeq() : 0;
     const clio::run::u64 wseq = view_.Ready() ? view_.LocalWriteSeq() : 0;
     if (view_.Ready()) {
-      const clio::run::u64 target = view_.PushedNow();
+      const clio::run::u64 target = BarrierTarget();
       while (!view_.FlushedThrough(target)) {
         KickFlusher();
         CLIO_CO_AWAIT(clio::run::yield(kBarrierPollUs));
@@ -616,15 +680,41 @@ clio::run::TaskResume Runtime::NoteTagsWritten(const std::vector<TagId> &tags,
   CLIO_TASK_BODY_END
 }
 
+clio::run::TaskResume Runtime::DropTagsBlobs(const std::vector<TagId> &tags) {
+  CLIO_TASK_BODY_BEGIN
+  if (view_.Ready()) {
+    std::vector<clio::run::u64> keys;
+    for (const TagId &t : tags) {
+      if (!t.IsNull()) {
+        keys.push_back((static_cast<clio::run::u64>(t.major_) << 32) | t.minor_);
+      }
+    }
+    std::sort(keys.begin(), keys.end());
+    keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+    for (clio::run::u32 stripe = 0; !keys.empty() && stripe < wtc::kStripes;
+         ++stripe) {
+      view_.DropTagsBlobsStripe(stripe, keys);
+      // Each stripe is one lock and a slice of the table: let the worker's
+      // other tasks (an fsync's barrier, the flusher) run between them.
+      if (stripe % kDropStripesPerYield == kDropStripesPerYield - 1) {
+        // > 0: yield(0) parks the task until a Future wakes it (none will).
+        CLIO_CO_AWAIT(clio::run::yield(kDropYieldUs));
+      }
+    }
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 clio::run::TaskResume Runtime::DropTagDataEverywhere(
     const std::vector<TagId> &tags) {
   CLIO_TASK_BODY_BEGIN
   if (!tags.empty() && view_.Ready()) {
     std::vector<BlobKey> keys;
+    CLIO_CO_AWAIT(DropTagsBlobs(tags));
     for (const TagId &t : tags) {
       if (t.IsNull()) continue;
       keys.push_back(BlobKey{t.major_, t.minor_, std::string()});
-      view_.DropTagBlobs(t.major_, t.minor_);
       view_.DropTagMeta(t.major_, t.minor_);
     }
     auto *ipc = CLIO_IPC;

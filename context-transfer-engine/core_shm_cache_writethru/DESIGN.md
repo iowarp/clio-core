@@ -73,13 +73,15 @@ ShmWtcRoot     version, ready, node_id, limits, counters,
 TagTable       open-addressed; key = TagId; value = flags (kCreated),
                sticky_rc (first failed flush of this tag)
 BlobTable      open-addressed; key = (TagId, blob name); value =
-               buffer (ShmPtr), cap, size, pending, write_gen, seqlock,
+               runs (granules), cap, size, wbegin/wend/retired, write_gen,
                hits, last_access_ns, score, inval_epoch,
                flags (kComplete, ...)
 Sharers        open-addressed; one entry per blob HOMED on this node that
                some node caches: set of caching nodes
-DirtyLog       ctp::ipc::mpsc_ring_buffer<DirtyRange>   (THE write log)
-blob buffers   from the segment allocator, one contiguous buffer per blob
+ThreadSlots    per thread: identity, journal, single-producer DirtyRange
+               queue (the write log, drained by the runtime)
+granules       4 KiB units: a leased RAM bdev, or the rest of this segment
+               carved at format; free bitmap + owner map (data lock)
 ```
 
 Limits are config: `capacity` (segment bytes), `log_depth`, `max_tags`,
@@ -91,19 +93,94 @@ Limits are config: `capacity` (segment bytes), `log_depth`, `max_tags`,
 ```
 PutBlob(tag, blob, off, size, src):
   lock;   entry = find-or-insert(tag, blob)
-          grow entry buffer to >= off+size (alloc new, copy, free old)
-          entry.pending++;  entry.write_gen++
+          grow entry buffer to >= off+size (append granule runs)
+          entry.write_gen++;  entry.wbegin++   (pending = wbegin - retired)
           entry.size = max(entry.size, off+size)
   unlock
-  memcpy(entry.buffer + off, src, size)           // entry seqlock odd/even
-  log.Push(DirtyRange{entry slot, off, size})     // waits if the log is full
-  log_pushed_seq++
+  memcpy(entry.runs + off, src, size)             // seqlock: wend++ after
+  publish DirtyRange{entry slot, off, size} in this thread's queue
 ```
 
 The client returns after the push. Exactly the bytes written are logged: a
 write that leaves a gap, or touches 4 KB of a 1 MB blob, logs only that
 range. Nothing is ever flushed per blob, and holes in a buffer never leave
 the cache.
+
+## Crash recovery (a client dies mid-operation)
+
+The segment belongs to the runtime and outlives every client. A client
+(FUSE, an application using the CTE client) may be SIGKILLed at any
+instruction, including while it holds a segment lock or between two
+updates of shared state. Requirements:
+
+- nothing ever hangs because a client died;
+- one client's crash never loses or corrupts ANOTHER client's data (a
+  security boundary as much as a reliability one);
+- the dead client's own unfinished, never-acknowledged write may be lost
+  or partially applied (POSIX permits either for a write in progress);
+- clients never repair anything: only the runtime does.
+
+### Granules, not an allocator
+
+Blob bytes live in 4 KiB granules tracked by a free bitmap, either in a
+leased RAM bdev (`data_pool`) or carved from this segment by the runtime at
+format time. A client never calls the segment allocator, whose free lists
+could not be repaired after a client died inside it. The bitmap can always
+be rebuilt from the entries' run lists.
+
+### Locks
+
+Every segment lock is a `ctp::TimedMutex`: the holder's pid and process
+start time are recorded. Clients wait on a held lock; they never break one.
+The runtime breaks a lock only after its holder is provably dead, and only
+after repairing what the lock guards (below); the release is a CAS on the
+dead holder's acquisition id.
+
+### Per-thread journal
+
+Each client thread claims a journal slot (pid, start time, tid) on first
+use. Before touching shared state it records the operation and its phase;
+the phase is stored after the state it describes is visible elsewhere, so
+the journal can be BEHIND the truth but never ahead of it. Under a stripe
+lock it records the slot it is about to change and the entry's `wbegin_`
+before changing it: as only the lock holder advances `wbegin_`, comparing it
+afterwards says exactly whether the dead client's increment happened.
+
+### Attribution: drain the living, the rest is the dead's
+
+Shared counters (`pins_`, `pending_`, `wend_`) are modified by many
+processes, so one increment cannot be attributed by itself. The repairer
+instead takes the stripe lock (so nothing new starts under it), waits for
+every LIVE client's bounded unlocked step on that entry (a copy in or out)
+to finish, as their journals show, and then attributes what is left over to
+the dead client. Runtime pins are counted apart (`rt_pins_`) because a
+flush pin is held until a remote home acks.
+
+### Roll forward, never back
+
+A dead writer whose copy started is rolled forward: the repairer closes the
+seqlock (`wend_`) and publishes its range, as if the write had completed
+with whatever bytes it copied. Cache and backing store then agree, and the
+entry stays servable. A dead writer that died under the stripe lock before
+its increments (seen by `wbegin_`) changed nothing that needs undoing
+except a half-made insert or growth:
+
+- an insert marks the slot live LAST, so a partial one is never findable;
+- a partial growth (runs appended, `cap_` not yet raised, or a zero-fill
+  cut short) is trimmed to `cap_` or zero-filled again (both idempotent);
+- a partial eviction of a clean victim is completed (idempotent);
+- with `data_lock_` held, the bitmap and owner map are rebuilt from every
+  entry's runs (runs only change under `data_lock_`, which the repairer
+  holds).
+
+### Per-thread dirty queues
+
+Each journal slot owns a single-producer queue of DirtyRange: the client
+writes a record, then publishes it with one store of its tail. A dead client
+therefore never leaves a reserved but unfilled record (the hazard of a
+shared MPSC ring, whose consumer cannot skip a slot it cannot attribute).
+The runtime's flusher drains every queue; the barrier (PushedNow /
+FlushedThrough) counts ranges the flusher popped.
 
 ## Background flusher
 
@@ -160,8 +237,9 @@ When an allocation fails (buffer for a write or a fill):
 1. sample up to `evict_sample` clean, resident entries starting at a
    rotating cursor in BlobTable (approximate, Redis-style; no global
    ordered structure to keep consistent across processes);
-2. free the buffer of the lowest-frecency sample; repeat until the
-   allocation fits or `evict_max_rounds` is reached;
+2. free the runs of the lowest-frecency sample (or, against
+   fragmentation, the clean owners of one granule window); repeat until
+   the allocation fits or the rounds run out;
 3. still no room (everything resident is dirty): wait on the flusher, then
    retry. Never fall back to a task write; a direct task write could reach
    the chain before an older logged write of the same bytes and then be
@@ -450,7 +528,7 @@ Where the code settled details the sections above left open.
 - **Locking.** The blob table is 64 stripes; a key probes only inside its
   stripe, so one stripe lock covers it. Payload memcpys hold a pin, never a
   lock. Eviction takes other stripes with TryLock only. Lock order is
-  stripe -> tag table -> allocator.
+  stripe -> tag table -> data lock (granule bitmap).
 - **Discovery.** The chimod publishes a `Locator` in the runtime metadata
   segment under its pool id; the segment name is derived from the runtime
   pid and pool id. The CTE core's Create (and a get-or-create of an

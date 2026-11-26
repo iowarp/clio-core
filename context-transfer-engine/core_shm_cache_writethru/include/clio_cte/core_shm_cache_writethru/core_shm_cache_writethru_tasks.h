@@ -100,6 +100,11 @@ struct WtcConfig {
    *  are clean and evictable, so room follows) before it stops waiting and,
    *  after a few last retries, writes around the cache. */
   clio::run::u32 nospace_wait_ms_ = 250;
+  /** [sharer_log_path] Base path of each container's sharer-directory WAL
+   *  ("" = none); the container appends "." + its container id. A blob's
+   *  home records which containers cache it there, so a home that restarts
+   *  still invalidates copies cached before it went down. */
+  std::string sharer_log_path_;
 
   WtcConfig()
       : next_pool_id_(clio::run::PoolId::GetNull()),
@@ -116,7 +121,7 @@ struct WtcConfig {
        max_blobs_, max_fill_, evict_sample_, half_life_ms_, flush_period_us_,
        flush_retries_, max_sharer_entries_, flush_shards_, flush_depth_,
        md_only_, entry_pool_id_, data_pool_, data_capacity_,
-       invalidate_on_flush_, nospace_wait_ms_);
+       invalidate_on_flush_, nospace_wait_ms_, sharer_log_path_);
   }
 
   /** Parse "major.minor". */
@@ -152,6 +157,9 @@ struct WtcConfig {
       size_of("data_capacity", &data_capacity_);
       if (node["data_pool"]) {
         data_pool_ = ParsePoolId(node["data_pool"].as<std::string>());
+      }
+      if (node["sharer_log_path"]) {
+        sharer_log_path_ = node["sharer_log_path"].as<std::string>();
       }
       if (node["log_depth"]) log_depth_ = node["log_depth"].as<clio::run::u32>();
       if (node["max_tags"]) max_tags_ = node["max_tags"].as<clio::run::u32>();

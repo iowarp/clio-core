@@ -35,6 +35,7 @@
 #include "clio_runtime/cycle_counter.h"
 #include "clio_runtime/ipc_manager.h"
 #include "clio_runtime/worker.h"
+#include "clio_runtime/work_orchestrator.h"
 #include "clio_runtime/singletons.h"
 
 namespace clio::run {
@@ -93,6 +94,37 @@ clio::run::shared_ptr<Task> IpcCpu2Self::RecvIn(Future<Task> &future) {
   return future.GetTaskPtr();
 }
 
+/**
+ * Wake the consumer of the event queue a completion was just queued on.
+ * Normally that is the worker that runs `parent` (RunWorkerId), signalled
+ * through the lane it currently parks on. A stall rescue hands a worker's
+ * queue OBJECT to its rescuer (tasks parked on it keep their worker id), so
+ * when the recorded worker no longer owns `queue` every worker is woken --
+ * rare, and a wake to the wrong thread would leave the completion waiting
+ * for the rescuer's max_sleep re-poll.
+ * @param parent the task waiting for the completion
+ * @param queue the event queue the completion went to
+ */
+static void WakeEventQueueOwner(const clio::run::shared_ptr<Task> &parent,
+                                void *queue) {
+  auto *orch = CLIO_WORK_ORCHESTRATOR;
+  Worker *w = orch != nullptr ? orch->GetWorker(parent->RunWorkerId())
+                              : nullptr;
+  if (w != nullptr &&
+      static_cast<void *>(w->GetEventQueue()) == queue) {
+    TaskLane *lane = w->GetLane();
+    if (lane != nullptr) {
+      CLIO_IPC->AwakenWorker(lane);
+      return;
+    }
+  }
+  if (orch != nullptr) {
+    orch->AwakenAllWorkers();
+  } else if (parent->Lane() != nullptr) {
+    CLIO_IPC->AwakenWorker(parent->Lane());
+  }
+}
+
 void IpcCpu2Self::SendOut(const clio::run::shared_ptr<Task> &task_ptr,
                                ctp::lbm::Transport *send_transport) {
   auto future_shm = task_ptr->RunFuture().GetFutureShm();
@@ -138,10 +170,14 @@ void IpcCpu2Self::SendOut(const clio::run::shared_ptr<Task> &task_ptr,
       rc->notify_ns_ = clio::run::CycleNow();
     }
     parent_event_queue->Emplace(std::move(event_future));
-    if (parent_task->Lane()) {
-      // Always signal — see ipc_cpu2cpu_impl.h for the race.
-      CLIO_IPC->AwakenWorker(parent_task->Lane());
-    }
+    // Wake the worker that OWNS the event queue, through the lane it parks
+    // on now. parent_task->Lane() is the lane the parent was taken from: after
+    // a stall rescue (Worker::AdoptLane) that is often not the lane its worker
+    // parks on, and its "active" flag stays set forever, so AwakenWorker took
+    // the worker for busy and skipped the signal. The completion then waited
+    // for the worker's max_sleep (50 ms) re-poll: mkdirs applied at ~100 ms
+    // each (two waits) and a Linux-tree rm -rf took 335-570 s instead of ~18.
+    WakeEventQueueOwner(parent_task, parent_task->EventQueue());
   } else if (task_ptr->task_flags_.Any(TASK_EXTERNAL_CLIENT)) {
     // Top-level task from an EXTERNAL (cross-process) SHM client. This is a
     // daemon-local deserialized copy (IpcCpu2Cpu::RecvIn AllocLoadTask'd it and

@@ -321,6 +321,23 @@ class CacheBase : public clio::cte::core::DualTargetInterposer {
   /** Delete a blob from volatile whether or not it is recorded here. */
   clio::run::TaskResume DropVolatile(TagId tag, std::string name);
   /**
+   * After a rejoin notice (a peer held this node dead), drop every CLEAN
+   * volatile copy kept here: while this node was cut off, failover routed
+   * writes for the blobs it owns to a stand-in's cache, so its own clean
+   * copies may be older than the stored blob. They refill from persistent
+   * on use. Dirty copies stay (they hold this owner's unflushed writes).
+   * Runs once per notice; concurrent callers wait for it.
+   */
+  clio::run::TaskResume DropCleanIfHeldDead();
+  /**
+   * Drop the clean copies this container keeps of blobs it no longer owns
+   * (#1435): a failover stand-in's copies once the owner is back. Dirty
+   * ones flush to the owner first (the flush round) and go on a later
+   * pass. Left in place, a later outage of the same owner would serve
+   * these old copies again. Called from the periodic flush.
+   */
+  clio::run::TaskResume DropOrphans();
+  /**
    * Flush and drop least-recently-used unlocked copies.
    * @param keep key never dropped (the blob being written)
    * @param n copies to drop at most
@@ -722,6 +739,12 @@ class CacheBase : public clio::cte::core::DualTargetInterposer {
   clio::cte::core::Client flush_client_;  ///< where flushed ranges land
   std::mutex mu_;                         ///< guards entries_ / busy_
   std::unordered_map<std::string, Entry> entries_;
+  /** CLIO_IPC->HeldDeadSeq() last acted on (DropCleanIfHeldDead). */
+  std::atomic<clio::run::u64> seen_held_dead_{0};
+  /** A DropCleanIfHeldDead pass is running. */
+  std::atomic<bool> rejoin_dropping_{false};
+  /** A DropOrphans pass is running. */
+  std::atomic<bool> orphan_scan_{false};
   std::unordered_set<std::string> busy_;
   /** (tag major, tag minor): the key the dirty index groups copies by. */
   using TagKey = std::pair<clio::run::u32, clio::run::u32>;

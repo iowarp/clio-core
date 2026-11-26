@@ -659,6 +659,14 @@ bool FsBdevTransport::Sync() {
   // sync that started after the ticket or start one that covers everyone
   // registered so far.
   std::unique_lock<std::mutex> lk(gc_mu_);
+  // The caller's writes completed before it called Sync, so they are all
+  // counted in mutations_ by now: a successful fdatasync that started after
+  // every one of them leaves nothing to flush (the allocator log still is).
+  if (synced_mutations_ >= mutations_.load(std::memory_order_acquire)) {
+    lk.unlock();
+    FlushAllocLog();
+    return true;
+  }
   const clio::run::u64 ticket = ++gc_next_;
   for (;;) {
     if (gc_done_ >= ticket) return gc_ok_through_ >= ticket;
@@ -667,13 +675,17 @@ bool FsBdevTransport::Sync() {
   }
   gc_running_ = true;
   const clio::run::u64 covers = gc_next_;  // everyone registered so far
+  const clio::run::u64 start_mut = mutations_.load(std::memory_order_acquire);
   lk.unlock();
   const int err = SyncBackingFiles();
   if (err == 0) FlushAllocLog();
   lk.lock();
   gc_running_ = false;
   gc_done_ = covers;
-  if (err == 0) gc_ok_through_ = covers;
+  if (err == 0) {
+    gc_ok_through_ = covers;
+    synced_mutations_ = std::max(synced_mutations_, start_mut);
+  }
   gc_cv_.notify_all();
   lk.unlock();
   if (err != 0) {
@@ -807,7 +819,11 @@ void FsBdevTransport::FinishAllocate(bool backed_ok, int worker_id,
 
 bool FsBdevTransport::GrowBackingFile(clio::run::u64 backed,
                                       clio::run::u64 target) {
-  if (stripe_.IsStriped()) return GrowStripedFiles(target);
+  if (stripe_.IsStriped()) {
+    const bool grew = GrowStripedFiles(target);
+    NoteMutation();  // grown, or truncated back: the files changed
+    return grew;
+  }
   if (!BackingFileIntact("grow")) return false;
   auto io = OpenBackingFile(io_depth_, file_path_);
   if (!io) {
@@ -827,6 +843,7 @@ bool FsBdevTransport::GrowBackingFile(clio::run::u64 backed,
     }
   }
   io->Close();
+  NoteMutation();
   return ok;
 }
 
@@ -1137,6 +1154,7 @@ clio::run::TaskResume FsBdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask> 
       while (!aio->IsComplete(token, result)) {
         CLIO_CO_AWAIT(clio::run::yield(10.0));
       }
+      NoteMutation();  // even a failed write may have landed some bytes
       if (bounce) {
         GiveBounce(std::move(bounce), static_cast<size_t>(seg));
       }

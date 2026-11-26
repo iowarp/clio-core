@@ -986,7 +986,13 @@ def main():
       break
     box = {}
 
-    def run(fn=fn, args=req.get('args', {}), box=box):
+    args_ = req.get('args', {})
+    if req['op'] == 'sh' and 'timeout' not in args_:
+      # The caller's deadline is the request's `timeout`; without this the
+      # shell ran under op_sh's own 600 s default whatever the test asked.
+      args_['timeout'] = req.get('timeout', 600)
+
+    def run(fn=fn, args=args_, box=box):
       t0 = time.monotonic()
       try:
         box['r'] = {'ok': True, 'ret': fn(**args)}

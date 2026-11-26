@@ -19,7 +19,7 @@ facts: Modules | filesystem, stream ; Daemon | clio_cte_fuse ; Page size | 1 MiB
     <rect class="box hl" x="440" y="192" width="190" height="62" rx="8"/><text class="title" x="452" y="216">Stream module</text><text class="muted" x="452" y="236">sizes, appends</text>
     <rect class="box" x="650" y="192" width="190" height="62" rx="8"/><text class="title" x="662" y="216">File pages</text><text class="muted" x="662" y="236">go straight down</text>
     <path class="edge hl" d="M220,162 L220,190" marker-end="url(#fs0)"/><path class="edge hl" d="M535,162 L535,190" marker-end="url(#fs0)"/><path class="edge" d="M745,162 L745,190" marker-end="url(#fs0)"/>
-    <rect class="box hl" x="20" y="284" width="820" height="56" rx="8"/><text class="title" x="32" y="308">CTE chain (indexer → … → cores)</text><text class="muted" x="32" y="326">page blobs and directory-block blobs, tiered and replicated alike; inode records as tag attributes</text>
+    <rect class="box hl" x="20" y="284" width="820" height="56" rx="8"/><text class="title" x="32" y="308">CTE chain (shm cache → … → cores)</text><text class="muted" x="32" y="326">page blobs and directory-block blobs, tiered and replicated alike; inode records as tag attributes</text>
     <path class="edge" d="M220,254 L220,282" marker-end="url(#fs0)"/><path class="edge" d="M535,254 L535,282" marker-end="url(#fs0)"/><path class="edge" d="M745,254 L745,282" marker-end="url(#fs0)"/>
   </svg>
   <figcaption>Namespace operations go to the filesystem module, sizes and
@@ -80,7 +80,7 @@ facts: Modules | filesystem, stream ; Daemon | clio_cte_fuse ; Page size | 1 MiB
     <rect class="box hl" x="656" y="240" width="168" height="140" rx="8"/><text class="title" x="668" y="262">Filesystem container</text><text class="muted" x="668" y="284">home of block d.1 of /a,</text><text class="muted" x="668" y="300">its only writer; sends</text><text class="muted" x="668" y="316">each change to every</text><text class="muted" x="668" y="332">copy before it</text><text class="muted" x="668" y="348">acknowledges it</text>
     <path class="edge hl" d="M656,322 L594,322" marker-end="url(#fs2)"/>
     <path class="edge" d="M320,452 L320,474" marker-end="url(#fs2)"/><path class="edge" d="M740,452 L740,474" marker-end="url(#fs2)"/>
-    <rect class="box hl" x="20" y="476" width="820" height="50" rx="8"/><text class="title" x="32" y="498">CTE chain (indexer → … → cores)</text><text class="muted" x="32" y="516">file pages, table blocks and xattr blobs: tiered, logged, replicated · inode records: tag attributes</text>
+    <rect class="box hl" x="20" y="476" width="820" height="50" rx="8"/><text class="title" x="32" y="498">CTE chain (shm cache → … → cores)</text><text class="muted" x="32" y="516">file pages, table blocks and xattr blobs: tiered, logged, replicated · inode records: tag attributes</text>
   </svg>
   <figcaption>There is no metadata server. Path operations go to the local
   filesystem container, which walks the path through its copies of the

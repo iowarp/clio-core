@@ -23,7 +23,7 @@ facts: Mount | clio_cte_fuse &lt;mountpoint&gt; -f ; Filesystem pool | 560.0 ; P
   <li><strong>File bytes are 1 MiB page blobs.</strong> Page <em>n</em> of a file is the blob named <code>"n"</code> in the file's tag. A write touches only the pages it covers.</li>
   <li><strong>The logical size is owned by the stream pool</strong> (<code>clio_cte_stream</code>, <code>565.0</code>), which also merges deferred appends from several nodes. The filesystem creates it with defaults if it is not composed.</li>
   <li><strong>Directories are inode-table blocks.</strong> Each block maps names to inode ids and is homed on one container. Blocks split when they pass <code>dir_split_entries</code> rows (default 1024).</li>
-  <li><strong>Durability follows the chain.</strong> Pages travel through the cache, indexer and replication modules to the CTE core. <code>fsync</code> returns once the bytes are on a tier at the configured persistence level, and the namespace journal is synced with it.</li>
+  <li><strong>Durability follows the chain.</strong> Pages travel through the shm cache, write-back cache and replication modules (and the indexer, when composed) to the CTE core. <code>fsync</code> returns once the bytes are on a tier at the configured persistence level, and the namespace journal is synced with it.</li>
 </ul>
 <p><a href="/design/filesystem.html">Filesystem and FUSE design</a> explains the inode table, the shared-memory mirror that answers <code>stat</code>, and the write path in detail.</p>
 
@@ -42,7 +42,7 @@ facts: Mount | clio_cte_fuse &lt;mountpoint&gt; -f ; Filesystem pool | 560.0 ; P
   <li><a href="/docs/runtime/index.html">Context Runtime</a> hosts the filesystem module as a pool and runs <code>clio-run</code>, the daemon the mount attaches to. The runtime's documentation covers <code>clio-run</code> and the compose file; this section covers only the filesystem entries of that file.</li>
   <li><a href="/docs/cte/index.html">Context Transfer Engine</a> stores every page and inode record. The CTE's C++ and Python clients can read files written through the mount by tag name.</li>
   <li><a href="/docs/cae/index.html">Context Assimilation Engine</a> imports external data into the same CTE pools, so imported objects and mounted files share tiers and the index.</li>
-  <li><a href="/docs/cee/index.html">Context Exploration Engine</a> queries files on the mount by name, keyword or time, served by the indexer pool the mount writes through.</li>
+  <li><a href="/docs/cee/index.html">Context Exploration Engine</a> queries files on the mount by name, keyword or time. Keyword search is served by the indexer, an opt-in pool the mount must write through.</li>
   <li><a href="/docs/memory-expansion/index.html">Memory expansion</a> and <a href="/docs/ml/index.html">machine learning</a> use the same tiers from inside a program instead of through a mount.</li>
 </ul>
 

@@ -104,14 +104,14 @@ clio_cte_fuse <mountpoint> [FUSE options]
     pool_name: clio_cte_filesystem
     pool_query: local
     pool_id: "560.0"
-    next_pool_id: "564.0"
+    next_pool_id: "568.0"
     metadata_log_path: "${CLIO_STORAGE_ROOT}/cfs_namespace_log"
     # dir_split_entries: 1024
     # case_insensitive: false
     # stream_pool_id: "565.0"
 </pre>
 <ul>
-  <li><code>next_pool_id</code> (required): the CTE pool that stores the tags and blobs. Point it at the chain top, the indexer (<code>564.0</code>), to use the indexer, shm cache, write-back cache and replication, or at <code>512.0</code> to bypass them.</li>
+  <li><code>next_pool_id</code> (required): the CTE pool that stores the tags and blobs. Point it at the chain top, the shm cache (<code>568.0</code>), to use the shm cache, write-back cache and replication, at the opt-in indexer (<code>564.0</code>) when it is composed, or at <code>512.0</code> to bypass them.</li>
   <li><code>metadata_log_path</code> (default unset): node-local journal of the directory table blocks this node is home for. The container id is appended, and <code>~</code> and <code>${VARS}</code> expand. Unset, directory blocks are stored as CTE blobs.</li>
   <li><code>dir_split_entries</code> (default <code>1024</code>): rows a directory block holds before it splits.</li>
   <li><code>case_insensitive</code> (default <code>false</code>): compare names case-insensitively while keeping their spelling. Fixed when the volume is created; a runtime configured the other way refuses the volume.</li>
@@ -123,7 +123,7 @@ clio_cte_fuse <mountpoint> [FUSE options]
     pool_name: clio_cte_stream
     pool_query: local
     pool_id: "565.0"
-    next_pool_id: "564.0"
+    next_pool_id: "568.0"
     staging_pool_id: "561.0"
     # log_path: "/mnt/nvme/$USER/clio/cte_stream_log"
 </pre>

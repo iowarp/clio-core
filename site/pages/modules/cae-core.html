@@ -38,7 +38,8 @@ the CAE pool is created. Two placements are in use:</p>
   CTE core directly or another interposer such as the
   <a href="/modules/summarizer.html">summarizer</a> or the
   <a href="/modules/indexer.html">indexer</a>. The default configuration
-  points it at the chain top, the indexer at 564.0, so imported data is
+  points it at the chain top, the shm cache at 568.0. Point it at the
+  indexer (564.0) when you compose that opt-in module, so imported data is
   indexed. When <code>next_pool_id</code> is not set, forwarding falls
   back to the global CTE core pool ID.</li>
 </ul>
@@ -66,15 +67,16 @@ compose:
 </pre>
 <p>The interceptor placement, from the default configuration, keeps
 the CAE at 400.0 and forwards to the top of the operator chain, the
-indexer at 564.0. The entry comes after the chain it forwards to:</p>
+shm cache at 568.0 (564.0 when the opt-in indexer is composed). The entry
+comes after the chain it forwards to:</p>
 <pre data-label="yaml">
 compose:
-  # ... CTE cores, write-back cache, shm cache (568.0), indexer (564.0)
+  # ... CTE cores, write-back cache, shm cache (568.0)
   - mod_name: clio_cae_core
     pool_name: cae_main
     pool_query: local
     pool_id: "400.0"
-    next_pool_id: "564.0"
+    next_pool_id: "568.0"
 </pre>
 <p>The module reads two compose keys. <code>next_pool_id</code> is
 written as <code>"major.minor"</code>. <code>allowed_roots</code> lists

@@ -342,6 +342,7 @@ class TransactionLog {
     ofs_.open(file_path_, std::ios::binary | std::ios::app);
     if (is_new && ofs_.is_open()) {
       WriteMagic();
+      dirty_ = true;  // the new file's magic (and name) are not durable yet
     }
   }
 
@@ -497,13 +498,17 @@ class TransactionLog {
     WriteRecord(type, buffer_);
   }
 
-  /** Flush pending writes to disk */
+  /**
+   * Flush pending writes to disk. A shard with nothing written since its
+   * last successful sync is skipped: every durability point syncs all of
+   * the runtime's shards, and fsyncing the clean ones cost a client fsync
+   * ~16 device flushes for the one or two shards it actually touched.
+   */
   void Sync() {
     std::lock_guard<std::mutex> lk(mu_);
-    if (ofs_.is_open()) {
-      ofs_.flush();
-      FsyncPath(file_path_);
-    }
+    if (!ofs_.is_open() || !dirty_) return;
+    ofs_.flush();
+    if (FsyncPath(file_path_)) dirty_ = false;
   }
 
   /**
@@ -844,6 +849,9 @@ class TransactionLog {
   std::string file_path_;
   clio::run::u64 capacity_bytes_ = 0;
   std::ofstream ofs_;
+  /** Records were written since the last successful Sync() (guarded by
+   *  mu_). Set conservatively: a failed or skipped durable rewrite keeps it. */
+  bool dirty_ = false;
   std::vector<char> buffer_;  // Reusable serialization buffer
   /**
    * One log is shared by every worker whose id maps onto it: the runtime
@@ -894,6 +902,7 @@ class TransactionLog {
     if (!ofs_.is_open()) return;
     WriteRecordTo(ofs_, type, NextSeq(), payload);
     ofs_.flush();
+    dirty_ = true;
   }
 
   /** Serialize one record [u8 type][u64 seq][u32 size][payload] to `out`. */

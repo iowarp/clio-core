@@ -33,9 +33,10 @@ module's contract.</p>
 <p>The filesystem is not an interposer. It speaks its own task interface
 (paths and handles, not tags and blobs) and is a <em>client</em> of the CTE
 pool named by <code>next_pool_id</code>, which should be the top of the
-interposition chain. In the default configuration that is the indexer:</p>
+interposition chain. In the default configuration that is the shm cache
+(point it at the indexer, 564.0, when you compose that opt-in module):</p>
 <pre data-label="text">
-filesystem(560.0) --pages, blocks, records--> indexer(564.0) -> shm cache(568.0)
+filesystem(560.0) --pages, blocks, records--> shm cache(568.0)
     -> [compressor(562.0) ->] write-back(567.0) -> volatile core(540.0)
                                                 -> replication(561.0) -> core(512.0)
 filesystem(560.0) --sizes, appends--> stream(565.0)
@@ -74,19 +75,19 @@ with its commented defaults. It must come after every chain pool it names and
 after the stream entry.</p>
 <pre data-label="yaml">
 compose:
-  # ... chain entries (core, replication, write-back, shm cache, indexer) ...
+  # ... chain entries (core, replication, write-back, shm cache) ...
   - mod_name: clio_cte_stream
     pool_name: clio_cte_stream
     pool_query: local
     pool_id: "565.0"
-    next_pool_id: "564.0"
+    next_pool_id: "568.0"
     staging_pool_id: "561.0"
 
   - mod_name: clio_cte_filesystem
     pool_name: clio_cte_filesystem
     pool_query: local
     pool_id: "560.0"
-    next_pool_id: "564.0"               # required: the chain top
+    next_pool_id: "568.0"               # required: the chain top
     metadata_log_path: "${CLIO_STORAGE_ROOT}/cfs_namespace_log"
     # dir_split_entries: 1024
     # dir_log_compact_bytes: 256KB
@@ -211,7 +212,8 @@ error.</p>
   <dt><code>next_pool_id</code></dt>
   <dd>Required, no default. The CTE pool that stores pages, directory blocks,
   inode records and xattrs. Without it the pool's create fails. Default
-  configuration: <code>"564.0"</code>, the indexer at the chain top.</dd>
+  configuration: <code>"568.0"</code>, the shm cache at the chain top
+  (<code>"564.0"</code> when the opt-in indexer is composed).</dd>
   <dt><code>metadata_log_path</code></dt>
   <dd>Default unset. Base path of this node's on-disk metadata;
   <code>~</code> and <code>${VARS}</code> expand. The directory journal is

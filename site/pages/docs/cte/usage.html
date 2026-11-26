@@ -7,7 +7,7 @@ lede: This page shows how to do each common job with the CTE client, in C++ and 
 facts: C++ | clio::cte::core::Tag, Client ; Python | clio_cte_core_ext ; Default pool | 512.0, or CLIO_CTE_POOL
 -->
 <h2>Connect a client</h2>
-<p>Every program first initializes the runtime client, then the CTE client. The CTE client binds to the core pool 512.0 by default; a process that can map the runtime's shared memory is moved to the chain's entry pool (the indexer, 564.0) through the shm cache. The environment variable <code>CLIO_CTE_POOL</code>, as <code>major.minor</code>, binds it to another pool that speaks the core interface, such as the indexer at 564.0, the top of the default chain. Set it before initialization.</p>
+<p>Every program first initializes the runtime client, then the CTE client. The CTE client binds to the core pool 512.0 by default; a process that can map the runtime's shared memory is moved to the chain's entry pool through the shm cache: the shm cache itself (568.0) by default, or the pool named by its <code>entry_pool_id</code> (the indexer, 564.0, when you compose it). The environment variable <code>CLIO_CTE_POOL</code>, as <code>major.minor</code>, binds it to another pool that speaks the core interface, such as the shm cache at 568.0, the top of the default chain. Set it before initialization.</p>
 <pre data-label="cpp">
 #include <clio_runtime/clio_runtime.h>
 #include <clio_cte/core/core_client.h>
@@ -19,7 +19,7 @@ auto *client = CLIO_CTE_CLIENT;                           // clio::cte::core::Cl
 <pre data-label="python">
 import os
 os.environ["CLIO_WITH_RUNTIME"] = "0"     # attach to a running clio-run
-os.environ["CLIO_CTE_POOL"] = "564.0"     # optional: the indexer, so SemanticSearch works
+os.environ["CLIO_CTE_POOL"] = "564.0"     # optional: the indexer (opt-in), so SemanticSearch works
 
 import clio_cte_core_ext as cte
 cte.clio_init(cte.RuntimeMode.kClient, False)    # (mode, default_with_runtime=False, is_restart=False)
@@ -92,7 +92,7 @@ for tag_name, blob_name in client.BlobQuery("experiment/.*", "note.*"):
 </pre>
 
 <h2>Search by keyword</h2>
-<p><code>SemanticSearch</code> is BM25 keyword search over blob contents. The core does not implement it; the indexer module at 564.0 does. The client must therefore be bound to the indexer or to a pool that forwards to it, through <code>CLIO_CTE_POOL=564.0</code> or a <code>Client</code> constructed on that pool. Results come back best first, with <code>score</code> 0 for a blob that matched the patterns but contains no query word. <code>k</code> defaults to 10; 0 means no cap.</p>
+<p><code>SemanticSearch</code> is BM25 keyword search over blob contents. The core does not implement it; the indexer module at 564.0 does, and the default compose does not include it. Compose it first: uncomment its entry, set the shm cache's <code>entry_pool_id</code> to <code>"564.0"</code>, and point the CAE, stream and filesystem entries' <code>next_pool_id</code> at <code>"564.0"</code>. The client must then be bound to the indexer or to a pool that forwards to it, through <code>CLIO_CTE_POOL=564.0</code> or a <code>Client</code> constructed on that pool. Results come back best first, with <code>score</code> 0 for a blob that matched the patterns but contains no query word. <code>k</code> defaults to 10; 0 means no cap.</p>
 <pre data-label="cpp">
 clio::cte::core::Client indexer(clio::run::PoolId(564, 0));
 auto hits = indexer.AsyncSemanticSearch("experiment/.*", ".*", "sea ice", 5);

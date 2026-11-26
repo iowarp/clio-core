@@ -199,7 +199,12 @@ struct TimedMutex {
    */
   CTP_INLINE_CROSS_FUN
   min_u64 TryLock() {
-    min_u64 my = ticket_.fetch_add(1) + 1;  // never 0
+    // The id carries the holder's pid in its high half, so the holder is
+    // known from the moment the CAS succeeds (no window where the lock is
+    // held by nobody identifiable). The low half is a per-lock count.
+    min_u64 low = (ticket_.fetch_add(1) + 1) & 0xFFFFFFFFull;
+    if (low == 0) low = 1;  // never 0, even without a pid (device passes)
+    const min_u64 my = (static_cast<min_u64>(MyPid()) << 32) | low;
     min_u64 expected = 0;
     if (!state_.compare_exchange_strong(expected, my)) {
       return 0;
@@ -208,6 +213,10 @@ struct TimedMutex {
     StampOwner();
     return my;
   }
+
+  /** Holder pid encoded in an acquisition id (0 if unknown). */
+  CTP_INLINE_CROSS_FUN
+  static min_u32 IdPid(min_u64 id) { return static_cast<min_u32>(id >> 32); }
 
   /**
    * Acquire, blocking the calling THREAD until success.
@@ -263,6 +272,25 @@ struct TimedMutex {
   /** Number of locks broken from dead owners (diagnostics). */
   CTP_INLINE_CROSS_FUN
   min_u64 GetStealCount() const { return steal_count_.load(); }
+
+ private:
+ public:
+  /** This process's pid, cached per thread and per fork generation. */
+  CTP_INLINE_CROSS_FUN
+  static min_u32 MyPid() {
+#if !CTP_IS_DEVICE_PASS
+    static thread_local min_u32 pid = 0;
+    static thread_local unsigned gen = 0;
+    const unsigned g = detail::ProcIdentityGen();
+    if (pid == 0 || gen != g) {
+      pid = static_cast<min_u32>(ctp::SystemInfo::GetPid());
+      gen = g;
+    }
+    return pid;
+#else
+    return 0;
+#endif
+  }
 
  private:
   /** Publish this process's identity as the holder. */
@@ -341,8 +369,11 @@ struct TimedMutex {
   CTP_INLINE_CROSS_FUN
   void TryReclaim(min_u64 observed) {
 #if !CTP_IS_DEVICE_PASS
-    min_u32 pid = owner_pid_.load();
+    min_u32 pid = IdPid(observed);
     min_u64 start = owner_start_.load();
+    if (pid == 0) {
+      pid = owner_pid_.load();
+    }
     if (pid == 0) {
       return;  // identity not yet published; too early to judge
     }
@@ -360,6 +391,17 @@ struct TimedMutex {
     (void)observed;
 #endif
   }
+
+ public:
+  /** Identity of the current holder: its pid (0 = none or not yet stamped). */
+  CTP_INLINE_CROSS_FUN
+  min_u32 OwnerPid() const { return owner_pid_.load(); }
+  /** Identity of the current holder: its process start time. */
+  CTP_INLINE_CROSS_FUN
+  min_u64 OwnerStart() const { return owner_start_.load(); }
+  /** Current acquisition id (0 = unlocked). */
+  CTP_INLINE_CROSS_FUN
+  min_u64 State() const { return state_.load(); }
 
   /**
    * Read a process's start time (Linux: /proc/<pid>/stat field 22, in clock
@@ -421,6 +463,38 @@ struct TimedMutex {
   }
 
   /**
+   * Is `pid` a zombie (exited, not yet reaped)? Linux: state field of
+   * /proc/<pid>/stat. False when unknown.
+   */
+  CTP_INLINE_CROSS_FUN
+  static bool IsZombie(min_u32 pid) {
+#if defined(__linux__) && !CTP_IS_DEVICE_PASS
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%u/stat", static_cast<unsigned>(pid));
+    FILE *f = fopen(path, "r");
+    if (f == nullptr) {
+      return false;
+    }
+    char buf[512];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+    // The state follows the LAST ')' (comm may contain parentheses).
+    char *rparen = nullptr;
+    for (char *p = buf; *p != '\0'; ++p) {
+      if (*p == ')') {
+        rparen = p;
+      }
+    }
+    return rparen != nullptr && rparen[1] == ' ' &&
+           (rparen[2] == 'Z' || rparen[2] == 'X');
+#else
+    (void)pid;
+    return false;
+#endif
+  }
+
+  /**
    * Is `pid` alive AND the same process instance that took the lock?
    *
    * Deliberately CONSERVATIVE: anything uncertain returns true (= do not
@@ -444,6 +518,11 @@ struct TimedMutex {
         return false;
       }
       return true;
+    }
+    // A killed process its parent has not reaped yet still answers kill(0),
+    // but it will never run again: it holds nothing it can release.
+    if (IsZombie(pid)) {
+      return false;
     }
     // The pid exists, but it may be a REUSED pid belonging to a different
     // process. Where a start time is available (Linux /proc), a mismatch

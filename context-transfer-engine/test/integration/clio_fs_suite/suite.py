@@ -202,19 +202,32 @@ def snapshot_bins(src, dst):
   """
   import shutil
   os.makedirs(dst, exist_ok=True)
-  for name in os.listdir(src):
-    if name in ('clio_run', 'clio_cte_fuse', 'cte_search',
-                'clio_safe_bdev_dist_stress', 'clio_safe_bdev_recover') or (
-        name.startswith('lib') and '.so' in name):
-      sp = os.path.join(src, name)
-      dp = os.path.join(dst, name)
-      if os.path.islink(sp):
-        if os.path.lexists(dp):
-          os.unlink(dp)
-        os.symlink(os.readlink(sp), dp)
-      else:
-        shutil.copy2(sp, dp)
-        _rpath_to_origin(dp, src)
+  wanted = [n for n in os.listdir(src)
+            if n in ('clio_run', 'clio_cte_fuse', 'cte_search',
+                     'clio_safe_bdev_dist_stress', 'clio_safe_bdev_recover') or
+            (n.startswith('lib') and '.so' in n)]
+  # A wanted symlink drags in its target: clio_run is a link to clio-run
+  # since the CLI rename, and a snapshot with only the link cannot start a
+  # runtime (sh: clio_run: not found).
+  i = 0
+  while i < len(wanted):
+    sp = os.path.join(src, wanted[i])
+    if os.path.islink(sp):
+      target = os.readlink(sp)
+      if '/' not in target and target not in wanted and \
+          os.path.exists(os.path.join(src, target)):
+        wanted.append(target)
+    i += 1
+  for name in wanted:
+    sp = os.path.join(src, name)
+    dp = os.path.join(dst, name)
+    if os.path.islink(sp):
+      if os.path.lexists(dp):
+        os.unlink(dp)
+      os.symlink(os.readlink(sp), dp)
+    else:
+      shutil.copy2(sp, dp)
+      _rpath_to_origin(dp, src)
   return dst
 
 

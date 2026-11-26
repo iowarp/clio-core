@@ -60,6 +60,10 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <set>
+#include <utility>
 #include <chrono>
 #include <cstring>
 #include <string>
@@ -205,6 +209,38 @@ TEST_CASE("FUSE ops - getattr root and missing", "[fuse][ops]") {
   REQUIRE(st.st_ino == 1);
 
   REQUIRE(cte_fuse_getattr("/no_such_file_xyz", &st, nullptr) == -ENOENT);
+}
+
+// ============================================================================
+// The namespace runs in shared memory: a create is one record in the
+// segment's op log (no task), applied by the module in the background under
+// the id the client minted.
+// ============================================================================
+
+TEST_CASE("FUSE ops - namespace runs in shared memory", "[fuse][ops][ns]") {
+  Fx();
+  auto *cfs = CLIO_CFS_CLIENT;
+  auto *v = cfs->Ns();
+  REQUIRE(v != nullptr);
+  const char *path = "/ns_probe.bin";
+  const clio::run::u64 pushed0 = v->PushedSeq();
+  auto fi = MakeFi();
+  REQUIRE(cte_fuse_create(path, 0644, &fi) == 0);
+  REQUIRE(v->PushedSeq() == pushed0 + 1);
+  cte_stat_t st;
+  REQUIRE(cte_fuse_getattr(path, &st, nullptr) == 0);
+  REQUIRE(S_ISREG(st.st_mode));
+  REQUIRE(cte_fuse_release(path, &fi) == 0);
+  // Once the module applied the log, it holds the file under the same id.
+  REQUIRE(cfs->FsWaitApplied() == 0);
+  auto t = cfs->AsyncGetattr(path);
+  t.Wait();
+  REQUIRE(t->GetReturnCode() == 0);
+  REQUIRE(t->exists_ != 0);
+  INFO("module ino " << t->ino_ << " stat ino " << static_cast<clio::run::u64>(st.st_ino) << " sizeof(st_ino) " << sizeof(st.st_ino));
+  REQUIRE(t->ino_ == static_cast<clio::run::u64>(st.st_ino));
+  REQUIRE(cte_fuse_unlink(path) == 0);
+  REQUIRE(cte_fuse_getattr(path, &st, nullptr) == -ENOENT);
 }
 
 // ============================================================================
@@ -738,6 +774,132 @@ TEST_CASE("FUSE ops - stat and read right after close see every byte",
 // ============================================================================
 // statfs
 // ============================================================================
+
+// ============================================================================
+// Parallel O_APPEND: every record lands exactly once, whole, and a view
+// taken mid-run is a prefix of whole records (it may lag, never show bytes
+// that are not final).
+// ============================================================================
+
+namespace {
+constexpr size_t kAppRecord = 1000;
+constexpr int kAppThreads = 8;
+constexpr int kAppPerThread = 64;
+
+/** Record `seq` of appender `t`: a header and a fill derived from both. */
+std::string AppendRecord(int t, int seq) {
+  std::string r(kAppRecord, static_cast<char>('a' + (t * 7 + seq) % 26));
+  const std::string head = "T" + std::to_string(t) + "S" +
+                           std::to_string(seq) + ";";
+  std::memcpy(&r[0], head.data(), head.size());
+  return r;
+}
+
+/**
+ * Check the file's first `size` bytes are whole, valid records.
+ * @param seen receives (t, seq) of every record
+ * @return true when every record is intact
+ */
+bool CheckAppendRecords(const char *path, size_t size,
+                        std::set<std::pair<int, int>> *seen) {
+  if (size % kAppRecord != 0) return false;
+  auto fi = MakeFi();
+  fi.flags = O_RDONLY;
+  if (cte_fuse_open(path, &fi) != 0) return false;
+  std::vector<char> data(size);
+  const int got = size == 0 ? 0
+                            : cte_fuse_read(path, data.data(), size, 0, &fi);
+  cte_fuse_release(path, &fi);
+  if (got != static_cast<int>(size)) return false;
+  for (size_t off = 0; off < size; off += kAppRecord) {
+    int t = -1;
+    int seq = -1;
+    if (std::sscanf(data.data() + off, "T%dS%d;", &t, &seq) != 2) return false;
+    if (std::memcmp(data.data() + off, AppendRecord(t, seq).data(),
+                    kAppRecord) != 0) {
+      return false;
+    }
+    if (seen != nullptr && !seen->insert({t, seq}).second) return false;
+  }
+  return true;
+}
+}  // namespace
+
+TEST_CASE("FUSE ops - parallel appends keep every record", "[fuse][ops]") {
+  Fx();
+  const char *path = "/append_par.log";
+  {
+    auto fi = MakeFi();
+    REQUIRE(cte_fuse_create(path, 0644, &fi) == 0);
+    REQUIRE(cte_fuse_release(path, &fi) == 0);
+  }
+  auto *nsv = CLIO_CFS_CLIENT->NsSegment();
+  REQUIRE(nsv != nullptr);
+  const clio::run::u64 pushed0 = nsv->PushedSeq();
+  const char *merge_env = std::getenv("CLIO_CFS_APPEND_MERGE");
+  const bool merge = merge_env != nullptr && *merge_env == '1';
+  std::atomic<int> errors{0};
+  std::atomic<bool> stop{false};
+  std::atomic<int> bad_views{0};
+  // A reader polls the file while appenders run: every view is whole records.
+  std::thread reader([&] {
+    while (!stop.load()) {
+      cte_stat_t st;
+      if (cte_fuse_getattr(path, &st, nullptr) == 0 &&
+          !CheckAppendRecords(path, static_cast<size_t>(st.st_size),
+                              nullptr)) {
+        bad_views.fetch_add(1);
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+  });
+  std::vector<std::thread> writers;
+  for (int t = 0; t < kAppThreads; ++t) {
+    writers.emplace_back([&, t] {
+      auto fi = MakeFi();
+      fi.flags = O_WRONLY | O_APPEND;
+      if (cte_fuse_open(path, &fi) != 0) {
+        errors.fetch_add(1);
+        return;
+      }
+      for (int seq = 0; seq < kAppPerThread; ++seq) {
+        const std::string r = AppendRecord(t, seq);
+        // O_APPEND: the offset the kernel passes is not the placement.
+        if (cte_fuse_write(path, r.data(), r.size(), 0, &fi) !=
+            static_cast<int>(r.size())) {
+          errors.fetch_add(1);
+        }
+      }
+      if (cte_fuse_fsync(path, 0, &fi) != 0) errors.fetch_add(1);
+      cte_fuse_release(path, &fi);
+    });
+  }
+  for (auto &w : writers) w.join();
+  stop.store(true);
+  reader.join();
+  REQUIRE(errors.load() == 0);
+  // Which path ran: the merge path logs one kOpAppend per append, the
+  // one-node path none.
+  const clio::run::u64 appends_logged = nsv->PushedSeq() - pushed0;
+  INFO("merge path " << merge << ", ops logged " << appends_logged);
+  if (merge) {
+    REQUIRE(appends_logged >=
+            static_cast<clio::run::u64>(kAppThreads * kAppPerThread));
+  } else {
+    REQUIRE(appends_logged == 0u);
+  }
+  INFO("views showing bytes that were not whole records: " << bad_views.load());
+  REQUIRE(bad_views.load() == 0);
+  // fsync waited for every merge: the file holds every record exactly once.
+  cte_stat_t st;
+  REQUIRE(cte_fuse_getattr(path, &st, nullptr) == 0);
+  REQUIRE(static_cast<size_t>(st.st_size) ==
+          kAppRecord * kAppThreads * kAppPerThread);
+  std::set<std::pair<int, int>> seen;
+  REQUIRE(CheckAppendRecords(path, static_cast<size_t>(st.st_size), &seen));
+  REQUIRE(seen.size() == static_cast<size_t>(kAppThreads * kAppPerThread));
+  REQUIRE(cte_fuse_unlink(path) == 0);
+}
 
 TEST_CASE("FUSE ops - statfs", "[fuse][ops]") {
   Fx();

@@ -2189,6 +2189,12 @@ struct Context {
    *  not happen -- and a later ReorganizeBlob to that score would see no difference and leave the blob where it
    *  is (a page promoted to a fast tier, then written back, could never be demoted). */
   static constexpr clio::run::u32 kKeepScore = 1u << 10;
+  /** kBypassShmCache -- keep THIS put or get out of the shm cache segment.
+   *  The client skips the segment and sends a task; the shm cache treats any
+   *  op flag as a non-plain operation, so it drains the blob's buffered
+   *  ranges, drops its copy and forwards the operation down the chain, and
+   *  the data is not held twice. Other layers ignore the bit. */
+  static constexpr clio::run::u32 kBypassShmCache = 1u << 11;
 
   /**
    * Fault-handler parameters (checkpointing / lazy copy). When the core
@@ -3428,6 +3434,16 @@ struct ReorganizeHintTask : public clio::run::Task {
  * The destructor frees data_ when TASK_DATA_OWNER is set (client-side
  * staging ownership, same contract as PutBlobTask).
  */
+/**
+ * Routing blob name (route_blob_) of a MultiPutBlob that lands a write-back
+ * cache's flushed ranges on their owner (cache_base). An interposer between
+ * the write-back cache's flush_pool and its persistent chain must pass such
+ * a batch down unchanged: absorbing it as a new write (the shm cache in data
+ * mode) would send it back to the write-back cache as dirty data, forever,
+ * and it would never reach persistent storage.
+ */
+inline constexpr const char kCacheLandBlob[] = "\x01" "cache_base.land";
+
 struct MultiPutDesc {
   TagId tag_id_;
   std::string blob_name_;

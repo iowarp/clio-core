@@ -21,6 +21,8 @@ namespace clio::cte::filesystem {
   X(kClose, CloseTask, Close)             \
   X(kMultiCreate, MultiCreateTask, MultiCreate) \
   X(kAdvanceSize, AdvanceSizeTask, AdvanceSize) \
+  X(kIdentifyRange, IdentifyRangeTask, IdentifyRange) \
+  X(kCommitRange, CommitRangeTask, CommitRange) \
   X(kShardOp, ShardOpTask, ShardOp)       \
   X(kSyncMeta, SyncMetaTask, SyncMeta)    \
   X(kRead, ReadTask, Read)                \
@@ -255,11 +257,12 @@ void Runtime::AggregateOut(clio::run::u32 method, clio::run::shared_ptr<clio::ru
 
 void Runtime::AggregateIn(clio::run::u32 method, clio::run::shared_ptr<clio::run::Task> &agg_task,
                           const clio::run::shared_ptr<clio::run::Task> &member_task) {
-  // No filesystem method is a ManyToOne collective: the aggregate is a
-  // copy of the first member.
-  (void)method;
-  (void)agg_task;
-  (void)member_task;
+  // IdentifyRange is the one ManyToOne collective: the aggregate lists
+  // every member. Every other aggregate is a copy of its first member.
+  if (method == Method::kIdentifyRange) {
+    auto &typed = agg_task.template Cast<IdentifyRangeTask>();
+    typed->AggregateIn(ctp::ipc::FullPtr<clio::run::Task>(member_task.get()));
+  }
 }
 
 #undef CLIO_FS_FOR_EACH_METHOD

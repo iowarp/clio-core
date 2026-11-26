@@ -26,9 +26,9 @@ compression primitives it links against.</p>
 
 <h2>Where it sits</h2>
 <p>When enabled, the compressor sits between the shm cache and the
-write-back cache: indexer (564.0), shm cache (568.0), compressor (562.0),
-write-back cache (567.0). The compressor sits below the indexer so the
-indexer's read-backs see logical bytes, and above the write-back cache so
+write-back cache: [indexer (564.0),] shm cache (568.0), compressor (562.0),
+write-back cache (567.0). It sits below the opt-in indexer, when that is
+composed, so the indexer's read-backs see logical bytes, and above the write-back cache so
 the volatile and persistent copies are both the stored, compressed
 form.</p>
 <ul>

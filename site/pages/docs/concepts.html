@@ -50,10 +50,10 @@ facts: Written for | Anyone configuring or scripting CLIO Core ; Read time | 8 m
     <tr><td><code>561.0</code></td><td><code>clio_cte_replication</code></td><td>Persistent copies</td></tr>
     <tr><td><code>562.0</code></td><td><code>clio_cte_compressor</code></td><td>Optional compression</td></tr>
     <tr><td><code>563.0</code></td><td><code>clio_cte_cache</code></td><td>Optional node-local copies; not composed by default</td></tr>
-    <tr><td><code>564.0</code></td><td><code>clio_cte_indexer</code></td><td>Keyword search index; top of the chain</td></tr>
+    <tr><td><code>564.0</code></td><td><code>clio_cte_indexer</code></td><td>Keyword search index; opt-in, not composed by default</td></tr>
     <tr><td><code>565.0</code></td><td><code>clio_cte_stream</code></td><td>Byte streams: page layout, file sizes, appends</td></tr>
     <tr><td><code>567.0</code></td><td><code>clio_cte_core_persist_write_back</code></td><td>Write-back cache joining the volatile and persistent engines</td></tr>
-    <tr><td><code>568.0</code></td><td><code>clio_cte_core_shm_cache_writethru</code></td><td>Metadata cache in shared memory that clients map</td></tr>
+    <tr><td><code>568.0</code></td><td><code>clio_cte_core_shm_cache_writethru</code></td><td>Metadata cache in shared memory that clients map; top of the default chain</td></tr>
     <tr><td><code>560.0</code></td><td><code>clio_cte_filesystem</code></td><td>The filesystem namespace</td></tr>
   </tbody>
 </table></div>
@@ -61,8 +61,9 @@ facts: Written for | Anyone configuring or scripting CLIO Core ; Read time | 8 m
 <h2>The module chain</h2>
 <p>Replication, caching, indexing and compression are separate modules that all speak the storage engine's interface. Each one forwards to the next through <code>next_pool_id</code>. In the default configuration, a write from the filesystem flows like this:</p>
 <pre data-label="data path">
-filesystem 560.0 → indexer 564.0 → shm cache 568.0 → [compressor 562.0] → write-back 567.0 → volatile core 540.0
-                                                         write-back flush → replication 561.0 → persistent core 512.0
+filesystem 560.0 → shm cache 568.0 → [compressor 562.0] → write-back 567.0 → volatile core 540.0
+                                       write-back flush → replication 561.0 → persistent core 512.0
 </pre>
 <p>The write-back cache acknowledges a write once it is in the volatile RAM core, and flushes it through replication to the persistent core every 10 s, on <code>fsync</code>, and before eviction.</p>
-<p>Any client can bind to any layer. Set <code>CLIO_CTE_POOL=564.0</code>, for example, and your Python client talks to the indexer, which serves search and forwards everything else. The <a href="/design/chain.html">interposition chain</a> design page describes each layer's guarantees.</p>
+<p>The indexer (564.0) is opt-in: to enable keyword search, uncomment its entry, set the shm cache's <code>entry_pool_id</code> to <code>"564.0"</code>, and point the CAE, stream and filesystem entries' <code>next_pool_id</code> at <code>"564.0"</code>, so it sits on top of the chain.</p>
+<p>Any client can bind to any layer. With the indexer composed, set <code>CLIO_CTE_POOL=564.0</code>, for example, and your Python client talks to the indexer, which serves search and forwards everything else. The <a href="/design/chain.html">interposition chain</a> design page describes each layer's guarantees.</p>
