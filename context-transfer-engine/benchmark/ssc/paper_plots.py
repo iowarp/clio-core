@@ -44,6 +44,12 @@ ARMS = {
     "wknn10": ("SSC lookup, no model", GREEN, "nomodel"),
     "const": ("Fixed guess", "#b5b4ae", "nomodel"),
     "guards": ("Guards only", "#5f5e5a", "nomodel"),
+    "v12d@qwen3:4b": ("S1 + SSC v12d (qwen3-4B)", BLUE, "s1ssc"),
+    "v12d@llama3.1:8b": ("S1 + SSC v12d (llama3.1-8B)", VIOLET, "s1ssc"),
+    # fixed I/O stacks (what CLIO runs today), synthesized on the same windows (add_fixed)
+    "fixed-default": ("Default stack (as shipped)", "#b5b4ae", "fixed"),
+    "fixed-default-idx": ("Default stack + declared indexer", GRAY, "fixed"),
+    "fixed-best": ("Best fixed stack (hand-tuned, hindsight)", "#5f5e5a", "fixed"),
 }
 MAIN = ["const", "guards", "rules", "wknn10", "none@qwen3:4b", "none@llama3.1:8b",
         "none@qwen3:4b+think", "none@qwen3:14b+think", "v10@qwen3:4b+think",
@@ -119,12 +125,17 @@ def load_offline(res):
     out = defaultdict(lambda: defaultdict(list))
     grids = {}
     for p in sorted(glob.glob(os.path.join(res, "offline", "*.jsonl"))):
+        b = os.path.basename(p)
+        if b.startswith("lc_") or "_lc_" in b:
+            continue                    # learning curve (load_lc): partial node experience
         node, app = os.path.basename(p).split("_")[:2]
         if node not in grids:
             gp = os.path.join(res, "grid", f"grid_{node}.jsonl")
             grids[node] = load_grid(gp) if os.path.exists(gp) else None
         for l in open(p):
             r = json.loads(l)
+            if "memory" in r:
+                continue
             r["raw_score"] = r["score"]
             r["score"] = max(0.0, r["score"])
             r["slowdown"] = slowdown(r, grids[node]) if grids[node] else float("nan")
@@ -138,6 +149,68 @@ def load_offline(res):
                     seen.add(k)
                     keep.append(r)
             d[v] = keep
+    for (node, app), d in out.items():
+        if grids.get(node):
+            add_fixed(d, grids[node])
+    return out
+
+
+DEFAULT_STACK = ("dram", False, False, "none")     # compose.DEFAULT: core only, DRAM first
+ALL_STACKS = [(p, c, i, z) for p in ("dram", "disk") for c in (False, True) for i in (False, True)
+              for z in ("none", "lz4", "zstd")]
+
+
+def add_fixed(d, grid):
+    """Fixed I/O stacks on the same windows as the decision arms (the windows of the 'guards' arm,
+    which every scenario has): the default stack as shipped (no indexer, so a stream declared
+    searched later breaks its requirement), the default with the user's declared indexer, and the
+    best single stack for the whole scenario, chosen with the measured grid on these very windows
+    (an expert who tuned the YAML with hindsight). One composition per run; latency 0."""
+    tmpl = d.get("guards")
+    if not tmpl:
+        return
+
+    def rows(stack, declared_idx):
+        out = []
+        for t in tmpl:
+            k = list(stack)
+            if declared_idx and t["phase"] in SEARCHED:
+                k[2] = True
+            rec = dict(zip(("placement", "cache", "indexer", "compression"), k))
+            r = {"seed": t["seed"], "step": t["step"], "phase": t["phase"], "recommended": rec,
+                 "violation": t["phase"] in SEARCHED and not rec["indexer"], "latency_s": 0.0}
+            try:
+                r["slowdown"] = slowdown(r, grid)
+            except KeyError:
+                return None
+            r["score"] = 0.0 if r["violation"] else 1.0 / r["slowdown"]
+            out.append(r)
+        return out
+
+    d["fixed-default"] = rows(DEFAULT_STACK, False)
+    d["fixed-default-idx"] = rows(DEFAULT_STACK, True)
+    cands = [x for x in (rows(s_, True) for s_ in ALL_STACKS) if x]
+    d["fixed-best"] = min(cands, key=lambda x: statistics.mean(math.log(r["slowdown"]) for r in x))
+    for v in [v for v in ("fixed-default", "fixed-default-idx") if d[v] is None]:
+        del d[v]
+
+
+def load_lc(res):
+    """Learning curve: {(node, app, variant): {N measured phases: {subset: [rows]}}}."""
+    out = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+    for p in sorted(glob.glob(os.path.join(res, "offline", "*.jsonl"))):
+        b = os.path.basename(p)
+        if not b.startswith("lc_") and "_lc_" not in b:
+            continue
+        node = b.split("_")[1] if b.startswith("lc_") else b.split("_")[0]
+        app = b.split("_")[2] if b.startswith("lc_") else b.split("_")[1]
+        grid = load_grid(os.path.join(res, "grid", f"grid_{node}.jsonl"))
+        for l in open(p):
+            r = json.loads(l)
+            if "memory" not in r:
+                continue
+            r["slowdown"] = slowdown(r, grid)
+            out[(node, app, r["variant"])][len(r["memory"])][tuple(r["memory"])].append(r)
     return out
 
 
@@ -328,74 +401,114 @@ def fig_phase_heatmap(off, figdir, node="1g", app="gs"):
 
 ACC_WITHIN = 1.25    # a decision is "accurate" if its window time is within 25% of the best setup
                      # (measurement noise between repeats is ~10% median, so 10% would mostly score noise)
-SCENARIOS = [(("1g", "gs"), "Gray-Scott\n1 GB node"), (("05g", "gs"), "Gray-Scott\n0.5 GB node"),
-             (("4g", "gs"), "Gray-Scott\n4 GB node"), (("1g", "app2"), "DL / HDF5 app\n1 GB node"),
-             (("1g", "app3"), "WfCommons\n1 GB node"), (("05g", "app3"), "WfCommons\n0.5 GB node"),
-             (("05gp", "app3"), "WfCommons\n0.5 GB + PFS")]
-MAIN_ARMS = [("v10@qwen3:4b", "S1 + SSC (qwen3-4B, thinking off)", BLUE, False),
-             ("v10@llama3.1:8b", "S1 + SSC (llama3.1-8B, thinking off)", VIOLET, False),
-             ("none@qwen3:4b+think", "S2, no SSC (qwen3-4B, thinking on)", ORANGE, False),
-             ("none@qwen3:4b", "S1, no SSC (qwen3-4B, thinking off)", "#b5b4ae", True)]
+SCENARIOS = [(("1g", "gs"), "Gray-Scott\n1 GB"), (("05g", "gs"), "Gray-Scott\n0.5 GB"),
+             (("4g", "gs"), "Gray-Scott\n4 GB"), (("05gp", "gs"), "Gray-Scott\n0.5 GB+PFS"),
+             (("1g", "app2"), "DL/HDF5\n1 GB"), (("4g", "app2"), "DL/HDF5\n4 GB"),
+             (("1g", "app3"), "WfCommons\n1 GB"), (("05g", "app3"), "WfCommons\n0.5 GB"),
+             (("05gp", "app3"), "WfCommons\n0.5 GB+PFS")]
+# main figure: automatic composition against the fixed stacks CLIO runs today; the reasoning model
+# without the SSC stays as the "why not just ask a thinking model" reference
+MAIN_ARMS = [("fixed-default", "Default stack, as shipped", "#cfcec9", True),
+             ("fixed-default-idx", "Default stack + declared indexer", "#a8a7a2", True),
+             ("fixed-best", "Best fixed stack (hand-tuned, hindsight)", "#5f5e5a", True),
+             ("v12d@qwen3:4b", "S1 + SSC (qwen3-4B, thinking off), this work", BLUE, False),
+             ("none@qwen3:4b+think", "S2, no SSC (qwen3-4B, thinking on)", ORANGE, False)]
 
 
 def fig_main(off, figdir):
-    """The paper's main figure: decision accuracy (left) and decision time (right), S1 + SSC vs
-    S2 without SSC, on every scenario where all of them ran."""
-    scen = [(k, lab) for k, lab in SCENARIOS
-            if k in off and all(v in off[k] for v, *_ in MAIN_ARMS[:3])]
+    """The paper's main figure. Left: slowdown vs. the best measured composition (geomean over the
+    windows of 10 unseen schedules, 95% CI over schedules) for the fixed stacks and S1 + SSC. Right:
+    decision time per window of the model-based arms (median, IQR)."""
+    scen = [(k, lab) for k, lab in SCENARIOS if k in off and "v12d@qwen3:4b" in off[k]]
     if not scen:
         return
-    fig, (a1, a2) = plt.subplots(1, 2, figsize=(7.0, 2.5), gridspec_kw={"wspace": 0.28})
+    fig, (a1, a2) = plt.subplots(1, 2, figsize=(7.0, 2.6), gridspec_kw={"wspace": 0.22, "width_ratios": [2.3, 1]})
     n = len(MAIN_ARMS)
-    w = 0.8 / n
-    for j, (v, label, color, ref) in enumerate(MAIN_ARMS):
+    w = 0.84 / n
+    for j, (v, label, color, fixed) in enumerate(MAIN_ARMS):
         for i, (k, _) in enumerate(scen):
             d = off[k]
             if v not in d:
                 continue
-            rows = d[v]
-            by = defaultdict(list)
-            for r in rows:
-                by[r["seed"]].append(r["slowdown"] <= ACC_WITHIN)
-            m, lo, hi = boot_ci([100 * statistics.mean(x) for x in by.values()])
-            lat = sorted(max(r.get("latency_s", 0.0), 1e-3) for r in rows)
-            med, q1, q3 = lat[len(lat) // 2], lat[len(lat) // 4], lat[3 * len(lat) // 4]
+            s = summarize(d[v])
             x = i + (j - (n - 1) / 2) * w
-            kw = dict(color="white" if ref else color, edgecolor=color if not ref else "#8a8985",
-                      linewidth=1.0, hatch="////" if ref else None)
-            a1.bar(x, m, w * 0.9, label=label if i == 0 else None, **kw)
-            a1.errorbar(x, m, yerr=[[m - lo], [hi - m]], fmt="none", ecolor=INK, elinewidth=0.7, capsize=1.5)
-            if m < 3:
-                a1.text(x, 2, f"{m:.0f}%", ha="center", va="bottom", fontsize=6, color=INK)
-            a2.bar(x, med, w * 0.9, **kw)
-            a2.errorbar(x, med, yerr=[[med - q1], [q3 - med]], fmt="none", ecolor=INK, elinewidth=0.7, capsize=1.5)
-            if v in ("none@qwen3:4b+think", "v10@qwen3:4b"):
-                a2.text(x, q3 * 1.25, f"{med:.0f} s" if med >= 10 else f"{med:.1f} s", ha="center",
-                        fontsize=6, color=INK)
-    for ax in (a1, a2):
-        ax.set_xticks(range(len(scen)), [lab for _, lab in scen])
-        ax.grid(axis="x", visible=False)
-    a1.set_ylim(0, 105)
-    a1.set_ylabel(f"accuracy (% of decisions within\n{100 * (ACC_WITHIN - 1):.0f}% of the best setup)")
-    a1.set_title("Decision accuracy (higher is better)", loc="left")
+            a1.bar(x, s["slow"], w * 0.92, bottom=0, color=color, edgecolor="none",
+                   label=label if i == 0 else None)
+            a1.errorbar(x, s["slow"], yerr=[[s["slow"] - s["slow_lo"]], [s["slow_hi"] - s["slow"]]],
+                        fmt="none", ecolor=INK, elinewidth=0.6, capsize=1.2)
+            if s["slow"] > 2.0:
+                a1.text(x, 2.02, f"{s['slow']:.1f}", ha="center", va="bottom", fontsize=5.5, color=INK)
+    a1.axhline(1.0, color=INK, linewidth=0.6)
+    a1.set_ylim(0.9, 2.1)
+    a1.set_xticks(range(len(scen)), [lab for _, lab in scen], fontsize=6.3)
+    a1.grid(axis="x", visible=False)
+    a1.set_ylabel("slowdown vs. best composition\n(geomean, lower is better)")
+    a1.set_title("Composition quality", loc="left")
+    # decision time: model arms on the scenarios where both ran
+    lat_arms = [(v, lab, c) for v, lab, c, fixed in MAIN_ARMS if not fixed]
+    lscen = [(k, lab) for k, lab in scen if all(v in off[k] for v, *_ in lat_arms)]
+    m = len(lat_arms)
+    for j, (v, label, color) in enumerate(lat_arms):
+        for i, (k, _) in enumerate(lscen):
+            lat = sorted(max(r.get("latency_s", 0.0), 1e-3) for r in off[k][v])
+            med, q1, q3 = lat[len(lat) // 2], lat[len(lat) // 4], lat[3 * len(lat) // 4]
+            x = i + (j - (m - 1) / 2) * 0.8 / m
+            a2.bar(x, med, 0.8 / m * 0.92, color=color, edgecolor="none")
+            a2.errorbar(x, med, yerr=[[med - q1], [q3 - med]], fmt="none", ecolor=INK, elinewidth=0.6, capsize=1.2)
+            a2.text(x, q3 * 1.3, f"{med:.0f}" if med >= 10 else f"{med:.1f}", ha="center", fontsize=5.5, color=INK)
     a2.set_yscale("log")
-    a2.set_ylim(None, a2.get_ylim()[1] * 4)
+    a2.set_ylim(0.1, 300)
+    short = lambda lab: lab.replace("Gray-Scott", "GS").replace("WfCommons", "WfC").replace("DL/HDF5", "DL")
+    a2.set_xticks(range(len(lscen)), [short(lab) for _, lab in lscen])
+    a2.grid(axis="x", visible=False)
     a2.set_ylabel("decision time per window (s, log)")
-    a2.set_title("Decision time (lower is better)", loc="left")
-    a1.legend(loc="upper center", bbox_to_anchor=(1.1, -0.2), ncol=2, borderaxespad=0)
+    a2.set_title("Decision time", loc="left")
+    a1.legend(loc="upper center", bbox_to_anchor=(0.72, -0.2), ncol=3, borderaxespad=0)
     save(fig, figdir, "fig_main_accuracy_speed")
+
+
+def fig_learning_curve(res, figdir, arms=(("wknn10", "SSC lookup, no model", GREEN),
+                                          ("v12d@qwen3:4b", "S1 + SSC (qwen3-4B)", BLUE))):
+    """Accuracy vs. how many Gray-Scott phases the node has measured (its experience); mean over
+    random subsets with min-max band; top axis: one-time measurement minutes for that many phases."""
+    lc = load_lc(res)
+    scen = [((n, a), lab) for (n, a), lab in SCENARIOS if any((n, a, v) in lc for v, *_ in arms)]
+    if not scen:
+        return
+    fig, axes = plt.subplots(1, len(scen), figsize=(1.55 * len(scen) + 0.4, 1.9), sharey=True)
+    axes = [axes] if len(scen) == 1 else list(axes)
+    for ax, ((node, app), lab) in zip(axes, scen):
+        for v, label, color in arms:
+            curve = lc.get((node, app, v))
+            if not curve:
+                continue
+            ns = sorted(curve)
+            accs = [[100 * statistics.mean(r["slowdown"] <= ACC_WITHIN for r in rows)
+                     for rows in curve[n].values()] for n in ns]
+            ax.plot(ns, [statistics.mean(a) for a in accs], "-o", color=color, ms=2.5, lw=1.1, label=label)
+            ax.fill_between(ns, [min(a) for a in accs], [max(a) for a in accs], color=color, alpha=0.15, lw=0)
+        ax.set_title(lab.replace("\n", ", "), loc="left")
+        ax.set_xticks([1, 2, 3, 5, 7])
+        ax.set_ylim(0, 105)
+        ax.set_xlabel("measured phases")
+    axes[0].set_ylabel("accuracy (%)")
+    axes[0].legend(loc="lower right", fontsize=6)
+    save(fig, figdir, "fig_learning_curve")
 
 # ------------------------------------------------------------------ live
 LIVE_ARMS = {
     "oracle": ("Oracle (knows the future)", "#b5b4ae"),
-    "fixed-best": ("Best fixed setup", GRAY),
+    "fixed-default": ("Default stack, as shipped", "#cfcec9"),
+    "fixed-best": ("Best fixed stack (hindsight)", GRAY),
     "rules": ("Expert rules", "#5f5e5a"),
     "s1-nossc": ("S1, no SSC (qwen3-4B)", AQUA),
     "s2-nossc": ("S2, no SSC (qwen3-4B think)", ORANGE),
     "s2-nossc-async": ("S2, no SSC, async", "#f4a27f"),
     "s1-ssc-llama": ("S1 + SSC (llama3.1-8B)", VIOLET),
-    "s1-ssc": ("S1 + SSC (qwen3-4B)", BLUE),
-    "s1-ssc-async": ("S1 + SSC, async", "#86b6ef"),
+    "s1-ssc": ("S1 + SSC v10 (qwen3-4B)", "#5a95dd"),
+    "s1-ssc-async": ("S1 + SSC v10, async", "#86b6ef"),
+    "s1-ssc12": ("S1 + SSC (qwen3-4B), this work", BLUE),
+    "s1-ssc12-async": ("S1 + SSC, async, this work", "#1f5fae"),
 }
 
 
@@ -457,7 +570,7 @@ def fig_live(live, meta, figdir, node):
 
 # ------------------------------------------------------------------ output
 def save(fig, figdir, name):
-    if not name.startswith(("fig_main", "fig_live")):
+    if not name.startswith(("fig_main", "fig_live", "fig_learning")):
         figdir = os.path.join(figdir, "extra")      # backup / appendix figures
         os.makedirs(figdir, exist_ok=True)
     fig.savefig(os.path.join(figdir, name + ".pdf"))

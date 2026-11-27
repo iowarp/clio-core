@@ -174,7 +174,7 @@ NONE_TEXT = ("## CONTROLLER SUMMARY\noptions this system can run: placement: dra
 
 def request(builder, obs):
     """The model request for the window just observed, and what finish() needs to use the answer."""
-    if SSC_VERSION in ("v10", "v11", "none"):
+    if SSC_VERSION in ("v10", "v11", "v12d", "none"):
         import ssc_v8
         st = builder.state(obs["tiers"])
         moved = len(builder.history) > 1 and builder.history[-2][0] != builder.history[-1][0]
@@ -185,7 +185,11 @@ def request(builder, obs):
             text = NONE_TEXT
         else:
             ssc_v8.SPEED_ONLY = True
-            ssc_v8.FIT_AWARE = SSC_VERSION == "v11"
+            ssc_v8.FIT_AWARE = SSC_VERSION in ("v11", "v12d")
+            # v12d (frozen on the Gray-Scott practice schedules): measured ratios next to the cost
+            # words, physical capacity; decisive evidence overrides the model in finish()
+            ssc_v8.SHOW_RATIO = SSC_VERSION == "v12d"
+            ssc_v8.CAPACITY = 1.0 if SSC_VERSION == "v12d" else 0.8
             text, qs = ssc_v8.build_v9(obs["window"], obs["ratio"], DECLARED[obs["phase"]], obs["tiers"],
                                        obs["phase"], CELLS)
         return (to_agentjev({"state_text": text, "questions": qs}),
@@ -217,8 +221,15 @@ def finish(builder, ctx, raw, lat):
     # v2: low-confidence changes only after a shift from the dominant class. v3: also when the
     # class differs from the previous window (a return to the dominant class is a transition too)
     need = 0.0 if st["drift"]["shift"] or (SSC_VERSION != "v2" and moved) else MIN_CONF
-    changed = [ax for ax in rec if rec[ax] != cur[ax] and ans[ax].get("pred") is not None
-               and (ans[ax].get("conf") or 0) >= need]
+    forced = {}
+    if SSC_VERSION == "v12d":
+        # decisive evidence (every other option > 1.15x slower on similar workloads) decides that
+        # axis; near-ties stay with the model (as in ablate_ssc.py)
+        import ssc_v8
+        forced = ssc_v8.decisive(obs["window"], obs["ratio"], DECLARED[obs["phase"]], tiers, obs["phase"], CELLS)
+        rec.update(forced)
+    changed = [ax for ax in rec if rec[ax] != cur[ax] and (ax in forced or (
+               ans[ax].get("pred") is not None and (ans[ax].get("conf") or 0) >= need))]
     prop = dict(cur)
     for ax in changed:
         prop[ax] = rec[ax]
@@ -229,7 +240,7 @@ def finish(builder, ctx, raw, lat):
         codecs = {k: float(v) for k, v in dist.items() if k != "none"} or {"lz4": 1.0}
         prop["compression"] = max(codecs, key=codecs.get)
         gated = True
-    info = {"answers": {k: v.get("pred") for k, v in ans.items()},
+    info = {"answers": {k: v.get("pred") for k, v in ans.items()}, "decisive": forced,
             "conf": {k: v.get("conf") for k, v in ans.items()}, "drift": st["drift"],
             "changed_axes": changed, "gated": gated, "moved": moved, "decision_latency_s": lat}
     return (prop if prop != cur else None), info
@@ -336,7 +347,7 @@ def main():
     ap.add_argument("out")
     ap.add_argument("--schedule", default=DEFAULT_SCHEDULE)
     ap.add_argument("--grid", default="/ssc-bench/live_results/grid_gs.jsonl")
-    ap.add_argument("--ssc", choices=["v2", "v3", "v4", "v5", "v6", "v10", "v11", "none"], default="v2")
+    ap.add_argument("--ssc", choices=["v2", "v3", "v4", "v5", "v6", "v10", "v11", "v12d", "none"], default="v2")
     ap.add_argument("--rules", action="store_true",
                     help="agentjev/llm: declared-requirement gate + capacity-watermark overflow reflex")
     ap.add_argument("--async-decide", action="store_true",
@@ -346,6 +357,9 @@ def main():
     a = ap.parse_args()
     global SSC_VERSION, ENVELOPE
     SSC_VERSION, ENVELOPE = a.ssc, a.envelope
+    global CAPACITY_FRACTION
+    if SSC_VERSION == "v12d":
+        CAPACITY_FRACTION = 1.0         # v12: physical capacity in the context and in the gate
     if a.schedule.startswith(("seed:", "gseed:", "dseed:", "wseed:")):
         kind, n = a.schedule.split(":")
         # gseed: the generalization phases join the draw (they were added after the design froze)

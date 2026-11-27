@@ -109,7 +109,9 @@ live() {
   local s best worst
   read best worst < <(ctr python3 choose_fixed.py $G/grid_1g.jsonl $PH 2>/dev/null)
   for s in 201 202 203; do
-    for a in "fixed-best 420 fixed:$best" "rules 420 heuristic2" "s1-ssc 480 s1:qwen3:4b --ssc v10 --rules" \
+    for a in "fixed-default 420 fixed:dram-nocache-noidx-none" "s1-ssc12 480 s1:qwen3:4b --ssc v12d --rules" \
+             "s1-ssc12-async 480 s1:qwen3:4b --ssc v12d --rules --async-decide" \
+             "fixed-best 420 fixed:$best" "rules 420 heuristic2" "s1-ssc 480 s1:qwen3:4b --ssc v10 --rules" \
              "s1-nossc 480 s1:qwen3:4b --ssc none --rules" "s1-ssc-llama 480 s1:llama3.1:8b --ssc v10 --rules" \
              "oracle 420 oracle" "s1-ssc-async 480 s1:qwen3:4b --ssc v10 --rules --async-decide" \
              "s2-nossc-async 600 s1:qwen3:4b+think --ssc none --rules --async-decide" \
@@ -144,7 +146,7 @@ if grid_done 1g; then                            # continue in the same job once
 fi
 # everything done?
 all=1; for u in "${UNITS[@]}"; do set -- $u; [ -f $D/$1.done ] || all=0; done
-for s in 201 202 203; do for a in fixed-best rules s1-ssc s1-nossc s1-ssc-llama oracle s1-ssc-async s2-nossc-async s2-nossc; do
+for s in 201 202 203; do for a in fixed-default s1-ssc12 s1-ssc12-async fixed-best rules s1-ssc s1-nossc s1-ssc-llama oracle s1-ssc-async s2-nossc-async s2-nossc; do
   [ -s $L/1g_app3/${a}_s${s}_r1.jsonl ] || all=0; done; done
 [ $all = 1 ] && touch $D/ALL_DONE && echo ALL_DONE
 echo "$(date +%T) step done"

@@ -122,14 +122,22 @@ def table_best(res, paper, nodes, app):
 
 
 # ------------------------------------------------------------------ main offline table
-ARMS_MAIN = [("v10@qwen3:4b", "S1 + SSC (qwen3-4B)"), ("v10@llama3.1:8b", "S1 + SSC (llama3.1-8B)"),
-             ("none@qwen3:4b+think", "S2, no SSC (qwen3-4B, thinking)"),
-             ("none@qwen3:14b+think", "S2, no SSC (qwen3-14B, thinking)"),
-             ("v10@qwen3:4b+think", "S2 + SSC (qwen3-4B, thinking)"),
-             ("v10x@qwen3:4b", "S1 + SSC, no node experience"),
-             ("none@qwen3:4b", "S1, no SSC (qwen3-4B)"), ("rules", "Expert rules"),
-             ("rulesh", "Expert rules + capacity codec"),
-             ("wknn10", "SSC lookup, no model"), ("guards", "Guards only"), ("const", "Fixed guess")]
+ARMS_MAIN = [
+    "Fixed I/O stacks (CLIO today)",
+    ("fixed-default", "Default stack, as shipped"),
+    ("fixed-default-idx", "Default stack + declared indexer"),
+    ("fixed-best", "Best fixed stack (hand-tuned, hindsight)"),
+    "Automatic composition (this work)",
+    ("v12d@qwen3:4b", "S1 + SSC (qwen3-4B)"), ("v12d@llama3.1:8b", "S1 + SSC (llama3.1-8B)"),
+    ("v10@qwen3:4b", "S1 + SSC, v10 (qwen3-4B)"), ("v10@llama3.1:8b", "S1 + SSC, v10 (llama3.1-8B)"),
+    "Alternative deciders (design justification)",
+    ("none@qwen3:4b+think", "S2, no SSC (qwen3-4B, thinking)"),
+    ("none@qwen3:14b+think", "S2, no SSC (qwen3-14B, thinking)"),
+    ("v10@qwen3:4b+think", "S2 + SSC (qwen3-4B, thinking)"),
+    ("none@qwen3:4b", "S1, no SSC (qwen3-4B)"),
+    ("v10x@qwen3:4b", "S1 + SSC, no node experience"),
+    ("rules", "Expert rules"), ("rulesh", "Expert rules + capacity codec"),
+    ("wknn10", "SSC lookup, no model")]
 
 
 def acc(rows):
@@ -143,8 +151,12 @@ def table_main(off, paper, scenarios):
     cols = [(k, lab.replace("\n", " ")) for k, lab in scenarios if k in off]
     lines = ["\\begin{tabular}{l" + "rrr" * len(cols) + "}", "\\toprule",
              " & " + " & ".join(f"\\multicolumn{{3}}{{c}}{{{lab}}}" for _, lab in cols) + " \\\\",
-             "Controller & " + " & ".join("acc.\\,\\% & slow. & s/dec." for _ in cols) + " \\\\", "\\midrule"]
-    for v, name in ARMS_MAIN:
+             "Controller & " + " & ".join("acc.\\,\\% & slow. & s/dec." for _ in cols) + " \\\\"]
+    for arm in ARMS_MAIN:
+        if isinstance(arm, str):        # group heading
+            lines += ["\\midrule", f"\\multicolumn{{{1 + 3 * len(cols)}}}{{l}}{{\\emph{{{arm}}}}} \\\\"]
+            continue
+        v, name = arm
         if not any(v in off[k] for k, _ in cols):
             continue
         row = [name]
@@ -307,6 +319,7 @@ def main():
     figtmp = os.path.join(paper, "figures", ".build")
     os.makedirs(figtmp, exist_ok=True)
     pp.fig_main(off, figtmp)
+    pp.fig_learning_curve(res, figtmp)
     live, meta = pp.load_live(res)
     live = common_schedules(live)
     for node in live:
