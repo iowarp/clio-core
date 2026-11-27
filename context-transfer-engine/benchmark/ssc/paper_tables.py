@@ -123,7 +123,7 @@ def table_best(res, paper, nodes, app):
 
 # ------------------------------------------------------------------ main offline table
 ARMS_MAIN = [
-    "Fixed I/O stacks (CLIO today)",
+    "Fixed I/O stacks (today)",
     ("fixed-default", "Default stack, as shipped"),
     ("fixed-default-idx", "Default stack + declared indexer"),
     ("fixed-best", "Best fixed stack (hand-tuned, hindsight)"),

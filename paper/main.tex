@@ -18,17 +18,20 @@
 \title{\sys: Automatic, Online Composition of Composable HPC Storage Stacks with Fast Language Models}
 
 \begin{abstract}
-Composable storage systems such as CLIO let an HPC node assemble its I/O path from modules (caches,
-compressors, indexers) and change it while an application runs. Yet nothing chooses the composition:
-CLIO, like every composable framework we surveyed, runs one fixed stack, the default or whatever a
-person wrote into a configuration file for that workload and node. The default is
-1.5--2.6$\times$ slower than the best composition on our workloads, and writing a better one requires
-an expert who measures the target workload on the target node, again for every new workload and node.
+HPC applications run on fixed I/O stacks: the same layers (caching, indexing, compression, tier
+placement) for every workload, every phase and every node, configured once, usually left at the
+default. Composable storage systems now let a node assemble its I/O path from modules and change it
+while an application runs, but none of them decides the composition; every framework we surveyed
+runs a fixed stack, the default or whatever a person wrote for that workload and node. On our
+workloads the default stack is 1.5--2.6$\times$ slower than the best composition, and a better fixed
+stack requires an expert who measures the target workload on the target node, again for every new
+workload and node.
 
-We present \sys{}, the first automatic, online composition for CLIO. Once per workload window, a small
+We present \sys{}, automatic online I/O stack composition. Once per workload window, a small
 language model with thinking off chooses the composition from a \emph{Storage System Context} (SSC)
 that \sys{} builds from measurements of \emph{other} workloads on the same node; the target workload is
-never measured in advance. On an NCSA Delta node with three applications (a Gray-Scott campaign, a
+never measured in advance. We implement \sys{} on the CLIO composable storage runtime and evaluate it on
+an NCSA Delta node with three applications (a Gray-Scott campaign, a
 DLIO/h5bench-style workload, and stages of three WfCommons workflows from real execution traces) and
 several node setups, \sys{} is 1.36--2.12$\times$ faster than the default stack and matches or beats a
 fixed stack hand-tuned with hindsight in five of six scenarios (1.00--1.13$\times$ the best
@@ -42,14 +45,20 @@ value on the 1\,GB node. \pending{live runs on schedules
 \maketitle
 
 \section{Introduction}
-HPC storage is becoming composable. Mochi/Bedrock~\cite{mochi}, ADIOS2 operators~\cite{adios2}, HDF5
-VOL connectors~\cite{hdf5vol}, Hermes~\cite{hermes} and IOWarp/CLIO~\cite{iowarp} assemble the I/O
-path from modules, and several of them can change that path while an application runs. In CLIO, a
-chain of a cache, an indexer and a compressor sits in front of a tiered core, and each module can
-be added or removed at run time.
+An HPC application's I/O passes through a stack of layers that decide where data goes and what is done
+to it on the way: which tier it lands in, whether it is cached, indexed or compressed. Today that stack
+is fixed. It is configured once, by a site or a user, usually left at the default, and applied to every
+workload, every phase of a run and every node alike. Yet the right stack is not universal: data that
+is re-read wants a cache, data that will be searched wants an index, data that would overflow the fast
+tier wants compression, and data that fits wants none of these.
 
-\textbf{The mechanism exists; the chooser does not.} CLIO has no automatic composition. A run uses
-one fixed stack: the default (DRAM first, no modules), or a configuration a person wrote for that
+Storage is becoming composable, which makes a per-workload stack possible. Mochi/Bedrock~\cite{mochi},
+ADIOS2 operators~\cite{adios2}, HDF5 VOL connectors~\cite{hdf5vol}, Hermes~\cite{hermes} and
+IOWarp/CLIO~\cite{iowarp} assemble the I/O path from modules, and several of them can change that path
+while an application runs.
+
+\textbf{The mechanism exists; the chooser does not.} None of these systems composes the stack
+automatically. A run uses one fixed stack: the default, or a configuration a person wrote for that
 workload on that node. The default is wrong in ways that matter: on our workloads it is
 1.5--2.6$\times$ slower than the best composition, loses writes when a window outgrows the fast
 tier, and leaves data that is searched later unindexed (\S\ref{sec:motivation}). A better fixed
@@ -83,8 +92,9 @@ well as an expert's hand-tuned stack, in about a second.
 
 \paragraph{Contributions.}
 \begin{itemize}
-\item \textbf{\sys{}}, the first automatic, online composition for CLIO: a decision loop that asks a
-  fast model (thinking off) typed questions per workload window and recomposes a live CLIO chain,
+\item \textbf{\sys{}}, automatic online I/O stack composition: a decision loop that asks a fast model
+  (thinking off) typed questions per workload window and recomposes the live stack, implemented on the
+  CLIO composable runtime,
   with two deterministic guards and an asynchronous mode that hides decision time behind I/O
   (\S\ref{sec:design}).
 \item The \textbf{Storage System Context (SSC)}, built automatically from measurements of
@@ -92,8 +102,7 @@ well as an expert's hand-tuned stack, in about a second.
   and no hand-written module descriptions (\S\ref{sec:ssc}).
 \item Fixes that make single-node composition meaningful in CLIO: a single-node read cache and
   device anti-affinity for same-node replicas (\S\ref{sec:clio}).
-\item An evaluation against the fixed stacks CLIO runs today (the default and a hand-tuned stack chosen
-  with hindsight) on three applications, four node setups and five models, with live runs on CLIO,
+\item An evaluation against fixed I/O stacks (the default and a stack hand-tuned with hindsight) on three applications, four node setups and five models, with live runs on CLIO,
   offline replays on measured ground truth, the cost of building the SSC (a learning curve over how
   much the node has measured), and ablations that justify each design choice: a reasoning model
   instead of a fast one, expert rules, a model-free lookup of the same evidence, and every SSC
@@ -125,9 +134,10 @@ and Table~\ref{tab:best} show the WfCommons phases; the Gray-Scott and DL/HDF5 p
 A workflow moves through such phases in seconds, so the composition must follow the workload while
 it runs, and the mapping must be relearned for each node.
 
-\paragraph{What CLIO runs today: a fixed stack.} CLIO has no automatic composition. A run uses the
-default stack (DRAM first, no cache, no indexer, no compression) or a composition someone wrote
-into the runtime's configuration for that workload and node, and keeps it for the whole run.
+\paragraph{What runs today: a fixed stack.} Composable runtimes, CLIO included, have no automatic
+composition. A run uses the default stack (here DRAM first, no cache, no indexer, no compression) or
+a composition someone wrote into the configuration for that workload and node, and keeps it for the
+whole run.
 Table~\ref{tab:main} quantifies the three options a user has. The default as shipped is
 1.50--2.58$\times$ slower than the best composition: it leaves data that is searched later without
 its index, loses writes when a window outgrows the tiers (the Gray-Scott log archive), and misses
@@ -312,7 +322,7 @@ text, VCF) since the traces record sizes only. Only the Gray-Scott phases are ev
 experience; DL/HDF5 and WfCommons test whether that experience transfers to applications the
 SSC has never seen.
 
-\paragraph{Controllers.} \emph{Fixed stacks (what CLIO runs today):} the default stack as shipped;
+\paragraph{Controllers.} \emph{Fixed stacks (what runs today):} the default stack as shipped;
 the default with the indexer on for streams the user declared searchable; and the best single stack
 for the scenario, chosen with the measured grid of the very windows it is scored on (an expert who
 hand-tuned the configuration with hindsight). \emph{\sys{}:} S1 + SSC with qwen3-4B and llama3.1-8B,
@@ -347,8 +357,8 @@ not held-out evidence; we therefore report v10 next to v12 throughout. No conclu
 depends on v12: against the fixed stacks, v10 with llama3.1-8B gives the same picture.
 
 \subsection{Main result: automatic composition vs.\ fixed stacks}\label{sec:main}
-Figure~\ref{fig:main} and Table~\ref{tab:main} compare \sys{} (S1 + SSC, v12) with the fixed stacks
-CLIO runs today, on 10 unseen schedules per scenario.
+Figure~\ref{fig:main} and Table~\ref{tab:main} compare \sys{} (S1 + SSC, v12) with fixed I/O
+stacks, on 10 unseen schedules per scenario.
 
 \begin{figure*}[t]
 \centering
@@ -644,8 +654,8 @@ the SSC is no better than no context (0\% accuracy, 2.9$\times$ the best on WfCo
 declared searchable, which a configuration could also do; we report the default with and without it.
 
 \section{Conclusion}
-Composable storage gives HPC nodes a choice of I/O stack, but CLIO, like the frameworks around it,
-leaves that choice to a fixed configuration. \sys{} makes it automatically and online: a fast model
+HPC applications still run on fixed I/O stacks, even where composable storage could give every
+workload its own. \sys{} composes the stack automatically and online: a fast model
 with thinking off, given a context built from the node's own measurements of other workloads, chooses
 a composition per window in about a second, 1.36--2.12$\times$ faster than the default stack and as good
 as a stack hand-tuned with hindsight in five of six scenarios, without measuring the target workload.
