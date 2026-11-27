@@ -53,7 +53,7 @@ tier wants compression, and data that fits wants none of these.
 
 Storage is becoming composable, which makes a per-workload stack possible. Mochi/Bedrock~\cite{mochi},
 ADIOS2 operators~\cite{adios2}, HDF5 VOL connectors~\cite{hdf5vol}, Hermes~\cite{hermes} and
-IOWarp/CLIO~\cite{iowarp} assemble the I/O path from modules, and several of them can change that path
+IOWarp~\cite{iowarp} assemble the I/O path from modules, and several of them can change that path
 while an application runs.
 
 \textbf{The mechanism exists; the chooser does not.} None of these systems composes the stack
@@ -269,7 +269,7 @@ check the answer; the new chain is applied to the live runtime at the next windo
   adds the strongest codec live). Every controller in the evaluation, including the rules, runs
   with the same guards.
 \item \textbf{Apply.} The new chain takes effect at the next window boundary. Module changes add or
-  remove pools on the running runtime (\texttt{clio\_run compose start/rm}, median 0.2\,s); a
+  remove pools on the running runtime (median 0.2\,s); a
   placement change restarts it. A canary put/get verifies every new chain.
 \end{enumerate}
 
@@ -284,8 +284,8 @@ node setup (24 compositions $\times$ 7 phases $\times$ 3 repeats, more when the 
 before the workload runs; everything else happens online. \S\ref{sec:ablation} measures what a node
 with no experience (a cold start) loses.
 
-\section{Implementation}\label{sec:clio}
-\sys{} runs on the IOWarp composable runtime (CLIO)~\cite{iowarp}. Two changes made single-node
+\section{Implementation}\label{sec:impl}
+\sys{} runs on the IOWarp composable runtime~\cite{iowarp}. Two changes made single-node
 composition meaningful there.
 \paragraph{Cache.} The runtime's cache is a cross-node read cache: the node that owns a blob keeps no copy.
 On one node every blob is owner-local, so the cache was a pass-through and its on/off decision was

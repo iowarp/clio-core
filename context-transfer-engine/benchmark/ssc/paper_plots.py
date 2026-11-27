@@ -563,7 +563,7 @@ def fig_live(live, meta, figdir, node):
     ax.set_xlabel("end-to-end time per schedule (s)")
     ax.legend(loc="lower right", fontsize=6.5)
     ax.grid(axis="y", visible=False)
-    ax.set_title(f"Live CLIO, {NODES.get(node, node)}", loc="left")
+    ax.set_title(f"Live runs, {NODES.get(node, node)}", loc="left")
     save(fig, figdir, f"fig_live_{node}")
     return stats
 

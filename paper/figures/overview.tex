@@ -4,7 +4,7 @@
   box/.style={draw, rounded corners=2pt, align=center, inner sep=3pt, minimum height=7mm},
   data/.style={box, fill=blue!6}, model/.style={box, fill=orange!12}, det/.style={box, fill=gray!12},
   mod/.style={draw, fill=white, minimum width=11mm, minimum height=5mm, inner sep=1pt}]
-  % CLIO chain
+  % composable I/O chain
   \node[mod] (cache) {cache};
   \node[mod, right=1.5mm of cache] (idx) {indexer};
   \node[mod, right=1.5mm of idx] (cmp) {compressor};
@@ -14,7 +14,7 @@
   \draw[->] (cache) -- (idx); \draw[->] (idx) -- (cmp); \draw[->] (cmp) -- (core);
   \draw[->] (core) -- (dram); \draw[->] (core) -- (ssd);
   \node[draw, dashed, rounded corners, fit=(cache)(core)(dram)(ssd), inner sep=3pt,
-        label={[font=\scriptsize\bfseries]above:CLIO chain (live)}] (chain) {};
+        label={[font=\scriptsize\bfseries]above:I/O stack (live)}] (chain) {};
   \node[data, left=6mm of chain] (app) {application\\windows};
   \draw[->, thick] (app) -- (chain);
   % loop
