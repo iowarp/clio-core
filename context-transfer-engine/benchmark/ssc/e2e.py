@@ -354,12 +354,20 @@ def main():
                     help="models: the workload keeps running while the model answers; the answer is applied "
                          "at the first window boundary after it arrives (a slow model acts on stale context)")
     ap.add_argument("--envelope", type=int, choices=[1, 2], default=2, help="safety-rule version (see ENVELOPE)")
+    ap.add_argument("--experience", choices=["gs", "wf"], default="gs",
+                    help="node experience: gs = Gray-Scott phases (frozen runs); wf = the other WfCommons workflows")
     a = ap.parse_args()
     global SSC_VERSION, ENVELOPE
     SSC_VERSION, ENVELOPE = a.ssc, a.envelope
     global CAPACITY_FRACTION
     if SSC_VERSION == "v12d":
         CAPACITY_FRACTION = 1.0         # v12: physical capacity in the context and in the gate
+    if a.experience == "wf":
+        workload.MEMORY_PHASES, workload.LEAVE_OUT = workload.WF_PHASES, "workflow"
+    if a.schedule.startswith("fseed:"):
+        # fseed: the WfCommons campaign (seven workflows' phases on one node)
+        a.schedule = random_schedule(int(a.schedule.split(":")[1]), phases=workload.WF_PHASES)
+        print("schedule", a.schedule, flush=True)
     if a.schedule.startswith(("seed:", "gseed:", "dseed:", "wseed:")):
         kind, n = a.schedule.split(":")
         # gseed: the generalization phases join the draw (they were added after the design froze)

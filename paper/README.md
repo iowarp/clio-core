@@ -1,4 +1,4 @@
-# Agora / SSC paper draft (ICS)
+# Accio / SSC paper draft (ICS)
 
 - `main.tex`, `refs.bib`: the draft (ACM `acmart`, sigconf). Red `[...]` = `\pending{}` numbers still being measured.
 - `tables/*.tex`, `figures/*.pdf`: **generated** from the Delta results, never edit by hand:

@@ -1,13 +1,7 @@
-\begin{tabular}{lrrrrrrrr}
+\begin{tabular}{l}
 \toprule
- & \multicolumn{2}{c}{Gray-Scott, 1 GB DRAM} & \multicolumn{2}{c}{DL/HDF5, 1 GB DRAM} & \multicolumn{2}{c}{WfCommons, 1 GB DRAM} & \multicolumn{2}{c}{WfCommons, 0.5 GB DRAM} \\
-Context & acc.\,\% & slow. & acc.\,\% & slow. & acc.\,\% & slow. & acc.\,\% & slow. \\
+ &  \\
+Context &  \\
 \midrule
-No SSC (option list only) & 0 & 5.55$\times$ & 0 & 4.82$\times$ & 0 & 3.62$\times$ & 0 & 5.16$\times$ \\
-SSC, no node experience & -- & -- & -- & -- & 0 & 2.87$\times$ & 0 & 2.94$\times$ \\
-Full SSC & 65 & 1.38$\times$ & 100 & 1.03$\times$ & 100 & 1.01$\times$ & 85 & 1.10$\times$ \\
-Full SSC, guards off & 65 & 1.38$\times$ & -- & -- & -- & -- & 85 & 1.10$\times$ \\
-Guards only (no model) & 100 & 1.04$\times$ & 68 & 1.53$\times$ & 100 & 1.00$\times$ & 85 & 1.09$\times$ \\
-SSC lookup, no model & 100 & 1.07$\times$ & 100 & 1.03$\times$ & 100 & 1.00$\times$ & 85 & 1.08$\times$ \\
 \bottomrule
 \end{tabular}

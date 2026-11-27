@@ -21,17 +21,21 @@ import matplotlib.pyplot as plt  # noqa: E402
 
 import paper_plots as pp  # noqa: E402
 
-APPS = {"gs": "Gray-Scott", "app2": "DL/HDF5", "app3": "WfCommons"}
+APPS = {"gs": "Gray-Scott", "app2": "DL/HDF5", "app3": "WfCommons", "wf": "WfCommons campaign"}
 PHASE_NAMES = {
     "gs_output": "GS snapshot output", "gs_analysis": "GS analysis re-read", "gs_products": "GS data products",
     "gs_log": "GS logs (searched)", "gs_archive": "GS log archive", "gs_field_reread": "GS field re-read",
     "gs_events": "GS events (searched)", "dl_samples": "DLIO training samples", "dl_ckpt": "DLIO checkpoint",
     "h5_particles": "h5bench particles (searched)", "mt_project": "Montage mProject images",
     "mt_fit": "Montage mDiffFit fits", "ep_fastq": "Epigenomics FASTQ", "ep_map": "Epigenomics map (searched)",
-    "kg_vcf": "1000Genome VCF", "kg_indiv": "1000Genome individuals"}
+    "kg_vcf": "1000Genome VCF", "kg_indiv": "1000Genome individuals", "cy_season": "Cycles season output",
+    "sk_realign": "SoyKB realigned BAMs", "sk_gvcf": "SoyKB gVCFs (searched)", "sg_decon": "Seismology SAC traces",
+    "sra_fastq": "SRAsearch reads"}
 APP_PHASES = {"gs": ["gs_output", "gs_analysis", "gs_products", "gs_log", "gs_archive"],
               "app2": ["dl_samples", "dl_ckpt", "h5_particles"],
-              "app3": ["mt_project", "mt_fit", "ep_fastq", "ep_map", "kg_vcf", "kg_indiv"]}
+              "app3": ["mt_project", "mt_fit", "ep_fastq", "ep_map", "kg_vcf", "kg_indiv"],
+              "wf": ["mt_project", "mt_fit", "ep_fastq", "ep_map", "kg_vcf", "kg_indiv", "cy_season",
+                     "sk_realign", "sk_gvcf", "sg_decon", "sra_fastq"]}
 COMP_COLS = [(p, c, x) for p in ("dram", "disk") for c in (False, True) for x in ("none", "lz4", "zstd")]
 
 
@@ -137,7 +141,9 @@ ARMS_MAIN = [
     ("none@qwen3:4b", "S1, no SSC (qwen3-4B)"),
     ("v10x@qwen3:4b", "S1 + SSC, no node experience"),
     ("rules", "Expert rules"), ("rulesh", "Expert rules + capacity codec"),
-    ("wknn10", "SSC lookup, no model")]
+    ("wknn10", "SSC lookup, no model"),
+    ("explore-first", "Explore each stack, then exploit"), ("egreedy", "$\\epsilon$-greedy exploration"),
+    ("explore-warm", "Exploration kept across 10 runs")]
 
 
 def acc(rows):
@@ -148,13 +154,14 @@ def acc(rows):
 
 
 def table_main(off, paper, scenarios):
+    """Accuracy and slowdown per scenario (decision time is in the main figure)."""
     cols = [(k, lab.replace("\n", " ")) for k, lab in scenarios if k in off]
-    lines = ["\\begin{tabular}{l" + "rrr" * len(cols) + "}", "\\toprule",
-             " & " + " & ".join(f"\\multicolumn{{3}}{{c}}{{{lab}}}" for _, lab in cols) + " \\\\",
-             "Controller & " + " & ".join("acc.\\,\\% & slow. & s/dec." for _ in cols) + " \\\\"]
+    lines = ["\\begin{tabular}{l" + "rr" * len(cols) + "}", "\\toprule",
+             " & " + " & ".join(f"\\multicolumn{{2}}{{c}}{{{lab}}}" for _, lab in cols) + " \\\\",
+             "Controller & " + " & ".join("acc. & slow." for _ in cols) + " \\\\"]
     for arm in ARMS_MAIN:
         if isinstance(arm, str):        # group heading
-            lines += ["\\midrule", f"\\multicolumn{{{1 + 3 * len(cols)}}}{{l}}{{\\emph{{{arm}}}}} \\\\"]
+            lines += ["\\midrule", f"\\multicolumn{{{1 + 2 * len(cols)}}}{{l}}{{\\emph{{{arm}}}}} \\\\"]
             continue
         v, name = arm
         if not any(v in off[k] for k, _ in cols):
@@ -163,13 +170,11 @@ def table_main(off, paper, scenarios):
         for k, _ in cols:
             d = off[k]
             if v not in d:
-                row += ["--", "--", "--"]
+                row += ["--", "--"]
                 continue
-            s = pp.summarize(d[v])
+            s_ = pp.summarize(d[v])
             a = acc(d[v])
-            n = s["seeds"]
-            row += [f"{a[0]:.0f}" + ("$^\\dagger$" if n < 10 else ""), f"{s['slow']:.2f}$\\times$",
-                    f"{s['lat_med']:.1f}" if s["lat_med"] >= 0.05 else "0"]
+            row += [f"{a[0]:.0f}" + ("$^\\dagger$" if s_["seeds"] < 10 else ""), f"{s_['slow']:.2f}"]
         lines.append(" & ".join(row) + " \\\\")
     lines += ["\\bottomrule", "\\end{tabular}"]
     write(os.path.join(paper, "tables", "main.tex"), "\n".join(lines) + "\n")
@@ -185,7 +190,7 @@ def table_modules(off, paper, key, arms=("v10@qwen3:4b", "none@qwen3:4b+think", 
     cell = grid_cells(f"{sys.argv[1]}/grid/grid_{node}.jsonl")
     lines = ["\\begin{tabular}{lll" + "l" * len(arms) + "}", "\\toprule",
              "Phase & best (place/cache/codec) & " + " & ".join(
-                 {"v10@qwen3:4b": "S1 + SSC", "none@qwen3:4b+think": "S2, no SSC",
+                 {"v10@qwen3:4b": "S1 + SSC", "v12d@qwen3:4b": "S1 + SSC", "none@qwen3:4b+think": "S2, no SSC",
                   "none@qwen3:4b": "S1, no SSC"}.get(a, a) for a in arms if a in d) + " \\\\", "\\midrule"]
     lines[0] = "\\begin{tabular}{ll" + "l" * len([a for a in arms if a in d]) + "}"
     for ph in APP_PHASES[app]:
@@ -213,9 +218,9 @@ def table_modules(off, paper, key, arms=("v10@qwen3:4b", "none@qwen3:4b+think", 
 # ------------------------------------------------------------------ ablation / sweep / live
 def table_ablation(off, paper):
     rows = [("none@qwen3:4b", "No SSC (option list only)"), ("v10x@qwen3:4b", "SSC, no node experience"),
-            ("v10@qwen3:4b", "Full SSC"), ("ng_v10@qwen3:4b", "Full SSC, guards off"),
+            ("v12d@qwen3:4b", "Full SSC"), ("ng_v12d@qwen3:4b", "Full SSC, guards off"),
             ("guards", "Guards only (no model)"), ("wknn10", "SSC lookup, no model")]
-    cols = [k for k in [("1g", "gs"), ("1g", "app2"), ("1g", "app3"), ("05g", "app3"), ("05gp", "app3")] if k in off]
+    cols = [k for k in [("1g", "wf"), ("05g", "wf"), ("05gp", "wf")] if k in off]
     lines = ["\\begin{tabular}{l" + "rr" * len(cols) + "}", "\\toprule",
              " & " + " & ".join(f"\\multicolumn{{2}}{{c}}{{{APPS[a]}, {pp.NODES.get(n, n)}}}" for n, a in cols) + " \\\\",
              "Context & " + " & ".join("acc.\\,\\% & slow." for _ in cols) + " \\\\", "\\midrule"]
@@ -233,7 +238,7 @@ def table_ablation(off, paper):
     write(os.path.join(paper, "tables", "ablation.tex"), "\n".join(lines) + "\n")
 
 
-def table_sweep(off, paper, key=("1g", "gs")):
+def table_sweep(off, paper, key=("1g", "wf")):
     if key not in off:
         return
     d = off[key]
@@ -242,13 +247,13 @@ def table_sweep(off, paper, key=("1g", "gs")):
              "\\midrule"]
     for m, lab in (("qwen3:1.7b", "qwen3-1.7B"), ("qwen3:4b", "qwen3-4B"), ("qwen3:8b", "qwen3-8B"),
                    ("qwen3:14b", "qwen3-14B"), ("llama3.1:8b", "llama3.1-8B")):
-        a, b = d.get(f"none@{m}"), d.get(f"v10@{m}")
+        a, b = d.get(f"none@{m}"), d.get(f"v12d@{m}")
         if not (a and b):
             continue
         lines.append(f"{lab} & {acc(a)[0]:.0f} & {acc(b)[0]:.0f} & {pp.summarize(a)['slow']:.2f}$\\times$ & "
                      f"{pp.summarize(b)['slow']:.2f}$\\times$ & {pp.summarize(b)['lat_med']:.2f} \\\\")
     lines += ["\\bottomrule", "\\end{tabular}"]
-    write(os.path.join(paper, "tables", "sweep.tex"), "\n".join(lines) + "\n")
+    write(os.path.join(paper, "tables", f"sweep_{key[1]}.tex"), "\n".join(lines) + "\n")
 
 
 def common_schedules(live):
@@ -263,8 +268,8 @@ def common_schedules(live):
 def table_live(res, paper):
     live, meta = pp.load_live(res)
     live = common_schedules(live)
-    order = ["oracle", "fixed-best", "rules", "s1-ssc", "s1-ssc-async", "s1-ssc-llama", "s1-nossc",
-             "s2-nossc", "s2-nossc-async"]
+    order = ["oracle", "fixed-default", "fixed-best", "rules", "s1-ssc12", "s1-ssc12-async", "s1-ssc",
+             "s1-ssc-async", "s1-ssc-llama", "s1-nossc", "s2-nossc", "s2-nossc-async"]
     for node, d in live.items():
         lines = ["\\begin{tabular}{lrrrrr}", "\\toprule",
                  "Controller & sched. & I/O (s) & recomp. (s) & decision (s) & total (s) \\\\", "\\midrule"]
@@ -278,9 +283,7 @@ def table_live(res, paper):
         write(os.path.join(paper, "tables", f"live_{node}.tex"), "\n".join(lines) + "\n")
 
 
-def table_agreement(off, paper, keys=(("1g", "gs"), ("4g", "gs"), ("1g", "app2"), ("4g", "app2"), ("1g", "app3"),
-                                      ("05g", "app3"), ("05gp", "app3")),
-                    v="v10@qwen3:4b"):
+def table_agreement(off, paper, keys=(("1g", "wf"), ("05g", "wf"), ("05gp", "wf")), v="v12d@qwen3:4b"):
     """How often the model's choice per axis equals the model-free lookup's (the option the SSC
     evidence ranks best), and who is right when they differ (both decisions scored on the grid)."""
     ax = ("placement", "cache", "compression")
@@ -311,6 +314,22 @@ def table_agreement(off, paper, keys=(("1g", "gs"), ("4g", "gs"), ("1g", "app2")
     write(os.path.join(paper, "tables", "agreement.tex"), "\n".join(lines) + "\n")
 
 
+def table_phases(paper):
+    """The campaign's phases: trace source, blob size, blobs and reads per window, ratio, intent."""
+    import workload
+    from controller import DECLARED
+    lines = ["\\begin{tabular}{llrrrl}", "\\toprule",
+             "Phase & trace stage & blob & blobs & reads & searched \\\\", "\\midrule"]
+    for ph in APP_PHASES["wf"]:
+        blob, n, reads, _ = workload.PHASES[ph]
+        stage = workload.WF_TRACES[ph].split(":")[1].split(",")[0].strip()
+        size = f"{blob // (1 << 20)}\\,MB" if blob >= 1 << 20 else f"{blob / 1024:.1f}".rstrip("0").rstrip(".") + "\\,KB"
+        lines.append(f"{PHASE_NAMES[ph]} & {tex_escape(stage)} & {size} & {n} & {reads} & "
+                     f"{DECLARED[ph]['searched_later']} \\\\")
+    lines += ["\\bottomrule", "\\end{tabular}"]
+    write(os.path.join(paper, "tables", "phases_wf.tex"), "\n".join(lines) + "\n")
+
+
 def main():
     res, paper = sys.argv[1], sys.argv[2]
     for sub in ("tables", "figures"):
@@ -327,14 +346,13 @@ def main():
     for f in os.listdir(figtmp):
         if f.endswith(".pdf"):
             shutil.copy(os.path.join(figtmp, f), os.path.join(paper, "figures", f))
-    fig_motivation(res, paper, [("1g", "app3", "WfCommons, 1 GB DRAM node"),
-                                ("05g", "app3", "WfCommons, 0.5 GB DRAM node"),
-                                ("05gp", "app3", "WfCommons, 0.5 GB DRAM + parallel FS")])
-    for app in ("gs", "app3"):
-        table_best(res, paper, ["1g", "05g", "05gp"], app)
+    fig_motivation(res, paper, [("1g", "wf", "1 GB DRAM node"), ("05g", "wf", "0.5 GB DRAM node"),
+                                ("05gp", "wf", "0.5 GB DRAM + parallel FS")])
+    table_best(res, paper, ["1g", "05g", "05gp"], "wf")
+    table_phases(paper)
     table_main(off, paper, pp.SCENARIOS)
-    for key in (("1g", "app3"), ("05g", "app3"), ("05gp", "app3"), ("1g", "gs")):
-        table_modules(off, paper, key)
+    for key in (("1g", "wf"), ("05g", "wf"), ("05gp", "wf")):
+        table_modules(off, paper, key, arms=("v12d@qwen3:4b", "none@qwen3:4b+think", "none@qwen3:4b"))
     table_ablation(off, paper)
     table_sweep(off, paper)
     table_live(res, paper)

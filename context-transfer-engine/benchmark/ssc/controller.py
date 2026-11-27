@@ -58,6 +58,12 @@ DECLARED = {
     "kg_vcf": {"durability": "important (input genotypes)", "searched_later": "no", "latency_critical": "no"},
     "kg_indiv": {"durability": "regenerable (per-individual results)", "searched_later": "no",
                  "latency_critical": "no"},
+    # four more WfCommons workflows (the SSC's experience is the other workflows, workload.WF_FAMILY)
+    "cy_season": {"durability": "regenerable (crop season output)", "searched_later": "no", "latency_critical": "no"},
+    "sk_realign": {"durability": "important (realigned reads)", "searched_later": "no", "latency_critical": "no"},
+    "sk_gvcf": {"durability": "important (per-sample variant calls)", "searched_later": "yes", "latency_critical": "no"},
+    "sg_decon": {"durability": "regenerable (receiver functions)", "searched_later": "no", "latency_critical": "no"},
+    "sra_fastq": {"durability": "regenerable (downloaded reads)", "searched_later": "no", "latency_critical": "no"},
 }
 DEFAULT_SCHEDULE = "gs_output:3,gs_analysis:3,gs_log:3,gs_products:3,gs_archive:3,gs_output:2"
 PLACE = {"dram": "dram", "ssd": "disk"}

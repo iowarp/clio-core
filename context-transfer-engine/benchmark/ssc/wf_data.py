@@ -12,9 +12,15 @@ are synthesized in the formats those workflows really write, with realistic stat
     map.txt    Epigenomics alignments (MAQ-style map text: read, chromosome, position, strand, ...)
     vcf.txt    1000Genome chromosome VCF: one variant per line, genotypes of 2,504 samples,
                mostly 0|0 (rare alleles), as in the 1000 Genomes phase 3 release
+    cycles.txt Cycles crop-model season output: one row per simulated day (date, weather,
+               crop growth, soil water and nitrogen columns), as the Cycles agroecosystem model writes
+    sac.bin    Seismology deconvolved receiver functions: SAC files (632-byte header + float32
+               samples of a band-limited, decaying waveform), as sG1IterDecon writes
+Files that already exist are kept (the earlier ones are not regenerated).
 """
 
 import os
+import zlib
 import sys
 
 import numpy as np
@@ -96,13 +102,52 @@ def vcf(rng, n=12000, samples=2504):
     return "".join(out).encode()
 
 
+def cycles_txt(rng, days=365 * 40):
+    out = ["YEAR  DOY  CROP           STAGE     THERMAL_TIME  CUM_BIOMASS  AG_BIOMASS  ROOT_BIOMASS  "
+           "FRAC_INTERCEPT  TOTAL_N  AG_N  ROOT_N  N_STRESS  WATER_STRESS  POTENTIAL_TR  ACTUAL_TR  "
+           "SOIL_EVAP  PRECIP  TMAX  TMIN  SOLAR_RAD\n"]
+    bio = 0.0
+    for d in range(days):
+        year, doy = 1980 + d // 365, d % 365 + 1
+        season = 0.5 + 0.5 * np.sin((doy - 100) / 365 * 2 * np.pi)
+        growing = 120 <= doy <= 280
+        bio = bio + max(0.0, rng.normal(0.08, 0.02)) * season if growing else 0.0
+        out.append(f"{year}  {doy:3d}  {'CornRM.110' if growing else 'N/A':13s}  "
+                   f"{'Vegetative' if growing and doy < 200 else 'Reproductive' if growing else 'N/A':9s}  "
+                   f"{rng.uniform(0, 1800) if growing else 0:12.1f}  {bio:11.3f}  {0.8 * bio:10.3f}  "
+                   f"{0.2 * bio:12.3f}  {min(1.0, bio / 8):14.3f}  {bio * 0.012:7.4f}  {bio * 0.009:5.4f}  "
+                   f"{bio * 0.003:6.4f}  {rng.uniform(0, 0.3) if growing else 0:8.3f}  "
+                   f"{rng.uniform(0, 0.4) if growing else 0:12.3f}  {6 * season:12.3f}  {5 * season:9.3f}  "
+                   f"{rng.uniform(0, 2):9.3f}  {max(0, rng.normal(2.5, 6)):6.2f}  {12 + 18 * season + rng.normal(0, 3):5.1f}  "
+                   f"{0 + 15 * season + rng.normal(0, 3):5.1f}  {8 + 20 * season + rng.normal(0, 2):10.2f}\n")
+    return "".join(out).encode()
+
+
+def sac_bin(rng, n_files=2000, npts=1000):
+    out = []
+    t = np.arange(npts) / 20.0                                   # 20 Hz receiver function
+    for _ in range(n_files):
+        hdr = np.zeros(158, dtype=np.float32).tobytes()           # 632-byte SAC header (70 floats,
+        hdr = hdr[:632]                                           #  40 ints, 192 chars), zero-filled
+        w = np.zeros(npts, dtype=np.float32)
+        for _ in range(rng.integers(3, 7)):                       # Ps conversions + multiples
+            t0, a, f = rng.uniform(1, 40), rng.normal(0, 0.3), rng.uniform(0.5, 2.0)
+            w += (a * np.exp(-((t - t0) ** 2) * f * 4) * np.cos(2 * np.pi * f * (t - t0))).astype(np.float32)
+        w += rng.normal(0, 0.01, npts).astype(np.float32)
+        out.append(hdr + w.tobytes())
+    return b"".join(out)
+
+
 def main():
     out = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_DIR
     os.makedirs(out, exist_ok=True)
     rng = np.random.default_rng(2026)
     for name, fn in (("fits.bin", fits), ("fit.txt", fit_txt), ("fastq.txt", fastq), ("map.txt", map_txt),
-                     ("vcf.txt", vcf)):
-        data = fn(rng)
+                     ("vcf.txt", vcf), ("cycles.txt", cycles_txt), ("sac.bin", sac_bin)):
+        if os.path.exists(os.path.join(out, name)):
+            print(f"{name:10s} kept", flush=True)
+            continue
+        data = fn(np.random.default_rng(zlib.crc32(name.encode())) if name in ("cycles.txt", "sac.bin") else rng)
         with open(os.path.join(out, name), "wb") as f:
             f.write(data)
         print(f"{name:10s} {len(data) / MB:7.1f} MB", flush=True)

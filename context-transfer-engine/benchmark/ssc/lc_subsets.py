@@ -12,9 +12,10 @@ import sys
 import workload
 
 per = int(sys.argv[1]) if len(sys.argv) > 1 else 5
-mem = list(workload.MEMORY_PHASES)
+wf = len(sys.argv) > 2 and sys.argv[2] == "wf"      # WfCommons experience: N of the 11 phases
+mem = list(workload.WF_PHASES if wf else workload.MEMORY_PHASES)
 rng = random.Random(2026)
-for n in (1, 2, 3, 5):
+for n in ((2, 4, 6, 8) if wf else (1, 2, 3, 5)):
     allc = list(itertools.combinations(mem, n))
     pick = allc if len(allc) <= per else rng.sample(allc, per)
     for c in pick:

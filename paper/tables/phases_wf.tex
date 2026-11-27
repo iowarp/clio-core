@@ -1,0 +1,17 @@
+\begin{tabular}{llrrrl}
+\toprule
+Phase & trace stage & blob & blobs & reads & searched \\
+\midrule
+Montage mProject images & mProject & 4\,MB & 180 & 1872 & no \\
+Montage mDiffFit fits & mDiffFit & 1\,KB & 4230 & 4230 & no \\
+Epigenomics FASTQ & fastqSplit/filterContams & 6\,MB & 165 & 165 & no \\
+Epigenomics map (searched) & map & 512\,KB & 660 & 660 & yes \\
+1000Genome VCF & ALL.chrN.250000.vcf & 4\,MB & 512 & 512 & no \\
+1000Genome individuals & individuals & 28\,KB & 2600 & 3900 & no \\
+Cycles season output & cycles/fertilizer\_increase & 304\,KB & 1600 & 640 & no \\
+SoyKB realigned BAMs & indel\_realign & 80\,KB & 1000 & 10000 & no \\
+SoyKB gVCFs (searched) & haplotype\_caller & 43\,KB & 2000 & 4000 & yes \\
+Seismology SAC traces & sG1IterDecon & 4.5\,KB & 4000 & 4000 & no \\
+SRAsearch reads & fasterq-dump & 8\,MB & 192 & 192 & no \\
+\bottomrule
+\end{tabular}

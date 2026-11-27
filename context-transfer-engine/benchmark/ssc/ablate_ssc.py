@@ -174,7 +174,10 @@ def main():
     ap.add_argument("--seeds", default="101-110")
     ap.add_argument("--variants", default="none,raw,v2,v3")
     ap.add_argument("--grid", default="/ssc-bench/live_results/grid_gs.jsonl")
-    ap.add_argument("--app", choices=["gs", "gs7", "app2", "app3"], default="gs",
+    ap.add_argument("--experience", choices=["gs", "wf"], default="gs",
+                    help="node experience: gs = the Gray-Scott phases, leave-one-phase-out (frozen runs); "
+                         "wf = the WfCommons workflows, leave-one-workflow-out")
+    ap.add_argument("--app", choices=["gs", "gs7", "app2", "app3", "mix", "wf"], default="gs",
                     help="schedule phases: gs = the five base phases (default), gs7 = + generalization "
                          "phases, app2 = the second application (DLIO / h5bench-style), app3 = WfCommons workflows")
     ap.add_argument("--memory-phases", default=None,
@@ -182,6 +185,8 @@ def main():
                          "(its experience); default all of workload.MEMORY_PHASES. Scoring always uses "
                          "the full grid.")
     a = ap.parse_args()
+    if a.experience == "wf":
+        workload.MEMORY_PHASES, workload.LEAVE_OUT = workload.WF_PHASES, "workflow"
     if a.memory_phases:
         mem = tuple(a.memory_phases.split(","))
         assert set(mem) <= set(workload.MEMORY_PHASES), mem
@@ -189,7 +194,7 @@ def main():
         global MEMORY_TAG
         MEMORY_TAG = {"memory": list(mem)}
     phases = {"gs": workload.BASE_PHASES, "gs7": workload.GS_PHASES, "app2": workload.APP2_PHASES,
-              "app3": workload.APP3_PHASES}[a.app]
+              "app3": workload.APP3_PHASES, "mix": workload.MIX_PHASES, "wf": workload.WF_PHASES}[a.app]
     lo, hi = (map(int, a.seeds.split("-")) if "-" in a.seeds else (int(a.seeds), int(a.seeds)))
     cell, best, worst = grid_table(a.grid)
     CELLS.update(cell)

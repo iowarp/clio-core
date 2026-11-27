@@ -50,6 +50,10 @@ ARMS = {
     "fixed-default": ("Default stack (as shipped)", "#b5b4ae", "fixed"),
     "fixed-default-idx": ("Default stack + declared indexer", GRAY, "fixed"),
     "fixed-best": ("Best fixed stack (hand-tuned, hindsight)", "#5f5e5a", "fixed"),
+    "explore-first": ("Explore each stack, then exploit", "#d9a441", "explore"),
+    "ucb": ("UCB1 exploration", "#c98f2a", "explore"),
+    "egreedy": ("epsilon-greedy exploration", "#b8860b", "explore"),
+    "explore-warm": ("Exploration kept across runs", "#8b6508", "explore"),
 }
 MAIN = ["const", "guards", "rules", "wknn10", "none@qwen3:4b", "none@llama3.1:8b",
         "none@qwen3:4b+think", "none@qwen3:14b+think", "v10@qwen3:4b+think",
@@ -58,7 +62,7 @@ NODES = {"05g": "0.5 GB DRAM", "1g": "1 GB DRAM", "4g": "4 GB DRAM",
          "05gp": "0.5 GB DRAM + parallel FS",
          # live result directories (node_app)
          "1g_app3": "WfCommons, 1 GB DRAM node", "1g_app2": "DL/HDF5, 1 GB DRAM node",
-         "05g_app3": "WfCommons, 0.5 GB DRAM node"}
+         "05g_app3": "WfCommons, 0.5 GB DRAM node", "1g_wf": "WfCommons campaign, 1 GB DRAM node"}
 
 plt.rcParams.update({
     "font.size": 8, "axes.titlesize": 8.5, "axes.labelsize": 8, "legend.fontsize": 7,
@@ -401,11 +405,8 @@ def fig_phase_heatmap(off, figdir, node="1g", app="gs"):
 
 ACC_WITHIN = 1.25    # a decision is "accurate" if its window time is within 25% of the best setup
                      # (measurement noise between repeats is ~10% median, so 10% would mostly score noise)
-SCENARIOS = [(("1g", "gs"), "Gray-Scott\n1 GB"), (("05g", "gs"), "Gray-Scott\n0.5 GB"),
-             (("4g", "gs"), "Gray-Scott\n4 GB"), (("05gp", "gs"), "Gray-Scott\n0.5 GB+PFS"),
-             (("1g", "app2"), "DL/HDF5\n1 GB"), (("4g", "app2"), "DL/HDF5\n4 GB"),
-             (("1g", "app3"), "WfCommons\n1 GB"), (("05g", "app3"), "WfCommons\n0.5 GB"),
-             (("05gp", "app3"), "WfCommons\n0.5 GB+PFS")]
+SCENARIOS = [(("1g", "wf"), "1 GB DRAM"), (("05g", "wf"), "0.5 GB DRAM"),
+             (("05gp", "wf"), "0.5 GB DRAM\n+ parallel FS")]
 # main figure: automatic composition against the fixed stacks CLIO runs today; the reasoning model
 # without the SSC stays as the "why not just ask a thinking model" reference
 MAIN_ARMS = [("fixed-default", "Default stack, as shipped", "#cfcec9", True),
