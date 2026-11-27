@@ -30,8 +30,7 @@ workload and node.
 We present \sys{}, automatic online I/O stack composition. Once per workload window, a small
 language model with thinking off chooses the composition from a \emph{Storage System Context} (SSC)
 that \sys{} builds from measurements of \emph{other} workloads on the same node; the target workload is
-never measured in advance. We implement \sys{} on the CLIO composable storage runtime and evaluate it on
-an NCSA Delta node with three applications (a Gray-Scott campaign, a
+never measured in advance. On an NCSA Delta node with three applications (a Gray-Scott campaign, a
 DLIO/h5bench-style workload, and stages of three WfCommons workflows from real execution traces) and
 several node setups, \sys{} is 1.36--2.12$\times$ faster than the default stack and matches or beats a
 fixed stack hand-tuned with hindsight in five of six scenarios (1.00--1.13$\times$ the best
@@ -93,16 +92,13 @@ well as an expert's hand-tuned stack, in about a second.
 \paragraph{Contributions.}
 \begin{itemize}
 \item \textbf{\sys{}}, automatic online I/O stack composition: a decision loop that asks a fast model
-  (thinking off) typed questions per workload window and recomposes the live stack, implemented on the
-  CLIO composable runtime,
-  with two deterministic guards and an asynchronous mode that hides decision time behind I/O
+  (thinking off) typed questions per workload window and recomposes the live stack, with two
+  deterministic guards and an asynchronous mode that hides decision time behind I/O
   (\S\ref{sec:design}).
 \item The \textbf{Storage System Context (SSC)}, built automatically from measurements of
   \emph{other} workloads on the same node (leave-workload-out), with feasibility stated as typed facts
   and no hand-written module descriptions (\S\ref{sec:ssc}).
-\item Fixes that make single-node composition meaningful in CLIO: a single-node read cache and
-  device anti-affinity for same-node replicas (\S\ref{sec:clio}).
-\item An evaluation against fixed I/O stacks (the default and a stack hand-tuned with hindsight) on three applications, four node setups and five models, with live runs on CLIO,
+\item An evaluation against fixed I/O stacks (the default and a stack hand-tuned with hindsight) on three applications, four node setups and five models, with live runs on a composable runtime,
   offline replays on measured ground truth, the cost of building the SSC (a learning curve over how
   much the node has measured), and ablations that justify each design choice: a reasoning model
   instead of a fast one, expert rules, a model-free lookup of the same evidence, and every SSC
@@ -110,8 +106,10 @@ well as an expert's hand-tuned stack, in about a second.
 \end{itemize}
 
 \section{Background and Motivation}\label{sec:motivation}
-\paragraph{Composable storage in CLIO.} CLIO's transfer engine (CTE) stores blobs in tags on
-tiered targets. Interceptor modules (ChiMods) form an ordered chain in front of the core:
+\paragraph{Composable I/O stacks.} We use the composable runtime of the IOWarp
+project~\cite{iowarp} as the platform; any runtime that can insert and remove I/O modules at run
+time fits the same model. Its transfer engine stores blobs in tags on tiered targets, and interceptor
+modules form an ordered chain in front of the core:
 cache $\rightarrow$ indexer $\rightarrow$ compressor $\rightarrow$ core. A composition decision has
 four parts: placement (DRAM-first or SSD-first), cache (on/off), indexer (on/off) and compression
 (none, lz4, zstd): $2\times2\times2\times3=24$ compositions. Cache, indexer and compressor are
@@ -134,7 +132,7 @@ and Table~\ref{tab:best} show the WfCommons phases; the Gray-Scott and DL/HDF5 p
 A workflow moves through such phases in seconds, so the composition must follow the workload while
 it runs, and the mapping must be relearned for each node.
 
-\paragraph{What runs today: a fixed stack.} Composable runtimes, CLIO included, have no automatic
+\paragraph{What runs today: a fixed stack.} Composable runtimes have no automatic
 composition. A run uses the default stack (here DRAM first, no cache, no indexer, no compression) or
 a composition someone wrote into the configuration for that workload and node, and keeps it for the
 whole run.
@@ -251,7 +249,7 @@ no cache, no indexer, no compression); modules are added only when a decision as
 \resizebox{0.95\textwidth}{!}{\input{figures/overview.tex}}
 \caption{\sys{} overview. Once per workload window, the client trace and the node's measured
 experience become the SSC; a fast model answers four typed questions; two deterministic guards
-check the answer; the new chain is applied to the live CLIO runtime at the next window boundary.}
+check the answer; the new chain is applied to the live runtime at the next window boundary.}
 \label{fig:overview}
 \end{figure*}
 
@@ -286,8 +284,10 @@ node setup (24 compositions $\times$ 7 phases $\times$ 3 repeats, more when the 
 before the workload runs; everything else happens online. \S\ref{sec:ablation} measures what a node
 with no experience (a cold start) loses.
 
-\section{Making Single-Node Composition Meaningful in CLIO}\label{sec:clio}
-\paragraph{Cache.} CLIO's cache is a cross-node read cache: the node that owns a blob keeps no copy.
+\section{Implementation}\label{sec:clio}
+\sys{} runs on the IOWarp composable runtime (CLIO)~\cite{iowarp}. Two changes made single-node
+composition meaningful there.
+\paragraph{Cache.} The runtime's cache is a cross-node read cache: the node that owns a blob keeps no copy.
 On one node every blob is owner-local, so the cache was a pass-through and its on/off decision was
 noise. We added an opt-in single-node mode (populate on read miss, delete on write; coherent because
 a single node has no foreign writers) and mark the SSD tier durable so cache copies stay in DRAM.
@@ -296,12 +296,12 @@ a single node has no foreign writers) and mark the SSD tier durable so cache cop
 copy landed on the same disk as the original. We added device anti-affinity: devices that already
 hold a copy are tried last.
 
-Both changes pass CLIO's own cache, replication, indexer and compressor test suites (17 of 17 tests).
+Both changes pass the runtime's own cache, replication, indexer and compressor test suites (17 of 17 tests).
 
 \section{Evaluation}\label{sec:eval}
 \subsection{Setup}\label{sec:setup}
 \paragraph{Platform.} One NCSA Delta node (AMD EPYC 7763, 64 cores, 256 GB RAM, local NVMe, 4
-NVIDIA A100-40GB), allocated exclusively so no other job shares it. CLIO and the workload run on
+NVIDIA A100-40GB), allocated exclusively so no other job shares it. The storage runtime and the workload run on
 cores 0--31; each model runs in its own Ollama server on one A100, pinned to cores 32--63. Four
 node setups: \emph{1\,GB}: 1\,GB DRAM tier + 2\,GB NVMe tier; \emph{0.5\,GB}: 0.5\,GB DRAM + 1.5\,GB
 NVMe; \emph{4\,GB}: 4\,GB DRAM + 8\,GB NVMe (Gray-Scott and DL/HDF5 only); \emph{DRAM+PFS}: 0.5\,GB
@@ -422,16 +422,16 @@ behind on Gray-Scott (65--69\%) and on WfCommons at 0.5\,GB (85\%), the errors v
 (\S\ref{sec:setup}). Decision time is about 1\,s for both models; the 0.3--0.4\,s of v10 on WfCommons
 were measured in an earlier campaign \pending{check v12 vs v10 latency on the same lane}.
 
-\subsection{Live end-to-end on CLIO}\label{sec:live}
+\subsection{Live end-to-end runs}\label{sec:live}
 \begin{table}[t]
-\caption{Live CLIO runs, WfCommons, 1\,GB node: mean per schedule over the schedules every arm has
+\caption{Live runs, WfCommons, 1\,GB node: mean per schedule over the schedules every arm has
 completed. \pending{default stack and \sys{} v12 arms on schedules 201--203; S2 arms on 202--203.}}
 \label{tab:live}
 \small\resizebox{\columnwidth}{!}{\input{tables/live_1g_app3.tex}}
 \end{table}
 
 Table~\ref{tab:live} and Figure~\ref{fig:live} show live runs, in which each controller drives a
-real CLIO runtime through a WfCommons schedule. The numbers below are for the frozen v10 SSC on
+real storage runtime through a WfCommons schedule. The numbers below are for the frozen v10 SSC on
 schedule 201; \pending{the default stack as shipped and \sys{} with v12 run on all three schedules}. With the SSC, qwen3-4B's compositions are within 5\%
 of the oracle's I/O time (117\,s vs.\ 112\,s on schedule 201) and 18\% faster than the rules'; the same
 model without the SSC spends 72\% more time on I/O (202\,s). In blocking mode its 41 decisions add
@@ -452,7 +452,7 @@ the run takes 140\,s, slower than S1 + SSC. These live numbers are from one sche
 \begin{figure}[t]
 \centering
 \includegraphics[width=\columnwidth]{figures/fig_live_1g_app3.pdf}
-\caption{Live CLIO, WfCommons, 1\,GB node: time per schedule split into I/O, recomposition and
+\caption{Live runs, WfCommons, 1\,GB node: time per schedule split into I/O, recomposition and
 blocking decision time.}
 \label{fig:live}
 \end{figure}
