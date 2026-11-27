@@ -28,7 +28,7 @@ trap 'rm -f "${D:?}/active.lock/job"; rmdir "$D/active.lock" 2>/dev/null' EXIT
 export SSC_DEADLINE=$(( $(date +%s) + ${STEP_MIN:-55} * 60 ))   # leave 5 min for shutdown
 left() { echo $(( SSC_DEADLINE - $(date +%s) )); }
 PH=mt_project,mt_fit,ep_fastq,ep_map,kg_vcf,kg_indiv
-declare -A DRAM=([1g]=1 [05g]=0.5 [05gp]=0.5) DISK=([1g]=2 [05g]=1.5 [05gp]=2)
+declare -A DRAM=([1g]=1 [05g]=0.5 [05gp]=0.5 [4g]=4) DISK=([1g]=2 [05g]=1.5 [05gp]=2 [4g]=8)
 # 05gp: a second node setup, 0.5 GB DRAM + the second tier on the parallel file system (Lustre
 # /work/hdd) instead of local NVMe. It also measures the Gray-Scott phases: they are the SSC's node
 # experience, and a new setup has to rebuild it from its own measurements.
@@ -37,7 +37,7 @@ TIER=/work/hdd/bekn/rpawar/ssc_tier/$JOB        # scratch tier file (not results
 CPUS=([0]=32-39 [1]=40-47 [2]=48-55 [3]=56-63)
 cd $HERE
 
-grid_done() { [ -f $G/grid_$1_wf.done ]; }
+grid_done() { [ -f $G/grid_$1_wf.done ] || { [ $1 = 4g ] && [ -f $G/grid_4g.done ]; }; }   # 4g: GS/DL grid only
 grid_step() {   # measure what fits; mark done (and append to the main grid) once all 24 setups are in
   local n=$1
   local extra=""; [ $n = 05gp ] && { mkdir -p $TIER; extra="SSC_DISK_DIR=$TIER"; }
@@ -61,6 +61,11 @@ s1_units() {   # s1_units <prefix> <node> <app>: one unit per arm (no-model base
     UNITS+=("$1_$(echo $v | tr '@:.' '___') $2 $3 101-110 $v 720"); done
 }
 UNITS=()
+# SSC v12d, frozen after the Gray-Scott practice schedules (seeds 1-3, results/practice): run once on
+# every test scenario, both S1 models, next to the v10 numbers already in results/offline
+V12="v12d@qwen3:4b,v12d@llama3.1:8b"
+for t in "1g app3" "05g app3" "1g gs" "4g gs" "1g app2" "4g app2" "05gp app3" "05gp gs"; do
+  set -- $t; UNITS+=("v12_$1_$2 $1 $2 101-110 $V12 900"); done
 for s in $(seq 101 110); do UNITS+=("s2_1g_$s 1g app3 $s none@qwen3:4b+think 1200"); done
 s1_units s1_1g 1g app3
 for s in $(seq 101 105); do UNITS+=("s2_05g_$s 05g app3 $s none@qwen3:4b+think 1200"); done
