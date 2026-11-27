@@ -75,20 +75,27 @@ for s in $(seq 101 105); do UNITS+=("s2_05gp_$s 05gp app3 $s none@qwen3:4b+think
 s1_units s1_05gp 05gp app3
 UNITS+=("s1_05gp_noguard 05gp app3 101-110 ng_v10@qwen3:4b 720")
 s1_units s1_05gp_gs 05gp gs
+# learning curve (v12d, qwen3:4b): the node has measured only N of the 7 Gray-Scott phases; the
+# subsets come from lc_subsets.py (seeded), N = 7 is the v12_* unit above; scored on the full grid
+while read k mem; do [ $k = 7 ] && continue
+  i=$(( ${i:-0} + 1 ))
+  for t in "1g app3" "05g app3" "1g gs"; do set -- $t
+    UNITS+=("lc_$1_$2_n${k}_$i $1 $2 101-105 v12d@qwen3:4b 360 $mem"); done
+done < <(cd $HERE && ctr python3 lc_subsets.py 3)
 rmdir "${D:?}"/*.claim 2>/dev/null               # one job at a time: claims left by a killed job are stale
 claim() { mkdir $D/$1.claim 2>/dev/null; }      # one lane per unit
 gpu_lane() {    # gpu_lane <gpu>: run units until none fits
   local g=$1
   for u in "${UNITS[@]}"; do
     set -- $u
-    local name=$1 n=$2 app=$3 seeds=$4 vars=$5 est=$6
+    local name=$1 n=$2 app=$3 seeds=$4 vars=$5 est=$6 mem=${7:+--memory-phases $7}
     [ -f $D/$name.done ] && continue
     grid_done $n || continue
     [ $(left) -lt $(( est + 120 )) ] && continue
     claim $name || continue
     SSC_QUEUE_ROOT=$SSC_TMP/q$g SSC_DRAM_GB=${DRAM[$n]} SSC_DISK_GB=${DISK[$n]} taskset -c ${CPUS[$g]} \
       timeout $(( $(left) - 60 )) ctr python3 ablate_ssc.py $O/${n}_${app}_${name}.jsonl.tmp --seeds $seeds \
-      --grid $G/grid_$n.jsonl --app $app --variants "$vars" >> $LOGDIR/off_$g.log 2>&1
+      --grid $G/grid_$n.jsonl --app $app --variants "$vars" $mem >> $LOGDIR/off_$g.log 2>&1
     local rc=$?
     if [ $rc -eq 0 ]; then mv $O/${n}_${app}_${name}.jsonl.tmp $O/${n}_${app}_${name}.jsonl; touch $D/$name.done
     else rm -f "${O:?}/${n}_${app}_${name}.jsonl.tmp"; fi

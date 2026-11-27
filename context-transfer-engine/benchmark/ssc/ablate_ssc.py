@@ -94,6 +94,7 @@ def model_busy():
 
 
 CELLS = {}
+MEMORY_TAG = {}     # --memory-phases: recorded on every row
 QUEUE_S1 = "/ssc-bench/live_queue_s1"      # s1_bridge.py: qwen3:8b, thinking off
 
 
@@ -176,7 +177,17 @@ def main():
     ap.add_argument("--app", choices=["gs", "gs7", "app2", "app3"], default="gs",
                     help="schedule phases: gs = the five base phases (default), gs7 = + generalization "
                          "phases, app2 = the second application (DLIO / h5bench-style), app3 = WfCommons workflows")
+    ap.add_argument("--memory-phases", default=None,
+                    help="learning curve: comma list of the Gray-Scott phases this node has measured "
+                         "(its experience); default all of workload.MEMORY_PHASES. Scoring always uses "
+                         "the full grid.")
     a = ap.parse_args()
+    if a.memory_phases:
+        mem = tuple(a.memory_phases.split(","))
+        assert set(mem) <= set(workload.MEMORY_PHASES), mem
+        workload.MEMORY_PHASES = mem
+        global MEMORY_TAG
+        MEMORY_TAG = {"memory": list(mem)}
     phases = {"gs": workload.BASE_PHASES, "gs7": workload.GS_PHASES, "app2": workload.APP2_PHASES,
               "app3": workload.APP3_PHASES}[a.app]
     lo, hi = (map(int, a.seeds.split("-")) if "-" in a.seeds else (int(a.seeds), int(a.seeds)))
@@ -239,7 +250,7 @@ def main():
                                           "recommended": rec, "best": dict(zip(AXES, b[0])),
                                           "score": round(score, 3),
                                           "axis_ok": {ax: rec[ax] == dict(zip(AXES, b[0]))[ax] for ax in AXES},
-                                          "answers": {}, "latency_s": 0.0}) + "\n")
+                                          "answers": {}, "latency_s": 0.0, **MEMORY_TAG}) + "\n")
                     c = rec
                     continue
                 base = variant[3:] if variant.startswith("ng_") else variant
@@ -276,7 +287,7 @@ def main():
                        "recommended": rec, "best": dict(zip(AXES, b[0])), "score": round(score, 3),
                        "axis_ok": {ax: rec[ax] == dict(zip(AXES, b[0]))[ax] for ax in AXES},
                        "answers": info["answers"], "latency_s": round(info["decision_latency_s"], 3),
-                       "violation": violation}
+                       "violation": violation, **MEMORY_TAG}
                 out.write(json.dumps(row) + "\n")
                 out.flush()
                 c = rec
